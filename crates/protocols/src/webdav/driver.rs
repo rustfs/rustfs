@@ -110,8 +110,8 @@ where
     bucket: String,
     /// Object key
     key: String,
-    /// Current position in file
-    position: u64,
+    /// Current position in file (using RwLock for interior mutability in async)
+    position: Arc<RwLock<u64>>,
     /// File size (known after metadata fetch)
     size: Option<u64>,
     /// Write buffer for accumulating data before upload
@@ -130,7 +130,7 @@ where
             session_context,
             bucket,
             key,
-            position: 0,
+            position: Arc::new(RwLock::new(0)),
             size: None,
             write_buffer: Arc::new(RwLock::new(Vec::new())),
             is_write,
@@ -146,7 +146,7 @@ where
         f.debug_struct("WebDavFile")
             .field("bucket", &self.bucket)
             .field("key", &self.key)
-            .field("position", &self.position)
+            .field("position", &"<locked>")
             .finish()
     }
 }
@@ -199,12 +199,16 @@ where
         .boxed()
     }
 
-    fn write_buf(&mut self, buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
+    fn write_buf(&mut self, mut buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
         let write_buffer = self.write_buffer.clone();
         async move {
             let mut buffer = write_buffer.write().await;
-            let chunk = buf.chunk();
-            buffer.extend_from_slice(chunk);
+            // Consume all chunks from the buffer, not just the first one
+            while buf.has_remaining() {
+                let chunk = buf.chunk();
+                buffer.extend_from_slice(chunk);
+                buf.advance(chunk.len());
+            }
             Ok(())
         }
         .boxed()
@@ -225,9 +229,10 @@ where
         let session_context = self.session_context.clone();
         let bucket = self.bucket.clone();
         let key = self.key.clone();
-        let start_pos = self.position;
+        let position = self.position.clone();
 
         async move {
+            let start_pos = *position.read().await;
             match storage
                 .get_object_range(
                     &bucket,
@@ -252,6 +257,9 @@ where
                                 }
                             }
                         }
+                        // Update position after successful read
+                        let bytes_read = data.len() as u64;
+                        *position.write().await = start_pos + bytes_read;
                         Ok(Bytes::from(data))
                     } else {
                         Ok(Bytes::new())
@@ -267,10 +275,11 @@ where
     }
 
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
-        let current_pos = self.position;
+        let position = self.position.clone();
         let size = self.size;
 
         async move {
+            let current_pos = *position.read().await;
             let new_pos = match pos {
                 SeekFrom::Start(offset) => offset,
                 SeekFrom::End(offset) => {
@@ -289,6 +298,8 @@ where
                     }
                 }
             };
+            // Persist the new position
+            *position.write().await = new_pos;
             Ok(new_pos)
         }
         .boxed()

@@ -100,6 +100,7 @@ where
                             let storage = storage.clone();
                             let tls_acceptor = tls_acceptor.clone();
 
+                            let max_body_size = self.config.max_body_size;
                             tokio::spawn(async move {
                                 let source_ip: IpAddr = addr.ip();
 
@@ -107,7 +108,7 @@ where
                                     match acceptor.accept(stream).await {
                                         Ok(tls_stream) => {
                                             let io = TokioIo::new(tls_stream);
-                                            if let Err(e) = Self::handle_connection_impl(io, storage, source_ip).await {
+                                            if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
                                                 debug!("Connection error: {}", e);
                                             }
                                         }
@@ -117,7 +118,7 @@ where
                                     }
                                 } else {
                                     let io = TokioIo::new(stream);
-                                    if let Err(e) = Self::handle_connection_impl(io, storage, source_ip).await {
+                                    if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
                                         debug!("Connection error: {}", e);
                                     }
                                 }
@@ -144,13 +145,14 @@ where
         io: TokioIo<I>,
         storage: S,
         source_ip: IpAddr,
+        max_body_size: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let service = service_fn(move |req: Request<hyper::body::Incoming>| {
             let storage = storage.clone();
-            async move { Self::handle_request(req, storage, source_ip).await }
+            async move { Self::handle_request(req, storage, source_ip, max_body_size).await }
         });
 
         http1::Builder::new().serve_connection(io, service).await?;
@@ -163,7 +165,23 @@ where
         req: Request<hyper::body::Incoming>,
         storage: S,
         source_ip: IpAddr,
+        max_body_size: u64,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        // Check Content-Length against max_body_size before reading body
+        if let Some(content_length) = req.headers().get("content-length") {
+            if let Ok(length_str) = content_length.to_str() {
+                if let Ok(length) = length_str.parse::<u64>() {
+                    if length > max_body_size {
+                        warn!("Request body too large: {} > {}", length, max_body_size);
+                        return Ok(error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            &format!("Request body too large. Maximum size is {} bytes", max_body_size),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Extract authorization header
         let auth_header = req.headers().get("authorization").and_then(|h| h.to_str().ok());
 
