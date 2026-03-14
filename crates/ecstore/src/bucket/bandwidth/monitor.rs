@@ -197,7 +197,7 @@ impl Monitor {
     pub fn update_measurement(&self, opts: &BucketOptions, bytes: u64) {
         {
             let guard = self.m_lock.read().unwrap_or_else(|e| {
-                warn!("bucket monitor measurement rwlock write poisoned, recovering");
+                warn!("bucket monitor measurement rwlock read poisoned, recovering");
                 e.into_inner()
             });
             if let Some(measurement) = guard.get(opts) {

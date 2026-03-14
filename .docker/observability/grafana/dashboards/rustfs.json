@@ -2776,7 +2776,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "rustfs_bucket_replication_bandwidth_current_bytes_per_second{job=~\"$job\",bucket=~\"$bucket\"}",
+          "expr": "sum by (bucket, targetArn) (rustfs_bucket_replication_bandwidth_current_bytes_per_second{job=~\"$job\",bucket=~\"$bucket\"})",
           "legendFormat": "{{bucket}} | {{targetArn}}",
           "range": true,
           "refId": "Replication_Bandwidth_Current"
@@ -2841,7 +2841,7 @@
       "targets": [
         {
           "editorMode": "builder",
-          "expr": "rustfs_bucket_replication_bandwidth_limit_bytes_per_second{job=~\"$job\",bucket=~\"$bucket\"}",
+          "expr": "max by (bucket, targetArn) (rustfs_bucket_replication_bandwidth_limit_bytes_per_second{job=~\"$job\",bucket=~\"$bucket\"})",
           "format": "time_series",
           "legendFormat": "{{bucket}} | {{targetArn}}",
           "range": true,

@@ -16,11 +16,12 @@ mod config;
 pub mod datatypes;
 mod replication_pool;
 mod replication_resyncer;
-pub mod replication_state;
+mod replication_state;
 mod rule;
 
 pub use config::*;
 pub use datatypes::*;
 pub use replication_pool::*;
 pub use replication_resyncer::*;
+pub use replication_state::BucketStats;
 pub use rule::*;

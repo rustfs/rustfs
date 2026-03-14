@@ -25,8 +25,8 @@ use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::replication::BucketStats;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
-use rustfs_ecstore::bucket::replication::replication_state::BucketStats;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
@@ -36,7 +36,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use url::Host;
 
 fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
@@ -124,13 +124,14 @@ impl Operation for GetReplicationMetricsHandler {
             .map_err(ApiError::from)?;
 
         if let Err(err) = get_replication_config(bucket).await {
-            error!("get_replication_config err {:?}", err);
             if err == StorageError::ConfigNotFound {
+                info!("replication configuration not found for bucket '{}'", bucket);
                 return Err(S3Error::with_message(
                     S3ErrorCode::ReplicationConfigurationNotFoundError,
                     "replication not found".to_string(),
                 ));
             }
+            error!("get_replication_config unexpected error: {:?}", err);
             return Err(ApiError::from(err).into());
         }
 

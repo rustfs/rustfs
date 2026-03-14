@@ -1936,9 +1936,11 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         && let Some(stats) = GLOBAL_REPLICATION_STATS.get()
     {
         for tgt in &rinfos.targets {
-            stats
-                .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
-                .await;
+            if tgt.replication_status != tgt.prev_replication_status {
+                stats
+                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                    .await;
+            }
         }
     }
 }
