@@ -32,12 +32,14 @@
 //! All exporters use **HTTP binary** (Protobuf) encoding with **gzip**
 //! compression for efficiency over the wire.
 
-use crate::TelemetryError;
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::OBSERVABILITY_METRIC_ENABLED;
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::OtelGuard;
+// Import helper functions from local.rs (sibling module)
+use crate::TelemetryError;
+use crate::telemetry::local::spawn_cleanup_task;
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
@@ -66,9 +68,6 @@ use tracing_subscriber::{
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-
-// Import helper functions from local.rs (sibling module)
-use super::local::{ensure_dir_permissions, spawn_cleanup_task};
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -197,7 +196,7 @@ pub(super) fn init_observability_http(
         }
         // 2. Permissions
         #[cfg(unix)]
-        ensure_dir_permissions(log_directory)?;
+        crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
         // 3. Rotation
         let rotation_str = config
