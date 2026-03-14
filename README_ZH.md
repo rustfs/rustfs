@@ -100,7 +100,7 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 ### 2\. Docker 快速启动 (选项 2)
 
-RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `1000`，否则会遇到权限拒绝错误。
+RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `10001`，否则会遇到权限拒绝错误。
 
 ```bash
  # 创建数据和日志目录
