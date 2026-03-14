@@ -158,8 +158,8 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
-  customAnnotations: # Specify custom annotations
-    {} # Customize annotations
+  customAnnotations: # Additional custom annotations (merged with class-specific annotations)
+    {}
   hosts:
     - host: example.rustfs.com
       paths:
