@@ -48,22 +48,38 @@ fn rust_log_requests_verbose(rust_log: &str) -> bool {
             return false;
         }
 
+        let directive_lc = directive.to_ascii_lowercase();
+        let mut parts = directive_lc.rsplitn(2, '=');
+        let level_candidate = parts.next().unwrap();
+        let has_eq = parts.next().is_some();
+
         // target-only directives (e.g. "hyper") default to trace in EnvFilter.
-        if !directive.contains('=') {
+        if !has_eq {
             return if matches!(
-                directive.to_ascii_lowercase().as_str(),
+                directive_lc.as_str(),
                 "trace" | "debug" | "info" | "warn" | "error" | "off"
             ) {
+                // A bare level directive (e.g. "debug").
                 is_verbose_level(directive)
             } else {
+                // Any other target-only directive is treated as verbose (trace by default).
                 true
             };
         }
 
-        if let Some(level_part) = directive.rsplit('=').next() {
-            is_verbose_level(level_part)
+        // If there is an '=' present, only treat the suffix as a level if it is
+        // an exact level token. Otherwise, this may be a span/field filter and
+        // we should treat the directive as target-only (verbose).
+        if matches!(
+            level_candidate,
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        ) {
+            is_verbose_level(level_candidate)
         } else {
-            false
+            // E.g. directives like `mycrate[span{field="value"}]` contain '='
+            // but do not specify a log level; EnvFilter treats them as
+            // target-only, which defaults to trace.
+            true
         }
     })
 }
