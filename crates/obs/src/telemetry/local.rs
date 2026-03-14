@@ -286,7 +286,7 @@ fn init_file_logging_internal(
 /// This prevents world-writable log directories from being a security hazard.
 /// No-ops if permissions are already `0755` or stricter.
 #[cfg(unix)]
-pub(super) fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
+pub fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
@@ -335,7 +335,7 @@ pub(super) fn ensure_dir_permissions(log_directory: &str) -> Result<(), Telemetr
 ///
 /// # Returns
 /// A [`tokio::task::JoinHandle`] for the spawned cleanup loop.
-pub(super) fn spawn_cleanup_task(
+pub fn spawn_cleanup_task(
     config: &OtelConfig,
     log_directory: &str,
     log_filename: &str,
