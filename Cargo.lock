@@ -163,9 +163,9 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.13"
+version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
+checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anstyle-parse"
@@ -1201,7 +1201,7 @@ version = "0.11.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52965399b470437fc7f4d4b51134668dbc96573fea6f1b83318a420e4605745"
 dependencies = [
- "digest 0.11.1",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -1361,9 +1361,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.56"
+version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
+checksum = "7a0dd1ca384932ff3641c8718a02769f1698e7563dc6974ffd03346116310423"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1470,7 +1470,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "inout 0.1.4",
 ]
 
@@ -1553,9 +1553,9 @@ checksum = "de0758edba32d61d1fd9f4d69491b47604b91ee2f7e6b33de7e54ca4ebe55dc3"
 
 [[package]]
 name = "colorchoice"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "combine"
@@ -1941,9 +1941,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-common"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bfb12502f3fc46cca1bb51ac28df9d618d813cdc3d2f25b9fe775a34af26bb3"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
@@ -2115,7 +2115,6 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
- "strsim 0.11.1",
  "syn 2.0.117",
 ]
 
@@ -3025,15 +3024,15 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "const-oid 0.9.6",
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "subtle",
 ]
 
 [[package]]
 name = "digest"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "285743a676ccb6b3e116bc14cc69319b957867930ae9c4822f8e0f54509d7243"
+checksum = "4850db49bf08e663084f7fb5c87d202ef91a3907271aff24a94eb97ff039153c"
 dependencies = [
  "block-buffer 0.12.0",
  "const-oid 0.10.2",
@@ -3606,9 +3605,9 @@ dependencies = [
 
 [[package]]
 name = "generic-array"
-version = "0.14.9"
+version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bb6743198531e02858aeaea5398fcc883e71851fcbcb5a2f773e2fb6cb1edf2"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
@@ -4088,7 +4087,7 @@ version = "0.13.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef451d73f36d8a3f93ad32c332ea01146c9650e1ec821a9b0e46c01277d544f8"
 dependencies = [
- "digest 0.11.1",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -5082,7 +5081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59e715bb6f273068fc89403d6c4f5eeb83708c62b74c8d43e3e8772ca73a6288"
 dependencies = [
  "cfg-if",
- "digest 0.11.1",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -5932,7 +5931,7 @@ version = "0.13.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8dfa4e14084d963d35bfb4cdb38712cde78dcf83054c0e8b9b8e899150f374e"
 dependencies = [
- "digest 0.11.1",
+ "digest 0.11.2",
  "hmac 0.13.0-rc.5",
 ]
 
@@ -7070,7 +7069,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-bigint 0.7.1",
  "crypto-primes",
- "digest 0.11.1",
+ "digest 0.11.2",
  "pkcs1 0.8.0-rc.4",
  "pkcs8 0.11.0-rc.11",
  "rand_core 0.10.0",
@@ -8500,9 +8499,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.17.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "381b283ce7bc6b476d903296fb59d0d36633652b633b27f64db4fb46dcbfc3b9"
+checksum = "dd5414fad8e6907dbdd5bc441a50ae8d6e26151a03b1de04d89a5576de61d01f"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -8519,11 +8518,11 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.17.0"
+version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6d4e30573c8cb306ed6ab1dca8423eec9a463ea0e155f45399455e0368b27e0"
+checksum = "d3db8978e608f1fe7357e211969fd9abdcae80bac1ba7a3369bb7eb6b404eb65"
 dependencies = [
- "darling 0.21.3",
+ "darling 0.23.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8584,7 +8583,7 @@ checksum = "3b167252f3c126be0d8926639c4c4706950f01445900c4b3db0fd7e89fcb750a"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.11.1",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -8606,7 +8605,7 @@ checksum = "7c5f3b1e2dc8aad28310d8410bd4d7e180eca65fca176c52ab00d364475d0024"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.11.1",
+ "digest 0.11.2",
 ]
 
 [[package]]
@@ -8683,7 +8682,7 @@ version = "3.0.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f1880df446116126965eeec169136b2e0251dba37c6223bcc819569550edea3"
 dependencies = [
- "digest 0.11.1",
+ "digest 0.11.2",
  "rand_core 0.10.0",
 ]
 
