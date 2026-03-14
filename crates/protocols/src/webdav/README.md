@@ -22,8 +22,13 @@ WebDAV (Web Distributed Authoring and Versioning) protocol implementation for Ru
 | `GET` | Download file | GetObject |
 | `DELETE` | Delete file/directory | DeleteObject / DeleteBucket |
 | `HEAD` | Get file metadata | HeadObject |
-| `MOVE` | Move/rename file | CopyObject + DeleteObject |
-| `COPY` | Copy file | CopyObject |
+
+### Not Yet Implemented
+
+| Method | Description | Status |
+|--------|-------------|--------|
+| `MOVE` | Move/rename file | Returns 501 Not Implemented |
+| `COPY` | Copy file | Returns 501 Not Implemented |
 
 ## Enable Feature
 

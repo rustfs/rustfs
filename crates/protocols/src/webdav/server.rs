@@ -316,7 +316,7 @@ fn unauthorized_response() -> Response<Full<Bytes>> {
         .status(StatusCode::UNAUTHORIZED)
         .header("WWW-Authenticate", "Basic realm=\"RustFS WebDAV\"")
         .body(Full::new(Bytes::from("Unauthorized")))
-        .unwrap()
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Unauthorized"))))
 }
 
 /// Create error response
@@ -324,7 +324,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .body(Full::new(Bytes::from(message.to_string())))
-        .unwrap()
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Internal Server Error"))))
 }
 
 /// Decode base64 string

@@ -118,13 +118,29 @@ where
     write_buffer: Arc<RwLock<Vec<u8>>>,
     /// Whether we're in write mode
     is_write: bool,
+    /// Maximum body size for chunked transfers
+    max_body_size: u64,
 }
 
 impl<S> WebDavFile<S>
 where
     S: S3StorageBackend + Debug + Clone + Send + Sync + 'static,
 {
+    /// Default maximum body size (5GB)
+    pub const DEFAULT_MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
     pub fn new(storage: S, session_context: Arc<SessionContext>, bucket: String, key: String, is_write: bool) -> Self {
+        Self::with_max_body_size(storage, session_context, bucket, key, is_write, Self::DEFAULT_MAX_BODY_SIZE)
+    }
+
+    pub fn with_max_body_size(
+        storage: S,
+        session_context: Arc<SessionContext>,
+        bucket: String,
+        key: String,
+        is_write: bool,
+        max_body_size: u64,
+    ) -> Self {
         Self {
             storage,
             session_context,
@@ -134,6 +150,7 @@ where
             size: None,
             write_buffer: Arc::new(RwLock::new(Vec::new())),
             is_write,
+            max_body_size,
         }
     }
 }
@@ -201,11 +218,16 @@ where
 
     fn write_buf(&mut self, mut buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
         let write_buffer = self.write_buffer.clone();
+        let max_body_size = self.max_body_size;
         async move {
             let mut buffer = write_buffer.write().await;
             // Consume all chunks from the buffer, not just the first one
             while buf.has_remaining() {
                 let chunk = buf.chunk();
+                // Check size limit before extending
+                if buffer.len() as u64 + chunk.len() as u64 > max_body_size {
+                    return Err(FsError::TooLarge);
+                }
                 buffer.extend_from_slice(chunk);
                 buf.advance(chunk.len());
             }
@@ -216,8 +238,13 @@ where
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
         let write_buffer = self.write_buffer.clone();
+        let max_body_size = self.max_body_size;
         async move {
             let mut buffer = write_buffer.write().await;
+            // Check size limit before extending
+            if buffer.len() as u64 + buf.len() as u64 > max_body_size {
+                return Err(FsError::TooLarge);
+            }
             buffer.extend_from_slice(&buf);
             Ok(())
         }
@@ -318,9 +345,10 @@ where
                 return Ok(());
             }
 
-            let buffer = write_buffer.read().await;
+            // Use write lock and std::mem::take to avoid cloning the buffer
+            let mut buffer = write_buffer.write().await;
             let file_size = buffer.len();
-            let data_bytes = Bytes::from(buffer.clone());
+            let data_bytes = Bytes::from(std::mem::take(&mut *buffer));
             drop(buffer);
 
             let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(data_bytes) });
@@ -344,9 +372,7 @@ where
             {
                 Ok(_) => {
                     debug!("Successfully flushed {} bytes to {}/{}", file_size, bucket, key);
-                    // Clear the buffer after successful upload
-                    let mut buffer = write_buffer.write().await;
-                    buffer.clear();
+                    // Buffer already cleared by std::mem::take above
                     Ok(())
                 }
                 Err(e) => {

@@ -91,7 +91,8 @@ impl WebDavConfig {
 impl Default for WebDavConfig {
     fn default() -> Self {
         Self {
-            bind_addr: crate::constants::defaults::DEFAULT_WEBDAV_ADDRESS.parse().unwrap(),
+            // Use direct construction instead of parse().unwrap() to avoid panic
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             tls_enabled: true,
             cert_dir: None,
             ca_file: None,
