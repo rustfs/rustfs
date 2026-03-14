@@ -19,6 +19,7 @@
 //!
 //! - [`cluster`]: Cluster-wide capacity and object statistics
 //! - [`bucket`]: Per-bucket usage and quota metrics
+//! - [`bucket_replication`]: Per-target replication bandwidth metrics
 //! - [`node`]: Per-node disk capacity and health metrics
 //! - [`resource`]: System resource metrics (CPU, memory, uptime)
 //!
@@ -61,12 +62,14 @@
 //! ```
 
 mod bucket;
+mod bucket_replication;
 mod cluster;
 pub(crate) mod global;
 mod node;
 mod resource;
 
 pub use bucket::{BucketStats, collect_bucket_metrics};
+pub use bucket_replication::{BucketReplicationBandwidthStats, collect_bucket_replication_bandwidth_metrics};
 pub use cluster::{ClusterStats, collect_cluster_metrics};
 pub use global::init_metrics_collectors;
 pub use node::{DiskStats, collect_node_metrics};
