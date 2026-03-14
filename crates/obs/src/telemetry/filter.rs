@@ -41,6 +41,13 @@ fn is_verbose_level(level: &str) -> bool {
     s.contains("trace") || s.contains("debug")
 }
 
+fn is_level_token(level: &str) -> bool {
+    matches!(
+        level.trim().to_ascii_lowercase().as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    )
+}
+
 fn rust_log_requests_verbose(rust_log: &str) -> bool {
     rust_log.split(',').any(|directive| {
         let directive = directive.trim();
@@ -48,39 +55,16 @@ fn rust_log_requests_verbose(rust_log: &str) -> bool {
             return false;
         }
 
-        let directive_lc = directive.to_ascii_lowercase();
-        let mut parts = directive_lc.rsplitn(2, '=');
-        let level_candidate = parts.next().unwrap();
-        let has_eq = parts.next().is_some();
-
-        // target-only directives (e.g. "hyper") default to trace in EnvFilter.
-        if !has_eq {
-            return if matches!(
-                directive_lc.as_str(),
-                "trace" | "debug" | "info" | "warn" | "error" | "off"
-            ) {
-                // A bare level directive (e.g. "debug").
-                is_verbose_level(directive)
-            } else {
-                // Any other target-only directive is treated as verbose (trace by default).
-                true
-            };
+        // Resolve by suffix token after the last '=', then classify:
+        // - known level token => evaluate verbosity from that level
+        // - otherwise => treat as target-only directive (verbose in EnvFilter)
+        if let Some(level_candidate) = directive.rsplit('=').next().map(str::trim)
+            && is_level_token(level_candidate)
+        {
+            return is_verbose_level(level_candidate);
         }
 
-        // If there is an '=' present, only treat the suffix as a level if it is
-        // an exact level token. Otherwise, this may be a span/field filter and
-        // we should treat the directive as target-only (verbose).
-        if matches!(
-            level_candidate,
-            "trace" | "debug" | "info" | "warn" | "error" | "off"
-        ) {
-            is_verbose_level(level_candidate)
-        } else {
-            // E.g. directives like `mycrate[span{field="value"}]` contain '='
-            // but do not specify a log level; EnvFilter treats them as
-            // target-only, which defaults to trace.
-            true
-        }
+        true
     })
 }
 
@@ -179,7 +163,9 @@ mod tests {
         assert!(rust_log_requests_verbose("debug"));
         assert!(rust_log_requests_verbose("rustfs=debug"));
         assert!(rust_log_requests_verbose("hyper"));
+        assert!(rust_log_requests_verbose("rustfs[{request_id=abc=def}]"));
         assert!(rust_log_requests_verbose("info,rustfs=trace"));
+        assert!(!rust_log_requests_verbose("rustfs= info"));
         assert!(!rust_log_requests_verbose("info"));
         assert!(!rust_log_requests_verbose("rustfs=info"));
     }
