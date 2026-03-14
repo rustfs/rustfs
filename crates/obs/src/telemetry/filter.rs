@@ -138,7 +138,6 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temp_env;
 
     #[test]
     fn test_is_verbose_level() {
