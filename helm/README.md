@@ -37,7 +37,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
 | config.rustfs.obs_endpoint.enabled | bool | `false` | Whether to send metrics/logs/traces/profilings to remote endpoint, eg, OLTP. |
 | config.rustfs.obs_endpoint.base_endpoint | string | `""` | Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318. |
-| config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in additon the OLTP. |
+| config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in addition the OLTP. |
 | config.rustfs.obs_endpoint.metrics.enabled | bool | `false` | Whether to send metrics to remote endpoint. |
 | config.rustfs.obs_endpoint.metrics.endpoint | string | `""` | Remote endpoint url for metrics. |
 | config.rustfs.obs_endpoint.trace.enabled | bool | `false` | Whether to send trace to remote endpoint. |
