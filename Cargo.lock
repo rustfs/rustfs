@@ -1201,7 +1201,7 @@ version = "0.11.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52965399b470437fc7f4d4b51134668dbc96573fea6f1b83318a420e4605745"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.1",
 ]
 
 [[package]]
@@ -3073,9 +3073,9 @@ dependencies = [
 
 [[package]]
 name = "digest"
-version = "0.11.2"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4850db49bf08e663084f7fb5c87d202ef91a3907271aff24a94eb97ff039153c"
+checksum = "285743a676ccb6b3e116bc14cc69319b957867930ae9c4822f8e0f54509d7243"
 dependencies = [
  "block-buffer 0.12.0",
  "const-oid 0.10.2",
@@ -4154,7 +4154,7 @@ version = "0.13.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef451d73f36d8a3f93ad32c332ea01146c9650e1ec821a9b0e46c01277d544f8"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.1",
 ]
 
 [[package]]
@@ -5154,7 +5154,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59e715bb6f273068fc89403d6c4f5eeb83708c62b74c8d43e3e8772ca73a6288"
 dependencies = [
  "cfg-if",
- "digest 0.11.2",
+ "digest 0.11.1",
 ]
 
 [[package]]
@@ -6004,7 +6004,7 @@ version = "0.13.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8dfa4e14084d963d35bfb4cdb38712cde78dcf83054c0e8b9b8e899150f374e"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.1",
  "hmac 0.13.0-rc.5",
 ]
 
@@ -7154,7 +7154,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-bigint 0.7.1",
  "crypto-primes",
- "digest 0.11.2",
+ "digest 0.11.1",
  "pkcs1 0.8.0-rc.4",
  "pkcs8 0.11.0-rc.11",
  "rand_core 0.10.0",
@@ -8672,7 +8672,7 @@ checksum = "3b167252f3c126be0d8926639c4c4706950f01445900c4b3db0fd7e89fcb750a"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.11.2",
+ "digest 0.11.1",
 ]
 
 [[package]]
@@ -8694,7 +8694,7 @@ checksum = "7c5f3b1e2dc8aad28310d8410bd4d7e180eca65fca176c52ab00d364475d0024"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.11.2",
+ "digest 0.11.1",
 ]
 
 [[package]]
@@ -8771,7 +8771,7 @@ version = "3.0.0-rc.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f1880df446116126965eeec169136b2e0251dba37c6223bcc819569550edea3"
 dependencies = [
- "digest 0.11.2",
+ "digest 0.11.1",
  "rand_core 0.10.0",
 ]
 
