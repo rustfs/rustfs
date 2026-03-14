@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Helm Ingress**: `customAnnotations` are now merged with class-specific annotations (nginx/traefik) instead of being ignored when `ingress.className` is set.
+
 ### Added
 - **OpenStack Keystone Authentication Integration**: Full support for OpenStack Keystone authentication via X-Auth-Token headers
   - Tower-based middleware (`KeystoneAuthLayer`) self-contained within `rustfs-keystone` crate
