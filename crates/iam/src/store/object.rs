@@ -512,10 +512,8 @@ impl Store for ObjectStore {
             })?;
 
         if u.credentials.is_expired() {
-            let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
-            let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
             warn!(
-                "load_user_identity failed: user is expired, delete the user and mapped policy, name: {name}, user_type: {user_type:?}"
+                "load_user_identity: user is expired, skipping load, name: {name}, user_type: {user_type:?}"
             );
             return Err(Error::NoSuchUser(name.to_owned()));
         }

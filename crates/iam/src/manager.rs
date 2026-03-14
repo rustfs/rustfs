@@ -805,7 +805,11 @@ where
         }
 
         let users = self.cache.users.load();
-        let u = users.get(name).cloned().unwrap_or_default();
+        let u = users
+            .get(name)
+            .cloned()
+            .or_else(|| self.cache.sts_accounts.load().get(name).cloned())
+            .unwrap_or_default();
         if !u.credentials.is_valid() {
             return Ok((Vec::new(), OffsetDateTime::now_utc()));
         }

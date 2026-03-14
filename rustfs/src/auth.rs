@@ -327,8 +327,10 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid token3"));
     }
 
-    if cred.is_temp() && cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
+    // Detect expired STS credentials: session_token is set but credential has expired.
+    // is_temp() returns false when expired, so check session_token directly.
+    if !cred.session_token.is_empty() && cred.is_expired() {
+        return Err(s3_error!(ExpiredToken, "The security token included in the request is expired"));
     }
 
     let Some(sys_cred) = get_global_action_cred() else {
