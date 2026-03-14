@@ -168,18 +168,16 @@ where
         max_body_size: u64,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Check Content-Length against max_body_size before reading body
-        if let Some(content_length) = req.headers().get("content-length") {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length > max_body_size {
-                        warn!("Request body too large: {} > {}", length, max_body_size);
-                        return Ok(error_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            &format!("Request body too large. Maximum size is {} bytes", max_body_size),
-                        ));
-                    }
-                }
-            }
+        if let Some(content_length) = req.headers().get("content-length")
+            && let Ok(length_str) = content_length.to_str()
+            && let Ok(length) = length_str.parse::<u64>()
+            && length > max_body_size
+        {
+            warn!("Request body too large: {} > {}", length, max_body_size);
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("Request body too large. Maximum size is {} bytes", max_body_size),
+            ));
         }
 
         // Extract authorization header
