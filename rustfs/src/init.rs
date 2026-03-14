@@ -556,9 +556,6 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
             request_timeout_secs,
         };
 
-        // Validate WebDAV configuration
-        config.validate().await?;
-
         // Create WebDAV server with protocol storage client
         let fs = crate::storage::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
