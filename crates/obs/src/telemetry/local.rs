@@ -26,6 +26,7 @@
 //! The function [`init_local_logging`] is the single entry point for both
 //! cases; callers do **not** need to distinguish between stdout and file modes.
 
+use super::guard::OtelGuard;
 use crate::TelemetryError;
 use crate::cleaner::LogCleaner;
 use crate::cleaner::types::FileMatchMode;
@@ -49,8 +50,6 @@ use tracing_subscriber::{
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-
-use super::guard::OtelGuard;
 
 /// Initialize local logging (stdout-only or file-rolling).
 ///
