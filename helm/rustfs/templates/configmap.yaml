@@ -43,7 +43,7 @@ data:
   {{- end }}
   {{- if .Values.config.rustfs.obs_endpoint.enabled }}
   RUSTFS_OBS_ENDPOINT: {{ .Values.config.rustfs.obs_endpoint.base_endpoint | quote }}
-  RUSTFS_OBS_USE_STDOUT: {{ .Values.config.rustfs.obs_endpoint.use_stdout }}
+  RUSTFS_OBS_USE_STDOUT: {{ .Values.config.rustfs.obs_endpoint.use_stdout | quote }}
   {{- with .Values.config.rustfs.obs_endpoint }}
     {{- if .metrics.enabled }}
   RUSTFS_OBS_METRIC_ENDPOINT: {{ .metrics.endpoint | quote }}
