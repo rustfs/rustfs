@@ -190,6 +190,24 @@ pub static BUCKET_REPL_TOTAL_FAILED_COUNT_MD: LazyLock<MetricDescriptor> = LazyL
     )
 });
 
+pub static BUCKET_REPL_BANDWIDTH_LIMIT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::BandwidthLimitBytesPerSecond,
+        "Configured bandwidth limit for replication in bytes per second",
+        &[BUCKET_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_BANDWIDTH_CURRENT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::BandwidthCurrentBytesPerSecond,
+        "Current replication bandwidth in bytes per second (EWMA)",
+        &[BUCKET_L, TARGET_ARN_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
 // TODO - add a metric for the number of DELETE requests proxied to replication target
 pub static BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(

@@ -263,6 +263,8 @@ pub enum MetricName {
     ReplicationMaxQueuedCount,
     ReplicationMaxDataTransferRate,
     ReplicationRecentBacklogCount,
+    BandwidthLimitBytesPerSecond,
+    BandwidthCurrentBytesPerSecond,
 
     // Scanner-related metrics
     ScannerBucketScansFinished,
@@ -580,6 +582,8 @@ impl MetricName {
             Self::ReplicationMaxQueuedCount => "max_queued_count".to_string(),
             Self::ReplicationMaxDataTransferRate => "max_data_transfer_rate".to_string(),
             Self::ReplicationRecentBacklogCount => "recent_backlog_count".to_string(),
+            Self::BandwidthLimitBytesPerSecond => "bandwidth_limit_bytes_per_second".to_string(),
+            Self::BandwidthCurrentBytesPerSecond => "bandwidth_current_bytes_per_second".to_string(),
 
             // Scanner-related metrics
             Self::ScannerBucketScansFinished => "bucket_scans_finished".to_string(),
