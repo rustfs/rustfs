@@ -496,6 +496,8 @@ pub enum AdminAction {
     GetBucketTargetAction,
     #[strum(serialize = "admin:ReplicationDiff")]
     ReplicationDiff,
+    #[strum(serialize = "admin:GetReplicationMetrics")]
+    GetReplicationMetricsAction,
     #[strum(serialize = "admin:ImportBucketMetadata")]
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
@@ -581,6 +583,7 @@ impl AdminAction {
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
                 | AdminAction::ReplicationDiff
+                | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
                 | AdminAction::SetTierAction
@@ -669,5 +672,10 @@ mod tests {
         let arr = parsed.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:*");
+    }
+
+    #[test]
+    fn test_get_replication_metrics_admin_action_is_valid() {
+        assert!(AdminAction::GetReplicationMetricsAction.is_valid());
     }
 }
