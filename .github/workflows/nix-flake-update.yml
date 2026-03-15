@@ -52,8 +52,8 @@ jobs:
             nix
             automated
           commit-msg: "chore(deps): update flake.lock"
-          pr-reviewers: houseme, heihutu
-          token: ${{ secrets.GITHUB_TOKEN }}
+          pr-reviewers: houseme, overtrue, majinghe
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
 
       - name: Log PR details
         if: steps.update.outputs.pull-request-number
