@@ -174,7 +174,7 @@ jobs:
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
-            matrix="${all}"
+            matrix="$(jq -c . <<<"${all}")"
           else
             unknown="$(jq -rn --arg selected "${selected}" --argjson all "${all}" '
               ($selected | split(",") | map(select(length > 0))) as $req
