@@ -23,6 +23,7 @@
 #
 # Manual Parameters:
 # - build_docker: Build and push Docker images (default: true)
+# - platforms: Comma-separated platform IDs or 'all' (default: all)
 
 name: Build and Release
 
@@ -53,6 +54,11 @@ on:
         required: false
         default: true
         type: boolean
+      platforms:
+        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,macos-aarch64)"
+        required: false
+        default: "all"
+        type: string
 
 permissions:
   contents: read
@@ -138,63 +144,70 @@ jobs:
           echo "  - Is prerelease: $is_prerelease"
 
   # Build RustFS binaries
+  prepare-platform-matrix:
+    name: Prepare Platform Matrix
+    runs-on: ubicloud-standard-2
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      selected: ${{ steps.select.outputs.selected }}
+    steps:
+      - name: Select target platforms
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
+          selected="$(echo "${selected}" | tr -d '[:space:]')"
+          if [[ -z "${selected}" ]]; then
+            selected="all"
+          fi
+
+          all='{"include":[
+            {"target_id":"linux-x86_64-musl","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"linux-x86_64-gnu","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+          ]}'
+
+          if [[ "${selected}" == "all" ]]; then
+            matrix="${all}"
+          else
+            unknown="$(jq -rn --arg selected "${selected}" --argjson all "${all}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | ($all.include | map(.target_id)) as $known
+              | [$req[] | select(( $known | index(.) ) == null)]
+            ')"
+            if [[ "$(jq 'length' <<<"${unknown}")" -gt 0 ]]; then
+              echo "Unknown platforms: $(jq -r 'join(\",\")' <<<"${unknown}")" >&2
+              echo "Allowed: $(jq -r '.include[].target_id' <<<"${all}" | paste -sd ',' -)" >&2
+              exit 1
+            fi
+
+            matrix="$(jq -c --arg selected "${selected}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | .include |= map(select(.target_id as $id | ($req | index($id))))
+            ' <<<"${all}")"
+          fi
+
+          echo "selected=${selected}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Selected platforms: ${selected}"
+
   build-rustfs:
     name: Build RustFS
-    needs: [ build-check ]
-    if: needs.build-check.outputs.should_build == 'true'
+    needs: [ build-check, prepare-platform-matrix ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Linux builds
-          # Use x86-64-v2 (SSE4.2 baseline) instead of native to ensure distributed
-          # binaries run on older x86_64 CPUs (e.g. Intel Celeron/Atom, Synology NAS).
-          # See: https://github.com/rustfs/rustfs/issues/1838
-          - os: ubicloud-standard-2
-            target: x86_64-unknown-linux-musl
-            cross: false
-            platform: linux
-            rustflags: ''
-          - os: ubicloud-standard-2
-            target: aarch64-unknown-linux-musl
-            cross: true
-            platform: linux
-            rustflags: ''
-          - os: ubicloud-standard-2
-            target: x86_64-unknown-linux-gnu
-            cross: false
-            platform: linux
-            rustflags: ''
-          - os: ubicloud-standard-2
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            platform: linux
-            rustflags: ''
-          # macOS builds
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            cross: false
-            platform: macos
-            rustflags: ''
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cross: false
-            platform: macos
-            rustflags: ''
-          # Windows builds (temporarily disabled)
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            platform: windows
-            rustflags: ''
-          #- os: windows-latest
-          #  target: aarch64-pc-windows-msvc
-          #  cross: true
-          #  platform: windows
+      matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
