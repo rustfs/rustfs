@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::bucket::bandwidth::monitor::Monitor;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -20,7 +21,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::time::Sleep;
 use tracing::{debug, warn};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BucketOptions {
     pub name: String,
     pub replication_arn: String,
@@ -54,6 +55,9 @@ impl<R> MonitoredReader<R> {
             header_size = opts.header_size,
             "MonitoredReader created"
         );
+        if throttle.is_some() {
+            m.init_measurement(&opts.bucket_options);
+        }
         MonitoredReader {
             r,
             m,
@@ -117,7 +121,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for MonitoredReader<R> {
             }
         }
 
-        poll_limited_read(&mut this.r, cx, buf, need, &mut this.temp_buf)
+        let filled_before = buf.filled().len();
+        let result = poll_limited_read(&mut this.r, cx, buf, need, &mut this.temp_buf);
+        if let Poll::Ready(Ok(())) = result {
+            let read_bytes = buf.filled().len().saturating_sub(filled_before) as u64;
+            if read_bytes > 0 {
+                this.m.update_measurement(&this.opts.bucket_options, read_bytes);
+            }
+        }
+        result
     }
 }
 

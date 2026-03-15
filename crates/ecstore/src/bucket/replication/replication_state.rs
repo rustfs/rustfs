@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::Error;
+use crate::global::get_global_bucket_monitor;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -585,6 +586,8 @@ pub struct BucketReplicationStat {
     pub latency: LatencyStats,
     pub xfer_rate_lrg: XferStats,
     pub xfer_rate_sml: XferStats,
+    pub bandwidth_limit_bytes_per_sec: i64,
+    pub current_bandwidth_bytes_per_sec: f64,
 }
 
 impl BucketReplicationStat {
@@ -1019,6 +1022,9 @@ impl ReplicationStats {
                     latency: stat.latency.merge(&old_stat.latency),
                     xfer_rate_lrg: lrg,
                     xfer_rate_sml: sml,
+                    bandwidth_limit_bytes_per_sec: stat.bandwidth_limit_bytes_per_sec,
+                    current_bandwidth_bytes_per_sec: stat.current_bandwidth_bytes_per_sec
+                        + old_stat.current_bandwidth_bytes_per_sec,
                 };
 
                 tot_replicated_size += stat.replicated_size;
@@ -1069,23 +1075,42 @@ impl ReplicationStats {
         // In actual implementation, statistics would be obtained from cluster
         // This is simplified to get from local cache
         let cache = self.cache.read().await;
-        if let Some(stats) = cache.get(bucket) {
-            BucketStats {
-                uptime: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                replication_stats: stats.clone_stats(),
-                queue_stats: Default::default(),
-                proxy_stats: ProxyMetric::default(),
-            }
+        let mut replication_stats = if let Some(stats) = cache.get(bucket) {
+            stats.clone_stats()
         } else {
-            BucketStats {
-                uptime: 0,
-                replication_stats: BucketReplicationStats::new(),
-                queue_stats: Default::default(),
-                proxy_stats: ProxyMetric::default(),
+            BucketReplicationStats::new()
+        };
+        let uptime = if cache.contains_key(bucket) {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        } else {
+            0
+        };
+        drop(cache);
+
+        if let Some(monitor) = get_global_bucket_monitor() {
+            let bw_report = monitor.get_report(|name| name == bucket);
+            for (opts, bw) in bw_report.bucket_stats {
+                let stat = replication_stats
+                    .stats
+                    .entry(opts.replication_arn)
+                    .or_insert_with(|| BucketReplicationStat {
+                        xfer_rate_lrg: XferStats::new(),
+                        xfer_rate_sml: XferStats::new(),
+                        ..Default::default()
+                    });
+                stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
+                stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
             }
+        }
+
+        BucketStats {
+            uptime,
+            replication_stats,
+            queue_stats: Default::default(),
+            proxy_stats: ProxyMetric::default(),
         }
     }
 
