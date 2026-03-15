@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{KeystoneError, KeystoneVersion, Result};
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str, get_env_u64};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -80,59 +81,35 @@ pub struct RoleMapping {
 impl KeystoneConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
-        let enable = std::env::var("RUSTFS_KEYSTONE_ENABLE")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false);
+        let enable = get_env_bool("RUSTFS_KEYSTONE_ENABLE", false);
 
         if !enable {
             return Ok(Self::default());
         }
 
-        let auth_url = std::env::var("RUSTFS_KEYSTONE_AUTH_URL")
-            .map_err(|_| KeystoneError::ConfigError("RUSTFS_KEYSTONE_AUTH_URL not set".to_string()))?;
+        let auth_url = get_env_opt_str("RUSTFS_KEYSTONE_AUTH_URL")
+            .ok_or_else(|| KeystoneError::ConfigError("RUSTFS_KEYSTONE_AUTH_URL not set".to_string()))?;
 
-        let version = std::env::var("RUSTFS_KEYSTONE_VERSION").unwrap_or_else(|_| "v3".to_string());
+        let version = get_env_str("RUSTFS_KEYSTONE_VERSION", "v3");
 
-        let admin_user = std::env::var("RUSTFS_KEYSTONE_ADMIN_USER").ok();
-        let admin_password = std::env::var("RUSTFS_KEYSTONE_ADMIN_PASSWORD").ok();
-        let admin_project = std::env::var("RUSTFS_KEYSTONE_ADMIN_PROJECT").ok();
-        let admin_domain = std::env::var("RUSTFS_KEYSTONE_ADMIN_DOMAIN").ok();
+        let admin_user = get_env_opt_str("RUSTFS_KEYSTONE_ADMIN_USER");
+        let admin_password = get_env_opt_str("RUSTFS_KEYSTONE_ADMIN_PASSWORD");
+        let admin_project = get_env_opt_str("RUSTFS_KEYSTONE_ADMIN_PROJECT");
+        let admin_domain = get_env_opt_str("RUSTFS_KEYSTONE_ADMIN_DOMAIN");
 
-        let verify_ssl = std::env::var("RUSTFS_KEYSTONE_VERIFY_SSL")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
+        let verify_ssl = get_env_bool("RUSTFS_KEYSTONE_VERIFY_SSL", true);
 
-        let enable_cache = std::env::var("RUSTFS_KEYSTONE_ENABLE_CACHE")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
+        let enable_cache = get_env_bool("RUSTFS_KEYSTONE_ENABLE_CACHE", true);
 
-        let cache_size = std::env::var("RUSTFS_KEYSTONE_CACHE_SIZE")
-            .unwrap_or_else(|_| "10000".to_string())
-            .parse()
-            .unwrap_or(10000);
+        let cache_size = get_env_u64("RUSTFS_KEYSTONE_CACHE_SIZE", 10000);
 
-        let cache_ttl_seconds = std::env::var("RUSTFS_KEYSTONE_CACHE_TTL")
-            .unwrap_or_else(|_| "300".to_string())
-            .parse()
-            .unwrap_or(300);
+        let cache_ttl_seconds = get_env_u64("RUSTFS_KEYSTONE_CACHE_TTL", 300);
 
-        let enable_tenant_prefix = std::env::var("RUSTFS_KEYSTONE_TENANT_PREFIX")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
+        let enable_tenant_prefix = get_env_bool("RUSTFS_KEYSTONE_TENANT_PREFIX", true);
 
-        let implicit_tenants = std::env::var("RUSTFS_KEYSTONE_IMPLICIT_TENANTS")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
+        let implicit_tenants = get_env_bool("RUSTFS_KEYSTONE_IMPLICIT_TENANTS", true);
 
-        let timeout_seconds = std::env::var("RUSTFS_KEYSTONE_TIMEOUT")
-            .unwrap_or_else(|_| "30".to_string())
-            .parse()
-            .unwrap_or(30);
+        let timeout_seconds = get_env_u64("RUSTFS_KEYSTONE_TIMEOUT", 30);
 
         Ok(Self {
             enable,
@@ -224,6 +201,7 @@ impl Default for KeystoneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env::with_vars;
 
     #[test]
     fn test_default_config() {
@@ -247,5 +225,45 @@ mod tests {
 
         config.version = "invalid".to_string();
         assert!(config.get_version().is_err());
+    }
+
+    #[test]
+    fn test_from_env_reads_configuration() {
+        with_vars(
+            vec![
+                ("RUSTFS_KEYSTONE_ENABLE", Some("true")),
+                ("RUSTFS_KEYSTONE_AUTH_URL", Some("https://keystone.example.com")),
+                ("RUSTFS_KEYSTONE_VERSION", Some("v2.0")),
+                ("RUSTFS_KEYSTONE_ADMIN_USER", Some("admin")),
+                ("RUSTFS_KEYSTONE_ADMIN_PASSWORD", Some("secret")),
+                ("RUSTFS_KEYSTONE_ADMIN_PROJECT", Some("service")),
+                ("RUSTFS_KEYSTONE_ADMIN_DOMAIN", Some("Default")),
+                ("RUSTFS_KEYSTONE_VERIFY_SSL", Some("false")),
+                ("RUSTFS_KEYSTONE_ENABLE_CACHE", Some("false")),
+                ("RUSTFS_KEYSTONE_CACHE_SIZE", Some("2048")),
+                ("RUSTFS_KEYSTONE_CACHE_TTL", Some("900")),
+                ("RUSTFS_KEYSTONE_TENANT_PREFIX", Some("false")),
+                ("RUSTFS_KEYSTONE_IMPLICIT_TENANTS", Some("false")),
+                ("RUSTFS_KEYSTONE_TIMEOUT", Some("99")),
+            ],
+            || {
+                let config = KeystoneConfig::from_env().expect("keystone config should load from env");
+
+                assert!(config.enable);
+                assert_eq!(config.auth_url, "https://keystone.example.com");
+                assert_eq!(config.version, "v2.0");
+                assert_eq!(config.admin_user.as_deref(), Some("admin"));
+                assert_eq!(config.admin_password.as_deref(), Some("secret"));
+                assert_eq!(config.admin_project.as_deref(), Some("service"));
+                assert_eq!(config.admin_domain.as_deref(), Some("Default"));
+                assert!(!config.verify_ssl);
+                assert!(!config.enable_cache);
+                assert_eq!(config.cache_size, 2048);
+                assert_eq!(config.cache_ttl_seconds, 900);
+                assert!(!config.enable_tenant_prefix);
+                assert!(!config.implicit_tenants);
+                assert_eq!(config.timeout_seconds, 99);
+            },
+        );
     }
 }

@@ -15,6 +15,7 @@
 //! Cloud provider detection and metadata fetching.
 
 use async_trait::async_trait;
+use rustfs_utils::get_env_opt_str;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -56,37 +57,33 @@ impl FromStr for CloudProvider {
 impl CloudProvider {
     /// Detects the cloud provider based on environment variables.
     pub fn detect_from_env() -> Option<Self> {
+        let has_env = |key| get_env_opt_str(key).is_some();
+
         // Check for AWS environment variables.
-        if std::env::var("RUSTFS_AWS_EXECUTION_ENV").is_ok()
-            || std::env::var("RUSTFS_AWS_REGION").is_ok()
-            || std::env::var("RUSTFS_EC2_INSTANCE_ID").is_ok()
-        {
+        if has_env("RUSTFS_AWS_EXECUTION_ENV") || has_env("RUSTFS_AWS_REGION") || has_env("RUSTFS_EC2_INSTANCE_ID") {
             return Some(Self::Aws);
         }
 
         // Check for Azure environment variables.
-        if std::env::var("RUSTFS_WEBSITE_SITE_NAME").is_ok()
-            || std::env::var("RUSTFS_WEBSITE_INSTANCE_ID").is_ok()
-            || std::env::var("RUSTFS_APPSETTING_WEBSITE_SITE_NAME").is_ok()
+        if has_env("RUSTFS_WEBSITE_SITE_NAME")
+            || has_env("RUSTFS_WEBSITE_INSTANCE_ID")
+            || has_env("RUSTFS_APPSETTING_WEBSITE_SITE_NAME")
         {
             return Some(Self::Azure);
         }
 
         // Check for GCP environment variables.
-        if std::env::var("RUSTFS_GCP_PROJECT").is_ok()
-            || std::env::var("RUSTFS_GOOGLE_CLOUD_PROJECT").is_ok()
-            || std::env::var("RUSTFS_GAE_INSTANCE").is_ok()
-        {
+        if has_env("RUSTFS_GCP_PROJECT") || has_env("RUSTFS_GOOGLE_CLOUD_PROJECT") || has_env("RUSTFS_GAE_INSTANCE") {
             return Some(Self::Gcp);
         }
 
         // Check for DigitalOcean environment variables.
-        if std::env::var("RUSTFS_DIGITALOCEAN_REGION").is_ok() {
+        if has_env("RUSTFS_DIGITALOCEAN_REGION") {
             return Some(Self::DigitalOcean);
         }
 
         // Check for Cloudflare environment variables.
-        if std::env::var("RUSTFS_CF_PAGES").is_ok() || std::env::var("RUSTFS_CF_WORKERS").is_ok() {
+        if has_env("RUSTFS_CF_PAGES") || has_env("RUSTFS_CF_WORKERS") {
             return Some(Self::Cloudflare);
         }
 
@@ -103,6 +100,42 @@ impl CloudProvider {
             Self::Cloudflare => "cloudflare",
             Self::Unknown(name) => name,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temp_env::{with_var, with_vars_unset};
+
+    #[test]
+    fn test_detect_from_env_prefers_known_provider_markers() {
+        with_var("RUSTFS_AWS_REGION", Some("us-east-1"), || {
+            assert_eq!(CloudProvider::detect_from_env(), Some(CloudProvider::Aws));
+        });
+    }
+
+    #[test]
+    fn test_detect_from_env_returns_none_without_markers() {
+        with_vars_unset(
+            vec![
+                "RUSTFS_AWS_EXECUTION_ENV",
+                "RUSTFS_AWS_REGION",
+                "RUSTFS_EC2_INSTANCE_ID",
+                "RUSTFS_WEBSITE_SITE_NAME",
+                "RUSTFS_WEBSITE_INSTANCE_ID",
+                "RUSTFS_APPSETTING_WEBSITE_SITE_NAME",
+                "RUSTFS_GCP_PROJECT",
+                "RUSTFS_GOOGLE_CLOUD_PROJECT",
+                "RUSTFS_GAE_INSTANCE",
+                "RUSTFS_DIGITALOCEAN_REGION",
+                "RUSTFS_CF_PAGES",
+                "RUSTFS_CF_WORKERS",
+            ],
+            || {
+                assert_eq!(CloudProvider::detect_from_env(), None);
+            },
+        );
     }
 }
 

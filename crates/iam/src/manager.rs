@@ -32,7 +32,7 @@ use rustfs_policy::{
     format::Format,
     policy::{Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa},
 };
-use rustfs_utils::path::path_join_buf;
+use rustfs_utils::{get_env_opt_str, path::path_join_buf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicU8;
@@ -147,7 +147,7 @@ where
 
         // Background ticker for synchronization
         // Check if environment variable is set
-        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
+        let skip_background_task = get_env_opt_str("RUSTFS_SKIP_BACKGROUND_TASK").is_some();
 
         if !skip_background_task {
             // Background thread starts periodic updates or receives signal updates

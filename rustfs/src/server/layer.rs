@@ -22,6 +22,7 @@ use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, Sta
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use rustfs_utils::get_env_opt_str;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -253,7 +254,7 @@ pub struct ConditionalCorsLayer {
 
 impl ConditionalCorsLayer {
     pub fn new() -> Self {
-        let cors_origins = std::env::var("RUSTFS_CORS_ALLOWED_ORIGINS").ok().filter(|s| !s.is_empty());
+        let cors_origins = get_env_opt_str("RUSTFS_CORS_ALLOWED_ORIGINS").filter(|s| !s.is_empty());
         Self { cors_origins }
     }
 
@@ -503,6 +504,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use temp_env::with_var;
 
     #[test]
     fn test_strip_quotes_from_first_etag_removes_quotes() {
@@ -592,6 +594,14 @@ mod tests {
             resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://allowed.com"
         );
+    }
+
+    #[test]
+    fn test_conditional_cors_layer_reads_env() {
+        with_var("RUSTFS_CORS_ALLOWED_ORIGINS", Some("https://allowed.com"), || {
+            let cors = ConditionalCorsLayer::new();
+            assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
+        });
     }
 
     #[tokio::test]
