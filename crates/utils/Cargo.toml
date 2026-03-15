@@ -70,6 +70,7 @@ zstd = { workspace = true, optional = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+temp-env = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

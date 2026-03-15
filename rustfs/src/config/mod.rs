@@ -16,6 +16,7 @@ use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use const_str::concat;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_utils::apply_external_env_compat;
 use std::path::PathBuf;
 use std::string::ToString;
 
@@ -262,6 +263,7 @@ impl Opt {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
+        let _ = apply_external_env_compat();
         let args: Vec<String> = args.into_iter().map(|a| a.into().to_string_lossy().into_owned()).collect();
         let args = preprocess_args_for_legacy(args);
         let cli = Cli::parse_from(args);
@@ -276,6 +278,7 @@ impl Opt {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
+        let _ = apply_external_env_compat();
         let args: Vec<String> = args.into_iter().map(|a| a.into().to_string_lossy().into_owned()).collect();
         let args = preprocess_args_for_legacy(args);
         let cli = Cli::try_parse_from(args)?;

@@ -70,10 +70,11 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
-use rustfs_utils::{build_external_env_compat_report, get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustfs_utils::{
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
+};
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
-use std::process::Command;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -82,7 +83,6 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-const ENV_EXTERNAL_COMPAT_BOOTSTRAPPED: &str = "_RUSTFS_EXTERNAL_PREFIX_COMPAT_BOOTSTRAPPED";
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
@@ -117,11 +117,7 @@ fn main() {
 }
 
 fn bootstrap_external_prefix_compat() -> Result<()> {
-    if std::env::var_os(ENV_EXTERNAL_COMPAT_BOOTSTRAPPED).is_some() {
-        return Ok(());
-    }
-
-    let env_compat_report = build_external_env_compat_report();
+    let env_compat_report = apply_external_env_compat();
     if env_compat_report.conflict_count() > 0 {
         // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
         // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
@@ -137,23 +133,21 @@ fn bootstrap_external_prefix_compat() -> Result<()> {
     }
 
     eprintln!(
-        "[INFO] Applying external-prefix compatibility for {} variable(s) and re-executing process.",
-        env_compat_report.mapped_count()
+        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
+        env_compat_report.mapped_count(),
+        format_external_prefix_mappings(&env_compat_report)
     );
 
-    // Re-exec ensures the child process starts with RUSTFS_* already present in its environment,
-    // so all subsequent config/env reads (including early startup paths) observe consistent keys.
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.args(std::env::args_os().skip(1));
-    cmd.env(ENV_EXTERNAL_COMPAT_BOOTSTRAPPED, "1");
-    for (source_key, rustfs_key) in env_compat_report.mapped_pairs {
-        if let Some(value) = std::env::var_os(source_key.as_str()) {
-            cmd.env(rustfs_key, value);
-        }
-    }
+    Ok(())
+}
 
-    let status = cmd.status()?;
-    std::process::exit(status.code().unwrap_or(1));
+fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
+    report
+        .mapped_pairs
+        .iter()
+        .map(|(source_key, rustfs_key)| format!("{source_key}->{rustfs_key}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn async_main() -> Result<()> {
@@ -218,6 +212,32 @@ async fn async_main() -> Result<()> {
             error!("Server encountered an error and is shutting down: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_external_prefix_mappings_lists_mapped_pairs() {
+        let report = ExternalEnvCompatReport {
+            mapped_pairs: vec![
+                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
+                (
+                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                ),
+            ],
+            conflict_keys: Vec::new(),
+        };
+
+        let formatted = format_external_prefix_mappings(&report);
+
+        assert_eq!(
+            formatted,
+            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
     }
 }
 

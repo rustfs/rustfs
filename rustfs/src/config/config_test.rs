@@ -123,6 +123,26 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_minio_prefixed_envs_are_accepted_by_parser() {
+        temp_env::with_vars(
+            [
+                ("MINIO_VOLUMES", Some("/compat/vol1")),
+                ("MINIO_ADDRESS", Some(":9100")),
+                ("RUSTFS_VOLUMES", None),
+                ("RUSTFS_ADDRESS", None),
+            ],
+            || {
+                let opt = Opt::parse_from(["rustfs"]);
+                assert_eq!(opt.volumes, vec!["/compat/vol1"]);
+                assert_eq!(opt.address, ":9100");
+                assert_eq!(std::env::var("RUSTFS_VOLUMES").as_deref(), Ok("/compat/vol1"));
+                assert_eq!(std::env::var("RUSTFS_ADDRESS").as_deref(), Ok(":9100"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_volumes_and_disk_layout_parsing() {
         use rustfs_ecstore::disks_layout::DisksLayout;
 

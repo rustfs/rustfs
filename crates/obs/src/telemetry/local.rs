@@ -89,7 +89,14 @@ pub(super) fn init_local_logging(
     let log_dir_str = config.log_directory.as_deref().filter(|s| !s.is_empty());
 
     if let Some(log_directory) = log_dir_str {
-        init_file_logging_internal(config, log_directory, logger_level, is_production)
+        match init_file_logging_internal(config, log_directory, logger_level, is_production) {
+            Ok(guard) => Ok(guard),
+            Err(error) if should_fallback_to_stdout(&error) => {
+                emit_file_logging_fallback_warning(log_directory, &error);
+                Ok(init_stdout_only(config, logger_level, is_production))
+            }
+            Err(error) => Err(error),
+        }
     } else {
         Ok(init_stdout_only(config, logger_level, is_production))
     }
@@ -316,6 +323,24 @@ pub fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError>
     }
 }
 
+pub(super) fn should_fallback_to_stdout(error: &TelemetryError) -> bool {
+    match error {
+        TelemetryError::SetPermissions(_) => true,
+        TelemetryError::Io(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("permission denied") || message.contains("os error 13")
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) {
+    eprintln!(
+        "[WARN] Failed to initialize file observability logging at '{}': {}. Falling back to stdout logging.",
+        log_directory, error
+    );
+}
+
 // ─── Cleanup task ─────────────────────────────────────────────────────────────
 
 /// Spawn a background task that periodically cleans up old log files.
@@ -434,5 +459,18 @@ mod tests {
             // the open() call, so the function returns Err instead of panicking.
             assert!(result.is_err(), "invalid filename must return Err, not panic");
         });
+    }
+
+    #[test]
+    fn test_permission_denied_errors_fall_back_to_stdout() {
+        assert!(should_fallback_to_stdout(&TelemetryError::Io(
+            "Permission denied (os error 13)".to_string()
+        )));
+        assert!(should_fallback_to_stdout(&TelemetryError::SetPermissions(
+            "dir='/logs', want=0o755, have=0o777, err=Permission denied (os error 13)".to_string()
+        )));
+        assert!(!should_fallback_to_stdout(&TelemetryError::Io(
+            "No such file or directory (os error 2)".to_string()
+        )));
     }
 }

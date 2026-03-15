@@ -31,7 +31,7 @@ use tracing::warn;
 /// - `i8`: The parsed value as i8 if successful, otherwise the default value.
 ///
 pub fn get_env_i8(key: &str, default: i8) -> i8 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
@@ -44,7 +44,7 @@ pub fn get_env_i8(key: &str, default: i8) -> i8 {
 /// - `Option<i8>`: The parsed value as i8 if successful, otherwise None
 ///
 pub fn get_env_opt_i8(key: &str) -> Option<i8> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -58,7 +58,7 @@ pub fn get_env_opt_i8(key: &str) -> Option<i8> {
 /// - `u8`: The parsed value as u8 if successful, otherwise the default value.
 ///
 pub fn get_env_u8(key: &str, default: u8) -> u8 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
@@ -71,7 +71,7 @@ pub fn get_env_u8(key: &str, default: u8) -> u8 {
 /// - `Option<u8>`: The parsed value as u8 if successful, otherwise None
 ///
 pub fn get_env_opt_u8(key: &str) -> Option<u8> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 static WARNED_ENV_MESSAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -87,19 +87,38 @@ fn log_once(key: &str, message: impl FnOnce() -> String) {
     }
 }
 
+fn external_alias_for_key(key: &str) -> Option<String> {
+    let suffix = key.strip_prefix("RUSTFS_")?;
+    if is_external_compatible_suffix(suffix) {
+        Some(format!("{}{}", external_env_prefix(), suffix))
+    } else {
+        None
+    }
+}
+
 fn resolve_env_with_aliases(key: &str, deprecated: &[&str]) -> Option<(String, String)> {
     if let Ok(value) = env::var(key) {
         return Some((key.to_string(), value));
     }
 
-    let (alias, value) = deprecated
+    if let Some((alias, value)) = deprecated
         .iter()
-        .find_map(|alias| env::var(alias).ok().map(|value| (*alias, value)))?;
+        .find_map(|alias| env::var(alias).ok().map(|value| (*alias, value)))
+    {
+        let deprecated_key = format!("env_alias:{alias}->{key}");
+        log_once(&deprecated_key, || {
+            format!("Environment variable {alias} is deprecated, use {key} instead")
+        });
+        return Some((alias.to_string(), value));
+    }
+
+    let alias = external_alias_for_key(key)?;
+    let value = env::var(&alias).ok()?;
     let deprecated_key = format!("env_alias:{alias}->{key}");
     log_once(&deprecated_key, || {
         format!("Environment variable {alias} is deprecated, use {key} instead")
     });
-    Some((alias.to_string(), value))
+    Some((alias, value))
 }
 
 const EXTERNAL_ENV_PREFIX_BYTES: [u8; 6] = [77, 73, 78, 73, 79, 95];
@@ -239,6 +258,13 @@ pub fn build_external_env_compat_report() -> ExternalEnvCompatReport {
     build_external_env_compat_report_from_entries(env::vars())
 }
 
+fn parse_env_value<T>(key: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    resolve_env_with_aliases(key, &[]).and_then(|(_, value)| value.parse().ok())
+}
+
 pub fn get_env_str_with_aliases(key: &str, deprecated: &[&str], default: &str) -> String {
     resolve_env_with_aliases(key, deprecated).map_or_else(|| default.to_string(), |(_, value)| value)
 }
@@ -272,7 +298,7 @@ pub fn get_env_bool_with_aliases(key: &str, deprecated: &[&str], default: bool) 
 /// - `i16`: The parsed value as i16 if successful, otherwise the default value.
 ///
 pub fn get_env_i16(key: &str, default: i16) -> i16 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 16-bit type: signed i16
@@ -284,7 +310,7 @@ pub fn get_env_i16(key: &str, default: i16) -> i16 {
 /// - `Option<i16>`: The parsed value as i16 if successful, otherwise None
 ///
 pub fn get_env_opt_i16(key: &str) -> Option<i16> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -298,7 +324,7 @@ pub fn get_env_opt_i16(key: &str) -> Option<i16> {
 /// - `u16`: The parsed value as u16 if successful, otherwise the default value.
 ///
 pub fn get_env_u16(key: &str, default: u16) -> u16 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 16-bit type: unsigned u16
@@ -310,7 +336,7 @@ pub fn get_env_u16(key: &str, default: u16) -> u16 {
 /// - `Option<u16>`: The parsed value as u16 if successful, otherwise None
 ///
 pub fn get_env_u16_opt(key: &str) -> Option<u16> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 16-bit type: unsigned u16
@@ -335,7 +361,7 @@ pub fn get_env_opt_u16(key: &str) -> Option<u16> {
 /// - `i32`: The parsed value as i32 if successful, otherwise the default value.
 ///
 pub fn get_env_i32(key: &str, default: i32) -> i32 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 32-bit type: signed i32
@@ -347,7 +373,7 @@ pub fn get_env_i32(key: &str, default: i32) -> i32 {
 /// - `Option<i32>`: The parsed value as i32 if successful, otherwise None
 ///
 pub fn get_env_opt_i32(key: &str) -> Option<i32> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -361,7 +387,7 @@ pub fn get_env_opt_i32(key: &str) -> Option<i32> {
 /// - `u32`: The parsed value as u32 if successful, otherwise the default value.
 ///
 pub fn get_env_u32(key: &str, default: u32) -> u32 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 32-bit type: unsigned u32
@@ -373,7 +399,7 @@ pub fn get_env_u32(key: &str, default: u32) -> u32 {
 /// - `Option<u32>`: The parsed value as u32 if successful, otherwise None
 ///
 pub fn get_env_opt_u32(key: &str) -> Option<u32> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
 ///
@@ -385,7 +411,7 @@ pub fn get_env_opt_u32(key: &str) -> Option<u32> {
 /// - `f32`: The parsed value as f32 if successful, otherwise the default value
 ///
 pub fn get_env_f32(key: &str, default: f32) -> f32 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 ///
@@ -396,7 +422,7 @@ pub fn get_env_f32(key: &str, default: f32) -> f32 {
 /// - `Option<f32>`: The parsed value as f32 if successful, otherwise None
 ///
 pub fn get_env_opt_f32(key: &str) -> Option<f32> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -409,7 +435,7 @@ pub fn get_env_opt_f32(key: &str) -> Option<f32> {
 /// - `i64`: The parsed value as i64 if successful, otherwise the default value
 ///
 pub fn get_env_i64(key: &str, default: i64) -> i64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 ///
@@ -420,7 +446,7 @@ pub fn get_env_i64(key: &str, default: i64) -> i64 {
 /// - `Option<i64>`: The parsed value as i64 if successful, otherwise None
 ///
 pub fn get_env_opt_i64(key: &str) -> Option<i64> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, returning Option<Option<i64>> if not set or parsing fails.
@@ -432,7 +458,7 @@ pub fn get_env_opt_i64(key: &str) -> Option<i64> {
 /// - `Option<Option<i64>>`: The parsed value as i64 if successful, otherwise None
 ///
 pub fn get_env_opt_opt_i64(key: &str) -> Option<Option<i64>> {
-    env::var(key).ok().map(|v| v.parse().ok())
+    resolve_env_with_aliases(key, &[]).map(|(_, value)| value.parse().ok())
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -445,7 +471,7 @@ pub fn get_env_opt_opt_i64(key: &str) -> Option<Option<i64>> {
 /// - `u64`: The parsed value as u64 if successful, otherwise the default value.
 ///
 pub fn get_env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 
 /// Retrieve an environment variable as an unsigned 64-bit integer, returning `None` if not set or parsing fails.
@@ -479,7 +505,7 @@ pub fn get_env_opt_u64_with_aliases(key: &str, deprecated: &[&str]) -> Option<u6
 /// - `Option<u64>`: The parsed value as u64 if successful, otherwise None
 ///
 pub fn get_env_opt_u64(key: &str) -> Option<u64> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -492,7 +518,7 @@ pub fn get_env_opt_u64(key: &str) -> Option<u64> {
 /// - `f64`: The parsed value as f64 if successful, otherwise the default value.
 ///
 pub fn get_env_f64(key: &str, default: f64) -> f64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
@@ -504,7 +530,7 @@ pub fn get_env_f64(key: &str, default: f64) -> f64 {
 /// - `Option<f64>`: The parsed value as f64 if successful, otherwise None
 ///
 pub fn get_env_opt_f64(key: &str) -> Option<f64> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
@@ -517,7 +543,7 @@ pub fn get_env_opt_f64(key: &str) -> Option<f64> {
 /// - `usize`: The parsed value as usize if successful, otherwise the default value.
 ///
 pub fn get_env_usize(key: &str, default: usize) -> usize {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    parse_env_value(key).unwrap_or(default)
 }
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 ///
@@ -528,7 +554,7 @@ pub fn get_env_usize(key: &str, default: usize) -> usize {
 /// - `Option<usize>`: The parsed value as usize if successful, otherwise None
 ///
 pub fn get_env_usize_opt(key: &str) -> Option<usize> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+    parse_env_value(key)
 }
 
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
@@ -565,7 +591,7 @@ pub fn get_env_str(key: &str, default: &str) -> String {
 /// - `Option<String>`: The environment variable value if set, otherwise None.
 ///
 pub fn get_env_opt_str(key: &str) -> Option<String> {
-    env::var(key).ok()
+    resolve_env_with_aliases(key, &[]).map(|(_, value)| value)
 }
 
 /// Retrieve an environment variable as a boolean, with a default value if not set or parsing fails.
@@ -615,9 +641,27 @@ pub fn get_env_opt_bool(key: &str) -> Option<bool> {
     })
 }
 
+/// Copy supported external-prefix variables such as `MINIO_*` into their
+/// canonical `RUSTFS_*` names in the current process when the canonical key is
+/// missing.
+#[allow(unsafe_code)]
+pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
+    let report = build_external_env_compat_report();
+    for (source_key, rustfs_key) in &report.mapped_pairs {
+        if let Ok(value) = env::var(source_key) {
+            // Safety: this helper is intended for early startup bootstrap
+            // before any background threads are created.
+            unsafe {
+                env::set_var(rustfs_key, value);
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_external_env_compat_report_from_entries;
+    use super::{apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_str};
 
     fn source_key(suffix: &str) -> String {
         let mut key = super::external_env_prefix().to_string();
@@ -671,5 +715,30 @@ mod tests {
         let report = build_external_env_compat_report_from_entries(vec![(source_key("UNKNOWN_COMPAT_TEST"), "1".to_string())]);
         assert_eq!(report.mapped_count(), 0);
         assert_eq!(report.conflict_count(), 0);
+    }
+
+    #[test]
+    fn minio_alias_is_used_for_rustfs_reads() {
+        temp_env::with_var("MINIO_ROOT_USER", Some("compat-admin"), || {
+            temp_env::with_var_unset("RUSTFS_ROOT_USER", || {
+                assert_eq!(get_env_str("RUSTFS_ROOT_USER", "default-user"), "compat-admin");
+            });
+        });
+    }
+
+    #[test]
+    fn apply_external_env_compat_copies_missing_rustfs_keys() {
+        temp_env::with_var("MINIO_ROOT_USER", Some("compat-admin"), || {
+            temp_env::with_var_unset("RUSTFS_ROOT_USER", || {
+                let report = apply_external_env_compat();
+                assert!(
+                    report
+                        .mapped_pairs
+                        .iter()
+                        .any(|(source_key, rustfs_key)| source_key == "MINIO_ROOT_USER" && rustfs_key == "RUSTFS_ROOT_USER")
+                );
+                assert_eq!(std::env::var("RUSTFS_ROOT_USER").as_deref(), Ok("compat-admin"));
+            });
+        });
     }
 }
