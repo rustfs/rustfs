@@ -45,3 +45,6 @@ docs
 # nix stuff
 result*
 *.gz
+rustfs-webdav.code-workspace
+
+.aiexclude

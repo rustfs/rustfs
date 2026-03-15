@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub enum Protocol {
     Ftps,
     Swift,
+    WebDav,
 }
 
 /// Protocol principal representing an authenticated user

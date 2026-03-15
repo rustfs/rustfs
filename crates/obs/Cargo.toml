@@ -38,6 +38,7 @@ rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-utils = { workspace = true, features = ["ip", "path"] }
 flate2 = { workspace = true }
 glob = { workspace = true }
+jiff = { workspace = true }
 metrics = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
@@ -47,7 +48,6 @@ opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
-smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
@@ -56,7 +56,6 @@ tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
-walkdir = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
@@ -65,3 +64,4 @@ pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+temp-env = { workspace = true }

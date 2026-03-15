@@ -31,11 +31,11 @@ jobs:
   update-flake:
     name: Update flake.lock
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
+        
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
@@ -46,14 +46,18 @@ jobs:
         id: update
         uses: DeterminateSystems/update-flake-lock@main
         with:
+          git-author-name: heihutu
+          git-author-email: heihutu@gmail.com
+          git-committer-name: heihutu
+          git-committer-email: heihutu@gmail.com
           pr-title: "chore(deps): update flake.lock"
           pr-labels: |
             dependencies
             nix
             automated
           commit-msg: "chore(deps): update flake.lock"
-          pr-reviewers: houseme, heihutu
-          token: ${{ secrets.GITHUB_TOKEN }}
+          pr-reviewers: houseme, overtrue, majinghe
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN }}
 
       - name: Log PR details
         if: steps.update.outputs.pull-request-number

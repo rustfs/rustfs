@@ -27,10 +27,6 @@
 //! 7. Stdout worker guard — flushes buffered log lines written to stdout.
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
-#[cfg(unix)]
-use pyroscope::PyroscopeAgent;
-#[cfg(unix)]
-use pyroscope::pyroscope::PyroscopeAgentRunning;
 
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
@@ -46,7 +42,7 @@ pub struct OtelGuard {
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
     #[cfg(unix)]
-    pub(crate) profiling_agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>,
+    pub(crate) profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread

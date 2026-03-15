@@ -804,7 +804,7 @@ impl BucketTargetSys {
 }
 
 async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
-    let tls_path = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
     if tls_path.is_empty() {
         return None;
     }

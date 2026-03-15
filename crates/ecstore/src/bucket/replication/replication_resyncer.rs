@@ -19,6 +19,7 @@ use crate::bucket::bucket_target_sys::{
 use crate::bucket::metadata_sys;
 use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
+use crate::bucket::replication::replication_pool::GLOBAL_REPLICATION_STATS;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
@@ -1629,9 +1630,13 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         )
     };
 
-    for tgt in rinfos.targets.iter() {
-        if tgt.replication_status != tgt.prev_replication_status {
-            // TODO: update global replication status
+    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+        for tgt in rinfos.targets.iter() {
+            if tgt.replication_status != tgt.prev_replication_status {
+                stats
+                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                    .await;
+            }
         }
     }
 
@@ -2087,7 +2092,15 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
             object_info = u;
         }
 
-        // TODO: update stats
+        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+            for tgt in &rinfos.targets {
+                if tgt.replication_status != tgt.prev_replication_status {
+                    stats
+                        .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                        .await;
+                }
+            }
+        }
     }
 
     let event_name = if replication_status == ReplicationStatusType::Completed {
@@ -2105,9 +2118,17 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
         ..Default::default()
     });
 
-    if rinfos.replication_status() != ReplicationStatusType::Completed {
-        // TODO: update stats
-        // pool
+    if rinfos.replication_status() != ReplicationStatusType::Completed
+        && roi.replication_status_internal == rinfos.replication_status_internal()
+        && let Some(stats) = GLOBAL_REPLICATION_STATS.get()
+    {
+        for tgt in &rinfos.targets {
+            if tgt.replication_status != tgt.prev_replication_status {
+                stats
+                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                    .await;
+            }
+        }
     }
 }
 

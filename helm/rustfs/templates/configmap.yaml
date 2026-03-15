@@ -41,11 +41,35 @@ data:
   RUSTFS_TLS_KEYLOG: "1"
   RUSTFS_TLS_PATH: "/opt/tls"
   {{- end }}
-  {{- if .Values.config.rustfs.metrics.enabled }}
-  RUSTFS_OBS_METRIC_ENDPOINT: {{ .Values.config.rustfs.metrics.endpoint | quote }}
-  {{- else }}
+  {{- if .Values.config.rustfs.obs_endpoint.enabled }}
+  RUSTFS_OBS_ENDPOINT: {{ .Values.config.rustfs.obs_endpoint.base_endpoint | quote }}
+  RUSTFS_OBS_USE_STDOUT: {{ .Values.config.rustfs.obs_endpoint.use_stdout | quote }}
+  {{- with .Values.config.rustfs.obs_endpoint }}
+    {{- if .metrics.enabled }}
+  RUSTFS_OBS_METRIC_ENDPOINT: {{ .metrics.endpoint | quote }}
+    {{- else }}
   RUSTFS_OBS_METRIC_ENDPOINT: ""
   RUSTFS_OBS_METRICS_EXPORT_ENABLED: "false"
+    {{- end }}
+    {{- if .trace.enabled }}
+  RUSTFS_OBS_TRACE_ENDPOINT: {{ .trace.endpoint | quote }}
+    {{- else }}
+  RUSTFS_OBS_TRACE_ENDPOINT: ""
+  RUSTFS_OBS_TRACES_EXPORT_ENABLED: "false"
+    {{- end }}
+    {{- if .logs.enabled }}
+  RUSTFS_OBS_LOG_ENDPOINT: {{ .logs.endpoint | quote }}
+    {{- else }}
+  RUSTFS_OBS_LOG_ENDPOINT: ""
+  RUSTFS_OBS_LOGS_EXPORT_ENABLED: "false"
+    {{- end }}
+    {{- if .profiling.enabled }}
+  RUSTFS_OBS_PROFILING_ENDPOINT: {{ .profiling.endpoint | quote }}
+    {{- else }}
+  RUSTFS_OBS_PROFILING_ENDPOINT: ""
+  RUSTFS_OBS_PROFILING_ENABLED: "false"
+    {{- end }}
+  {{- end }}
   {{- end }}
   {{- with .Values.config.rustfs.scanner }}
     {{- if .speed }}

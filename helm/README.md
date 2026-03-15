@@ -32,9 +32,20 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.log_rotation.keep_files | int | `"30"` | Default log keep files for rustfs.  |
 | config.rustfs.metrics.enabled | bool | `false` | Toggle metrics export. |
 | config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
-| config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest` |
-| config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS` |
-| config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`) |
+| config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest`. |
+| config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS`. |
+| config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
+| config.rustfs.obs_endpoint.enabled | bool | `false` | Whether to send metrics/logs/traces/profilings to remote endpoint, eg, OLTP. |
+| config.rustfs.obs_endpoint.base_endpoint | string | `""` | Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318. |
+| config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in addition the OLTP. |
+| config.rustfs.obs_endpoint.metrics.enabled | bool | `false` | Whether to send metrics to remote endpoint. |
+| config.rustfs.obs_endpoint.metrics.endpoint | string | `""` | Remote endpoint url for metrics. |
+| config.rustfs.obs_endpoint.trace.enabled | bool | `false` | Whether to send trace to remote endpoint. |
+| config.rustfs.obs_endpoint.trace.endpoint | string | `""` | Remote endpoint url for trace. |
+| config.rustfs.obs_endpoint.logs.enabled | bool | `false` | Whether to send logs to remote endpoint. |
+| config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
+| config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
+| config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
@@ -60,7 +71,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-hash" | string | `"sha1"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-max-age" | string | `"3600"` |  |
 | ingress.nginxAnnotations."nginx.ingress.kubernetes.io/session-cookie-name" | string | `"rustfs"` |  |
-| ingress.customAnnotations | dict | `{}` |Customize annotations.  |
+| ingress.customAnnotations | dict | `{}` | Additional custom annotations, merged with class-specific stickiness annotations. |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.httponly" | string | `"true"` |  |
 | ingress.traefikAnnotations."traefik.ingress.kubernetes.io/service.sticky.cookie.name" | string | `"rustfs"` |  |

@@ -79,9 +79,22 @@ config:
       start_delay_secs: ""
       # Enable/disable scanner sleeps for throttling
       idle_mode: ""
-    metrics:
-      enabled: false
-      endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
+    obs_endpoint:
+      enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
+      base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
+      use_stdout: false # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
+      metrics:
+        enabled: false
+        endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
+      trace:
+        enabled: false
+        endpoint: "" # If specified, rustfs will export traces to this OTLP endpoint. e.g. "http://localhost:4318/v1/traces"
+      logs:
+        enabled: false
+        endpoint: "" # If specified, rustfs will export logs to this OTLP endpoint. e.g. "http://localhost:4318/v1/logs"
+      profiling:
+        enabled: false
+        endpoint: "" # If specified, rustfs will export profiling data to this endpoint. e.g. "http://localhost:6060/debug/pprof/profile"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -145,8 +158,8 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
-  customAnnotations: # Specify custom annotations
-    {} # Customize annotations
+  customAnnotations: # Additional custom annotations (merged with class-specific annotations)
+    {}
   hosts:
     - host: example.rustfs.com
       paths:
