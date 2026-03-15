@@ -215,32 +215,6 @@ async fn async_main() -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_external_prefix_mappings_lists_mapped_pairs() {
-        let report = ExternalEnvCompatReport {
-            mapped_pairs: vec![
-                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
-                (
-                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
-                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
-                ),
-            ],
-            conflict_keys: Vec::new(),
-        };
-
-        let formatted = format_external_prefix_mappings(&report);
-
-        assert_eq!(
-            formatted,
-            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
-        );
-    }
-}
-
 #[instrument(skip(config))]
 async fn run(config: config::Config) -> Result<()> {
     debug!("config: {:?}", &config);
@@ -700,4 +674,30 @@ async fn handle_shutdown(
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
     info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_external_prefix_mappings_lists_mapped_pairs() {
+        let report = ExternalEnvCompatReport {
+            mapped_pairs: vec![
+                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
+                (
+                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                ),
+            ],
+            conflict_keys: Vec::new(),
+        };
+
+        let formatted = format_external_prefix_mappings(&report);
+
+        assert_eq!(
+            formatted,
+            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
+    }
 }
