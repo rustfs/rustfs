@@ -36,6 +36,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Configure Git
+        run: |
+          git config user.name "heihutu"
+          git config user.email "heihutu@gmail.com"
+
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
