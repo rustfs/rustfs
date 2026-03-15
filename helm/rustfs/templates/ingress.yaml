@@ -1,11 +1,12 @@
 {{- if .Values.ingress.enabled -}}
 {{- $ingressAnnotations := dict }}
 {{- if eq .Values.ingress.className "nginx" }}
-{{- $ingressAnnotations = .Values.ingress.nginxAnnotations }}
+{{- $ingressAnnotations = deepCopy (default (dict) .Values.ingress.nginxAnnotations) }}
 {{- else if eq .Values.ingress.className "traefik" }}
-{{- $ingressAnnotations = .Values.ingress.traefikAnnotations }}
-{{- else if eq .Values.ingress.className "" }}
-{{- $ingressAnnotations = .Values.ingress.customAnnotations }}
+{{- $ingressAnnotations = deepCopy (default (dict) .Values.ingress.traefikAnnotations) }}
+{{- end }}
+{{- with .Values.ingress.customAnnotations }}
+{{- $ingressAnnotations = merge $ingressAnnotations . }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
