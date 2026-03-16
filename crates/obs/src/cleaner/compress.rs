@@ -176,10 +176,7 @@ where
 
         if let Ok(src_meta) = std::fs::metadata(path) {
             let mode = src_meta.permissions().mode();
-            let _ = std::fs::set_permissions(
-                &tmp_archive_path,
-                std::fs::Permissions::from_mode(mode),
-            );
+            let _ = std::fs::set_permissions(&tmp_archive_path, std::fs::Permissions::from_mode(mode));
         }
     }
 
