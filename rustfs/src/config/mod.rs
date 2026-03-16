@@ -16,7 +16,7 @@ use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use const_str::concat;
 use rustfs_config::RUSTFS_REGION;
-use rustfs_utils::apply_external_env_compat;
+use rustfs_utils::{apply_external_env_compat, get_env_opt_str};
 use std::path::PathBuf;
 use std::string::ToString;
 
@@ -356,14 +356,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parse the command line arguments and environment arguments from [`Opt`] and convert them
-    /// into a ready to use [`Config`].
-    ///
-    /// Supports both `rustfs <volume>` (legacy) and `rustfs server <volume>`.
-    ///
-    /// This includes some intermediate checks for mutually exclusive options.
-    pub fn parse() -> std::io::Result<Self> {
-        let opt = Opt::parse();
+    fn from_opt(opt: Opt) -> std::io::Result<Self> {
         let Opt {
             volumes,
             address,
@@ -394,6 +387,7 @@ impl Config {
                 let path = access_key_file.as_ref()?;
                 Some(std::fs::read_to_string(path))
             })
+            .or_else(|| get_env_opt_str("RUSTFS_ROOT_USER").map(Ok))
             .transpose()?
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
@@ -408,6 +402,7 @@ impl Config {
                 let path = secret_key_file.as_ref()?;
                 Some(std::fs::read_to_string(path))
             })
+            .or_else(|| get_env_opt_str("RUSTFS_ROOT_PASSWORD").map(Ok))
             .transpose()?
             .unwrap_or_else(|| {
                 // neither argument was specified ... using default
@@ -440,6 +435,16 @@ impl Config {
             buffer_profile_disable,
             buffer_profile,
         })
+    }
+
+    /// Parse the command line arguments and environment arguments from [`Opt`] and convert them
+    /// into a ready to use [`Config`].
+    ///
+    /// Supports both `rustfs <volume>` (legacy) and `rustfs server <volume>`.
+    ///
+    /// This includes some intermediate checks for mutually exclusive options.
+    pub fn parse() -> std::io::Result<Self> {
+        Self::from_opt(Opt::parse())
     }
 }
 
