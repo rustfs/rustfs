@@ -13,6 +13,11 @@
 // limitations under the License.
 
 //! Core log-file cleanup orchestration.
+//!
+//! This module connects scanning, retention selection, compression, and safe
+//! deletion into one reusable service object. The public surface is intentionally
+//! small: callers configure a [`LogCleaner`] once and then trigger discrete
+//! cleanup passes whenever log rotation or background maintenance requires it.
 
 use super::compress::{CompressionOptions, compress_file};
 use super::scanner::{LogScanResult, scan_log_directory};
@@ -34,37 +39,64 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 struct CompressionTaskResult {
+    /// Original file metadata so successful workers can be deleted later.
     file: FileInfo,
+    /// Whether compression completed successfully for this file.
     compressed: bool,
 }
 
 /// Log-file lifecycle manager.
+///
+/// A cleaner instance is immutable after construction and therefore safe to
+/// reuse across periodic background jobs. Each call to [`LogCleaner::cleanup`]
+/// performs a fresh directory scan and applies the configured retention rules.
 pub struct LogCleaner {
+    /// Directory containing the active and rotated log files.
     pub(super) log_dir: PathBuf,
+    /// Pattern used to recognize relevant log generations.
     pub(super) file_pattern: String,
+    /// The currently active log file that must never be touched.
     pub(super) active_filename: String,
+    /// Whether `file_pattern` is interpreted as a prefix or suffix.
     pub(super) match_mode: FileMatchMode,
+    /// Minimum number of regular log files to keep regardless of size.
     pub(super) keep_files: usize,
+    /// Optional cap for the cumulative size of regular logs.
     pub(super) max_total_size_bytes: u64,
+    /// Optional cap for an individual regular log file.
     pub(super) max_single_file_size_bytes: u64,
+    /// Whether selected regular logs should be compressed before deletion.
     pub(super) compress_old_files: bool,
+    /// Gzip compression level used when gzip is selected or used as fallback.
     pub(super) gzip_compression_level: u32,
+    /// Retention window for already compressed archives, expressed in days.
     pub(super) compressed_file_retention_days: u64,
+    /// Glob patterns that are excluded before any cleanup decision is made.
     pub(super) exclude_patterns: Vec<glob::Pattern>,
+    /// Whether zero-byte regular logs may be removed during scanning.
     pub(super) delete_empty_files: bool,
+    /// Minimum age a regular log must reach before it becomes eligible.
     pub(super) min_file_age_seconds: u64,
+    /// Dry-run mode reports intended actions without modifying files.
     pub(super) dry_run: bool,
     // Parallel compression controls while keeping backward compatibility with
     // the original serial cleaner behavior.
+    /// Preferred archive codec for compression-enabled cleanup passes.
     pub(super) compression_algorithm: CompressionAlgorithm,
+    /// Enables the work-stealing compression path when compression is active.
     pub(super) parallel_compress: bool,
+    /// Number of worker threads used by the parallel compressor.
     pub(super) parallel_workers: usize,
+    /// Zstd compression level when zstd is selected.
     pub(super) zstd_compression_level: i32,
+    /// Whether a failed zstd attempt should retry with gzip.
     pub(super) zstd_fallback_to_gzip: bool,
+    /// Number of internal threads requested from the zstd encoder.
     pub(super) zstd_workers: usize,
 }
 
 impl LogCleaner {
+    /// Create a builder with the required path and filename matching inputs.
     pub fn builder(
         log_dir: impl Into<PathBuf>,
         file_pattern: impl Into<String>,
@@ -108,6 +140,8 @@ impl LogCleaner {
                 total_size as f64 / 1024.0 / 1024.0
             );
 
+            // Select the oldest files first, then additionally trim any files
+            // that still violate configured size constraints.
             let to_delete = self.select_files_to_process(&logs, total_size);
             if !to_delete.is_empty() {
                 let (deleted, freed) = if self.parallel_compress && self.compress_old_files {
@@ -143,6 +177,11 @@ impl LogCleaner {
         Ok((total_deleted, total_freed))
     }
 
+    /// Choose regular log files that should be compressed and/or deleted.
+    ///
+    /// The `files` slice must already be sorted from oldest to newest. The
+    /// method first preserves the newest `keep_files` generations, then applies
+    /// total-size and per-file-size limits to the remaining tail.
     pub(super) fn select_files_to_process(&self, files: &[FileInfo], total_size: u64) -> Vec<FileInfo> {
         let mut to_delete = Vec::new();
         if files.is_empty() {
@@ -171,6 +210,7 @@ impl LogCleaner {
         to_delete
     }
 
+    /// Select compressed archives whose age exceeds the archive retention window.
     fn select_expired_compressed(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
         let retention = Duration::from_secs(self.compressed_file_retention_days * 24 * 3600);
         let now = SystemTime::now();
@@ -191,6 +231,9 @@ impl LogCleaner {
     ///
     /// The flow is intentionally split into "parallel compression" followed by
     /// "serial deletion" to reduce cross-platform file-locking failures.
+    /// Compression workers only decide whether an archive was created; the main
+    /// thread remains responsible for actual source removal so deletion policy
+    /// and error reporting stay deterministic.
     fn parallel_stealing_compress(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
         if files.len() <= 1 {
             return self.serial_compress_and_delete(files);
@@ -221,8 +264,9 @@ impl LogCleaner {
         let steal_successes = Arc::new(AtomicU64::new(0));
         let (tx, rx) = bounded::<CompressionTaskResult>(worker_count.saturating_mul(2).max(8));
 
-        // Spawn fixed workers in a scoped thread region so panics are
-        // contained and can be downgraded to a serial fallback.
+        // Spawn a fixed-size worker set in a scoped region so panics are
+        // contained and can be downgraded to a serial fallback instead of
+        // leaking detached threads.
         let scope_result = thread::scope(|scope| {
             for (worker_id, local_worker) in workers.into_iter().enumerate() {
                 let tx = tx.clone();
@@ -346,6 +390,7 @@ impl LogCleaner {
         Ok((deleted, freed))
     }
 
+    /// Attempt to steal a task from peer workers using randomized victim order.
     fn steal_from_victims(
         worker_id: usize,
         local_worker: &Worker<FileInfo>,
@@ -383,6 +428,9 @@ impl LogCleaner {
     }
 
     /// Serial fallback path and non-parallel baseline.
+    ///
+    /// This path is also used whenever the task set is too small to benefit
+    /// from worker orchestration.
     fn serial_compress_and_delete(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
         let started_at = Instant::now();
         let mut deletable = Vec::with_capacity(files.len());
@@ -417,6 +465,7 @@ impl LogCleaner {
         Ok((deleted, freed))
     }
 
+    /// Snapshot compression-related configuration for a single cleanup pass.
     fn compression_options(&self) -> CompressionOptions {
         CompressionOptions {
             algorithm: self.compression_algorithm,
@@ -428,6 +477,7 @@ impl LogCleaner {
         }
     }
 
+    /// Delete a file while refusing symlinks and accommodating platform quirks.
     fn secure_delete(&self, path: &PathBuf) -> std::io::Result<()> {
         let meta = std::fs::symlink_metadata(path)?;
         if meta.file_type().is_symlink() {
@@ -463,6 +513,10 @@ impl LogCleaner {
         }
     }
 
+    /// Delete the supplied files and return `(deleted_count, freed_bytes)`.
+    ///
+    /// In dry-run mode the returned counters still reflect the projected work
+    /// so callers and metrics can report what would have happened.
     pub(super) fn delete_files(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
         let mut deleted = 0usize;
         let mut freed = 0u64;
@@ -492,6 +546,9 @@ impl LogCleaner {
 }
 
 /// Builder for [`LogCleaner`].
+///
+/// The builder keeps startup code readable when an application only needs to
+/// override a subset of retention knobs.
 pub struct LogCleanerBuilder {
     log_dir: PathBuf,
     file_pattern: String,
@@ -516,6 +573,7 @@ pub struct LogCleanerBuilder {
 }
 
 impl LogCleanerBuilder {
+    /// Create a builder with conservative defaults.
     pub fn new(log_dir: impl Into<PathBuf>, file_pattern: impl Into<String>, active_filename: impl Into<String>) -> Self {
         Self {
             log_dir: log_dir.into(),
@@ -541,96 +599,118 @@ impl LogCleanerBuilder {
         }
     }
 
+    /// Configure whether `file_pattern` is matched as a prefix or suffix.
     pub fn match_mode(mut self, match_mode: FileMatchMode) -> Self {
         self.match_mode = match_mode;
         self
     }
 
+    /// Preserve at least this many newest regular log files.
     pub fn keep_files(mut self, keep_files: usize) -> Self {
         self.keep_files = keep_files;
         self
     }
 
+    /// Cap the aggregate size of retained regular log files.
     pub fn max_total_size_bytes(mut self, max_total_size_bytes: u64) -> Self {
         self.max_total_size_bytes = max_total_size_bytes;
         self
     }
 
+    /// Cap the size of any individual regular log file.
     pub fn max_single_file_size_bytes(mut self, max_single_file_size_bytes: u64) -> Self {
         self.max_single_file_size_bytes = max_single_file_size_bytes;
         self
     }
 
+    /// Enable archival compression before deleting selected source logs.
     pub fn compress_old_files(mut self, compress_old_files: bool) -> Self {
         self.compress_old_files = compress_old_files;
         self
     }
 
+    /// Set the gzip compression level used for gzip output or gzip fallback.
     pub fn gzip_compression_level(mut self, gzip_compression_level: u32) -> Self {
         self.gzip_compression_level = gzip_compression_level;
         self
     }
 
+    /// Set how long compressed archives may remain on disk.
     pub fn compressed_file_retention_days(mut self, days: u64) -> Self {
         self.compressed_file_retention_days = days;
         self
     }
 
+    /// Exclude files matching these glob patterns from every cleanup pass.
     pub fn exclude_patterns(mut self, patterns: Vec<String>) -> Self {
         self.exclude_patterns = patterns;
         self
     }
 
+    /// Allow the scanner to remove matching zero-byte regular logs immediately.
     pub fn delete_empty_files(mut self, delete_empty_files: bool) -> Self {
         self.delete_empty_files = delete_empty_files;
         self
     }
 
+    /// Require regular log files to be at least this old before processing.
     pub fn min_file_age_seconds(mut self, seconds: u64) -> Self {
         self.min_file_age_seconds = seconds;
         self
     }
 
+    /// Enable dry-run mode for scans, compression decisions, and deletion.
     pub fn dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
+    /// Set the preferred compression algorithm explicitly.
     pub fn compression_algorithm(mut self, algorithm: CompressionAlgorithm) -> Self {
         self.compression_algorithm = algorithm;
         self
     }
 
+    /// Parse and set the compression algorithm from configuration text.
     pub fn compression_algorithm_str(mut self, algorithm: impl AsRef<str>) -> Self {
         self.compression_algorithm = CompressionAlgorithm::from_config_str(algorithm.as_ref());
         self
     }
 
+    /// Enable or disable the parallel work-stealing compression path.
     pub fn parallel_compress(mut self, enabled: bool) -> Self {
         self.parallel_compress = enabled;
         self
     }
 
+    /// Set the number of compression workers, clamped to at least one.
     pub fn parallel_workers(mut self, workers: usize) -> Self {
         self.parallel_workers = workers.max(1);
         self
     }
 
+    /// Set the zstd compression level.
     pub fn zstd_compression_level(mut self, level: i32) -> Self {
         self.zstd_compression_level = level;
         self
     }
 
+    /// Retry compression with gzip when zstd encoding fails.
     pub fn zstd_fallback_to_gzip(mut self, enabled: bool) -> Self {
         self.zstd_fallback_to_gzip = enabled;
         self
     }
 
+    /// Set the number of internal worker threads requested from zstd.
     pub fn zstd_workers(mut self, workers: usize) -> Self {
         self.zstd_workers = workers.max(1);
         self
     }
 
+    /// Finalize the builder into an immutable [`LogCleaner`].
+    ///
+    /// Invalid glob patterns are ignored rather than failing construction, and
+    /// codec-related numeric values are clamped into safe ranges.
     pub fn build(self) -> LogCleaner {
         let patterns = self
             .exclude_patterns

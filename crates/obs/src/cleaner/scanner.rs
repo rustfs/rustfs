@@ -18,6 +18,11 @@
 //! The one exception is zero-byte file removal — when `delete_empty_files`
 //! is enabled, `scan_log_directory` removes empty regular files as part of
 //! the scan so that they are not counted in retention calculations.
+//!
+//! The scanner is also the first safety boundary of the cleaner pipeline. It
+//! performs a shallow directory walk, rejects symlinks by relying on
+//! `symlink_metadata`, and separates plain logs from pre-compressed archives so
+//! later stages can apply different retention rules without rescanning.
 
 use super::types::{CompressionAlgorithm, FileInfo, FileMatchMode};
 use std::fs;
@@ -26,6 +31,10 @@ use std::time::SystemTime;
 use tracing::debug;
 
 /// Result of a single pass directory scan.
+///
+/// Separating regular logs from compressed archives keeps the selection logic
+/// straightforward: active retention limits apply to the former, while archive
+/// expiry rules apply to the latter.
 pub(super) struct LogScanResult {
     /// Regular log files eligible for deletion/compression.
     pub logs: Vec<FileInfo>,
@@ -48,6 +57,7 @@ pub(super) struct LogScanResult {
 /// * `delete_empty_files` - When `true`, zero-byte regular files that match
 ///   the pattern are deleted immediately inside this function and excluded
 ///   from the returned [`LogScanResult`].
+/// * `dry_run` - When `true`, destructive actions are logged but not executed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_log_directory(
     log_dir: &Path,
@@ -125,9 +135,12 @@ pub(super) fn scan_log_directory(
             .find(|suffix| filename.ends_with(suffix));
         let is_compressed = matched_suffix.is_some();
 
-        // For matching, we need the "base" name.
-        // If compressed: "foo.log.gz" -> check "foo.log"
-        // If regular: "foo.log" -> check "foo.log"
+        // Perform matching on the logical log filename.
+        // Examples:
+        // - regular log: `foo.log.1`   -> `foo.log.1`
+        // - archive:     `foo.log.1.gz` -> `foo.log.1`
+        // This allows the same include/exclude pattern configuration to apply
+        // to both raw and already-compressed generations.
         let name_to_match = if let Some(suffix) = matched_suffix {
             &filename[..filename.len() - suffix.len()]
         } else {
@@ -151,8 +164,10 @@ pub(super) fn scan_log_directory(
             Err(_) => continue, // Skip files where we can't read modification time
         };
 
-        // 5. Handle zero-byte files (Regular logs only).
-        // We generally don't delete empty compressed files implicitly, but let's stick to regular files logic.
+        // 5. Handle zero-byte files (regular logs only).
+        // Empty compressed artifacts are left alone here because they belong
+        // to the archive-retention path and should not disappear outside that
+        // explicit policy.
         if !is_compressed && file_size == 0 && delete_empty_files {
             if !dry_run {
                 if let Err(e) = fs::remove_file(&path) {
@@ -166,8 +181,9 @@ pub(super) fn scan_log_directory(
             continue;
         }
 
-        // 6. Age Check (Regular logs only).
-        // Compressed files have their own retention check in the caller.
+        // 6. Age gate regular logs only.
+        // Compressed files deliberately bypass this check because archive
+        // expiry is driven by a dedicated retention horizon in the caller.
         if !is_compressed
             && let Ok(age) = now.duration_since(modified)
             && age.as_secs() < min_file_age_seconds

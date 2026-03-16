@@ -13,6 +13,11 @@
 // limitations under the License.
 
 //! Shared types used across the log-cleanup sub-modules.
+//!
+//! These types deliberately stay lightweight because they are passed between
+//! the scanner, selector, compressor, and deletion stages. Keeping them small
+//! and explicit makes the cleaner easier to reason about and cheaper to move
+//! across worker threads in the parallel pipeline.
 
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP,
@@ -45,6 +50,10 @@ impl FileMatchMode {
     }
 
     /// Parse a config value into a [`FileMatchMode`].
+    ///
+    /// Any non-`prefix` value falls back to [`FileMatchMode::Suffix`] to keep
+    /// configuration handling permissive and aligned with the historical
+    /// cleaner default used by rolling log filenames.
     pub fn from_config_str(value: &str) -> Self {
         if value.trim().eq_ignore_ascii_case(DEFAULT_OBS_LOG_MATCH_MODE_PREFIX) {
             Self::Prefix
@@ -70,6 +79,7 @@ pub enum CompressionAlgorithm {
 }
 
 impl CompressionAlgorithm {
+    /// Parse a normalized lowercase configuration token or extension alias.
     fn parse_normalized(value: &str) -> Option<Self> {
         if value == DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP || value == DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION {
             Some(Self::Gzip)
@@ -80,13 +90,20 @@ impl CompressionAlgorithm {
         }
     }
 
-    /// Parse from user-facing configuration string.
+    /// Parse from a user-facing configuration string.
+    ///
+    /// Supported values include both semantic names (`gzip`, `zstd`) and file
+    /// extension aliases (`gz`, `zst`). Unknown values intentionally fall back
+    /// to the crate default so observability startup remains resilient.
     pub fn from_config_str(value: &str) -> Self {
         let normalized = value.trim().to_ascii_lowercase();
         Self::parse_normalized(&normalized).unwrap_or_default()
     }
 
     /// Archive suffix (without dot) used for this algorithm.
+    ///
+    /// The returned value is suitable for appending to an existing filename,
+    /// rather than replacing the source extension.
     pub fn extension(self) -> &'static str {
         match self {
             Self::Gzip => DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION.trim_start_matches('.'),
@@ -95,6 +112,9 @@ impl CompressionAlgorithm {
     }
 
     /// Supported compressed suffixes used by scanner retention logic.
+    ///
+    /// The scanner uses this list to recognize already-archived files and to
+    /// keep them on a separate retention path from plain log files.
     pub fn compressed_suffixes() -> [&'static str; 2] {
         [
             DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION,
@@ -102,6 +122,7 @@ impl CompressionAlgorithm {
         ]
     }
 
+    /// Stable lowercase string form used in logs and configuration echoes.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Gzip => DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP,
@@ -134,23 +155,31 @@ impl fmt::Display for CompressionAlgorithm {
 /// Worker-thread default used by parallel compressor.
 ///
 /// The worker count follows CPU capacity but stays within [4, 8] to keep
-/// throughput stable and avoid oversubscription.
+/// throughput stable and avoid oversubscription. The lower bound helps the
+/// work-stealing path on small machines still exercise concurrency, while the
+/// upper bound avoids swamping the host when each task may also use internal
+/// codec threads.
 pub fn default_parallel_workers() -> usize {
     num_cpus::get().clamp(4, 8)
 }
 
 /// Metadata for a single log file discovered by the scanner.
 ///
-/// Carries enough information to make cleanup decisions (sort by age, compare
-/// size against limits, etc.) without re-reading filesystem metadata on every
-/// operation.
+/// This snapshot is intentionally immutable after discovery. The cleaner uses
+/// it to sort candidates by age, evaluate retention constraints, and report
+/// deletion metrics without re-reading metadata during every later stage.
 #[derive(Debug, Clone)]
 pub(super) struct FileInfo {
-    /// Absolute path to the file.
+    /// Absolute or scanner-produced path to the file on disk.
     pub path: PathBuf,
     /// File size in bytes at the time of discovery.
+    ///
+    /// This value is used for retention accounting and freed-byte metrics.
     pub size: u64,
     /// Last-modification timestamp from the filesystem.
+    ///
+    /// The selection phase sorts on this timestamp so the oldest files are
+    /// processed first.
     pub modified: SystemTime,
 }
 

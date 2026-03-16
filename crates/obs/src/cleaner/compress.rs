@@ -17,6 +17,10 @@
 //! This module performs compression only. Source-file deletion is intentionally
 //! handled by the caller in a separate step to avoid platform-specific file
 //! locking issues (especially on Windows).
+//!
+//! The separation is important for operational safety: a failed archive write
+//! must never result in premature source deletion, and an already-existing
+//! archive should make repeated cleanup passes idempotent.
 
 use super::types::CompressionAlgorithm;
 use flate2::Compression;
@@ -27,7 +31,10 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-/// Compression options shared by serial/parallel cleaner paths.
+/// Compression options shared by serial and parallel cleaner paths.
+///
+/// The core cleaner prepares this immutable bundle once per cleanup pass and
+/// then hands it to each worker so all files in that run use the same policy.
 #[derive(Debug, Clone)]
 pub(super) struct CompressionOptions {
     /// Preferred compression codec for the current cleanup pass.
@@ -45,6 +52,9 @@ pub(super) struct CompressionOptions {
 }
 
 /// Compression output metadata used for metrics and deletion gating.
+///
+/// Callers inspect the output size and archive path before deciding whether it
+/// is safe to remove the source log file.
 #[derive(Debug, Clone)]
 pub(super) struct CompressionOutput {
     /// Final path of the compressed archive file.
@@ -58,6 +68,9 @@ pub(super) struct CompressionOutput {
 }
 
 /// Compress a single source file with the requested codec and fallback policy.
+///
+/// This function centralizes the fallback behavior so the orchestration layer
+/// does not need per-codec branching.
 pub(super) fn compress_file(path: &Path, options: &CompressionOptions) -> Result<CompressionOutput, std::io::Error> {
     match options.algorithm {
         CompressionAlgorithm::Gzip => compress_gzip(path, options.gzip_level, options.dry_run),
@@ -76,6 +89,7 @@ pub(super) fn compress_file(path: &Path, options: &CompressionOptions) -> Result
     }
 }
 
+/// Compress a file to `*.gz` using the configured gzip level.
 fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
     let archive_path = archive_path(path, CompressionAlgorithm::Gzip);
     compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Gzip, |reader, writer| {
@@ -87,6 +101,7 @@ fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOu
     })
 }
 
+/// Compress a file to `*.zst` using multi-threaded zstd when available.
 fn compress_zstd(path: &Path, level: i32, workers: usize, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
     let archive_path = archive_path(path, CompressionAlgorithm::Zstd);
     compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Zstd, |reader, writer| {
@@ -134,6 +149,8 @@ where
         });
     }
 
+    // Create the output archive only after the dry-run short-circuit so this
+    // helper remains side-effect free when the caller is evaluating policy.
     let input = File::open(path)?;
     let output = File::create(archive_path)?;
     let mut reader = BufReader::new(input);
@@ -169,7 +186,11 @@ where
     })
 }
 
-/// Build `<filename>.<ext>` path without replacing existing extension.
+/// Build `<filename>.<ext>` without replacing an existing extension.
+///
+/// Rotated log filenames often already encode a generation number or suffix
+/// (for example `server.log.3`). Appending the archive extension preserves that
+/// information in the final artifact name (`server.log.3.gz`).
 fn archive_path(path: &Path, algorithm: CompressionAlgorithm) -> PathBuf {
     let ext = algorithm.extension();
     let mut file_name: OsString = path
