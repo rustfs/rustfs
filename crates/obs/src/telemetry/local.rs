@@ -29,16 +29,19 @@
 use super::guard::OtelGuard;
 use crate::TelemetryError;
 use crate::cleaner::LogCleaner;
-use crate::cleaner::types::FileMatchMode;
+use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
-use crate::global::OBSERVABILITY_METRIC_ENABLED;
+use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
-    DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL,
-    DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
+    DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN,
+    DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
+    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
+    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
+    DEFAULT_OBS_LOG_ZSTD_WORKERS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
 use std::sync::Arc;
@@ -131,7 +134,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .with(fmt_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(false).ok();
+    set_observability_metric_enabled(false);
     counter!("rustfs.start.total").increment(1);
     info!("Init stdout logging (level: {})", logger_level);
 
@@ -182,10 +185,7 @@ fn init_file_logging_internal(
         .to_lowercase();
 
     // Determine match mode from config, defaulting to Suffix
-    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
-        Some("prefix") => FileMatchMode::Prefix,
-        _ => FileMatchMode::Suffix,
-    };
+    let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
 
     let rotation = match rotation_str.as_str() {
         "minutely" => Rotation::Minutely,
@@ -255,7 +255,7 @@ fn init_file_logging_internal(
         .with(stdout_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(false).ok();
+    set_observability_metric_enabled(false);
 
     // ── 5. Start background cleanup task ─────────────────────────────────────
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
@@ -347,10 +347,7 @@ pub fn spawn_cleanup_task(
     let active_filename = file_pattern.clone();
 
     // Determine match mode from config, defaulting to Suffix
-    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
-        Some("prefix") => FileMatchMode::Prefix,
-        _ => FileMatchMode::Suffix,
-    };
+    let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
 
     let max_total_size = config
         .log_max_total_size_bytes
@@ -362,6 +359,21 @@ pub fn spawn_cleanup_task(
     let gzip_level = config
         .log_gzip_compression_level
         .unwrap_or(DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL);
+    let compression_algorithm = CompressionAlgorithm::from_config_str(
+        config
+            .log_compression_algorithm
+            .as_deref()
+            .unwrap_or(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM),
+    );
+    let parallel_compress = config.log_parallel_compress.unwrap_or(DEFAULT_OBS_LOG_PARALLEL_COMPRESS);
+    let parallel_workers = config.log_parallel_workers.unwrap_or(DEFAULT_OBS_LOG_PARALLEL_WORKERS);
+    let zstd_level = config
+        .log_zstd_compression_level
+        .unwrap_or(DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL);
+    let zstd_fallback_to_gzip = config
+        .log_zstd_fallback_to_gzip
+        .unwrap_or(DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP);
+    let zstd_workers = config.log_zstd_workers.unwrap_or(DEFAULT_OBS_LOG_ZSTD_WORKERS);
     let retention_days = config
         .log_compressed_file_retention_days
         .unwrap_or(DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS);
@@ -387,12 +399,29 @@ pub fn spawn_cleanup_task(
             .max_single_file_size_bytes(max_single_file_size)
             .compress_old_files(compress)
             .gzip_compression_level(gzip_level)
+            // Default to zstd + parallel compression, with env-driven fallback.
+            .compression_algorithm(compression_algorithm)
+            .parallel_compress(parallel_compress)
+            .parallel_workers(parallel_workers)
+            .zstd_compression_level(zstd_level)
+            .zstd_fallback_to_gzip(zstd_fallback_to_gzip)
+            .zstd_workers(zstd_workers)
             .compressed_file_retention_days(retention_days)
             .exclude_patterns(exclude_patterns)
             .delete_empty_files(delete_empty)
             .min_file_age_seconds(min_age)
             .dry_run(dry_run)
             .build(),
+    );
+
+    info!(
+        compression_algorithm = %compression_algorithm,
+        parallel_compress,
+        parallel_workers,
+        zstd_level,
+        zstd_fallback_to_gzip,
+        zstd_workers,
+        "log cleaner compression profile configured"
     );
 
     tokio::spawn(async move {
@@ -403,9 +432,17 @@ pub fn spawn_cleanup_task(
             let result = tokio::task::spawn_blocking(move || cleaner_clone.cleanup()).await;
 
             match result {
-                Ok(Ok(_)) => {} // Success
-                Ok(Err(e)) => tracing::warn!("Log cleanup failed: {}", e),
-                Err(e) => tracing::warn!("Log cleanup task panicked: {}", e),
+                Ok(Ok(_)) => {
+                    counter!(METRIC_LOG_CLEANER_RUNS_TOTAL).increment(1);
+                }
+                Ok(Err(e)) => {
+                    counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
+                    tracing::warn!("Log cleanup failed: {}", e);
+                }
+                Err(e) => {
+                    counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
+                    tracing::warn!("Log cleanup task panicked: {}", e);
+                }
             }
         }
     })

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelGuard, SystemObserver, telemetry::init_telemetry};
+use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, SystemObserver, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
@@ -23,9 +23,38 @@ static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 /// Flag indicating if observability metric is enabled
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
 
+/// Namespaced metrics for cleaner and rolling logging.
+pub(crate) const METRIC_LOG_CLEANER_DELETED_FILES_TOTAL: &str = "rustfs.log_cleaner.deleted_files_total";
+pub(crate) const METRIC_LOG_CLEANER_FREED_BYTES_TOTAL: &str = "rustfs.log_cleaner.freed_bytes_total";
+pub(crate) const METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS: &str = "rustfs.log_cleaner.compress_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE: &str = "rustfs.log_cleaner.steal_success_rate";
+pub(crate) const METRIC_LOG_CLEANER_RUNS_TOTAL: &str = "rustfs.log_cleaner.runs_total";
+pub(crate) const METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL: &str = "rustfs.log_cleaner.run_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs.log_cleaner.rotation_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs.log_cleaner.rotation_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs.log_cleaner.rotation_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs.log_cleaner.active_file_size_bytes";
+
 /// Check whether Observability metric is enabled
 pub fn observability_metric_enabled() -> bool {
     OBSERVABILITY_METRIC_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Set the global observability metrics flag once.
+///
+/// When this function is called multiple times, only the first value is kept
+/// and later values are ignored to preserve OnceCell semantics.
+pub(crate) fn set_observability_metric_enabled(enabled: bool) {
+    if OBSERVABILITY_METRIC_ENABLED.set(enabled).is_err()
+        && let Some(current) = OBSERVABILITY_METRIC_ENABLED.get()
+        && *current != enabled
+    {
+        warn!(
+            current = *current,
+            requested = enabled,
+            "OBSERVABILITY_METRIC_ENABLED was already initialized; keeping original value"
+        );
+    }
 }
 
 /// Initialize the observability module
@@ -51,22 +80,53 @@ pub fn observability_metric_enabled() -> bool {
 pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError> {
     // Load the configuration file
     let config = AppConfig::new_with_endpoint(endpoint);
+    init_obs_with_config(&config.observability).await
+}
 
-    let otel_guard = init_telemetry(&config.observability)?;
-    // Server will be created per connection - this ensures isolation
+/// Initialize the observability module with an explicit [`OtelConfig`].
+///
+/// This is the lower-level counterpart to [`init_obs`]: it accepts a fully
+/// constructed [`OtelConfig`] rather than building one from an endpoint URL.
+/// Useful when the config is already available (e.g., embedded in a larger
+/// application config struct) or when unit-testing with custom settings.
+///
+/// # Parameters
+/// - `config`: A pre-built [`OtelConfig`] to drive all telemetry backends.
+///
+/// # Returns
+/// An [`OtelGuard`] that must be kept alive for the lifetime of the
+/// application. Dropping it flushes and shuts down all providers.
+///
+/// # Errors
+/// Returns [`GlobalError`] when the underlying telemetry backend fails to
+/// initialise (e.g., cannot create the log directory, or an OTLP exporter
+/// cannot connect).
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::{AppConfig, init_obs_with_config};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let config = AppConfig::new_with_endpoint(Some("http://localhost:4318".to_string()));
+/// let _guard = init_obs_with_config(&config.observability)
+///     .await
+///     .expect("observability init failed");
+/// # }
+/// ```
+pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, GlobalError> {
+    let otel_guard = init_telemetry(config)?;
     tokio::spawn(async move {
-        // Record the PID-related metrics of the current process
         let obs_result = SystemObserver::init_process_observer().await;
         match obs_result {
             Ok(_) => {
-                info!(target: "rustfs::obs::system::metrics","Process observer initialized successfully");
+                info!(target: "rustfs::obs::system::metrics", "Process observer initialized successfully");
             }
             Err(e) => {
-                error!(target: "rustfs::obs::system::metrics","Failed to initialize process observer: {}", e);
+                error!(target: "rustfs::obs::system::metrics", "Failed to initialize process observer: {}", e);
             }
         }
     });
-
     Ok(otel_guard)
 }
 
@@ -121,9 +181,79 @@ pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GlobalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const README: &str = include_str!("../README.md");
+    const GRAFANA_DASHBOARD: &str = include_str!("../../../.docker/observability/grafana/dashboards/rustfs.json");
+
     #[tokio::test]
     async fn test_get_uninitialized_guard() {
         let result = get_global_guard();
         assert!(matches!(result, Err(GlobalError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_log_cleaner_metric_constants_use_rustfs_prefix() {
+        let metrics = [
+            METRIC_LOG_CLEANER_DELETED_FILES_TOTAL,
+            METRIC_LOG_CLEANER_FREED_BYTES_TOTAL,
+            METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS,
+            METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE,
+            METRIC_LOG_CLEANER_RUNS_TOTAL,
+            METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL,
+            METRIC_LOG_CLEANER_ROTATION_TOTAL,
+            METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL,
+            METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
+            METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES,
+        ];
+
+        for metric in metrics {
+            assert!(
+                metric.starts_with("rustfs.log_cleaner."),
+                "metric '{metric}' should use rustfs.log_cleaner.* namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readme_contains_grafana_dashboard_draft_section() {
+        assert!(README.contains("## Cleaner & Rotation Metrics"));
+        assert!(README.contains("### Grafana Dashboard JSON Draft (Ready to Import)"));
+        assert!(README.contains("\"uid\": \"rustfs-log-cleaner\""));
+        assert!(README.contains("rustfs_log_cleaner_runs_total"));
+        assert!(README.contains("rustfs_log_cleaner_rotation_failures_total"));
+    }
+
+    #[test]
+    fn test_readme_contains_promql_templates_section() {
+        assert!(README.contains("### PromQL Templates"));
+        assert!(README.contains("Cleanup failure ratio"));
+        assert!(README.contains("histogram_quantile(0.95"));
+        assert!(README.contains("max(rustfs_log_cleaner_active_file_size_bytes)"));
+    }
+
+    #[test]
+    fn test_grafana_dashboard_contains_log_cleaner_row() {
+        assert!(GRAFANA_DASHBOARD.contains("\"title\": \"Log Cleaner\""));
+        assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_runs_total"));
+        assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_rotation_failures_total"));
+        assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_active_file_size_bytes"));
+    }
+
+    #[test]
+    fn test_readme_mentions_deployed_dashboard_path() {
+        assert!(README.contains(".docker/observability/grafana/dashboards/rustfs.json"));
+        assert!(README.contains("row title: `Log Cleaner`"));
+    }
+
+    #[test]
+    fn test_init_obs_with_config_signature_is_correct() {
+        // Compile-time check: verifies that `init_obs_with_config` is public and
+        // accepts `&OtelConfig`, matching the README documentation.
+        // The future is created but intentionally not polled — this avoids
+        // initialising the global tracing subscriber in a unit-test context.
+        fn _type_check() {
+            let config = OtelConfig::default();
+            let _future = init_obs_with_config(&config);
+        }
     }
 }

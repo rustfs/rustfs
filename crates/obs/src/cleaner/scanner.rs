@@ -19,8 +19,7 @@
 //! is enabled, `scan_log_directory` removes empty regular files as part of
 //! the scan so that they are not counted in retention calculations.
 
-use super::types::{FileInfo, FileMatchMode};
-use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION;
+use super::types::{CompressionAlgorithm, FileInfo, FileMatchMode};
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
@@ -121,13 +120,16 @@ pub(super) fn scan_log_directory(
         }
 
         // 3. Classify file type and check pattern match.
-        let is_compressed = filename.ends_with(DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION);
+        let matched_suffix = CompressionAlgorithm::compressed_suffixes()
+            .into_iter()
+            .find(|suffix| filename.ends_with(suffix));
+        let is_compressed = matched_suffix.is_some();
 
         // For matching, we need the "base" name.
         // If compressed: "foo.log.gz" -> check "foo.log"
         // If regular: "foo.log" -> check "foo.log"
-        let name_to_match = if is_compressed {
-            &filename[..filename.len() - DEFAULT_OBS_LOG_GZIP_COMPRESSION_ALL_EXTENSION.len()]
+        let name_to_match = if let Some(suffix) = matched_suffix {
+            &filename[..filename.len() - suffix.len()]
         } else {
             filename
         };
@@ -153,7 +155,7 @@ pub(super) fn scan_log_directory(
         // We generally don't delete empty compressed files implicitly, but let's stick to regular files logic.
         if !is_compressed && file_size == 0 && delete_empty_files {
             if !dry_run {
-                if let Err(e) = std::fs::remove_file(&path) {
+                if let Err(e) = fs::remove_file(&path) {
                     tracing::warn!("Failed to delete empty file {:?}: {}", path, e);
                 } else {
                     debug!("Deleted empty file: {:?}", path);

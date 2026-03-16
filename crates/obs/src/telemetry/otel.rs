@@ -34,7 +34,7 @@
 
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
-use crate::global::OBSERVABILITY_METRIC_ENABLED;
+use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::OtelGuard;
 // Import helper functions from local.rs (sibling module)
@@ -53,7 +53,7 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
-use rustfs_config::observability::DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES;
+use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
@@ -204,10 +204,7 @@ pub(super) fn init_observability_http(
             .as_deref()
             .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
             .to_lowercase();
-        let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
-            Some("prefix") => FileMatchMode::Prefix,
-            _ => FileMatchMode::Suffix,
-        };
+        let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
         let rotation = match rotation_str.as_str() {
             "minutely" => Rotation::Minutely,
             "hourly" => Rotation::Hourly,
@@ -394,7 +391,7 @@ fn build_meter_provider(
 
     global::set_meter_provider(provider.clone());
     metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
-    OBSERVABILITY_METRIC_ENABLED.set(true).ok();
+    set_observability_metric_enabled(true);
     Ok(Some(provider))
 }
 
