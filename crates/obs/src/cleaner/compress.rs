@@ -152,10 +152,22 @@ where
     // Create the output archive only after the dry-run short-circuit so this
     // helper remains side-effect free when the caller is evaluating policy.
     let input = File::open(path)?;
-    let output = File::create(archive_path)?;
+
+    // Write to a temporary file first and then atomically rename it into place
+    // so callers never observe a partially written archive at `archive_path`.
+    let mut tmp_name = archive_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_archive_path = std::path::PathBuf::from(tmp_name);
+
+    let output = File::create(&tmp_archive_path)?;
     let mut reader = BufReader::new(input);
     let writer = BufWriter::new(output);
-    let _ = writer_fn(&mut reader, writer)?;
+
+    if let Err(e) = writer_fn(&mut reader, writer) {
+        // Best-effort cleanup of the incomplete temporary archive.
+        let _ = std::fs::remove_file(&tmp_archive_path);
+        return Err(e);
+    }
 
     // Preserve Unix mode bits so rotated archives keep the same access policy.
     #[cfg(unix)]
@@ -164,9 +176,15 @@ where
 
         if let Ok(src_meta) = std::fs::metadata(path) {
             let mode = src_meta.permissions().mode();
-            let _ = std::fs::set_permissions(archive_path, std::fs::Permissions::from_mode(mode));
+            let _ = std::fs::set_permissions(
+                &tmp_archive_path,
+                std::fs::Permissions::from_mode(mode),
+            );
         }
     }
+
+    // Atomically move the fully written temp file into its final location.
+    std::fs::rename(&tmp_archive_path, archive_path)?;
 
     let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
     debug!(
