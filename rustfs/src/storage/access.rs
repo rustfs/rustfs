@@ -106,6 +106,55 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
         )
 }
 
+/// Checks only IAM policies (not bucket policies) for the given action.
+/// Used by ListAllMyBuckets filtering to avoid leaking public buckets into a user's bucket list.
+pub async fn authorize_request_iam_only<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    let req_info = req_info_ref(req)?;
+
+    let Some(cred) = &req_info.cred else {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    };
+
+    let Ok(iam_store) = rustfs_iam::get() else {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("authorize_request_iam_only {:?}", IamError::IamSysNotInitialized),
+        ));
+    };
+
+    let default_claims = HashMap::new();
+    let claims = cred.claims.as_ref().unwrap_or(&default_claims);
+    let conditions = get_condition_values_with_query(
+        &req.headers,
+        cred,
+        req_info.version_id.as_deref(),
+        None,
+        remote_addr,
+        req.uri.query(),
+    );
+
+    let iam_allowed = iam_store
+        .is_allowed(&Args {
+            account: &cred.access_key,
+            groups: &cred.groups,
+            action,
+            bucket: req_info.bucket.as_deref().unwrap_or(""),
+            conditions: &conditions,
+            is_owner: req_info.is_owner,
+            object: req_info.object.as_deref().unwrap_or(""),
+            claims,
+            deny_only: false,
+        })
+        .await;
+
+    if iam_allowed {
+        return Ok(());
+    }
+
+    Err(s3_error!(AccessDenied, "Access Denied"))
+}
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));

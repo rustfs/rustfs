@@ -18,7 +18,7 @@ use crate::app::context::{AppContext, default_notify_interface, get_global_app_c
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
-use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
+use crate::storage::access::{ReqInfo, authorize_request, authorize_request_iam_only, req_info_ref};
 use crate::storage::ecfs::{RUSTFS_OWNER, default_owner};
 use crate::storage::helper::OperationHelper;
 use crate::storage::s3_api::{acl, encryption, replication, tagging};
@@ -381,10 +381,10 @@ impl DefaultBucketUsecase {
                     };
                     req_info.bucket = Some(info.name.clone());
 
-                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
+                    if authorize_request_iam_only(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
                         .await
                         .is_ok()
-                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
+                        || authorize_request_iam_only(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
                             .await
                             .is_ok()
                     {
