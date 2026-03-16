@@ -383,15 +383,36 @@ where
                 }
             });
 
+            let groups_cache = self.cache.groups.load();
             let mut groups = Vec::new();
             group_policy_cache.iter().for_each(|(k, v)| {
+                if !groups_cache.contains_key(k) {
+                    Cache::delete(&self.cache.group_policies, k, OffsetDateTime::now_utc());
+                    return;
+                }
+
                 if v.policy_set().contains(name) {
                     groups.push(k.to_owned());
                 }
             });
 
-            if !users.is_empty() || !groups.is_empty() {
-                return Err(Error::PolicyInUse);
+            // Force-detach: remove this policy from any user/group that still references it,
+            // then proceed to delete. Admin-initiated deletes should not be blocked.
+            for user in &users {
+                if let Some(v) = user_policy_cache.get(user.as_str()) {
+                    let mut set = v.policy_set();
+                    set.remove(name);
+                    let new_policy = set.iter().cloned().collect::<Vec<_>>().join(",");
+                    let _ = self.policy_db_set(user, UserType::Reg, false, &new_policy).await;
+                }
+            }
+            for group in &groups {
+                if let Some(v) = group_policy_cache.get(group.as_str()) {
+                    let mut set = v.policy_set();
+                    set.remove(name);
+                    let new_policy = set.iter().cloned().collect::<Vec<_>>().join(",");
+                    let _ = self.policy_db_set(group, UserType::Reg, true, &new_policy).await;
+                }
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {

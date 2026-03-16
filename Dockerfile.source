@@ -180,9 +180,9 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["cargo", "run", "--bin", "rustfs", "--"]
 
 # -----------------------------
-# Runtime stage (Ubuntu minimal)
+# Runtime stage (Ubuntu 24.04 — glibc 2.39, matches rust:1.91-trixie builder requirements)
 # -----------------------------
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ARG BUILD_DATE
 ARG VCS_REF

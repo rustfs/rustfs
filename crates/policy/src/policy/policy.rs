@@ -200,14 +200,17 @@ pub struct BucketPolicy {
 
 impl BucketPolicy {
     pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        // Owner bypass must be checked BEFORE deny statements so that bucket
+        // owners (root credentials) can always manage their own buckets even
+        // when an explicit Deny-all policy is in place.
+        if args.is_owner {
+            return true;
+        }
+
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
                 return false;
             }
-        }
-
-        if args.is_owner {
-            return true;
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {

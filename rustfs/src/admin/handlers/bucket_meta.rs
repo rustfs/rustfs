@@ -633,6 +633,13 @@ impl Operation for ImportBucketMetadata {
             }
         }
 
+        // Persist all updated bucket metadata to disk
+        for (_bucket_name, mut metadata) in bucket_metadatas {
+            if let Err(e) = metadata.save().await {
+                warn!("save bucket metadata failed for {}: {e}", metadata.name);
+            }
+        }
+
         // TODO: site replication notify
 
         let mut header = HeaderMap::new();
