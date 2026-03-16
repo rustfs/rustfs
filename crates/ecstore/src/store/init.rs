@@ -149,7 +149,7 @@ impl ECStore {
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 
-        let decommission_cancelers = vec![None; pools.len()];
+        let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
             id: deployment_id.unwrap(),
             disk_map,

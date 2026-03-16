@@ -13,6 +13,17 @@
 // limitations under the License.
 
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::bucket::{
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{
+            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule, eval_action_from_lifecycle,
+        },
+        lifecycle::IlmAction,
+    },
+    metadata_sys,
+    object_lock::objectlock_sys::BucketObjectLockSys,
+};
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -30,25 +41,32 @@ use crate::store_api::{
     BucketOperations, BucketOptions, CompletePart, GetObjectReader, HealOperations, MakeBucketOptions, MultipartOperations,
     ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, StorageAPI,
 };
-use crate::{sets::Sets, store::ECStore};
+use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, WarpReader};
+use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
+use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::task::{Context, Poll};
 use time::{Duration, OffsetDateTime};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -178,7 +196,6 @@ impl PoolMeta {
                     stats.last_update = OffsetDateTime::now_utc();
 
                     let mut pd = d.clone();
-                    pd.start_time = None;
                     pd.canceled = true;
                     pd.failed = false;
                     pd.complete = false;
@@ -202,7 +219,6 @@ impl PoolMeta {
                     stats.last_update = OffsetDateTime::now_utc();
 
                     let mut pd = d.clone();
-                    pd.start_time = None;
                     pd.canceled = false;
                     pd.failed = true;
                     pd.complete = false;
@@ -226,7 +242,6 @@ impl PoolMeta {
                     stats.last_update = OffsetDateTime::now_utc();
 
                     let mut pd = d.clone();
-                    pd.start_time = None;
                     pd.canceled = false;
                     pd.failed = false;
                     pd.complete = true;
@@ -576,6 +591,132 @@ impl Display for DecomBucketInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionFinalState {
+    Complete,
+    Failed,
+}
+
+fn determine_decommission_final_state(items_failed: usize, was_cancelled: bool) -> DecommissionFinalState {
+    if items_failed > 0 || was_cancelled {
+        DecommissionFinalState::Failed
+    } else {
+        DecommissionFinalState::Complete
+    }
+}
+
+fn remaining_versions_after_decommission(fivs: &FileInfoVersions) -> usize {
+    fivs.versions.iter().filter(|version| !version.deleted).count()
+}
+
+fn decommission_delete_marker_opts(
+    version: &rustfs_filemeta::FileInfo,
+    version_id: Option<String>,
+    src_pool_idx: usize,
+) -> ObjectOptions {
+    ObjectOptions {
+        versioned: true,
+        version_id,
+        mod_time: version.mod_time,
+        src_pool_idx,
+        data_movement: true,
+        delete_marker: true,
+        skip_decommissioned: true,
+        delete_replication: version.replication_state_internal.clone(),
+        ..Default::default()
+    }
+}
+
+async fn should_skip_lifecycle_for_decommission(
+    store: Arc<ECStore>,
+    bucket: &str,
+    version: &rustfs_filemeta::FileInfo,
+    lifecycle_config: Option<&BucketLifecycleConfiguration>,
+    lock_retention: Option<DefaultRetention>,
+    replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+    apply_actions: bool,
+) -> bool {
+    let Some(lifecycle_config) = lifecycle_config else {
+        return false;
+    };
+
+    let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
+    let object_info = crate::store_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
+    let event = eval_action_from_lifecycle(lifecycle_config, lock_retention, replication_config, &object_info).await;
+
+    match event.action {
+        IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
+            if apply_actions && object_info.is_remote() {
+                let _ = apply_expiry_on_transitioned_object(store, &object_info, &event, &LcEventSrc::Decom).await;
+            }
+            false
+        }
+        IlmAction::DeleteAction
+        | IlmAction::DeleteVersionAction
+        | IlmAction::DeleteAllVersionsAction
+        | IlmAction::DelMarkerDeleteAllVersionsAction => {
+            if apply_actions {
+                let _ = apply_expiry_rule(&event, &LcEventSrc::Decom, &object_info).await;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+struct IndexedDecommissionReader<R> {
+    inner: R,
+    index: Option<Index>,
+}
+
+impl<R> IndexedDecommissionReader<R> {
+    fn new(inner: R, index: Option<Index>) -> Self {
+        Self { inner, index }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for IndexedDecommissionReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> EtagResolvable for IndexedDecommissionReader<R> {}
+
+impl<R: AsyncRead + Unpin + Send + Sync> HashReaderDetector for IndexedDecommissionReader<R> {}
+
+impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedDecommissionReader<R> {
+    fn try_get_index(&self) -> Option<&Index> {
+        self.index.as_ref()
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> Reader for IndexedDecommissionReader<R> {}
+
+fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
+    let bytes = index?;
+    let mut decoded = Index::new();
+    if decoded.load(bytes.as_ref()).is_ok() {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
+    use sha2::{Digest, Sha256};
+
+    let sha256hex = if !chunk.is_empty() {
+        Some(hex_simd::encode_to_string(Sha256::digest(&chunk), hex_simd::AsciiCase::Lower))
+    } else {
+        None
+    };
+
+    let reader = IndexedDecommissionReader::new(WarpReader::new(Cursor::new(chunk)), index);
+    let hash_reader = HashReader::new(Box::new(reader), size, actual_size, None, sha256hex, false)?;
+    Ok(PutObjReader::new(hash_reader))
+}
+
 impl ECStore {
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
@@ -621,13 +762,18 @@ impl ECStore {
             return Err(Error::other("InvalidArgument"));
         }
 
-        let Some(has_canceler) = self.decommission_cancelers.get(idx) else {
-            return Err(Error::other("InvalidArgument"));
-        };
+        let canceler = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            let Some(slot) = cancelers.get_mut(idx) else {
+                return Err(Error::other("InvalidArgument"));
+            };
 
-        if has_canceler.is_none() {
-            return Err(StorageError::DecommissionNotStarted);
-        }
+            let Some(canceler) = slot.take() else {
+                return Err(StorageError::DecommissionNotStarted);
+            };
+
+            canceler
+        };
 
         let mut lock = self.pool_meta.write().await;
         if lock.decommission_cancel(idx) {
@@ -639,6 +785,8 @@ impl ECStore {
                 notification_sys.reload_pool_meta().await;
             }
         }
+
+        canceler.cancel();
 
         Ok(())
     }
@@ -684,8 +832,8 @@ impl ECStore {
         Ok(())
     }
 
-    #[allow(unused_assignments)]
-    #[tracing::instrument(skip(self, set, wk, rcfg))]
+    #[allow(unused_assignments, clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, set, wk, lifecycle_config, lock_retention, replication_config))]
     async fn decommission_entry(
         self: &Arc<Self>,
         idx: usize,
@@ -693,7 +841,9 @@ impl ECStore {
         bucket: String,
         set: Arc<SetDisks>,
         wk: Arc<Workers>,
-        rcfg: Option<String>,
+        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lock_retention: Option<DefaultRetention>,
+        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     ) {
         warn!("decommission_entry: {} {}", &bucket, &entry.name);
         wk.give().await;
@@ -713,12 +863,27 @@ impl ECStore {
         fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
 
         let mut decommissioned: usize = 0;
-        let expired: usize = 0;
+        let mut expired: usize = 0;
 
         for version in fivs.versions.iter() {
-            // TODO: filterLifecycle
+            if should_skip_lifecycle_for_decommission(
+                self.clone(),
+                &bucket,
+                version,
+                lifecycle_config.as_ref(),
+                lock_retention.clone(),
+                replication_config.clone(),
+                true,
+            )
+            .await
+            {
+                expired += 1;
+                decommissioned += 1;
+                continue;
+            }
+
             let remaining_versions = fivs.versions.len() - expired;
-            if version.deleted && remaining_versions == 1 && rcfg.is_none() {
+            if version.deleted && remaining_versions == 1 && replication_config.is_none() {
                 //
                 decommissioned += 1;
                 info!("decommission_pool: DELETE marked object with no other non-current versions will be skipped");
@@ -731,25 +896,19 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             if version.deleted {
-                // TODO: other params
                 if let Err(err) = self
                     .delete_object(
                         bucket.as_str(),
                         &version.name,
-                        ObjectOptions {
-                            versioned: true,
-                            version_id: version_id.clone(),
-                            mod_time: version.mod_time,
-                            src_pool_idx: idx,
-                            data_movement: true,
-                            delete_marker: true,
-                            skip_decommissioned: true,
-                            ..Default::default()
-                        },
+                        decommission_delete_marker_opts(version, version_id.clone(), idx),
                     )
                     .await
                 {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+                        warn!(
+                            "decommission_pool: ignore delete-marker copy for {}/{} version {:?}: {:?}",
+                            &bucket, &version.name, &version_id, &err
+                        );
                         ignore = true;
                         continue;
                     }
@@ -776,7 +935,33 @@ impl ECStore {
 
             for _i in 0..3 {
                 if version.is_remote() {
-                    // TODO: DecomTieredObject
+                    if let Err(err) = self
+                        .decommission_tiered_object(
+                            bucket.as_str(),
+                            &version.name,
+                            version,
+                            &ObjectOptions {
+                                version_id: version_id.clone(),
+                                mod_time: version.mod_time,
+                                user_defined: version.metadata.clone(),
+                                src_pool_idx: idx,
+                                data_movement: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err)
+                        {
+                            ignore = true;
+                            break;
+                        }
+
+                        failure = true;
+                        error!("decommission_pool: decommission_tiered_object err {:?}", &err);
+                        error = Some(err);
+                    }
+                    break;
                 }
 
                 let bucket = bucket.clone();
@@ -847,7 +1032,8 @@ impl ECStore {
             }
 
             {
-                self.pool_meta.write().await.count_item(idx, decommissioned, failure);
+                let size = usize::try_from(version.size).unwrap_or_default();
+                self.pool_meta.write().await.count_item(idx, size, failure);
             }
 
             if failure {
@@ -872,6 +1058,14 @@ impl ECStore {
                 .await
         {
             error!("decommission_pool: delete_object err {:?}", &err);
+        } else if decommissioned != fivs.versions.len() {
+            warn!(
+                "decommission_pool: source object retained for {}/{} because only {}/{} versions were decommissioned",
+                &bucket,
+                &entry.name,
+                decommissioned,
+                fivs.versions.len()
+            );
         }
 
         {
@@ -903,16 +1097,19 @@ impl ECStore {
     ) -> Result<()> {
         let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
 
-        // let mut vc = None;
-        // replication
-        let rcfg: Option<String> = None;
+        let mut lifecycle_config = None;
+        let mut lock_retention = None;
+        let mut replication_config = None;
 
         if bi.name != RUSTFS_META_BUCKET {
-            let _versioning = BucketVersioningSys::get(&bi.name).await?;
-            // vc = Some(versioning);
-            // TODO: LifecycleSys
-            // TODO: BucketObjectLockSys
-            // TODO: ReplicationConfig
+            let _ = BucketVersioningSys::get(&bi.name).await?;
+            lifecycle_config = GLOBAL_LifecycleSys.get(&bi.name).await;
+            lock_retention = BucketObjectLockSys::get(&bi.name).await;
+            replication_config = match metadata_sys::get_replication_config(&bi.name).await {
+                Ok(config) => Some(config),
+                Err(Error::ConfigNotFound) => None,
+                Err(err) => return Err(err),
+            };
         }
 
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
@@ -925,17 +1122,22 @@ impl ECStore {
                 let bucket = bi.name.clone();
                 let wk = wk.clone();
                 let set = set.clone();
-                let rcfg = rcfg.clone();
+                let lifecycle_config = lifecycle_config.clone();
+                let lock_retention = lock_retention.clone();
+                let replication_config = replication_config.clone();
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
                     let wk = wk.clone();
                     let set = set.clone();
-                    let rcfg = rcfg.clone();
+                    let lifecycle_config = lifecycle_config.clone();
+                    let lock_retention = lock_retention.clone();
+                    let replication_config = replication_config.clone();
 
                     Box::pin(async move {
                         wk.take().await;
-                        this.decommission_entry(idx, entry, bucket, set, wk, rcfg).await
+                        this.decommission_entry(idx, entry, bucket, set, wk, lifecycle_config, lock_retention, replication_config)
+                            .await
                     })
                 }
             });
@@ -988,7 +1190,15 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
-        if let Err(err) = self.decommission_in_background(rx, idx).await {
+        let decommission_token = rx.child_token();
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            if let Some(slot) = cancelers.get_mut(idx) {
+                *slot = Some(decommission_token.clone());
+            }
+        }
+
+        if let Err(err) = self.decommission_in_background(decommission_token.clone(), idx).await {
             error!("decom err {:?}", &err);
             if let Err(er) = self.decommission_failed(idx).await {
                 error!("decom failed err {:?}", &er);
@@ -1001,29 +1211,49 @@ impl ECStore {
 
         warn!("decommission: decommission_in_background complete {}", idx);
 
-        let (failed, cmd_line) = {
+        let (final_state, cmd_line) = {
             let pool_meta = self.pool_meta.read().await;
-            let failed = {
+            let final_state = {
                 if let Some(info) = &pool_meta.pools[idx].decommission {
-                    info.items_decommission_failed > 0
+                    determine_decommission_final_state(info.items_decommission_failed, info.canceled)
                 } else {
-                    false
+                    DecommissionFinalState::Failed
                 }
             };
             let cmd_line = pool_meta.pools[idx].cmd_line.clone();
-            (failed, cmd_line)
+            (final_state, cmd_line)
         };
 
-        if !failed {
+        let mut completed_successfully = false;
+
+        if final_state == DecommissionFinalState::Complete {
             warn!("Decommissioning complete for pool {}, verifying for any pending objects", cmd_line);
-            if let Err(er) = self.decommission_failed(idx).await {
-                error!("decom failed err {:?}", &er);
+            if let Err(err) = self.check_after_decommission(idx).await {
+                error!("decom post-check err {:?}", &err);
+                if let Err(er) = self.decommission_failed(idx).await {
+                    error!("decom failed err {:?}", &er);
+                }
+            } else if let Err(er) = self.complete_decommission(idx).await {
+                error!("decom complete err {:?}", &er);
+            } else {
+                completed_successfully = true;
             }
-        } else if let Err(er) = self.complete_decommission(idx).await {
-            error!("decom complete err {:?}", &er);
+        } else if let Err(er) = self.decommission_failed(idx).await {
+            error!("decom failed err {:?}", &er);
         }
 
-        warn!("Decommissioning complete for pool {}", cmd_line);
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            if let Some(slot) = cancelers.get_mut(idx) {
+                *slot = None;
+            }
+        }
+
+        if completed_successfully {
+            warn!("Decommissioning complete for pool {}", cmd_line);
+        } else {
+            warn!("Decommissioning finished in failed state for pool {}", cmd_line);
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -1043,6 +1273,14 @@ impl ECStore {
             }
         }
 
+        let canceler = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            cancelers.get_mut(idx).and_then(Option::take)
+        };
+        if let Some(canceler) = canceler {
+            canceler.cancel();
+        }
+
         Ok(())
     }
 
@@ -1059,6 +1297,14 @@ impl ECStore {
             if let Some(notification_sys) = get_global_notification_sys() {
                 notification_sys.reload_pool_meta().await;
             }
+        }
+
+        let canceler = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            cancelers.get_mut(idx).and_then(Option::take)
+        };
+        if let Some(canceler) = canceler {
+            canceler.cancel();
         }
 
         Ok(())
@@ -1190,6 +1436,94 @@ impl ECStore {
         Ok(ret)
     }
 
+    async fn check_after_decommission(self: &Arc<Self>, idx: usize) -> Result<()> {
+        let buckets = self.get_buckets_to_decommission().await?;
+        let pool = self.pools[idx].clone();
+
+        for set in &pool.disk_set {
+            for bucket_info in &buckets {
+                let mut lifecycle_config = None;
+                let mut lock_retention = None;
+                let mut replication_config = None;
+                if bucket_info.name != RUSTFS_META_BUCKET {
+                    lifecycle_config = GLOBAL_LifecycleSys.get(&bucket_info.name).await;
+                    lock_retention = BucketObjectLockSys::get(&bucket_info.name).await;
+                    replication_config = match metadata_sys::get_replication_config(&bucket_info.name).await {
+                        Ok(config) => Some(config),
+                        Err(Error::ConfigNotFound) => None,
+                        Err(err) => return Err(err),
+                    };
+                }
+
+                let versions_found = Arc::new(AtomicUsize::new(0));
+                let versions_found_cb = versions_found.clone();
+                let bucket_name = bucket_info.name.clone();
+                let lifecycle_config_cb = lifecycle_config.clone();
+                let lock_retention_cb = lock_retention.clone();
+                let replication_config_cb = replication_config.clone();
+                let store = Arc::clone(self);
+
+                let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
+                    let versions_found = versions_found_cb.clone();
+                    let bucket_name = bucket_name.clone();
+                    let lifecycle_config = lifecycle_config_cb.clone();
+                    let lock_retention = lock_retention_cb.clone();
+                    let replication_config = replication_config_cb.clone();
+                    let store = Arc::clone(&store);
+                    Box::pin(async move {
+                        if !entry.is_object() {
+                            return;
+                        }
+
+                        if bucket_name == RUSTFS_META_BUCKET && entry.name.contains(DATA_USAGE_CACHE_NAME) {
+                            return;
+                        }
+
+                        let Ok(fivs) = entry.file_info_versions(&bucket_name) else {
+                            return;
+                        };
+
+                        let mut remaining = 0;
+                        for version in &fivs.versions {
+                            if version.deleted {
+                                continue;
+                            }
+                            if should_skip_lifecycle_for_decommission(
+                                Arc::clone(&store),
+                                &bucket_name,
+                                version,
+                                lifecycle_config.as_ref(),
+                                lock_retention.clone(),
+                                replication_config.clone(),
+                                false,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            remaining += 1;
+                        }
+
+                        versions_found.fetch_add(remaining, Ordering::Relaxed);
+                    })
+                });
+
+                set.list_objects_to_decommission(CancellationToken::new(), bucket_info.clone(), callback)
+                    .await?;
+
+                let versions_found = versions_found.load(Ordering::Relaxed);
+                if versions_found > 0 {
+                    return Err(Error::other(format!(
+                        "at least {versions_found} object(s)/version(s) were found in bucket `{}` after decommissioning",
+                        bucket_info.name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, rd))]
     async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
@@ -1238,7 +1572,10 @@ impl ECStore {
 
                 reader.read_exact(&mut chunk).await?;
 
-                let mut data = PutObjReader::from_vec(chunk);
+                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
+                let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
+                let index = decode_part_index(part.index.as_ref());
+                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
 
                 let pi = match self
                     .put_object_part(
@@ -1294,8 +1631,13 @@ impl ECStore {
             return Ok(());
         }
 
-        let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, None, false)?;
+        let actual_size = object_info.get_actual_size()?;
+        let index = object_info
+            .parts
+            .first()
+            .and_then(|part| decode_part_index(part.index.as_ref()));
+        let reader = IndexedDecommissionReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
+        let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
@@ -1322,6 +1664,105 @@ impl ECStore {
 
         warn!("decommission_object: put_object done {} {}", &bucket, &object_info.name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determine_decommission_final_state_marks_failures_and_cancellations() {
+        assert_eq!(determine_decommission_final_state(0, false), DecommissionFinalState::Complete);
+        assert_eq!(determine_decommission_final_state(1, false), DecommissionFinalState::Failed);
+        assert_eq!(determine_decommission_final_state(0, true), DecommissionFinalState::Failed);
+    }
+
+    #[test]
+    fn remaining_versions_after_decommission_ignores_delete_markers() {
+        let fivs = FileInfoVersions {
+            versions: vec![
+                rustfs_filemeta::FileInfo {
+                    deleted: false,
+                    size: 128,
+                    ..Default::default()
+                },
+                rustfs_filemeta::FileInfo {
+                    deleted: true,
+                    size: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(remaining_versions_after_decommission(&fivs), 1);
+    }
+
+    #[test]
+    fn decommission_delete_marker_opts_preserves_replication_state() {
+        let mod_time = OffsetDateTime::now_utc();
+        let version = rustfs_filemeta::FileInfo {
+            mod_time: Some(mod_time),
+            replication_state_internal: Some(rustfs_filemeta::ReplicationState {
+                replica_status: rustfs_filemeta::ReplicationStatusType::Replica,
+                delete_marker: true,
+                replicate_decision_str: "existing".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let opts = decommission_delete_marker_opts(&version, Some("version-id".to_string()), 7);
+        let replication = opts.delete_replication.expect("replication state should be preserved");
+
+        assert!(opts.versioned);
+        assert!(opts.data_movement);
+        assert!(opts.delete_marker);
+        assert!(opts.skip_decommissioned);
+        assert_eq!(opts.src_pool_idx, 7);
+        assert_eq!(opts.version_id.as_deref(), Some("version-id"));
+        assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
+        assert!(replication.delete_marker);
+        assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn decommission_state_transitions_preserve_start_time() {
+        let start_time = OffsetDateTime::now_utc();
+        let mut pool_meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "/tmp/pool".to_string(),
+                last_update: start_time,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    ..Default::default()
+                }),
+            }],
+            dont_save: true,
+        };
+
+        assert!(pool_meta.decommission_failed(0));
+        assert_eq!(
+            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(start_time)
+        );
+
+        assert!(pool_meta.decommission_complete(0));
+        assert_eq!(
+            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(start_time)
+        );
+
+        assert!(pool_meta.decommission_cancel(0));
+        assert_eq!(
+            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(start_time)
+        );
     }
 }
 

@@ -71,6 +71,10 @@ impl Index {
         self.info.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.info.is_empty()
+    }
+
     fn alloc_infos(&mut self, n: usize) {
         if n > MAX_INDEX_ENTRIES {
             panic!("n > MAX_INDEX_ENTRIES");

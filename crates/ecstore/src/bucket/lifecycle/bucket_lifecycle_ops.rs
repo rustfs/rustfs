@@ -96,8 +96,14 @@ impl LifecycleSys {
     }
 
     pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
-        let lc = get_lifecycle_config(bucket).await.expect("get_lifecycle_config err!").0;
-        Some(lc)
+        match get_lifecycle_config(bucket).await {
+            Ok((lc, _)) => Some(lc),
+            Err(err) if err == Error::ConfigNotFound => None,
+            Err(err) => {
+                warn!(bucket, error = ?err, "failed to load lifecycle config");
+                None
+            }
+        }
     }
 
     pub fn trace(_oi: &ObjectInfo) -> TraceFn {
