@@ -498,7 +498,10 @@ impl FileMeta {
                     return Ok(None);
                 }
                 VersionType::Object => {
-                    if update_version && !fi.deleted {
+                    // Only enter the update-in-place path for versioned objects (fi.version_id.is_some()).
+                    // Non-versioned objects (fi.version_id == None) must fall through to the removal path
+                    // so the version entry is actually deleted from metadata, not just updated.
+                    if update_version && !fi.deleted && fi.version_id.is_some() {
                         let mut v = self.get_idx(i)?;
 
                         if let Some(obj) = v.object.as_mut() {
