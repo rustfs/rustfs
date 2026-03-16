@@ -7764,10 +7764,14 @@ dependencies = [
 name = "rustfs-obs"
 version = "0.0.5"
 dependencies = [
+ "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-utils",
  "flate2",
  "glob",
  "jiff",
  "metrics",
+ "num_cpus",
  "nvml-wrapper",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -7779,6 +7783,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-utils",
  "serde",
+ "serde_json",
  "sysinfo",
  "temp-env",
  "tempfile",
@@ -7789,6 +7794,7 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

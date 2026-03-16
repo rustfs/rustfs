@@ -14,67 +14,89 @@
 
 //! Core log-file cleanup orchestration.
 //!
-//! [`LogCleaner`] is the public entry point for the cleanup subsystem.
-//! Construct it with [`LogCleaner::builder`] and call [`LogCleaner::cleanup`]
-//! periodically (e.g. from a `tokio::spawn`-ed loop).
-//!
-//! Internally the cleaner delegates to:
-//! - [`super::scanner`] — to discover which files exist and which are eligible,
-//! - [`super::compress`] — to gzip-compress files before they are deleted,
-//! - [`LogCleaner::select_files_to_delete`] — to apply count / size limits.
+//! This module connects scanning, retention selection, compression, and safe
+//! deletion into one reusable service object. The public surface is intentionally
+//! small: callers configure a [`LogCleaner`] once and then trigger discrete
+//! cleanup passes whenever log rotation or background maintenance requires it.
 
-use super::compress::compress_file;
+use super::compress::{CompressionOptions, compress_file};
 use super::scanner::{LogScanResult, scan_log_directory};
-use super::types::{FileInfo, FileMatchMode};
+use super::types::{CompressionAlgorithm, FileInfo, FileMatchMode, default_parallel_workers};
+use crate::global::{
+    METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS, METRIC_LOG_CLEANER_DELETED_FILES_TOTAL, METRIC_LOG_CLEANER_FREED_BYTES_TOTAL,
+    METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE,
+};
+use crossbeam_channel::bounded;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_utils::thread;
+use metrics::{counter, gauge, histogram};
 use rustfs_config::DEFAULT_LOG_KEEP_FILES;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use tracing::{debug, error, info};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, error, info, warn};
+
+#[derive(Debug)]
+struct CompressionTaskResult {
+    /// Original file metadata so successful workers can be deleted later.
+    file: FileInfo,
+    /// Whether compression completed successfully for this file.
+    compressed: bool,
+}
 
 /// Log-file lifecycle manager.
 ///
-/// Holds all cleanup policy parameters and exposes a single [`cleanup`] method
-/// that performs one full cleanup pass.
-///
-/// # Thread-safety
-/// `LogCleaner` is `Send + Sync`.  Multiple callers can share a reference
-/// (e.g. via `Arc`) and call `cleanup` concurrently without data races,
-/// because no mutable state is mutated after construction.
+/// A cleaner instance is immutable after construction and therefore safe to
+/// reuse across periodic background jobs. Each call to [`LogCleaner::cleanup`]
+/// performs a fresh directory scan and applies the configured retention rules.
 pub struct LogCleaner {
-    /// Directory containing the managed log files.
+    /// Directory containing the active and rotated log files.
     pub(super) log_dir: PathBuf,
-    /// Pattern string to match files (used as prefix or suffix).
+    /// Pattern used to recognize relevant log generations.
     pub(super) file_pattern: String,
-    /// Exact name of the active log file (to exclude from cleanup).
+    /// The currently active log file that must never be touched.
     pub(super) active_filename: String,
-    /// Whether to match by prefix or suffix.
+    /// Whether `file_pattern` is interpreted as a prefix or suffix.
     pub(super) match_mode: FileMatchMode,
-    /// The cleaner will never delete files if doing so would leave fewer than
-    /// this many files in the directory.
+    /// Minimum number of regular log files to keep regardless of size.
     pub(super) keep_files: usize,
-    /// Hard ceiling on the total bytes of all managed files; `0` = no limit.
+    /// Optional cap for the cumulative size of regular logs.
     pub(super) max_total_size_bytes: u64,
-    /// Hard ceiling on a single file's size; `0` = no per-file limit.
+    /// Optional cap for an individual regular log file.
     pub(super) max_single_file_size_bytes: u64,
-    /// Compress eligible files with gzip before removing them.
+    /// Whether selected regular logs should be compressed before deletion.
     pub(super) compress_old_files: bool,
-    /// Gzip compression level (`1`–`9`, clamped on construction).
+    /// Gzip compression level used when gzip is selected or used as fallback.
     pub(super) gzip_compression_level: u32,
-    /// Delete compressed archives older than this many days; `0` = keep forever.
+    /// Retention window for already compressed archives, expressed in days.
     pub(super) compressed_file_retention_days: u64,
-    /// Compiled glob patterns for files that must never be cleaned up.
+    /// Glob patterns that are excluded before any cleanup decision is made.
     pub(super) exclude_patterns: Vec<glob::Pattern>,
-    /// Delete zero-byte files even when they are younger than `min_file_age_seconds`.
+    /// Whether zero-byte regular logs may be removed during scanning.
     pub(super) delete_empty_files: bool,
-    /// Files younger than this threshold (in seconds) are never touched.
+    /// Minimum age a regular log must reach before it becomes eligible.
     pub(super) min_file_age_seconds: u64,
-    /// When `true`, log what would be done without performing any destructive
-    /// filesystem operations.
+    /// Dry-run mode reports intended actions without modifying files.
     pub(super) dry_run: bool,
+    // Parallel compression controls while keeping backward compatibility with
+    // the original serial cleaner behavior.
+    /// Preferred archive codec for compression-enabled cleanup passes.
+    pub(super) compression_algorithm: CompressionAlgorithm,
+    /// Enables the work-stealing compression path when compression is active.
+    pub(super) parallel_compress: bool,
+    /// Number of worker threads used by the parallel compressor.
+    pub(super) parallel_workers: usize,
+    /// Zstd compression level when zstd is selected.
+    pub(super) zstd_compression_level: i32,
+    /// Whether a failed zstd attempt should retry with gzip.
+    pub(super) zstd_fallback_to_gzip: bool,
+    /// Number of internal threads requested from the zstd encoder.
+    pub(super) zstd_workers: usize,
 }
 
 impl LogCleaner {
-    /// Create a builder to construct a `LogCleaner`.
+    /// Create a builder with the required path and filename matching inputs.
     pub fn builder(
         log_dir: impl Into<PathBuf>,
         file_pattern: impl Into<String>,
@@ -84,19 +106,6 @@ impl LogCleaner {
     }
 
     /// Perform one full cleanup pass.
-    ///
-    /// Steps:
-    /// 1. Scan the log directory for managed files (excluding the active file).
-    /// 2. Apply count/size policies to select files for deletion.
-    /// 3. Optionally compress selected files, then delete them.
-    /// 4. Collect and delete expired compressed archives.
-    ///
-    /// # Returns
-    /// A tuple `(deleted_count, freed_bytes)` covering all deletions in this
-    /// pass (both regular files and expired compressed archives).
-    ///
-    /// # Errors
-    /// Returns an [`std::io::Error`] if the log directory cannot be read.
     pub fn cleanup(&self) -> Result<(usize, u64), std::io::Error> {
         if !self.log_dir.exists() {
             debug!("Log directory does not exist: {:?}", self.log_dir);
@@ -106,8 +115,6 @@ impl LogCleaner {
         let mut total_deleted = 0usize;
         let mut total_freed = 0u64;
 
-        // ── 1. Discover active log files (Archives only) ──────────────────────
-        // We explicitly pass `active_filename` to exclude it from the list.
         let LogScanResult {
             mut logs,
             mut compressed_archives,
@@ -122,7 +129,6 @@ impl LogCleaner {
             self.dry_run,
         )?;
 
-        // ── 2. Select + compress + delete (Regular Logs) ──────────────────────
         if !logs.is_empty() {
             logs.sort_by_key(|f| f.modified);
             let total_size: u64 = logs.iter().map(|f| f.size).sum();
@@ -134,16 +140,20 @@ impl LogCleaner {
                 total_size as f64 / 1024.0 / 1024.0
             );
 
+            // Select the oldest files first, then additionally trim any files
+            // that still violate configured size constraints.
             let to_delete = self.select_files_to_process(&logs, total_size);
-
             if !to_delete.is_empty() {
-                let (d, f) = self.compress_and_delete(&to_delete)?;
-                total_deleted += d;
-                total_freed += f;
+                let (deleted, freed) = if self.parallel_compress && self.compress_old_files {
+                    self.parallel_stealing_compress(&to_delete)?
+                } else {
+                    self.serial_compress_and_delete(&to_delete)?
+                };
+                total_deleted += deleted;
+                total_freed += freed;
             }
         }
 
-        // ── 3. Remove expired compressed archives ─────────────────────────────
         if !compressed_archives.is_empty() && self.compressed_file_retention_days > 0 {
             let expired = self.select_expired_compressed(&mut compressed_archives);
             if !expired.is_empty() {
@@ -154,6 +164,8 @@ impl LogCleaner {
         }
 
         if total_deleted > 0 || total_freed > 0 {
+            counter!(METRIC_LOG_CLEANER_DELETED_FILES_TOTAL).increment(total_deleted as u64);
+            counter!(METRIC_LOG_CLEANER_FREED_BYTES_TOTAL).increment(total_freed);
             info!(
                 "Cleanup completed: deleted {} files, freed {} bytes ({:.2} MB)",
                 total_deleted,
@@ -165,51 +177,31 @@ impl LogCleaner {
         Ok((total_deleted, total_freed))
     }
 
-    // ─── Selection ────────────────────────────────────────────────────────────
-
-    /// Choose which files from `files` (sorted oldest-first) should be deleted.
+    /// Choose regular log files that should be compressed and/or deleted.
     ///
-    /// The algorithm respects three constraints in order:
-    /// 1. Always keep at least `keep_files` files (archives).
-    /// 2. Delete old files while the total size exceeds `max_total_size_bytes`.
-    /// 3. Delete any file whose individual size exceeds `max_single_file_size_bytes`.
+    /// The `files` slice must already be sorted from oldest to newest. The
+    /// method first preserves the newest `keep_files` generations, then applies
+    /// total-size and per-file-size limits to the remaining tail.
     pub(super) fn select_files_to_process(&self, files: &[FileInfo], total_size: u64) -> Vec<FileInfo> {
         let mut to_delete = Vec::new();
-
         if files.is_empty() {
             return to_delete;
         }
 
-        // Calculate how many files we *must* delete to satisfy keep_files.
         let must_delete_count = files.len().saturating_sub(self.keep_files);
-
         let mut current_size = total_size;
 
         for (idx, file) in files.iter().enumerate() {
-            // Condition 1: Enforce keep_files.
-            // If we are in the range of files that exceed the count limit, delete them.
             if idx < must_delete_count {
                 current_size = current_size.saturating_sub(file.size);
                 to_delete.push(file.clone());
                 continue;
             }
 
-            // Condition 2: Enforce max_total_size_bytes.
             let over_total = self.max_total_size_bytes > 0 && current_size > self.max_total_size_bytes;
-
-            // Condition 3: Enforce max_single_file_size_bytes.
-            // Note: Since active file is excluded, if an archive is > max_single, it means it
-            // was rotated out being too large (likely) or we lowered the limit. It should be deleted.
             let over_single = self.max_single_file_size_bytes > 0 && file.size > self.max_single_file_size_bytes;
 
-            if over_total {
-                current_size = current_size.saturating_sub(file.size);
-                to_delete.push(file.clone());
-            } else if over_single {
-                debug!(
-                    "Archive exceeds single-file size limit: {:?} ({} > {} bytes). Deleting.",
-                    file.path, file.size, self.max_single_file_size_bytes
-                );
+            if over_total || over_single {
                 current_size = current_size.saturating_sub(file.size);
                 to_delete.push(file.clone());
             }
@@ -218,9 +210,9 @@ impl LogCleaner {
         to_delete
     }
 
-    /// Select compressed files that have exceeded the retention period.
+    /// Select compressed archives whose age exceeds the archive retention window.
     fn select_expired_compressed(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
-        let retention = std::time::Duration::from_secs(self.compressed_file_retention_days * 24 * 3600);
+        let retention = Duration::from_secs(self.compressed_file_retention_days * 24 * 3600);
         let now = SystemTime::now();
         let mut expired = Vec::new();
 
@@ -235,22 +227,259 @@ impl LogCleaner {
         expired
     }
 
-    // ─── Compression + deletion ───────────────────────────────────────────────
-
-    /// Securely delete a file, preventing symlink attacks (TOCTOU).
+    /// Parallel compressor with work stealing.
     ///
-    /// This function verifies that the path is not a symlink before attempting deletion.
-    /// While strictly speaking a race condition is still theoretically possible between
-    /// `symlink_metadata` and `remove_file`, this check covers the vast majority of
-    /// privilege escalation vectors where a user replaces a log file with a symlink
-    /// to a system file.
-    fn secure_delete(&self, path: &PathBuf) -> std::io::Result<()> {
-        // 1. Lstat (symlink_metadata) - do not follow links
-        let meta = std::fs::symlink_metadata(path)?;
+    /// The flow is intentionally split into "parallel compression" followed by
+    /// "serial deletion" to reduce cross-platform file-locking failures.
+    /// Compression workers only decide whether an archive was created; the main
+    /// thread remains responsible for actual source removal so deletion policy
+    /// and error reporting stay deterministic.
+    fn parallel_stealing_compress(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
+        if files.len() <= 1 {
+            return self.serial_compress_and_delete(files);
+        }
 
-        // 2. Symlink Check
-        // If it's a symlink, we NEVER delete it. It might point to /etc/passwd.
-        // In a log directory, symlinks are unexpected and dangerous.
+        let worker_count = self.parallel_workers.min(files.len()).max(1);
+        if worker_count <= 1 {
+            return self.serial_compress_and_delete(files);
+        }
+
+        let compression_options = self.compression_options();
+        let started_at = Instant::now();
+        let injector = Arc::new(Injector::new());
+        for file in files {
+            injector.push(file.clone());
+        }
+
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut stealers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let worker = Worker::new_fifo();
+            stealers.push(worker.stealer());
+            workers.push(worker);
+        }
+
+        let stealers = Arc::new(stealers);
+        let steal_attempts = Arc::new(AtomicU64::new(0));
+        let steal_successes = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = bounded::<CompressionTaskResult>(worker_count.saturating_mul(2).max(8));
+
+        // Spawn a fixed-size worker set in a scoped region so panics are
+        // contained and can be downgraded to a serial fallback instead of
+        // leaking detached threads.
+        let scope_result = thread::scope(|scope| {
+            for (worker_id, local_worker) in workers.into_iter().enumerate() {
+                let tx = tx.clone();
+                let injector = Arc::clone(&injector);
+                let stealers = Arc::clone(&stealers);
+                let options = compression_options.clone();
+                let attempts = Arc::clone(&steal_attempts);
+                let successes = Arc::clone(&steal_successes);
+
+                scope.spawn(move |_| {
+                    let mut seed = (worker_id as u64 + 1)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+
+                    loop {
+                        // Search order: local FIFO -> global injector batch ->
+                        // random victim stealers.
+                        let task = if let Some(file) = local_worker.pop() {
+                            Some(file)
+                        } else {
+                            match injector.steal_batch_and_pop(&local_worker) {
+                                Steal::Success(file) => {
+                                    attempts.fetch_add(1, Ordering::Relaxed);
+                                    successes.fetch_add(1, Ordering::Relaxed);
+                                    Some(file)
+                                }
+                                Steal::Retry => continue,
+                                Steal::Empty => {
+                                    let stolen = Self::steal_from_victims(
+                                        worker_id,
+                                        &local_worker,
+                                        &stealers,
+                                        &attempts,
+                                        &successes,
+                                        &mut seed,
+                                    );
+                                    // Exit only when all task sources are empty.
+                                    if stolen.is_none()
+                                        && injector.is_empty()
+                                        && local_worker.is_empty()
+                                        && stealers.iter().all(Stealer::is_empty)
+                                    {
+                                        break;
+                                    }
+                                    stolen
+                                }
+                            }
+                        };
+
+                        let Some(file) = task else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+
+                        let compressed = match compress_file(&file.path, &options) {
+                            Ok(output) => {
+                                debug!(
+                                    file = ?file.path,
+                                    archive = ?output.archive_path,
+                                    algorithm = %output.algorithm_used,
+                                    input_bytes = output.input_bytes,
+                                    output_bytes = output.output_bytes,
+                                    "parallel compression done"
+                                );
+                                true
+                            }
+                            Err(err) => {
+                                warn!(file = ?file.path, error = %err, "parallel compression failed");
+                                false
+                            }
+                        };
+
+                        if tx.send(CompressionTaskResult { file, compressed }).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        drop(tx);
+
+        // Any worker panic triggers deterministic fallback behavior.
+        if scope_result.is_err() {
+            warn!("parallel compression worker panicked, falling back to serial path");
+            return self.serial_compress_and_delete(files);
+        }
+
+        let mut deletable = Vec::with_capacity(files.len());
+        for result in rx {
+            if result.compressed {
+                deletable.push(result.file);
+            }
+        }
+
+        let (deleted, freed) = self.delete_files(&deletable)?;
+        let elapsed = started_at.elapsed().as_secs_f64();
+        let attempts = steal_attempts.load(Ordering::Relaxed);
+        let successes = steal_successes.load(Ordering::Relaxed);
+        let success_rate = if attempts == 0 {
+            0.0
+        } else {
+            successes as f64 / attempts as f64
+        };
+
+        // Emit post-run cleanup metrics for monitoring and alerting.
+        histogram!(METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS).record(elapsed);
+        gauge!(METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE).set(success_rate);
+
+        info!(
+            workers = worker_count,
+            algorithm = %self.compression_algorithm,
+            deleted,
+            freed,
+            duration_seconds = elapsed,
+            steal_attempts = attempts,
+            steal_successes = successes,
+            steal_success_rate = success_rate,
+            "parallel cleanup finished"
+        );
+
+        Ok((deleted, freed))
+    }
+
+    /// Attempt to steal a task from peer workers using randomized victim order.
+    fn steal_from_victims(
+        worker_id: usize,
+        local_worker: &Worker<FileInfo>,
+        stealers: &[Stealer<FileInfo>],
+        attempts: &AtomicU64,
+        successes: &AtomicU64,
+        seed: &mut u64,
+    ) -> Option<FileInfo> {
+        if stealers.len() <= 1 {
+            return None;
+        }
+
+        // Xorshift step to randomize victim polling order and avoid convoying.
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let start = (*seed as usize) % stealers.len();
+
+        let steal_result = Steal::from_iter((0..stealers.len()).map(|offset| {
+            let victim = (start + offset) % stealers.len();
+            if victim == worker_id {
+                return Steal::Empty;
+            }
+            attempts.fetch_add(1, Ordering::Relaxed);
+            stealers[victim].steal_batch_and_pop(local_worker)
+        }));
+
+        match steal_result {
+            Steal::Success(file) => {
+                successes.fetch_add(1, Ordering::Relaxed);
+                Some(file)
+            }
+            Steal::Retry | Steal::Empty => None,
+        }
+    }
+
+    /// Serial fallback path and non-parallel baseline.
+    ///
+    /// This path is also used whenever the task set is too small to benefit
+    /// from worker orchestration.
+    fn serial_compress_and_delete(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
+        let started_at = Instant::now();
+        let mut deletable = Vec::with_capacity(files.len());
+
+        if self.compress_old_files {
+            let options = self.compression_options();
+            for file in files {
+                match compress_file(&file.path, &options) {
+                    Ok(output) => {
+                        debug!(
+                            file = ?file.path,
+                            archive = ?output.archive_path,
+                            algorithm = %output.algorithm_used,
+                            input_bytes = output.input_bytes,
+                            output_bytes = output.output_bytes,
+                            "serial compression done"
+                        );
+                        deletable.push(file.clone());
+                    }
+                    Err(err) => {
+                        warn!(file = ?file.path, error = %err, "serial compression failed, source kept");
+                    }
+                }
+            }
+        } else {
+            deletable.extend(files.iter().cloned());
+        }
+
+        let (deleted, freed) = self.delete_files(&deletable)?;
+        histogram!(METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS).record(started_at.elapsed().as_secs_f64());
+
+        Ok((deleted, freed))
+    }
+
+    /// Snapshot compression-related configuration for a single cleanup pass.
+    fn compression_options(&self) -> CompressionOptions {
+        CompressionOptions {
+            algorithm: self.compression_algorithm,
+            gzip_level: self.gzip_compression_level,
+            zstd_level: self.zstd_compression_level,
+            zstd_workers: self.zstd_workers,
+            zstd_fallback_to_gzip: self.zstd_fallback_to_gzip,
+            dry_run: self.dry_run,
+        }
+    }
+
+    /// Delete a file while refusing symlinks and accommodating platform quirks.
+    fn secure_delete(&self, path: &PathBuf) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(path)?;
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -258,59 +487,36 @@ impl LogCleaner {
             ));
         }
 
-        // 3. Perform Deletion
-        std::fs::remove_file(path)
-    }
-
-    /// Optionally compress and then delete the given files.
-    ///
-    /// This function is synchronous and blocking. It should be called within a
-    /// `spawn_blocking` task if running in an async context.
-    fn compress_and_delete(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
-        let mut total_deleted = 0;
-        let mut total_freed = 0;
-
-        for f in files {
-            let mut deleted_size = 0;
-            if self.compress_old_files {
-                match compress_file(&f.path, self.gzip_compression_level, self.dry_run) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to compress {:?}: {}", f.path, e);
+        #[cfg(windows)]
+        {
+            // Retry removes to mitigate transient handle races from external
+            // scanners/AV software.
+            let mut last_err: Option<std::io::Error> = None;
+            for _ in 0..3 {
+                match std::fs::remove_file(path) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        last_err = Some(err);
+                        std::thread::sleep(Duration::from_millis(20));
                     }
                 }
             }
-
-            // Now delete
-            if self.dry_run {
-                info!("[DRY RUN] Would delete: {:?} ({} bytes)", f.path, f.size);
-                deleted_size = f.size;
-            } else {
-                match self.secure_delete(&f.path) {
-                    Ok(()) => {
-                        debug!("Deleted: {:?}", f.path);
-                        deleted_size = f.size;
-                    }
-                    Err(e) => {
-                        error!("Failed to delete {:?}: {}", f.path, e);
-                    }
-                }
+            if let Some(err) = last_err {
+                return Err(err);
             }
-            if deleted_size > 0 {
-                total_deleted += 1;
-                total_freed += deleted_size;
-            }
+            return Ok(());
         }
 
-        Ok((total_deleted, total_freed))
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(path)
+        }
     }
 
-    /// Delete all files in `files`, logging each operation.
+    /// Delete the supplied files and return `(deleted_count, freed_bytes)`.
     ///
-    /// Errors on individual files are logged but do **not** abort the loop.
-    ///
-    /// # Returns
-    /// `(deleted_count, freed_bytes)`.
+    /// In dry-run mode the returned counters still reflect the projected work
+    /// so callers and metrics can report what would have happened.
     pub(super) fn delete_files(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
         let mut deleted = 0usize;
         let mut freed = 0u64;
@@ -320,16 +526,17 @@ impl LogCleaner {
                 info!("[DRY RUN] Would delete: {:?} ({} bytes)", f.path, f.size);
                 deleted += 1;
                 freed += f.size;
-            } else {
-                match self.secure_delete(&f.path) {
-                    Ok(()) => {
-                        debug!("Deleted: {:?}", f.path);
-                        deleted += 1;
-                        freed += f.size;
-                    }
-                    Err(e) => {
-                        error!("Failed to delete {:?}: {}", f.path, e);
-                    }
+                continue;
+            }
+
+            match self.secure_delete(&f.path) {
+                Ok(()) => {
+                    deleted += 1;
+                    freed += f.size;
+                    debug!("Deleted: {:?}", f.path);
+                }
+                Err(e) => {
+                    error!("Failed to delete {:?}: {}", f.path, e);
                 }
             }
         }
@@ -339,6 +546,9 @@ impl LogCleaner {
 }
 
 /// Builder for [`LogCleaner`].
+///
+/// The builder keeps startup code readable when an application only needs to
+/// override a subset of retention knobs.
 pub struct LogCleanerBuilder {
     log_dir: PathBuf,
     file_pattern: String,
@@ -354,18 +564,22 @@ pub struct LogCleanerBuilder {
     delete_empty_files: bool,
     min_file_age_seconds: u64,
     dry_run: bool,
+    compression_algorithm: CompressionAlgorithm,
+    parallel_compress: bool,
+    parallel_workers: usize,
+    zstd_compression_level: i32,
+    zstd_fallback_to_gzip: bool,
+    zstd_workers: usize,
 }
 
 impl LogCleanerBuilder {
+    /// Create a builder with conservative defaults.
     pub fn new(log_dir: impl Into<PathBuf>, file_pattern: impl Into<String>, active_filename: impl Into<String>) -> Self {
         Self {
             log_dir: log_dir.into(),
             file_pattern: file_pattern.into(),
             active_filename: active_filename.into(),
             match_mode: FileMatchMode::Prefix,
-            // Default to a safe non-zero value so that a builder created
-            // without an explicit `keep_files()` call does not immediately
-            // delete all matching log files.
             keep_files: DEFAULT_LOG_KEEP_FILES,
             max_total_size_bytes: 0,
             max_single_file_size_bytes: 0,
@@ -376,64 +590,127 @@ impl LogCleanerBuilder {
             delete_empty_files: false,
             min_file_age_seconds: 0,
             dry_run: false,
+            compression_algorithm: CompressionAlgorithm::default(),
+            parallel_compress: true,
+            parallel_workers: default_parallel_workers(),
+            zstd_compression_level: 8,
+            zstd_fallback_to_gzip: true,
+            zstd_workers: 1,
         }
     }
 
+    /// Configure whether `file_pattern` is matched as a prefix or suffix.
     pub fn match_mode(mut self, match_mode: FileMatchMode) -> Self {
         self.match_mode = match_mode;
         self
     }
 
+    /// Preserve at least this many newest regular log files.
     pub fn keep_files(mut self, keep_files: usize) -> Self {
         self.keep_files = keep_files;
         self
     }
 
+    /// Cap the aggregate size of retained regular log files.
     pub fn max_total_size_bytes(mut self, max_total_size_bytes: u64) -> Self {
         self.max_total_size_bytes = max_total_size_bytes;
         self
     }
 
+    /// Cap the size of any individual regular log file.
     pub fn max_single_file_size_bytes(mut self, max_single_file_size_bytes: u64) -> Self {
         self.max_single_file_size_bytes = max_single_file_size_bytes;
         self
     }
 
+    /// Enable archival compression before deleting selected source logs.
     pub fn compress_old_files(mut self, compress_old_files: bool) -> Self {
         self.compress_old_files = compress_old_files;
         self
     }
 
+    /// Set the gzip compression level used for gzip output or gzip fallback.
     pub fn gzip_compression_level(mut self, gzip_compression_level: u32) -> Self {
         self.gzip_compression_level = gzip_compression_level;
         self
     }
 
+    /// Set how long compressed archives may remain on disk.
     pub fn compressed_file_retention_days(mut self, days: u64) -> Self {
         self.compressed_file_retention_days = days;
         self
     }
 
+    /// Exclude files matching these glob patterns from every cleanup pass.
     pub fn exclude_patterns(mut self, patterns: Vec<String>) -> Self {
         self.exclude_patterns = patterns;
         self
     }
 
+    /// Allow the scanner to remove matching zero-byte regular logs immediately.
     pub fn delete_empty_files(mut self, delete_empty_files: bool) -> Self {
         self.delete_empty_files = delete_empty_files;
         self
     }
 
+    /// Require regular log files to be at least this old before processing.
     pub fn min_file_age_seconds(mut self, seconds: u64) -> Self {
         self.min_file_age_seconds = seconds;
         self
     }
 
+    /// Enable dry-run mode for scans, compression decisions, and deletion.
     pub fn dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
+    /// Set the preferred compression algorithm explicitly.
+    pub fn compression_algorithm(mut self, algorithm: CompressionAlgorithm) -> Self {
+        self.compression_algorithm = algorithm;
+        self
+    }
+
+    /// Parse and set the compression algorithm from configuration text.
+    pub fn compression_algorithm_str(mut self, algorithm: impl AsRef<str>) -> Self {
+        self.compression_algorithm = CompressionAlgorithm::from_config_str(algorithm.as_ref());
+        self
+    }
+
+    /// Enable or disable the parallel work-stealing compression path.
+    pub fn parallel_compress(mut self, enabled: bool) -> Self {
+        self.parallel_compress = enabled;
+        self
+    }
+
+    /// Set the number of compression workers, clamped to at least one.
+    pub fn parallel_workers(mut self, workers: usize) -> Self {
+        self.parallel_workers = workers.max(1);
+        self
+    }
+
+    /// Set the zstd compression level.
+    pub fn zstd_compression_level(mut self, level: i32) -> Self {
+        self.zstd_compression_level = level;
+        self
+    }
+
+    /// Retry compression with gzip when zstd encoding fails.
+    pub fn zstd_fallback_to_gzip(mut self, enabled: bool) -> Self {
+        self.zstd_fallback_to_gzip = enabled;
+        self
+    }
+
+    /// Set the number of internal worker threads requested from zstd.
+    pub fn zstd_workers(mut self, workers: usize) -> Self {
+        self.zstd_workers = workers.max(1);
+        self
+    }
+
+    /// Finalize the builder into an immutable [`LogCleaner`].
+    ///
+    /// Invalid glob patterns are ignored rather than failing construction, and
+    /// codec-related numeric values are clamped into safe ranges.
     pub fn build(self) -> LogCleaner {
         let patterns = self
             .exclude_patterns
@@ -456,6 +733,12 @@ impl LogCleanerBuilder {
             delete_empty_files: self.delete_empty_files,
             min_file_age_seconds: self.min_file_age_seconds,
             dry_run: self.dry_run,
+            compression_algorithm: self.compression_algorithm,
+            parallel_compress: self.parallel_compress,
+            parallel_workers: self.parallel_workers.max(1),
+            zstd_compression_level: self.zstd_compression_level.clamp(1, 21),
+            zstd_fallback_to_gzip: self.zstd_fallback_to_gzip,
+            zstd_workers: self.zstd_workers.max(1),
         }
     }
 }

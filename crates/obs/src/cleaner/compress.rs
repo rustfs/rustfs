@@ -12,66 +12,205 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Gzip compression helper for old log files.
+//! Compression helpers for old log files.
 //!
-//! Files are compressed in place: `<name>` → `<name>.gz`.  The original file
-//! is **not** deleted here — deletion is handled by the caller after
-//! compression succeeds.
+//! This module performs compression only. Source-file deletion is intentionally
+//! handled by the caller in a separate step to avoid platform-specific file
+//! locking issues (especially on Windows).
+//!
+//! The separation is important for operational safety: a failed archive write
+//! must never result in premature source deletion, and an already-existing
+//! archive should make repeated cleanup passes idempotent.
 
+use super::types::CompressionAlgorithm;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rustfs_config::observability::DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::Path;
-use tracing::{debug, info};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
-/// Compress `path` to `<path>.gz` using gzip.
+/// Compression options shared by serial and parallel cleaner paths.
 ///
-/// If a `.gz` file for the given path already exists the function returns
-/// `Ok(())` immediately without overwriting the existing archive.
-///
-/// # Arguments
-/// * `path`    - Path to the uncompressed log file.
-/// * `level`   - Gzip compression level (`1`–`9`); clamped automatically.
-/// * `dry_run` - When `true`, log what would be done without writing anything.
-///
-/// # Errors
-/// Propagates any I/O error encountered while opening, reading, writing, or
-/// flushing files.
-pub(super) fn compress_file(path: &Path, level: u32, dry_run: bool) -> Result<(), std::io::Error> {
-    let gz_path = path.with_extension(DEFAULT_OBS_LOG_GZIP_COMPRESSION_EXTENSION);
+/// The core cleaner prepares this immutable bundle once per cleanup pass and
+/// then hands it to each worker so all files in that run use the same policy.
+#[derive(Debug, Clone)]
+pub(super) struct CompressionOptions {
+    /// Preferred compression codec for the current cleanup pass.
+    pub algorithm: CompressionAlgorithm,
+    /// Gzip level (1..=9).
+    pub gzip_level: u32,
+    /// Zstd level (1..=21).
+    pub zstd_level: i32,
+    /// Internal zstd worker threads used by zstdmt.
+    pub zstd_workers: usize,
+    /// If true, fallback to gzip when zstd encoding fails.
+    pub zstd_fallback_to_gzip: bool,
+    /// Dry-run mode reports planned actions without writing files.
+    pub dry_run: bool,
+}
 
-    if gz_path.exists() {
-        debug!("Compressed file already exists, skipping: {:?}", gz_path);
-        return Ok(());
+/// Compression output metadata used for metrics and deletion gating.
+///
+/// Callers inspect the output size and archive path before deciding whether it
+/// is safe to remove the source log file.
+#[derive(Debug, Clone)]
+pub(super) struct CompressionOutput {
+    /// Final path of the compressed archive file.
+    pub archive_path: PathBuf,
+    /// Codec actually used to produce the output.
+    pub algorithm_used: CompressionAlgorithm,
+    /// Input bytes before compression.
+    pub input_bytes: u64,
+    /// Compressed output bytes on disk.
+    pub output_bytes: u64,
+}
+
+/// Compress a single source file with the requested codec and fallback policy.
+///
+/// This function centralizes the fallback behavior so the orchestration layer
+/// does not need per-codec branching.
+pub(super) fn compress_file(path: &Path, options: &CompressionOptions) -> Result<CompressionOutput, std::io::Error> {
+    match options.algorithm {
+        CompressionAlgorithm::Gzip => compress_gzip(path, options.gzip_level, options.dry_run),
+        CompressionAlgorithm::Zstd => match compress_zstd(path, options.zstd_level, options.zstd_workers, options.dry_run) {
+            Ok(output) => Ok(output),
+            Err(err) if options.zstd_fallback_to_gzip => {
+                warn!(
+                    file = ?path,
+                    error = %err,
+                    "zstd compression failed, fallback to gzip"
+                );
+                compress_gzip(path, options.gzip_level, options.dry_run)
+            }
+            Err(err) => Err(err),
+        },
+    }
+}
+
+/// Compress a file to `*.gz` using the configured gzip level.
+fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
+    let archive_path = archive_path(path, CompressionAlgorithm::Gzip);
+    compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Gzip, |reader, writer| {
+        let mut encoder = GzEncoder::new(writer, Compression::new(level.clamp(1, 9)));
+        let written = std::io::copy(reader, &mut encoder)?;
+        let mut out = encoder.finish()?;
+        out.flush()?;
+        Ok(written)
+    })
+}
+
+/// Compress a file to `*.zst` using multi-threaded zstd when available.
+fn compress_zstd(path: &Path, level: i32, workers: usize, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
+    let archive_path = archive_path(path, CompressionAlgorithm::Zstd);
+    compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Zstd, |reader, writer| {
+        let mut encoder = zstd::stream::Encoder::new(writer, level.clamp(1, 21))?;
+        encoder.multithread(workers.max(1) as u32)?;
+        let written = std::io::copy(reader, &mut encoder)?;
+        let mut out = encoder.finish()?;
+        out.flush()?;
+        Ok(written)
+    })
+}
+
+fn compress_with_writer<F>(
+    path: &Path,
+    archive_path: &Path,
+    dry_run: bool,
+    algorithm_used: CompressionAlgorithm,
+    mut writer_fn: F,
+) -> Result<CompressionOutput, std::io::Error>
+where
+    F: FnMut(&mut BufReader<File>, BufWriter<File>) -> Result<u64, std::io::Error>,
+{
+    // Keep idempotent behavior: existing archive means this file has already
+    // been handled in a previous cleanup pass.
+    if archive_path.exists() {
+        debug!(file = ?archive_path, "compressed archive already exists, skipping");
+        let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+        return Ok(CompressionOutput {
+            archive_path: archive_path.to_path_buf(),
+            algorithm_used,
+            input_bytes,
+            output_bytes,
+        });
     }
 
+    let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if dry_run {
-        info!("[DRY RUN] Would compress file: {:?} -> {:?}", path, gz_path);
-        return Ok(());
+        info!("[DRY RUN] Would compress file: {:?} -> {:?}", path, archive_path);
+        return Ok(CompressionOutput {
+            archive_path: archive_path.to_path_buf(),
+            algorithm_used,
+            input_bytes,
+            output_bytes: 0,
+        });
     }
 
+    // Create the output archive only after the dry-run short-circuit so this
+    // helper remains side-effect free when the caller is evaluating policy.
     let input = File::open(path)?;
-    let output = File::create(&gz_path)?;
 
+    // Write to a temporary file first and then atomically rename it into place
+    // so callers never observe a partially written archive at `archive_path`.
+    let mut tmp_name = archive_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_archive_path = std::path::PathBuf::from(tmp_name);
+
+    let output = File::create(&tmp_archive_path)?;
     let mut reader = BufReader::new(input);
-    let mut writer = BufWriter::new(output);
+    let writer = BufWriter::new(output);
 
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level.clamp(1, 9)));
-    std::io::copy(&mut reader, &mut encoder)?;
-    let compressed = encoder.finish()?;
+    if let Err(e) = writer_fn(&mut reader, writer) {
+        // Best-effort cleanup of the incomplete temporary archive.
+        let _ = std::fs::remove_file(&tmp_archive_path);
+        return Err(e);
+    }
 
-    writer.write_all(&compressed)?;
-    writer.flush()?;
+    // Preserve Unix mode bits so rotated archives keep the same access policy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
+        if let Ok(src_meta) = std::fs::metadata(path) {
+            let mode = src_meta.permissions().mode();
+            let _ = std::fs::set_permissions(&tmp_archive_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    // Atomically move the fully written temp file into its final location.
+    std::fs::rename(&tmp_archive_path, archive_path)?;
+
+    let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
     debug!(
-        "Compressed {:?} -> {:?} ({} bytes -> {} bytes)",
-        path,
-        gz_path,
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        compressed.len()
+        file = ?path,
+        archive = ?archive_path,
+        input_bytes,
+        output_bytes,
+        algorithm = %algorithm_used,
+        "compression finished"
     );
 
-    Ok(())
+    Ok(CompressionOutput {
+        archive_path: archive_path.to_path_buf(),
+        algorithm_used,
+        input_bytes,
+        output_bytes,
+    })
+}
+
+/// Build `<filename>.<ext>` without replacing an existing extension.
+///
+/// Rotated log filenames often already encode a generation number or suffix
+/// (for example `server.log.3`). Appending the archive extension preserves that
+/// information in the final artifact name (`server.log.3.gz`).
+fn archive_path(path: &Path, algorithm: CompressionAlgorithm) -> PathBuf {
+    let ext = algorithm.extension();
+    let mut file_name: OsString = path
+        .file_name()
+        .map_or_else(|| OsString::from("archive"), |n| n.to_os_string());
+    file_name.push(format!(".{ext}"));
+    path.with_file_name(file_name)
 }
