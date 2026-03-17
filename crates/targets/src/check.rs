@@ -69,8 +69,9 @@ pub async fn check_mqtt_broker_available(
     let mut mqtt_options = MqttOptions::new("rustfs_check", host, port);
 
     // Set credentials if provided
-    if let (Some(user), Some(pass)) = (username, password) {
+    if let Some(user) = username {
         if !user.is_empty() {
+            let pass = password.unwrap_or("");
             mqtt_options.set_credentials(user, pass);
         }
     }
