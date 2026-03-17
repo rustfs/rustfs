@@ -69,12 +69,11 @@ pub async fn check_mqtt_broker_available(
     let mut mqtt_options = MqttOptions::new("rustfs_check", host, port);
 
     // Set credentials if provided
-    if let Some(user) = username {
-        if !user.is_empty() {
+    if let Some(user) = username
+        && !user.is_empty() {
             let pass = password.unwrap_or("");
             mqtt_options.set_credentials(user, pass);
         }
-    }
 
     mqtt_options.set_keep_alive(std::time::Duration::from_secs(5));
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
