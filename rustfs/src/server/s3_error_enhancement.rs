@@ -18,7 +18,7 @@
 //! error pages with albwebfs branding, RequestId, HostId, and proper structure.
 
 use bytes::Bytes;
-use http::{header::CONTENT_TYPE, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderValue, Request, Response, StatusCode, header::CONTENT_TYPE};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use quick_xml::de::from_str;
@@ -57,21 +57,39 @@ struct S3ErrorXml {
 
 /// Tower layer that enhances S3 error responses with professional branding.
 #[derive(Clone, Debug)]
-pub struct S3ErrorEnhancementLayer;
+pub struct S3ErrorEnhancementLayer<ReqBody, ResBody> {
+    _marker: PhantomData<(ReqBody, ResBody)>,
+}
 
-impl S3ErrorEnhancementLayer {
+impl<ReqBody, ResBody> S3ErrorEnhancementLayer<ReqBody, ResBody> {
     pub fn new() -> Self {
-        Self
+        Self { _marker: PhantomData }
     }
 }
 
-impl Default for S3ErrorEnhancementLayer {
+impl<ReqBody, ResBody> Default for S3ErrorEnhancementLayer<ReqBody, ResBody> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S, ReqBody, ResBody> Layer<S> for S3ErrorEnhancementLayer
+/// Wraps a service with S3 error enhancement.
+///
+/// This is the preferred entry point when composing the HTTP stack, as it
+/// provides straightforward type inference compared to using the layer directly.
+pub fn layer<S, ReqBody, ResBody>(service: S) -> S3ErrorEnhancement<S, ReqBody, ResBody>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: From<BoxError>,
+    ReqBody: Send + 'static,
+    ResBody: Body<Data = Bytes> + Send + Unpin + 'static,
+    ResBody::Error: Into<BoxError> + Send,
+{
+    S3ErrorEnhancementLayer::<ReqBody, ResBody>::new().layer(service)
+}
+
+impl<S, ReqBody, ResBody> Layer<S> for S3ErrorEnhancementLayer<ReqBody, ResBody>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
@@ -107,12 +125,7 @@ where
 {
     type Response = Response<Full<Bytes>>;
     type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Self::Response, Self::Error>>
-                + Send,
-        >,
-    >;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -130,10 +143,7 @@ where
 
             // Only enhance 4xx and 5xx error responses
             if !status.is_client_error() && !status.is_server_error() {
-                let body = BodyExt::collect(body)
-                    .await
-                    .map_err(Into::<BoxError>::into)?
-                    .to_bytes();
+                let body = BodyExt::collect(body).await.map_err(Into::<BoxError>::into)?.to_bytes();
                 return Ok(Response::from_parts(parts, Full::new(body)));
             }
 
@@ -145,10 +155,7 @@ where
                 .map(|v| v.contains("application/xml") || v.contains("text/xml"))
                 .unwrap_or(false);
 
-            let body_bytes = BodyExt::collect(body)
-                .await
-                .map_err(Into::<BoxError>::into)?
-                .to_bytes();
+            let body_bytes = BodyExt::collect(body).await.map_err(Into::<BoxError>::into)?.to_bytes();
 
             let enhanced_body = if is_xml {
                 enhance_s3_error_xml(&body_bytes, &parts.headers, status)
@@ -159,10 +166,7 @@ where
             // Set Server header for all error responses
             parts
                 .headers
-                .insert(
-                    http::header::SERVER,
-                    HeaderValue::from_static(SERVER_HEADER_VALUE),
-                );
+                .insert(http::header::SERVER, HeaderValue::from_static(SERVER_HEADER_VALUE));
 
             Ok(Response::from_parts(parts, Full::new(enhanced_body)))
         })
@@ -170,11 +174,7 @@ where
 }
 
 /// Enhances S3 error XML with RequestId, HostId, and professional structure.
-fn enhance_s3_error_xml(
-    body: &[u8],
-    headers: &http::HeaderMap,
-    status: StatusCode,
-) -> Bytes {
+fn enhance_s3_error_xml(body: &[u8], headers: &http::HeaderMap, status: StatusCode) -> Bytes {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
         Err(_) => return Bytes::copy_from_slice(body),
@@ -225,20 +225,35 @@ fn generate_host_id() -> String {
 
 fn status_to_code_and_message(status: StatusCode) -> (String, String) {
     match status.as_u16() {
-        400 => ("InvalidRequest".into(), "The request was invalid. Please verify your request and try again.".into()),
-        401 => ("Unauthorized".into(), "Authentication required. Please provide valid credentials.".into()),
-        403 => ("AccessDenied".into(), "Access denied. You do not have permission to perform this operation.".into()),
-        404 => ("NoSuchKey".into(), "The specified resource does not exist.".into()),
-        405 => ("MethodNotAllowed".into(), "The specified method is not allowed against this resource.".into()),
-        409 => ("Conflict".into(), "The request could not be completed due to a conflict with the current state.".into()),
-        416 => ("InvalidRange".into(), "The requested range is not satisfiable.".into()),
-        429 => ("SlowDown".into(), "Too many requests. Please reduce your request rate and try again.".into()),
-        500 => ("InternalError".into(), "We encountered an internal error. Please try again later.".into()),
-        503 => ("ServiceUnavailable".into(), "The service is temporarily unavailable. Please retry your request.".into()),
-        _ => (
-            "InternalError".into(),
-            format!("An error occurred ({}). Please try again.", status),
+        400 => (
+            "InvalidRequest".into(),
+            "The request was invalid. Please verify your request and try again.".into(),
         ),
+        401 => ("Unauthorized".into(), "Authentication required. Please provide valid credentials.".into()),
+        403 => (
+            "AccessDenied".into(),
+            "Access denied. You do not have permission to perform this operation.".into(),
+        ),
+        404 => ("NoSuchKey".into(), "The specified resource does not exist.".into()),
+        405 => (
+            "MethodNotAllowed".into(),
+            "The specified method is not allowed against this resource.".into(),
+        ),
+        409 => (
+            "Conflict".into(),
+            "The request could not be completed due to a conflict with the current state.".into(),
+        ),
+        416 => ("InvalidRange".into(), "The requested range is not satisfiable.".into()),
+        429 => (
+            "SlowDown".into(),
+            "Too many requests. Please reduce your request rate and try again.".into(),
+        ),
+        500 => ("InternalError".into(), "We encountered an internal error. Please try again later.".into()),
+        503 => (
+            "ServiceUnavailable".into(),
+            "The service is temporarily unavailable. Please retry your request.".into(),
+        ),
+        _ => ("InternalError".into(), format!("An error occurred ({}). Please try again.", status)),
     }
 }
 

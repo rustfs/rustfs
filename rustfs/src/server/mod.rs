@@ -21,9 +21,9 @@ mod http;
 mod hybrid;
 mod layer;
 mod prefix;
-mod s3_error_enhancement;
 mod readiness;
 mod runtime;
+mod s3_error_enhancement;
 mod service_state;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};

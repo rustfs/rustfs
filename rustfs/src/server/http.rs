@@ -22,7 +22,7 @@ use crate::server::{
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
     layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
-    s3_error_enhancement::S3ErrorEnhancementLayer,
+    s3_error_enhancement,
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -594,7 +594,7 @@ fn process_connection(
         let http_service = s3_service;
 
         // Enhance S3 error responses with professional albwebfs branding (RequestId, HostId, Server header)
-        let http_service = S3ErrorEnhancementLayer::new().layer(http_service);
+        let http_service = s3_error_enhancement::layer(http_service);
 
         let service = hybrid(http_service, rpc_service);
 
