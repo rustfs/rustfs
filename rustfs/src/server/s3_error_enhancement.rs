@@ -19,13 +19,16 @@
 
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, HeaderValue, Request, Response, StatusCode};
+use http_body::HttpBody;
 use http_body_util::{BodyExt, Full};
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
 use serde::{Deserialize, Serialize};
 use std::task::{Context, Poll};
-use tower::Service;
+use tower::{Layer, Service};
 use uuid::Uuid;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Branding constants for albwebfs error responses.
 pub const SERVER_HEADER_VALUE: &str = "albwebfs";
@@ -67,15 +70,15 @@ impl Default for S3ErrorEnhancementLayer {
     }
 }
 
-impl<S, ReqBody, ResBody> tower::Layer<S> for S3ErrorEnhancementLayer
+impl<S, ReqBody, ResBody> Layer<S> for S3ErrorEnhancementLayer
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
     ReqBody: Send + 'static,
-    ResBody: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    ResBody: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    ResBody::Error: Into<BoxError> + Send,
 {
-    type Service = S3ErrorEnhancement<S>;
+    type Service = S3ErrorEnhancement<S, ReqBody, ResBody>;
 
     fn layer(&self, inner: S) -> Self::Service {
         S3ErrorEnhancement { inner }
@@ -84,17 +87,18 @@ where
 
 /// Service that wraps another service and enhances S3 error responses.
 #[derive(Clone, Debug)]
-pub struct S3ErrorEnhancement<S> {
+pub struct S3ErrorEnhancement<S, ReqBody, ResBody> {
     inner: S,
 }
 
-impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for S3ErrorEnhancement<S>
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for S3ErrorEnhancement<S, ReqBody, ResBody>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
+    S::Error: From<BoxError>,
     ReqBody: Send + 'static,
-    ResBody: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    ResBody: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    ResBody::Error: Into<BoxError> + Send,
 {
     type Response = Response<Full<Bytes>>;
     type Error = S::Error;
@@ -116,24 +120,21 @@ where
         Box::pin(async move {
             let response = future.await?;
 
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
             let status = parts.status;
-            let mut headers = parts.headers;
 
             // Only enhance 4xx and 5xx error responses
             if !status.is_client_error() && !status.is_server_error() {
                 let body = BodyExt::collect(body)
                     .await
-                    .map_err(|e| std::io::Error::other(e.into()))?
+                    .map_err(Into::<BoxError>::into)?
                     .to_bytes();
-                return Ok(Response::from_parts(
-                    parts,
-                    Full::new(body),
-                ));
+                return Ok(Response::from_parts(parts, Full::new(body)));
             }
 
             // Check content-type for XML
-            let is_xml = headers
+            let is_xml = parts
+                .headers
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("application/xml") || v.contains("text/xml"))
@@ -141,30 +142,24 @@ where
 
             let body_bytes = BodyExt::collect(body)
                 .await
-                .map_err(|e| std::io::Error::other(e.into()))?
+                .map_err(Into::<BoxError>::into)?
                 .to_bytes();
 
             let enhanced_body = if is_xml {
-                enhance_s3_error_xml(&body_bytes, &headers, status)
+                enhance_s3_error_xml(&body_bytes, &parts.headers, status)
             } else {
                 body_bytes
             };
 
             // Set Server header for all error responses
-            headers.insert(
-                http::header::SERVER,
-                HeaderValue::from_static(SERVER_HEADER_VALUE),
-            );
+            parts
+                .headers
+                .insert(
+                    http::header::SERVER,
+                    HeaderValue::from_static(SERVER_HEADER_VALUE),
+                );
 
-            Ok(Response::from_parts(
-                http::response::Parts {
-                    status,
-                    headers,
-                    version: parts.version,
-                    extensions: parts.extensions,
-                },
-                Full::new(enhanced_body),
-            ))
+            Ok(Response::from_parts(parts, Full::new(enhanced_body)))
         })
     }
 }
