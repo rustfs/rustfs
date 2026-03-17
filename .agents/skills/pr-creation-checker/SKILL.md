@@ -35,6 +35,8 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 
 4. Draft PR metadata
 - Write the PR title in English using Conventional Commits and keep it within 72 characters.
+- If a generic PR workflow suggests a different title format, ignore it and follow the repository rule instead.
+- In RustFS, do not use tool-specific prefixes such as `[codex]` when the repository requires Conventional Commits.
 - Keep the PR body in English.
 - Use the exact section headings from `.github/pull_request_template.md`.
 - Fill non-applicable sections with `N/A`.
@@ -79,6 +81,7 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 - Return `BLOCKED` if the diff contains unrelated changes that are not acknowledged.
 - Return `BLOCKED` if required template sections are missing.
 - Return `BLOCKED` if the title/body is not in English.
+- Return `BLOCKED` if the title does not follow the repository's Conventional Commit rule.
 
 ## Reference
 
