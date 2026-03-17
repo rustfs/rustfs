@@ -682,6 +682,14 @@ impl LifecycleCalculate for LifecycleExpiration {
         if !obj.is_latest || !obj.delete_marker {
             return None;
         }
+        // Check date first (date-based expiration takes priority over days).
+        // A zero unix timestamp means "not set" (default value) and is skipped.
+        if let Some(ref date) = self.date {
+            let expiry_date = OffsetDateTime::from(date.clone());
+            if expiry_date.unix_timestamp() != 0 {
+                return Some(expiry_date);
+            }
+        }
         match self.days {
             Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
             None => None,
@@ -1220,5 +1228,51 @@ mod tests {
 
         assert_eq!(event.action, IlmAction::DeleteVersionAction);
         assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
+    }
+
+    #[tokio::test]
+    async fn expired_object_delete_marker_date_based_not_yet_due() {
+        // A date-based rule that has not yet reached its expiry date must not
+        // trigger immediate deletion (unwrap_or(now) must not override the date).
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let future_date = base_time + Duration::days(10);
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    date: Some(future_date.into()),
+                    expired_object_delete_marker: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-date-del-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 1,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        // now is before the configured date — must not schedule deletion
+        let now_before = base_time + Duration::days(5);
+        let event_before = lc.eval_inner(&opts, now_before, 0).await;
+        assert_eq!(event_before.action, IlmAction::NoneAction);
+
+        // now is after the configured date — must schedule deletion
+        let now_after = base_time + Duration::days(11);
+        let event_after = lc.eval_inner(&opts, now_after, 0).await;
+        assert_eq!(event_after.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event_after.due, Some(future_date));
     }
 }
