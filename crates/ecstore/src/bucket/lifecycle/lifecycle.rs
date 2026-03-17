@@ -439,18 +439,19 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref() {
                         if expiration.expired_object_delete_marker.is_some_and(|v| v) {
-                            let due = expiration.next_due(obj).unwrap_or(now);
-                            if now.unix_timestamp() >= due.unix_timestamp() {
-                                events.push(Event {
-                                    action: IlmAction::DeleteVersionAction,
-                                    rule_id: rule.id.clone().unwrap_or_default(),
-                                    due: Some(due),
-                                    noncurrent_days: 0,
-                                    newer_noncurrent_versions: 0,
-                                    storage_class: "".into(),
-                                });
-                                // Stop after scheduling an expired delete-marker event.
-                                break;
+                            if let Some(due) = expiration.next_due(obj) {
+                                if now.unix_timestamp() >= due.unix_timestamp() {
+                                    events.push(Event {
+                                        action: IlmAction::DeleteVersionAction,
+                                        rule_id: rule.id.clone().unwrap_or_default(),
+                                        due: Some(due),
+                                        noncurrent_days: 0,
+                                        newer_noncurrent_versions: 0,
+                                        storage_class: "".into(),
+                                    });
+                                    // Stop after scheduling an expired delete-marker event.
+                                    break;
+                                }
                             }
                         }
                     }
