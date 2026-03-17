@@ -691,7 +691,7 @@ impl LifecycleCalculate for LifecycleExpiration {
             }
         }
         match self.days {
-            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
+            Some(days) => obj.mod_time.map(|mod_time| expected_expiry_time(mod_time, days)),
             None => None,
         }
     }
