@@ -450,8 +450,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
                                 });
+                                // Stop after scheduling an expired delete-marker event.
+                                break;
                             }
-                            break;
                         }
                     }
                 }
