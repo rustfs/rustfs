@@ -1139,6 +1139,7 @@ mod tests {
         let mut filter = LifecycleRuleFilter::default();
         filter.prefix = Some("prefix".to_string());
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1152,6 +1153,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 
@@ -1183,6 +1185,7 @@ mod tests {
         filter.and = Some(and);
 
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1196,6 +1199,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 
@@ -1222,6 +1226,7 @@ mod tests {
     async fn expired_object_delete_marker_requires_single_version() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1236,6 +1241,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 
@@ -1258,6 +1264,7 @@ mod tests {
     async fn expired_object_delete_marker_deletes_only_delete_marker_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1272,6 +1279,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 
@@ -1299,6 +1307,7 @@ mod tests {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let future_date = base_time + Duration::days(10);
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1313,6 +1322,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 

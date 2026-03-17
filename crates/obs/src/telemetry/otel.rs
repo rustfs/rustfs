@@ -213,7 +213,8 @@ pub(super) fn init_observability_http(
                 .as_deref()
                 .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
                 .to_lowercase();
-            let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
+            let match_mode =
+                FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
             let rotation = match rotation_str.as_str() {
                 "minutely" => Rotation::Minutely,
                 "hourly" => Rotation::Hourly,
