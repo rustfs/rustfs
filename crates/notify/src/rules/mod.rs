@@ -13,8 +13,14 @@
 // limitations under the License.
 
 mod config;
+#[cfg(test)]
+mod config_test;
 pub mod pattern;
 mod pattern_rules;
+#[cfg(test)]
+mod pattern_rules_test;
+#[cfg(test)]
+mod pattern_test;
 mod rules_map;
 mod subscriber_index;
 mod subscriber_snapshot;

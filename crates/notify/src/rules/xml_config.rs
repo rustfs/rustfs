@@ -83,17 +83,20 @@ impl FilterRule {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct FilterRuleList {
+#[derive(Debug, Serialize, Clone, Default, PartialEq, Eq)]
+pub struct S3KeyFilter {
     #[serde(rename = "FilterRule", default, skip_serializing_if = "Vec::is_empty")]
-    pub rules: Vec<FilterRule>,
+    pub filter_rule_list: Vec<FilterRule>,
 }
 
-impl FilterRuleList {
+impl S3KeyFilter {
+    /// Validate filter rules for duplicates.
+    /// According to AWS S3 documentation, there can be at most one prefix
+    /// and one suffix filter rule per queue configuration.
     pub fn validate(&self) -> Result<(), ParseConfigError> {
         let mut has_prefix = false;
         let mut has_suffix = false;
-        for rule in &self.rules {
+        for rule in &self.filter_rule_list {
             rule.validate()?;
             if rule.name == "prefix" {
                 if has_prefix {
@@ -110,11 +113,19 @@ impl FilterRuleList {
         Ok(())
     }
 
+    /// Check if filter rule list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.filter_rule_list.is_empty()
+    }
+
+    /// Generate pattern string from filter rules.
+    /// This method extracts prefix and suffix values from filter rules
+    /// and generates a wildcard pattern string for matching object keys.
     pub fn pattern(&self) -> String {
         let mut prefix_val: Option<&str> = None;
         let mut suffix_val: Option<&str> = None;
 
-        for rule in &self.rules {
+        for rule in &self.filter_rule_list {
             if rule.name == "prefix" {
                 prefix_val = Some(&rule.value);
             } else if rule.name == "suffix" {
@@ -123,16 +134,88 @@ impl FilterRuleList {
         }
         pattern::new_pattern(prefix_val, suffix_val)
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+#[derive(Debug, serde::Deserialize)]
+struct S3KeyContent {
+    #[serde(rename = "FilterRule", default)]
+    filter_rule_list: Vec<FilterRule>,
+    #[serde(rename = "FilterRuleList", default)]
+    filter_rule_list_wrapper: Option<S3KeyFilterRuleList>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct S3KeyFilterRuleList {
+    #[serde(rename = "FilterRule", default)]
+    filter_rule_list: Vec<FilterRule>,
+}
+
+impl S3KeyContent {
+    /// Get all filter rules from this S3Key content, handling both direct FilterRule
+    /// and FilterRuleList wrapper structures
+    fn get_filter_rules(&self) -> Vec<FilterRule> {
+        // If we have a FilterRuleList wrapper, use that
+        if let Some(wrapper) = &self.filter_rule_list_wrapper
+            && !wrapper.filter_rule_list.is_empty()
+        {
+            return wrapper.filter_rule_list.clone();
+        }
+        // Otherwise use direct FilterRule list
+        self.filter_rule_list.clone()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct S3KeyFilter {
-    #[serde(rename = "FilterRuleList", default, skip_serializing_if = "FilterRuleList::is_empty")]
-    pub filter_rule_list: FilterRuleList,
+/// Custom deserializer for S3KeyFilter to handle Filter element correctly.
+/// AWS S3 XML structure: <Filter><S3Key><FilterRule>...</FilterRule></S3Key></Filter>
+impl<'de> Deserialize<'de> for S3KeyFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct S3KeyFilterVisitor {
+            filter_rules: Vec<FilterRule>,
+        }
+
+        impl S3KeyFilterVisitor {
+            fn new() -> Self {
+                Self {
+                    filter_rules: Vec::new(),
+                }
+            }
+        }
+
+        impl<'de> serde::de::Visitor<'de> for S3KeyFilterVisitor {
+            type Value = S3KeyFilter;
+
+            fn expecting(&self, _formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                Ok(())
+            }
+
+            fn visit_map<V>(mut self, mut map: V) -> Result<Self::Value, V::Error>
+            where
+                V: serde::de::MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "S3Key" => {
+                            // Parse S3Key content which contains FilterRule(s)
+                            let s3key_content: S3KeyContent = map.next_value()?;
+                            self.filter_rules = s3key_content.get_filter_rules();
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(S3KeyFilter {
+                    filter_rule_list: self.filter_rules,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(S3KeyFilterVisitor::new())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -163,7 +246,7 @@ impl QueueConfig {
                 return Err(ParseConfigError::DuplicateEventName(event.to_string()));
             }
         }
-        self.filter.filter_rule_list.validate()?;
+        self.filter.validate()?;
 
         // Validate ARN (similar to Go's Queue.Validate)
         // The Go code checks targetList.Exists(q.ARN.TargetID)
@@ -207,25 +290,6 @@ impl QueueConfig {
 pub struct LambdaConfigDetail {
     #[serde(rename = "CloudFunction")]
     pub arn: String,
-    // According to AWS S3 documentation, <CloudFunctionConfiguration> usually also contains Id, Event, Filter
-    // But in order to strictly correspond to the Go `lambda` structure provided, only ARN is included here.
-    // If full support is required, additional fields can be added.
-    // For example:
-    // #[serde(rename = "Id", skip_serializing_if = "Option::is_none")]
-    // pub id: Option<String>,
-    // #[serde(rename = "Event", default, skip_serializing_if = "Vec::is_empty")]
-    // pub events: Vec<EventName>,
-    // #[serde(rename = "Filter", default, skip_serializing_if = "S3KeyFilterIsEmpty")]
-    // pub filter: S3KeyFilter,
-}
-
-/// Corresponding to the `topic` structure in the Go code.
-/// Used to parse <Topic> ARN from inside the <TopicConfiguration> tag.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-pub struct TopicConfigDetail {
-    #[serde(rename = "Topic")]
-    pub arn: String,
-    // Similar to LambdaConfigDetail, it can be extended to include fields such as Id, Event, Filter, etc.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -241,12 +305,9 @@ pub struct NotificationConfiguration {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub lambda_list: Vec<LambdaConfigDetail>, // Modify: Use a new structure
-    #[serde(
-        rename = "TopicConfiguration", // Tags for each topic configuration item in XML
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub topic_list: Vec<TopicConfigDetail>, // Modify: Use a new structure
+    // TopicConfiguration is not supported - left empty for XML compatibility
+    #[serde(skip)]
+    pub topic_list: Vec<()>, // Not used, always returns error if populated
 }
 
 impl NotificationConfiguration {
