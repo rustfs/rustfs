@@ -136,8 +136,11 @@ impl RuleValidate for LifecycleRule {
 }
 
 fn lifecycle_rule_prefix(rule: &LifecycleRule) -> Option<&str> {
+    // Prefer a non-empty legacy prefix; treat an empty legacy prefix as if it were not set
     if let Some(p) = rule.prefix.as_deref() {
-        return Some(p);
+        if !p.is_empty() {
+            return Some(p);
+        }
     }
 
     let Some(filter) = rule.filter.as_ref() else {
