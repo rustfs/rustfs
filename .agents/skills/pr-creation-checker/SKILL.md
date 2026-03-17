@@ -9,10 +9,10 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 
 ## Read sources of truth first
 
-- Read `/Users/overtrue/www/rustfs/AGENTS.md`.
-- Read `/Users/overtrue/www/rustfs/.github/pull_request_template.md`.
-- Use `/Users/overtrue/www/rustfs/Makefile` and `/Users/overtrue/www/rustfs/.config/make/` for local quality commands.
-- Use `/Users/overtrue/www/rustfs/.github/workflows/ci.yml` for CI expectations.
+- Read `AGENTS.md`.
+- Read `.github/pull_request_template.md`.
+- Use `Makefile` and `.config/make/` for local quality commands.
+- Use `.github/workflows/ci.yml` for CI expectations.
 - Do not restate long command matrices or template sections from memory when the files exist.
 
 ## Workflow
@@ -39,6 +39,8 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 - Use the exact section headings from `.github/pull_request_template.md`.
 - Fill non-applicable sections with `N/A`.
 - Include verification commands in the PR description.
+- Do not include local filesystem paths in the PR body unless the user explicitly asks for them.
+- Prefer repo-relative paths, command names, and concise summaries over machine-specific paths such as `/Users/...`.
 
 5. Prepare reviewer context
 - Summarize why the change exists.
@@ -62,6 +64,7 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 ### PR Body
 - Reproduce the repository template headings exactly.
 - Fill every section.
+- Omit local absolute paths unless explicitly required.
 
 ### Verification
 - List each command run.

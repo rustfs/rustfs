@@ -9,4 +9,5 @@
 - Confirm the PR body is in English.
 - Confirm the PR body keeps the exact headings from `.github/pull_request_template.md`.
 - Confirm non-applicable sections are filled with `N/A`.
+- Confirm the PR body does not include local absolute paths unless explicitly required.
 - Confirm multiline GitHub CLI commands use `--body-file`.
