@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_minio_admin_request, read_compatible_admin_body};
+use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::{
@@ -44,16 +44,16 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 use url::form_urlencoded;
 
-fn minio_time_sentinel() -> OffsetDateTime {
+fn compat_time_sentinel() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH
 }
 
 fn list_expiration_or_sentinel(expiration: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
-    Some(expiration.unwrap_or_else(minio_time_sentinel))
+    Some(expiration.unwrap_or_else(compat_time_sentinel))
 }
 
 fn expiration_for_admin_path(path: &str, expiration: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
-    if is_minio_admin_request(path) {
+    if is_compat_admin_request(path) {
         list_expiration_or_sentinel(expiration)
     } else {
         expiration
@@ -61,7 +61,7 @@ fn expiration_for_admin_path(path: &str, expiration: Option<OffsetDateTime>) -> 
 }
 
 fn delete_service_account_success_status(path: &str) -> StatusCode {
-    if is_minio_admin_request(path) {
+    if is_compat_admin_request(path) {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::OK
@@ -1223,7 +1223,7 @@ mod tests {
     use serde_urlencoded::from_bytes;
 
     #[test]
-    fn access_key_query_supports_minio_alias() {
+    fn access_key_query_supports_external_alias() {
         let query: AccessKeyQuery = from_bytes(b"access-key=test-access-key").expect("parse query");
         assert_eq!(query.access_key, "test-access-key");
     }
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn list_access_keys_query_parses_minio_parameters() {
+    fn list_access_keys_query_parses_external_parameters() {
         let query = parse_list_access_keys_query(Some("users=alice&users=bob&all=true&listType=svcacc-only"));
 
         assert_eq!(query.users, vec!["alice".to_string(), "bob".to_string()]);
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_service_account_uses_minio_success_status() {
+    fn delete_service_account_uses_external_success_status() {
         assert_eq!(
             delete_service_account_success_status("/minio/admin/v3/delete-service-account"),
             StatusCode::NO_CONTENT
@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn expiration_for_minio_admin_path_uses_sentinel() {
+    fn expiration_for_external_admin_path_uses_sentinel() {
         assert_eq!(
             expiration_for_admin_path("/minio/admin/v3/list-service-accounts", None),
             Some(OffsetDateTime::UNIX_EPOCH)

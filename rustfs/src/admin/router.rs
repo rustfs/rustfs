@@ -264,13 +264,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonicalize_admin_path_maps_minio_prefix_to_rustfs_prefix() {
+    fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
         assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
         assert_eq!(canonicalize_admin_path("/rustfs/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
     }
 
     #[test]
-    fn is_admin_path_accepts_rustfs_and_minio_prefixes() {
+    fn is_admin_path_accepts_rustfs_and_compat_prefixes() {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
         assert!(!is_admin_path("/bucket/object"));

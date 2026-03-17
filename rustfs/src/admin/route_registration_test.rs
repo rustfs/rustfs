@@ -24,7 +24,7 @@ fn admin_path(path: &str) -> String {
     format!("{}{}", ADMIN_PREFIX, path)
 }
 
-fn minio_admin_path(path: &str) -> String {
+fn compat_admin_alias_path(path: &str) -> String {
     format!("{}{}", MINIO_ADMIN_PREFIX, path)
 }
 
@@ -122,7 +122,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 }
 
 #[test]
-fn test_minio_admin_alias_paths_match_existing_admin_routes() {
+fn test_admin_alias_paths_match_existing_admin_routes() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
     health::register_health_route(&mut router).expect("register health route");
@@ -134,21 +134,21 @@ fn test_minio_admin_alias_paths_match_existing_admin_routes() {
     quota::register_quota_route(&mut router).expect("register quota route");
 
     for (method, path) in [
-        (Method::GET, minio_admin_path("/v3/is-admin")),
-        (Method::GET, minio_admin_path("/v3/info")),
-        (Method::GET, minio_admin_path("/v3/storageinfo")),
-        (Method::GET, minio_admin_path("/v3/pools/list")),
-        (Method::PUT, minio_admin_path("/v3/add-service-account")),
-        (Method::GET, minio_admin_path("/v3/temporary-account-info")),
-        (Method::GET, minio_admin_path("/v3/info-access-key")),
-        (Method::GET, minio_admin_path("/v3/list-access-keys-bulk")),
-        (Method::PUT, minio_admin_path("/v3/set-policy")),
-        (Method::PUT, minio_admin_path("/v3/set-bucket-quota")),
-        (Method::GET, minio_admin_path("/v3/get-bucket-quota")),
-        (Method::POST, minio_admin_path("/v3/idp/builtin/policy/attach")),
-        (Method::POST, minio_admin_path("/v3/idp/builtin/policy/detach")),
-        (Method::GET, minio_admin_path("/v3/idp/builtin/policy-entities")),
-        (Method::POST, minio_admin_path("/v3/rebalance/start")),
+        (Method::GET, compat_admin_alias_path("/v3/is-admin")),
+        (Method::GET, compat_admin_alias_path("/v3/info")),
+        (Method::GET, compat_admin_alias_path("/v3/storageinfo")),
+        (Method::GET, compat_admin_alias_path("/v3/pools/list")),
+        (Method::PUT, compat_admin_alias_path("/v3/add-service-account")),
+        (Method::GET, compat_admin_alias_path("/v3/temporary-account-info")),
+        (Method::GET, compat_admin_alias_path("/v3/info-access-key")),
+        (Method::GET, compat_admin_alias_path("/v3/list-access-keys-bulk")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-policy")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
+        (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
+        (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/attach")),
+        (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
+        (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
+        (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

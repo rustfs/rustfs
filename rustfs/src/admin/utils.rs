@@ -20,7 +20,7 @@ pub(crate) fn has_space_be(s: &str) -> bool {
     s.trim().len() != s.len()
 }
 
-pub(crate) fn is_minio_admin_request(path: &str) -> bool {
+pub(crate) fn is_compat_admin_request(path: &str) -> bool {
     path.starts_with(MINIO_ADMIN_PREFIX)
 }
 
@@ -35,7 +35,7 @@ pub(crate) async fn read_compatible_admin_body(
         .await
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-    if is_minio_admin_request(path) {
+    if is_compat_admin_request(path) {
         decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
             .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
             .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
@@ -45,7 +45,7 @@ pub(crate) async fn read_compatible_admin_body(
 }
 
 pub(crate) fn encode_compatible_admin_payload(path: &str, secret_key: &str, data: Vec<u8>) -> S3Result<(Vec<u8>, &'static str)> {
-    if is_minio_admin_request(path) {
+    if is_compat_admin_request(path) {
         let encrypted = encrypt_stream_io(secret_key.as_bytes(), &data)
             .map_err(|e| s3_error!(InternalError, "failed to encrypt MinIO admin payload: {}", e))?;
         Ok((encrypted, "application/octet-stream"))
@@ -61,9 +61,9 @@ mod tests {
     use s3s::Body;
 
     #[test]
-    fn detects_minio_admin_paths_only_for_minio_prefix() {
-        assert!(is_minio_admin_request("/minio/admin/v3/list-users"));
-        assert!(!is_minio_admin_request("/rustfs/admin/v3/list-users"));
+    fn detects_compat_admin_paths_only_for_external_prefix() {
+        assert!(is_compat_admin_request("/minio/admin/v3/list-users"));
+        assert!(!is_compat_admin_request("/rustfs/admin/v3/list-users"));
     }
 
     #[test]
@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_minio_payload_with_compatible_encryption() {
+    fn encodes_compat_payload_with_compatible_encryption() {
         let payload = b"{\"ok\":true}".to_vec();
         let (encoded, content_type) =
             encode_compatible_admin_payload("/minio/admin/v3/list-users", "secret", payload.clone()).expect("encode payload");
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_legacy_minio_payload_as_fallback() {
+    async fn reads_legacy_compat_payload_as_fallback() {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 

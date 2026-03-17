@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_minio_prefixed_envs_are_accepted_by_parser() {
+    fn test_external_prefixed_envs_are_accepted_by_parser() {
         temp_env::with_vars(
             [
                 ("MINIO_VOLUMES", Some("/compat/vol1")),

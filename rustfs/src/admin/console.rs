@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn minio_admin_paths_are_not_console_paths() {
+    fn external_admin_paths_are_not_console_paths() {
         assert!(is_console_path("/rustfs/console/"));
         assert!(!is_console_path("/minio/admin/v3/info"));
         assert!(!is_console_path("/rustfs/admin/v3/info"));

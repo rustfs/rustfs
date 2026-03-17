@@ -893,7 +893,7 @@ mod tests {
     use rustfs_madmin::UserInfo;
 
     #[test]
-    fn set_policy_query_supports_minio_parameter_names() {
+    fn set_policy_query_supports_external_parameter_names() {
         let query: SetPolicyForUserOrGroupQuery =
             serde_urlencoded::from_str("policy=readwrite&user-or-group=test-user&is-group=true").expect("query should parse");
 
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_entities_query_supports_repeated_minio_parameters() {
+    fn policy_entities_query_supports_repeated_external_parameters() {
         let query = parse_policy_entities_query(Some("user=alice&user=bob&group=ops&policy=readonly&policy=writeonly"));
 
         assert_eq!(query.users, vec!["alice".to_string(), "bob".to_string()]);
