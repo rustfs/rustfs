@@ -55,7 +55,7 @@ on:
         default: true
         type: boolean
       platforms:
-        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,macos-aarch64)"
+        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,linux-aarch64-musl)"
         required: false
         default: "all"
         type: string
@@ -187,10 +187,7 @@ jobs:
             {"target_id":"linux-x86_64-musl","os":"blacksmith-4vcpu-ubuntu-2404","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
             {"target_id":"linux-aarch64-musl","os":"blacksmith-4vcpu-ubuntu-2404","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
             {"target_id":"linux-x86_64-gnu","os":"blacksmith-4vcpu-ubuntu-2404","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-gnu","os":"blacksmith-4vcpu-ubuntu-2404","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+            {"target_id":"linux-aarch64-gnu","os":"blacksmith-4vcpu-ubuntu-2404","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -249,26 +246,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p ./rustfs/static
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
-            fi
+          chmod +w ./rustfs/static/LICENSE || true
+          curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+            -o console.zip --retry 3 --retry-delay 5 --max-time 300
+          if [[ $? -eq 0 ]]; then
+            unzip -o console.zip -d ./rustfs/static
+            rm console.zip
           else
-            chmod +w ./rustfs/static/LICENSE || true
-            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-              -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
-            fi
+            echo "Warning: Failed to download console assets, continuing without them"
+            echo "// Static assets not available" > ./rustfs/static/empty.txt
           fi
 
       - name: Build RustFS
@@ -278,14 +264,7 @@ jobs:
           touch rustfs/build.rs
 
           if [[ "${{ matrix.cross }}" == "true" ]]; then
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              # Use cross for Windows ARM64
-              cargo install cross --git https://github.com/cross-rs/cross
-              cross build --release --target ${{ matrix.target }} -p rustfs --bins
-            else
-              # Use zigbuild for other cross-compilation
-              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
-            fi
+            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
           else
             cargo build --release --target ${{ matrix.target }} -p rustfs --bins
           fi
@@ -361,38 +340,20 @@ jobs:
           fi
 
           cd target/${{ matrix.target }}/release
-          # Determine the binary name based on platform
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            BINARY_NAME="rustfs.exe"
-          else
-            BINARY_NAME="rustfs"
-          fi
+          BINARY_NAME="rustfs"
 
           # Verify the binary exists before packaging
           if [[ ! -f "$BINARY_NAME" ]]; then
             echo "❌ Binary $BINARY_NAME not found in $(pwd)"
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              dir
-            else
-              ls -la
-            fi
+            ls -la
             exit 1
           fi
 
-          # Universal packaging function
+          # Package with zip
           package_zip() {
             local src=$1
             local dst=$2
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              # Windows uses PowerShell Compress-Archive
-              powershell -Command "Compress-Archive -Path '$src' -DestinationPath '$dst' -Force"
-            elif command -v zip &> /dev/null; then
-              # Unix systems use zip command
-              zip "$dst" "$src"
-            else
-              echo "❌ No zip utility available"
-              exit 1
-            fi
+            zip "$dst" "$src"
           }
 
           # Create the zip package
@@ -404,11 +365,7 @@ jobs:
           # Verify the package was created
           if [[ -f "${PACKAGE_NAME}.zip" ]]; then
             echo "✅ Package created successfully: ${PACKAGE_NAME}.zip"
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              dir
-            else
-              ls -lh ${PACKAGE_NAME}.zip
-            fi
+            ls -lh ${PACKAGE_NAME}.zip
           else
             echo "❌ Failed to create package: ${PACKAGE_NAME}.zip"
             exit 1
@@ -487,52 +444,22 @@ jobs:
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
 
-          # Install ossutil (platform-specific)
+          # Install ossutil (Linux only)
           OSSUTIL_VERSION="2.1.1"
-          case "${{ matrix.platform }}" in
-            linux)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            ARCH="arm64"
+          else
+            ARCH="amd64"
+          fi
+          OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
+          OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
 
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            macos)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
-
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            windows)
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
-
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              OSSUTIL_BIN=./ossutil.exe
-              ;;
-          esac
+          curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          unzip "$OSSUTIL_ZIP"
+          mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+          chmod +x /usr/local/bin/ossutil
+          OSSUTIL_BIN=ossutil
 
           # Determine upload path based on build type
           if [[ "$BUILD_TYPE" == "development" ]]; then
