@@ -55,7 +55,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status};
-use tower::{Layer, ServiceBuilder};
+use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;

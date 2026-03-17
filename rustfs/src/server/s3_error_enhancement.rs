@@ -56,7 +56,6 @@ struct S3ErrorXml {
 }
 
 /// Tower layer that enhances S3 error responses with professional branding.
-#[derive(Clone, Debug)]
 pub struct S3ErrorEnhancementLayer<ReqBody, ResBody> {
     _marker: PhantomData<(ReqBody, ResBody)>,
 }
@@ -73,6 +72,12 @@ impl<ReqBody, ResBody> Default for S3ErrorEnhancementLayer<ReqBody, ResBody> {
     }
 }
 
+impl<ReqBody, ResBody> Clone for S3ErrorEnhancementLayer<ReqBody, ResBody> {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
 /// Wraps a service with S3 error enhancement.
 ///
 /// This is the preferred entry point when composing the HTTP stack, as it
@@ -81,7 +86,6 @@ pub fn layer<S, ReqBody, ResBody>(service: S) -> S3ErrorEnhancement<S, ReqBody, 
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
-    S::Error: From<BoxError>,
     ReqBody: Send + 'static,
     ResBody: Body<Data = Bytes> + Send + Unpin + 'static,
     ResBody::Error: Into<BoxError> + Send,
@@ -108,17 +112,27 @@ where
 }
 
 /// Service that wraps another service and enhances S3 error responses.
-#[derive(Clone, Debug)]
 pub struct S3ErrorEnhancement<S, ReqBody, ResBody> {
     inner: S,
     _marker: PhantomData<(ReqBody, ResBody)>,
+}
+
+impl<S, ReqBody, ResBody> Clone for S3ErrorEnhancement<S, ReqBody, ResBody>
+where
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for S3ErrorEnhancement<S, ReqBody, ResBody>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
-    S::Error: From<BoxError>,
     ReqBody: Send + 'static,
     ResBody: Body<Data = Bytes> + Send + Unpin + 'static,
     ResBody::Error: Into<BoxError> + Send,
@@ -143,7 +157,10 @@ where
 
             // Only enhance 4xx and 5xx error responses
             if !status.is_client_error() && !status.is_server_error() {
-                let body = BodyExt::collect(body).await.map_err(Into::<BoxError>::into)?.to_bytes();
+                let body = match BodyExt::collect(body).await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(_) => Bytes::new(),
+                };
                 return Ok(Response::from_parts(parts, Full::new(body)));
             }
 
@@ -155,7 +172,10 @@ where
                 .map(|v| v.contains("application/xml") || v.contains("text/xml"))
                 .unwrap_or(false);
 
-            let body_bytes = BodyExt::collect(body).await.map_err(Into::<BoxError>::into)?.to_bytes();
+            let body_bytes = match BodyExt::collect(body).await {
+                Ok(collected) => collected.to_bytes(),
+                Err(_) => Bytes::new(),
+            };
 
             let enhanced_body = if is_xml {
                 enhance_s3_error_xml(&body_bytes, &parts.headers, status)
