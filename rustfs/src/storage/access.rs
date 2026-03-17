@@ -405,6 +405,7 @@ impl S3Access for FS {
 
         let ext = cx.extensions_mut();
         ext.insert(req_info);
+        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
 
         // Verify uniformly here? Or verify separately below?
 
@@ -415,8 +416,6 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
-        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
-
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
@@ -480,8 +479,6 @@ impl S3Access for FS {
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
-        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
-
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1318,8 +1315,6 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
-        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
-
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
