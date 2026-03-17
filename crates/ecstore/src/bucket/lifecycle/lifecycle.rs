@@ -436,7 +436,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         if let Some(ref lc_rules) = self.filter_rules(obj).await {
             for rule in lc_rules.iter() {
-                if obj.expired_object_deletemarker() {
+                if obj.is_latest && obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref() {
                         if expiration.expired_object_delete_marker.is_some_and(|v| v) {
                             if let Some(due) = expiration.next_due(obj) {
