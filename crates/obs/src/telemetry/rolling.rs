@@ -19,7 +19,12 @@
 //! log files do not grow indefinitely by rotating them when they exceed a configured size.
 
 use crate::cleaner::types::FileMatchMode;
+use crate::global::{
+    METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES, METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
+    METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL, METRIC_LOG_CLEANER_ROTATION_TOTAL,
+};
 use jiff::Zoned;
+use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -186,6 +191,7 @@ impl RollingAppender {
     }
 
     fn roll(&mut self) -> io::Result<()> {
+        let rotate_started = std::time::Instant::now();
         // 1. Close current file first to ensure all buffers are flushed to OS (if any)
         // and handle released.
         if let Some(mut file) = self.file.take()
@@ -250,6 +256,9 @@ impl RollingAppender {
                     // This overrides whatever open_file() derived from mtime, ensuring
                     // we stick to the logical rotation time.
                     self.last_roll_ts = now.timestamp().as_second();
+                    counter!(METRIC_LOG_CLEANER_ROTATION_TOTAL).increment(1);
+                    histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
+                    gauge!(METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES).set(self.size as f64);
                     return Ok(());
                 }
                 Err(e) => {
@@ -281,6 +290,8 @@ impl RollingAppender {
             "RollingAppender: Failed to rotate log file after {} retries. Error: {:?}",
             MAX_RETRIES, last_error
         );
+        counter!(METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL).increment(1);
+        histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
 
         // Attempt to re-open existing active file to allow continued writing
         self.open_file()?;
@@ -314,6 +325,7 @@ impl Write for RollingAppender {
         if let Some(file) = &mut self.file {
             let n = file.write(buf)?;
             self.size += n as u64;
+            gauge!(METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES).set(self.size as f64);
             Ok(n)
         } else {
             Err(io::Error::other("Failed to open log file"))

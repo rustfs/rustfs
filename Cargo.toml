@@ -199,6 +199,9 @@ const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-queue = "0.3.12"
+crossbeam-channel = "0.5.15"
+crossbeam-deque = "0.8.6"
+crossbeam-utils = "0.8.21"
 datafusion = "52.3.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"

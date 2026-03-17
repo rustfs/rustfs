@@ -14,7 +14,7 @@ logging, distributed tracing, metrics via OpenTelemetry, and continuous profilin
 | **Distributed tracing**      | OTLP/HTTP export to Jaeger, Tempo, or any OTel collector                     |
 | **Metrics**                  | OTLP/HTTP export, bridged from the `metrics` crate facade                    |
 | **Continuous Profiling**     | CPU/Memory profiling export to Pyroscope                                     |
-| **Log cleanup**              | Background task: size limits, gzip compression, retention policies           |
+| **Log cleanup**              | Background task: size limits, zstd/gzip compression, retention policies      |
 | **GPU metrics** *(optional)* | Enable with the `gpu` feature flag                                           |
 
 ---
@@ -148,14 +148,173 @@ All configuration is read from environment variables at startup.
 |-------------------------------------------------|--------------|-------------------------------------------------------------|
 | `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Hard cap on total log directory size (2 GiB)                |
 | `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | `0`          | Per-file size cap; `0` = unlimited                          |
-| `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Gzip-compress files before deleting                         |
+| `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Compress files before deleting                              |
 | `RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL`         | `6`          | Gzip level `1` (fastest) – `9` (best)                       |
-| `RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS` | `30`         | Delete `.gz` archives older than N days; `0` = keep forever |
+| `RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM`          | `zstd`       | Compression codec: `zstd` or `gzip`                         |
+| `RUSTFS_OBS_LOG_PARALLEL_COMPRESS`              | `true`       | Enable work-stealing parallel compression                   |
+| `RUSTFS_OBS_LOG_PARALLEL_WORKERS`               | `6`          | Number of cleaner worker threads                            |
+| `RUSTFS_OBS_LOG_ZSTD_COMPRESSION_LEVEL`         | `8`          | Zstd level `1` (fastest) – `21` (best ratio)               |
+| `RUSTFS_OBS_LOG_ZSTD_FALLBACK_TO_GZIP`          | `true`       | Fallback to gzip when zstd compression fails                |
+| `RUSTFS_OBS_LOG_ZSTD_WORKERS`                   | `1`          | zstdmt worker threads per compression task                  |
+| `RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS` | `30`         | Delete `.gz` / `.zst` archives older than N days; `0` = keep forever |
 | `RUSTFS_OBS_LOG_EXCLUDE_PATTERNS`               | _(empty)_    | Comma-separated glob patterns to never clean up             |
 | `RUSTFS_OBS_LOG_DELETE_EMPTY_FILES`             | `true`       | Remove zero-byte files                                      |
 | `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`           | `3600`       | Minimum file age (seconds) before cleanup                   |
 | `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `1800`       | How often the cleanup task runs (0.5 hours)                 |
 | `RUSTFS_OBS_LOG_DRY_RUN`                        | `false`      | Report deletions without actually removing files            |
+
+---
+
+## Cleaner & Rotation Metrics
+
+The log rotation and cleanup pipeline emits these metrics (via the `metrics` facade):
+
+| Metric | Type | Description |
+|---|---|---|
+| `rustfs.log_cleaner.deleted_files_total` | counter | Number of files deleted per cleanup pass |
+| `rustfs.log_cleaner.freed_bytes_total` | counter | Bytes reclaimed by deletion |
+| `rustfs.log_cleaner.compress_duration_seconds` | histogram | Compression stage duration |
+| `rustfs.log_cleaner.steal_success_rate` | gauge | Work-stealing success ratio in parallel mode |
+| `rustfs.log_cleaner.runs_total` | counter | Successful cleanup loop runs |
+| `rustfs.log_cleaner.run_failures_total` | counter | Failed or panicked cleanup loop runs |
+| `rustfs.log_cleaner.rotation_total` | counter | Successful file rotations |
+| `rustfs.log_cleaner.rotation_failures_total` | counter | Failed file rotations |
+| `rustfs.log_cleaner.rotation_duration_seconds` | histogram | Rotation latency |
+| `rustfs.log_cleaner.active_file_size_bytes` | gauge | Current active log file size |
+
+These metrics cover compression, cleanup, and file rotation end-to-end.
+
+### Metric Semantics
+
+- `deleted_files_total` and `freed_bytes_total` are emitted after each cleanup pass and include both normal log cleanup and expired compressed archive cleanup.
+- `compress_duration_seconds` measures compression stage wall-clock time for both serial and parallel modes.
+- `steal_success_rate` is updated by the parallel work-stealing path and remains at the last computed value.
+- `rotation_*` metrics are emitted by `RollingAppender` and include retries; a failed final rotation increments `rotation_failures_total`.
+- `active_file_size_bytes` is sampled on writes and after successful roll, so dashboards can track current active file growth.
+
+### Grafana Dashboard JSON Draft (Ready to Import)
+
+> Save this as `rustfs-log-cleaner-dashboard.json`, then import from Grafana UI.
+> For Prometheus datasources, metric names are usually normalized to underscores,
+> so `rustfs.log_cleaner.deleted_files_total` becomes `rustfs_log_cleaner_deleted_files_total`.
+>
+> The same panels are now checked in at:
+> `.docker/observability/grafana/dashboards/rustfs.json`
+> (row title: `Log Cleaner`).
+
+```json
+{
+  "uid": "rustfs-log-cleaner",
+  "title": "RustFS Log Cleaner",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "tags": ["rustfs", "observability", "log-cleaner"],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Cleanup Runs / Failures",
+      "type": "timeseries",
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(rustfs_log_cleaner_runs_total[5m]))", "legendFormat": "runs/s" },
+        { "refId": "B", "expr": "sum(rate(rustfs_log_cleaner_run_failures_total[5m]))", "legendFormat": "failures/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Freed Bytes / Deleted Files",
+      "type": "timeseries",
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(rustfs_log_cleaner_freed_bytes_total[15m]))", "legendFormat": "bytes/s" },
+        { "refId": "B", "expr": "sum(rate(rustfs_log_cleaner_deleted_files_total[15m]))", "legendFormat": "files/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Compression P95 Latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(rustfs_log_cleaner_compress_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "title": "Rotation Success / Failure",
+      "type": "timeseries",
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(rustfs_log_cleaner_rotation_total[5m]))", "legendFormat": "rotation/s" },
+        { "refId": "B", "expr": "sum(rate(rustfs_log_cleaner_rotation_failures_total[5m]))", "legendFormat": "rotation_failures/s" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Steal Success Rate",
+      "type": "timeseries",
+      "targets": [
+        { "refId": "A", "expr": "max(rustfs_log_cleaner_steal_success_rate)", "legendFormat": "ratio" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
+    },
+    {
+      "id": 6,
+      "title": "Active File Size",
+      "type": "timeseries",
+      "targets": [
+        { "refId": "A", "expr": "max(rustfs_log_cleaner_active_file_size_bytes)", "legendFormat": "bytes" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }
+    }
+  ]
+}
+```
+
+### PromQL Templates
+
+Use these templates directly in Grafana panels/alerts.
+
+- **Cleanup run rate**
+  - `sum(rate(rustfs_log_cleaner_runs_total[$__rate_interval]))`
+- **Cleanup failure rate**
+  - `sum(rate(rustfs_log_cleaner_run_failures_total[$__rate_interval]))`
+- **Cleanup failure ratio**
+  - `sum(rate(rustfs_log_cleaner_run_failures_total[$__rate_interval])) / clamp_min(sum(rate(rustfs_log_cleaner_runs_total[$__rate_interval])), 1e-9)`
+- **Freed bytes throughput**
+  - `sum(rate(rustfs_log_cleaner_freed_bytes_total[$__rate_interval]))`
+- **Deleted files throughput**
+  - `sum(rate(rustfs_log_cleaner_deleted_files_total[$__rate_interval]))`
+- **Compression p95 latency**
+  - `histogram_quantile(0.95, sum(rate(rustfs_log_cleaner_compress_duration_seconds_bucket[$__rate_interval])) by (le))`
+- **Rotation failure ratio**
+  - `sum(rate(rustfs_log_cleaner_rotation_failures_total[$__rate_interval])) / clamp_min(sum(rate(rustfs_log_cleaner_rotation_total[$__rate_interval])), 1e-9)`
+- **Work-stealing efficiency (latest)**
+  - `max(rustfs_log_cleaner_steal_success_rate)`
+- **Active file size (latest)**
+  - `max(rustfs_log_cleaner_active_file_size_bytes)`
+
+### Suggested Alerts
+
+- **CleanupFailureRatioHigh**: failure ratio > 0.05 for 10m.
+- **CompressionLatencyP95High**: p95 above your baseline SLO for 15m.
+- **RotationFailuresDetected**: rotation failure rate > 0 for 3 consecutive windows.
+- **NoCleanupActivity**: runs rate == 0 for expected active environments.
+
+### Metrics Compatibility
+
+The project is currently in active development. Metric names and labels are updated directly when architecture evolves, and no backward-compatibility shim is maintained for old names.
+Use the metric names documented in this README as the current source of truth.
 
 ---
 
@@ -207,6 +366,19 @@ export RUSTFS_OBS_LOG_DRY_RUN=true
 # Observe log output — no files will actually be deleted.
 ```
 
+### Parallel zstd cleanup (recommended production profile)
+
+```bash
+export RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs
+export RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM=zstd
+export RUSTFS_OBS_LOG_PARALLEL_COMPRESS=true
+export RUSTFS_OBS_LOG_PARALLEL_WORKERS=6
+export RUSTFS_OBS_LOG_ZSTD_COMPRESSION_LEVEL=8
+export RUSTFS_OBS_LOG_ZSTD_FALLBACK_TO_GZIP=true
+export RUSTFS_OBS_LOG_ZSTD_WORKERS=1
+./rustfs
+```
+
 ---
 
 ## Module Structure
@@ -229,9 +401,9 @@ rustfs-obs/src/
 │
 ├── cleaner/                 # Background log-file cleanup subsystem
 │   ├── mod.rs               # LogCleaner public API + tests
-│   ├── types.rs             # FileInfo shared type
+│   ├── types.rs             # Shared cleaner types (match mode, compression codec, FileInfo)
 │   ├── scanner.rs           # Filesystem discovery
-│   ├── compress.rs          # Gzip compression helper
+│   ├── compress.rs          # Gzip/Zstd compression helper
 │   └── core.rs              # Selection, compression, deletion logic
 │
 └── system/                  # Host metrics (CPU, memory, disk, GPU)
