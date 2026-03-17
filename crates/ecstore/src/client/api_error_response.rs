@@ -25,7 +25,7 @@ use std::fmt::Display;
 
 use s3s::S3ErrorCode;
 
-const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/rustfs/rustfs/issues.";
+const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/albwebsolutions/albwebfs/issues.";
 
 #[derive(Serialize, Deserialize, Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[serde(default, rename_all = "PascalCase")]

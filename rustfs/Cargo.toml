@@ -20,10 +20,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "RustFS is a high-performance, distributed file system designed for modern cloud-native applications, providing efficient data storage and retrieval with advanced features like S3 Select, IAM, and policy management."
+description = "albwebfs is a high-performance, distributed file system designed for modern cloud-native applications, providing efficient data storage and retrieval with advanced features like S3 Select, IAM, and policy management."
 keywords.workspace = true
 categories.workspace = true
-documentation = "https://docs.rustfs.com/"
+documentation = "https://albwebsolutions.de/albwebfs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [[bin]]
@@ -94,6 +94,7 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 
 # Serialization and Data Formats
 bytes = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
 flatbuffers.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true

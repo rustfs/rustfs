@@ -21,6 +21,7 @@ mod http;
 mod hybrid;
 mod layer;
 mod prefix;
+mod s3_error_enhancement;
 mod readiness;
 mod runtime;
 mod service_state;

@@ -27,11 +27,11 @@ use tracing::{debug, error, info, instrument, warn};
 pub(crate) fn print_server_info() {
     let current_year = jiff::Zoned::now().year();
     // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("albwebfs Object Storage Server");
+    info!("Copyright: 2026-{} Albwebsolutions", current_year);
     info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
     info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
+    info!("Docs: https://albwebsolutions.de/albwebfs/");
 }
 
 /// Initialize the asynchronous update check system.

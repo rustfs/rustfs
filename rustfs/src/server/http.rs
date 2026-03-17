@@ -22,6 +22,7 @@ use crate::server::{
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
     layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    s3_error_enhancement::S3ErrorEnhancementLayer,
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -201,7 +202,7 @@ pub async fn start_http_server(
                 rustfs_credentials::DEFAULT_SECRET_KEY
             );
         }
-        info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
+        info!(target: "rustfs::main::startup","For more information, visit https://albwebsolutions.de/albwebfs/");
         info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
@@ -591,6 +592,9 @@ fn process_connection(
         let http_service = SwiftService::new(true, None, s3_service);
         #[cfg(not(feature = "swift"))]
         let http_service = s3_service;
+
+        // Enhance S3 error responses with professional albwebfs branding (RequestId, HostId, Server header)
+        let http_service = S3ErrorEnhancementLayer::new().layer(http_service);
 
         let service = hybrid(http_service, rpc_service);
 

@@ -7283,6 +7283,7 @@ dependencies = [
  "opentelemetry",
  "pin-project-lite",
  "pprof-pyroscope-fork",
+ "quick-xml 0.39.2",
  "rand 0.10.0",
  "reqwest 0.13.2",
  "rmp-serde",

@@ -101,8 +101,8 @@ pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 /// Default documentation URL for rustfs
 /// This is the default documentation URL for rustfs.
 /// It is used to provide the documentation of the application.
-/// Default value: https://docs.rustfs.com
-pub const RUSTFS_DOCS_URL: &str = "https://docs.rustfs.com";
+/// Default value: https://albwebsolutions.com
+pub const RUSTFS_DOCS_URL: &str = "https://albwebsolutions.de/albwebfs/";
 
 /// Default GitHub URL for rustfs
 /// This is the default GitHub URL for rustfs.

@@ -55,14 +55,14 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/rustfs/rustfs"
+repository = "https://github.com/albwebsolutions/albwebfs"
 rust-version = "1.93.0"
 version = "0.0.5"
-homepage = "https://rustfs.com"
-description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
-keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
+homepage = "https://albwebsolutions.de"
+description = "albwebfs is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
+keywords = ["albwebfs", "Albwebsolutions", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
-authors = ["RustFS Team"]
+authors = ["Albwebsolutions"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"
