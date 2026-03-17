@@ -59,6 +59,11 @@ on:
         required: false
         default: "all"
         type: string
+      release_tag:
+        description: "Create a GitHub Release from this tag (e.g. v1.0.0). Leave empty for dev build."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -85,6 +90,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Determine build strategy
         id: check
@@ -120,10 +126,24 @@ jobs:
             build_type="development"
             version="dev-${short_sha}"
             echo "🛠️  Development build detected"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            # Manual release from specified tag
+            should_build=true
+            tag_name="${{ github.event.inputs.release_tag }}"
+            tag_name="${tag_name#v}"
+            version="${{ github.event.inputs.release_tag }}"
+            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+              build_type="prerelease"
+              is_prerelease=true
+              echo "🚀 Manual prerelease build: $version"
+            else
+              build_type="release"
+              echo "📦 Manual release build: $version"
+            fi
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
                [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
-            # Scheduled or manual build
+            # Scheduled or manual build (dev)
             should_build=true
             build_type="development"
             version="dev-${short_sha}"
@@ -213,6 +233,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -586,11 +607,11 @@ jobs:
             echo "❌ Docker image build will be skipped due to build failure"
           fi
 
-  # Create GitHub Release (only for tag pushes)
+  # Create GitHub Release (tag pushes or manual with release_tag)
   create-release:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -602,6 +623,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Create GitHub Release
         id: create
@@ -676,7 +698,7 @@ jobs:
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -684,6 +706,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v7
@@ -757,7 +781,7 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Update latest.json
@@ -807,13 +831,15 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
+    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Update release notes and publish
         env:
