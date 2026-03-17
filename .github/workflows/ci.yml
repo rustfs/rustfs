@@ -76,7 +76,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubicloud-standard-2
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -93,7 +93,7 @@ jobs:
     name: Typos
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -136,7 +136,7 @@ jobs:
     name: Build RustFS Debug Binary
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -167,7 +167,7 @@ jobs:
     name: End-to-End Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -214,7 +214,7 @@ jobs:
     name: S3 Implemented Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout repository
