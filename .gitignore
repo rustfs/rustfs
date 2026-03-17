@@ -16,6 +16,7 @@ vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
 *.log
 deploy/certs/*
+deploy/data/*
 *jsonl
 .env
 .rustfs.sys

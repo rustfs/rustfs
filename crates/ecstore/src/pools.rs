@@ -93,6 +93,147 @@ pub struct PoolMeta {
     pub dont_save: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPoolMeta {
+    pub version: u16,
+    pub pools: Vec<PersistedPoolStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPoolStatus {
+    #[serde(rename = "id")]
+    pub id: usize,
+    #[serde(rename = "cmdline")]
+    pub cmd_line: String,
+    #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
+    pub last_update: OffsetDateTime,
+    #[serde(rename = "decommissionInfo")]
+    pub decommission: Option<PersistedPoolDecommissionInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedPoolDecommissionInfo {
+    #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+    pub start_time: Option<OffsetDateTime>,
+    #[serde(rename = "startSize")]
+    pub start_size: usize,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "complete")]
+    pub complete: bool,
+    #[serde(rename = "failed")]
+    pub failed: bool,
+    #[serde(rename = "canceled")]
+    pub canceled: bool,
+    #[serde(rename = "queuedBuckets", default)]
+    pub queued_buckets: Vec<String>,
+    #[serde(rename = "decommissionedBuckets", default)]
+    pub decommissioned_buckets: Vec<String>,
+    #[serde(rename = "bucket", default)]
+    pub bucket: String,
+    #[serde(rename = "prefix", default)]
+    pub prefix: String,
+    #[serde(rename = "object", default)]
+    pub object: String,
+    #[serde(rename = "objectsDecommissioned")]
+    pub items_decommissioned: usize,
+    #[serde(rename = "objectsDecommissionedFailed")]
+    pub items_decommission_failed: usize,
+    #[serde(rename = "bytesDecommissioned")]
+    pub bytes_done: usize,
+    #[serde(rename = "bytesDecommissionedFailed")]
+    pub bytes_failed: usize,
+}
+
+impl From<PersistedPoolMeta> for PoolMeta {
+    fn from(value: PersistedPoolMeta) -> Self {
+        Self {
+            version: value.version,
+            pools: value.pools.into_iter().map(Into::into).collect(),
+            dont_save: false,
+        }
+    }
+}
+
+impl From<PersistedPoolStatus> for PoolStatus {
+    fn from(value: PersistedPoolStatus) -> Self {
+        Self {
+            id: value.id,
+            cmd_line: value.cmd_line,
+            last_update: value.last_update,
+            decommission: value.decommission.map(Into::into),
+        }
+    }
+}
+
+impl From<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
+    fn from(value: PersistedPoolDecommissionInfo) -> Self {
+        Self {
+            start_time: value.start_time,
+            start_size: value.start_size,
+            total_size: value.total_size,
+            current_size: value.current_size,
+            complete: value.complete,
+            failed: value.failed,
+            canceled: value.canceled,
+            queued_buckets: value.queued_buckets,
+            decommissioned_buckets: value.decommissioned_buckets,
+            bucket: value.bucket,
+            prefix: value.prefix,
+            object: value.object,
+            items_decommissioned: value.items_decommissioned,
+            items_decommission_failed: value.items_decommission_failed,
+            bytes_done: value.bytes_done,
+            bytes_failed: value.bytes_failed,
+        }
+    }
+}
+
+impl From<&PoolMeta> for PersistedPoolMeta {
+    fn from(value: &PoolMeta) -> Self {
+        Self {
+            version: value.version,
+            pools: value.pools.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&PoolStatus> for PersistedPoolStatus {
+    fn from(value: &PoolStatus) -> Self {
+        Self {
+            id: value.id,
+            cmd_line: value.cmd_line.clone(),
+            last_update: value.last_update,
+            decommission: value.decommission.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfo {
+    fn from(value: &PoolDecommissionInfo) -> Self {
+        Self {
+            start_time: value.start_time,
+            start_size: value.start_size,
+            total_size: value.total_size,
+            current_size: value.current_size,
+            complete: value.complete,
+            failed: value.failed,
+            canceled: value.canceled,
+            queued_buckets: value.queued_buckets.clone(),
+            decommissioned_buckets: value.decommissioned_buckets.clone(),
+            bucket: value.bucket.clone(),
+            prefix: value.prefix.clone(),
+            object: value.object.clone(),
+            items_decommissioned: value.items_decommissioned,
+            items_decommission_failed: value.items_decommission_failed,
+            bytes_done: value.bytes_done,
+            bytes_failed: value.bytes_failed,
+        }
+    }
+}
+
 impl PoolMeta {
     pub fn new(pools: &[Arc<Sets>], prev_meta: &PoolMeta) -> Self {
         let mut new_meta = Self {
@@ -162,8 +303,8 @@ impl PoolMeta {
         }
 
         let mut buf = Deserializer::new(Cursor::new(&data[4..]));
-        let meta: PoolMeta = Deserialize::deserialize(&mut buf)?;
-        *self = meta;
+        let meta: PersistedPoolMeta = Deserialize::deserialize(&mut buf)?;
+        *self = meta.into();
 
         if self.version != POOL_META_VERSION {
             return Err(Error::other(format!("unexpected PoolMeta version: {}", self.version)));
@@ -179,7 +320,7 @@ impl PoolMeta {
         data.write_u16::<LittleEndian>(POOL_META_FORMAT)?;
         data.write_u16::<LittleEndian>(POOL_META_VERSION)?;
         let mut buf = Vec::new();
-        self.serialize(&mut Serializer::new(&mut buf))?;
+        PersistedPoolMeta::from(self).serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;
 
         for pool in pools {
@@ -1763,6 +1904,60 @@ mod tests {
             pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
             Some(start_time)
         );
+    }
+
+    #[test]
+    fn pool_meta_persists_decommission_resume_queues() {
+        let start_time = OffsetDateTime::now_utc();
+        let pool_meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 1,
+                cmd_line: "/data/pool1/disk{1...4}".to_string(),
+                last_update: start_time,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    queued_buckets: vec!["bucket-a".to_string(), "bucket-b/prefix".to_string()],
+                    decommissioned_buckets: vec!["bucket-done".to_string()],
+                    bucket: "bucket-b".to_string(),
+                    prefix: "prefix".to_string(),
+                    object: "object.txt".to_string(),
+                    items_decommissioned: 7,
+                    items_decommission_failed: 1,
+                    bytes_done: 1024,
+                    bytes_failed: 128,
+                    ..Default::default()
+                }),
+            }],
+            dont_save: false,
+        };
+
+        let mut buf = Vec::new();
+        PersistedPoolMeta::from(&pool_meta)
+            .serialize(&mut Serializer::new(&mut buf))
+            .expect("pool meta should serialize");
+
+        let mut deserializer = Deserializer::new(Cursor::new(&buf));
+        let restored: PoolMeta = PersistedPoolMeta::deserialize(&mut deserializer)
+            .expect("pool meta should deserialize")
+            .into();
+
+        let restored_decommission = restored.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission info should survive round-trip");
+        assert_eq!(
+            restored_decommission.queued_buckets,
+            vec!["bucket-a".to_string(), "bucket-b/prefix".to_string()]
+        );
+        assert_eq!(restored_decommission.decommissioned_buckets, vec!["bucket-done".to_string()]);
+        assert_eq!(restored_decommission.bucket, "bucket-b");
+        assert_eq!(restored_decommission.prefix, "prefix");
+        assert_eq!(restored_decommission.object, "object.txt");
+        assert_eq!(restored_decommission.items_decommissioned, 7);
+        assert_eq!(restored_decommission.items_decommission_failed, 1);
+        assert_eq!(restored_decommission.bytes_done, 1024);
+        assert_eq!(restored_decommission.bytes_failed, 128);
     }
 }
 
