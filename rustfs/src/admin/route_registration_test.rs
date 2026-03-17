@@ -101,6 +101,8 @@ fn test_register_routes_cover_representative_admin_paths() {
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));
     assert_route(&router, Method::POST, &admin_path("/v3/tier/clear"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-bucket-quota"));
+    assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
     assert_route(&router, Method::PUT, &admin_path("/v3/quota/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
 
@@ -129,6 +131,7 @@ fn test_minio_admin_alias_paths_match_existing_admin_routes() {
     system::register_system_route(&mut router).expect("register system route");
     pools::register_pool_route(&mut router).expect("register pool route");
     rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
+    quota::register_quota_route(&mut router).expect("register quota route");
 
     for (method, path) in [
         (Method::GET, minio_admin_path("/v3/is-admin")),
@@ -140,6 +143,8 @@ fn test_minio_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, minio_admin_path("/v3/info-access-key")),
         (Method::GET, minio_admin_path("/v3/list-access-keys-bulk")),
         (Method::PUT, minio_admin_path("/v3/set-policy")),
+        (Method::PUT, minio_admin_path("/v3/set-bucket-quota")),
+        (Method::GET, minio_admin_path("/v3/get-bucket-quota")),
         (Method::POST, minio_admin_path("/v3/idp/builtin/policy/attach")),
         (Method::POST, minio_admin_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, minio_admin_path("/v3/idp/builtin/policy-entities")),

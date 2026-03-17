@@ -31,6 +31,7 @@ use serde_json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use url::form_urlencoded;
 
 #[derive(Debug, Deserialize)]
 pub struct SetBucketQuotaRequest {
@@ -39,8 +40,84 @@ pub struct SetBucketQuotaRequest {
     pub quota_type: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CompatibleBucketQuotaRequest {
+    #[serde(default)]
+    quota: Option<u64>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default, alias = "quotatype")]
+    quota_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MinioBucketQuotaResponse {
+    quota: u64,
+    size: u64,
+    rate: u64,
+    requests: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    quotatype: String,
+}
+
 fn default_quota_type() -> String {
     rustfs_config::QUOTA_TYPE_HARD.to_string()
+}
+
+fn is_minio_set_bucket_quota_path(path: &str) -> bool {
+    path.ends_with("/v3/set-bucket-quota")
+}
+
+fn is_minio_get_bucket_quota_path(path: &str) -> bool {
+    path.ends_with("/v3/get-bucket-quota")
+}
+
+fn bucket_from_params_or_query(params: &Params<'_, '_>, uri: &hyper::Uri) -> String {
+    if let Some(bucket) = params.get("bucket") {
+        return bucket.to_string();
+    }
+
+    if let Some(query) = uri.query() {
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            if key == "bucket" {
+                return value.into_owned();
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, s3s::S3Error> {
+    if body.is_empty() {
+        return Ok(SetBucketQuotaRequest {
+            quota: None,
+            quota_type: default_quota_type(),
+        });
+    }
+
+    let request: CompatibleBucketQuotaRequest =
+        serde_json::from_slice(body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?;
+
+    Ok(SetBucketQuotaRequest {
+        quota: request
+            .size
+            .filter(|quota| *quota > 0)
+            .or(request.quota.filter(|quota| *quota > 0)),
+        quota_type: request.quota_type.unwrap_or_else(default_quota_type),
+    })
+}
+
+fn minio_bucket_quota_response(quota: &BucketQuota) -> MinioBucketQuotaResponse {
+    let size = quota.quota.unwrap_or(0);
+
+    MinioBucketQuotaResponse {
+        quota: size,
+        size,
+        rate: 0,
+        requests: 0,
+        quotatype: if size > 0 { "hard".to_string() } else { String::new() },
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +184,18 @@ async fn current_usage_from_context(bucket: &str) -> u64 {
 pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-bucket-quota").as_str(),
+        AdminOperation(&SetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/get-bucket-quota").as_str(),
+        AdminOperation(&GetBucketQuotaHandler {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/quota/{bucket}").as_str(),
         AdminOperation(&SetBucketQuotaHandler {}),
     )?;
@@ -161,7 +250,7 @@ impl Operation for SetBucketQuotaHandler {
         )
         .await?;
 
-        let bucket = params.get("bucket").unwrap_or("").to_string();
+        let bucket = bucket_from_params_or_query(&params, &req.uri);
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
@@ -172,14 +261,7 @@ impl Operation for SetBucketQuotaHandler {
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-        let request: SetBucketQuotaRequest = if body.is_empty() {
-            SetBucketQuotaRequest {
-                quota: None,
-                quota_type: default_quota_type(),
-            }
-        } else {
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
-        };
+        let request = parse_set_bucket_quota_request(&body)?;
 
         if request.quota_type.to_uppercase() != rustfs_config::QUOTA_TYPE_HARD {
             return Err(s3_error!(InvalidArgument, "{}", rustfs_config::QUOTA_INVALID_TYPE_ERROR_MSG));
@@ -199,15 +281,18 @@ impl Operation for SetBucketQuotaHandler {
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
 
-        let response = BucketQuotaResponse {
-            bucket,
-            quota: quota.quota,
-            size: current_usage,
-            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
-        };
+        let json = if is_minio_set_bucket_quota_path(req.uri.path()) {
+            String::new()
+        } else {
+            let response = BucketQuotaResponse {
+                bucket,
+                quota: quota.quota,
+                size: current_usage,
+                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+            };
 
-        let json =
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
+        };
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -226,7 +311,7 @@ impl Operation for GetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        let bucket = params.get("bucket").unwrap_or("").to_string();
+        let bucket = bucket_from_params_or_query(&params, &req.uri);
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
@@ -254,15 +339,19 @@ impl Operation for GetBucketQuotaHandler {
             _ => s3_error!(InternalError, "Failed to get quota: {}", e),
         })?;
 
-        let response = BucketQuotaResponse {
-            bucket,
-            quota: quota.quota,
-            size: current_usage.unwrap_or(0),
-            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
-        };
+        let json = if is_minio_get_bucket_quota_path(req.uri.path()) {
+            serde_json::to_string(&minio_bucket_quota_response(&quota))
+                .map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
+        } else {
+            let response = BucketQuotaResponse {
+                bucket,
+                quota: quota.quota,
+                size: current_usage.unwrap_or(0),
+                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+            };
 
-        let json =
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
+        };
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -484,6 +573,34 @@ mod tests {
     #[test]
     fn test_default_quota_type() {
         assert_eq!(default_quota_type(), "HARD");
+    }
+
+    #[test]
+    fn parse_set_bucket_quota_request_accepts_minio_shape() {
+        let request = parse_set_bucket_quota_request(br#"{"quota":1073741824,"size":1073741824,"quotatype":"hard"}"#)
+            .expect("parse quota request");
+
+        assert_eq!(request.quota, Some(1073741824));
+        assert_eq!(request.quota_type, "hard");
+    }
+
+    #[test]
+    fn parse_set_bucket_quota_request_prefers_non_zero_quota_over_zero_size() {
+        let request =
+            parse_set_bucket_quota_request(br#"{"quota":1073741824,"size":0,"quotatype":"hard"}"#).expect("parse quota request");
+
+        assert_eq!(request.quota, Some(1073741824));
+        assert_eq!(request.quota_type, "hard");
+    }
+
+    #[test]
+    fn minio_bucket_quota_response_uses_minio_field_names() {
+        let quota = BucketQuota::new(Some(1024));
+        let json = serde_json::to_string(&minio_bucket_quota_response(&quota)).expect("serialize");
+
+        assert!(json.contains("\"quota\":1024"));
+        assert!(json.contains("\"size\":1024"));
+        assert!(json.contains("\"quotatype\":\"hard\""));
     }
 
     #[test]
