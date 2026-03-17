@@ -61,9 +61,7 @@ impl LicenseError {
     fn into_io(self) -> Error {
         match self {
             LicenseError::StatePoisoned | LicenseError::Clock(_) => Error::other(self.to_string()),
-            LicenseError::Missing | LicenseError::Invalid(_) => {
-                Error::new(ErrorKind::PermissionDenied, self.to_string())
-            }
+            LicenseError::Missing | LicenseError::Invalid(_) => Error::new(ErrorKind::PermissionDenied, self.to_string()),
             #[cfg(feature = "license")]
             LicenseError::Expired { .. } => Error::new(ErrorKind::PermissionDenied, self.to_string()),
         }
