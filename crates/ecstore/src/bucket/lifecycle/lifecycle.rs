@@ -134,6 +134,22 @@ impl RuleValidate for LifecycleRule {
     }
 }
 
+fn lifecycle_rule_prefix(rule: &LifecycleRule) -> Option<&str> {
+    if let Some(p) = rule.prefix.as_deref() {
+        return Some(p);
+    }
+
+    let Some(filter) = rule.filter.as_ref() else {
+        return None;
+    };
+
+    if let Some(p) = filter.prefix.as_deref() {
+        return Some(p);
+    }
+
+    filter.and.as_ref().and_then(|and| and.prefix.as_deref())
+}
+
 #[async_trait::async_trait]
 pub trait Lifecycle {
     async fn has_transition(&self) -> bool;
@@ -177,8 +193,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 continue;
             }
 
-            let rule_prefix = &rule.prefix.clone().unwrap_or_default();
-            if prefix.len() > 0 && rule_prefix.len() > 0 && !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix)
+            let rule_prefix = lifecycle_rule_prefix(rule).unwrap_or("");
+            if !prefix.is_empty()
+                && !rule_prefix.is_empty()
+                && !prefix.starts_with(rule_prefix)
+                && !rule_prefix.starts_with(prefix)
             {
                 continue;
             }
@@ -297,8 +316,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
             if rule.status.as_str() == ExpirationStatus::DISABLED {
                 continue;
             }
-            if let Some(prefix) = rule.prefix.clone() {
-                if !obj.name.starts_with(prefix.as_str()) {
+            if let Some(rule_prefix) = lifecycle_rule_prefix(rule) {
+                if !obj.name.starts_with(rule_prefix) {
                     continue;
                 }
             }
@@ -416,54 +435,19 @@ impl Lifecycle for BucketLifecycleConfiguration {
             for rule in lc_rules.iter() {
                 if obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref() {
-                        if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                            events.push(Event {
-                                action: IlmAction::DeleteVersionAction,
-                                rule_id: rule.id.clone().unwrap_or_default(),
-                                due: Some(now),
-                                noncurrent_days: 0,
-                                newer_noncurrent_versions: 0,
-                                storage_class: "".into(),
-                            });
-                            break;
-                        }
-
-                        if let Some(days) = expiration.days {
-                            let expected_expiry = expected_expiry_time(mod_time, days /*, date*/);
-                            if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                        if expiration.expired_object_delete_marker.is_some_and(|v| v) {
+                            let due = expiration.next_due(obj).unwrap_or(now);
+                            if now.unix_timestamp() >= due.unix_timestamp() {
                                 events.push(Event {
                                     action: IlmAction::DeleteVersionAction,
                                     rule_id: rule.id.clone().unwrap_or_default(),
-                                    due: Some(expected_expiry),
+                                    due: Some(due),
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
                                 });
-                                break;
                             }
-                        }
-                    }
-                }
-
-                if obj.is_latest {
-                    if let Some(ref expiration) = rule.expiration {
-                        if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                            if obj.delete_marker && expired_object_delete_marker {
-                                let due = expiration.next_due(obj);
-                                if let Some(due) = due {
-                                    if now.unix_timestamp() >= due.unix_timestamp() {
-                                        events.push(Event {
-                                            action: IlmAction::DelMarkerDeleteAllVersionsAction,
-                                            rule_id: rule.id.clone().unwrap_or_default(),
-                                            due: Some(due),
-                                            noncurrent_days: 0,
-                                            newer_noncurrent_versions: 0,
-                                            storage_class: "".into(),
-                                        });
-                                    }
-                                }
-                                continue;
-                            }
+                            break;
                         }
                     }
                 }
@@ -860,6 +844,7 @@ impl Default for TransitionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use s3s::dto::LifecycleRuleFilter;
 
     #[tokio::test]
     async fn validate_rejects_non_positive_expiration_days() {
@@ -1073,5 +1058,119 @@ mod tests {
         let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
 
         assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_RULE_STATUS);
+    }
+
+    #[tokio::test]
+    async fn filter_rules_respects_filter_prefix() {
+        let mut filter = LifecycleRuleFilter::default();
+        filter.prefix = Some("prefix".to_string());
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: Some(filter),
+                id: Some("rule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let match_obj = ObjectOpts {
+            name: "prefix/file".to_string(),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let matched = lc.filter_rules(&match_obj).await.unwrap();
+        assert_eq!(matched.len(), 1);
+
+        let non_match_obj = ObjectOpts {
+            name: "other/file".to_string(),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let not_matched = lc.filter_rules(&non_match_obj).await.unwrap();
+        assert_eq!(not_matched.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_object_delete_marker_requires_single_version() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_delete_marker: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-expired-del-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 2,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let now = base_time + Duration::days(2);
+        let event = lc.eval_inner(&opts, now, 0).await;
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn expired_object_delete_marker_deletes_only_delete_marker_after_due() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_delete_marker: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-expired-del-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 1,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let now = base_time + Duration::days(2);
+        let event = lc.eval_inner(&opts, now, 0).await;
+
+        assert_eq!(event.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
     }
 }
