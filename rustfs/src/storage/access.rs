@@ -405,7 +405,13 @@ impl S3Access for FS {
 
         let ext = cx.extensions_mut();
         ext.insert(req_info);
-        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
+        license_check().map_err(|er| match er.kind() {
+            std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+            _ => {
+                error!("license check failed due to unexpected error: {er}");
+                s3_error!(InternalError, "License validation failed")
+            }
+        })?;
 
         // Verify uniformly here? Or verify separately below?
 

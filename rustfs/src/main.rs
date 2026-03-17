@@ -114,10 +114,6 @@ async fn async_main() -> Result<()> {
 
     // Initialize the configuration
     init_license(config.license.clone());
-    info!("license status: {}", license_status());
-    if let Some(token) = current_license() {
-        info!("runtime license loaded: {}", token.name);
-    }
 
     // Initialize Observability
     let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
@@ -138,6 +134,11 @@ async fn async_main() -> Result<()> {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
+    }
+
+    info!("license status: {}", license_status());
+    if let Some(token) = current_license() {
+        info!("runtime license loaded: {}", token.name);
     }
 
     // print startup logo

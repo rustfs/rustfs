@@ -165,7 +165,10 @@ fn apply_missing_status(state: &mut LicenseState) {
 
 fn apply_invalid_status(state: &mut LicenseState, err: LicenseError) {
     state.token = None;
-    state.status = LicenseStatus::Invalid(err.to_string());
+    state.status = LicenseStatus::Invalid(match err {
+        LicenseError::Invalid(message) => message,
+        other => other.to_string(),
+    });
 }
 
 fn apply_valid_status(state: &mut LicenseState, token: Token) {
