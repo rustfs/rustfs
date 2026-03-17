@@ -20,8 +20,9 @@
 
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
-    ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition, TransitionStorageClass,
+    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator,
+    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
+    TransitionStorageClass,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -1074,6 +1075,50 @@ mod tests {
                 abort_incomplete_multipart_upload: None,
                 filter: Some(filter),
                 id: Some("rule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let match_obj = ObjectOpts {
+            name: "prefix/file".to_string(),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let matched = lc.filter_rules(&match_obj).await.unwrap();
+        assert_eq!(matched.len(), 1);
+
+        let non_match_obj = ObjectOpts {
+            name: "other/file".to_string(),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+            is_latest: true,
+            ..Default::default()
+        };
+        let not_matched = lc.filter_rules(&non_match_obj).await.unwrap();
+        assert_eq!(not_matched.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn filter_rules_respects_filter_and_prefix() {
+        let mut filter = LifecycleRuleFilter::default();
+
+        let mut and = LifecycleRuleAndOperator::default();
+        and.prefix = Some("prefix".to_string());
+        filter.and = Some(and);
+
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: Some(filter),
+                id: Some("rule-and-prefix".to_string()),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
