@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -88,7 +89,7 @@ pub struct UserInfo {
     #[serde(rename = "memberOf", skip_serializing_if = "Option::is_none")]
     pub member_of: Option<Vec<String>>,
 
-    #[serde(rename = "updatedAt")]
+    #[serde(rename = "updatedAt", with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
 }
 
@@ -150,44 +151,40 @@ pub const ACCESS_KEY_LIST_ALL: &str = "all";
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddServiceAccountReq {
     #[serde(rename = "policy", skip_serializing_if = "Option::is_none")]
-    pub policy: Option<String>,
+    pub policy: Option<Value>,
 
     #[serde(rename = "targetUser", skip_serializing_if = "Option::is_none")]
     pub target_user: Option<String>,
 
-    #[serde(rename = "accessKey")]
+    #[serde(rename = "accessKey", default)]
     pub access_key: String,
 
-    #[serde(rename = "secretKey")]
+    #[serde(rename = "secretKey", default)]
     pub secret_key: String,
 
-    #[serde(rename = "name")]
+    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
+    #[serde(
+        rename = "expiration",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "time::serde::rfc3339::option"
+    )]
     pub expiration: Option<OffsetDateTime>,
+
+    #[serde(rename = "comment", skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl AddServiceAccountReq {
     pub fn validate(&self) -> Result<(), String> {
-        if self.access_key.is_empty() {
-            return Err("accessKey is empty".to_string());
-        }
-
-        if self.secret_key.is_empty() {
-            return Err("secretKey is empty".to_string());
-        }
-
-        if self.name.is_none() {
-            return Err("name is empty".to_string());
-        }
-
-        // TODO: validate
-
-        Ok(())
+        validate_service_account_name(self.name.as_deref())?;
+        validate_service_account_description(self.description.as_deref().or(self.comment.as_deref()))?;
+        validate_service_account_expiration(self.expiration)
     }
 }
 
@@ -284,7 +281,7 @@ pub struct InfoAccessKeyResp {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateServiceAccountReq {
     #[serde(rename = "newPolicy", skip_serializing_if = "Option::is_none")]
-    pub new_policy: Option<String>,
+    pub new_policy: Option<Value>,
 
     #[serde(rename = "newSecretKey", skip_serializing_if = "Option::is_none")]
     pub new_secret_key: Option<String>,
@@ -298,16 +295,78 @@ pub struct UpdateServiceAccountReq {
     #[serde(rename = "newDescription", skip_serializing_if = "Option::is_none")]
     pub new_description: Option<String>,
 
-    #[serde(rename = "newExpiration", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "newExpiration", skip_serializing_if = "Option::is_none", default)]
     #[serde(with = "time::serde::rfc3339::option")]
     pub new_expiration: Option<OffsetDateTime>,
 }
 
 impl UpdateServiceAccountReq {
     pub fn validate(&self) -> Result<(), String> {
-        // TODO: validate
-        Ok(())
+        validate_service_account_name(self.new_name.as_deref())?;
+        validate_service_account_description(self.new_description.as_deref())?;
+        validate_service_account_expiration(self.new_expiration)
     }
+}
+
+fn validate_service_account_name(name: Option<&str>) -> Result<(), String> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    if name.len() > 32 {
+        return Err("name must not be longer than 32 characters".to_string());
+    }
+
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Ok(());
+    };
+
+    if !first.is_ascii_alphabetic() {
+        return Err(
+            "name must contain only ASCII letters, digits, underscores and hyphens and must start with a letter".to_string(),
+        );
+    }
+
+    if chars.any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+        return Err(
+            "name must contain only ASCII letters, digits, underscores and hyphens and must start with a letter".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_service_account_description(description: Option<&str>) -> Result<(), String> {
+    let Some(description) = description else {
+        return Ok(());
+    };
+
+    if description.len() > 256 {
+        return Err("description must be at most 256 bytes long".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_service_account_expiration(expiration: Option<OffsetDateTime>) -> Result<(), String> {
+    let Some(expiration) = expiration else {
+        return Ok(());
+    };
+
+    if expiration.unix_timestamp() == 0 {
+        return Ok(());
+    }
+
+    if expiration < OffsetDateTime::now_utc() {
+        return Err("the expiration time should be in the future".to_string());
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -489,6 +548,54 @@ pub struct IAMEntities {
     /// applicable to the STS
     #[serde(rename = "stsPolicies")]
     pub sts_policies: Vec<HashMap<String, Vec<String>>>,
+}
+
+/// PolicyEntitiesResult - contains response to a policy entities query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyEntitiesResult {
+    #[serde(rename = "timestamp", with = "time::serde::rfc3339")]
+    pub timestamp: time::OffsetDateTime,
+    #[serde(rename = "userMappings", skip_serializing_if = "Vec::is_empty")]
+    pub user_mappings: Vec<UserPolicyEntities>,
+    #[serde(rename = "groupMappings", skip_serializing_if = "Vec::is_empty")]
+    pub group_mappings: Vec<GroupPolicyEntities>,
+    #[serde(rename = "policyMappings", skip_serializing_if = "Vec::is_empty")]
+    pub policy_mappings: Vec<PolicyEntities>,
+}
+
+impl Default for PolicyEntitiesResult {
+    fn default() -> Self {
+        Self {
+            timestamp: time::OffsetDateTime::UNIX_EPOCH,
+            user_mappings: Vec::new(),
+            group_mappings: Vec::new(),
+            policy_mappings: Vec::new(),
+        }
+    }
+}
+
+/// UserPolicyEntities - user -> policies mapping
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct UserPolicyEntities {
+    pub user: String,
+    pub policies: Vec<String>,
+    #[serde(rename = "memberOfMappings", skip_serializing_if = "Vec::is_empty")]
+    pub member_of_mappings: Vec<GroupPolicyEntities>,
+}
+
+/// GroupPolicyEntities - group -> policies mapping
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct GroupPolicyEntities {
+    pub group: String,
+    pub policies: Vec<String>,
+}
+
+/// PolicyEntities - policy -> user+group mapping
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyEntities {
+    pub policy: String,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
 }
 
 /// IAMErrEntities - represents errored out IAM entries while import with error
@@ -727,13 +834,14 @@ mod tests {
     #[test]
     fn test_add_service_account_req_validate_success() {
         let req = AddServiceAccountReq {
-            policy: Some("ReadOnlyAccess".to_string()),
+            policy: Some(serde_json::json!({"Version": "2012-10-17"})),
             target_user: Some("testuser".to_string()),
             access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             name: Some("test-service".to_string()),
             description: Some("Test service account".to_string()),
             expiration: None,
+            comment: None,
         };
 
         let result = req.validate();
@@ -741,54 +849,55 @@ mod tests {
     }
 
     #[test]
-    fn test_add_service_account_req_validate_empty_access_key() {
+    fn test_add_service_account_req_validate_allows_generated_credentials() {
         let req = AddServiceAccountReq {
             policy: None,
             target_user: None,
             access_key: "".to_string(),
-            secret_key: "secret".to_string(),
-            name: Some("test".to_string()),
-            description: None,
-            expiration: None,
-        };
-
-        let result = req.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("accessKey is empty"));
-    }
-
-    #[test]
-    fn test_add_service_account_req_validate_empty_secret_key() {
-        let req = AddServiceAccountReq {
-            policy: None,
-            target_user: None,
-            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: "".to_string(),
-            name: Some("test".to_string()),
-            description: None,
-            expiration: None,
-        };
-
-        let result = req.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("secretKey is empty"));
-    }
-
-    #[test]
-    fn test_add_service_account_req_validate_empty_name() {
-        let req = AddServiceAccountReq {
-            policy: None,
-            target_user: None,
-            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: "secret".to_string(),
             name: None,
             description: None,
             expiration: None,
+            comment: None,
+        };
+
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_add_service_account_req_validate_invalid_name() {
+        let req = AddServiceAccountReq {
+            policy: None,
+            target_user: None,
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "secret".to_string(),
+            name: Some("1invalid".to_string()),
+            description: None,
+            expiration: None,
+            comment: None,
         };
 
         let result = req.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("name is empty"));
+        assert!(result.unwrap_err().contains("must start with a letter"));
+    }
+
+    #[test]
+    fn test_add_service_account_req_validate_rejects_long_description() {
+        let req = AddServiceAccountReq {
+            policy: None,
+            target_user: None,
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "secret".to_string(),
+            name: Some("test".to_string()),
+            description: Some("a".repeat(257)),
+            expiration: None,
+            comment: None,
+        };
+
+        let result = req.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at most 256 bytes"));
     }
 
     #[test]
@@ -861,7 +970,7 @@ mod tests {
     #[test]
     fn test_update_service_account_req_validate() {
         let req = UpdateServiceAccountReq {
-            new_policy: Some("FullAccess".to_string()),
+            new_policy: Some(serde_json::json!({"Version": "2012-10-17"})),
             new_secret_key: Some("newsecret".to_string()),
             new_status: Some("enabled".to_string()),
             new_name: Some("updated-service".to_string()),
@@ -972,6 +1081,7 @@ mod tests {
 
     #[test]
     fn test_serialization_deserialization_roundtrip() {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let user_info = UserInfo {
             auth_info: Some(UserAuthInfo {
                 auth_type: UserAuthType::Ldap,
@@ -982,16 +1092,19 @@ mod tests {
             policy_name: Some("ReadOnlyAccess".to_string()),
             status: AccountStatus::Enabled,
             member_of: Some(vec!["group1".to_string()]),
-            updated_at: None,
+            updated_at: Some(now),
         };
 
         let json = serde_json::to_string(&user_info).unwrap();
         let deserialized: UserInfo = serde_json::from_str(&json).unwrap();
 
+        assert!(json.contains("\"updatedAt\":\""));
+        assert!(json.contains('T'));
         assert_eq!(deserialized.secret_key.unwrap(), "secret123");
         assert_eq!(deserialized.policy_name.unwrap(), "ReadOnlyAccess");
         assert_eq!(deserialized.status, AccountStatus::Enabled);
         assert_eq!(deserialized.member_of.unwrap().len(), 1);
+        assert_eq!(deserialized.updated_at, Some(now));
     }
 
     #[test]
@@ -1030,13 +1143,14 @@ mod tests {
     fn test_edge_cases() {
         // Test empty strings and edge cases
         let req = AddServiceAccountReq {
-            policy: Some("".to_string()),
+            policy: Some(serde_json::Value::Null),
             target_user: Some("".to_string()),
             access_key: "valid_key".to_string(),
             secret_key: "valid_secret".to_string(),
             name: Some("valid_name".to_string()),
             description: Some("".to_string()),
             expiration: None,
+            comment: None,
         };
 
         // Should still validate successfully with empty optional strings
@@ -1045,13 +1159,14 @@ mod tests {
         // Test very long strings
         let long_string = "a".repeat(1000);
         let long_req = AddServiceAccountReq {
-            policy: Some(long_string.clone()),
+            policy: Some(serde_json::json!({"Statement": [long_string.clone()]})),
             target_user: Some(long_string.clone()),
             access_key: long_string.clone(),
             secret_key: long_string.clone(),
-            name: Some(long_string.clone()),
-            description: Some(long_string),
+            name: Some("valid_name".to_string()),
+            description: Some("valid description".to_string()),
             expiration: None,
+            comment: None,
         };
 
         assert!(long_req.validate().is_ok());

@@ -81,6 +81,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/import-iam"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-canned-policies"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-policy"));
+    assert_route(&router, Method::POST, &admin_path("/v3/idp/builtin/policy/attach"));
+    assert_route(&router, Method::POST, &admin_path("/v3/idp/builtin/policy/detach"));
+    assert_route(&router, Method::GET, &admin_path("/v3/idp/builtin/policy-entities"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
 
@@ -137,6 +140,9 @@ fn test_minio_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, minio_admin_path("/v3/info-access-key")),
         (Method::GET, minio_admin_path("/v3/list-access-keys-bulk")),
         (Method::PUT, minio_admin_path("/v3/set-policy")),
+        (Method::POST, minio_admin_path("/v3/idp/builtin/policy/attach")),
+        (Method::POST, minio_admin_path("/v3/idp/builtin/policy/detach")),
+        (Method::GET, minio_admin_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, minio_admin_path("/v3/rebalance/start")),
     ] {
         assert!(

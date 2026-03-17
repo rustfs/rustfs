@@ -28,7 +28,7 @@ use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
 use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
-    sys::NewServiceAccountOpts,
+    sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
 };
 use rustfs_madmin::{
     AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity,
@@ -71,6 +71,30 @@ fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> b
         && requester.parent_user.is_empty()
         && !requester.is_temp()
         && !requester.is_service_account()
+}
+
+fn should_reject_group_import_name(group_name: &str, group_lookup: &rustfs_iam::error::Error) -> bool {
+    has_space_be(group_name) || !matches!(group_lookup, rustfs_iam::error::Error::NoSuchGroup(_))
+}
+
+fn should_restore_group_as_disabled(status: &str) -> bool {
+    status.eq_ignore_ascii_case(rustfs_iam::sys::STATUS_DISABLED)
+}
+
+fn imported_service_account_status(status: &str) -> Option<String> {
+    if status.eq_ignore_ascii_case(rustfs_policy::auth::ACCOUNT_OFF)
+        || status.eq_ignore_ascii_case(rustfs_madmin::AccountStatus::Disabled.as_ref())
+    {
+        return Some(rustfs_policy::auth::ACCOUNT_OFF.to_string());
+    }
+
+    if status.eq_ignore_ascii_case(rustfs_policy::auth::ACCOUNT_ON)
+        || status.eq_ignore_ascii_case(rustfs_madmin::AccountStatus::Enabled.as_ref())
+    {
+        return Some(rustfs_policy::auth::ACCOUNT_ON.to_string());
+    }
+
+    None
 }
 
 pub struct AddUser {}
@@ -429,6 +453,7 @@ const ALL_SVC_ACCTS_FILE: &str = "svcaccts.json";
 const USER_POLICY_MAPPINGS_FILE: &str = "user_mappings.json";
 const GROUP_POLICY_MAPPINGS_FILE: &str = "group_mappings.json";
 const STS_USER_POLICY_MAPPINGS_FILE: &str = "stsuser_mappings.json";
+const GROUP_POLICY_MAPPING_USER_TYPE: UserType = UserType::Reg;
 
 const IAM_ASSETS_DIR: &str = "iam-assets";
 
@@ -613,7 +638,7 @@ impl Operation for ExportIam {
                 GROUP_POLICY_MAPPINGS_FILE => {
                     let mut group_policy_mappings = HashMap::new();
                     iam_store
-                        .load_mapped_policies(UserType::Reg, true, &mut group_policy_mappings)
+                        .load_mapped_policies(GROUP_POLICY_MAPPING_USER_TYPE, true, &mut group_policy_mappings)
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
@@ -799,7 +824,7 @@ impl Operation for ImportIam {
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                 for (group_name, group_info) in groups {
                     if let Err(e) = iam_store.get_group_description(&group_name).await
-                        && (matches!(e, rustfs_iam::error::Error::NoSuchGroup(_)) || has_space_be(&group_name))
+                        && should_reject_group_import_name(&group_name, &e)
                     {
                         return Err(s3_error!(InvalidArgument, "group not found or has space be"));
                     }
@@ -810,6 +835,14 @@ impl Operation for ImportIam {
                             error: e.to_string(),
                         });
                     } else {
+                        if should_restore_group_as_disabled(&group_info.status) {
+                            iam_store.set_group_status(&group_name, false).await.map_err(|e| {
+                                S3Error::with_message(
+                                    S3ErrorCode::InternalError,
+                                    format!("set group status failed, name: {group_name}, err: {e}"),
+                                )
+                            })?;
+                        }
                         added.groups.push(group_name.clone());
                     }
                 }
@@ -887,6 +920,29 @@ impl Operation for ImportIam {
                             error: e.to_string(),
                         });
                     } else {
+                        if let Some(status) = imported_service_account_status(&req.status)
+                            && status == rustfs_policy::auth::ACCOUNT_OFF
+                        {
+                            iam_store
+                                .update_service_account(
+                                    &ak,
+                                    UpdateServiceAccountOpts {
+                                        session_policy: None,
+                                        secret_key: None,
+                                        name: None,
+                                        description: None,
+                                        expiration: None,
+                                        status: Some(status),
+                                    },
+                                )
+                                .await
+                                .map_err(|e| {
+                                    S3Error::with_message(
+                                        S3ErrorCode::InternalError,
+                                        format!("update service account status failed, name: {ak}, err: {e}"),
+                                    )
+                                })?;
+                        }
                         added.service_accounts.push(ak.clone());
                     }
                 }
@@ -967,7 +1023,7 @@ impl Operation for ImportIam {
                     }
 
                     if let Err(e) = iam_store
-                        .policy_db_set(&group_name, UserType::None, true, &policies.policies)
+                        .policy_db_set(&group_name, GROUP_POLICY_MAPPING_USER_TYPE, true, &policies.policies)
                         .await
                     {
                         failed.group_policies.push(IAMErrPolicyEntity {
@@ -1058,8 +1114,12 @@ impl Operation for ImportIam {
 
 #[cfg(test)]
 mod tests {
-    use super::should_check_deny_only;
+    use super::{
+        GROUP_POLICY_MAPPING_USER_TYPE, imported_service_account_status, should_check_deny_only, should_reject_group_import_name,
+        should_restore_group_as_disabled,
+    };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
+    use rustfs_iam::error::Error as IamError;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -1112,5 +1172,41 @@ mod tests {
             ..Default::default()
         };
         assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_group_import_allows_missing_group_without_spaces() {
+        assert!(!should_reject_group_import_name(
+            "new-group",
+            &IamError::NoSuchGroup("new-group".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_group_import_rejects_group_names_with_spaces() {
+        assert!(should_reject_group_import_name(
+            " bad-group",
+            &IamError::NoSuchGroup(" bad-group".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_group_import_restores_disabled_status_only_when_needed() {
+        assert!(should_restore_group_as_disabled("disabled"));
+        assert!(!should_restore_group_as_disabled("enabled"));
+    }
+
+    #[test]
+    fn test_imported_service_account_status_maps_on_and_off() {
+        assert_eq!(imported_service_account_status("off").as_deref(), Some("off"));
+        assert_eq!(imported_service_account_status("on").as_deref(), Some("on"));
+        assert_eq!(imported_service_account_status("disabled").as_deref(), Some("off"));
+        assert_eq!(imported_service_account_status("enabled").as_deref(), Some("on"));
+        assert!(imported_service_account_status("unknown").is_none());
+    }
+
+    #[test]
+    fn test_group_policy_mappings_use_regular_user_type() {
+        assert_eq!(GROUP_POLICY_MAPPING_USER_TYPE, rustfs_iam::store::UserType::Reg);
     }
 }

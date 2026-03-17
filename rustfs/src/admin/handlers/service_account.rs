@@ -40,8 +40,53 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::C
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
+use time::OffsetDateTime;
 use tracing::{debug, warn};
 use url::form_urlencoded;
+
+fn minio_time_sentinel() -> OffsetDateTime {
+    OffsetDateTime::UNIX_EPOCH
+}
+
+fn list_expiration_or_sentinel(expiration: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    Some(expiration.unwrap_or_else(minio_time_sentinel))
+}
+
+fn delete_service_account_success_status() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
+    debug!("{action}, e: {:?}", err);
+    if is_err_no_such_service_account(&err) {
+        s3_error!(InvalidRequest, "service account not exist")
+    } else {
+        s3_error!(InternalError, "{action}")
+    }
+}
+
+fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
+    debug!("{action}, e: {:?}", err);
+    if is_err_no_such_temp_account(&err) {
+        s3_error!(InvalidRequest, "access key not exist")
+    } else {
+        s3_error!(InternalError, "{action}")
+    }
+}
+
+fn parse_update_service_account_policy(new_policy: Option<serde_json::Value>) -> S3Result<Option<Policy>> {
+    let Some(policy) = new_policy else {
+        return Ok(None);
+    };
+
+    let policy_bytes = serde_json::to_vec(&policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+    let sp = Policy::parse_config(&policy_bytes).map_err(|e| {
+        debug!("parse policy failed, e: {:?}", e);
+        s3_error!(InvalidArgument, "parse policy failed")
+    })?;
+
+    Ok(Some(sp))
+}
 
 pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -130,7 +175,9 @@ impl Operation for AddServiceAccount {
             .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
 
         let session_policy = if let Some(policy) = &create_req.policy {
-            let p = Policy::parse_config(policy.as_bytes()).map_err(|e| {
+            let policy_bytes =
+                serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+            let p = Policy::parse_config(&policy_bytes).map_err(|e| {
                 debug!("parse policy failed, e: {:?}", e);
                 s3_error!(InvalidArgument, "parse policy failed")
             })?;
@@ -204,7 +251,7 @@ impl Operation for AddServiceAccount {
             access_key: create_req.access_key,
             secret_key: create_req.secret_key,
             name: create_req.name,
-            description: create_req.description,
+            description: create_req.description.or(create_req.comment),
             expiration: create_req.expiration,
             session_policy,
             ..Default::default()
@@ -443,22 +490,7 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
-        let sp = {
-            if let Some(policy) = update_req.new_policy {
-                let sp = Policy::parse_config(policy.as_bytes()).map_err(|e| {
-                    debug!("parse policy failed, e: {:?}", e);
-                    s3_error!(InvalidArgument, "parse policy failed")
-                })?;
-
-                if sp.version.is_empty() && sp.statements.is_empty() {
-                    None
-                } else {
-                    Some(sp)
-                }
-            } else {
-                None
-            }
-        };
+        let sp = parse_update_service_account_policy(update_req.new_policy)?;
 
         let opts = UpdateServiceAccountOpts {
             secret_key: update_req.new_secret_key,
@@ -469,15 +501,15 @@ impl Operation for UpdateServiceAccount {
             session_policy: sp,
         };
 
-        let _ = iam_store.update_service_account(&access_key, opts).await.map_err(|e| {
-            debug!("update service account failed, e: {:?}", e);
-            s3_error!(InternalError, "update service account failed")
-        })?;
+        let _ = iam_store
+            .update_service_account(&access_key, opts)
+            .await
+            .map_err(|e| map_service_account_lookup_error(e, "update service account failed"))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(S3Response::with_headers((StatusCode::NO_CONTENT, Body::empty()), header))
     }
 }
 
@@ -507,10 +539,10 @@ impl Operation for InfoServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let (svc_account, session_policy) = iam_store.get_service_account(&access_key).await.map_err(|e| {
-            debug!("get service account failed, e: {:?}", e);
-            s3_error!(InternalError, "get service account failed")
-        })?;
+        let (svc_account, session_policy) = iam_store
+            .get_service_account(&access_key)
+            .await
+            .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -538,9 +570,10 @@ impl Operation for InfoServiceAccount {
                 deny_only: false,
             })
             .await
-            && request_user_name(&cred) != svc_account.parent_user {
-                return Err(s3_error!(AccessDenied, "access denied"));
-            }
+            && request_user_name(&cred) != svc_account.parent_user
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
         let resp = build_info_service_account_resp(&iam_store, &svc_account, session_policy).await?;
 
@@ -608,14 +641,10 @@ impl Operation for TemporaryAccountInfo {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
-        let (temp_account, session_policy) = iam_store.get_temporary_account(&query.access_key).await.map_err(|e| {
-            debug!("get temporary account failed, e: {:?}", e);
-            if is_err_no_such_temp_account(&e) {
-                s3_error!(InvalidRequest, "temporary account not exist")
-            } else {
-                s3_error!(InternalError, "get temporary account failed")
-            }
-        })?;
+        let (temp_account, session_policy) = iam_store
+            .get_temporary_account(&query.access_key)
+            .await
+            .map_err(|e| map_temp_account_lookup_error(e, "get temporary account failed"))?;
 
         let resp: TemporaryAccountInfoResp = build_info_service_account_resp(&iam_store, &temp_account, session_policy).await?;
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
@@ -844,7 +873,7 @@ impl Operation for ListServiceAccount {
                 access_key: sa.access_key,
                 name: sa.name,
                 description: sa.description,
-                expiration: sa.expiration,
+                expiration: list_expiration_or_sentinel(sa.expiration),
             })
             .collect();
 
@@ -955,9 +984,9 @@ impl Operation for ListAccessKeysBulk {
                     deny_only: false,
                 })
                 .await
-            {
-                return Err(s3_error!(AccessDenied, "access denied"));
-            }
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
         if !iam_store
             .is_allowed(&Args {
@@ -1035,7 +1064,7 @@ impl Operation for ListAccessKeysBulk {
                         access_key: sts.access_key,
                         name: sts.name,
                         description: sts.description,
-                        expiration: sts.expiration,
+                        expiration: list_expiration_or_sentinel(sts.expiration),
                     })
                     .collect();
 
@@ -1059,7 +1088,7 @@ impl Operation for ListAccessKeysBulk {
                         access_key: svc.access_key,
                         name: svc.name,
                         description: svc.description,
-                        expiration: svc.expiration,
+                        expiration: list_expiration_or_sentinel(svc.expiration),
                     })
                     .collect();
 
@@ -1167,7 +1196,7 @@ impl Operation for DeleteServiceAccount {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(S3Response::with_headers((delete_service_account_success_status(), Body::empty()), header))
     }
 }
 
@@ -1256,5 +1285,42 @@ mod tests {
     fn list_access_keys_query_defaults_to_all_list_type() {
         let query = ListAccessKeysQuery::default();
         assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+    }
+
+    #[test]
+    fn delete_service_account_uses_minio_success_status() {
+        assert_eq!(delete_service_account_success_status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn map_service_account_lookup_error_reports_missing_accounts_explicitly() {
+        let err = map_service_account_lookup_error(
+            rustfs_iam::error::Error::NoSuchServiceAccount("missing".to_string()),
+            "get service account failed",
+        );
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("service account not exist"));
+    }
+
+    #[test]
+    fn map_temp_account_lookup_error_reports_missing_access_keys_explicitly() {
+        let err = map_temp_account_lookup_error(
+            rustfs_iam::error::Error::NoSuchTempAccount("missing".to_string()),
+            "get temporary account failed",
+        );
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("access key not exist"));
+    }
+
+    #[test]
+    fn parse_update_service_account_policy_keeps_explicit_empty_policy() {
+        let policy = parse_update_service_account_policy(Some(json!({}))).expect("empty policy should parse");
+
+        assert!(policy.is_some());
+        let policy = policy.unwrap();
+        assert!(policy.version.is_empty());
+        assert!(policy.statements.is_empty());
     }
 }

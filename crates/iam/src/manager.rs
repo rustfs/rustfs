@@ -595,7 +595,11 @@ where
         Ok(users
             .values()
             .filter_map(|x| {
-                if !access_key.is_empty() && x.credentials.parent_user.as_str() == access_key && x.credentials.is_temp() {
+                if !access_key.is_empty()
+                    && x.credentials.parent_user.as_str() == access_key
+                    && x.credentials.is_temp()
+                    && !x.credentials.is_service_account()
+                {
                     let mut c = x.credentials.clone();
                     c.secret_key = String::new();
                     c.session_token = String::new();
@@ -1419,9 +1423,6 @@ where
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
-        let (ps, updated_at) = self.policy_db_get_internal(name, true, false).await?;
-        let policy = ps.join(",");
-
         let gi = self
             .cache
             .groups
@@ -1430,13 +1431,25 @@ where
             .cloned()
             .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
-        Ok(GroupDesc {
-            name: name.to_string(),
-            policy,
-            members: gi.members,
-            updated_at: Some(updated_at),
-            status: gi.status,
-        })
+        let mapped_policy = if let Some(policy) = self.cache.group_policies.load().get(name).cloned() {
+            Some(policy)
+        } else {
+            let mut policies = HashMap::new();
+            if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, true, &mut policies).await
+                && !is_err_no_such_policy(&err)
+            {
+                return Err(err);
+            }
+
+            if let Some(policy) = policies.get(name).cloned() {
+                Cache::add_or_update(&self.cache.group_policies, name, &policy, OffsetDateTime::now_utc());
+                Some(policy)
+            } else {
+                None
+            }
+        };
+
+        Ok(build_group_desc(name, gi, mapped_policy))
     }
 
     pub async fn list_groups(&self) -> Result<Vec<String>> {
@@ -1882,6 +1895,20 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
     (policies.join(","), Policy::merge_policies(to_merge))
 }
 
+fn build_group_desc(name: &str, group_info: GroupInfo, mapped_policy: Option<MappedPolicy>) -> GroupDesc {
+    let (policy, updated_at) = mapped_policy
+        .map(|policy| (policy.policies, Some(policy.update_at)))
+        .unwrap_or_else(|| (String::new(), Some(OffsetDateTime::now_utc())));
+
+    GroupDesc {
+        name: name.to_string(),
+        policy,
+        members: group_info.members,
+        updated_at,
+        status: group_info.status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2225,5 +2252,23 @@ mod tests {
         assert_eq!(merged.version, "2012-10-17");
         assert!(merged.statements.is_empty());
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_build_group_desc_preserves_policy_for_disabled_group() {
+        let group_info = GroupInfo {
+            status: STATUS_DISABLED.to_string(),
+            members: vec!["alice".to_string()],
+            ..Default::default()
+        };
+        let mapped_policy = MappedPolicy::new("readonly");
+
+        let desc = build_group_desc("ops", group_info, Some(mapped_policy));
+
+        assert_eq!(desc.name, "ops");
+        assert_eq!(desc.status, STATUS_DISABLED);
+        assert_eq!(desc.policy, "readonly");
+        assert_eq!(desc.members, vec!["alice".to_string()]);
+        assert!(desc.updated_at.is_some());
     }
 }

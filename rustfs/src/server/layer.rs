@@ -100,6 +100,64 @@ where
 }
 
 #[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatLayer;
+
+impl<S> Layer<S> for AdminChunkedContentLengthCompatLayer {
+    type Service = AdminChunkedContentLengthCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AdminChunkedContentLengthCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatService<S> {
+    inner: S,
+}
+
+impl<S, ResBody> Service<HttpRequest<Incoming>> for AdminChunkedContentLengthCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+        if should_force_zero_content_length_for_admin_empty_body(&req) {
+            req.headers_mut()
+                .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+    }
+}
+
+fn should_force_zero_content_length_for_admin_empty_body<B>(req: &HttpRequest<B>) -> bool {
+    req.method() == Method::PUT
+        && is_empty_body_admin_put_path(req.uri().path())
+        && !req.headers().contains_key(http::header::CONTENT_LENGTH)
+}
+
+fn is_empty_body_admin_put_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/minio/admin/v3/set-user-status"
+            | "/minio/admin/v3/set-group-status"
+            | "/rustfs/admin/v3/set-user-status"
+            | "/rustfs/admin/v3/set-group-status"
+    )
+}
+
+#[derive(Clone)]
 pub struct ObjectAttributesEtagFixLayer;
 
 impl<S> Layer<S> for ObjectAttributesEtagFixLayer {
@@ -505,9 +563,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use temp_env::with_var;
+
+    #[test]
+    fn admin_chunked_put_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-user-status?accessKey=test&status=enabled")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn admin_request_with_explicit_content_length_is_left_unchanged() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn non_admin_chunked_put_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
 
     #[test]
     fn test_strip_quotes_from_first_etag_removes_quotes() {
