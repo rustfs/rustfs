@@ -106,7 +106,21 @@ jobs:
           short_sha=$(git rev-parse --short HEAD)
 
           # Determine build type based on trigger
-          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            # Manual release from specified tag
+            should_build=true
+            tag_name="${{ github.event.inputs.release_tag }}"
+            tag_name="${tag_name#v}"
+            version="${{ github.event.inputs.release_tag }}"
+            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
+              build_type="prerelease"
+              is_prerelease=true
+              echo "🚀 Manual prerelease build: $version"
+            else
+              build_type="release"
+              echo "📦 Manual release build: $version"
+            fi
+          elif [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             # Tag push - release or prerelease
             should_build=true
             tag_name="${GITHUB_REF#refs/tags/}"
@@ -127,20 +141,6 @@ jobs:
             build_type="development"
             version="dev-${short_sha}"
             echo "🛠️  Development build detected"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            # Manual release from specified tag
-            should_build=true
-            tag_name="${{ github.event.inputs.release_tag }}"
-            tag_name="${tag_name#v}"
-            version="${{ github.event.inputs.release_tag }}"
-            if [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
-              build_type="prerelease"
-              is_prerelease=true
-              echo "🚀 Manual prerelease build: $version"
-            else
-              build_type="release"
-              echo "📦 Manual release build: $version"
-            fi
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
                [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
@@ -552,7 +552,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
-    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
+    if: needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -639,7 +639,7 @@ jobs:
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
+    if: needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -722,7 +722,7 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+    if: needs.build-check.outputs.build_type == 'release' && needs.upload-release-assets.result == 'success'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Update latest.json
@@ -772,7 +772,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')) && needs.build-check.outputs.build_type != 'development'
+    if: needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
