@@ -14,7 +14,8 @@
 
 # Build and Release Workflow
 #
-# This workflow builds RustFS binaries and automatically triggers Docker image builds.
+# This workflow builds RustFS binaries for Linux only (no Windows/macOS).
+# Automatically triggers Docker image builds.
 #
 # Flow:
 # 1. Build binaries for multiple platforms
@@ -55,7 +56,7 @@ on:
         default: true
         type: boolean
       platforms:
-        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,linux-aarch64-musl)"
+        description: "Comma-separated Linux targets or 'all' (e.g. linux-x86_64-musl,linux-aarch64-musl). Windows/macOS not supported."
         required: false
         default: "all"
         type: string
@@ -177,18 +178,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Linux only - Windows and macOS are not supported
           selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
           selected="$(echo "${selected}" | tr -d '[:space:]')"
           if [[ -z "${selected}" ]]; then
             selected="all"
           fi
 
+          # Platform matrix: Linux only (x86_64 and aarch64, musl and gnu)
           all='{"include":[
             {"target_id":"linux-x86_64-musl","os":"blacksmith-4vcpu-ubuntu-2404","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
             {"target_id":"linux-aarch64-musl","os":"blacksmith-4vcpu-ubuntu-2404","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
             {"target_id":"linux-x86_64-gnu","os":"blacksmith-4vcpu-ubuntu-2404","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
             {"target_id":"linux-aarch64-gnu","os":"blacksmith-4vcpu-ubuntu-2404","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""}
           ]}'
+
+          # Reject any non-Linux platforms if explicitly requested
+          if [[ "${selected}" != "all" ]]; then
+            for req in $(echo "${selected}" | tr ',' '\n'); do
+              if [[ "${req}" == windows-* ]] || [[ "${req}" == macos-* ]] || [[ "${req}" == darwin-* ]]; then
+                echo "❌ Windows and macOS are not supported. Only Linux targets are built." >&2
+                echo "Allowed: linux-x86_64-musl, linux-aarch64-musl, linux-x86_64-gnu, linux-aarch64-gnu" >&2
+                exit 1
+              fi
+            done
+          fi
 
           if [[ "${selected}" == "all" ]]; then
             matrix="$(jq -c . <<<"${all}")"
