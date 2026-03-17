@@ -15,7 +15,7 @@
 use crate::admin::console::is_console_path;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
-use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
+use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
 use crate::storage::apply_cors_headers;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
@@ -221,7 +221,9 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
 
     let path = req.uri().path();
     if path.starts_with(ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_PREFIX)
         || path.starts_with(RUSTFS_ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_V3_PREFIX)
         || path.starts_with(CONSOLE_PREFIX)
         || path.starts_with(RPC_PREFIX)
     {
@@ -264,6 +266,7 @@ impl ConditionalCorsLayer {
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
         !path.starts_with(ADMIN_PREFIX)
+            && !path.starts_with(MINIO_ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
@@ -555,6 +558,7 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/my-bucket/key"));
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
     }

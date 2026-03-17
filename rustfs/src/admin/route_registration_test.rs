@@ -17,11 +17,15 @@ use crate::admin::{
     router::{AdminOperation, S3Router},
     rpc,
 };
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
 
 fn admin_path(path: &str) -> String {
     format!("{}{}", ADMIN_PREFIX, path)
+}
+
+fn minio_admin_path(path: &str) -> String {
+    format!("{}{}", MINIO_ADMIN_PREFIX, path)
 }
 
 fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
@@ -69,9 +73,14 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::DELETE, &admin_path("/v3/group/test-group"));
     assert_route(&router, Method::PUT, &admin_path("/v3/update-group-members"));
     assert_route(&router, Method::PUT, &admin_path("/v3/add-service-accounts"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/add-service-account"));
+    assert_route(&router, Method::GET, &admin_path("/v3/temporary-account-info"));
+    assert_route(&router, Method::GET, &admin_path("/v3/info-access-key"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-access-keys-bulk"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-iam"));
     assert_route(&router, Method::PUT, &admin_path("/v3/import-iam"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-canned-policies"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-policy"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
 
@@ -105,6 +114,38 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
     assert_route(&router, Method::GET, "/rustfs/rpc/read_file_stream");
     assert_route(&router, Method::HEAD, "/rustfs/rpc/read_file_stream");
+}
+
+#[test]
+fn test_minio_admin_alias_paths_match_existing_admin_routes() {
+    let mut router: S3Router<AdminOperation> = S3Router::new(false);
+
+    health::register_health_route(&mut router).expect("register health route");
+    sts::register_admin_auth_route(&mut router).expect("register sts route");
+    user::register_user_route(&mut router).expect("register user route");
+    system::register_system_route(&mut router).expect("register system route");
+    pools::register_pool_route(&mut router).expect("register pool route");
+    rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
+
+    for (method, path) in [
+        (Method::GET, minio_admin_path("/v3/is-admin")),
+        (Method::GET, minio_admin_path("/v3/info")),
+        (Method::GET, minio_admin_path("/v3/storageinfo")),
+        (Method::GET, minio_admin_path("/v3/pools/list")),
+        (Method::PUT, minio_admin_path("/v3/add-service-account")),
+        (Method::GET, minio_admin_path("/v3/temporary-account-info")),
+        (Method::GET, minio_admin_path("/v3/info-access-key")),
+        (Method::GET, minio_admin_path("/v3/list-access-keys-bulk")),
+        (Method::PUT, minio_admin_path("/v3/set-policy")),
+        (Method::POST, minio_admin_path("/v3/rebalance/start")),
+    ] {
+        assert!(
+            router.contains_compatible_route(method.clone(), &path),
+            "expected MinIO admin alias path to match: {} {}",
+            method.as_str(),
+            path
+        );
+    }
 }
 
 #[test]

@@ -134,6 +134,19 @@ pub struct ListServiceAccountsResp {
     pub accounts: Vec<ServiceAccountInfo>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ListAccessKeysResp {
+    #[serde(rename = "serviceAccounts", default)]
+    pub service_accounts: Vec<ServiceAccountInfo>,
+    #[serde(rename = "stsKeys", default)]
+    pub sts_keys: Vec<ServiceAccountInfo>,
+}
+
+pub const ACCESS_KEY_LIST_USERS_ONLY: &str = "users-only";
+pub const ACCESS_KEY_LIST_STS_ONLY: &str = "sts-only";
+pub const ACCESS_KEY_LIST_SVCACC_ONLY: &str = "svcacc-only";
+pub const ACCESS_KEY_LIST_ALL: &str = "all";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddServiceAccountReq {
     #[serde(rename = "policy", skip_serializing_if = "Option::is_none")]
@@ -195,7 +208,7 @@ pub struct AddServiceAccountResp<'a> {
     pub credentials: Credentials<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InfoServiceAccountResp {
     pub parent_user: String,
@@ -211,6 +224,61 @@ pub struct InfoServiceAccountResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(with = "time::serde::rfc3339::option")]
     pub expiration: Option<OffsetDateTime>,
+}
+
+pub type TemporaryAccountInfoResp = InfoServiceAccountResp;
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LDAPSpecificAccessKeyInfo {
+    #[serde(rename = "username", skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+impl LDAPSpecificAccessKeyInfo {
+    pub fn is_empty(&self) -> bool {
+        self.username.is_none()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct OpenIDSpecificAccessKeyInfo {
+    #[serde(rename = "configName", skip_serializing_if = "Option::is_none")]
+    pub config_name: Option<String>,
+    #[serde(rename = "userID", skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(rename = "userIDClaim", skip_serializing_if = "Option::is_none")]
+    pub user_id_claim: Option<String>,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(rename = "displayNameClaim", skip_serializing_if = "Option::is_none")]
+    pub display_name_claim: Option<String>,
+}
+
+impl OpenIDSpecificAccessKeyInfo {
+    pub fn is_empty(&self) -> bool {
+        self.config_name.is_none()
+            && self.user_id.is_none()
+            && self.user_id_claim.is_none()
+            && self.display_name.is_none()
+            && self.display_name_claim.is_none()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InfoAccessKeyResp {
+    pub access_key: String,
+    #[serde(flatten)]
+    pub info: InfoServiceAccountResp,
+    pub user_type: String,
+    pub user_provider: String,
+    #[serde(rename = "ldapSpecificInfo", skip_serializing_if = "LDAPSpecificAccessKeyInfo::is_empty")]
+    pub ldap_specific_info: LDAPSpecificAccessKeyInfo,
+    #[serde(
+        rename = "openIDSpecificInfo",
+        skip_serializing_if = "OpenIDSpecificAccessKeyInfo::is_empty"
+    )]
+    pub open_id_specific_info: OpenIDSpecificAccessKeyInfo,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

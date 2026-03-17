@@ -7372,6 +7372,7 @@ dependencies = [
  "rustfs-common",
  "rustfs-config",
  "rustfs-credentials",
+ "rustfs-crypto",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-heal",

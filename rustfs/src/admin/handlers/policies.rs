@@ -72,6 +72,11 @@ pub fn register_iam_policy_route(r: &mut S3Router<AdminOperation>) -> std::io::R
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
         AdminOperation(&SetPolicyForUserOrGroup {}),
     )?;
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-policy").as_str(),
+        AdminOperation(&SetPolicyForUserOrGroup {}),
+    )?;
 
     Ok(())
 }
@@ -323,11 +328,11 @@ impl Operation for RemoveCannedPolicy {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct SetPolicyForUserOrGroupQuery {
-    #[serde(rename = "policyName")]
+    #[serde(rename = "policyName", alias = "policy")]
     pub policy_name: String,
-    #[serde(rename = "userOrGroup")]
+    #[serde(rename = "userOrGroup", alias = "user-or-group")]
     pub user_or_group: String,
-    #[serde(rename = "isGroup")]
+    #[serde(rename = "isGroup", alias = "is-group")]
     pub is_group: bool,
 }
 
@@ -417,5 +422,30 @@ impl Operation for SetPolicyForUserOrGroup {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetPolicyForUserOrGroupQuery;
+
+    #[test]
+    fn set_policy_query_supports_minio_parameter_names() {
+        let query: SetPolicyForUserOrGroupQuery =
+            serde_urlencoded::from_str("policy=readwrite&user-or-group=test-user&is-group=true").expect("query should parse");
+
+        assert_eq!(query.policy_name, "readwrite");
+        assert_eq!(query.user_or_group, "test-user");
+        assert!(query.is_group);
+    }
+
+    #[test]
+    fn set_policy_query_supports_rustfs_parameter_names() {
+        let query: SetPolicyForUserOrGroupQuery =
+            serde_urlencoded::from_str("policyName=readwrite&userOrGroup=test-user&isGroup=false").expect("query should parse");
+
+        assert_eq!(query.policy_name, "readwrite");
+        assert_eq!(query.user_or_group, "test-user");
+        assert!(!query.is_group);
     }
 }

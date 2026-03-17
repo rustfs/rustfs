@@ -17,7 +17,7 @@ use crate::{
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
-        utils::has_space_be,
+        utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::RemoteAddr,
@@ -50,7 +50,7 @@ use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AddUserQuery {
-    #[serde(rename = "accessKey")]
+    #[serde(rename = "accessKey", alias = "access-key")]
     pub access_key: Option<String>,
     pub status: Option<String>,
 }
@@ -100,14 +100,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let mut input = req.input;
-        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
-            }
-        };
+        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
 
         // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
@@ -282,9 +275,10 @@ impl Operation for ListUsers {
 
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }

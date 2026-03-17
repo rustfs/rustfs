@@ -142,7 +142,7 @@ impl Config {
         Config {
             port,
             api: Api {
-                base_url: format!("{http_prefix}{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
+                base_url: build_console_api_base_url(&format!("{http_prefix}{local_ip}:{port}")),
             },
             s3: S3 {
                 endpoint: format!("{http_prefix}{local_ip}:{port}"),
@@ -190,6 +190,10 @@ impl Config {
     pub(crate) fn doc(&self) -> String {
         self.doc.clone()
     }
+}
+
+fn build_console_api_base_url(base_url: &str) -> String {
+    format!("{base_url}{RUSTFS_ADMIN_PREFIX}")
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -350,7 +354,7 @@ async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     };
 
     let url = format!("{}://{}:{}", scheme, host_for_url, cfg.port);
-    cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
+    cfg.api.base_url = build_console_api_base_url(&url);
     cfg.s3.endpoint = url;
 
     Response::builder()
@@ -645,4 +649,39 @@ pub(crate) fn make_console_server() -> Router {
 
     // Build console router with enhanced middleware stack using tower-http features
     setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn console_api_base_url_keeps_rustfs_admin_prefix() {
+        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001, "test", "2026-03-16T00:00:00Z");
+
+        assert!(
+            cfg.api.base_url.ends_with("/rustfs/admin/v3"),
+            "console baseURL must keep using the RustFS admin prefix"
+        );
+        assert!(
+            !cfg.api.base_url.ends_with("/minio/admin/v3"),
+            "console baseURL must not switch to the MinIO admin prefix by default"
+        );
+    }
+
+    #[test]
+    fn console_api_base_url_builder_preserves_existing_console_contract() {
+        assert_eq!(
+            build_console_api_base_url("http://127.0.0.1:9001"),
+            "http://127.0.0.1:9001/rustfs/admin/v3"
+        );
+    }
+
+    #[test]
+    fn minio_admin_paths_are_not_console_paths() {
+        assert!(is_console_path("/rustfs/console/"));
+        assert!(!is_console_path("/minio/admin/v3/info"));
+        assert!(!is_console_path("/rustfs/admin/v3/info"));
+    }
 }
