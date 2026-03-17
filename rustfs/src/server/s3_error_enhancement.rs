@@ -19,11 +19,12 @@
 
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, HeaderValue, Request, Response, StatusCode};
-use http_body::HttpBody;
+use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use uuid::Uuid;
@@ -75,13 +76,16 @@ where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
     ReqBody: Send + 'static,
-    ResBody: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    ResBody: Body<Data = Bytes> + Send + Unpin + 'static,
     ResBody::Error: Into<BoxError> + Send,
 {
     type Service = S3ErrorEnhancement<S, ReqBody, ResBody>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        S3ErrorEnhancement { inner }
+        S3ErrorEnhancement {
+            inner,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -89,6 +93,7 @@ where
 #[derive(Clone, Debug)]
 pub struct S3ErrorEnhancement<S, ReqBody, ResBody> {
     inner: S,
+    _marker: PhantomData<(ReqBody, ResBody)>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for S3ErrorEnhancement<S, ReqBody, ResBody>
@@ -97,7 +102,7 @@ where
     S::Future: Send,
     S::Error: From<BoxError>,
     ReqBody: Send + 'static,
-    ResBody: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    ResBody: Body<Data = Bytes> + Send + Unpin + 'static,
     ResBody::Error: Into<BoxError> + Send,
 {
     type Response = Response<Full<Bytes>>;
