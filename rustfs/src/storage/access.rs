@@ -408,7 +408,7 @@ impl S3Access for FS {
         license_check().map_err(|er| match er.kind() {
             std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
             _ => {
-                error!("license check failed due to unexpected error: {er}");
+                tracing::error!("license check failed due to unexpected error: {er}");
                 s3_error!(InternalError, "License validation failed")
             }
         })?;

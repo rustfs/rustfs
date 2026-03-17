@@ -167,6 +167,7 @@ fn apply_invalid_status(state: &mut LicenseState, err: LicenseError) {
     state.token = None;
     state.status = LicenseStatus::Invalid(match err {
         LicenseError::Invalid(message) => message,
+        #[cfg(feature = "license")]
         LicenseError::Expired { expired_at, now } => format!("expired at {expired_at}, now {now}"),
         LicenseError::Clock(message) => format!("system clock error: {message}"),
         LicenseError::Missing => "license is required".to_string(),
