@@ -153,6 +153,7 @@ pub struct AddServiceAccountReq {
     #[serde(
         rename = "policy",
         skip_serializing_if = "Option::is_none",
+        default,
         deserialize_with = "deserialize_optional_policy_value"
     )]
     pub policy: Option<Value>,
@@ -287,6 +288,7 @@ pub struct UpdateServiceAccountReq {
     #[serde(
         rename = "newPolicy",
         skip_serializing_if = "Option::is_none",
+        default,
         deserialize_with = "deserialize_optional_policy_value"
     )]
     pub new_policy: Option<Value>,
@@ -902,6 +904,19 @@ mod tests {
     }
 
     #[test]
+    fn test_add_service_account_req_allows_missing_policy_field() {
+        let req: AddServiceAccountReq = serde_json::from_str(
+            r#"{
+                "accessKey":"AKIAIOSFODNN7EXAMPLE",
+                "secretKey":"secret"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(req.policy, None);
+    }
+
+    #[test]
     fn test_add_service_account_req_validate_invalid_name() {
         let req = AddServiceAccountReq {
             policy: None,
@@ -1029,6 +1044,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(req.new_policy, Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})));
+    }
+
+    #[test]
+    fn test_update_service_account_req_allows_missing_policy_field() {
+        let req: UpdateServiceAccountReq = serde_json::from_str(r#"{}"#).unwrap();
+
+        assert_eq!(req.new_policy, None);
     }
 
     #[test]
