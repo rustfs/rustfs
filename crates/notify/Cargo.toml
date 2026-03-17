@@ -48,7 +48,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 wildmatch = { workspace = true, features = ["serde"] }
 
-# quick-xml dependencies (kept for potential async-tokio usage)
+# quick-xml dependencies for custom S3KeyFilter XML deserialization
 # Custom deserializer implemented for S3KeyFilter to handle both XML structures:
 # - Direct FilterRule elements under S3Key (AWS S3 format)
 # - FilterRuleList wrapper format

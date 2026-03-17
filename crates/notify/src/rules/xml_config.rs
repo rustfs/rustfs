@@ -187,8 +187,12 @@ impl<'de> Deserialize<'de> for S3KeyFilter {
         impl<'de> serde::de::Visitor<'de> for S3KeyFilterVisitor {
             type Value = S3KeyFilter;
 
-            fn expecting(&self, _formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                Ok(())
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "an S3Key filter map with an `S3Key` element containing one or more \
+ `FilterRule` children (e.g. <Filter><S3Key><FilterRule>...</FilterRule></S3Key></Filter>)"
+                )
             }
 
             fn visit_map<V>(mut self, mut map: V) -> Result<Self::Value, V::Error>
@@ -290,6 +294,25 @@ impl QueueConfig {
 pub struct LambdaConfigDetail {
     #[serde(rename = "CloudFunction")]
     pub arn: String,
+    // According to AWS S3 documentation, <CloudFunctionConfiguration> usually also contains Id, Event, Filter
+    // But in order to strictly correspond to the Go `lambda` structure provided, only ARN is included here.
+    // If full support is required, additional fields can be added.
+    // For example:
+    // #[serde(rename = "Id", skip_serializing_if = "Option::is_none")]
+    // pub id: Option<String>,
+    // #[serde(rename = "Event", default, skip_serializing_if = "Vec::is_empty")]
+    // pub events: Vec<EventName>,
+    // #[serde(rename = "Filter", default, skip_serializing_if = "S3KeyFilterIsEmpty")]
+    // pub filter: S3KeyFilter,
+}
+
+/// Corresponding to the `topic` structure in the Go code.
+/// Used to parse <Topic> ARN from inside the <TopicConfiguration> tag.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct TopicConfigDetail {
+    #[serde(rename = "Topic")]
+    pub arn: String,
+    // Similar to LambdaConfigDetail, it can be extended to include fields such as Id, Event, Filter, etc.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -305,9 +328,13 @@ pub struct NotificationConfiguration {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub lambda_list: Vec<LambdaConfigDetail>, // Modify: Use a new structure
-    // TopicConfiguration is not supported - left empty for XML compatibility
-    #[serde(skip)]
-    pub topic_list: Vec<()>, // Not used, always returns error if populated
+
+    #[serde(
+        rename = "TopicConfiguration", // Tags for each topic configuration item in XML
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub topic_list: Vec<TopicConfigDetail>, // Modify: Use a new structure
 }
 
 impl NotificationConfiguration {
