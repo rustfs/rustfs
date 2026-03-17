@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body};
+use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_minio_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::{
@@ -52,8 +52,20 @@ fn list_expiration_or_sentinel(expiration: Option<OffsetDateTime>) -> Option<Off
     Some(expiration.unwrap_or_else(minio_time_sentinel))
 }
 
-fn delete_service_account_success_status() -> StatusCode {
-    StatusCode::NO_CONTENT
+fn expiration_for_admin_path(path: &str, expiration: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    if is_minio_admin_request(path) {
+        list_expiration_or_sentinel(expiration)
+    } else {
+        expiration
+    }
+}
+
+fn delete_service_account_success_status(path: &str) -> StatusCode {
+    if is_minio_admin_request(path) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::OK
+    }
 }
 
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
@@ -873,7 +885,7 @@ impl Operation for ListServiceAccount {
                 access_key: sa.access_key,
                 name: sa.name,
                 description: sa.description,
-                expiration: list_expiration_or_sentinel(sa.expiration),
+                expiration: expiration_for_admin_path(req.uri.path(), sa.expiration),
             })
             .collect();
 
@@ -1064,7 +1076,7 @@ impl Operation for ListAccessKeysBulk {
                         access_key: sts.access_key,
                         name: sts.name,
                         description: sts.description,
-                        expiration: list_expiration_or_sentinel(sts.expiration),
+                        expiration: expiration_for_admin_path(req.uri.path(), sts.expiration),
                     })
                     .collect();
 
@@ -1088,7 +1100,7 @@ impl Operation for ListAccessKeysBulk {
                         access_key: svc.access_key,
                         name: svc.name,
                         description: svc.description,
-                        expiration: list_expiration_or_sentinel(svc.expiration),
+                        expiration: expiration_for_admin_path(req.uri.path(), svc.expiration),
                     })
                     .collect();
 
@@ -1196,7 +1208,10 @@ impl Operation for DeleteServiceAccount {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((delete_service_account_success_status(), Body::empty()), header))
+        Ok(S3Response::with_headers(
+            (delete_service_account_success_status(req.uri.path()), Body::empty()),
+            header,
+        ))
     }
 }
 
@@ -1289,7 +1304,31 @@ mod tests {
 
     #[test]
     fn delete_service_account_uses_minio_success_status() {
-        assert_eq!(delete_service_account_success_status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            delete_service_account_success_status("/minio/admin/v3/delete-service-account"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[test]
+    fn delete_service_account_keeps_rustfs_console_success_status() {
+        assert_eq!(
+            delete_service_account_success_status("/rustfs/admin/v3/delete-service-account"),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn expiration_for_minio_admin_path_uses_sentinel() {
+        assert_eq!(
+            expiration_for_admin_path("/minio/admin/v3/list-service-accounts", None),
+            Some(OffsetDateTime::UNIX_EPOCH)
+        );
+    }
+
+    #[test]
+    fn expiration_for_rustfs_admin_path_preserves_none() {
+        assert_eq!(expiration_for_admin_path("/rustfs/admin/v3/list-service-accounts", None), None);
     }
 
     #[test]

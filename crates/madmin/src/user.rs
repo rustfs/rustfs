@@ -150,7 +150,11 @@ pub const ACCESS_KEY_LIST_ALL: &str = "all";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddServiceAccountReq {
-    #[serde(rename = "policy", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "policy",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_policy_value"
+    )]
     pub policy: Option<Value>,
 
     #[serde(rename = "targetUser", skip_serializing_if = "Option::is_none")]
@@ -280,7 +284,11 @@ pub struct InfoAccessKeyResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateServiceAccountReq {
-    #[serde(rename = "newPolicy", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "newPolicy",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_policy_value"
+    )]
     pub new_policy: Option<Value>,
 
     #[serde(rename = "newSecretKey", skip_serializing_if = "Option::is_none")]
@@ -305,6 +313,21 @@ impl UpdateServiceAccountReq {
         validate_service_account_name(self.new_name.as_deref())?;
         validate_service_account_description(self.new_description.as_deref())?;
         validate_service_account_expiration(self.new_expiration)
+    }
+}
+
+fn deserialize_optional_policy_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.map(normalize_policy_value))
+}
+
+fn normalize_policy_value(value: Value) -> Value {
+    match value {
+        Value::String(policy) => serde_json::from_str(&policy).unwrap_or(Value::String(policy)),
+        other => other,
     }
 }
 
@@ -865,6 +888,20 @@ mod tests {
     }
 
     #[test]
+    fn test_add_service_account_req_deserializes_stringified_policy_json() {
+        let req: AddServiceAccountReq = serde_json::from_str(
+            r#"{
+                "policy":"{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+                "accessKey":"AKIAIOSFODNN7EXAMPLE",
+                "secretKey":"secret"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(req.policy, Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})));
+    }
+
+    #[test]
     fn test_add_service_account_req_validate_invalid_name() {
         let req = AddServiceAccountReq {
             policy: None,
@@ -980,6 +1017,18 @@ mod tests {
 
         let result = req.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_service_account_req_deserializes_stringified_policy_json() {
+        let req: UpdateServiceAccountReq = serde_json::from_str(
+            r#"{
+                "newPolicy":"{\"Version\":\"2012-10-17\",\"Statement\":[]}"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(req.new_policy, Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})));
     }
 
     #[test]
