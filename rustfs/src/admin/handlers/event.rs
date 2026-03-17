@@ -225,7 +225,9 @@ impl Operation for NotificationTarget {
             let topic = kv_map
                 .get(rustfs_config::MQTT_TOPIC)
                 .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
-            check_mqtt_broker_available(endpoint, topic)
+            let username = kv_map.get(rustfs_config::MQTT_USERNAME).copied();
+            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).copied();
+            check_mqtt_broker_available(endpoint, topic, username, password)
                 .await
                 .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
 
