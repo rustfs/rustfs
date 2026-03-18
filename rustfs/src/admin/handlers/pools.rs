@@ -39,6 +39,21 @@ fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerP
     resolve_endpoints_handle()
 }
 
+fn validate_start_decommission_guards(
+    decommission_running: bool,
+    rebalance_running: bool,
+) -> s3s::S3Result<()> {
+    if decommission_running {
+        return Err(s3_error!(InvalidRequest, "DecommissionAlreadyRunning"));
+    }
+
+    if rebalance_running {
+        return Err(s3_error!(InvalidRequest, "RebalanceAlreadyRunning"));
+    }
+
+    Ok(())
+}
+
 fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
     let idx = pool.parse::<usize>().ok()?;
     (idx < endpoint_count).then_some(idx)
@@ -218,14 +233,7 @@ impl Operation for StartDecommission {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if store.is_decommission_running().await {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                "DecommissionAlreadyRunning".to_string(),
-            ));
-        }
-
-        // TODO: check IsRebalanceStarted
+        validate_start_decommission_guards(store.is_decommission_running().await, store.is_rebalance_started().await)?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -350,7 +358,7 @@ impl Operation for CancelDecommission {
 
 #[cfg(test)]
 mod pools_handler_tests {
-    use super::parse_pool_idx_by_id;
+    use super::{parse_pool_idx_by_id, validate_start_decommission_guards};
 
     #[test]
     fn test_parse_pool_idx_by_id_rejects_non_numeric() {
@@ -370,5 +378,22 @@ mod pools_handler_tests {
     #[test]
     fn test_parse_pool_idx_by_id_accepts_valid_index() {
         assert_eq!(parse_pool_idx_by_id("2", 4), Some(2));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_rejects_decommission_running() {
+        let err = validate_start_decommission_guards(true, false).expect_err("decommission running should be rejected");
+        assert!(err.to_string().contains("DecommissionAlreadyRunning"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_rejects_rebalance_running() {
+        let err = validate_start_decommission_guards(false, true).expect_err("rebalance running should be rejected");
+        assert!(err.to_string().contains("RebalanceAlreadyRunning"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_allows_when_idle() {
+        assert!(validate_start_decommission_guards(false, false).is_ok());
     }
 }
