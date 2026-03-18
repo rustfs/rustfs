@@ -249,6 +249,8 @@ impl FileMeta {
 
         if let Some(ref data) = fi.data {
             self.data.replace(&data_key_for_version(fi.version_id), data.to_vec())?;
+        } else {
+            let _ = self.data.remove_key(&data_key_for_version(fi.version_id))?;
         }
 
         let version = FileMetaVersion::from(fi);
@@ -700,7 +702,7 @@ impl FileMeta {
                 fi.successor_mod_time = succ_mod_time;
             }
 
-            if read_data {
+            if read_data && fi.inline_data() {
                 fi.data = self
                     .data
                     .find(data_key_for_version(fi.version_id).as_str())?
@@ -1487,6 +1489,36 @@ mod test {
 
         // Verify integrity under normal conditions
         assert!(fm.validate_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_add_version_clears_stale_inline_data_for_null_version() {
+        let mut fm = FileMeta::new();
+
+        let mut inline_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        inline_fi.mod_time = Some(OffsetDateTime::now_utc());
+        inline_fi.data = Some(Bytes::new());
+        inline_fi.set_inline_data();
+        fm.add_version(inline_fi).unwrap();
+
+        let inline_version = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+        assert!(inline_version.inline_data());
+        assert_eq!(inline_version.data, Some(Bytes::new()));
+
+        let mut disk_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        disk_fi.mod_time = Some(OffsetDateTime::now_utc() + time::Duration::seconds(1));
+        disk_fi.size = 1024;
+        fm.add_version(disk_fi).unwrap();
+
+        let latest = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+        assert!(!latest.inline_data());
+        assert!(latest.data.is_none());
+        assert!(
+            fm.data
+                .find(data_key_for_version(latest.version_id).as_str())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
