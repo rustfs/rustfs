@@ -94,6 +94,14 @@ fn should_preserve_decommission_canceled_state(meta_canceled: bool, cancel_signa
     meta_canceled || cancel_signal
 }
 
+fn decommission_cancel_signal_result(cancel_signal: bool) -> Result<()> {
+    if cancel_signal {
+        Err(StorageError::OperationCanceled)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     #[serde(rename = "id")]
@@ -1026,9 +1034,9 @@ impl ECStore {
 
         wk.wait().await;
 
-        if rx.is_cancelled() {
+        if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
             warn!("decommission_pool: canceled after wait {} {}", idx, &bi.name);
-            return Err(StorageError::OperationCanceled);
+            return Err(err);
         }
 
         warn!("decommission_pool: decommission_pool done {} {}", idx, &bi.name);
@@ -1169,9 +1177,9 @@ impl ECStore {
                 warn!("decommission: decommission_pool done {}", &bucket.name);
             }
 
-            if rx.is_cancelled() {
+            if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
                 warn!("decommission: cancellation observed after decommission_pool {}", &bucket.name);
-                return Err(StorageError::OperationCanceled);
+                return Err(err);
             }
 
             {
@@ -1643,8 +1651,8 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DecommissionTerminalState, classify_decommission_terminal_state, dedup_indices, ensure_decommission_not_rebalancing,
-        should_preserve_decommission_canceled_state,
+        DecommissionTerminalState, classify_decommission_terminal_state, decommission_cancel_signal_result, dedup_indices,
+        ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state,
     };
     use crate::error::Error;
 
@@ -1693,5 +1701,16 @@ mod pools_tests {
     #[test]
     fn test_should_preserve_decommission_canceled_state_when_not_canceled() {
         assert!(!should_preserve_decommission_canceled_state(false, false));
+    }
+
+    #[test]
+    fn test_decommission_cancel_signal_result_returns_err_when_canceled() {
+        let err = decommission_cancel_signal_result(true).expect_err("canceled signal should return operation-canceled");
+        assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
+    fn test_decommission_cancel_signal_result_returns_ok_when_not_canceled() {
+        assert!(decommission_cancel_signal_result(false).is_ok());
     }
 }
