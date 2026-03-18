@@ -356,21 +356,21 @@ pub fn extract_metadata_from_mime_with_object_name(
     skip_content_type: bool,
     object_name: Option<&str>,
 ) {
+    const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
+
     for (k, v) in headers.iter() {
         if k.as_str() == "content-type" && skip_content_type {
             continue;
         }
 
-        if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
+        if let Some(key) = USER_METADATA_PREFIXES
+            .iter()
+            .find_map(|prefix| k.as_str().strip_prefix(prefix))
+        {
             if key.is_empty() {
                 continue;
             }
 
-            metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
-            continue;
-        }
-
-        if let Some(key) = k.as_str().strip_prefix("x-rustfs-meta-") {
             metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
             continue;
         }
@@ -1068,6 +1068,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_metadata_from_mime_minio_meta() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-minio-meta-origin", HeaderValue::from_static("gateway"));
+        headers.insert("x-minio-meta-source-id", HeaderValue::from_static("abc123"));
+        headers.insert("x-minio-meta-", HeaderValue::from_static("empty-key"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        assert_eq!(metadata.get("origin"), Some(&"gateway".to_string()));
+        assert_eq!(metadata.get("source-id"), Some(&"abc123".to_string()));
+        assert!(!metadata.contains_key(""));
+    }
+
+    #[test]
     fn test_extract_metadata_from_mime_supported_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("text/plain"));
@@ -1226,6 +1241,7 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("application/xml"));
         headers.insert("x-amz-meta-version", HeaderValue::from_static("1.0"));
         headers.insert("x-rustfs-meta-source", HeaderValue::from_static("upload"));
+        headers.insert("x-minio-meta-origin", HeaderValue::from_static("replication"));
         headers.insert("cache-control", HeaderValue::from_static("public"));
         headers.insert("authorization", HeaderValue::from_static("Bearer xyz")); // Should be ignored
 
@@ -1234,6 +1250,7 @@ mod tests {
         assert_eq!(metadata.get("content-type"), Some(&"application/xml".to_string()));
         assert_eq!(metadata.get("version"), Some(&"1.0".to_string()));
         assert_eq!(metadata.get("source"), Some(&"upload".to_string()));
+        assert_eq!(metadata.get("origin"), Some(&"replication".to_string()));
         assert_eq!(metadata.get("cache-control"), Some(&"public".to_string()));
         assert!(!metadata.contains_key("authorization"));
     }
