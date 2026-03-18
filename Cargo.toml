@@ -179,7 +179,7 @@ time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros
 # Utilities and Tools
 anyhow = "1.0.102"
 arc-swap = "1.8.2"
-astral-tokio-tar = "0.5.6"
+astral-tokio-tar = "0.6.0"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.15" }
