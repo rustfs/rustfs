@@ -150,6 +150,32 @@ fn get_by_index<T>(items: &[T], idx: usize) -> Result<&T> {
     items.get(idx).ok_or_else(|| Error::other("InvalidArgument"))
 }
 
+fn resolve_decommission_bucket_state(meta: &PoolMeta, idx: usize, bucket: &DecomBucketInfo) -> Result<bool> {
+    ensure_valid_decommission_pool_index(meta.pools.len(), idx)?;
+
+    let Some(pool) = meta.pools.get(idx) else {
+        return Err(Error::other("InvalidArgument"));
+    };
+    let Some(info) = pool.decommission.as_ref() else {
+        return Err(Error::other("decommission metadata not initialized"));
+    };
+
+    Ok(info.is_bucket_decommissioned(&bucket.to_string()))
+}
+
+fn mark_decommission_bucket_done(meta: &mut PoolMeta, idx: usize, bucket: &DecomBucketInfo) -> Result<bool> {
+    ensure_valid_decommission_pool_index(meta.pools.len(), idx)?;
+
+    let Some(pool) = meta.pools.get_mut(idx) else {
+        return Err(Error::other("InvalidArgument"));
+    };
+    let Some(info) = pool.decommission.as_mut() else {
+        return Err(Error::other("decommission metadata not initialized"));
+    };
+
+    Ok(info.bucket_pop(&bucket.to_string()))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1316,7 +1342,7 @@ impl ECStore {
         for bucket in pending.iter() {
             let is_decommissioned = {
                 let pool_meta = self.pool_meta.read().await;
-                pool_meta.is_bucket_decommissioned(idx, bucket.to_string())
+                resolve_decommission_bucket_state(&pool_meta, idx, bucket)?
             };
 
             if is_decommissioned {
@@ -1324,7 +1350,7 @@ impl ECStore {
 
                 {
                     let mut pool_meta = self.pool_meta.write().await;
-                    if pool_meta.bucket_done(idx, bucket.to_string())
+                    if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?
                         && let Err(err) = pool_meta.save(self.pools.clone()).await
                     {
                         error!("decom pool_meta.save err {:?}", err);
@@ -1349,7 +1375,7 @@ impl ECStore {
 
             {
                 let mut pool_meta = self.pool_meta.write().await;
-                if pool_meta.bucket_done(idx, bucket.to_string())
+                if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?
                     && let Err(err) = pool_meta.save(self.pools.clone()).await
                 {
                     error!("decom pool_meta.save err {:?}", err);
@@ -1842,8 +1868,8 @@ mod pools_tests {
         cancel_decommission_canceler, classify_decommission_terminal_state, decommission_cancel_signal_result,
         decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing,
         ensure_decommission_start_allowed, ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler,
-        is_decommission_active, is_decommission_cancel_terminal, require_decommission_store,
-        should_preserve_decommission_canceled_state, take_decommission_canceler,
+        is_decommission_active, is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_state, should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -1913,6 +1939,136 @@ mod pools_tests {
     fn test_pool_meta_is_bucket_decommissioned_returns_false_for_out_of_range() {
         let meta = PoolMeta::default();
         assert!(!meta.is_bucket_decommissioned(7, "bucket-a".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_decommission_bucket_state_rejects_out_of_range_index() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let err =
+            resolve_decommission_bucket_state(&meta, 3, &bucket).expect_err("out-of-range index should return invalid argument");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_bucket_state_rejects_missing_decommission_meta() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let err = resolve_decommission_bucket_state(&meta, 0, &bucket)
+            .expect_err("missing decommission metadata should return explicit error");
+        assert!(err.to_string().contains("decommission metadata not initialized"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_bucket_state_returns_true_for_done_bucket() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    decommissioned_buckets: vec!["bucket-a".to_string()],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let done = resolve_decommission_bucket_state(&meta, 0, &bucket).expect("valid state should resolve");
+        assert!(done);
+    }
+
+    #[test]
+    fn test_mark_decommission_bucket_done_rejects_missing_decommission_meta() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let err = mark_decommission_bucket_done(&mut meta, 0, &bucket)
+            .expect_err("missing decommission metadata should return explicit error");
+        assert!(err.to_string().contains("decommission metadata not initialized"));
+    }
+
+    #[test]
+    fn test_mark_decommission_bucket_done_rejects_out_of_range_index() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let err =
+            mark_decommission_bucket_done(&mut meta, 1, &bucket).expect_err("out-of-range index should return invalid argument");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_mark_decommission_bucket_done_pops_bucket_when_present() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    queued_buckets: vec!["bucket-a".to_string()],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let popped = mark_decommission_bucket_done(&mut meta, 0, &bucket).expect("valid state should mark bucket done");
+        assert!(popped);
     }
 
     #[tokio::test]
