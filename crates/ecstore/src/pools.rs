@@ -802,10 +802,15 @@ impl ECStore {
         false
     }
 
-    pub(crate) async fn spawn_decommission_routines(&self, rx: CancellationToken, indices: Vec<usize>) {
+    pub(crate) async fn spawn_decommission_routines(
+        &self,
+        store: Arc<ECStore>,
+        rx: CancellationToken,
+        indices: Vec<usize>,
+    ) -> Result<()> {
         let indices = dedup_indices(&indices);
         if indices.is_empty() {
-            return;
+            return Ok(());
         }
 
         let index_cancelers = {
@@ -814,12 +819,7 @@ impl ECStore {
         };
 
         if index_cancelers.is_empty() {
-            return;
-        }
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("store not init");
-            return;
+            return Ok(());
         };
 
         for (idx, canceler) in index_cancelers {
@@ -828,6 +828,8 @@ impl ECStore {
                 store.do_decommission_in_routine(canceler, idx).await;
             });
         }
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -845,8 +847,12 @@ impl ECStore {
 
         ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("store not init"));
+        };
+
         self.start_decommission(indices.clone()).await?;
-        self.spawn_decommission_routines(rx, indices).await;
+        self.spawn_decommission_routines(store, rx, indices).await?;
 
         Ok(())
     }

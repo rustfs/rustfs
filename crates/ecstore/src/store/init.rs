@@ -246,7 +246,12 @@ impl ECStore {
 
                     if let Err(err) = store.decommission(rx.clone(), pool_indices.clone()).await {
                         if is_err_decommission_running(&err) {
-                            store.spawn_decommission_routines(rx.clone(), pool_indices.clone()).await;
+                            if let Err(spawn_err) = store
+                                .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
+                                .await
+                            {
+                                error!("store init spawn_decommission_routines err: {}", spawn_err);
+                            }
                             return;
                         }
 
