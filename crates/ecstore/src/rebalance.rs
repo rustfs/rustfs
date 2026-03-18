@@ -802,15 +802,28 @@ impl ECStore {
                         let terminal_event = classify_rebalance_terminal_event(result, now);
                         msg = terminal_event.message().to_string();
                         let mut rebalance_meta = store.rebalance_meta.write().await;
-                        if let Some(pool_stat) = rebalance_meta.as_mut().and_then(|meta| meta.pool_stats.get_mut(pool_index))
-                        {
-                            apply_rebalance_terminal_event(
-                                &mut pool_stat.info.status,
-                                &mut pool_stat.info.end_time,
-                                &mut pool_stat.info.last_error,
-                                terminal_event,
-                                now,
-                            );
+                        if let Some(meta) = rebalance_meta.as_mut() {
+                            let meta_stopped = meta.stopped_at.is_some();
+                            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
+                                if should_preserve_rebalance_stopped_state(
+                                    meta_stopped,
+                                    pool_stat.info.status,
+                                    &terminal_event,
+                                ) {
+                                    info!(
+                                        "rebalance_buckets: preserving stopped status for pool {}",
+                                        pool_index
+                                    );
+                                } else {
+                                    apply_rebalance_terminal_event(
+                                        &mut pool_stat.info.status,
+                                        &mut pool_stat.info.end_time,
+                                        &mut pool_stat.info.last_error,
+                                        terminal_event,
+                                        now,
+                                    );
+                                }
+                            }
                         }
                     }
                     _ = timer.tick() => {
@@ -1103,6 +1116,18 @@ fn ensure_rebalance_not_decommissioning(decommission_running: bool) -> bool {
 
 fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
+}
+
+fn is_rebalance_stopped_terminal_event(terminal_event: &RebalanceTerminalEvent) -> bool {
+    matches!(terminal_event, RebalanceTerminalEvent::Stopped { .. })
+}
+
+fn should_preserve_rebalance_stopped_state(
+    meta_stopped: bool,
+    status: RebalStatus,
+    terminal_event: &RebalanceTerminalEvent,
+) -> bool {
+    (meta_stopped || status == RebalStatus::Stopped) && !is_rebalance_stopped_terminal_event(terminal_event)
 }
 
 fn resolve_rebalance_participants(pool_stats: &[RebalanceStats], pool_count: usize) -> Vec<bool> {
@@ -1579,10 +1604,10 @@ mod rebalance_unit_tests {
         GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, migrate_entry_version,
-        next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
+        migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_worker_result, should_pool_participate,
-        should_skip_start_rebalance, take_bucket_from_rebalance_queue,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2167,6 +2192,47 @@ mod rebalance_unit_tests {
         assert_eq!(status, RebalStatus::Stopped);
         assert_eq!(end_time, Some(now));
         assert_eq!(last_error, None);
+    }
+
+    #[test]
+    fn test_is_rebalance_stopped_terminal_event_only_matches_stopped_variant() {
+        let stopped = RebalanceTerminalEvent::Stopped {
+            msg: "stopped".to_string(),
+        };
+        let completed = RebalanceTerminalEvent::Completed {
+            msg: "completed".to_string(),
+        };
+
+        assert!(is_rebalance_stopped_terminal_event(&stopped));
+        assert!(!is_rebalance_stopped_terminal_event(&completed));
+    }
+
+    #[test]
+    fn test_should_preserve_rebalance_stopped_state_when_meta_marked_stopped() {
+        let event = RebalanceTerminalEvent::Completed {
+            msg: "completed".to_string(),
+        };
+
+        assert!(should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
+    }
+
+    #[test]
+    fn test_should_preserve_rebalance_stopped_state_when_pool_already_stopped() {
+        let event = RebalanceTerminalEvent::Failed {
+            msg: "failed".to_string(),
+            last_error: "boom".to_string(),
+        };
+
+        assert!(should_preserve_rebalance_stopped_state(false, RebalStatus::Stopped, &event));
+    }
+
+    #[test]
+    fn test_should_preserve_rebalance_stopped_state_allows_stopped_terminal_update() {
+        let event = RebalanceTerminalEvent::Stopped {
+            msg: "stopped".to_string(),
+        };
+
+        assert!(!should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
     }
 
     #[test]
