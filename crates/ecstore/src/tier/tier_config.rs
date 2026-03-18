@@ -146,7 +146,7 @@ impl Clone for TierConfig {
     fn clone(&self) -> TierConfig {
         let mut s3 = None;
         let mut r = None;
-        let mut m = None;
+        let mut compatible_backend = None;
         let mut aliyun = None;
         let mut tencent = None;
         let mut huaweicloud = None;
@@ -165,9 +165,9 @@ impl Clone for TierConfig {
                 r = Some(r_);
             }
             TierType::MinIO => {
-                let mut m_ = self.minio.as_ref().expect("err").clone();
-                m_.secret_key = "REDACTED".to_string();
-                m = Some(m_);
+                let mut compatible_backend_ = self.minio.as_ref().expect("err").clone();
+                compatible_backend_.secret_key = "REDACTED".to_string();
+                compatible_backend = Some(compatible_backend_);
             }
             TierType::Aliyun => {
                 let mut aliyun_ = self.aliyun.as_ref().expect("err").clone();
@@ -207,7 +207,7 @@ impl Clone for TierConfig {
             name: self.name.clone(),
             s3,
             rustfs: r,
-            minio: m,
+            minio: compatible_backend,
             aliyun,
             tencent,
             huaweicloud,
@@ -408,7 +408,7 @@ impl TierMinIO {
         if name.is_empty() {
             return Err(std::io::Error::other(ERR_TIER_NAME_EMPTY));
         }
-        let m = TierMinIO {
+        let backend = TierMinIO {
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
             bucket: bucket.to_string(),
@@ -417,7 +417,7 @@ impl TierMinIO {
         };
 
         for option in options {
-            let option = option(m.clone());
+            let option = option(backend.clone());
             let option = *option;
             option?;
         }
@@ -426,7 +426,7 @@ impl TierMinIO {
             version: C_TIER_CONFIG_VER.to_string(),
             tier_type: TierType::MinIO,
             name: name.to_string(),
-            minio: Some(m),
+            minio: Some(backend),
             ..Default::default()
         })
     }

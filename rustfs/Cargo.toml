@@ -36,6 +36,7 @@ metrics = []
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
+license = []
 full = ["metrics", "ftps", "swift", "webdav"]
 
 [lints]
@@ -48,6 +49,7 @@ rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-filemeta.workspace = true
@@ -167,6 +169,7 @@ aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+temp-env = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

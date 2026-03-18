@@ -129,13 +129,53 @@ impl ObjectStore {
     }
 
     fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let de = rustfs_crypto::decrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
-        Ok(de)
+        if Self::is_plaintext_json(data) {
+            return Ok(data.to_vec());
+        }
+
+        let cred = get_global_action_cred().unwrap_or_default();
+        let secret_key = cred.secret_key;
+        let mut keys: Vec<(Vec<u8>, bool)> = vec![(secret_key.clone().into_bytes(), false)];
+        if !cred.access_key.is_empty() && !secret_key.is_empty() {
+            keys.push((format!("{}:{secret_key}", cred.access_key).into_bytes(), true));
+        }
+
+        const STREAM_IO_HEADER_LEN: usize = 41;
+        let mut last_err = None;
+        for (key, is_access_secret) in keys {
+            if is_access_secret
+                && data.len() >= STREAM_IO_HEADER_LEN
+                && let Ok(plain) = rustfs_crypto::decrypt_stream_io(&key, data)
+            {
+                return Ok(plain);
+            }
+            match rustfs_crypto::decrypt_data(&key, data) {
+                Ok(plain) => return Ok(plain),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap_or(rustfs_crypto::Error::ErrUnexpectedHeader).into())
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
-        let en = rustfs_crypto::encrypt_data(get_global_action_cred().unwrap_or_default().secret_key.as_bytes(), data)?;
+        let cred = get_global_action_cred().unwrap_or_default();
+        let password = if !cred.access_key.is_empty() && !cred.secret_key.is_empty() {
+            format!("{}:{}", cred.access_key, cred.secret_key).into_bytes()
+        } else {
+            cred.secret_key.clone().into_bytes()
+        };
+        let en = rustfs_crypto::encrypt_stream_io(&password, data)?;
         Ok(en)
+    }
+
+    fn is_plaintext_json(data: &[u8]) -> bool {
+        std::str::from_utf8(data).is_ok() && serde_json::from_slice::<serde_json::Value>(data).is_ok()
+    }
+
+    #[cfg(test)]
+    fn encrypt_data_for_test(data: &[u8]) -> Result<Vec<u8>> {
+        Self::encrypt_data(data)
     }
 
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
@@ -1163,4 +1203,84 @@ impl Store for ObjectStore {
 
     //     Ok(())
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectStore;
+    use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
+
+    fn test_cred() -> Credentials {
+        if let Some(cred) = get_global_action_cred() {
+            return cred;
+        }
+        let _ = init_global_action_credentials(Some("COMPATTESTAK".to_string()), Some("COMPATTESTSK1234567890".to_string()));
+        get_global_action_cred().unwrap_or_default()
+    }
+
+    #[test]
+    fn test_decrypt_data_accepts_plaintext_json() {
+        let raw = br#"{"Version":1,"policy":"readonly"}"#;
+        let out = ObjectStore::decrypt_data(raw).expect("plaintext json should pass through");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_decrypt_data_accepts_rustfs_legacy_secret_encryption() {
+        let cred = test_cred();
+        let plain = br#"{"accessKey":"ak","secretKey":"sk"}"#;
+        let encrypted = rustfs_crypto::encrypt_data(cred.secret_key.as_bytes(), plain).expect("encrypt with rustfs secret");
+        let out = ObjectStore::decrypt_data(&encrypted).expect("decrypt rustfs legacy encryption");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn test_decrypt_data_accepts_access_secret_encryption() {
+        let cred = test_cred();
+        let plain = br#"{"Version":1,"updatedAt":"2025-03-07T12:00:00Z"}"#;
+        let root_cred = format!("{}:{}", cred.access_key, cred.secret_key);
+        let encrypted = rustfs_crypto::encrypt_stream_io(root_cred.as_bytes(), plain).expect("encrypt with stream_io");
+        let out = ObjectStore::decrypt_data(&encrypted).expect("decrypt stream_io");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn test_decrypt_data_corrupt_stream_io_fails() {
+        let cred = test_cred();
+        let plain = br#"{"Version":1}"#;
+        let root_cred = format!("{}:{}", cred.access_key, cred.secret_key);
+        let mut encrypted = rustfs_crypto::encrypt_stream_io(root_cred.as_bytes(), plain).expect("encrypt with stream_io");
+        if encrypted.len() > 50 {
+            encrypted[50] ^= 0xFF; // corrupt one byte
+        }
+        let result = ObjectStore::decrypt_data(&encrypted);
+        assert!(result.is_err(), "corrupt stream_io data should fail decrypt");
+    }
+
+    #[test]
+    fn test_decrypt_data_short_data_fails() {
+        let short = &[0x00u8; 40]; // less than 41-byte stream_io header, not valid JSON
+        let result = ObjectStore::decrypt_data(short);
+        assert!(result.is_err(), "short non-JSON data should fail decrypt");
+    }
+
+    #[test]
+    fn test_encrypt_data_produces_stream_io_format() {
+        let _ = test_cred();
+        let plain = br#"{"Version":1,"policy":"readonly"}"#;
+        let encrypted = ObjectStore::encrypt_data_for_test(plain).expect("encrypt should succeed");
+        // stream_io header: salt(32) + alg_id(1) + nonce_prefix(8) = 41 bytes
+        const STREAM_IO_HEADER_LEN: usize = 41;
+        assert!(
+            encrypted.len() >= STREAM_IO_HEADER_LEN,
+            "encrypted should have at least 41-byte stream_io header"
+        );
+        assert!(
+            encrypted[32] == 0x00 || encrypted[32] == 0x01 || encrypted[32] == 0x02,
+            "alg_id should be 0x00, 0x01, or 0x02"
+        );
+        // Round-trip: encrypt then decrypt
+        let decrypted = ObjectStore::decrypt_data(&encrypted).expect("decrypt should succeed");
+        assert_eq!(plain, decrypted.as_slice());
+    }
 }

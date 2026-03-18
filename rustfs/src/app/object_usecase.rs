@@ -82,13 +82,14 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, RESERVED_METADATA_PREFIX,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION,
+    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-        RESERVED_METADATA_PREFIX_LOWER,
     },
+    insert_str, remove_str,
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
 use rustfs_utils::{
@@ -426,9 +427,8 @@ impl DefaultObjectUsecase {
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             let algorithm = CompressionAlgorithm::default();
-            metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), algorithm.to_string());
-
-            metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
@@ -437,10 +437,8 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            opts.user_defined
-                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), algorithm.to_string());
-            opts.user_defined
-                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             reader = Box::new(CompressReader::new(hrd, algorithm));
             size = HashReader::SIZE_PRESERVE_LAYER;
@@ -497,10 +495,12 @@ impl DefaultObjectUsecase {
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            opts.user_defined.insert(k, jiff::Zoned::now().to_string());
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            opts.user_defined.insert(k, dsc.pending_status().unwrap_or_default());
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_STATUS,
+                dsc.pending_status().unwrap_or_default(),
+            );
         }
 
         let obj_info = store
@@ -2104,11 +2104,8 @@ impl DefaultObjectUsecase {
         let mut compress_metadata = HashMap::new();
 
         if is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64 {
-            compress_metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                CompressionAlgorithm::default().to_string(),
-            );
-            compress_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), actual_size.to_string());
+            insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+            insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
 
             let hrd = EtagReader::new(reader, None);
 
@@ -2117,24 +2114,9 @@ impl DefaultObjectUsecase {
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             length = HashReader::SIZE_PRESERVE_LAYER;
         } else {
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}compression"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}actual-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
-            src_info
-                .user_defined
-                .remove(&format!("{RESERVED_METADATA_PREFIX}compression-size"));
+            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION);
+            remove_str(&mut src_info.user_defined, SUFFIX_ACTUAL_SIZE);
+            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION_SIZE);
         }
 
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
@@ -3480,11 +3462,8 @@ impl DefaultObjectUsecase {
                 let actual_size = size;
 
                 if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
-                    metadata.insert(
-                        format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
-                        CompressionAlgorithm::default().to_string(),
-                    );
-                    metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), size.to_string());
+                    insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+                    insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                     let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 

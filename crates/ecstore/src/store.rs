@@ -156,7 +156,7 @@ pub struct ECStore {
     // pub local_disks: Vec<DiskStore>,
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
-    pub decommission_cancelers: Vec<Option<usize>>,
+    pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
 }
 
 // impl Clone for ECStore {

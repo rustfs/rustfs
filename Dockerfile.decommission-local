@@ -1,0 +1,65 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM rust:1.91-trixie
+
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    lld \
+    protobuf-compiler \
+    flatbuffers-compiler; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/rustfs
+
+COPY . .
+
+RUN ./scripts/static.sh
+RUN cargo run --bin gproto
+RUN cargo build --release --locked --bin rustfs
+
+RUN set -eux; \
+    groupadd -g 10001 rustfs; \
+    useradd -u 10001 -g rustfs -M -s /usr/sbin/nologin rustfs
+
+WORKDIR /app
+
+RUN set -eux; \
+    mkdir -p /data /logs; \
+    chown -R rustfs:rustfs /data /logs /app; \
+    chmod 0750 /data /logs
+
+COPY entrypoint.sh /entrypoint.sh
+RUN install -m 0755 /usr/src/rustfs/target/release/rustfs /usr/bin/rustfs && chmod +x /entrypoint.sh
+
+ENV RUSTFS_VOLUMES="/data" \
+    RUST_LOG="warn" \
+    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
+    RUSTFS_USERNAME="rustfs" \
+    RUSTFS_GROUPNAME="rustfs" \
+    RUSTFS_UID="10001" \
+    RUSTFS_GID="10001"
+
+EXPOSE 9000 9001
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/bin/rustfs"]

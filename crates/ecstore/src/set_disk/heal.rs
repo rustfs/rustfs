@@ -124,11 +124,12 @@ impl SetDisks {
                         );
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
-                            // Initialize erasure coding
-                            erasure_coding::Erasure::new(
+                            // Initialize erasure coding; use legacy mode for old-version files
+                            erasure_coding::Erasure::new_with_options(
                                 latest_meta.erasure.data_blocks,
                                 latest_meta.erasure.parity_blocks,
                                 latest_meta.erasure.block_size,
+                                latest_meta.uses_legacy_checksum,
                             )
                         } else {
                             erasure_coding::Erasure::default()
@@ -347,7 +348,14 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                let checksum_algo = erasure_info.get_checksum_info(part.number).algorithm;
+                                let checksum_info = erasure_info.get_checksum_info(part.number);
+                                let checksum_algo = if latest_meta.uses_legacy_checksum
+                                    && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+                                {
+                                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                                } else {
+                                    checksum_info.algorithm
+                                };
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());
                                 // let mut errors = Vec::with_capacity(out_dated_disks.len());
@@ -420,7 +428,7 @@ impl SetDisks {
                                             ]),
                                             erasure.shard_file_size(part.size as i64),
                                             erasure.shard_size(),
-                                            HashAlgorithm::HighwayHash256,
+                                            HashAlgorithm::HighwayHash256S,
                                         )
                                         .await
                                         {

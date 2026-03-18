@@ -175,6 +175,7 @@ pub(super) fn init_observability_http(
     let mut cleanup_handle = None;
     let mut tracing_guard = None; // Guard for file writer
     let mut stdout_guard = None; // Guard for stdout writer (File mode)
+    let mut force_stdout_logging = false;
 
     // ── Case 1: OTLP Logging
     if !log_ep.is_empty() {
@@ -201,40 +202,34 @@ pub(super) fn init_observability_http(
     {
         let log_filename = config.log_filename.as_deref().unwrap_or(&service_name);
         let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
+        let file_logging_result = (|| -> Result<_, TelemetryError> {
+            fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-        // 1. Ensure dir exists
-        if let Err(e) = fs::create_dir_all(log_directory) {
-            return Err(TelemetryError::Io(e.to_string()));
-        }
-        // 2. Permissions
-        #[cfg(unix)]
-        crate::telemetry::local::ensure_dir_permissions(log_directory)?;
+            #[cfg(unix)]
+            crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
-        // 3. Rotation
-        let rotation_str = config
-            .log_rotation_time
-            .as_deref()
-            .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
-            .to_lowercase();
-        let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
-        let rotation = match rotation_str.as_str() {
-            "minutely" => Rotation::Minutely,
-            "hourly" => Rotation::Hourly,
-            "daily" => Rotation::Daily,
-            _ => Rotation::Daily,
-        };
-        let max_single_file_size = config
-            .log_max_single_file_size_bytes
-            .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+            let rotation_str = config
+                .log_rotation_time
+                .as_deref()
+                .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
+                .to_lowercase();
+            let match_mode =
+                FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
+            let rotation = match rotation_str.as_str() {
+                "minutely" => Rotation::Minutely,
+                "hourly" => Rotation::Hourly,
+                "daily" => Rotation::Daily,
+                _ => Rotation::Daily,
+            };
+            let max_single_file_size = config
+                .log_max_single_file_size_bytes
+                .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
 
-        let file_appender =
-            RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            let file_appender =
+                RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
 
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        tracing_guard = Some(guard);
-
-        file_layer_opt = Some(
-            tracing_subscriber::fmt::layer()
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let file_layer = tracing_subscriber::fmt::layer()
                 .with_timer(LocalTime::rfc_3339())
                 .with_target(true)
                 .with_ansi(false)
@@ -247,17 +242,28 @@ pub(super) fn init_observability_http(
                 .with_current_span(true)
                 .with_span_list(true)
                 .with_span_events(span_events.clone())
-                .with_filter(build_env_filter(logger_level, None)),
-        );
+                .with_filter(build_env_filter(logger_level, None));
+            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+            Ok((file_layer, guard, cleanup_handle, rotation_str))
+        })();
 
-        // The cleanup task keeps rotated files bounded while the OTLP trace and
-        // metric exporters continue to operate independently.
-        cleanup_handle = Some(spawn_cleanup_task(config, log_directory, log_filename, keep_files));
+        match file_logging_result {
+            Ok((file_layer, guard, new_cleanup_handle, rotation_str)) => {
+                tracing_guard = Some(guard);
+                file_layer_opt = Some(file_layer);
+                cleanup_handle = Some(new_cleanup_handle);
 
-        info!(
-            "Init file logging at '{}', rotation: {}, keep {} files",
-            log_directory, rotation_str, keep_files
-        );
+                info!(
+                    "Init file logging at '{}', rotation: {}, keep {} files",
+                    log_directory, rotation_str, keep_files
+                );
+            }
+            Err(error) if crate::telemetry::local::should_fallback_to_stdout(&error) => {
+                crate::telemetry::local::emit_file_logging_fallback_warning(log_directory, &error);
+                force_stdout_logging = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     // ── Tracing subscriber registry ───────────────────────────────────────────
@@ -266,10 +272,9 @@ pub(super) fn init_observability_http(
         .map(|p| OpenTelemetryLayer::new(p.tracer(service_name.to_string())));
     let metrics_layer = meter_provider.as_ref().map(|p| MetricsLayer::new(p.clone()));
 
-    // Optional stdout mirror (matching `init_file_logging_internal` logic).
-    // This is separate from OTLP stdout exporting; it only affects local human
-    // readable output for the tracing subscriber.
-    if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    // Optional stdout mirror (matching init_file_logging_internal logic)
+    // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
+    if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
         stdout_layer_opt = Some(

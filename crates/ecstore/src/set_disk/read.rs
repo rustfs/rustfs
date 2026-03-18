@@ -603,7 +603,12 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = erasure_coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -648,6 +653,14 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
+            let checksum_info = fi.erasure.get_checksum_info(part_number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
+
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -659,7 +672,7 @@ impl SetDisks {
                     read_offset,
                     till_offset,
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    checksum_algo.clone(),
                     skip_verify_bitrot,
                 )
                 .await

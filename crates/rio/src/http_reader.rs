@@ -18,6 +18,7 @@ use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
+use rustfs_utils::get_env_opt_str;
 use std::error::Error as _;
 use std::io::{self, Error};
 use std::ops::Not as _;
@@ -32,11 +33,8 @@ use tracing::error;
 /// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
 /// If the variable is not set, return None.
 fn tls_path() -> Option<&'static std::path::PathBuf> {
-    static TLS_PATH: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
-        std::env::var("RUSTFS_TLS_PATH")
-            .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(s.into()) })
-    });
+    static TLS_PATH: LazyLock<Option<std::path::PathBuf>> =
+        LazyLock::new(|| get_env_opt_str("RUSTFS_TLS_PATH").and_then(|s| if s.is_empty() { None } else { Some(s.into()) }));
     TLS_PATH.as_ref()
 }
 

@@ -310,17 +310,6 @@ impl DataUsageHash {
 
         let hash = self.calculate_hash();
 
-        warn!(
-            "mod_alt: key: {} hash: {} cycle: {} cycles: {} mod: {} hash >> 32: {} result: {}",
-            self.0,
-            hash,
-            cycle,
-            cycles,
-            (hash >> 32) as u32,
-            (hash >> 32) as u32 % cycles,
-            cycle % cycles,
-        );
-
         (hash >> 32) as u32 % cycles == cycle % cycles
     }
 
