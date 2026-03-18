@@ -21,7 +21,7 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
-    is_err_version_not_found,
+    is_err_operation_canceled, is_err_version_not_found,
 };
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
@@ -88,6 +88,10 @@ fn classify_decommission_terminal_state(failed_items_present: bool) -> Decommiss
     } else {
         DecommissionTerminalState::Completed
     }
+}
+
+fn should_preserve_decommission_canceled_state(meta_canceled: bool, cancel_signal: bool) -> bool {
+    meta_canceled || cancel_signal
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1029,8 +1033,27 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
-        if let Err(err) = self.decommission_in_background(rx, idx).await {
+        let result = self.decommission_in_background(rx.clone(), idx).await;
+
+        let (failed, canceled, cmd_line) = {
+            let pool_meta = self.pool_meta.read().await;
+            let (failed, canceled) = if let Some(info) = &pool_meta.pools[idx].decommission {
+                (info.items_decommission_failed > 0, info.canceled)
+            } else {
+                (false, false)
+            };
+            let cmd_line = pool_meta.pools[idx].cmd_line.clone();
+            (failed, canceled, cmd_line)
+        };
+
+        if let Err(err) = result {
             error!("decom err {:?}", &err);
+
+            if is_err_operation_canceled(&err) || should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
+                warn!("decommission: canceled for pool {}, preserving canceled state", cmd_line);
+                return;
+            }
+
             if let Err(er) = self.decommission_failed(idx).await {
                 error!("decom failed err {:?}", &er);
             } else {
@@ -1042,18 +1065,10 @@ impl ECStore {
 
         warn!("decommission: decommission_in_background complete {}", idx);
 
-        let (failed, cmd_line) = {
-            let pool_meta = self.pool_meta.read().await;
-            let failed = {
-                if let Some(info) = &pool_meta.pools[idx].decommission {
-                    info.items_decommission_failed > 0
-                } else {
-                    false
-                }
-            };
-            let cmd_line = pool_meta.pools[idx].cmd_line.clone();
-            (failed, cmd_line)
-        };
+        if should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
+            warn!("decommission: canceled for pool {}, skipping terminal state overwrite", cmd_line);
+            return;
+        }
 
         match classify_decommission_terminal_state(failed) {
             DecommissionTerminalState::Completed => {
@@ -1619,6 +1634,7 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DecommissionTerminalState, classify_decommission_terminal_state, dedup_indices, ensure_decommission_not_rebalancing,
+        should_preserve_decommission_canceled_state,
     };
     use crate::error::Error;
 
@@ -1652,5 +1668,20 @@ mod pools_tests {
     #[test]
     fn test_classify_decommission_terminal_state_failed_when_failures_present() {
         assert_eq!(classify_decommission_terminal_state(true), DecommissionTerminalState::Failed);
+    }
+
+    #[test]
+    fn test_should_preserve_decommission_canceled_state_when_meta_canceled() {
+        assert!(should_preserve_decommission_canceled_state(true, false));
+    }
+
+    #[test]
+    fn test_should_preserve_decommission_canceled_state_when_signal_canceled() {
+        assert!(should_preserve_decommission_canceled_state(false, true));
+    }
+
+    #[test]
+    fn test_should_preserve_decommission_canceled_state_when_not_canceled() {
+        assert!(!should_preserve_decommission_canceled_state(false, false));
     }
 }
