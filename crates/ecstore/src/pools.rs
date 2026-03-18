@@ -183,6 +183,10 @@ fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: 
     Ok(())
 }
 
+fn require_decommission_store<T>(store: Option<T>) -> Result<T> {
+    store.ok_or_else(|| Error::other("store not init"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     #[serde(rename = "id")]
@@ -847,9 +851,7 @@ impl ECStore {
 
         ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(Error::other("store not init"));
-        };
+        let store = require_decommission_store(new_object_layer_fn())?;
 
         self.start_decommission(indices.clone()).await?;
         self.spawn_decommission_routines(store, rx, indices).await?;
@@ -1803,7 +1805,8 @@ mod pools_tests {
         classify_decommission_terminal_state, decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        is_decommission_cancel_terminal, require_decommission_store, should_preserve_decommission_canceled_state,
+        take_decommission_canceler,
     };
     use crate::error::Error;
     use time::OffsetDateTime;
@@ -2002,6 +2005,18 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_cancel_allowed_allows_active() {
         assert!(ensure_decommission_cancel_allowed(true, true, false).is_ok());
+    }
+
+    #[test]
+    fn test_require_decommission_store_returns_value_when_present() {
+        let store = require_decommission_store(Some(7_u8)).expect("present store should be returned");
+        assert_eq!(store, 7);
+    }
+
+    #[test]
+    fn test_require_decommission_store_returns_error_when_missing() {
+        let err = require_decommission_store::<u8>(None).expect_err("missing store should return error");
+        assert!(err.to_string().contains("store not init"));
     }
 
     #[test]
