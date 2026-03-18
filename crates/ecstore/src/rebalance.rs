@@ -703,9 +703,15 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut() {
-            stop_rebalance_state(meta, OffsetDateTime::now_utc());
+        let meta_to_save = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            stop_rebalance_meta_snapshot(rebalance_meta.as_mut(), OffsetDateTime::now_utc())
+        };
+
+        if let Some(meta_to_save) = meta_to_save
+            && let Some(pool) = self.pools.first().cloned()
+        {
+            meta_to_save.save(pool).await?;
         }
 
         Ok(())
@@ -1193,6 +1199,13 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     }
 }
 
+fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
+    meta.map(|meta| {
+        stop_rebalance_state(meta, now);
+        meta.clone()
+    })
+}
+
 impl ECStore {
     #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, set))]
@@ -1623,7 +1636,7 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_worker_result, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_state,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
         take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2624,6 +2637,43 @@ mod rebalance_unit_tests {
         assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
         assert_eq!(meta.pool_stats[0].info.end_time, Some(stopped_at));
         assert_eq!(meta.pool_stats[0].info.last_error, None);
+    }
+
+    #[test]
+    fn test_stop_rebalance_meta_snapshot_returns_none_when_meta_missing() {
+        let now = OffsetDateTime::from_unix_timestamp(50_000).unwrap();
+        assert!(stop_rebalance_meta_snapshot(None, now).is_none());
+    }
+
+    #[test]
+    fn test_stop_rebalance_meta_snapshot_stops_meta_and_returns_snapshot() {
+        let now = OffsetDateTime::from_unix_timestamp(60_000).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut meta = RebalanceMeta {
+            cancel: Some(cancel),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let snapshot = stop_rebalance_meta_snapshot(Some(&mut meta), now).expect("snapshot should be returned for present meta");
+
+        assert!(cancel_clone.is_cancelled());
+        assert!(meta.cancel.is_none());
+        assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+
+        assert!(snapshot.cancel.is_none());
+        assert_eq!(snapshot.stopped_at, Some(now));
+        assert_eq!(snapshot.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(snapshot.pool_stats[0].info.end_time, Some(now));
     }
 
     #[test]
