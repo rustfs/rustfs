@@ -858,9 +858,11 @@ impl Default for TransitionOptions {
 mod tests {
     use super::*;
     use s3s::dto::LifecycleRuleFilter;
+    use serial_test::serial;
     use std::sync::Arc;
 
     #[tokio::test]
+    #[serial]
     async fn validate_rejects_non_positive_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -888,6 +890,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_accepts_positive_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -912,6 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_rejects_non_midnight_expiration_date() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -936,6 +940,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn predict_expiration_selects_closest_expiry_for_put_object() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -987,6 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_accepts_multiple_rules_without_ids() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![
@@ -1027,6 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_rejects_rule_id_too_long() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -1051,6 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_rejects_duplicate_rule_ids() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![
@@ -1090,6 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_latest_object_after_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1123,6 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_keeps_latest_object_before_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1154,6 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_latest_object_after_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1189,6 +1200,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1224,6 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1261,6 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn noncurrent_versions_expiration_limit_returns_configured_limits() {
         let lc = Arc::new(BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -1295,6 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn validate_rejects_invalid_status_case_sensitive() {
         let lc = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
@@ -1319,6 +1334,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn filter_rules_respects_filter_prefix() {
         let mut filter = LifecycleRuleFilter::default();
         filter.prefix = Some("prefix".to_string());
@@ -1359,6 +1375,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn filter_rules_respects_filter_and_prefix() {
         let mut filter = LifecycleRuleFilter::default();
 
@@ -1403,6 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_delete_marker_requires_single_version() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1439,6 +1457,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_delete_marker_deletes_only_delete_marker_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1477,6 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_delete_marker_date_based_not_yet_due() {
         // A date-based rule that has not yet reached its expiry date must not
         // trigger immediate deletion (unwrap_or(now) must not override the date).
