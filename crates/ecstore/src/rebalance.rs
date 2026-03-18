@@ -703,11 +703,9 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        if let Some(meta) = rebalance_meta.as_ref()
-            && let Some(cancel_tx) = meta.cancel.as_ref()
-        {
-            cancel_tx.cancel();
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        if let Some(meta) = rebalance_meta.as_mut() {
+            stop_rebalance_state(meta, OffsetDateTime::now_utc());
         }
 
         Ok(())
@@ -1177,6 +1175,16 @@ fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     }
 }
 
+fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
+    if let Some(cancel_tx) = meta.cancel.take() {
+        cancel_tx.cancel();
+    }
+
+    if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
+        apply_stopped_at(meta, now);
+    }
+}
+
 impl ECStore {
     #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, set))]
@@ -1607,7 +1615,8 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_worker_result, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, take_bucket_from_rebalance_queue,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_state,
+        take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2522,6 +2531,60 @@ mod rebalance_unit_tests {
         assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Failed);
         assert_eq!(meta.pool_stats[1].info.end_time, Some(now));
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_stop_rebalance_state_cancels_token_and_marks_stopped_when_in_progress() {
+        let now = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut meta = RebalanceMeta {
+            cancel: Some(cancel),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        stop_rebalance_state(&mut meta, now);
+
+        assert!(cancel_clone.is_cancelled());
+        assert!(meta.cancel.is_none());
+        assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+    }
+
+    #[test]
+    fn test_stop_rebalance_state_clears_token_without_forcing_stopped_when_not_in_progress() {
+        let now = OffsetDateTime::from_unix_timestamp(20_000).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut meta = RebalanceMeta {
+            cancel: Some(cancel),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    end_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        stop_rebalance_state(&mut meta, now);
+
+        assert!(cancel_clone.is_cancelled());
+        assert!(meta.cancel.is_none());
+        assert_eq!(meta.stopped_at, None);
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
     }
 
     #[test]
