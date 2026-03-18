@@ -39,6 +39,11 @@ fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerP
     resolve_endpoints_handle()
 }
 
+fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
+    let idx = pool.parse::<usize>().ok()?;
+    (idx < endpoint_count).then_some(idx)
+}
+
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -322,8 +327,7 @@ impl Operation for CancelDecommission {
 
         let has_idx = {
             if is_byid {
-                let a = query.pool.parse::<usize>().unwrap_or_default();
-                if a < endpoints.as_ref().len() { Some(a) } else { None }
+                parse_pool_idx_by_id(&query.pool, endpoints.as_ref().len())
             } else {
                 endpoints.get_pool_idx(&query.pool)
             }
@@ -341,5 +345,30 @@ impl Operation for CancelDecommission {
         store.decommission_cancel(idx).await.map_err(ApiError::from)?;
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
+    }
+}
+
+#[cfg(test)]
+mod pools_handler_tests {
+    use super::parse_pool_idx_by_id;
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_non_numeric() {
+        assert_eq!(parse_pool_idx_by_id("invalid", 4), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_out_of_range() {
+        assert_eq!(parse_pool_idx_by_id("4", 4), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_empty_pool_count() {
+        assert_eq!(parse_pool_idx_by_id("0", 0), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_accepts_valid_index() {
+        assert_eq!(parse_pool_idx_by_id("2", 4), Some(2));
     }
 }
