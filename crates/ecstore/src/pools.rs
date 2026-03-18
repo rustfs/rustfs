@@ -923,10 +923,12 @@ impl ECStore {
                 .unwrap_or_default();
 
             drop(pool_meta);
-            if ok && let Some(notification_sys) = get_global_notification_sys()
-                && let Err(err) = notification_sys.reload_pool_meta().await {
-                    error!("decommission_entry: reload_pool_meta err {:?}", err);
-                }
+            if ok
+                && let Some(notification_sys) = get_global_notification_sys()
+                && let Err(err) = notification_sys.reload_pool_meta().await
+            {
+                error!("decommission_entry: reload_pool_meta err {:?}", err);
+            }
         }
 
         warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
