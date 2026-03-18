@@ -106,6 +106,14 @@ fn cancel_decommission_canceler(canceler: Option<CancellationToken>) -> bool {
     }
 }
 
+fn ensure_decommission_routines_scheduled(bound_count: usize) -> Result<()> {
+    if bound_count == 0 {
+        return Err(Error::other("decommission routines not scheduled"));
+    }
+
+    Ok(())
+}
+
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
         return Err(Error::RebalanceAlreadyRunning);
@@ -832,9 +840,7 @@ impl ECStore {
             bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
         };
 
-        if index_cancelers.is_empty() {
-            return Ok(());
-        };
+        ensure_decommission_routines_scheduled(index_cancelers.len())?;
 
         for (idx, canceler) in index_cancelers {
             let store = store.clone();
@@ -864,7 +870,17 @@ impl ECStore {
         let store = require_decommission_store(new_object_layer_fn())?;
 
         self.start_decommission(indices.clone()).await?;
-        self.spawn_decommission_routines(store, rx, indices).await?;
+        if let Err(err) = self.spawn_decommission_routines(store, rx, indices.clone()).await {
+            for idx in indices {
+                if let Err(cancel_err) = self.decommission_cancel(idx).await {
+                    error!(
+                        "decommission: failed to rollback decommission state for idx {} after spawn error: {:?}",
+                        idx, cancel_err
+                    );
+                }
+            }
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -1390,6 +1406,8 @@ impl ECStore {
             let pi = self.get_decommission_pool_space_info(idx).await?;
             space_infos.push((idx, pi));
         }
+
+        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
         let mut pool_meta = self.pool_meta.write().await;
         for idx in indices.iter().copied() {
@@ -2113,5 +2131,16 @@ mod pools_tests {
     #[test]
     fn test_cancel_decommission_canceler_returns_false_when_missing() {
         assert!(!cancel_decommission_canceler(None));
+    }
+
+    #[test]
+    fn test_ensure_decommission_routines_scheduled_accepts_positive_bound_count() {
+        assert!(super::ensure_decommission_routines_scheduled(1).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_decommission_routines_scheduled_rejects_zero_bound_count() {
+        let err = super::ensure_decommission_routines_scheduled(0).expect_err("zero bound count should be rejected");
+        assert!(err.to_string().contains("decommission routines not scheduled"));
     }
 }
