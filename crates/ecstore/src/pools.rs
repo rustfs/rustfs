@@ -146,6 +146,10 @@ fn ensure_valid_decommission_pool_index(pool_count: usize, idx: usize) -> Result
     Ok(())
 }
 
+fn get_by_index<T>(items: &[T], idx: usize) -> Result<&T> {
+    items.get(idx).ok_or_else(|| Error::other("InvalidArgument"))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -730,7 +734,7 @@ impl ECStore {
 
         let pool_meta = self.pool_meta.read().await;
 
-        let mut pool_info = pool_meta.pools[idx].clone();
+        let mut pool_info = get_by_index(pool_meta.pools.as_slice(), idx)?.clone();
         if let Some(d) = pool_info.decommission.as_mut() {
             d.total_size = space_info.total;
             d.current_size = space_info.free;
@@ -1206,12 +1210,17 @@ impl ECStore {
 
         let (failed, canceled, cmd_line) = {
             let pool_meta = self.pool_meta.read().await;
-            let (failed, canceled) = if let Some(info) = &pool_meta.pools[idx].decommission {
+            let Some(pool) = pool_meta.pools.get(idx) else {
+                error!("decommission: pool metadata missing for idx {}", idx);
+                return;
+            };
+
+            let (failed, canceled) = if let Some(info) = &pool.decommission {
                 (info.items_decommission_failed > 0, info.canceled)
             } else {
                 (false, false)
             };
-            let cmd_line = pool_meta.pools[idx].cmd_line.clone();
+            let cmd_line = pool.cmd_line.clone();
             (failed, canceled, cmd_line)
         };
 
@@ -1297,7 +1306,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_in_background(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
-        let pool = self.pools[idx].clone();
+        let pool = get_by_index(self.pools.as_slice(), idx)?.clone();
 
         let pending = {
             let pool_meta = self.pool_meta.read().await;
@@ -1832,7 +1841,7 @@ mod pools_tests {
         DecommissionTerminalState, PoolDecommissionInfo, PoolStatus, bind_decommission_cancelers, cancel_decommission_canceler,
         classify_decommission_terminal_state, decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
-        ensure_valid_decommission_pool_index, has_active_decommission_canceler, is_decommission_active,
+        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
         is_decommission_cancel_terminal, require_decommission_store, should_preserve_decommission_canceled_state,
         take_decommission_canceler,
     };
@@ -1849,6 +1858,20 @@ mod pools_tests {
     fn test_dedup_indices_handles_empty_input() {
         let empty: Vec<usize> = Vec::new();
         assert!(dedup_indices(&empty).is_empty());
+    }
+
+    #[test]
+    fn test_get_by_index_returns_value_when_in_range() {
+        let values = vec!["a", "b", "c"];
+        let value = get_by_index(values.as_slice(), 1).expect("in-range index should return value");
+        assert_eq!(*value, "b");
+    }
+
+    #[test]
+    fn test_get_by_index_returns_error_when_out_of_range() {
+        let values = vec![1_u8];
+        let err = get_by_index(values.as_slice(), 2).expect_err("out-of-range index should fail");
+        assert!(err.to_string().contains("InvalidArgument"));
     }
 
     #[test]
