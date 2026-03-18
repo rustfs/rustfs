@@ -13,51 +13,273 @@
 // limitations under the License.
 
 use rustfs_appauth::token::Token;
-use std::io::{Error, Result};
+use rustfs_appauth::token::parse_license;
+use std::fmt;
+use std::io::{Error, ErrorKind, Result};
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-use tracing::error;
-use tracing::info;
+use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
 
-static LICENSE: OnceLock<Token> = OnceLock::new();
+pub type LicenseResult<T> = std::result::Result<T, LicenseError>;
+pub type SharedLicenseVerifier = Arc<dyn LicenseVerifier>;
 
-/// Initialize the license
-pub fn init_license(license: Option<String>) {
-    if license.is_none() {
-        error!("License is None");
-        return;
-    }
-    let license = license.unwrap();
-    let token = rustfs_appauth::token::parse_license(&license).unwrap_or_default();
-
-    LICENSE.set(token).unwrap_or_else(|_| {
-        error!("Failed to set license");
-    });
+#[derive(Clone, Debug)]
+pub enum LicenseError {
+    /// Internal license state lock could not be acquired.
+    StatePoisoned,
+    /// License is required in licensed builds but not provided.
+    Missing,
+    /// Token decoding or signature check failed.
+    Invalid(String),
+    /// License expiration check failed.
+    #[cfg(feature = "license")]
+    Expired { expired_at: u64, now: u64 },
+    /// System time could not be read.
+    Clock(String),
 }
 
-/// Get the license
-pub fn get_license() -> Option<Token> {
-    LICENSE.get().cloned()
-}
-
-/// Check the license
-/// This function checks if the license is valid.
-#[allow(unreachable_code)]
-pub fn license_check() -> Result<()> {
-    return Ok(());
-    let invalid_license = LICENSE.get().map(|token| {
-        if token.expired < SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() {
-            error!("License expired");
-            return Err(Error::other("Incorrect license, please contact RustFS."));
+impl fmt::Display for LicenseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LicenseError::StatePoisoned => write!(f, "License state is unavailable"),
+            LicenseError::Missing => write!(f, "License is required when building with feature `license`."),
+            LicenseError::Invalid(message) => write!(f, "Incorrect license, please contact RustFS. {message}"),
+            #[cfg(feature = "license")]
+            LicenseError::Expired { expired_at, now } => {
+                write!(f, "Incorrect license, please contact RustFS. expired_at={expired_at}, now={now}")
+            }
+            LicenseError::Clock(message) => write!(f, "Failed to read system time: {message}"),
         }
-        info!("License is valid ! expired at {}", token.expired);
-        Ok(())
-    });
+    }
+}
 
-    if invalid_license.is_none() || invalid_license.is_some_and(|v| v.is_err()) {
-        return Err(Error::other("Incorrect license, please contact RustFS."));
+impl std::error::Error for LicenseError {}
+
+impl LicenseError {
+    fn into_io(self) -> Error {
+        match self {
+            LicenseError::StatePoisoned | LicenseError::Clock(_) => Error::other(self.to_string()),
+            LicenseError::Missing | LicenseError::Invalid(_) => Error::new(ErrorKind::PermissionDenied, self.to_string()),
+            #[cfg(feature = "license")]
+            LicenseError::Expired { .. } => Error::new(ErrorKind::PermissionDenied, self.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+enum LicenseStatus {
+    /// Internal state has not been evaluated yet.
+    #[default]
+    Uninitialized,
+    /// License has been validated.
+    Valid,
+    /// License is missing for strict license builds.
+    Missing,
+    /// License validation failed.
+    Invalid(String),
+}
+
+impl fmt::Display for LicenseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uninitialized => write!(f, "uninitialized"),
+            Self::Valid => write!(f, "valid"),
+            Self::Missing => write!(f, "missing"),
+            Self::Invalid(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LicenseState {
+    token: Option<Token>,
+    status: LicenseStatus,
+}
+
+/// Verifier for parsing and validating raw license materials.
+pub trait LicenseVerifier: Send + Sync {
+    fn validate(&self, raw_license: &str, now: u64) -> LicenseResult<Token>;
+}
+
+#[derive(Debug, Default)]
+struct AppAuthLicenseVerifier;
+
+impl LicenseVerifier for AppAuthLicenseVerifier {
+    fn validate(&self, raw_license: &str, _now: u64) -> LicenseResult<Token> {
+        let token = parse_license(raw_license).map_err(|err| LicenseError::Invalid(err.to_string()))?;
+
+        #[cfg(feature = "license")]
+        if token.expired <= _now {
+            return Err(LicenseError::Expired {
+                expired_at: token.expired,
+                now: _now,
+            });
+        }
+
+        Ok(token)
+    }
+}
+
+static LICENSE_STATE: OnceLock<RwLock<LicenseState>> = OnceLock::new();
+static LICENSE_VERIFIER: OnceLock<SharedLicenseVerifier> = OnceLock::new();
+
+fn license_state() -> &'static RwLock<LicenseState> {
+    LICENSE_STATE.get_or_init(|| RwLock::new(LicenseState::default()))
+}
+
+fn default_license_verifier() -> SharedLicenseVerifier {
+    Arc::new(AppAuthLicenseVerifier)
+}
+
+fn license_verifier() -> &'static SharedLicenseVerifier {
+    LICENSE_VERIFIER.get_or_init(default_license_verifier)
+}
+
+fn now_epoch_secs() -> LicenseResult<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| LicenseError::Clock(err.to_string()))
+        .map(|value| value.as_secs())
+}
+
+fn normalized_license(raw_license: Option<String>) -> Option<String> {
+    raw_license.map(|raw| raw.trim().to_string()).filter(|raw| !raw.is_empty())
+}
+
+fn strict_build_missing_status() -> LicenseStatus {
+    if cfg!(feature = "license") {
+        LicenseStatus::Missing
+    } else {
+        LicenseStatus::Uninitialized
+    }
+}
+
+fn apply_missing_status(state: &mut LicenseState) {
+    state.token = None;
+    state.status = strict_build_missing_status();
+}
+
+fn apply_invalid_status(state: &mut LicenseState, err: LicenseError) {
+    state.token = None;
+    state.status = LicenseStatus::Invalid(match err {
+        LicenseError::Invalid(message) => message,
+        #[cfg(feature = "license")]
+        LicenseError::Expired { expired_at, now } => format!("expired at {expired_at}, now {now}"),
+        LicenseError::Clock(message) => format!("system clock error: {message}"),
+        LicenseError::Missing => "license is required".to_string(),
+        LicenseError::StatePoisoned => "license state is unavailable".to_string(),
+    });
+}
+
+fn apply_valid_status(state: &mut LicenseState, token: Token) {
+    state.token = Some(token);
+    state.status = LicenseStatus::Valid;
+}
+
+/// Replace the global license verifier.
+///
+/// This is the extension point for OEM/build-time overlays.
+/// Returns `false` if the verifier was already initialized.
+#[allow(dead_code)]
+pub fn set_license_verifier(verifier: SharedLicenseVerifier) -> bool {
+    LICENSE_VERIFIER.set(verifier).is_ok()
+}
+
+/// Initialize the license in memory.
+///
+/// This keeps the default API signature stable and is safe to call multiple times.
+pub fn initialize_license(raw_license: Option<String>) {
+    if let Err(err) = initialize_license_result(raw_license) {
+        error!("license initialization failed: {err}");
+    }
+}
+
+/// Explicit initialization API with typed error return.
+pub fn initialize_license_result(raw_license: Option<String>) -> LicenseResult<()> {
+    let normalized = normalized_license(raw_license);
+    let mut state = license_state().write().map_err(|_| LicenseError::StatePoisoned)?;
+
+    match normalized {
+        Some(raw_license) => {
+            let now = now_epoch_secs()?;
+            match license_verifier().validate(&raw_license, now) {
+                Ok(token) => {
+                    apply_valid_status(&mut state, token.clone());
+                    info!("license loaded, subject: {}", token.name);
+                    Ok(())
+                }
+                Err(err) => {
+                    apply_invalid_status(&mut state, err.clone());
+                    warn!("license verification failed: {err}");
+                    Err(err)
+                }
+            }
+        }
+        None => {
+            apply_missing_status(&mut state);
+            if let LicenseStatus::Missing = state.status {
+                Err(LicenseError::Missing)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Legacy name kept for existing startup code.
+pub fn init_license(license: Option<String>) {
+    initialize_license(license);
+}
+
+/// Return the current license information.
+pub fn get_license() -> Option<Token> {
+    license_state().read().ok().and_then(|state| state.token.clone())
+}
+
+/// New name for compatibility with external integrations.
+pub fn current_license() -> Option<Token> {
+    get_license()
+}
+
+/// Observe the current license status for observability.
+pub fn license_status() -> String {
+    license_state()
+        .read()
+        .ok()
+        .map(|state| state.status.to_string())
+        .unwrap_or_else(|| LicenseStatus::Uninitialized.to_string())
+}
+
+/// Check whether current in-memory license is currently valid.
+#[cfg(feature = "license")]
+pub fn ensure_license() -> LicenseResult<()> {
+    let state = license_state().read().map_err(|_| LicenseError::StatePoisoned)?;
+    match &state.status {
+        LicenseStatus::Missing => return Err(LicenseError::Missing),
+        LicenseStatus::Invalid(message) => return Err(LicenseError::Invalid(message.to_string())),
+        LicenseStatus::Uninitialized | LicenseStatus::Valid => {}
+    };
+
+    let token = state.token.as_ref().ok_or(LicenseError::Missing)?;
+    let now = now_epoch_secs()?;
+    if token.expired <= now {
+        return Err(LicenseError::Expired {
+            expired_at: token.expired,
+            now,
+        });
     }
 
     Ok(())
+}
+
+#[cfg(not(feature = "license"))]
+pub fn ensure_license() -> LicenseResult<()> {
+    Ok(())
+}
+
+/// Compatibility API for call-sites that still use the legacy name.
+pub fn license_check() -> Result<()> {
+    ensure_license().map_err(LicenseError::into_io)
 }

@@ -44,7 +44,7 @@ use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use license::init_license;
+use license::{current_license, init_license, license_status};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -134,6 +134,11 @@ async fn async_main() -> Result<()> {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
+    }
+
+    info!("license status: {}", license_status());
+    if let Some(token) = current_license() {
+        info!("runtime license loaded: {}", token.name);
     }
 
     // print startup logo
