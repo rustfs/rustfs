@@ -121,6 +121,14 @@ fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bo
     Ok(())
 }
 
+fn ensure_valid_decommission_pool_index(pool_count: usize, idx: usize) -> Result<()> {
+    if idx >= pool_count {
+        return Err(Error::other("InvalidArgument"));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecommissionTerminalState {
     Completed,
@@ -1313,6 +1321,10 @@ impl ECStore {
 
         ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
+        for idx in indices.iter().copied() {
+            ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
+        }
+
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
         for bk in decom_buckets.iter() {
@@ -1772,9 +1784,9 @@ mod pools_tests {
     use super::{
         DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
         decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, has_active_decommission_canceler,
-        is_decommission_active, is_decommission_cancel_terminal, should_preserve_decommission_canceled_state,
-        take_decommission_canceler,
+        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
     use tokio_util::sync::CancellationToken;
@@ -1824,6 +1836,23 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_start_allowed_allows_terminal_state() {
         assert!(ensure_decommission_start_allowed(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_valid_decommission_pool_index_accepts_in_range_index() {
+        assert!(ensure_valid_decommission_pool_index(4, 3).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_valid_decommission_pool_index_rejects_out_of_range_index() {
+        let err = ensure_valid_decommission_pool_index(2, 2).expect_err("out-of-range index should fail");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_ensure_valid_decommission_pool_index_rejects_when_pool_count_zero() {
+        let err = ensure_valid_decommission_pool_index(0, 0).expect_err("empty pool list should reject all indices");
+        assert!(err.to_string().contains("InvalidArgument"));
     }
 
     #[test]
