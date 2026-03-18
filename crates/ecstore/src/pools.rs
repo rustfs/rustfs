@@ -869,7 +869,7 @@ impl ECStore {
             return Err(Error::other("InvalidArgument"));
         }
 
-        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
         let store = require_decommission_store(new_object_layer_fn())?;
 
@@ -1374,7 +1374,7 @@ impl ECStore {
             return Err(Error::other("errInvalidArgument"));
         }
 
-        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
         for idx in indices.iter().copied() {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
@@ -1416,7 +1416,7 @@ impl ECStore {
             space_infos.push((idx, pi));
         }
 
-        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
         let mut pool_meta = self.pool_meta.write().await;
         for idx in indices.iter().copied() {

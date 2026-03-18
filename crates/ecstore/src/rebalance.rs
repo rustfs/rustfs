@@ -387,6 +387,10 @@ fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
     meta.pool_stats.iter().any(is_rebalance_pool_started)
 }
 
+fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
+    is_rebalance_in_progress(meta)
+}
+
 fn first_rebalance_bucket(pool_stat: &RebalanceStats) -> Option<String> {
     pool_stat.buckets.first().cloned()
 }
@@ -684,6 +688,13 @@ impl ECStore {
 
         info!("is_rebalance_started: rebalance not started");
         false
+    }
+
+    pub async fn is_rebalance_conflicting_with_decommission(&self) -> bool {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        rebalance_meta
+            .as_ref()
+            .is_some_and(is_rebalance_conflicting_with_decommission)
     }
 
     pub async fn is_pool_rebalancing(&self, pool_index: usize) -> bool {
@@ -1626,6 +1637,7 @@ impl SetDisks {
 mod rebalance_unit_tests {
     use super::first_rebalance_bucket;
     use super::is_rebalance_actively_running;
+    use super::is_rebalance_conflicting_with_decommission;
     use super::is_rebalance_in_progress;
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
@@ -2423,6 +2435,46 @@ mod rebalance_unit_tests {
         };
 
         assert!(is_rebalance_in_progress(&meta));
+    }
+
+    #[test]
+    fn test_is_rebalance_conflicting_with_decommission_true_when_in_progress() {
+        let now = OffsetDateTime::now_utc();
+        let meta = RebalanceMeta {
+            stopped_at: None,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(now),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(is_rebalance_conflicting_with_decommission(&meta));
+    }
+
+    #[test]
+    fn test_is_rebalance_conflicting_with_decommission_false_when_stopped() {
+        let now = OffsetDateTime::now_utc();
+        let meta = RebalanceMeta {
+            stopped_at: Some(now),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(now),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!is_rebalance_conflicting_with_decommission(&meta));
     }
 
     #[test]
