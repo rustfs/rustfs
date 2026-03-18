@@ -28,7 +28,10 @@ static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::ne
 
 fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
     let cache = cache.get_or_init(Default::default);
-    let mut cache = cache.lock().unwrap();
+    let mut cache = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
 
     if let Some(existing) = cache.get(value) {
         existing
@@ -146,10 +149,11 @@ impl PrometheusMetric {
     /// from the metrics_type module.
     #[inline]
     pub fn from_descriptor(descriptor: &crate::MetricDescriptor, value: f64) -> Self {
+        let help = intern_string(&HELP_CACHE, &descriptor.help);
         Self {
             name: Cow::Owned(descriptor.get_full_metric_name()),
             metric_type: descriptor.metric_type,
-            help: Cow::Owned(descriptor.help.clone()),
+            help: Cow::Borrowed(help),
             labels: Vec::new(),
             value,
         }
