@@ -72,6 +72,14 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
     Ok(())
 }
 
+fn validate_complete_multipart_parts(parts: &[CompletePart]) -> S3Result<()> {
+    if parts.windows(2).any(|window| window[0].part_num >= window[1].part_num) {
+        return Err(s3_error!(InvalidPartOrder, "Part numbers must be strictly increasing"));
+    }
+
+    Ok(())
+}
+
 fn encode_s3_path(path: &str) -> String {
     path.split('/')
         .map(|part| encode(part).to_string())
@@ -253,23 +261,8 @@ impl DefaultMultipartUsecase {
             .map(CompletePart::from)
             .collect::<Vec<_>>();
 
-        // is part number sorted?
-        if !uploaded_parts_vec.is_sorted_by_key(|p| p.part_num) {
-            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
-        }
-
-        // Handle duplicate part numbers: according to S3 specification, when the same part number
-        // is uploaded multiple times, the last uploaded part (in the list order) should be used.
-        // This can happen in concurrent upload scenarios where a part is re-uploaded before completion.
-        // We deduplicate by keeping the last occurrence of each part number using a HashMap.
-        let mut part_map: HashMap<usize, CompletePart> = HashMap::new();
-        for part in uploaded_parts_vec {
-            part_map.insert(part.part_num, part);
-        }
-
-        // Reconstruct the parts list in sorted order, keeping only the last occurrence of each part number
-        let mut uploaded_parts: Vec<CompletePart> = part_map.into_values().collect();
-        uploaded_parts.sort_by_key(|p| p.part_num);
+        validate_complete_multipart_parts(&uploaded_parts_vec)?;
+        let uploaded_parts = uploaded_parts_vec;
 
         // TODO: check object lock
 
@@ -1226,6 +1219,60 @@ mod tests {
 
         let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_duplicate_part_numbers() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .multipart_upload(Some(multipart_upload))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::POST);
+
+        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_out_of_order_parts() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![
+                CompletedPart {
+                    part_number: Some(2),
+                    ..Default::default()
+                },
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .multipart_upload(Some(multipart_upload))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::POST);
+
+        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
     #[tokio::test]
