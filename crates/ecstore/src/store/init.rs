@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::error::is_err_decommission_running;
 
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]

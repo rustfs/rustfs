@@ -434,7 +434,7 @@ impl Operation for RebalanceStop {
         }
 
         store
-            .save_rebalance_stats(0, RebalSaveOpt::StoppedAt)
+            .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
 
@@ -692,7 +692,6 @@ mod rebalance_handler_tests {
                     start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
             RebalanceStats {
                 participating: false,
@@ -798,7 +797,7 @@ mod rebalance_handler_tests {
     fn test_validate_start_rebalance_guards_rejects_single_pool() {
         let err = validate_start_rebalance_guards(true, false, false).expect_err("single pool should be rejected");
         assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
-        assert_eq!(err.message(), Some("NotImplemented"));
+        assert_eq!(err.message(), None);
     }
 
     #[test]
@@ -806,16 +805,15 @@ mod rebalance_handler_tests {
         let err =
             validate_start_rebalance_guards(false, true, false).expect_err("decommission running should block rebalance start");
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("decommission is already in progress"));
+        assert_eq!(err.message(), Some("Rebalance cannot be started, decommission is already in progress"));
     }
 
     #[test]
     fn test_validate_start_rebalance_guards_prefers_decommission_over_running_rebalance() {
-        let err = validate_start_rebalance_guards(false, true, true).expect_err(
-            "decommission should be rejected before another rebalance when both are running",
-        );
+        let err = validate_start_rebalance_guards(false, true, true)
+            .expect_err("decommission should be rejected before another rebalance when both are running");
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("decommission is already in progress"));
+        assert_eq!(err.message(), Some("Rebalance cannot be started, decommission is already in progress"));
     }
 
     #[test]

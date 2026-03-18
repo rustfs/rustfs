@@ -17,6 +17,7 @@ use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
+use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
@@ -435,7 +436,16 @@ impl NotificationSys {
         }
 
         warn!("notification stop_rebalance stop_rebalance start");
-        let _ = store.stop_rebalance().await;
+        if let Err(err) = store.stop_rebalance().await {
+            error!("notification stop_rebalance local stop err {:?}", err);
+            return;
+        }
+
+        if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+            error!("notification stop_rebalance local save err {:?}", err);
+            return;
+        }
+
         warn!("notification stop_rebalance stop_rebalance done");
     }
 

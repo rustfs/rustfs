@@ -27,6 +27,7 @@ use rustfs_ecstore::{
     get_global_lock_client,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
+    rebalance::RebalSaveOpt,
     rpc::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
@@ -810,7 +811,20 @@ impl Node for NodeService {
             }));
         };
 
-        let _ = store.stop_rebalance().await;
+        if let Err(err) = store.stop_rebalance().await {
+            return Ok(Response::new(StopRebalanceResponse {
+                success: false,
+                error_info: Some(format!("failed to stop rebalance: {err}")),
+            }));
+        }
+
+        if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+            return Ok(Response::new(StopRebalanceResponse {
+                success: false,
+                error_info: Some(format!("failed to save rebalance stop metadata: {err}")),
+            }));
+        }
+
         Ok(Response::new(StopRebalanceResponse {
             success: true,
             error_info: None,

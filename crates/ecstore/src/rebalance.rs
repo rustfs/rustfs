@@ -1125,6 +1125,21 @@ fn is_rebalance_actively_running(meta: &RebalanceMeta) -> bool {
     meta.cancel.is_some() && is_rebalance_in_progress(meta)
 }
 
+fn apply_rebalance_save_option(meta: &mut RebalanceMeta, pool_idx: usize, opt: RebalSaveOpt, now: OffsetDateTime) {
+    match opt {
+        RebalSaveOpt::Stats => {
+            if pool_idx >= meta.pool_stats.len() {
+                info!("save_rebalance_stats: pool_idx {pool_idx} out of range for pool_stats");
+            }
+        }
+        RebalSaveOpt::StoppedAt => {
+            apply_stopped_at(meta, now);
+        }
+    }
+
+    meta.last_refreshed_at = Some(now);
+}
+
 fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     meta.stopped_at = Some(now);
 
@@ -1466,47 +1481,24 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
-        // TODO: lock
-        let mut meta = RebalanceMeta::new();
-        let pool = clone_first_arc(&self.pools, "save_rebalance_stats: no pools available")?;
-        if let Err(err) = meta.load(pool.clone()).await
-            && err != Error::ConfigNotFound
-        {
-            info!("save_rebalance_stats: load err: {:?}", err);
-            return Err(err);
-        }
-
-        let now = OffsetDateTime::now_utc();
-
-        match opt {
-            RebalSaveOpt::Stats => {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
-                if let Some(rbm) = rebalance_meta.as_mut() {
-                    rbm.last_refreshed_at = Some(now);
-                    if let Some(pool_stat) = rbm.pool_stats.get(pool_idx)
-                        && let Some(target_pool_stat) = meta.pool_stats.get_mut(pool_idx)
-                    {
-                        *target_pool_stat = pool_stat.clone();
-                    }
-                }
-            }
-            RebalSaveOpt::StoppedAt => {
-                apply_stopped_at(&mut meta, now);
-            }
-        }
-
-        meta.last_refreshed_at = Some(now);
-
-        {
+        let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
-            *rebalance_meta = Some(meta.clone());
-        }
+            let Some(meta) = rebalance_meta.as_mut() else {
+                return Ok(());
+            };
+
+            let now = OffsetDateTime::now_utc();
+            apply_rebalance_save_option(meta, pool_idx, opt, now);
+            meta.clone()
+        };
+
+        let pool = clone_first_arc(&self.pools, "save_rebalance_stats: no pools available")?;
 
         info!(
             "save_rebalance_stats: save rebalance meta, pool_idx: {}, opt: {:?}, meta: {:?}",
-            pool_idx, opt, meta
+            pool_idx, opt, meta_to_save
         );
-        meta.save(pool).await?;
+        meta_to_save.save(pool).await?;
 
         Ok(())
     }
@@ -1584,12 +1576,13 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalStatus, RebalanceInfo, RebalanceMeta,
-        RebalanceStats, RebalanceTerminalEvent, apply_rebalance_terminal_event, apply_stopped_at,
-        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, ensure_rebalance_not_decommissioning,
-        ensure_valid_rebalance_pool_index, migrate_entry_version, resolve_rebalance_bucket_error, resolve_rebalance_participants,
+        GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
+        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, migrate_entry_version,
+        next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_worker_result, should_pool_participate,
-        should_skip_start_rebalance, next_rebal_bucket_from_stat, take_bucket_from_rebalance_queue,
+        should_skip_start_rebalance, take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2410,10 +2403,7 @@ mod rebalance_unit_tests {
 
         assert!(take_bucket_from_rebalance_queue(&mut pool_stat, "bucket-a"));
         assert_eq!(pool_stat.buckets, vec!["bucket-b".to_string()]);
-        assert_eq!(
-            pool_stat.rebalanced_buckets,
-            vec!["bucket-a".to_string(), "bucket-a".to_string()]
-        );
+        assert_eq!(pool_stat.rebalanced_buckets, vec!["bucket-a".to_string(), "bucket-a".to_string()]);
     }
 
     #[test]
@@ -2425,10 +2415,7 @@ mod rebalance_unit_tests {
         };
 
         assert!(!take_bucket_from_rebalance_queue(&mut pool_stat, "bucket-c"));
-        assert_eq!(
-            pool_stat.buckets,
-            vec!["bucket-a".to_string(), "bucket-b".to_string()]
-        );
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
         assert!(pool_stat.rebalanced_buckets.is_empty());
     }
 
@@ -2469,6 +2456,72 @@ mod rebalance_unit_tests {
         assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Failed);
         assert_eq!(meta.pool_stats[1].info.end_time, Some(now));
         assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn test_apply_rebalance_save_option_stats_keeps_pool_status_and_updates_refresh() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let later = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                buckets: vec!["bucket-a".to_string()],
+                ..Default::default()
+            }],
+            last_refreshed_at: Some(now),
+            stopped_at: None,
+            ..Default::default()
+        };
+
+        apply_rebalance_save_option(&mut meta, 0, RebalSaveOpt::Stats, later);
+
+        assert_eq!(meta.last_refreshed_at, Some(later));
+        assert_eq!(meta.stopped_at, None);
+        assert_eq!(meta.pool_stats.len(), 1);
+        assert!(meta.pool_stats[0].participating);
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert_eq!(meta.pool_stats[0].info.start_time, Some(now));
+        assert_eq!(meta.pool_stats[0].buckets, vec!["bucket-a".to_string()]);
+    }
+
+    #[test]
+    fn test_apply_rebalance_save_option_stopped_at_updates_refresh_and_statuses() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![
+                RebalanceStats {
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    info: RebalanceInfo {
+                        status: RebalStatus::Failed,
+                        last_error: Some("previous failure".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        apply_rebalance_save_option(&mut meta, 9_000, RebalSaveOpt::StoppedAt, now);
+
+        assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.last_refreshed_at, Some(now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(now));
+        assert!(meta.pool_stats[0].info.last_error.is_none());
+        assert_eq!(meta.pool_stats[1].info.status, RebalStatus::Failed);
+        assert_eq!(meta.pool_stats[1].info.last_error.as_deref(), Some("previous failure"));
     }
 
     #[test]

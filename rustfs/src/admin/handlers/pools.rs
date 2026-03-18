@@ -41,10 +41,7 @@ fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerP
     resolve_endpoints_handle()
 }
 
-fn validate_start_decommission_guards(
-    decommission_running: bool,
-    rebalance_running: bool,
-) -> s3s::S3Result<()> {
+fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> s3s::S3Result<()> {
     if decommission_running {
         return Err(s3_error!(InvalidRequest, "DecommissionAlreadyRunning"));
     }

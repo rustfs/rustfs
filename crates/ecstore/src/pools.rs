@@ -76,6 +76,20 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionTerminalState {
+    Completed,
+    Failed,
+}
+
+fn classify_decommission_terminal_state(failed_items_present: bool) -> DecommissionTerminalState {
+    if failed_items_present {
+        DecommissionTerminalState::Failed
+    } else {
+        DecommissionTerminalState::Completed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     #[serde(rename = "id")]
@@ -1038,13 +1052,19 @@ impl ECStore {
             (failed, cmd_line)
         };
 
-        if !failed {
-            warn!("Decommissioning complete for pool {}, verifying for any pending objects", cmd_line);
-            if let Err(er) = self.decommission_failed(idx).await {
-                error!("decom failed err {:?}", &er);
+        match classify_decommission_terminal_state(failed) {
+            DecommissionTerminalState::Completed => {
+                warn!("Decommissioning complete for pool {}, marking completed state", cmd_line);
+                if let Err(er) = self.complete_decommission(idx).await {
+                    error!("decom complete err {:?}", &er);
+                }
             }
-        } else if let Err(er) = self.complete_decommission(idx).await {
-            error!("decom complete err {:?}", &er);
+            DecommissionTerminalState::Failed => {
+                warn!("Decommissioning finished with failed items for pool {}, marking failed state", cmd_line);
+                if let Err(er) = self.decommission_failed(idx).await {
+                    error!("decom failed err {:?}", &er);
+                }
+            }
         }
 
         warn!("Decommissioning complete for pool {}", cmd_line);
@@ -1594,7 +1614,9 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 
 #[cfg(test)]
 mod pools_tests {
-    use super::{dedup_indices, ensure_decommission_not_rebalancing};
+    use super::{
+        DecommissionTerminalState, classify_decommission_terminal_state, dedup_indices, ensure_decommission_not_rebalancing,
+    };
     use crate::error::Error;
 
     #[test]
@@ -1617,5 +1639,15 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_allows_idle() {
         assert!(ensure_decommission_not_rebalancing(false).is_ok());
+    }
+
+    #[test]
+    fn test_classify_decommission_terminal_state_completed_when_no_failures() {
+        assert_eq!(classify_decommission_terminal_state(false), DecommissionTerminalState::Completed);
+    }
+
+    #[test]
+    fn test_classify_decommission_terminal_state_failed_when_failures_present() {
+        assert_eq!(classify_decommission_terminal_state(true), DecommissionTerminalState::Failed);
     }
 }
