@@ -16,90 +16,56 @@
 //!
 //! Collects usage metrics for each bucket in the cluster, including
 //! size, object counts, and quota information.
+//!
+//! This collector reuses the metric descriptors defined in `metrics_type::node_bucket`
+//! to avoid duplication of metric names, types, and help text.
 
-use crate::MetricType;
 use crate::format::PrometheusMetric;
+use crate::metrics_type::node_bucket::*;
 use std::borrow::Cow;
 
-/// Usage statistics for a single bucket.
+/// Bucket statistics for metrics collection.
+///
+/// This struct provides a decoupled interface for collecting bucket metrics
+/// without depending on specific internal types. HTTP handlers should populate
+/// this struct from their available data sources.
 #[derive(Debug, Clone, Default)]
 pub struct BucketStats {
-    /// Bucket name
+    /// Name of the bucket
     pub name: String,
-    /// Total bytes used by the bucket
+    /// Total size of all objects in the bucket (bytes)
     pub size_bytes: u64,
-    /// Total number of objects in the bucket
+    /// Number of objects in the bucket
     pub objects_count: u64,
-    /// Quota limit in bytes (0 means no quota)
+    /// Quota limit for the bucket (bytes), 0 if no quota
     pub quota_bytes: u64,
 }
 
-// Static metric definitions
-const METRIC_SIZE: &str = "rustfs_bucket_usage_bytes";
-const METRIC_OBJECTS: &str = "rustfs_bucket_objects_total";
-const METRIC_QUOTA: &str = "rustfs_bucket_quota_bytes";
-
-const HELP_SIZE: &str = "Total bytes used by the bucket";
-const HELP_OBJECTS: &str = "Total number of objects in the bucket";
-const HELP_QUOTA: &str = "Quota limit in bytes for the bucket";
-
-/// Collects per-bucket usage metrics from the provided bucket statistics.
+/// Collects per-bucket metrics from the provided bucket statistics.
 ///
-/// # Metrics Produced
-///
-/// For each bucket, the following metrics are produced with a `bucket` label:
-///
-/// - `rustfs_bucket_usage_bytes`: Total bytes used by the bucket
-/// - `rustfs_bucket_objects_total`: Total number of objects in the bucket
-/// - `rustfs_bucket_quota_bytes`: Quota limit in bytes (0 if no quota configured)
-///
-/// # Arguments
-///
-/// * `buckets` - Slice of bucket statistics
-///
-/// # Example
-///
-/// ```
-/// use rustfs_metrics::collectors::{collect_bucket_metrics, BucketStats};
-///
-/// let buckets = vec![
-///     BucketStats {
-///         name: "my-bucket".to_string(),
-///         size_bytes: 1_000_000,
-///         objects_count: 100,
-///         quota_bytes: 10_000_000,
-///     },
-/// ];
-/// let metrics = collect_bucket_metrics(&buckets);
-/// assert_eq!(metrics.len(), 3); // size, objects, quota
-/// ```
-#[must_use]
-#[inline]
+/// Uses the metric descriptors from `metrics_type::node_bucket` module.
+/// Returns a vector of Prometheus metrics for all buckets.
 pub fn collect_bucket_metrics(buckets: &[BucketStats]) -> Vec<PrometheusMetric> {
     if buckets.is_empty() {
         return Vec::new();
     }
 
     let mut metrics = Vec::with_capacity(buckets.len() * 3);
-
     for bucket in buckets {
         let bucket_label: Cow<'static, str> = Cow::Owned(bucket.name.clone());
 
-        // Bucket size in bytes
         metrics.push(
-            PrometheusMetric::new(METRIC_SIZE, MetricType::Gauge, HELP_SIZE, bucket.size_bytes as f64)
+            PrometheusMetric::from_descriptor(&BUCKET_USAGE_BYTES_MD, bucket.size_bytes as f64)
                 .with_label("bucket", bucket_label.clone()),
         );
 
-        // Object count
         metrics.push(
-            PrometheusMetric::new(METRIC_OBJECTS, MetricType::Gauge, HELP_OBJECTS, bucket.objects_count as f64)
+            PrometheusMetric::from_descriptor(&BUCKET_OBJECTS_TOTAL_MD, bucket.objects_count as f64)
                 .with_label("bucket", bucket_label.clone()),
         );
 
-        // Quota (always emit, 0 when no quota configured for consistent PromQL queries)
         metrics.push(
-            PrometheusMetric::new(METRIC_QUOTA, MetricType::Gauge, HELP_QUOTA, bucket.quota_bytes as f64)
+            PrometheusMetric::from_descriptor(&BUCKET_QUOTA_BYTES_MD, bucket.quota_bytes as f64)
                 .with_label("bucket", bucket_label),
         );
     }
@@ -118,27 +84,28 @@ mod tests {
             BucketStats {
                 name: "test-bucket".to_string(),
                 size_bytes: 1000,
-                objects_count: 50,
+                objects_count: 100,
                 quota_bytes: 0,
             },
             BucketStats {
-                name: "other-bucket".to_string(),
+                name: "another-bucket".to_string(),
                 size_bytes: 2000,
-                objects_count: 100,
+                objects_count: 200,
                 quota_bytes: 0,
             },
         ];
 
         let metrics = collect_bucket_metrics(&buckets);
-        report_metrics(&metrics); // This will compile and run, but we can't easily assert on the global recorder state here.
+        report_metrics(&metrics);
 
         // 2 buckets * 3 metrics each (size, objects, quota) = 6 metrics
         assert_eq!(metrics.len(), 6);
 
-        // Verify test-bucket metrics
+        // Verify test-bucket metrics have correct labels
+        let test_bucket_size_name = BUCKET_USAGE_BYTES_MD.get_full_metric_name();
         let test_bucket_size = metrics
             .iter()
-            .find(|m| m.name == METRIC_SIZE && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "test-bucket"));
+            .find(|m| m.name == test_bucket_size_name && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "test-bucket"));
         assert!(test_bucket_size.is_some());
         assert_eq!(test_bucket_size.map(|m| m.value), Some(1000.0));
     }
@@ -159,9 +126,13 @@ mod tests {
         assert_eq!(metrics.len(), 3);
 
         // Verify quota metric exists
-        let quota_metric = metrics.iter().find(|m| m.name == METRIC_QUOTA);
+        let quota_metric_name = BUCKET_QUOTA_BYTES_MD.get_full_metric_name();
+        let quota_metric = metrics.iter().find(|m| {
+            m.name == quota_metric_name
+                && m.value == 10000.0
+                && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "quota-bucket")
+        });
         assert!(quota_metric.is_some());
-        assert_eq!(quota_metric.map(|m| m.value), Some(10000.0));
     }
 
     #[test]
@@ -185,9 +156,13 @@ mod tests {
 
         // Zero quota should still produce a quota metric with value 0 for consistent PromQL queries
         assert_eq!(metrics.len(), 3);
-        let quota_metric = metrics.iter().find(|m| m.name == METRIC_QUOTA);
+        let quota_metric_name = BUCKET_QUOTA_BYTES_MD.get_full_metric_name();
+        let quota_metric = metrics.iter().find(|m| {
+            m.name == quota_metric_name
+                && m.value == 0.0
+                && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "no-quota-bucket")
+        });
         assert!(quota_metric.is_some());
-        assert_eq!(quota_metric.map(|m| m.value), Some(0.0));
     }
 
     #[test]
