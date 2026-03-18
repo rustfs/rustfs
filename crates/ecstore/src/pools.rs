@@ -220,6 +220,10 @@ fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>
     result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
 }
 
+fn resolve_decommission_bucket_done_save_result(result: Result<()>, idx: usize, bucket: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("decommission metadata save failed for pool {idx} bucket {bucket}: {err}")))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1414,10 +1418,12 @@ impl ECStore {
 
                 {
                     let mut pool_meta = self.pool_meta.write().await;
-                    if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?
-                        && let Err(err) = pool_meta.save(self.pools.clone()).await
-                    {
-                        error!("decom pool_meta.save err {:?}", err);
+                    if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)? {
+                        resolve_decommission_bucket_done_save_result(
+                            pool_meta.save(self.pools.clone()).await,
+                            idx,
+                            bucket.name.as_str(),
+                        )?;
                     }
                 }
                 continue;
@@ -1439,10 +1445,12 @@ impl ECStore {
 
             {
                 let mut pool_meta = self.pool_meta.write().await;
-                if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?
-                    && let Err(err) = pool_meta.save(self.pools.clone()).await
-                {
-                    error!("decom pool_meta.save err {:?}", err);
+                if mark_decommission_bucket_done(&mut pool_meta, idx, bucket)? {
+                    resolve_decommission_bucket_done_save_result(
+                        pool_meta.save(self.pools.clone()).await,
+                        idx,
+                        bucket.name.as_str(),
+                    )?;
                 }
 
                 warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
@@ -1933,8 +1941,8 @@ mod pools_tests {
         decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
-        mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_state,
-        resolve_decommission_preflight_heal_result, resolve_decommission_update_after_result,
+        mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_preflight_heal_result, resolve_decommission_update_after_result,
         should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
     };
     use crate::error::Error;
@@ -2238,6 +2246,21 @@ mod pools_tests {
         assert!(
             err.to_string()
                 .contains("decommission preflight heal failed for bucket bucket-a")
+        );
+    }
+
+    #[test]
+    fn test_resolve_decommission_bucket_done_save_result_passthrough_ok() {
+        assert!(resolve_decommission_bucket_done_save_result(Ok(()), 1, "bucket-a").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_bucket_done_save_result_wraps_error_context() {
+        let err = resolve_decommission_bucket_done_save_result(Err(Error::SlowDown), 2, "bucket-a")
+            .expect_err("metadata save failure should carry pool/bucket context");
+        assert!(
+            err.to_string()
+                .contains("decommission metadata save failed for pool 2 bucket bucket-a")
         );
     }
 
