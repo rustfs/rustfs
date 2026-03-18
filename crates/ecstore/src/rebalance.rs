@@ -653,20 +653,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut()
-            && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
-        {
-            info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
-
-            if take_bucket_from_rebalance_queue(pool_stat, &bucket) {
-                info!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
-                return Ok(());
-            } else {
-                info!("bucket_rebalance_done: bucket {} not found", bucket);
-            }
-        }
-        info!("bucket_rebalance_done: bucket {} not found", bucket);
-        Ok(())
+        mark_rebalance_bucket_done(rebalance_meta.as_mut(), pool_index, &bucket)
     }
 
     pub async fn is_rebalance_started(&self) -> bool {
@@ -983,6 +970,26 @@ fn next_rebal_bucket_from_stat(pool_stat: &RebalanceStats) -> Option<String> {
     }
 
     first_rebalance_bucket(pool_stat)
+}
+
+fn mark_rebalance_bucket_done(meta: Option<&mut RebalanceMeta>, pool_index: usize, bucket: &str) -> Result<()> {
+    let Some(meta) = meta else {
+        return Err(Error::other("rebalance metadata not initialized"));
+    };
+
+    ensure_valid_rebalance_pool_index(meta.pool_stats.len(), pool_index)?;
+    let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) else {
+        return Err(Error::other(format!("invalid rebalance pool index: {pool_index}")));
+    };
+
+    info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
+
+    if take_bucket_from_rebalance_queue(pool_stat, bucket) {
+        info!("bucket_rebalance_done: bucket {} rebalanced", bucket);
+        Ok(())
+    } else {
+        Err(Error::other(format!("rebalance bucket not found in queue: {bucket}")))
+    }
 }
 
 fn take_bucket_from_rebalance_queue(pool_stat: &mut RebalanceStats, bucket: &str) -> bool {
@@ -1646,10 +1653,10 @@ mod rebalance_unit_tests {
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error, resolve_rebalance_participants,
-        resolve_rebalance_save_task_result, resolve_rebalance_worker_result, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue,
+        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error,
+        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_worker_result,
+        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2565,6 +2572,53 @@ mod rebalance_unit_tests {
         assert!(!take_bucket_from_rebalance_queue(&mut pool_stat, "bucket-c"));
         assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
         assert!(pool_stat.rebalanced_buckets.is_empty());
+    }
+
+    #[test]
+    fn test_mark_rebalance_bucket_done_rejects_missing_meta() {
+        let err = mark_rebalance_bucket_done(None, 0, "bucket-a").expect_err("missing meta should fail");
+        assert!(err.to_string().contains("rebalance metadata not initialized"));
+    }
+
+    #[test]
+    fn test_mark_rebalance_bucket_done_rejects_invalid_pool_index() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        let err = mark_rebalance_bucket_done(Some(&mut meta), 3, "bucket-a").expect_err("invalid pool index should fail");
+        assert!(err.to_string().contains("invalid rebalance pool index"));
+    }
+
+    #[test]
+    fn test_mark_rebalance_bucket_done_rejects_missing_bucket() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                buckets: vec!["bucket-a".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = mark_rebalance_bucket_done(Some(&mut meta), 0, "bucket-x").expect_err("missing bucket should fail");
+        assert!(err.to_string().contains("rebalance bucket not found in queue"));
+    }
+
+    #[test]
+    fn test_mark_rebalance_bucket_done_marks_bucket_as_rebalanced() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+                rebalanced_buckets: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        mark_rebalance_bucket_done(Some(&mut meta), 0, "bucket-a").expect("bucket in queue should be marked done");
+        assert_eq!(meta.pool_stats[0].buckets, vec!["bucket-b".to_string()]);
+        assert_eq!(meta.pool_stats[0].rebalanced_buckets, vec!["bucket-a".to_string()]);
     }
 
     #[test]
