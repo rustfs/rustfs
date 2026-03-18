@@ -46,7 +46,9 @@ use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::HeaderMap;
-use rmp_serde::{Deserializer, Serializer};
+#[cfg(test)]
+use rmp_serde::Deserializer;
+use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
@@ -235,6 +237,22 @@ impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfo {
 }
 
 impl PoolMeta {
+    fn decode_pool_meta_payload(payload: &[u8]) -> Result<Self> {
+        match rmp_serde::from_slice::<PersistedPoolMeta>(payload) {
+            Ok(meta) => Ok(meta.into()),
+            Err(persisted_err) => {
+                let mut legacy: PoolMeta = rmp_serde::from_slice(payload).map_err(|legacy_err| {
+                    Error::other(format!(
+                        "PoolMeta decode failed for both persisted and legacy formats: persisted={persisted_err}; legacy={legacy_err}"
+                    ))
+                })?;
+                // Runtime-only flag must not be restored from on-disk payload.
+                legacy.dont_save = false;
+                Ok(legacy)
+            }
+        }
+    }
+
     pub fn new(pools: &[Arc<Sets>], prev_meta: &PoolMeta) -> Self {
         let mut new_meta = Self {
             version: POOL_META_VERSION,
@@ -302,9 +320,7 @@ impl PoolMeta {
             return Err(Error::other(format!("PoolMeta: unknown version: {version}")));
         }
 
-        let mut buf = Deserializer::new(Cursor::new(&data[4..]));
-        let meta: PersistedPoolMeta = Deserialize::deserialize(&mut buf)?;
-        *self = meta.into();
+        *self = Self::decode_pool_meta_payload(&data[4..])?;
 
         if self.version != POOL_META_VERSION {
             return Err(Error::other(format!("unexpected PoolMeta version: {}", self.version)));
@@ -1958,6 +1974,63 @@ mod tests {
         assert_eq!(restored_decommission.items_decommission_failed, 1);
         assert_eq!(restored_decommission.bytes_done, 1024);
         assert_eq!(restored_decommission.bytes_failed, 128);
+    }
+
+    #[test]
+    fn pool_meta_decode_supports_legacy_payload() {
+        let start_time = OffsetDateTime::now_utc();
+        let legacy_meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 3,
+                cmd_line: "/legacy/pool".to_string(),
+                last_update: start_time,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    items_decommissioned: 9,
+                    items_decommission_failed: 2,
+                    bytes_done: 2048,
+                    bytes_failed: 256,
+                    queued_buckets: vec!["not-persisted".to_string()],
+                    decommissioned_buckets: vec!["not-persisted".to_string()],
+                    bucket: "not-persisted".to_string(),
+                    prefix: "not-persisted".to_string(),
+                    object: "not-persisted".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            dont_save: true,
+        };
+
+        let mut legacy_payload = Vec::new();
+        legacy_meta
+            .serialize(&mut Serializer::new(&mut legacy_payload))
+            .expect("legacy payload should serialize");
+
+        // New persisted schema has fewer top-level fields and should not decode this legacy struct payload.
+        let persisted_decode: std::result::Result<PersistedPoolMeta, _> = rmp_serde::from_slice(&legacy_payload);
+        assert!(persisted_decode.is_err());
+
+        let decoded = PoolMeta::decode_pool_meta_payload(&legacy_payload).expect("legacy payload should decode");
+        assert_eq!(decoded.version, POOL_META_VERSION);
+        assert!(!decoded.dont_save, "runtime-only flag should reset on load");
+        assert_eq!(decoded.pools.len(), 1);
+        assert_eq!(decoded.pools[0].id, 3);
+        assert_eq!(decoded.pools[0].cmd_line, "/legacy/pool");
+        assert_eq!(decoded.pools[0].last_update, start_time);
+
+        let decommission = decoded.pools[0].decommission.as_ref().expect("decommission should decode");
+        assert_eq!(decommission.start_time, Some(start_time));
+        assert_eq!(decommission.items_decommissioned, 9);
+        assert_eq!(decommission.items_decommission_failed, 2);
+        assert_eq!(decommission.bytes_done, 2048);
+        assert_eq!(decommission.bytes_failed, 256);
+        // These fields were skipped in legacy payload and should be defaulted.
+        assert!(decommission.queued_buckets.is_empty());
+        assert!(decommission.decommissioned_buckets.is_empty());
+        assert!(decommission.bucket.is_empty());
+        assert!(decommission.prefix.is_empty());
+        assert!(decommission.object.is_empty());
     }
 }
 
