@@ -91,9 +91,10 @@ impl ECStore {
         if !opts.no_metadata {
             for bucket in buckets.iter_mut() {
                 if let Ok(created) = metadata_sys::created_at(&bucket.name).await
-                    && should_override_created_from_metadata(created) {
-                        bucket.created = Some(created);
-                    }
+                    && should_override_created_from_metadata(created)
+                {
+                    bucket.created = Some(created);
+                }
             }
         }
         Ok(buckets)
