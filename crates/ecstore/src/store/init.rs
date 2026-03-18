@@ -244,7 +244,7 @@ impl ECStore {
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
 
                     if let Err(err) = store.decommission(rx.clone(), pool_indices.clone()).await {
-                        if err == StorageError::DecommissionAlreadyRunning {
+                        if is_err_decommission_running(&err) {
                             for i in pool_indices.iter() {
                                 store.do_decommission_in_routine(rx.clone(), *i).await;
                             }

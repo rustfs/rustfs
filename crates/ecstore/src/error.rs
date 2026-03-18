@@ -687,6 +687,14 @@ pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
 }
 
+pub fn is_err_decommission_running(err: &Error) -> bool {
+    matches!(err, &StorageError::DecommissionAlreadyRunning)
+}
+
+pub fn is_err_rebalance_running(err: &Error) -> bool {
+    matches!(err, &StorageError::RebalanceAlreadyRunning)
+}
+
 pub fn is_err_io(err: &Error) -> bool {
     matches!(err, &StorageError::Io(_))
 }
@@ -985,6 +993,15 @@ mod tests {
 
         let disk_error = StorageError::DiskFull;
         assert_ne!(bucket1, disk_error);
+    }
+
+    #[test]
+    fn test_error_running_state_helpers() {
+        assert!(is_err_decommission_running(&StorageError::DecommissionAlreadyRunning));
+        assert!(!is_err_decommission_running(&StorageError::RebalanceAlreadyRunning));
+
+        assert!(is_err_rebalance_running(&StorageError::RebalanceAlreadyRunning));
+        assert!(!is_err_rebalance_running(&StorageError::DecommissionAlreadyRunning));
     }
 
     #[test]
