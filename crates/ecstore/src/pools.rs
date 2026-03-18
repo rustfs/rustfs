@@ -105,6 +105,22 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     Ok(())
 }
 
+fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool {
+    !complete && !failed && !canceled
+}
+
+fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bool) -> Result<()> {
+    if !pool_present {
+        return Err(Error::other("InvalidArgument"));
+    }
+
+    if decommission_active {
+        return Err(StorageError::DecommissionAlreadyRunning);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecommissionTerminalState {
     Completed,
@@ -335,25 +351,25 @@ impl PoolMeta {
         }
     }
     pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
-        if let Some(pool) = self.pools.get_mut(idx) {
-            if let Some(ref info) = pool.decommission
-                && !info.complete
-                && !info.failed
-                && !info.canceled
-            {
-                return Err(StorageError::DecommissionAlreadyRunning);
-            }
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(Error::other("InvalidArgument"));
+        };
 
-            let now = OffsetDateTime::now_utc();
-            pool.last_update = now;
-            pool.decommission = Some(PoolDecommissionInfo {
-                start_time: Some(now),
-                start_size: pi.free,
-                total_size: pi.total,
-                current_size: pi.free,
-                ..Default::default()
-            });
-        }
+        let decommission_active = pool
+            .decommission
+            .as_ref()
+            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
+        ensure_decommission_start_allowed(true, decommission_active)?;
+
+        let now = OffsetDateTime::now_utc();
+        pool.last_update = now;
+        pool.decommission = Some(PoolDecommissionInfo {
+            start_time: Some(now),
+            start_size: pi.free,
+            total_size: pi.total,
+            current_size: pi.free,
+            ..Default::default()
+        });
 
         Ok(())
     }
@@ -1317,13 +1333,30 @@ impl ECStore {
             }
         }
 
+        let mut space_infos = Vec::with_capacity(indices.len());
+        for idx in indices.iter().copied() {
+            let pi = self.get_decommission_pool_space_info(idx).await?;
+            space_infos.push((idx, pi));
+        }
+
         let mut pool_meta = self.pool_meta.write().await;
-        for idx in indices.iter() {
-            let pi = self.get_decommission_pool_space_info(*idx).await?;
+        for idx in indices.iter().copied() {
+            let (pool_present, decommission_active) = if let Some(pool) = pool_meta.pools.get(idx) {
+                let active = pool
+                    .decommission
+                    .as_ref()
+                    .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
+                (true, active)
+            } else {
+                (false, false)
+            };
 
-            pool_meta.decommission(*idx, pi)?;
+            ensure_decommission_start_allowed(pool_present, decommission_active)?;
+        }
 
-            pool_meta.queue_buckets(*idx, decom_buckets.clone());
+        for (idx, pi) in space_infos {
+            pool_meta.decommission(idx, pi)?;
+            pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
         pool_meta.save(self.pools.clone()).await?;
@@ -1737,8 +1770,9 @@ mod pools_tests {
     use super::{
         DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
         decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, has_active_decommission_canceler, is_decommission_cancel_terminal,
-        should_preserve_decommission_canceled_state, take_decommission_canceler,
+        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, has_active_decommission_canceler,
+        is_decommission_active, is_decommission_cancel_terminal, should_preserve_decommission_canceled_state,
+        take_decommission_canceler,
     };
     use crate::error::Error;
     use tokio_util::sync::CancellationToken;
@@ -1763,6 +1797,31 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_allows_idle() {
         assert!(ensure_decommission_not_rebalancing(false).is_ok());
+    }
+
+    #[test]
+    fn test_is_decommission_active_true_only_when_not_terminal() {
+        assert!(is_decommission_active(false, false, false));
+        assert!(!is_decommission_active(true, false, false));
+        assert!(!is_decommission_active(false, true, false));
+        assert!(!is_decommission_active(false, false, true));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_allowed_rejects_missing_pool() {
+        let err = ensure_decommission_start_allowed(false, false).expect_err("missing pool should be invalid");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_allowed_rejects_running_state() {
+        let err = ensure_decommission_start_allowed(true, true).expect_err("active decommission should be rejected");
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_allowed_allows_terminal_state() {
+        assert!(ensure_decommission_start_allowed(true, false).is_ok());
     }
 
     #[test]
