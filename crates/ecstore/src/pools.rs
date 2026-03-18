@@ -212,6 +212,10 @@ fn track_decommission_current_object(meta: &mut PoolMeta, idx: usize, bucket: &s
     Ok(())
 }
 
+fn resolve_decommission_update_after_result(result: Result<bool>) -> Result<bool> {
+    result.map_err(|err| Error::other(format!("decommission metadata update failed: {err}")))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1157,10 +1161,15 @@ impl ECStore {
                 return;
             }
 
-            let ok = pool_meta
-                .update_after(idx, self.pools.clone(), Duration::seconds(30))
-                .await
-                .unwrap_or_default();
+            let ok = match resolve_decommission_update_after_result(
+                pool_meta.update_after(idx, self.pools.clone(), Duration::seconds(30)).await,
+            ) {
+                Ok(ok) => ok,
+                Err(err) => {
+                    error!("decommission_entry: update_after err {:?}", err);
+                    return;
+                }
+            };
 
             drop(pool_meta);
             if ok
@@ -1917,7 +1926,8 @@ mod pools_tests {
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_state,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2192,6 +2202,20 @@ mod pools_tests {
         let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
         assert_eq!(info.bucket, "bucket-a");
         assert_eq!(info.object, "object-a");
+    }
+
+    #[test]
+    fn test_resolve_decommission_update_after_result_passthrough_ok() {
+        let ok = resolve_decommission_update_after_result(Ok(true)).expect("ok value should pass through");
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_resolve_decommission_update_after_result_wraps_error_context() {
+        let err = resolve_decommission_update_after_result(ensure_valid_decommission_pool_index(0, 0).map(|_| false))
+            .expect_err("invalid argument should be wrapped with context");
+        assert!(err.to_string().contains("decommission metadata update failed"));
+        assert!(err.to_string().contains("InvalidArgument"));
     }
 
     #[tokio::test]
