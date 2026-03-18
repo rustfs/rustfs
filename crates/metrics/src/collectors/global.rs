@@ -25,13 +25,13 @@ use crate::collectors::{
     collect_bucket_metrics, collect_bucket_replication_bandwidth_metrics, collect_cluster_metrics, collect_node_metrics,
     collect_resource_metrics,
 };
-use crate::format::report_metrics;
 use crate::constants::{
     DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL,
     DEFAULT_NODE_METRICS_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL, ENV_BUCKET_METRICS_INTERVAL,
     ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
     ENV_NODE_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
+use crate::format::report_metrics;
 use rustfs_utils::get_env_opt_u64;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -90,15 +90,13 @@ pub fn init_metrics_collectors(token: CancellationToken) {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_BUCKET_METRICS_INTERVAL);
 
-    let bucket_replication_bandwidth_interval = parse_interval(
-        ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
-        LEGACY_REPLICATION_BANDWIDTH_INTERVAL,
-    )
-    .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-    .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-    .filter(|&v| v > 0)
-    .map(Duration::from_secs)
-    .unwrap_or(DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL);
+    let bucket_replication_bandwidth_interval =
+        parse_interval(ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, LEGACY_REPLICATION_BANDWIDTH_INTERVAL)
+            .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+            .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+            .filter(|&v| v > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL);
 
     let node_interval = parse_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL)
         .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))

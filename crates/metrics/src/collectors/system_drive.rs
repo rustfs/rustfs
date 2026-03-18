@@ -126,16 +126,16 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
             drive_label,
         );
         push_drive_metric(&mut metrics, &DRIVE_WAITING_IO_MD, stat.waiting_io as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_API_LATENCY_MD, stat.api_latency_micros as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.health as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, stat.reads_per_sec, server_label, drive_label);
         push_drive_metric(
             &mut metrics,
-            &DRIVE_READS_KB_PER_SEC_MD,
-            stat.reads_kb_per_sec,
+            &DRIVE_API_LATENCY_MD,
+            stat.api_latency_micros as f64,
             server_label,
             drive_label,
         );
+        push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.health as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, stat.reads_per_sec, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_READS_KB_PER_SEC_MD, stat.reads_kb_per_sec, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_READS_AWAIT_MD, stat.reads_await, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_WRITES_PER_SEC_MD, stat.writes_per_sec, server_label, drive_label);
         push_drive_metric(

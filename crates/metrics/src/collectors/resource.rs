@@ -75,7 +75,9 @@ mod tests {
 
         // Verify memory metric
         let memory_metric_name = PROCESS_MEMORY_BYTES_MD.get_full_metric_name();
-        let memory = metrics.iter().find(|m| m.name == memory_metric_name && m.value == (1024 * 1024 * 256) as f64);
+        let memory = metrics
+            .iter()
+            .find(|m| m.name == memory_metric_name && m.value == (1024 * 1024 * 256) as f64);
         assert!(memory.is_some());
 
         // Verify uptime metric

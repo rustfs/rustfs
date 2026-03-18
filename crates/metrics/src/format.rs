@@ -17,11 +17,11 @@
 //! This module renders metrics in the standard Prometheus text format.
 //! Optimized for minimal allocations and fast rendering.
 
-use std::collections::HashMap;
-use std::borrow::Cow;
-use std::sync::{Mutex, OnceLock};
 use crate::MetricType;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 static NAME_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
 static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
