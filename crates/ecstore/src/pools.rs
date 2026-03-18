@@ -797,15 +797,17 @@ impl ECStore {
             return;
         }
 
-        tokio::spawn(async move {
-            let Some(store) = new_object_layer_fn() else {
-                error!("store not init");
-                return;
-            };
-            for (idx, canceler) in index_cancelers {
+        let Some(store) = new_object_layer_fn() else {
+            error!("store not init");
+            return;
+        };
+
+        for (idx, canceler) in index_cancelers {
+            let store = store.clone();
+            tokio::spawn(async move {
                 store.do_decommission_in_routine(canceler, idx).await;
-            }
-        });
+            });
+        }
     }
 
     #[tracing::instrument(skip(self, rx))]
