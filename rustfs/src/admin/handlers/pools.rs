@@ -243,7 +243,10 @@ impl Operation for StartDecommission {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        validate_start_decommission_guards(store.is_decommission_running().await, store.is_rebalance_started().await)?;
+        validate_start_decommission_guards(
+            store.is_decommission_running().await,
+            store.is_rebalance_conflicting_with_decommission().await,
+        )?;
 
         let query = {
             if let Some(query) = req.uri.query() {

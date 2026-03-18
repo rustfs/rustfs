@@ -280,7 +280,7 @@ impl Operation for RebalanceStart {
         validate_start_rebalance_guards(
             store.pools.len() == 1,
             store.is_decommission_running().await,
-            store.is_rebalance_started().await,
+            store.is_rebalance_conflicting_with_decommission().await,
         )?;
 
         let bucket_infos = store
@@ -425,7 +425,7 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
-        validate_stop_rebalance_guards(store.is_rebalance_started().await)?;
+        validate_stop_rebalance_guards(store.is_rebalance_conflicting_with_decommission().await)?;
 
         if let Some(notification_sys) = get_global_notification_sys() {
             notification_sys
