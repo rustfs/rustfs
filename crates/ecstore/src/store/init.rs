@@ -158,7 +158,7 @@ impl ECStore {
             peer_sys,
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
-            decommission_cancelers,
+            decommission_cancelers: RwLock::new(decommission_cancelers),
         });
 
         // Only set it when the global deployment ID is not yet configured

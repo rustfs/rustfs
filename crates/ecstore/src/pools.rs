@@ -68,6 +68,28 @@ fn dedup_indices(indices: &[usize]) -> Vec<usize> {
     output
 }
 
+fn bind_decommission_cancelers(
+    indices: &[usize],
+    parent: &CancellationToken,
+    cancelers: &mut [Option<CancellationToken>],
+) -> Vec<(usize, CancellationToken)> {
+    let mut bound = Vec::with_capacity(indices.len());
+
+    for idx in indices {
+        if let Some(slot) = cancelers.get_mut(*idx) {
+            let token = parent.child_token();
+            *slot = Some(token.clone());
+            bound.push((*idx, token));
+        }
+    }
+
+    bound
+}
+
+fn take_decommission_canceler(cancelers: &mut [Option<CancellationToken>], idx: usize) -> Option<CancellationToken> {
+    cancelers.get_mut(idx).and_then(Option::take)
+}
+
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
         return Err(Error::RebalanceAlreadyRunning);
@@ -702,6 +724,13 @@ impl ECStore {
             }
         }
 
+        if let Some(canceler) = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            take_decommission_canceler(cancelers.as_mut_slice(), idx)
+        } {
+            canceler.cancel();
+        }
+
         Ok(())
     }
     pub async fn is_decommission_running(&self) -> bool {
@@ -736,14 +765,18 @@ impl ECStore {
 
         self.start_decommission(indices.clone()).await?;
 
-        let rx_clone = rx.clone();
+        let index_cancelers = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
+        };
+
         tokio::spawn(async move {
             let Some(store) = new_object_layer_fn() else {
                 error!("store not init");
                 return;
             };
-            for idx in indices.iter() {
-                store.do_decommission_in_routine(rx_clone.clone(), *idx).await;
+            for (idx, canceler) in index_cancelers {
+                store.do_decommission_in_routine(canceler, idx).await;
             }
         });
 
@@ -1062,6 +1095,11 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
+        defer!(|| async {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            let _ = take_decommission_canceler(cancelers.as_mut_slice(), idx);
+        });
+
         let result = self.decommission_in_background(rx.clone(), idx).await;
 
         let (failed, canceled, cmd_line) = {
@@ -1667,10 +1705,12 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DecommissionTerminalState, classify_decommission_terminal_state, decommission_cancel_signal_result, dedup_indices,
-        ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state,
+        DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
+        decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
+        ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_dedup_indices_removes_duplicates_preserving_order() {
@@ -1752,5 +1792,48 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_cancel_allowed_allows_active() {
         assert!(ensure_decommission_cancel_allowed(true, true, false).is_ok());
+    }
+
+    #[test]
+    fn test_bind_decommission_cancelers_binds_existing_slots_only() {
+        let parent = CancellationToken::new();
+        let mut cancelers = vec![None, None];
+
+        let bound = bind_decommission_cancelers(&[0, 3, 1], &parent, cancelers.as_mut_slice());
+
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].0, 0);
+        assert_eq!(bound[1].0, 1);
+        assert!(cancelers[0].is_some());
+        assert!(cancelers[1].is_some());
+    }
+
+    #[test]
+    fn test_bind_decommission_cancelers_child_tokens_follow_parent_cancel() {
+        let parent = CancellationToken::new();
+        let mut cancelers = vec![None];
+
+        let bound = bind_decommission_cancelers(&[0], &parent, cancelers.as_mut_slice());
+        assert_eq!(bound.len(), 1);
+        assert!(!bound[0].1.is_cancelled());
+
+        parent.cancel();
+        assert!(bound[0].1.is_cancelled());
+    }
+
+    #[test]
+    fn test_take_decommission_canceler_takes_and_clears_slot() {
+        let token = CancellationToken::new();
+        let mut cancelers = vec![Some(token.clone())];
+
+        let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
+        assert!(taken.is_some());
+        assert!(cancelers[0].is_none());
+    }
+
+    #[test]
+    fn test_take_decommission_canceler_returns_none_for_missing_slot() {
+        let mut cancelers: Vec<Option<CancellationToken>> = Vec::new();
+        assert!(take_decommission_canceler(cancelers.as_mut_slice(), 0).is_none());
     }
 }
