@@ -836,7 +836,9 @@ impl ECStore {
             if rx.is_cancelled() {
                 info!("Pool {} rebalancing is stopped", pool_index);
                 let err = Error::OperationCanceled;
-                done_tx.send(Err(err.clone())).await.ok();
+                if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
+                    error!("{send_err}");
+                }
                 final_result = Err(err);
                 break;
             }
@@ -845,7 +847,9 @@ impl ECStore {
                 Ok(bucket) => bucket,
                 Err(err) => {
                     error!("next_rebal_bucket failed for pool {}: {:?}", pool_index, err);
-                    done_tx.send(Err(err.clone())).await.ok();
+                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
+                        error!("{send_err}");
+                    }
                     final_result = Err(err);
                     break;
                 }
@@ -860,7 +864,9 @@ impl ECStore {
                         continue;
                     }
                     error!("Error rebalancing bucket {}: {:?}", bucket, err);
-                    done_tx.send(Err(err.clone())).await.ok();
+                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
+                        error!("{send_err}");
+                    }
                     final_result = Err(err);
                     break;
                 }
@@ -868,7 +874,9 @@ impl ECStore {
                 info!("Rebalance bucket: done {} ", bucket);
                 if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
                     error!("bucket_rebalance_done failed for pool {}: {:?}", pool_index, err);
-                    done_tx.send(Err(err.clone())).await.ok();
+                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
+                        error!("{send_err}");
+                    }
                     final_result = Err(err);
                     break;
                 }
@@ -880,8 +888,10 @@ impl ECStore {
 
         info!("Pool {} rebalancing is done", pool_index);
 
-        if final_result.is_ok() {
-            done_tx.send(Ok(())).await.ok();
+        if final_result.is_ok()
+            && let Err(err) = send_rebalance_done_signal(&done_tx, Ok(()), pool_index).await
+        {
+            final_result = Err(err);
         }
         drop(done_tx);
         if let Err(err) = resolve_rebalance_save_task_result(pool_index, save_task.await)
@@ -1046,6 +1056,17 @@ fn resolve_rebalance_save_task_result(
         Ok(()) => Ok(()),
         Err(err) => Err(Error::other(format!("rebalance save_task for pool {pool_idx} join error: {err}"))),
     }
+}
+
+async fn send_rebalance_done_signal(
+    done_tx: &tokio::sync::mpsc::Sender<Result<()>>,
+    signal: Result<()>,
+    pool_idx: usize,
+) -> Result<()> {
+    done_tx
+        .send(signal)
+        .await
+        .map_err(|err| Error::other(format!("rebalance done signal send failed for pool {pool_idx}: {err}")))
 }
 
 fn resolve_rebalance_bucket_error(entry_error: Option<Error>, worker_error: Option<Error>) -> Result<()> {
@@ -1672,8 +1693,9 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_next_rebalance_bucket,
         resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_worker_result, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -1685,6 +1707,7 @@ mod rebalance_unit_tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::OffsetDateTime;
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     struct MigrationBackendSpy {
@@ -2110,6 +2133,29 @@ mod rebalance_unit_tests {
 
         let err = resolve_rebalance_save_task_result(3, Err(join_error)).unwrap_err();
         assert!(err.to_string().contains("rebalance save_task for pool 3 join error"));
+    }
+
+    #[tokio::test]
+    async fn test_send_rebalance_done_signal_sends_message() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        send_rebalance_done_signal(&tx, Ok(()), 2)
+            .await
+            .expect("send should succeed when receiver is active");
+
+        let received = rx.recv().await.expect("receiver should get signal");
+        assert!(received.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_send_rebalance_done_signal_reports_closed_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let err = send_rebalance_done_signal(&tx, Ok(()), 5)
+            .await
+            .expect_err("send should fail when receiver is closed");
+        assert!(err.to_string().contains("rebalance done signal send failed for pool 5"));
     }
 
     #[test]
