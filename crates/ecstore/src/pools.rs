@@ -216,6 +216,10 @@ fn resolve_decommission_update_after_result(result: Result<bool>) -> Result<bool
     result.map_err(|err| Error::other(format!("decommission metadata update failed: {err}")))
 }
 
+fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -864,7 +868,9 @@ impl ECStore {
             let mut cancelers = self.decommission_cancelers.write().await;
             take_decommission_canceler(cancelers.as_mut_slice(), idx)
         };
-        let _ = cancel_decommission_canceler(canceler);
+        if !cancel_decommission_canceler(canceler) {
+            warn!("decommission_cancel: no active canceler found for pool {}", idx);
+        }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
             notification_sys.reload_pool_meta().await?;
@@ -1285,7 +1291,9 @@ impl ECStore {
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
         defer!(|| async {
             let mut cancelers = self.decommission_cancelers.write().await;
-            let _ = take_decommission_canceler(cancelers.as_mut_slice(), idx);
+            if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
+                warn!("decommission: canceler already cleared for pool {}", idx);
+            }
         });
 
         let result = self.decommission_in_background(rx.clone(), idx).await;
@@ -1473,7 +1481,7 @@ impl ECStore {
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
         for bk in decom_buckets.iter() {
-            let _ = self.heal_bucket(&bk.name, &HealOpts::default()).await;
+            resolve_decommission_preflight_heal_result(&bk.name, self.heal_bucket(&bk.name, &HealOpts::default()).await)?;
         }
 
         let meta_buckets = [
@@ -1926,8 +1934,8 @@ mod pools_tests {
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_state,
-        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object,
+        resolve_decommission_preflight_heal_result, resolve_decommission_update_after_result,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2216,6 +2224,21 @@ mod pools_tests {
             .expect_err("invalid argument should be wrapped with context");
         assert!(err.to_string().contains("decommission metadata update failed"));
         assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_passthrough_ok() {
+        assert!(resolve_decommission_preflight_heal_result::<()>("bucket-a", Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
+        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::SlowDown))
+            .expect_err("heal failure should carry preflight context");
+        assert!(
+            err.to_string()
+                .contains("decommission preflight heal failed for bucket bucket-a")
+        );
     }
 
     #[tokio::test]
