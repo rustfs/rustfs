@@ -773,6 +773,10 @@ impl ECStore {
             bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
         };
 
+        if index_cancelers.is_empty() {
+            return;
+        }
+
         tokio::spawn(async move {
             let Some(store) = new_object_layer_fn() else {
                 error!("store not init");
