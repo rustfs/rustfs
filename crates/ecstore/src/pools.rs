@@ -748,6 +748,28 @@ impl ECStore {
         false
     }
 
+    pub(crate) async fn spawn_decommission_routines(&self, rx: CancellationToken, indices: Vec<usize>) {
+        let indices = dedup_indices(&indices);
+        if indices.is_empty() {
+            return;
+        }
+
+        let index_cancelers = {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
+        };
+
+        tokio::spawn(async move {
+            let Some(store) = new_object_layer_fn() else {
+                error!("store not init");
+                return;
+            };
+            for (idx, canceler) in index_cancelers {
+                store.do_decommission_in_routine(canceler, idx).await;
+            }
+        });
+    }
+
     #[tracing::instrument(skip(self, rx))]
     pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         let indices = dedup_indices(&indices);
@@ -764,21 +786,7 @@ impl ECStore {
         ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
         self.start_decommission(indices.clone()).await?;
-
-        let index_cancelers = {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
-        };
-
-        tokio::spawn(async move {
-            let Some(store) = new_object_layer_fn() else {
-                error!("store not init");
-                return;
-            };
-            for (idx, canceler) in index_cancelers {
-                store.do_decommission_in_routine(canceler, idx).await;
-            }
-        });
+        self.spawn_decommission_routines(rx, indices).await;
 
         Ok(())
     }
