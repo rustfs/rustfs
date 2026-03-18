@@ -603,6 +603,54 @@ mod rebalance_handler_tests {
     }
 
     #[test]
+    fn test_build_rebalance_pool_progress_stopped_uses_stop_time() {
+        let ps = RebalanceStats {
+            init_capacity: 1_000,
+            init_free_space: 200,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+                ..Default::default()
+            },
+            participating: true,
+            ..Default::default()
+        };
+
+        let stop_time = OffsetDateTime::from_unix_timestamp(1_200).unwrap();
+        let progress = build_rebalance_pool_progress(stop_time, Some(stop_time), 0.3, &ps).expect("progress should be generated");
+
+        assert_eq!(progress.elapsed, 200);
+        assert_eq!(progress.eta, 0);
+    }
+
+    #[test]
+    fn test_build_rebalance_pool_progress_prefers_info_end_time_over_stop_time() {
+        let ps = RebalanceStats {
+            init_capacity: 1_000,
+            init_free_space: 200,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                start_time: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+                end_time: Some(OffsetDateTime::from_unix_timestamp(1_180).unwrap()),
+                ..Default::default()
+            },
+            participating: true,
+            ..Default::default()
+        };
+
+        let progress = build_rebalance_pool_progress(
+            OffsetDateTime::from_unix_timestamp(1_300).unwrap(),
+            Some(OffsetDateTime::from_unix_timestamp(1_250).unwrap()),
+            0.3,
+            &ps,
+        )
+        .expect("progress should be generated");
+
+        assert_eq!(progress.elapsed, 180);
+        assert_eq!(progress.eta, 0);
+    }
+
+    #[test]
     fn test_rebalance_used_pct_normal_and_zero_total() {
         assert_eq!(rebalance_used_pct(1_000, 650), 0.35);
         assert_eq!(rebalance_used_pct(0, 0), 0.0);
