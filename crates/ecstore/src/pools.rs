@@ -131,6 +131,10 @@ fn decommission_cancel_signal_result(cancel_signal: bool) -> Result<()> {
     }
 }
 
+fn is_decommission_cancel_terminal(complete: bool, failed: bool, canceled: bool) -> bool {
+    complete || failed || canceled
+}
+
 fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
     if !pool_present {
         return Err(Error::other("InvalidArgument"));
@@ -711,7 +715,7 @@ impl ECStore {
         let mut lock = self.pool_meta.write().await;
         let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
             if let Some(info) = pool.decommission.as_ref() {
-                (true, true, info.complete || info.failed)
+                (true, true, is_decommission_cancel_terminal(info.complete, info.failed, info.canceled))
             } else {
                 (true, false, false)
             }
@@ -1733,8 +1737,8 @@ mod pools_tests {
     use super::{
         DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
         decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, has_active_decommission_canceler, should_preserve_decommission_canceled_state,
-        take_decommission_canceler,
+        ensure_decommission_not_rebalancing, has_active_decommission_canceler, is_decommission_cancel_terminal,
+        should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
     use tokio_util::sync::CancellationToken;
@@ -1801,6 +1805,26 @@ mod pools_tests {
     fn test_ensure_decommission_cancel_allowed_rejects_missing_pool() {
         let err = ensure_decommission_cancel_allowed(false, false, false).expect_err("missing pool should be invalid");
         assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_terminal_true_when_completed() {
+        assert!(is_decommission_cancel_terminal(true, false, false));
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_terminal_true_when_failed() {
+        assert!(is_decommission_cancel_terminal(false, true, false));
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_terminal_true_when_canceled() {
+        assert!(is_decommission_cancel_terminal(false, false, true));
+    }
+
+    #[test]
+    fn test_is_decommission_cancel_terminal_false_when_active() {
+        assert!(!is_decommission_cancel_terminal(false, false, false));
     }
 
     #[test]
