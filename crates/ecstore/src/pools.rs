@@ -77,8 +77,8 @@ fn bind_decommission_cancelers(
 
     for idx in indices {
         if let Some(slot) = cancelers.get_mut(*idx) {
-            if slot.is_some() {
-                continue;
+            if let Some(existing) = slot.take() {
+                existing.cancel();
             }
             let token = parent.child_token();
             *slot = Some(token.clone());
@@ -2047,16 +2047,20 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_bind_decommission_cancelers_skips_already_bound_slot() {
+    fn test_bind_decommission_cancelers_replaces_existing_slot() {
         let parent = CancellationToken::new();
         let existing = CancellationToken::new();
         let mut cancelers = vec![Some(existing.clone())];
 
         let bound = bind_decommission_cancelers(&[0], &parent, cancelers.as_mut_slice());
 
-        assert!(bound.is_empty());
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].0, 0);
+        assert!(existing.is_cancelled());
+        let replacement = cancelers[0].as_ref().expect("replacement token should be stored");
+        assert!(!replacement.is_cancelled());
         parent.cancel();
-        assert!(!existing.is_cancelled());
+        assert!(replacement.is_cancelled());
     }
 
     #[test]
