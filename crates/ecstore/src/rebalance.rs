@@ -679,7 +679,7 @@ impl ECStore {
                 );
             });
 
-            let started = is_rebalance_actively_running(meta);
+            let started = is_rebalance_conflicting_with_decommission(meta);
             if started {
                 info!("is_rebalance_started: rebalance started");
                 return true;
