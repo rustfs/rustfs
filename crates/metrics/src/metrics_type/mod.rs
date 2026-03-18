@@ -15,6 +15,7 @@
 pub mod audit;
 pub mod bucket;
 pub mod bucket_replication;
+pub mod cluster;
 pub mod cluster_config;
 pub mod cluster_erasure_set;
 pub mod cluster_health;
@@ -24,6 +25,9 @@ pub mod cluster_usage;
 pub mod entry;
 pub mod ilm;
 pub mod logger_webhook;
+pub mod node_bucket;
+pub mod node_disk;
+pub mod process_resource;
 pub mod replication;
 pub mod request;
 pub mod scanner;
