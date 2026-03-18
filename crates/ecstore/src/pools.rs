@@ -176,6 +176,42 @@ fn mark_decommission_bucket_done(meta: &mut PoolMeta, idx: usize, bucket: &Decom
     Ok(info.bucket_pop(&bucket.to_string()))
 }
 
+fn count_decommission_item(meta: &mut PoolMeta, idx: usize, size: usize, failed: bool) -> Result<()> {
+    ensure_valid_decommission_pool_index(meta.pools.len(), idx)?;
+
+    let Some(pool) = meta.pools.get_mut(idx) else {
+        return Err(Error::other("InvalidArgument"));
+    };
+    let Some(info) = pool.decommission.as_mut() else {
+        return Err(Error::other("decommission metadata not initialized"));
+    };
+
+    if failed {
+        info.items_decommission_failed += 1;
+        info.bytes_failed += size;
+    } else {
+        info.items_decommissioned += 1;
+        info.bytes_done += size;
+    }
+
+    Ok(())
+}
+
+fn track_decommission_current_object(meta: &mut PoolMeta, idx: usize, bucket: &str, object: &str) -> Result<()> {
+    ensure_valid_decommission_pool_index(meta.pools.len(), idx)?;
+
+    let Some(pool) = meta.pools.get_mut(idx) else {
+        return Err(Error::other("InvalidArgument"));
+    };
+    let Some(info) = pool.decommission.as_mut() else {
+        return Err(Error::other("decommission metadata not initialized"));
+    };
+
+    info.object = object.to_string();
+    info.bucket = bucket.to_string();
+    Ok(())
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -991,7 +1027,11 @@ impl ECStore {
                 }
 
                 {
-                    self.pool_meta.write().await.count_item(idx, 0, failure);
+                    let mut pool_meta = self.pool_meta.write().await;
+                    if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, failure) {
+                        error!("decommission_pool: count_decommission_item err {:?}", err);
+                        return;
+                    }
                 }
 
                 if !failure {
@@ -1078,7 +1118,11 @@ impl ECStore {
             }
 
             {
-                self.pool_meta.write().await.count_item(idx, decommissioned, failure);
+                let mut pool_meta = self.pool_meta.write().await;
+                if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommissioned, failure) {
+                    error!("decommission_pool: count_decommission_item err {:?}", err);
+                    return;
+                }
             }
 
             if failure {
@@ -1108,7 +1152,10 @@ impl ECStore {
         {
             let mut pool_meta = self.pool_meta.write().await;
 
-            pool_meta.track_current_bucket_object(idx, bucket.clone(), entry.name.clone());
+            if let Err(err) = track_decommission_current_object(&mut pool_meta, idx, bucket.as_str(), entry.name.as_str()) {
+                error!("decommission_entry: track_decommission_current_object err {:?}", err);
+                return;
+            }
 
             let ok = pool_meta
                 .update_after(idx, self.pools.clone(), Duration::seconds(30))
@@ -1865,11 +1912,12 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
-        cancel_decommission_canceler, classify_decommission_terminal_state, decommission_cancel_signal_result,
-        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler,
-        is_decommission_active, is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
-        resolve_decommission_bucket_state, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
+        decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
+        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
+        get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_state,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2069,6 +2117,81 @@ mod pools_tests {
         };
         let popped = mark_decommission_bucket_done(&mut meta, 0, &bucket).expect("valid state should mark bucket done");
         assert!(popped);
+    }
+
+    #[test]
+    fn test_count_decommission_item_rejects_missing_decommission_meta() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = count_decommission_item(&mut meta, 0, 64, true)
+            .expect_err("missing decommission metadata should return explicit error");
+        assert!(err.to_string().contains("decommission metadata not initialized"));
+    }
+
+    #[test]
+    fn test_count_decommission_item_updates_done_and_failed_counters() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        count_decommission_item(&mut meta, 0, 32, false).expect("success counter should be updated");
+        count_decommission_item(&mut meta, 0, 16, true).expect("failed counter should be updated");
+
+        let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
+        assert_eq!(info.items_decommissioned, 1);
+        assert_eq!(info.bytes_done, 32);
+        assert_eq!(info.items_decommission_failed, 1);
+        assert_eq!(info.bytes_failed, 16);
+    }
+
+    #[test]
+    fn test_track_decommission_current_object_rejects_missing_decommission_meta() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = track_decommission_current_object(&mut meta, 0, "bucket-a", "object-a")
+            .expect_err("missing decommission metadata should return explicit error");
+        assert!(err.to_string().contains("decommission metadata not initialized"));
+    }
+
+    #[test]
+    fn test_track_decommission_current_object_updates_bucket_and_object() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        track_decommission_current_object(&mut meta, 0, "bucket-a", "object-a").expect("valid state should track bucket/object");
+
+        let info = meta.pools[0].decommission.as_ref().expect("decommission info should exist");
+        assert_eq!(info.bucket, "bucket-a");
+        assert_eq!(info.object, "object-a");
     }
 
     #[tokio::test]
