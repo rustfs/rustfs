@@ -797,20 +797,32 @@ mod rebalance_handler_tests {
     #[test]
     fn test_validate_start_rebalance_guards_rejects_single_pool() {
         let err = validate_start_rebalance_guards(true, false, false).expect_err("single pool should be rejected");
-        assert!(err.to_string().contains("NotImplemented"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
+        assert_eq!(err.message(), Some("NotImplemented"));
     }
 
     #[test]
     fn test_validate_start_rebalance_guards_rejects_decommission_running() {
         let err =
             validate_start_rebalance_guards(false, true, false).expect_err("decommission running should block rebalance start");
-        assert!(err.to_string().contains("decommission is already in progress"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("decommission is already in progress"));
+    }
+
+    #[test]
+    fn test_validate_start_rebalance_guards_prefers_decommission_over_running_rebalance() {
+        let err = validate_start_rebalance_guards(false, true, true).expect_err(
+            "decommission should be rejected before another rebalance when both are running",
+        );
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("decommission is already in progress"));
     }
 
     #[test]
     fn test_validate_start_rebalance_guards_rejects_rebalance_running() {
         let err = validate_start_rebalance_guards(false, false, true).expect_err("running rebalance should block second start");
-        assert!(err.to_string().contains("Rebalance already in progress"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(err.message(), Some("Rebalance already in progress"));
     }
 
     #[test]
@@ -821,7 +833,8 @@ mod rebalance_handler_tests {
     #[test]
     fn test_validate_stop_rebalance_guards_rejects_when_not_started() {
         let err = validate_stop_rebalance_guards(false).expect_err("non-started rebalance should be rejected");
-        assert!(err.to_string().contains("Pool rebalance is not started"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("Pool rebalance is not started"));
     }
 
     #[test]
@@ -832,7 +845,8 @@ mod rebalance_handler_tests {
     #[test]
     fn test_validate_rebalance_status_pool_guard_rejects_empty() {
         let err = validate_rebalance_status_pool_guard(0).expect_err("empty pool list should be rejected");
-        assert!(err.to_string().contains("No storage pools available"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("No storage pools available"));
     }
 
     #[test]
