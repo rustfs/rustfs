@@ -264,19 +264,13 @@ impl Operation for StartDecommission {
                 }
             };
 
-            let mut has_found = None;
-            for (i, pool) in store.pools.iter().enumerate() {
-                if i == idx {
-                    has_found = Some(pool.clone());
-                    break;
-                }
+            if idx >= store.pools.len() {
+                return Err(s3_error!(InvalidArgument));
             }
 
-            let Some(_p) = has_found else {
-                return Err(s3_error!(InvalidArgument));
-            };
-
-            pools_indices.push(idx);
+            if !pools_indices.contains(&idx) {
+                pools_indices.push(idx);
+            }
         }
 
         if !pools_indices.is_empty() {
