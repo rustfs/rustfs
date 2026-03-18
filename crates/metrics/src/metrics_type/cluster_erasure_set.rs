@@ -22,6 +22,33 @@ pub const POOL_ID_L: &str = "pool_id";
 /// The label for the pool ID
 pub const SET_ID_L: &str = "set_id";
 
+pub static ERASURE_SET_SIZE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ErasureSetSize,
+        "Total number of drives in the erasure set in a pool",
+        &[POOL_ID_L, SET_ID_L],
+        subsystems::CLUSTER_ERASURE_SET,
+    )
+});
+
+pub static ERASURE_SET_PARITY_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ErasureSetParity,
+        "Parity drives in the erasure set in a pool",
+        &[POOL_ID_L, SET_ID_L],
+        subsystems::CLUSTER_ERASURE_SET,
+    )
+});
+
+pub static ERASURE_SET_DATA_SHARDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ErasureSetDataShards,
+        "Data shards in the erasure set in a pool",
+        &[POOL_ID_L, SET_ID_L],
+        subsystems::CLUSTER_ERASURE_SET,
+    )
+});
+
 pub static ERASURE_SET_OVERALL_WRITE_QUORUM_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ErasureSetOverallWriteQuorum,

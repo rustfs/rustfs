@@ -61,12 +61,30 @@
 //! report_metrics(&metrics);
 //! ```
 
+mod audit;
 mod bucket;
 mod bucket_replication;
 mod cluster;
+mod cluster_config;
+mod cluster_erasure_set;
+mod cluster_health;
+mod cluster_iam;
+mod cluster_usage;
 pub(crate) mod global;
+mod ilm;
+mod logger_webhook;
 mod node;
+mod notification;
+mod replication;
+mod request;
 mod resource;
+mod scanner;
+mod stats_collector;
+mod system_cpu;
+mod system_drive;
+mod system_memory;
+mod system_network;
+mod system_process;
 
 pub use bucket::{BucketStats, collect_bucket_metrics};
 pub use bucket_replication::{BucketReplicationBandwidthStats, collect_bucket_replication_bandwidth_metrics};
