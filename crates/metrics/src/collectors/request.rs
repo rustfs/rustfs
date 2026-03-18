@@ -151,8 +151,8 @@ mod tests {
         let metrics = collect_request_metrics(&stats);
         report_metrics(&metrics);
 
-        // 7 base metrics + 4 TTFB buckets + 2 traffic metrics = 13
-        assert_eq!(metrics.len(), 13);
+        // 6 base metrics + 4 TTFB buckets + 2 traffic metrics = 12
+        assert_eq!(metrics.len(), 12);
 
         let total_name = API_REQUESTS_TOTAL_MD.get_full_metric_name();
         let total = metrics.iter().find(|m| m.name == total_name);
