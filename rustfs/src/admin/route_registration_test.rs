@@ -196,3 +196,18 @@ fn test_phase5_admin_info_and_rpc_read_file_contract() {
         "rpc read_file_stream route must remain wired to disk.read_file_stream"
     );
 }
+
+#[test]
+fn test_replication_set_remote_target_uses_compat_body_decoder() {
+    let replication_src = include_str!("handlers/replication.rs");
+    let handler_marker = "impl Operation for SetRemoteTargetHandler";
+    let handler_start = replication_src
+        .find(handler_marker)
+        .expect("Expected impl Operation for SetRemoteTargetHandler in handlers/replication.rs");
+    let handler_block = &replication_src[handler_start..];
+
+    assert!(
+        handler_block.contains("read_compatible_admin_body("),
+        "set-remote-target must decode MinIO-compatible encrypted admin payloads"
+    );
+}
