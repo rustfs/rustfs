@@ -14,6 +14,10 @@
 
 use super::*;
 
+fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
+    created != OffsetDateTime::UNIX_EPOCH
+}
+
 impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -68,7 +72,9 @@ impl ECStore {
         let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
         if let Ok(sys) = metadata_sys::get(bucket).await {
-            info.created = Some(sys.created);
+            if should_override_created_from_metadata(sys.created) {
+                info.created = Some(sys.created);
+            }
             info.versioning = sys.versioning();
             info.object_locking = sys.object_locking();
         }
@@ -84,7 +90,9 @@ impl ECStore {
 
         if !opts.no_metadata {
             for bucket in buckets.iter_mut() {
-                if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
+                if let Ok(created) = metadata_sys::created_at(&bucket.name).await
+                    && should_override_created_from_metadata(created)
+                {
                     bucket.created = Some(created);
                 }
             }
@@ -146,5 +154,22 @@ impl ECStore {
             monitor.delete_bucket(bucket);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_override_created_from_metadata;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn should_not_override_when_metadata_created_is_unix_epoch() {
+        assert!(!should_override_created_from_metadata(OffsetDateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn should_override_when_metadata_created_is_valid_time() {
+        let created = OffsetDateTime::from_unix_timestamp(1704067200).expect("valid timestamp");
+        assert!(should_override_created_from_metadata(created));
     }
 }
