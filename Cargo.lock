@@ -7603,6 +7603,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_urlencoded",
+ "serial_test",
  "sha1 0.11.0-rc.5",
  "sha2 0.11.0-rc.5",
  "shadow-rs",
