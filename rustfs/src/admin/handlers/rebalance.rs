@@ -424,19 +424,22 @@ impl Operation for RebalanceStop {
 
         validate_stop_rebalance_guards(store.is_rebalance_started().await)?;
 
-        store
-            .stop_rebalance()
-            .await
-            .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
-
         if let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys.stop_rebalance().await;
-        }
+            notification_sys
+                .stop_rebalance()
+                .await
+                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+        } else {
+            store
+                .stop_rebalance()
+                .await
+                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
 
-        store
-            .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
-            .await
-            .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+            store
+                .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
+                .await
+                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+        }
 
         warn!("handle RebalanceStop save_rebalance_stats done ");
         if let Some(notification_sys) = get_global_notification_sys() {

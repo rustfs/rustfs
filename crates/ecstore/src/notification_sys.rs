@@ -412,16 +412,18 @@ impl NotificationSys {
         }
     }
 
-    pub async fn stop_rebalance(&self) {
+    pub async fn stop_rebalance(&self) -> Result<()> {
         warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
-            return;
+            return Err(Error::other("stop_rebalance: not init"));
         };
 
         // warn!("notification stop_rebalance load_rebalance_meta");
         // self.load_rebalance_meta(false).await;
         // warn!("notification stop_rebalance load_rebalance_meta done");
+
+        let mut failures = Vec::new();
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
@@ -432,21 +434,27 @@ impl NotificationSys {
         for result in results {
             if let Err(err) = result {
                 error!("notification stop_rebalance err {:?}", err);
+                failures.push(format!("peer stop_rebalance failed: {err}"));
             }
         }
 
         warn!("notification stop_rebalance stop_rebalance start");
-        if let Err(err) = store.stop_rebalance().await {
-            error!("notification stop_rebalance local stop err {:?}", err);
-            return;
+        match store.stop_rebalance().await {
+            Ok(_) => {
+                if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+                    error!("notification stop_rebalance local save err {:?}", err);
+                    failures.push(format!("local save_rebalance_stats failed: {err}"));
+                }
+            }
+            Err(err) => {
+                error!("notification stop_rebalance local stop err {:?}", err);
+                failures.push(format!("local stop_rebalance failed: {err}"));
+            }
         }
 
-        if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
-            error!("notification stop_rebalance local save err {:?}", err);
-            return;
-        }
-
+        aggregate_stop_rebalance_failures(failures)?;
         warn!("notification stop_rebalance stop_rebalance done");
+        Ok(())
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
@@ -783,6 +791,18 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
     offline_disks
 }
 
+fn aggregate_stop_rebalance_failures(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::other(format!(
+        "stop_rebalance encountered {} failure(s): {}",
+        failures.len(),
+        failures.join(" | ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +854,21 @@ mod tests {
         .await;
 
         assert_eq!(result.endpoint, "fallback");
+    }
+
+    #[test]
+    fn aggregate_stop_rebalance_failures_returns_ok_when_empty() {
+        assert!(aggregate_stop_rebalance_failures(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn aggregate_stop_rebalance_failures_returns_joined_error_when_non_empty() {
+        let err = aggregate_stop_rebalance_failures(vec!["peer-1 failed".to_string(), "local save failed".to_string()])
+            .expect_err("non-empty failures should return error");
+
+        let msg = err.to_string();
+        assert!(msg.contains("2 failure(s)"));
+        assert!(msg.contains("peer-1 failed"));
+        assert!(msg.contains("local save failed"));
     }
 }

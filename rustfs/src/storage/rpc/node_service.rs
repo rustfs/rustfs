@@ -1970,6 +1970,7 @@ mod tests {
         // Should fail because object layer is not initialized in test
         assert!(!stop_response.success);
         assert!(stop_response.error_info.is_some());
+        assert!(stop_response.error_info.unwrap().contains("errServerNotInitialized"));
     }
 
     #[tokio::test]
