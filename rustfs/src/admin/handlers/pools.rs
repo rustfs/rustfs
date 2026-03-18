@@ -241,8 +241,8 @@ impl Operation for StartDecommission {
         for pool in pools.iter() {
             let idx = {
                 if is_byid {
-                    pool.parse::<usize>()
-                        .map_err(|_e| s3_error!(InvalidArgument, "pool parse failed"))?
+                    parse_pool_idx_by_id(pool, store.pools.len())
+                        .ok_or_else(|| s3_error!(InvalidArgument, "pool parse failed"))?
                 } else {
                     let Some(idx) = endpoints.get_pool_idx(pool) else {
                         return Err(s3_error!(InvalidArgument, "pool parse failed"));
