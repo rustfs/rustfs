@@ -15,7 +15,6 @@
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
-use crate::storage::s3_api::common::RUSTFS_OWNER_ID;
 use rustfs_ecstore::{
     bucket::tagging::decode_tags_to_map,
     error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
@@ -28,17 +27,6 @@ use std::fmt::Debug;
 use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StoredOwner {
-    pub(crate) id: String,
-}
-
-pub(crate) fn default_owner() -> StoredOwner {
-    StoredOwner {
-        id: RUSTFS_OWNER_ID.to_string(),
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct FS {

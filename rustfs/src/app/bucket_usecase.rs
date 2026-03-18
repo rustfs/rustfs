@@ -19,7 +19,6 @@ use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::ecfs::default_owner;
 use crate::storage::helper::OperationHelper;
 use crate::storage::s3_api::bucket::{build_list_buckets_output, build_list_objects_v2_output};
 use crate::storage::s3_api::{acl, encryption, replication, tagging};
@@ -67,6 +66,17 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
 
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
+
+fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
+    if is_owner {
+        return Ok(S3Response::new(CreateBucketOutput::default()));
+    }
+
+    Err(s3_error!(
+        BucketAlreadyExists,
+        "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
+    ))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -147,8 +157,8 @@ impl DefaultBucketUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-        let requester_id = match req_info_ref(&req) {
-            Ok(r) => r.cred.as_ref().map(|c| c.access_key.clone()),
+        let requester_is_owner = match req_info_ref(&req) {
+            Ok(r) => r.is_owner,
             Err(_) => {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
             }
@@ -179,18 +189,7 @@ impl DefaultBucketUsecase {
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
-                let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == default_owner().id);
-
-                if is_owner {
-                    let output = CreateBucketOutput::default();
-                    let result = Ok(S3Response::new(output));
-                    let _ = helper.complete(&result);
-                    return result;
-                }
-                let result = Err(s3_error!(
-                    BucketAlreadyExists,
-                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
-                ));
+                let result = create_bucket_exists_response(requester_is_owner);
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -1591,6 +1590,12 @@ mod tests {
         }
     }
 
+    fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
+        let mut req = build_request(input, method);
+        req.extensions.insert(req_info);
+        req
+    }
+
     #[test]
     fn resolve_notification_region_prefers_global_region() {
         let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
@@ -1607,6 +1612,36 @@ mod tests {
     fn resolve_notification_region_defaults_value() {
         let binding = resolve_notification_region(None, None);
         assert_eq!(binding, RUSTFS_REGION);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_ok_for_owner() {
+        let response = create_bucket_exists_response(true).expect("owner recreate should succeed");
+        assert_eq!(response.output.location, None);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
+        let err = create_bucket_exists_response(false).expect_err("non-owner recreate should fail");
+        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
+    }
+
+    #[test]
+    fn build_request_with_req_info_preserves_owner_state() {
+        let input = CreateBucketInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+        let req = build_request_with_req_info(
+            input,
+            Method::PUT,
+            ReqInfo {
+                is_owner: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
     }
 
     #[tokio::test]
