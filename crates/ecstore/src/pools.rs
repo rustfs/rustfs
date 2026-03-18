@@ -106,9 +106,9 @@ fn cancel_decommission_canceler(canceler: Option<CancellationToken>) -> bool {
     }
 }
 
-fn ensure_decommission_routines_scheduled(bound_count: usize) -> Result<()> {
-    if bound_count == 0 {
-        return Err(Error::other("decommission routines not scheduled"));
+fn ensure_decommission_routines_scheduled(bound_count: usize, expected_count: usize) -> Result<()> {
+    if bound_count == 0 || bound_count != expected_count {
+        return Err(Error::other("decommission routines not fully scheduled"));
     }
 
     Ok(())
@@ -840,7 +840,7 @@ impl ECStore {
             bind_decommission_cancelers(indices.as_slice(), &rx, cancelers.as_mut_slice())
         };
 
-        ensure_decommission_routines_scheduled(index_cancelers.len())?;
+        ensure_decommission_routines_scheduled(index_cancelers.len(), indices.len())?;
 
         for (idx, canceler) in index_cancelers {
             let store = store.clone();
@@ -2135,12 +2135,18 @@ mod pools_tests {
 
     #[test]
     fn test_ensure_decommission_routines_scheduled_accepts_positive_bound_count() {
-        assert!(super::ensure_decommission_routines_scheduled(1).is_ok());
+        assert!(super::ensure_decommission_routines_scheduled(2, 2).is_ok());
     }
 
     #[test]
     fn test_ensure_decommission_routines_scheduled_rejects_zero_bound_count() {
-        let err = super::ensure_decommission_routines_scheduled(0).expect_err("zero bound count should be rejected");
-        assert!(err.to_string().contains("decommission routines not scheduled"));
+        let err = super::ensure_decommission_routines_scheduled(0, 1).expect_err("zero bound count should be rejected");
+        assert!(err.to_string().contains("decommission routines not fully scheduled"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_routines_scheduled_rejects_partial_binding() {
+        let err = super::ensure_decommission_routines_scheduled(1, 2).expect_err("partial binding should be rejected");
+        assert!(err.to_string().contains("decommission routines not fully scheduled"));
     }
 }
