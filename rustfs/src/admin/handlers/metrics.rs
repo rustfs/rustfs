@@ -32,7 +32,10 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
+
+const DEFAULT_METRICS_SAMPLES: u64 = 1;
+const MAX_METRICS_SAMPLES: u64 = 120;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MetricsParams {
@@ -50,6 +53,8 @@ struct MetricsParams {
     by_job_id: String,
     #[serde(rename = "by-depID")]
     by_dep_id: String,
+    #[serde(skip)]
+    n_set: bool,
 }
 
 impl Default for MetricsParams {
@@ -58,12 +63,13 @@ impl Default for MetricsParams {
             disks: Default::default(),
             hosts: Default::default(),
             tick: Default::default(),
-            n: u64::MAX,
+            n: DEFAULT_METRICS_SAMPLES,
             types: Default::default(),
             by_disk: Default::default(),
             by_host: Default::default(),
             by_job_id: Default::default(),
             by_dep_id: Default::default(),
+            n_set: false,
         }
     }
 }
@@ -93,7 +99,8 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
                 if key == "n"
                     && let Some(value) = parts.next()
                 {
-                    mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
+                    mp.n_set = true;
+                    mp.n = value.parse::<u64>().unwrap_or(DEFAULT_METRICS_SAMPLES);
                 }
                 if key == "types"
                     && let Some(value) = parts.next()
@@ -126,6 +133,25 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
     mp
 }
 
+fn resolve_sample_count(mp: &MetricsParams) -> u64 {
+    let requested = if mp.n_set { mp.n } else { DEFAULT_METRICS_SAMPLES };
+
+    if requested == 0 {
+        return DEFAULT_METRICS_SAMPLES;
+    }
+
+    if requested > MAX_METRICS_SAMPLES {
+        warn!(
+            requested,
+            max = MAX_METRICS_SAMPLES,
+            "metrics request sample count too large, capping to safety limit"
+        );
+        return MAX_METRICS_SAMPLES;
+    }
+
+    requested
+}
+
 struct MetricsStream {
     inner: ReceiverStream<Result<Bytes, StdError>>,
 }
@@ -155,10 +181,7 @@ impl Operation for MetricsHandler {
 
         let tick = parse_duration(&mp.tick).unwrap_or_else(|_| std_Duration::from_secs(3));
 
-        let mut n = mp.n;
-        if n == 0 {
-            n = u64::MAX;
-        }
+        let mut n = resolve_sample_count(&mp);
 
         let types = if mp.types != 0 {
             MetricType::new(mp.types)
@@ -210,7 +233,9 @@ impl Operation for MetricsHandler {
 
                 // todo write resp
                 match serde_json::to_vec(&m) {
-                    Ok(re) => {
+                    Ok(mut re) => {
+                        // NDJSON framing allows stream clients to parse incremental records.
+                        re.push(b'\n');
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {
@@ -232,5 +257,35 @@ impl Operation for MetricsHandler {
         });
 
         Ok(S3Response::new((StatusCode::OK, body)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, extract_metrics_init_params, resolve_sample_count};
+    use http::Uri;
+
+    #[test]
+    fn metrics_params_default_to_single_sample() {
+        let uri: Uri = "/rustfs/admin/v3/metrics".parse().unwrap();
+        let mp = extract_metrics_init_params(&uri);
+
+        assert_eq!(resolve_sample_count(&mp), DEFAULT_METRICS_SAMPLES);
+    }
+
+    #[test]
+    fn metrics_params_treat_zero_as_single_sample() {
+        let uri: Uri = "/rustfs/admin/v3/metrics?n=0".parse().unwrap();
+        let mp = extract_metrics_init_params(&uri);
+
+        assert_eq!(resolve_sample_count(&mp), DEFAULT_METRICS_SAMPLES);
+    }
+
+    #[test]
+    fn metrics_params_cap_samples_to_safety_limit() {
+        let uri: Uri = "/rustfs/admin/v3/metrics?n=9999".parse().unwrap();
+        let mp = extract_metrics_init_params(&uri);
+
+        assert_eq!(resolve_sample_count(&mp), MAX_METRICS_SAMPLES);
     }
 }
