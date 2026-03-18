@@ -262,11 +262,7 @@ impl PoolMeta {
     }
 
     pub fn is_suspended(&self, idx: usize) -> bool {
-        if idx >= self.pools.len() {
-            return false;
-        }
-
-        self.pools[idx].decommission.is_some()
+        self.pools.get(idx).is_some_and(|pool| pool.decommission.is_some())
     }
 
     pub async fn load(&mut self, pool: Arc<Sets>, _pools: Vec<Arc<Sets>>) -> Result<()> {
@@ -419,8 +415,10 @@ impl PoolMeta {
         Ok(())
     }
     pub fn queue_buckets(&mut self, idx: usize, bks: Vec<DecomBucketInfo>) {
-        for bk in bks.iter() {
-            if let Some(dec) = self.pools[idx].decommission.as_mut() {
+        if let Some(pool) = self.pools.get_mut(idx)
+            && let Some(dec) = pool.decommission.as_mut()
+        {
+            for bk in bks.iter() {
                 dec.bucket_push(bk);
             }
         }
@@ -441,11 +439,10 @@ impl PoolMeta {
     }
 
     pub fn is_bucket_decommissioned(&self, idx: usize, bucket: String) -> bool {
-        if let Some(ref info) = self.pools[idx].decommission {
-            info.is_bucket_decommissioned(&bucket)
-        } else {
-            false
-        }
+        self.pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| info.is_bucket_decommissioned(&bucket))
     }
 
     pub fn bucket_done(&mut self, idx: usize, bucket: String) -> bool {
@@ -488,14 +485,17 @@ impl PoolMeta {
     }
 
     pub async fn update_after(&mut self, idx: usize, pools: Vec<Arc<Sets>>, duration: Duration) -> Result<bool> {
-        if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
-            return Err(Error::other("InvalidArgument"));
-        }
-
+        let last_update = match self.pools.get(idx) {
+            Some(pool) if pool.decommission.is_some() => pool.last_update,
+            _ => return Err(Error::other("InvalidArgument")),
+        };
         let now = OffsetDateTime::now_utc();
 
-        if now.unix_timestamp() - self.pools[idx].last_update.unix_timestamp() > duration.whole_seconds() {
-            self.pools[idx].last_update = now;
+        if now.unix_timestamp() - last_update.unix_timestamp() > duration.whole_seconds() {
+            let Some(pool) = self.pools.get_mut(idx) else {
+                return Err(Error::other("InvalidArgument"));
+            };
+            pool.last_update = now;
             self.save(pools).await?;
 
             return Ok(true);
@@ -1838,15 +1838,15 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DecommissionTerminalState, PoolDecommissionInfo, PoolStatus, bind_decommission_cancelers, cancel_decommission_canceler,
-        classify_decommission_terminal_state, decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices,
-        ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, require_decommission_store, should_preserve_decommission_canceled_state,
-        take_decommission_canceler,
+        DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
+        cancel_decommission_canceler, classify_decommission_terminal_state, decommission_cancel_signal_result,
+        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing,
+        ensure_decommission_start_allowed, ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler,
+        is_decommission_active, is_decommission_cancel_terminal, require_decommission_store,
+        should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -1871,6 +1871,76 @@ mod pools_tests {
     fn test_get_by_index_returns_error_when_out_of_range() {
         let values = vec![1_u8];
         let err = get_by_index(values.as_slice(), 2).expect_err("out-of-range index should fail");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_pool_meta_is_suspended_returns_false_for_out_of_range() {
+        let meta = PoolMeta::default();
+        assert!(!meta.is_suspended(1));
+    }
+
+    #[test]
+    fn test_pool_meta_queue_buckets_ignores_out_of_range_index() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo::default()),
+            }],
+            ..Default::default()
+        };
+
+        meta.queue_buckets(
+            9,
+            vec![DecomBucketInfo {
+                name: "bucket-a".to_string(),
+                prefix: String::new(),
+            }],
+        );
+
+        let queued = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("pool should have decommission info")
+            .queued_buckets
+            .clone();
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn test_pool_meta_is_bucket_decommissioned_returns_false_for_out_of_range() {
+        let meta = PoolMeta::default();
+        assert!(!meta.is_bucket_decommissioned(7, "bucket-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_update_after_rejects_out_of_range_index() {
+        let mut meta = PoolMeta::default();
+        let err = meta
+            .update_after(1, Vec::new(), Duration::seconds(1))
+            .await
+            .expect_err("out-of-range index should fail");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_update_after_rejects_when_decommission_missing() {
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = meta
+            .update_after(0, Vec::new(), Duration::seconds(1))
+            .await
+            .expect_err("pool without decommission should fail");
         assert!(err.to_string().contains("InvalidArgument"));
     }
 
