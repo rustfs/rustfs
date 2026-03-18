@@ -628,26 +628,7 @@ impl ECStore {
         info!("next_rebal_bucket: pool_index: {}", pool_index);
         let rebalance_meta = self.rebalance_meta.read().await;
         info!("next_rebal_bucket: rebalance_meta: {:?}", rebalance_meta);
-        if let Some(meta) = rebalance_meta.as_ref()
-            && let Some(pool_stat) = meta.pool_stats.get(pool_index)
-        {
-            if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
-                info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
-                return Ok(None);
-            }
-
-            if pool_stat.buckets.is_empty() {
-                info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
-                return Ok(None);
-            }
-            if let Some(bucket) = next_rebal_bucket_from_stat(pool_stat) {
-                info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, bucket);
-                return Ok(Some(bucket));
-            }
-        }
-
-        info!("next_rebal_bucket: pool_index: {} None", pool_index);
-        Ok(None)
+        resolve_next_rebalance_bucket(rebalance_meta.as_ref(), pool_index)
     }
 
     #[tracing::instrument(skip(self))]
@@ -970,6 +951,35 @@ fn next_rebal_bucket_from_stat(pool_stat: &RebalanceStats) -> Option<String> {
     }
 
     first_rebalance_bucket(pool_stat)
+}
+
+fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize) -> Result<Option<String>> {
+    let Some(meta) = meta else {
+        return Err(Error::other("rebalance metadata not initialized"));
+    };
+
+    ensure_valid_rebalance_pool_index(meta.pool_stats.len(), pool_index)?;
+    let Some(pool_stat) = meta.pool_stats.get(pool_index) else {
+        return Err(Error::other(format!("invalid rebalance pool index: {pool_index}")));
+    };
+
+    if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
+        info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
+        return Ok(None);
+    }
+
+    if pool_stat.buckets.is_empty() {
+        info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
+        return Ok(None);
+    }
+
+    if let Some(bucket) = next_rebal_bucket_from_stat(pool_stat) {
+        info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, bucket);
+        return Ok(Some(bucket));
+    }
+
+    info!("next_rebal_bucket: pool_index: {} None", pool_index);
+    Ok(None)
 }
 
 fn mark_rebalance_bucket_done(meta: Option<&mut RebalanceMeta>, pool_index: usize, bucket: &str) -> Result<()> {
@@ -1653,10 +1663,10 @@ mod rebalance_unit_tests {
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_rebalance_bucket_error,
-        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_worker_result,
-        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_worker_result, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2546,6 +2556,63 @@ mod rebalance_unit_tests {
         };
 
         assert_eq!(next_rebal_bucket_from_stat(&pool_stat), Some("bucket-a".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_next_rebalance_bucket_rejects_missing_meta() {
+        let err = resolve_next_rebalance_bucket(None, 0).expect_err("missing meta should fail");
+        assert!(err.to_string().contains("rebalance metadata not initialized"));
+    }
+
+    #[test]
+    fn test_resolve_next_rebalance_bucket_rejects_invalid_pool_index() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        let err = resolve_next_rebalance_bucket(Some(&meta), 3).expect_err("invalid pool index should fail");
+        assert!(err.to_string().contains("invalid rebalance pool index"));
+    }
+
+    #[test]
+    fn test_resolve_next_rebalance_bucket_returns_none_for_completed_pool() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                buckets: vec!["bucket-a".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let next = resolve_next_rebalance_bucket(Some(&meta), 0).expect("completed pool should return none");
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_resolve_next_rebalance_bucket_returns_first_bucket_for_active_pool() {
+        let now = OffsetDateTime::now_utc();
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let next = resolve_next_rebalance_bucket(Some(&meta), 0).expect("active pool should return first bucket");
+        assert_eq!(next.as_deref(), Some("bucket-a"));
     }
 
     #[test]
