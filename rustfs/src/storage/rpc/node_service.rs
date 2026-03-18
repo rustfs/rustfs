@@ -21,14 +21,14 @@ use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
-        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
-        error::DiskError,
+        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        UpdateMetadataOpts, error::DiskError,
     },
     get_global_lock_client,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     rpc::{LocalPeerS3Client, PeerS3Client},
-    store::{all_local_disk_path, find_local_disk},
+    store::{all_local_disk_path, find_local_disk_by_ref},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
 use rustfs_filemeta::{FileInfo, MetacacheReader};
@@ -74,8 +74,8 @@ pub fn make_server() -> NodeService {
 }
 
 impl NodeService {
-    async fn find_disk(&self, disk_path: &String) -> Option<DiskStore> {
-        find_local_disk(disk_path).await
+    async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
+        find_local_disk_by_ref(disk_path).await
     }
 
     async fn all_disk(&self) -> Vec<String> {
@@ -1353,6 +1353,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "{}".to_string(),
+            file_info_bin: Vec::new(),
+            opts_bin: Vec::new(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1373,6 +1375,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
             opts: "{}".to_string(),
+            file_info_bin: Vec::new(),
+            opts_bin: Vec::new(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1393,6 +1397,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "invalid json".to_string(),
+            file_info_bin: Vec::new(),
+            opts_bin: Vec::new(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1412,6 +1418,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
+            file_info_bin: Vec::new(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1431,6 +1438,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
+            file_info_bin: Vec::new(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1451,6 +1459,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "{}".to_string(),
+            opts_bin: Vec::new(),
         });
 
         let response = service.read_version(request).await;
@@ -1472,6 +1481,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "invalid json".to_string(),
+            opts_bin: Vec::new(),
         });
 
         let response = service.read_version(request).await;
@@ -1629,6 +1639,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "{}".to_string(),
+            read_multiple_req_bin: Vec::new(),
         });
 
         let response = service.read_multiple(request).await;
@@ -1647,6 +1658,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "invalid json".to_string(),
+            read_multiple_req_bin: Vec::new(),
         });
 
         let response = service.read_multiple(request).await;
@@ -2195,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_disk_method() {
         let service = create_test_node_service();
-        let disk = service.find_disk(&"non-existent-disk".to_string()).await;
+        let disk = service.find_disk("non-existent-disk").await;
         // Should return None for non-existent disk
         assert!(disk.is_none());
     }

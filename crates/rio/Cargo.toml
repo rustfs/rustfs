@@ -55,3 +55,5 @@ hex-simd.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+axum = { workspace = true }
+http-body-util = { workspace = true }

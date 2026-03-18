@@ -19,7 +19,6 @@ use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_utils::get_env_opt_str;
-use std::error::Error as _;
 use std::io::{self, Error};
 use std::ops::Not as _;
 use std::pin::Pin;
@@ -111,19 +110,6 @@ fn get_http_client() -> Client {
     CLIENT.clone()
 }
 
-static HTTP_DEBUG_LOG: bool = false;
-#[inline(always)]
-fn http_debug_log(args: std::fmt::Arguments) {
-    if HTTP_DEBUG_LOG {
-        println!("{args}");
-    }
-}
-macro_rules! http_log {
-    ($($arg:tt)*) => {
-        http_debug_log(format_args!($($arg)*));
-    };
-}
-
 pin_project! {
     pub struct HttpReader {
         url:String,
@@ -147,26 +133,6 @@ impl HttpReader {
         body: Option<Vec<u8>>,
         _read_buf_size: usize,
     ) -> io::Result<Self> {
-        // http_log!(
-        //     "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
-        //     _read_buf_size
-        // );
-        // First, check if the connection is available (HEAD)
-        let client = get_http_client();
-        let head_resp = client.head(&url).headers(headers.clone()).send().await;
-        match head_resp {
-            Ok(resp) => {
-                http_log!("[HttpReader::new] HEAD status: {}", resp.status());
-                if !resp.status().is_success() {
-                    return Err(Error::other(format!("HEAD failed: url: {}, status {}", url, resp.status())));
-                }
-            }
-            Err(e) => {
-                http_log!("[HttpReader::new] HEAD error: {e}");
-                return Err(Error::other(e.source().map(|s| s.to_string()).unwrap_or_else(|| e.to_string())));
-            }
-        }
-
         let client = get_http_client();
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
@@ -290,22 +256,6 @@ impl HttpWriter {
         let url_clone = url.clone();
         let method_clone = method.clone();
         let headers_clone = headers.clone();
-
-        // First, try to write empty data to check if writable
-        let client = get_http_client();
-        let resp = client.put(&url).headers(headers.clone()).body(Vec::new()).send().await;
-        match resp {
-            Ok(resp) => {
-                // http_log!("[HttpWriter::new] empty PUT status: {}", resp.status());
-                if !resp.status().is_success() {
-                    return Err(Error::other(format!("Empty PUT failed: status {}", resp.status())));
-                }
-            }
-            Err(e) => {
-                // http_log!("[HttpWriter::new] empty PUT error: {e}");
-                return Err(Error::other(format!("Empty PUT failed: {e}")));
-            }
-        }
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(8);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
@@ -437,77 +387,88 @@ impl AsyncWrite for HttpWriter {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use reqwest::Method;
-//     use std::vec;
-//     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+    use http_body_util::BodyExt as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex,
+    };
 
-//     #[tokio::test]
-//     async fn test_http_writer_err() {
-//         // Use a real local server for integration, or mockito for unit test
-//         // Here, we use the Go test server at 127.0.0.1:8081 (scripts/testfile.go)
-//         let url = "http://127.0.0.1:8081/testfile".to_string();
-//         let data = vec![42u8; 8];
+    #[derive(Clone, Default)]
+    struct TestState {
+        head_count: Arc<AtomicUsize>,
+        get_count: Arc<AtomicUsize>,
+        put_count: Arc<AtomicUsize>,
+        put_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
 
-//         // Write
-//         // Add header X-Deny-Write = 1 to simulate non-writable situation
-//         let mut headers = HeaderMap::new();
-//         headers.insert("X-Deny-Write", "1".parse().unwrap());
-//         // Here we use PUT method
-//         let writer_result = HttpWriter::new(url.clone(), Method::PUT, headers).await;
-//         match writer_result {
-//             Ok(mut writer) => {
-//                 // If creation succeeds, write should fail
-//                 let write_result = writer.write_all(&data).await;
-//                 assert!(write_result.is_err(), "write_all should fail when server denies write");
-//                 if let Err(e) = write_result {
-//                     println!("write_all error: {e}");
-//                 }
-//                 let shutdown_result = writer.shutdown().await;
-//                 if let Err(e) = shutdown_result {
-//                     println!("shutdown error: {e}");
-//                 }
-//             }
-//             Err(e) => {
-//                 // Direct construction failure is also acceptable
-//                 println!("HttpWriter::new error: {e}");
-//                 assert!(
-//                     e.to_string().contains("Empty PUT failed") || e.to_string().contains("Forbidden"),
-//                     "unexpected error: {e}"
-//                 );
-//                 return;
-//             }
-//         }
-//         // Should not reach here
-//         panic!("HttpWriter should not allow writing when server denies write");
-//     }
+    async fn get_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        (StatusCode::OK, Body::from("hello"))
+    }
 
-//     #[tokio::test]
-//     async fn test_http_writer_and_reader_ok() {
-//         // Use local Go test server
-//         let url = "http://127.0.0.1:8081/testfile".to_string();
-//         let data = vec![99u8; 512 * 1024]; // 512KB of data
+    async fn reject_head(State(state): State<TestState>) -> impl IntoResponse {
+        state.head_count.fetch_add(1, Ordering::SeqCst);
+        StatusCode::METHOD_NOT_ALLOWED
+    }
 
-//         // Write (without X-Deny-Write)
-//         let headers = HeaderMap::new();
-//         let mut writer = HttpWriter::new(url.clone(), Method::PUT, headers).await.unwrap();
-//         writer.write_all(&data).await.unwrap();
-//         writer.shutdown().await.unwrap();
+    async fn accept_put(State(state): State<TestState>, body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        state.put_bodies.lock().await.push(bytes.to_vec());
+        StatusCode::OK
+    }
 
-//         http_log!("Wrote {} bytes to {} (ok case)", data.len(), url);
+    async fn start_test_server(state: TestState) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .with_state(state);
 
-//         // Read back
-//         let mut reader = HttpReader::with_capacity(url.clone(), Method::GET, HeaderMap::new(), 8192)
-//             .await
-//             .unwrap();
-//         let mut buf = Vec::new();
-//         reader.read_to_end(&mut buf).await.unwrap();
-//         assert_eq!(buf, data);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
-//         // println!("Read {} bytes from {} (ok case)", buf.len(), url);
-//         // tokio::time::sleep(std::time::Duration::from_secs(2)).await; // Wait for server to process
-//         // println!("[test_http_writer_and_reader_ok] completed successfully");
-//     }
-// }
+        (format!("http://{addr}/stream"), handle)
+    }
+
+    #[tokio::test]
+    async fn http_reader_does_not_send_preflight_head() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None).await.unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"hello");
+        assert_eq!(state.head_count.load(Ordering::SeqCst), 0);
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_does_not_send_empty_preflight_put() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+}

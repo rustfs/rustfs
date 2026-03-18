@@ -22,7 +22,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::WalkDirOptions;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use rustfs_ecstore::store::find_local_disk;
+use rustfs_ecstore::store::find_local_disk_by_ref;
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
 use s3s::S3Request;
@@ -95,7 +95,7 @@ impl Operation for ReadFile {
             }
         };
 
-        let Some(disk) = find_local_disk(&query.disk).await else {
+        let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
             return Err(s3_error!(InvalidArgument, "disk not found"));
         };
 
@@ -152,7 +152,7 @@ impl Operation for WalkDir {
 
         let args: WalkDirOptions =
             serde_json::from_slice(&body).map_err(|e| s3_error!(InternalError, "unmarshal body err {}", e))?;
-        let Some(disk) = find_local_disk(&query.disk).await else {
+        let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
             return Err(s3_error!(InvalidArgument, "disk not found"));
         };
 
@@ -192,7 +192,7 @@ impl Operation for PutFile {
             }
         };
 
-        let Some(disk) = find_local_disk(&query.disk).await else {
+        let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
             return Err(s3_error!(InvalidArgument, "disk not found"));
         };
 
