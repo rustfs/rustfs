@@ -97,6 +97,15 @@ fn has_active_decommission_canceler(cancelers: &[Option<CancellationToken>]) -> 
     cancelers.iter().any(Option::is_some)
 }
 
+fn cancel_decommission_canceler(canceler: Option<CancellationToken>) -> bool {
+    if let Some(canceler) = canceler {
+        canceler.cancel();
+        true
+    } else {
+        false
+    }
+}
+
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
         return Err(Error::RebalanceAlreadyRunning);
@@ -765,21 +774,22 @@ impl ECStore {
 
         ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
 
-        if lock.decommission_cancel(idx) {
+        let should_reload_pool_meta = if lock.decommission_cancel(idx) {
             lock.save(self.pools.clone()).await?;
+            true
+        } else {
+            false
+        };
+        drop(lock);
 
-            drop(lock);
-
-            if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await?;
-            }
-        }
-
-        if let Some(canceler) = {
+        let canceler = {
             let mut cancelers = self.decommission_cancelers.write().await;
             take_decommission_canceler(cancelers.as_mut_slice(), idx)
-        } {
-            canceler.cancel();
+        };
+        let _ = cancel_decommission_canceler(canceler);
+
+        if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
+            notification_sys.reload_pool_meta().await?;
         }
 
         Ok(())
@@ -1801,7 +1811,7 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DecommissionTerminalState, PoolDecommissionInfo, PoolStatus, bind_decommission_cancelers,
+        DecommissionTerminalState, PoolDecommissionInfo, PoolStatus, bind_decommission_cancelers, cancel_decommission_canceler,
         classify_decommission_terminal_state, decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, has_active_decommission_canceler, is_decommission_active,
@@ -2089,5 +2099,19 @@ mod pools_tests {
     fn test_has_active_decommission_canceler_false_when_all_empty() {
         let cancelers = vec![None, None];
         assert!(!has_active_decommission_canceler(cancelers.as_slice()));
+    }
+
+    #[test]
+    fn test_cancel_decommission_canceler_cancels_when_present() {
+        let token = CancellationToken::new();
+        let canceled = cancel_decommission_canceler(Some(token.clone()));
+
+        assert!(canceled);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_decommission_canceler_returns_false_when_missing() {
+        assert!(!cancel_decommission_canceler(None));
     }
 }
