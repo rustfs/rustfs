@@ -708,9 +708,8 @@ impl ECStore {
             stop_rebalance_meta_snapshot(rebalance_meta.as_mut(), OffsetDateTime::now_utc())
         };
 
-        if let Some(meta_to_save) = meta_to_save
-            && let Some(pool) = self.pools.first().cloned()
-        {
+        if let Some(meta_to_save) = meta_to_save {
+            let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
             meta_to_save.save(pool).await?;
         }
 
@@ -1202,6 +1201,7 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
 fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
     meta.map(|meta| {
         stop_rebalance_state(meta, now);
+        meta.last_refreshed_at = Some(now);
         meta.clone()
     })
 }
@@ -2668,10 +2668,12 @@ mod rebalance_unit_tests {
         assert!(cancel_clone.is_cancelled());
         assert!(meta.cancel.is_none());
         assert_eq!(meta.stopped_at, Some(now));
+        assert_eq!(meta.last_refreshed_at, Some(now));
         assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
 
         assert!(snapshot.cancel.is_none());
         assert_eq!(snapshot.stopped_at, Some(now));
+        assert_eq!(snapshot.last_refreshed_at, Some(now));
         assert_eq!(snapshot.pool_stats[0].info.status, RebalStatus::Stopped);
         assert_eq!(snapshot.pool_stats[0].info.end_time, Some(now));
     }
