@@ -247,15 +247,21 @@ impl FileMeta {
             fi.version_id = Some(Uuid::nil());
         }
 
+        let version_key = data_key_for_version(fi.version_id);
+        let mut next_data = self.data.clone();
+
         if let Some(ref data) = fi.data {
-            self.data.replace(&data_key_for_version(fi.version_id), data.to_vec())?;
+            next_data.replace(&version_key, data.to_vec())?;
         } else {
-            let _ = self.data.remove_key(&data_key_for_version(fi.version_id))?;
+            let _ = next_data.remove_key(&version_key)?;
         }
 
         let version = FileMetaVersion::from(fi);
 
-        self.add_version_filemata(version)
+        self.add_version_filemata(version)?;
+        self.data = next_data;
+
+        Ok(())
     }
 
     pub fn add_version_filemata(&mut self, version: FileMetaVersion) -> Result<()> {
@@ -1519,6 +1525,27 @@ mod test {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_add_version_keeps_inline_data_when_version_insert_fails() {
+        let mut fm = FileMeta::new();
+
+        let mut inline_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        inline_fi.mod_time = Some(OffsetDateTime::now_utc());
+        inline_fi.data = Some(Bytes::from_static(b"inline"));
+        inline_fi.set_inline_data();
+        fm.add_version(inline_fi).unwrap();
+
+        let before = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        assert_eq!(before, Some(Bytes::from_static(b"inline").to_vec()));
+
+        let invalid_disk_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        let err = fm.add_version(invalid_disk_fi).unwrap_err();
+        assert!(err.to_string().contains("file meta version invalid"));
+
+        let after = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        assert_eq!(after, Some(Bytes::from_static(b"inline").to_vec()));
     }
 
     #[test]
