@@ -1026,6 +1026,11 @@ impl ECStore {
 
         wk.wait().await;
 
+        if rx.is_cancelled() {
+            warn!("decommission_pool: canceled after wait {} {}", idx, &bi.name);
+            return Err(StorageError::OperationCanceled);
+        }
+
         warn!("decommission_pool: decommission_pool done {} {}", idx, &bi.name);
 
         Ok(())
@@ -1162,6 +1167,11 @@ impl ECStore {
                 return Err(err);
             } else {
                 warn!("decommission: decommission_pool done {}", &bucket.name);
+            }
+
+            if rx.is_cancelled() {
+                warn!("decommission: cancellation observed after decommission_pool {}", &bucket.name);
+                return Err(StorageError::OperationCanceled);
             }
 
             {
