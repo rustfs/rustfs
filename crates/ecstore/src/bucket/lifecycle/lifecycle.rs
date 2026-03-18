@@ -1305,6 +1305,7 @@ mod tests {
     async fn expired_object_delete_marker_without_date_or_days_deletes_immediately() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -1318,6 +1319,7 @@ mod tests {
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
+                del_marker_expiration: None,
             }],
         };
 
