@@ -57,9 +57,12 @@ pub const POOL_META_FORMAT: u16 = 1;
 pub const POOL_META_VERSION: u16 = 1;
 
 fn dedup_indices(indices: &[usize]) -> Vec<usize> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::with_capacity(indices.len());
     let mut output = Vec::with_capacity(indices.len());
     for idx in indices {
-        if !output.contains(idx) {
+        if seen.insert(*idx) {
             output.push(*idx);
         }
     }
