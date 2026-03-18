@@ -501,7 +501,7 @@ impl ECStore {
 
         let pool_stats = {
             let rebalance_meta = self.rebalance_meta.read().await;
-            rebalance_meta.as_ref().map(|v| v.pool_stats.clone()).unwrap_or_default()
+            clone_rebalance_pool_stats(rebalance_meta.as_ref())?
         };
 
         info!("update_rebalance_stats: pool_stats: {:?}", &pool_stats);
@@ -951,6 +951,13 @@ fn next_rebal_bucket_from_stat(pool_stat: &RebalanceStats) -> Option<String> {
     }
 
     first_rebalance_bucket(pool_stat)
+}
+
+fn clone_rebalance_pool_stats(meta: Option<&RebalanceMeta>) -> Result<Vec<RebalanceStats>> {
+    let Some(meta) = meta else {
+        return Err(Error::other("rebalance metadata not initialized"));
+    };
+    Ok(meta.pool_stats.clone())
 }
 
 fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize) -> Result<Option<String>> {
@@ -1661,7 +1668,7 @@ mod rebalance_unit_tests {
     use super::{
         GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
-        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
+        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_next_rebalance_bucket,
         resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
@@ -2556,6 +2563,23 @@ mod rebalance_unit_tests {
         };
 
         assert_eq!(next_rebal_bucket_from_stat(&pool_stat), Some("bucket-a".to_string()));
+    }
+
+    #[test]
+    fn test_clone_rebalance_pool_stats_rejects_missing_meta() {
+        let err = clone_rebalance_pool_stats(None).expect_err("missing rebalance meta should fail");
+        assert!(err.to_string().contains("rebalance metadata not initialized"));
+    }
+
+    #[test]
+    fn test_clone_rebalance_pool_stats_clones_entries() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats::default()],
+            ..Default::default()
+        };
+
+        let stats = clone_rebalance_pool_stats(Some(&meta)).expect("metadata should clone pool stats");
+        assert_eq!(stats.len(), 1);
     }
 
     #[test]
