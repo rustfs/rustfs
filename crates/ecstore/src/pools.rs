@@ -90,6 +90,10 @@ fn take_decommission_canceler(cancelers: &mut [Option<CancellationToken>], idx: 
     cancelers.get_mut(idx).and_then(Option::take)
 }
 
+fn has_active_decommission_canceler(cancelers: &[Option<CancellationToken>]) -> bool {
+    cancelers.iter().any(Option::is_some)
+}
+
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
         return Err(Error::RebalanceAlreadyRunning);
@@ -734,6 +738,13 @@ impl ECStore {
         Ok(())
     }
     pub async fn is_decommission_running(&self) -> bool {
+        {
+            let cancelers = self.decommission_cancelers.read().await;
+            if has_active_decommission_canceler(cancelers.as_slice()) {
+                return true;
+            }
+        }
+
         let pool_meta = self.pool_meta.read().await;
         for pool in pool_meta.pools.iter() {
             if let Some(ref info) = pool.decommission
@@ -1715,7 +1726,8 @@ mod pools_tests {
     use super::{
         DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
         decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        ensure_decommission_not_rebalancing, has_active_decommission_canceler, should_preserve_decommission_canceled_state,
+        take_decommission_canceler,
     };
     use crate::error::Error;
     use tokio_util::sync::CancellationToken;
@@ -1843,5 +1855,17 @@ mod pools_tests {
     fn test_take_decommission_canceler_returns_none_for_missing_slot() {
         let mut cancelers: Vec<Option<CancellationToken>> = Vec::new();
         assert!(take_decommission_canceler(cancelers.as_mut_slice(), 0).is_none());
+    }
+
+    #[test]
+    fn test_has_active_decommission_canceler_true_when_any_slot_present() {
+        let cancelers = vec![None, Some(CancellationToken::new())];
+        assert!(has_active_decommission_canceler(cancelers.as_slice()));
+    }
+
+    #[test]
+    fn test_has_active_decommission_canceler_false_when_all_empty() {
+        let cancelers = vec![None, None];
+        assert!(!has_active_decommission_canceler(cancelers.as_slice()));
     }
 }
