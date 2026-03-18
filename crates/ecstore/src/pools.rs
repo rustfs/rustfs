@@ -56,6 +56,25 @@ pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
 pub const POOL_META_VERSION: u16 = 1;
 
+fn dedup_indices(indices: &[usize]) -> Vec<usize> {
+    let mut output = Vec::with_capacity(indices.len());
+    for idx in indices {
+        if !output.contains(idx) {
+            output.push(*idx);
+        }
+    }
+
+    output
+}
+
+fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
+    if rebalance_running {
+        return Err(Error::other("RebalanceAlreadyRunning"));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     #[serde(rename = "id")]
@@ -659,6 +678,8 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
+        let indices = dedup_indices(&indices);
+
         warn!("decommission: {:?}", indices);
         if indices.is_empty() {
             return Err(Error::other("InvalidArgument"));
@@ -667,6 +688,8 @@ impl ECStore {
         if self.single_pool() {
             return Err(Error::other("InvalidArgument"));
         }
+
+        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
         self.start_decommission(indices.clone()).await?;
 
@@ -1119,6 +1142,8 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
+        let indices = dedup_indices(&indices);
+
         if indices.is_empty() {
             return Err(Error::other("errInvalidArgument"));
         }
@@ -1126,6 +1151,8 @@ impl ECStore {
         if self.single_pool() {
             return Err(Error::other("errInvalidArgument"));
         }
+
+        ensure_decommission_not_rebalancing(self.is_rebalance_started().await)?;
 
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
@@ -1562,4 +1589,32 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
     }
 
     total
+}
+
+#[cfg(test)]
+mod pools_tests {
+    use super::{dedup_indices, ensure_decommission_not_rebalancing};
+    use crate::error::Error;
+
+    #[test]
+    fn test_dedup_indices_removes_duplicates_preserving_order() {
+        assert_eq!(dedup_indices(&[0, 2, 1, 2, 3, 0]), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn test_dedup_indices_handles_empty_input() {
+        let empty: Vec<usize> = Vec::new();
+        assert!(dedup_indices(&empty).is_empty());
+    }
+
+    #[test]
+    fn test_ensure_decommission_not_rebalancing_rejects_running_rebalance() {
+        let err = ensure_decommission_not_rebalancing(true).expect_err("rebalance running should be rejected");
+        assert_eq!(err.to_string(), Error::other("RebalanceAlreadyRunning").to_string());
+    }
+
+    #[test]
+    fn test_ensure_decommission_not_rebalancing_allows_idle() {
+        assert!(ensure_decommission_not_rebalancing(false).is_ok());
+    }
 }
