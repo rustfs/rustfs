@@ -129,6 +129,18 @@ fn ensure_valid_decommission_pool_index(pool_count: usize, idx: usize) -> Result
     Ok(())
 }
 
+fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
+    if let Some(pool) = pool {
+        let active = pool
+            .decommission
+            .as_ref()
+            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
+        (true, active)
+    } else {
+        (false, false)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecommissionTerminalState {
     Completed,
@@ -1325,6 +1337,14 @@ impl ECStore {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
         }
 
+        {
+            let pool_meta = self.pool_meta.read().await;
+            for idx in indices.iter().copied() {
+                let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
+                ensure_decommission_start_allowed(pool_present, decommission_active)?;
+            }
+        }
+
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
         for bk in decom_buckets.iter() {
@@ -1355,16 +1375,7 @@ impl ECStore {
 
         let mut pool_meta = self.pool_meta.write().await;
         for idx in indices.iter().copied() {
-            let (pool_present, decommission_active) = if let Some(pool) = pool_meta.pools.get(idx) {
-                let active = pool
-                    .decommission
-                    .as_ref()
-                    .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
-                (true, active)
-            } else {
-                (false, false)
-            };
-
+            let (pool_present, decommission_active) = decommission_start_guard_state(pool_meta.pools.get(idx));
             ensure_decommission_start_allowed(pool_present, decommission_active)?;
         }
 
@@ -1782,13 +1793,14 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DecommissionTerminalState, bind_decommission_cancelers, classify_decommission_terminal_state,
-        decommission_cancel_signal_result, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
-        should_preserve_decommission_canceled_state, take_decommission_canceler,
+        DecommissionTerminalState, PoolDecommissionInfo, PoolStatus, bind_decommission_cancelers,
+        classify_decommission_terminal_state, decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices,
+        ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_valid_decommission_pool_index, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_terminal, should_preserve_decommission_canceled_state, take_decommission_canceler,
     };
     use crate::error::Error;
+    use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -1836,6 +1848,57 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_start_allowed_allows_terminal_state() {
         assert!(ensure_decommission_start_allowed(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_missing_pool() {
+        assert_eq!(decommission_start_guard_state(None), (false, false));
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_idle_pool_without_decommission_info() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: None,
+        };
+
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false));
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_active_pool_when_not_terminal() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                complete: false,
+                failed: false,
+                canceled: false,
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, true));
+    }
+
+    #[test]
+    fn test_decommission_start_guard_state_reports_terminal_pool_as_not_active() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                complete: false,
+                failed: false,
+                canceled: true,
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false));
     }
 
     #[test]
