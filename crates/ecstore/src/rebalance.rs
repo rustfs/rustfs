@@ -1163,16 +1163,19 @@ fn apply_rebalance_save_option(meta: &mut RebalanceMeta, pool_idx: usize, opt: R
     meta.last_refreshed_at = Some(now);
 }
 
-fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
-    meta.stopped_at = Some(now);
-
+fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
             pool_stat.info.status = RebalStatus::Stopped;
-            pool_stat.info.end_time.get_or_insert(now);
+            pool_stat.info.end_time.get_or_insert(stop_time);
             pool_stat.info.last_error = None;
         }
     }
+}
+
+fn apply_stopped_at(meta: &mut RebalanceMeta, now: OffsetDateTime) {
+    meta.stopped_at = Some(now);
+    mark_started_rebalance_pools_stopped(meta, now);
 }
 
 fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
@@ -1180,8 +1183,13 @@ fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
         cancel_tx.cancel();
     }
 
+    let stop_time = meta.stopped_at.unwrap_or(now);
     if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
-        apply_stopped_at(meta, now);
+        meta.stopped_at = Some(stop_time);
+    }
+
+    if meta.stopped_at.is_some() {
+        mark_started_rebalance_pools_stopped(meta, stop_time);
     }
 }
 
@@ -2585,6 +2593,37 @@ mod rebalance_unit_tests {
         assert!(meta.cancel.is_none());
         assert_eq!(meta.stopped_at, None);
         assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Completed);
+    }
+
+    #[test]
+    fn test_stop_rebalance_state_normalizes_started_pool_when_stopped_at_already_set() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(30_000).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(40_000).unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let mut meta = RebalanceMeta {
+            cancel: Some(cancel),
+            stopped_at: Some(stopped_at),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    last_error: Some("stale".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        stop_rebalance_state(&mut meta, now);
+
+        assert!(cancel_clone.is_cancelled());
+        assert!(meta.cancel.is_none());
+        assert_eq!(meta.stopped_at, Some(stopped_at));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(meta.pool_stats[0].info.end_time, Some(stopped_at));
+        assert_eq!(meta.pool_stats[0].info.last_error, None);
     }
 
     #[test]
