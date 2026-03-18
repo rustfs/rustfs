@@ -389,13 +389,22 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_rejects_decommission_running() {
         let err = validate_start_decommission_guards(true, false).expect_err("decommission running should be rejected");
-        assert!(err.to_string().contains("DecommissionAlreadyRunning"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
     }
 
     #[test]
     fn test_validate_start_decommission_guards_rejects_rebalance_running() {
         let err = validate_start_decommission_guards(false, true).expect_err("rebalance running should be rejected");
-        assert!(err.to_string().contains("RebalanceAlreadyRunning"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("RebalanceAlreadyRunning"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_prefers_decommission_over_rebalance() {
+        let err = validate_start_decommission_guards(true, true).expect_err("decommission should be checked before rebalance");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
     }
 
     #[test]
