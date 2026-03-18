@@ -14,7 +14,7 @@
 
 use crate::server::RPC_PREFIX;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
@@ -31,8 +31,8 @@ use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::AsyncWriteExt;
-use tokio_util::io::ReaderStream;
+use tokio::io;
+use tokio_util::io::{ReaderStream, StreamReader};
 use tower::Service;
 use tracing::warn;
 
@@ -223,18 +223,21 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    let mut body = req.into_body().into_data_stream();
-    while let Some(item) = body.next().await {
-        let bytes = match item {
-            Ok(bytes) => bytes,
-            Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("body stream err {e}")),
-        };
-        if let Err(e) = file.write_all(&bytes).await {
-            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));
-        }
+    if let Err(e) = copy_body_to_writer(req.into_body().into_data_stream(), &mut file).await {
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));
     }
 
     empty_ok()
+}
+
+async fn copy_body_to_writer<S, E, W>(body: S, writer: &mut W) -> io::Result<u64>
+where
+    S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+    E: Into<BoxError>,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut reader = StreamReader::new(body.map_err(io::Error::other));
+    tokio::io::copy(&mut reader, writer).await
 }
 
 fn parse_query<T>(req: &Request<Incoming>) -> Result<T, RpcErrorResponse>
@@ -266,6 +269,8 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio_stream::iter;
 
     #[test]
     fn internode_rpc_path_matches_rpc_prefix() {
@@ -287,5 +292,23 @@ mod tests {
         let headers = HeaderMap::new();
         let response = verify_internode_rpc_signature(&uri, &Method::GET, &headers).expect_err("response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn copy_body_to_writer_streams_all_chunks() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        let body = iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ]);
+
+        let copied = copy_body_to_writer(body, &mut writer).await.expect("copy succeeds");
+        drop(writer);
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("read succeeds");
+
+        assert_eq!(copied, 11);
+        assert_eq!(out, b"hello world");
     }
 }
