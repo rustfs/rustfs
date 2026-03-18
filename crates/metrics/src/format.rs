@@ -31,7 +31,7 @@ fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: 
     let mut cache = cache.lock().unwrap();
 
     if let Some(existing) = cache.get(value) {
-        *existing
+        existing
     } else {
         let value = Box::leak(value.to_string().into_boxed_str());
         cache.insert(value.to_string(), value);
@@ -39,11 +39,8 @@ fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: 
     }
 }
 
-fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &Cow<'static, str>) -> &'static str {
-    match value {
-        Cow::Borrowed(value) => value,
-        Cow::Owned(value) => intern_string(cache, value),
-    }
+fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
+    intern_string(cache, value)
 }
 
 /// Report metrics using the `metrics` crate.
