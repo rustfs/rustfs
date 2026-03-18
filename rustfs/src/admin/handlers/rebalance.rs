@@ -731,6 +731,22 @@ mod rebalance_handler_tests {
     }
 
     #[test]
+    fn test_build_rebalance_pool_statuses_empty_inputs() {
+        let statuses = build_rebalance_pool_statuses(
+            OffsetDateTime::from_unix_timestamp(2_000).unwrap(),
+            None,
+            0.3,
+            &[],
+            &[DiskStat {
+                total_space: 1_000,
+                available_space: 500,
+            }],
+        );
+
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
     fn test_validate_start_rebalance_guards_rejects_single_pool() {
         let err = validate_start_rebalance_guards(true, false, false).expect_err("single pool should be rejected");
         assert!(err.to_string().contains("NotImplemented"));
