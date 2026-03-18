@@ -1611,7 +1611,7 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_rejects_running_rebalance() {
         let err = ensure_decommission_not_rebalancing(true).expect_err("rebalance running should be rejected");
-        assert_eq!(err.to_string(), Error::RebalanceAlreadyRunning.to_string());
+        assert!(matches!(err, Error::RebalanceAlreadyRunning));
     }
 
     #[test]
