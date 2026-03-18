@@ -35,6 +35,8 @@ use crate::{
 use hyper::Method;
 use rustfs_ecstore::new_object_layer_fn;
 
+use std::collections::HashSet;
+
 fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerPools> {
     resolve_endpoints_handle()
 }
@@ -57,6 +59,17 @@ fn validate_start_decommission_guards(
 fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
     let idx = pool.parse::<usize>().ok()?;
     (idx < endpoint_count).then_some(idx)
+}
+
+fn dedup_indices(indices: &[usize]) -> Vec<usize> {
+    let mut seen = HashSet::with_capacity(indices.len());
+    let mut output = Vec::with_capacity(indices.len());
+    for idx in indices {
+        if seen.insert(*idx) {
+            output.push(*idx);
+        }
+    }
+    output
 }
 
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -247,7 +260,7 @@ impl Operation for StartDecommission {
         let is_byid = query.by_id.as_str() == "true";
 
         let pools: Vec<&str> = query.pool.split(",").collect();
-        let mut pools_indices = Vec::with_capacity(pools.len());
+        let mut parsed_indices = Vec::with_capacity(pools.len());
 
         let ctx = CancellationToken::new();
 
@@ -268,10 +281,9 @@ impl Operation for StartDecommission {
                 return Err(s3_error!(InvalidArgument));
             }
 
-            if !pools_indices.contains(&idx) {
-                pools_indices.push(idx);
-            }
+            parsed_indices.push(idx);
         }
+        let pools_indices = dedup_indices(&parsed_indices);
 
         if !pools_indices.is_empty() {
             store.decommission(ctx.clone(), pools_indices).await.map_err(ApiError::from)?;
@@ -352,7 +364,7 @@ impl Operation for CancelDecommission {
 
 #[cfg(test)]
 mod pools_handler_tests {
-    use super::{parse_pool_idx_by_id, validate_start_decommission_guards};
+    use super::{dedup_indices, parse_pool_idx_by_id, validate_start_decommission_guards};
 
     #[test]
     fn test_parse_pool_idx_by_id_rejects_non_numeric() {
@@ -389,5 +401,16 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_allows_when_idle() {
         assert!(validate_start_decommission_guards(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_dedup_indices_removes_duplicates_preserving_order() {
+        assert_eq!(dedup_indices(&[0, 2, 1, 2, 3, 0]), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn test_dedup_indices_handles_empty_input() {
+        let empty: Vec<usize> = Vec::new();
+        assert!(dedup_indices(&empty).is_empty());
     }
 }
