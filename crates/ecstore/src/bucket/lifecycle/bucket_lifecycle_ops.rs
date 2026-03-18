@@ -45,8 +45,7 @@ use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
 use rustfs_s3_common::EventName;
-use rustfs_utils::path::encode_dir_object;
-use rustfs_utils::string::strings_has_prefix_fold;
+use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::Body;
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
@@ -97,8 +96,14 @@ impl LifecycleSys {
     }
 
     pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
-        let lc = get_lifecycle_config(bucket).await.expect("get_lifecycle_config err!").0;
-        Some(lc)
+        match get_lifecycle_config(bucket).await {
+            Ok((lc, _)) => Some(lc),
+            Err(err) if err == Error::ConfigNotFound => None,
+            Err(err) => {
+                warn!(bucket, error = ?err, "failed to load lifecycle config");
+                None
+            }
+        }
     }
 
     pub fn trace(_oi: &ObjectInfo) -> TraceFn {
@@ -471,10 +476,7 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let max_workers = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+        let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
         let mut n = max_workers;
         let tw = 8; //globalILMConfig.getTransitionWorkers();
         if tw > 0 {
@@ -569,17 +571,11 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            let max_workers = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+            let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
             n = max_workers;
         }
         // Allow environment override of maximum workers
-        let absolute_max = env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(32);
+        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", 32);
         n = std::cmp::min(n, absolute_max);
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
@@ -603,10 +599,7 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = env::var("RUSTFS_MAX_EXPIRY_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
+    let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
     if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
@@ -615,10 +608,7 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     if workers == 0 {
-        workers = env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
+        workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;

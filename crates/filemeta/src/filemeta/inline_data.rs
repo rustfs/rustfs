@@ -40,10 +40,14 @@ impl FileMeta {
 
     /// Count shared data directories
     pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
-        let version_id = version_id.unwrap_or_default();
+        let vid = version_id.unwrap_or_default();
 
         if self.data.entries().unwrap_or_default() > 0
-            && self.data.find(version_id.to_string().as_str()).unwrap_or_default().is_some()
+            && self
+                .data
+                .find(super::data_key_for_version(version_id).as_str())
+                .unwrap_or_default()
+                .is_some()
         {
             return 0;
         }
@@ -51,9 +55,7 @@ impl FileMeta {
         self.versions
             .iter()
             .filter(|v| {
-                v.header.version_type == VersionType::Object
-                    && v.header.version_id != Some(version_id)
-                    && v.header.uses_data_dir()
+                v.header.version_type == VersionType::Object && v.header.version_id != Some(vid) && v.header.uses_data_dir()
             })
             .filter_map(|v| FileMetaVersion::decode_data_dir_from_meta(&v.meta).ok())
             .filter(|&dir| dir.is_some() && dir == data_dir)

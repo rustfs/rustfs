@@ -22,8 +22,24 @@ impl FileMeta {
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
         let mut xl = FileMeta::default();
         xl.unmarshal_msg(buf)?;
-
         Ok(xl)
+    }
+
+    /// Read (major, minor, header_ver, meta_ver) from xl.meta without full parse.
+    /// Returns Err if format is not feat (e.g. legacy  uses rmp_serde in meta block).
+    pub fn read_format_versions(buf: &[u8]) -> Result<(u16, u16, u8, u8)> {
+        let (buf, major, minor) = Self::check_xl2_v1(buf)?;
+        if buf.len() < 5 {
+            return Err(Error::other("insufficient data for metadata length prefix"));
+        }
+        let (mut size_buf, buf) = buf.split_at(5);
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+        if buf.len() < bin_len as usize {
+            return Err(Error::other("insufficient data for metadata"));
+        }
+        let (meta, _) = buf.split_at(bin_len as usize);
+        let (_, header_ver, meta_ver, _) = Self::decode_xl_headers(meta)?;
+        Ok((major, minor, header_ver, meta_ver))
     }
 
     pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
@@ -294,11 +310,9 @@ impl FileMeta {
 
         let offset = wr.len();
 
-        // xl header
-        rmp::encode::write_uint8(&mut wr, XL_HEADER_VERSION)?;
-        rmp::encode::write_uint8(&mut wr, XL_META_VERSION)?;
+        rmp::encode::write_uint(&mut wr, XL_HEADER_VERSION as u64)?;
+        rmp::encode::write_uint(&mut wr, XL_META_VERSION as u64)?;
 
-        // versions
         rmp::encode::write_sint(&mut wr, self.versions.len() as i64)?;
 
         for ver in self.versions.iter() {

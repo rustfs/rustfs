@@ -80,9 +80,12 @@ use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLoc
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
 use rustfs_s3_common::EventName;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
+use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
-use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER};
+use rustfs_utils::http::{
+    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
+};
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
@@ -134,6 +137,30 @@ mod write;
 /// Defaults to 30 seconds if not set or invalid
 pub fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+}
+
+fn build_tiered_decommission_file_info(
+    bucket: &str,
+    object: &str,
+    fi: &FileInfo,
+    disk_count: usize,
+    default_parity_count: usize,
+    storage_class: Option<&str>,
+) -> (FileInfo, usize) {
+    let parity_drives = GLOBAL_STORAGE_CLASS
+        .get()
+        .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
+        .unwrap_or(default_parity_count);
+    let data_drives = disk_count - parity_drives;
+    let mut write_quorum = data_drives;
+    if data_drives == parity_drives {
+        write_quorum += 1;
+    }
+
+    let mut updated = fi.clone();
+    updated.erasure = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives).erasure;
+
+    (updated, write_quorum)
 }
 
 #[derive(Clone, Debug)]
@@ -620,7 +647,7 @@ impl ObjectIO for SetDisks {
                     &tmp_object,
                     erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    HashAlgorithm::HighwayHash256S,
                 )
                 .await
                 {
@@ -678,8 +705,8 @@ impl ObjectIO for SetDisks {
             )));
         }
 
-        if user_defined.contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression")) {
-            user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), w_size.to_string());
+        if contains_key_str(&user_defined, SUFFIX_COMPRESSION) {
+            insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
         }
 
         let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
@@ -765,7 +792,7 @@ impl ObjectIO for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 
@@ -1336,6 +1363,12 @@ impl ObjectOperations for SetDisks {
         let mut delete_marker = opts.versioned;
 
         if opts.version_id.is_some() {
+            // Decommission/rebalance may recreate a delete marker on a new pool before that
+            // exact version exists there, so we must still treat it as a mark-delete write.
+            if opts.data_movement && opts.delete_marker && !version_found {
+                mark_delete = true;
+            }
+
             if version_found && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
                 mark_delete = false;
             }
@@ -1889,6 +1922,68 @@ impl ObjectOperations for SetDisks {
     }
 }
 
+impl SetDisks {
+    #[tracing::instrument(skip(self, fi, opts))]
+    pub(crate) async fn decommission_tiered_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        let _lock_guard = if !opts.no_lock {
+            Some(
+                self.new_ns_lock(bucket, object)
+                    .await?
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "Failed to acquire write lock: {}",
+                            self.format_lock_error_from_error(bucket, object, "write", &e)
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let disks = self.disks.read().await.clone();
+        let storage_class = opts.user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str);
+        let (fi, write_quorum) =
+            build_tiered_decommission_file_info(bucket, object, fi, disks.len(), self.default_parity_count, storage_class);
+        let parts_metadata = vec![fi.clone(); disks.len()];
+        let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+
+        let mut errs = Vec::with_capacity(shuffle_disks.len());
+        let mut futures = Vec::with_capacity(shuffle_disks.len());
+        for (index, disk) in shuffle_disks.iter().enumerate() {
+            let mut file_info = parts_metadata[index].clone();
+            file_info.erasure.index = index + 1;
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.write_metadata("", bucket, object, file_info).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        for result in join_all(futures).await {
+            match result {
+                Ok(_) => errs.push(None),
+                Err(err) => errs.push(Some(err)),
+            }
+        }
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(to_object_err(err.into(), vec![bucket, object]));
+        }
+
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl ListOperations for SetDisks {
     #[tracing::instrument(skip(self))]
@@ -2007,7 +2102,7 @@ impl MultipartOperations for SetDisks {
                     &tmp_part_path,
                     erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256,
+                    HashAlgorithm::HighwayHash256S,
                 )
                 .await
                 {
@@ -2454,11 +2549,11 @@ impl MultipartOperations for SetDisks {
 
         fi.data_dir = Some(Uuid::new_v4());
 
-        if let Some(cssum) = user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM)
+        if let Some(cssum) = get_header_map(&user_defined, SUFFIX_REPLICATION_SSEC_CRC)
             && !cssum.is_empty()
         {
-            fi.checksum = base64_simd::STANDARD.decode_to_vec(cssum).ok().map(Bytes::from);
-            user_defined.remove(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM);
+            fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(Bytes::from);
+            remove_header_map(&mut user_defined, SUFFIX_REPLICATION_SSEC_CRC);
         }
 
         let parts_metadata = vec![fi.clone(); disks.len()];
@@ -2809,8 +2904,8 @@ impl MultipartOperations for SetDisks {
             }
         }
 
-        if let Some(rc_crc) = opts.user_defined.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
-            if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(rc_crc) {
+        if let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC) {
+            if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(&rc_crc) {
                 fi.checksum = Some(Bytes::from(rc_crc_bytes));
             } else {
                 error!("complete_multipart_upload decode rc_crc failed rc_crc={}", rc_crc);
@@ -2849,25 +2944,19 @@ impl MultipartOperations for SetDisks {
         fi.metadata.insert("etag".to_owned(), etag);
 
         if opts.replication_request {
-            if let Some(actual_size) = opts
-                .user_defined
-                .get(format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size").as_str())
-            {
+            if let Some(actual_size) = get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP) {
+                insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
                 fi.metadata
-                    .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), actual_size.clone());
-                fi.metadata
-                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
+                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
             }
         } else {
-            fi.metadata
-                .insert(format!("{RESERVED_METADATA_PREFIX}actual-size"), object_actual_size.to_string());
+            insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, object_actual_size.to_string());
             fi.metadata
                 .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
         }
 
         if fi.is_compressed() {
-            fi.metadata
-                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), object_size.to_string());
+            insert_str(&mut fi.metadata, SUFFIX_COMPRESSION_SIZE, object_size.to_string());
         }
 
         if opts.data_movement {
@@ -2927,7 +3016,7 @@ impl MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 
@@ -3356,12 +3445,18 @@ async fn disks_with_all_parts(
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
+                let checksum_algo =
+                    if meta.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                    } else {
+                        checksum_info.algorithm
+                    };
                 let data_len = data.len();
                 let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size) as usize,
-                    checksum_info.algorithm,
+                    checksum_algo,
                     checksum_info.hash,
                     meta.erasure.shard_size(),
                 )
@@ -4159,6 +4254,33 @@ mod tests {
         assert!(e_tag_matches("abc", "abc"));
         assert!(e_tag_matches("\"abc\"", "abc"));
         assert!(e_tag_matches("\"abc\"", "*"));
+    }
+
+    #[test]
+    fn test_build_tiered_decommission_file_info_preserves_transition_metadata() {
+        let version_id = Uuid::new_v4();
+        let transition_version_id = Uuid::new_v4();
+        let original = FileInfo {
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_tier: "WARM-TIER".to_string(),
+            transition_version_id: Some(transition_version_id),
+            erasure: FileInfo::new("old-bucket/old-object", 8, 8).erasure,
+            ..Default::default()
+        };
+
+        let (updated, write_quorum) = build_tiered_decommission_file_info("bucket", "object", &original, 16, 4, None);
+
+        assert_eq!(updated.version_id, original.version_id);
+        assert_eq!(updated.transition_status, original.transition_status);
+        assert_eq!(updated.transitioned_objname, original.transitioned_objname);
+        assert_eq!(updated.transition_tier, original.transition_tier);
+        assert_eq!(updated.transition_version_id, original.transition_version_id);
+        assert_eq!(updated.erasure.data_blocks, 12);
+        assert_eq!(updated.erasure.parity_blocks, 4);
+        assert_eq!(write_quorum, 12);
+        assert_ne!(updated.erasure.distribution, original.erasure.distribution);
     }
 
     #[test]

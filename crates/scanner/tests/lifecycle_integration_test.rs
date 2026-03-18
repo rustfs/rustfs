@@ -267,12 +267,12 @@ async fn create_test_tier(server: u32) {
                 ..Default::default()
             })
         } else if server == 2 {
-            let test_minio_server = std::env::var("TEST_MINIO_SERVER").unwrap_or_else(|_| "localhost:9000".to_string());
+            let test_compatible_server = std::env::var("TEST_MINIO_SERVER").unwrap_or_else(|_| "localhost:9000".to_string());
             Some(TierMinIO {
                 access_key: "minioadmin".to_string(),
                 secret_key: "minioadmin".to_string(),
                 bucket: "mblock2".to_string(),
-                endpoint: format!("http://{}", test_minio_server),
+                endpoint: format!("http://{}", test_compatible_server),
                 prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
                 region: "".to_string(),
                 ..Default::default()

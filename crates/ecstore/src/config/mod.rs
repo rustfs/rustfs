@@ -75,10 +75,15 @@ pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
     GLOBAL_CONFIG_SYS.init(api).await
 }
 
+pub async fn try_migrate_server_config(api: Arc<ECStore>) {
+    com::try_migrate_server_config(api).await
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KV {
     pub key: String,
     pub value: String,
+    #[serde(default, alias = "hiddenIfEmpty")]
     pub hidden_if_empty: bool,
 }
 

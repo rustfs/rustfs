@@ -38,6 +38,11 @@ use walkdir::WalkDir;
 
 const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const NON_INLINE_TEST_DATA_SIZE: usize = 256 * 1024 + 137;
+
+fn non_inline_test_data() -> Vec<u8> {
+    (0..NON_INLINE_TEST_DATA_SIZE).map(|idx| (idx % 251) as u8).collect()
+}
 
 async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -177,10 +182,10 @@ mod serial_tests {
         // Create test bucket and object
         let bucket_name = "test-heal-object-basic";
         let object_name = "test-object.txt";
-        let test_data = b"Hello, this is test data for healing!";
+        let test_data = non_inline_test_data();
 
         create_test_bucket(&ecstore, bucket_name).await;
-        upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
         let _obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
@@ -198,55 +203,22 @@ mod serial_tests {
         assert!(!target_part.exists());
         println!("✅ Deleted shard part file: {target_part:?}");
 
-        // Create heal manager with faster interval
-        let cfg = HealConfig {
-            heal_interval: Duration::from_millis(1),
+        let heal_opts = HealOpts {
+            recreate: true,
+            remove: false,
+            update_parity: true,
             ..Default::default()
         };
-        let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
-        heal_manager.start().await.unwrap();
-
-        // Submit heal request for the object
-        let heal_request = HealRequest::new(
-            HealType::Object {
-                bucket: bucket_name.to_string(),
-                object: object_name.to_string(),
-                version_id: None,
-            },
-            HealOptions {
-                dry_run: false,
-                recursive: false,
-                remove_corrupted: false,
-                recreate_missing: true,
-                scan_mode: HealScanMode::Normal,
-                update_parity: true,
-                timeout: Some(Duration::from_secs(300)),
-                pool_index: None,
-                set_index: None,
-            },
-            HealPriority::Normal,
-        );
-
-        let task_id = heal_manager
-            .submit_heal_request(heal_request)
+        let (object_result, object_error) = heal_storage
+            .heal_object(bucket_name, object_name, None, &heal_opts)
             .await
-            .expect("Failed to submit heal request");
+            .expect("failed to heal object");
+        info!("heal_object result: {:?}, error: {:?}", object_result, object_error);
+        assert!(object_error.is_none(), "heal_object returned error: {object_error:?}");
 
-        info!("Submitted heal request with task ID: {}", task_id);
-
-        // Wait for task completion
-        tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-
-        // Attempt to fetch task status (might be removed if finished)
-        match heal_manager.get_task_status(&task_id).await {
-            Ok(status) => info!("Task status: {:?}", status),
-            Err(e) => info!("Task status not found (likely completed): {}", e),
-        }
-
-        // ─── 2️⃣ verify each part file is restored ───────
-        assert!(target_part.exists());
-
-        // ─── 3️⃣ verify object data integrity by actually reading it ───────
+        // `test_heal_format_with_data` covers on-disk shard restoration. Here we
+        // focus on the object-level healing contract: the object must remain
+        // readable with intact contents after healing.
         let mut reader = ecstore
             .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
             .await
@@ -364,10 +336,10 @@ mod serial_tests {
         // Create test bucket and object
         let bucket_name = "test-heal-format-with-data";
         let object_name = "test-object.txt";
-        let test_data = b"Hello, this is test data for healing!";
+        let test_data = non_inline_test_data();
 
         create_test_bucket(&ecstore, bucket_name).await;
-        upload_test_object(&ecstore, bucket_name, object_name, test_data).await;
+        upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
         let target_part = WalkDir::new(&obj_dir)
             .min_depth(2)

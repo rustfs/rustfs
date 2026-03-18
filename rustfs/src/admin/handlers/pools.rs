@@ -220,7 +220,12 @@ impl Operation for StartDecommission {
             ));
         }
 
-        // TODO: check IsRebalanceStarted
+        if store.is_rebalance_started().await {
+            return Err(S3Error::with_message(
+                S3ErrorCode::OperationAborted,
+                "Decommission cannot be started, rebalance is already in progress".to_string(),
+            ));
+        }
 
         let query = {
             if let Some(query) = req.uri.query() {

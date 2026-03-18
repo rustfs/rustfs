@@ -14,7 +14,64 @@
 
 use super::*;
 
+fn select_data_movement_target_pool(
+    existing_pool_idx: Result<usize>,
+    src_pool_idx: usize,
+    delete_marker: bool,
+) -> Result<Option<usize>> {
+    match existing_pool_idx {
+        Ok(pool_idx) => {
+            if delete_marker && pool_idx == src_pool_idx {
+                Ok(None)
+            } else {
+                Ok(Some(pool_idx))
+            }
+        }
+        Err(err) => {
+            if is_err_read_quorum(&err) {
+                return Err(StorageError::ErasureWriteQuorum);
+            }
+            if delete_marker && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 impl ECStore {
+    #[instrument(skip(self, fi, opts))]
+    pub(crate) async fn decommission_tiered_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &rustfs_filemeta::FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_put_object_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return Err(Error::other(format!("error decommissioning {bucket}/{object}")));
+        }
+
+        let idx = self.get_pool_idx_no_lock(bucket, &object, fi.size).await?;
+        if opts.data_movement && idx == opts.src_pool_idx {
+            return Err(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.clone().unwrap_or_default(),
+            ));
+        }
+
+        self.pools[idx]
+            .get_disks_by_key(&object)
+            .decommission_tiered_object(bucket, &object, fi, opts)
+            .await
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub(super) async fn handle_get_object_reader(
         &self,
@@ -179,6 +236,30 @@ impl ECStore {
         let mut gopts = opts.clone();
         gopts.no_lock = true;
 
+        if opts.data_movement {
+            let existing_pool_idx = self
+                .get_pool_info_existing_with_opts(bucket, object, &gopts)
+                .await
+                .map(|(pinfo, _)| pinfo.index);
+            let target_pool_idx =
+                match select_data_movement_target_pool(existing_pool_idx, opts.src_pool_idx, opts.delete_marker)? {
+                    Some(pool_idx) => pool_idx,
+                    None => self.get_pool_idx_no_lock(bucket, object, 0).await?,
+                };
+
+            if opts.src_pool_idx == target_pool_idx {
+                return Err(StorageError::DataMovementOverwriteErr(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    opts.version_id.unwrap_or_default(),
+                ));
+            }
+
+            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+            obj.name = decode_dir_object(obj.name.as_str());
+            return Ok(obj);
+        }
+
         // Determine which pool contains it
         let (mut pinfo, errs) = self
             .get_pool_info_existing_with_opts(bucket, object, &gopts)
@@ -202,12 +283,6 @@ impl ECStore {
                 object.to_owned(),
                 opts.version_id.unwrap_or_default(),
             ));
-        }
-
-        if opts.data_movement {
-            let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts).await?;
-            obj.name = decode_dir_object(obj.name.as_str());
-            return Ok(obj);
         }
 
         if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
@@ -563,5 +638,29 @@ impl ECStore {
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_marker_data_movement_falls_back_when_only_source_pool_has_object() {
+        let target = select_data_movement_target_pool(Ok(1), 1, true).unwrap();
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn delete_marker_data_movement_falls_back_when_version_does_not_exist_yet() {
+        let err = StorageError::ObjectNotFound("bucket".to_string(), "object".to_string());
+        let target = select_data_movement_target_pool(Err(err), 1, true).unwrap();
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn non_delete_marker_data_movement_keeps_existing_pool() {
+        let target = select_data_movement_target_pool(Ok(0), 1, false).unwrap();
+        assert_eq!(target, Some(0));
     }
 }

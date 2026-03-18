@@ -492,7 +492,7 @@ impl ECStore {
     }
 
     pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
-        // warn!("list_path opt {:?}", &o);
+        // tracing::warn!("list_path opt {:?}", &o);
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {

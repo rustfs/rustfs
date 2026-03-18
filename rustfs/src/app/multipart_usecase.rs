@@ -17,17 +17,17 @@
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
 use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage::ecfs::RUSTFS_OWNER;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, parse_copy_source_range,
     put_opts,
 };
+use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
-use rustfs_config::RUSTFS_REGION;
+use http::{HeaderMap, Uri};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     metadata_sys,
@@ -47,18 +47,18 @@ use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_TYPE,
-    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+    AMZ_CHECKSUM_TYPE, get_source_scheme,
+    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
 };
 use s3s::dto::*;
-use s3s::region::Region;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
+use urlencoding::encode;
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
@@ -70,6 +70,74 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
         ));
     }
     Ok(())
+}
+
+fn validate_complete_multipart_parts(parts: &[CompletePart]) -> S3Result<()> {
+    if parts.windows(2).any(|window| window[0].part_num >= window[1].part_num) {
+        return Err(s3_error!(InvalidPartOrder, "Part numbers must be strictly increasing"));
+    }
+
+    Ok(())
+}
+
+fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<CompletePart>> {
+    // For duplicate part numbers, keep the last occurrence from the request.
+    // This matches retry/resend semantics where later uploads override earlier ones.
+    let mut seen = HashSet::with_capacity(parts.len());
+    let mut deduped_reversed = Vec::with_capacity(parts.len());
+    for part in parts.into_iter().rev() {
+        if seen.insert(part.part_num) {
+            deduped_reversed.push(part);
+        }
+    }
+    deduped_reversed.reverse();
+
+    validate_complete_multipart_parts(&deduped_reversed)?;
+    Ok(deduped_reversed)
+}
+
+fn encode_s3_path(path: &str) -> String {
+    path.split('/')
+        .map(|part| encode(part).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn extract_request_scheme(headers: &HeaderMap, uri: &Uri) -> String {
+    get_source_scheme(headers)
+        .and_then(|value| {
+            value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| uri.scheme_str().map(str::to_owned))
+        .unwrap_or_else(|| "http".to_string())
+        .to_ascii_lowercase()
+}
+
+fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
+}
+
+fn build_complete_multipart_location(headers: &HeaderMap, uri: &Uri, bucket: &str, key: &str) -> String {
+    let object_path = format!("/{}/{}", encode(bucket), encode_s3_path(key));
+
+    match extract_request_host(headers, uri) {
+        Some(host) => {
+            let scheme = extract_request_scheme(headers, uri);
+            format!("{scheme}://{host}{object_path}")
+        }
+        None => object_path,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -91,10 +159,6 @@ impl DefaultMultipartUsecase {
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
-    }
-
-    fn global_region(&self) -> Option<Region> {
-        self.context.as_ref().and_then(|context| context.region().get())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -213,23 +277,7 @@ impl DefaultMultipartUsecase {
             .map(CompletePart::from)
             .collect::<Vec<_>>();
 
-        // is part number sorted?
-        if !uploaded_parts_vec.is_sorted_by_key(|p| p.part_num) {
-            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
-        }
-
-        // Handle duplicate part numbers: according to S3 specification, when the same part number
-        // is uploaded multiple times, the last uploaded part (in the list order) should be used.
-        // This can happen in concurrent upload scenarios where a part is re-uploaded before completion.
-        // We deduplicate by keeping the last occurrence of each part number using a HashMap.
-        let mut part_map: HashMap<usize, CompletePart> = HashMap::new();
-        for part in uploaded_parts_vec {
-            part_map.insert(part.part_num, part);
-        }
-
-        // Reconstruct the parts list in sorted order, keeping only the last occurrence of each part number
-        let mut uploaded_parts: Vec<CompletePart> = part_map.into_values().collect();
-        uploaded_parts.sort_by_key(|p| p.part_num);
+        let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
 
         // TODO: check object lock
 
@@ -354,15 +402,12 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let region = self
-            .global_region()
-            .map(|region| region.to_string())
-            .unwrap_or_else(|| RUSTFS_REGION.to_string());
+        let location = build_complete_multipart_location(&req.headers, &req.uri, &bucket, &key);
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region.clone()),
+            location: Some(location.clone()),
             server_side_encryption: server_side_encryption.clone(),
             ssekms_key_id: ssekms_key_id.clone(),
             checksum_crc32: checksum_crc32.clone(),
@@ -378,7 +423,7 @@ impl DefaultMultipartUsecase {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(region),
+            location: Some(location),
             server_side_encryption,
             ssekms_key_id,
             checksum_crc32,
@@ -482,8 +527,9 @@ impl DefaultMultipartUsecase {
         };
 
         if is_compressible(&req.headers, &key) {
-            metadata.insert(
-                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_COMPRESSION,
                 CompressionAlgorithm::default().to_string(),
             );
         }
@@ -603,9 +649,7 @@ impl DefaultMultipartUsecase {
             StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
         );
 
-        let is_compressible = fi
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
+        let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
@@ -857,39 +901,7 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListPartsOutput {
-            bucket: Some(res.bucket),
-            key: Some(res.object),
-            upload_id: Some(res.upload_id),
-            parts: Some(
-                res.parts
-                    .into_iter()
-                    .map(|p| Part {
-                        e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
-                        last_modified: p.last_mod.map(Timestamp::from),
-                        part_number: Some(p.part_num as i32),
-                        size: Some(p.size as i64),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            initiator: Some(Initiator {
-                id: RUSTFS_OWNER.id.clone(),
-                display_name: RUSTFS_OWNER.display_name.clone(),
-            }),
-            is_truncated: Some(res.is_truncated),
-            next_part_number_marker: res.next_part_number_marker.try_into().ok(),
-            max_parts: res.max_parts.try_into().ok(),
-            part_number_marker: res.part_number_marker.try_into().ok(),
-            storage_class: if res.storage_class.is_empty() {
-                None
-            } else {
-                Some(res.storage_class.into())
-            },
-            ..Default::default()
-        };
-        Ok(S3Response::new(output))
+        Ok(S3Response::new(build_list_parts_output(res)))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1014,9 +1026,7 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
         let src_stream = src_reader.stream;
 
-        let is_compressible = mp_info
-            .user_defined
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
+        let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
 
@@ -1129,7 +1139,7 @@ impl DefaultMultipartUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -1147,6 +1157,41 @@ mod tests {
 
     fn make_usecase() -> DefaultMultipartUsecase {
         DefaultMultipartUsecase::without_context()
+    }
+
+    #[test]
+    fn test_build_complete_multipart_location_uses_forwarded_proto_and_encodes_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("storage.example.com:9000"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        let location = build_complete_multipart_location(
+            &headers,
+            &Uri::from_static("/bucket/object?uploadId=1"),
+            "bucket",
+            "dir/file name.txt",
+        );
+
+        assert_eq!(location, "https://storage.example.com:9000/bucket/dir/file%20name.txt");
+    }
+
+    #[test]
+    fn test_build_complete_multipart_location_falls_back_to_uri_authority_and_scheme() {
+        let location = build_complete_multipart_location(
+            &HeaderMap::new(),
+            &"https://gateway.example.com:9443/complete".parse::<Uri>().unwrap(),
+            "bucket",
+            "object.txt",
+        );
+
+        assert_eq!(location, "https://gateway.example.com:9443/bucket/object.txt");
+    }
+
+    #[test]
+    fn test_build_complete_multipart_location_returns_path_without_host() {
+        let location = build_complete_multipart_location(&HeaderMap::new(), &Uri::from_static("/"), "bucket", "nested/object");
+
+        assert_eq!(location, "/bucket/nested/object");
     }
 
     #[tokio::test]
@@ -1189,6 +1234,81 @@ mod tests {
 
         let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_allows_duplicate_part_numbers_by_using_last_occurrence() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .multipart_upload(Some(multipart_upload))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::POST);
+
+        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_out_of_order_parts() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![
+                CompletedPart {
+                    part_number: Some(2),
+                    ..Default::default()
+                },
+                CompletedPart {
+                    part_number: Some(1),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .multipart_upload(Some(multipart_upload))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::POST);
+
+        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
+    }
+
+    #[test]
+    fn normalize_complete_multipart_parts_keeps_last_duplicate_part() {
+        let input = vec![
+            CompletePart {
+                part_num: 1,
+                etag: Some("old".to_string()),
+                ..Default::default()
+            },
+            CompletePart {
+                part_num: 1,
+                etag: Some("new".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let normalized = normalize_complete_multipart_parts(input).expect("normalization should succeed");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].part_num, 1);
+        assert_eq!(normalized[0].etag.as_deref(), Some("new"));
     }
 
     #[tokio::test]

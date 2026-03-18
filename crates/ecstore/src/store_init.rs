@@ -18,7 +18,7 @@ use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
 use crate::{
     disk::{
-        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
         error::DiskError,
         format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
         new_disk,
@@ -71,11 +71,13 @@ pub async fn connect_load_init_formats(
     check_format_erasure_values(&formats, set_drive_count)?;
 
     if first_disk && should_init_erasure_disks(&errs) {
-        //  UnformattedDisk, not format file create
+        // UnformattedDisk, try migrate from MinIO format first, else create new format
         info!("first_disk && should_init_erasure_disks");
-        // new format and save
+        if let Ok(fm) = try_migrate_format(disks, set_count, set_drive_count).await {
+            info!("Migrated format from MinIO config");
+            return Ok(fm);
+        }
         let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
-
         return Ok(fm);
     }
 
@@ -147,6 +149,60 @@ async fn init_format_erasure(
     save_format_file_all(disks, &fms).await?;
 
     get_format_erasure_in_quorum(&fms)
+}
+
+/// Tries to migrate format
+/// Returns Ok(FormatV3) if migration succeeds, Err otherwise.
+async fn try_migrate_format(disks: &[Option<DiskStore>], set_count: usize, set_drive_count: usize) -> Result<FormatV3> {
+    for disk in disks.iter().flatten() {
+        let data = match disk.read_all(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
+            Ok(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+
+        let fm = FormatV3::try_from(data.as_ref()).map_err(|e| Error::other(format!("parse MinIO format: {e}")))?;
+
+        let first_set = fm
+            .erasure
+            .sets
+            .first()
+            .ok_or_else(|| Error::other("MinIO format: erasure.sets is empty"))?;
+        if fm.erasure.sets.len() != set_count || first_set.len() != set_drive_count {
+            debug!(
+                "MinIO format set count mismatch: got {}x{}, expected {}x{}",
+                fm.erasure.sets.len(),
+                first_set.len(),
+                set_count,
+                set_drive_count
+            );
+            continue;
+        }
+
+        if fm.erasure.version != FormatErasureVersion::V3 {
+            debug!("MinIO format erasure version not V3: {:?}", fm.erasure.version);
+            continue;
+        }
+
+        let mut fms = vec![None; disks.len()];
+        for (idx, disk_opt) in disks.iter().enumerate() {
+            if disk_opt.is_none() {
+                continue;
+            }
+            let set_idx = idx / set_drive_count;
+            let disk_idx = idx % set_drive_count;
+            if set_idx >= fm.erasure.sets.len() || disk_idx >= fm.erasure.sets[set_idx].len() {
+                continue;
+            }
+            let mut newfm = fm.clone();
+            newfm.erasure.this = fm.erasure.sets[set_idx][disk_idx];
+            fms[idx] = Some(newfm);
+        }
+
+        save_format_file_all(disks, &fms).await?;
+        return get_format_erasure_in_quorum(&fms);
+    }
+
+    Err(Error::other("no MinIO format to migrate"))
 }
 
 pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {

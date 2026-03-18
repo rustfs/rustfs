@@ -18,6 +18,7 @@ use rustfs_targets::{
     store::{Key, Store},
     target::EntityTarget,
 };
+use rustfs_utils::get_env_usize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
@@ -179,10 +180,7 @@ pub async fn stream_events_with_batching(
 
     // Configuration parameters
     const DEFAULT_BATCH_SIZE: usize = 1;
-    let batch_size = std::env::var("RUSTFS_EVENT_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BATCH_SIZE);
+    let batch_size = get_env_usize("RUSTFS_EVENT_BATCH_SIZE", DEFAULT_BATCH_SIZE);
     const BATCH_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_RETRIES: usize = 5;
     const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
