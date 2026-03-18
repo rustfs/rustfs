@@ -16,7 +16,6 @@ mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
-mod rpc;
 pub mod utils;
 
 #[cfg(test)]
@@ -28,7 +27,6 @@ use handlers::{
     bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user,
 };
 use router::{AdminOperation, S3Router};
-use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 /// Create admin router
@@ -44,7 +42,6 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     health::register_health_route(&mut r)?;
     sts::register_admin_auth_route(&mut r)?;
 
-    register_rpc_route(&mut r)?;
     user::register_user_route(&mut r)?;
     system::register_system_route(&mut r)?;
     pools::register_pool_route(&mut r)?;
