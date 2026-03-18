@@ -416,6 +416,7 @@ impl Clone for StorageError {
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
@@ -484,6 +485,7 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => 0x2E,
             StorageError::DoneForNow => 0x2F,
             StorageError::DecommissionAlreadyRunning => 0x30,
+            StorageError::RebalanceAlreadyRunning => 0x40,
             StorageError::ErasureReadQuorum => 0x31,
             StorageError::ErasureWriteQuorum => 0x32,
             StorageError::NotFirstDisk => 0x33,
@@ -556,6 +558,7 @@ impl StorageError {
             0x2E => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
             0x2F => Some(StorageError::DoneForNow),
             0x30 => Some(StorageError::DecommissionAlreadyRunning),
+            0x40 => Some(StorageError::RebalanceAlreadyRunning),
             0x31 => Some(StorageError::ErasureReadQuorum),
             0x32 => Some(StorageError::ErasureWriteQuorum),
             0x33 => Some(StorageError::NotFirstDisk),
@@ -946,6 +949,7 @@ mod tests {
         assert_eq!(StorageError::VolumeExists.to_u32(), 0x05);
         assert_eq!(StorageError::FileNotFound.to_u32(), 0x06);
         assert_eq!(StorageError::DecommissionAlreadyRunning.to_u32(), 0x30);
+        assert_eq!(StorageError::RebalanceAlreadyRunning.to_u32(), 0x40);
     }
 
     #[test]
@@ -958,6 +962,7 @@ mod tests {
         assert!(matches!(StorageError::from_u32(0x03), Some(StorageError::DiskFull)));
         assert!(matches!(StorageError::from_u32(0x04), Some(StorageError::VolumeNotFound)));
         assert!(matches!(StorageError::from_u32(0x30), Some(StorageError::DecommissionAlreadyRunning)));
+        assert!(matches!(StorageError::from_u32(0x40), Some(StorageError::RebalanceAlreadyRunning)));
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());
@@ -1069,6 +1074,7 @@ mod tests {
             StorageError::BucketExists("test".to_string()),
             StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
             StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning,
         ];
 
         for original_error in test_errors {
