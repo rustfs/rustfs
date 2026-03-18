@@ -18,6 +18,7 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
+use rustfs_common::internode_metrics::global_internode_metrics;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::{DiskAPI, WalkDirOptions};
 use rustfs_ecstore::rpc::verify_rpc_signature;
@@ -31,7 +32,7 @@ use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io;
+use tokio::io::{self, AsyncWriteExt};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tower::Service;
 use tracing::warn;
@@ -106,18 +107,25 @@ fn is_internode_rpc_path(path: &str) -> bool {
 
 async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
+        global_internode_metrics().record_error();
         return *response;
     }
 
     let method = req.method().clone();
     let path = req.uri().path();
 
-    match (method, path) {
+    let response = match (method, path) {
         (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
         (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
         (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req).await,
         _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+    };
+
+    if !response.status().is_success() {
+        global_internode_metrics().record_error();
     }
+
+    response
 }
 
 fn verify_internode_rpc_signature(uri: &Uri, method: &Method, headers: &HeaderMap) -> Result<(), RpcErrorResponse> {
@@ -155,12 +163,19 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("read file err {e}")),
     };
 
+    global_internode_metrics().record_incoming_request();
+    let metrics = global_internode_metrics().clone();
+    let stream = bytes_stream(
+        ReaderStream::with_capacity(file, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+            metrics.record_sent_bytes(bytes.len());
+            bytes
+        }),
+        query.length,
+    );
+
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(file, DEFAULT_READ_BUFFER_SIZE),
-            query.length,
-        ))))
+        .body(Body::from(StreamingBlob::wrap(stream)))
         .expect("failed to build read file stream response")
 }
 
@@ -195,9 +210,16 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
+    global_internode_metrics().record_incoming_request();
+    let metrics = global_internode_metrics().clone();
+    let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+        metrics.record_sent_bytes(bytes.len());
+        bytes
+    });
+
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE))))
+        .body(Body::from(StreamingBlob::wrap(stream)))
         .expect("failed to build walk dir response")
 }
 
@@ -223,7 +245,15 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    if let Err(e) = copy_body_to_writer(req.into_body().into_data_stream(), &mut file).await {
+    let copied = match copy_body_to_writer(req.into_body().into_data_stream(), &mut file).await {
+        Ok(copied) => copied,
+        Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}")),
+    };
+
+    global_internode_metrics().record_incoming_request();
+    global_internode_metrics().record_recv_bytes(copied as usize);
+
+    if let Err(e) = file.flush().await {
         return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));
     }
 

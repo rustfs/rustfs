@@ -18,6 +18,7 @@ use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
+use rustfs_common::internode_metrics::global_internode_metrics;
 use rustfs_utils::get_env_opt_str;
 use std::io::{self, Error};
 use std::ops::Not as _;
@@ -115,6 +116,7 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
+        track_internode_metrics: bool,
         #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
@@ -133,33 +135,47 @@ impl HttpReader {
         body: Option<Vec<u8>>,
         _read_buf_size: usize,
     ) -> io::Result<Self> {
+        let track_internode_metrics = is_internode_rpc_url(&url);
         let client = get_http_client();
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            if track_internode_metrics {
+                global_internode_metrics().record_error();
+            }
+            Error::other(format!("HttpReader HTTP request error: {e}"))
+        })?;
 
         if resp.status().is_success().not() {
+            if track_internode_metrics {
+                global_internode_metrics().record_error();
+            }
             return Err(Error::other(format!(
                 "HttpReader HTTP request failed with non-200 status {}",
                 resp.status()
             )));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e| Error::other(format!("HttpReader stream error: {e}")));
+        if track_internode_metrics {
+            global_internode_metrics().record_outgoing_request();
+        }
+
+        let stream = resp.bytes_stream().map_err(move |e| {
+            if track_internode_metrics {
+                global_internode_metrics().record_error();
+            }
+            Error::other(format!("HttpReader stream error: {e}"))
+        });
 
         Ok(Self {
             inner: StreamReader::new(Box::pin(stream)),
             url,
             method,
             headers,
+            track_internode_metrics,
         })
     }
     pub fn url(&self) -> &str {
@@ -175,14 +191,17 @@ impl HttpReader {
 
 impl AsyncRead for HttpReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        // http_log!(
-        //     "[HttpReader::poll_read] url: {}, method: {:?}, buf.remaining: {}",
-        //     self.url,
-        //     self.method,
-        //     buf.remaining()
-        // );
-        // Read from the inner stream
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let filled_before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let bytes_read = buf.filled().len().saturating_sub(filled_before);
+                if self.track_internode_metrics && bytes_read > 0 {
+                    global_internode_metrics().record_recv_bytes(bytes_read);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -207,6 +226,7 @@ impl HashReaderDetector for HttpReader {
 
 struct ReceiverStream {
     receiver: mpsc::Receiver<Option<Bytes>>,
+    track_internode_metrics: bool,
 }
 
 impl Stream for ReceiverStream {
@@ -228,7 +248,12 @@ impl Stream for ReceiverStream {
         //     }
         // }
         match poll {
-            Poll::Ready(Some(Some(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Some(bytes))) => {
+                if self.track_internode_metrics {
+                    global_internode_metrics().record_sent_bytes(bytes.len());
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
             Poll::Ready(Some(None)) => Poll::Ready(None), // Sender shutdown
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -256,12 +281,16 @@ impl HttpWriter {
         let url_clone = url.clone();
         let method_clone = method.clone();
         let headers_clone = headers.clone();
+        let track_internode_metrics = is_internode_rpc_url(&url);
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(8);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
 
         let handle = tokio::spawn(async move {
-            let stream = ReceiverStream { receiver };
+            let stream = ReceiverStream {
+                receiver,
+                track_internode_metrics,
+            };
             let body = reqwest::Body::wrap_stream(stream);
             // http_log!(
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
@@ -280,6 +309,9 @@ impl HttpWriter {
                 Ok(resp) => {
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
+                        if track_internode_metrics {
+                            global_internode_metrics().record_error();
+                        }
                         let _ = err_tx.send(Error::other(format!(
                             "HttpWriter HTTP request failed with non-200 status {}",
                             resp.status()
@@ -288,6 +320,9 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
+                    if track_internode_metrics {
+                        global_internode_metrics().record_error();
+                    }
                     // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
                     let _ = err_tx.send(Error::other(format!("HTTP request failed: {e}")));
                     return Err(Error::other(format!("HTTP request failed: {e}")));
@@ -299,6 +334,9 @@ impl HttpWriter {
         });
 
         // http_log!("[HttpWriter::new] connection established successfully");
+        if track_internode_metrics {
+            global_internode_metrics().record_outgoing_request();
+        }
         Ok(Self {
             url,
             method,
@@ -321,6 +359,10 @@ impl HttpWriter {
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
+}
+
+fn is_internode_rpc_url(url: &str) -> bool {
+    url.contains("/rustfs/rpc/")
 }
 
 impl AsyncWrite for HttpWriter {

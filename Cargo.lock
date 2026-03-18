@@ -7995,6 +7995,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.10.0",
  "reqwest 0.13.2",
+ "rustfs-common",
  "rustfs-config",
  "rustfs-utils",
  "s3s",
