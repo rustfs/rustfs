@@ -392,7 +392,8 @@ impl NotificationSys {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn load_rebalance_meta(&self, start: bool) {
+    pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for (i, client) in self.peer_clients.iter().flatten().enumerate() {
             warn!(
@@ -406,10 +407,13 @@ impl NotificationSys {
         for result in results {
             if let Err(err) = result {
                 error!("notification load_rebalance_meta err {:?}", err);
+                failures.push(format!("peer load_rebalance_meta failed: {err}"));
             } else {
                 warn!("notification load_rebalance_meta success");
             }
         }
+
+        aggregate_notification_failures("load_rebalance_meta", failures)
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
@@ -452,7 +456,7 @@ impl NotificationSys {
             }
         }
 
-        aggregate_stop_rebalance_failures(failures)?;
+        aggregate_notification_failures("stop_rebalance", failures)?;
         warn!("notification stop_rebalance stop_rebalance done");
         Ok(())
     }
@@ -791,13 +795,13 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
     offline_disks
 }
 
-fn aggregate_stop_rebalance_failures(failures: Vec<String>) -> Result<()> {
+fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Result<()> {
     if failures.is_empty() {
         return Ok(());
     }
 
     Err(Error::other(format!(
-        "stop_rebalance encountered {} failure(s): {}",
+        "{operation} encountered {} failure(s): {}",
         failures.len(),
         failures.join(" | ")
     )))
@@ -857,16 +861,20 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_stop_rebalance_failures_returns_ok_when_empty() {
-        assert!(aggregate_stop_rebalance_failures(Vec::new()).is_ok());
+    fn aggregate_notification_failures_returns_ok_when_empty() {
+        assert!(aggregate_notification_failures("stop_rebalance", Vec::new()).is_ok());
     }
 
     #[test]
-    fn aggregate_stop_rebalance_failures_returns_joined_error_when_non_empty() {
-        let err = aggregate_stop_rebalance_failures(vec!["peer-1 failed".to_string(), "local save failed".to_string()])
-            .expect_err("non-empty failures should return error");
+    fn aggregate_notification_failures_returns_joined_error_when_non_empty() {
+        let err = aggregate_notification_failures(
+            "load_rebalance_meta",
+            vec!["peer-1 failed".to_string(), "local save failed".to_string()],
+        )
+        .expect_err("non-empty failures should return error");
 
         let msg = err.to_string();
+        assert!(msg.contains("load_rebalance_meta"));
         assert!(msg.contains("2 failure(s)"));
         assert!(msg.contains("peer-1 failed"));
         assert!(msg.contains("local save failed"));

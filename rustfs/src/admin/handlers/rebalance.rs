@@ -302,7 +302,10 @@ impl Operation for RebalanceStart {
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("RebalanceStart Loading rebalance meta start");
-            notification_sys.load_rebalance_meta(true).await;
+            notification_sys
+                .load_rebalance_meta(true)
+                .await
+                .map_err(|e| s3_error!(InternalError, "Failed to propagate rebalance meta: {}", e))?;
             warn!("RebalanceStart Loading rebalance meta done");
         }
 
@@ -444,7 +447,10 @@ impl Operation for RebalanceStop {
         warn!("handle RebalanceStop save_rebalance_stats done ");
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("handle RebalanceStop notification_sys load_rebalance_meta");
-            notification_sys.load_rebalance_meta(false).await;
+            notification_sys
+                .load_rebalance_meta(false)
+                .await
+                .map_err(|e| s3_error!(InternalError, "Failed to refresh rebalance meta: {}", e))?;
             warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
 
