@@ -102,6 +102,18 @@ fn decommission_cancel_signal_result(cancel_signal: bool) -> Result<()> {
     }
 }
 
+fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
+    if !pool_present {
+        return Err(Error::other("InvalidArgument"));
+    }
+
+    if !decommission_present || terminal {
+        return Err(StorageError::DecommissionNotStarted);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     #[serde(rename = "id")]
@@ -667,15 +679,19 @@ impl ECStore {
             return Err(Error::other("InvalidArgument"));
         }
 
-        let Some(has_canceler) = self.decommission_cancelers.get(idx) else {
-            return Err(Error::other("InvalidArgument"));
+        let mut lock = self.pool_meta.write().await;
+        let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
+            if let Some(info) = pool.decommission.as_ref() {
+                (true, true, info.complete || info.failed)
+            } else {
+                (true, false, false)
+            }
+        } else {
+            (false, false, false)
         };
 
-        if has_canceler.is_none() {
-            return Err(StorageError::DecommissionNotStarted);
-        }
+        ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
 
-        let mut lock = self.pool_meta.write().await;
         if lock.decommission_cancel(idx) {
             lock.save(self.pools.clone()).await?;
 
@@ -1652,7 +1668,7 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DecommissionTerminalState, classify_decommission_terminal_state, decommission_cancel_signal_result, dedup_indices,
-        ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state,
+        ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, should_preserve_decommission_canceled_state,
     };
     use crate::error::Error;
 
@@ -1712,5 +1728,29 @@ mod pools_tests {
     #[test]
     fn test_decommission_cancel_signal_result_returns_ok_when_not_canceled() {
         assert!(decommission_cancel_signal_result(false).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_decommission_cancel_allowed_rejects_missing_pool() {
+        let err = ensure_decommission_cancel_allowed(false, false, false).expect_err("missing pool should be invalid");
+        assert!(err.to_string().contains("InvalidArgument"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_cancel_allowed_rejects_not_started() {
+        let err =
+            ensure_decommission_cancel_allowed(true, false, false).expect_err("not-started decommission should be rejected");
+        assert!(matches!(err, Error::DecommissionNotStarted));
+    }
+
+    #[test]
+    fn test_ensure_decommission_cancel_allowed_rejects_terminal() {
+        let err = ensure_decommission_cancel_allowed(true, true, true).expect_err("terminal decommission should be rejected");
+        assert!(matches!(err, Error::DecommissionNotStarted));
+    }
+
+    #[test]
+    fn test_ensure_decommission_cancel_allowed_allows_active() {
+        assert!(ensure_decommission_cancel_allowed(true, true, false).is_ok());
     }
 }
