@@ -70,7 +70,7 @@ fn dedup_indices(indices: &[usize]) -> Vec<usize> {
 
 fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     if rebalance_running {
-        return Err(Error::other("RebalanceAlreadyRunning"));
+        return Err(Error::RebalanceAlreadyRunning);
     }
 
     Ok(())
@@ -1611,7 +1611,7 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_rejects_running_rebalance() {
         let err = ensure_decommission_not_rebalancing(true).expect_err("rebalance running should be rejected");
-        assert_eq!(err.to_string(), Error::other("RebalanceAlreadyRunning").to_string());
+        assert_eq!(err.to_string(), Error::RebalanceAlreadyRunning.to_string());
     }
 
     #[test]

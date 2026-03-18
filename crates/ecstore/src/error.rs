@@ -144,6 +144,8 @@ pub enum StorageError {
     DecommissionNotStarted,
     #[error("Decommission already running")]
     DecommissionAlreadyRunning,
+    #[error("Rebalance already running")]
+    RebalanceAlreadyRunning,
     #[error("No heal required")]
     NoHealRequired,
     #[error("DoneForNow")]
