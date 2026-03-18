@@ -670,7 +670,7 @@ impl ECStore {
             drop(lock);
 
             if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await;
+                notification_sys.reload_pool_meta().await?;
             }
         }
 
@@ -923,9 +923,10 @@ impl ECStore {
                 .unwrap_or_default();
 
             drop(pool_meta);
-            if ok && let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await;
-            }
+            if ok && let Some(notification_sys) = get_global_notification_sys()
+                && let Err(err) = notification_sys.reload_pool_meta().await {
+                    error!("decommission_entry: reload_pool_meta err {:?}", err);
+                }
         }
 
         warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
@@ -1083,7 +1084,7 @@ impl ECStore {
             drop(pool_meta);
 
             if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await;
+                notification_sys.reload_pool_meta().await?;
             }
         }
 
@@ -1101,7 +1102,7 @@ impl ECStore {
             pool_meta.save(self.pools.clone()).await?;
             drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await;
+                notification_sys.reload_pool_meta().await?;
             }
         }
 
@@ -1209,7 +1210,7 @@ impl ECStore {
         pool_meta.save(self.pools.clone()).await?;
 
         if let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys.reload_pool_meta().await;
+            notification_sys.reload_pool_meta().await?;
         }
 
         Ok(())

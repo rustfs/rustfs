@@ -377,7 +377,8 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn reload_pool_meta(&self) {
+    pub async fn reload_pool_meta(&self) -> Result<()> {
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
             futures.push(client.reload_pool_meta());
@@ -387,8 +388,11 @@ impl NotificationSys {
         for result in results {
             if let Err(err) = result {
                 error!("notification reload_pool_meta err {:?}", err);
+                failures.push(format!("peer reload_pool_meta failed: {err}"));
             }
         }
+
+        aggregate_notification_failures("reload_pool_meta", failures)
     }
 
     #[tracing::instrument(skip(self))]
