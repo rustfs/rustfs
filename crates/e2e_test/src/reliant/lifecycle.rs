@@ -19,7 +19,6 @@ use aws_sdk_s3::config::{Credentials, Region};
 use bytes::Bytes;
 use serial_test::serial;
 use std::error::Error;
-use tokio::time::sleep;
 
 const ENDPOINT: &str = "http://localhost:9000";
 const ACCESS_KEY: &str = "rustfsadmin";
@@ -62,6 +61,7 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error::Error>> {
     use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
+    use chrono::{Duration as ChronoDuration, Utc};
     use tokio::time::Duration;
 
     let client = create_aws_s3_client().await?;
@@ -70,6 +70,7 @@ async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error:
     // Upload test object first
     let test_content = "Test object for lifecycle expiration";
     let lifecycle_object_key = "lifecycle-test-object.txt";
+    let untouched_object_key = "keep-object.txt";
     client
         .put_object()
         .bucket(BUCKET)
@@ -77,13 +78,29 @@ async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error:
         .body(Bytes::from(test_content.as_bytes()).into())
         .send()
         .await?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(untouched_object_key)
+        .body(Bytes::from("should-stay".as_bytes()).into())
+        .send()
+        .await?;
 
     // Verify object exists initially
     let resp = client.get_object().bucket(BUCKET).key(lifecycle_object_key).send().await?;
     assert!(resp.content_length().unwrap_or(0) > 0);
+    let untouched_resp = client.get_object().bucket(BUCKET).key(untouched_object_key).send().await?;
+    assert!(untouched_resp.content_length().unwrap_or(0) > 0);
 
-    // Configure lifecycle rule: expire after current time + 3 seconds
-    let expiration = LifecycleExpiration::builder().days(0).build();
+    // Use a past midnight UTC date to trigger immediate lifecycle expiry without requiring days=0.
+    let yesterday_midnight_utc = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight should always be valid")
+        - ChronoDuration::days(1);
+    let expiration = LifecycleExpiration::builder()
+        .date(aws_sdk_s3::primitives::DateTime::from_secs(yesterday_midnight_utc.and_utc().timestamp()))
+        .build();
     let filter = LifecycleRuleFilter::builder().prefix(lifecycle_object_key).build();
     let rule = LifecycleRule::builder()
         .id("expire-test-object")
@@ -105,29 +122,73 @@ async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error:
     let rules = resp.rules();
     assert!(rules.iter().any(|r| r.id().unwrap_or("") == "expire-test-object"));
 
-    // Wait for lifecycle processing (scanner runs every 1 second)
-    sleep(Duration::from_secs(3)).await;
-
-    // After lifecycle processing, the object should be deleted by the lifecycle rule
-    let get_result = client.get_object().bucket(BUCKET).key(lifecycle_object_key).send().await;
-
-    match get_result {
-        Ok(_) => {
-            panic!("Expected object to be deleted by lifecycle rule, but it still exists");
-        }
-        Err(e) => {
-            if let Some(service_error) = e.as_service_error() {
-                if service_error.is_no_such_key() {
-                    println!("Lifecycle configuration test completed - object was successfully deleted by lifecycle rule");
-                } else {
-                    panic!("Expected NoSuchKey error, but got: {e:?}");
+    // Poll for deletion instead of using a fixed sleep to keep the test deterministic.
+    // Default scanner cycle interval is 60s with jitter, so allow enough time for one full cycle.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    loop {
+        let get_result = client.get_object().bucket(BUCKET).key(lifecycle_object_key).send().await;
+        match get_result {
+            Ok(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("Expected object to be deleted by lifecycle rule within 150s, but it still exists");
                 }
-            } else {
-                panic!("Expected service error, but got: {e:?}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                if let Some(service_error) = e.as_service_error() {
+                    if service_error.is_no_such_key() {
+                        println!("Lifecycle configuration test completed - object was successfully deleted by lifecycle rule");
+                        break;
+                    }
+                    panic!("Expected NoSuchKey error, but got: {e:?}");
+                } else {
+                    panic!("Expected service error, but got: {e:?}");
+                }
             }
         }
     }
 
     println!("Lifecycle configuration test completed.");
+
+    // Non-matching prefix object should remain available.
+    let untouched_after = client.get_object().bucket(BUCKET).key(untouched_object_key).send().await?;
+    assert!(untouched_after.content_length().unwrap_or(0) > 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires running RustFS server at localhost:9000"]
+async fn test_bucket_lifecycle_rejects_zero_days() -> Result<(), Box<dyn std::error::Error>> {
+    use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
+
+    let client = create_aws_s3_client().await?;
+    setup_test_bucket(&client).await?;
+
+    let expiration = LifecycleExpiration::builder().days(0).build();
+    let filter = LifecycleRuleFilter::builder().prefix("zero-days/").build();
+    let rule = LifecycleRule::builder()
+        .id("expire-zero-days")
+        .filter(filter)
+        .expiration(expiration)
+        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+        .build()?;
+    let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
+
+    let err = client
+        .put_bucket_lifecycle_configuration()
+        .bucket(BUCKET)
+        .lifecycle_configuration(lifecycle)
+        .send()
+        .await
+        .expect_err("zero-day lifecycle expiration should be rejected");
+
+    let err_msg = format!("{err:?}");
+    assert!(
+        err_msg.contains("InvalidArgument") && err_msg.contains("greater than 0"),
+        "unexpected error: {err_msg}"
+    );
+
     Ok(())
 }
