@@ -82,7 +82,14 @@ mod tests {
         let metrics = collect_bucket_replication_bandwidth_metrics(&stats);
         assert_eq!(metrics.len(), 2);
 
-        let limit_metric = metrics.iter().find(|m| m.value == 1_048_576.0);
+        let limit_metric_name = BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name();
+        let limit_metric = metrics.iter().find(|m| {
+            m.name == limit_metric_name
+                && m.value == 1_048_576.0
+                && m.labels
+                    .iter()
+                    .any(|(k, v)| *k == "bucket" && v == "b1")
+        });
         assert!(limit_metric.is_some());
         assert!(
             limit_metric
@@ -95,7 +102,14 @@ mod tests {
                 .unwrap_or(false)
         );
 
-        let current_metric = metrics.iter().find(|m| m.value == 204_800.0);
+        let current_metric_name = BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name();
+        let current_metric = metrics.iter().find(|m| {
+            m.name == current_metric_name
+                && m.value == 204_800.0
+                && m.labels
+                    .iter()
+                    .any(|(k, v)| *k == "bucket" && v == "b1")
+        });
         assert!(current_metric.is_some());
     }
 

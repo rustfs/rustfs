@@ -84,68 +84,69 @@ pub struct DriveCountStats {
 ///
 /// Returns a vector of Prometheus metrics for each drive.
 pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<PrometheusMetric> {
+    fn push_drive_metric(
+        metrics: &mut Vec<PrometheusMetric>,
+        descriptor: &'static crate::MetricDescriptor,
+        value: f64,
+        server_label: &str,
+        drive_label: &str,
+    ) {
+        metrics.push(
+            PrometheusMetric::from_descriptor(descriptor, value)
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
+                .with_label_owned(SERVER_LABEL, server_label.to_string()),
+        );
+    }
+
     let mut metrics = Vec::with_capacity(stats.len() * 19);
 
     for stat in stats {
-        metrics.extend(vec![
-            PrometheusMetric::from_descriptor(&DRIVE_TOTAL_BYTES_MD, stat.total_bytes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_USED_BYTES_MD, stat.used_bytes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_FREE_BYTES_MD, stat.free_bytes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_USED_INODES_MD, stat.used_inodes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_FREE_INODES_MD, stat.free_inodes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_TOTAL_INODES_MD, stat.total_inodes as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_TIMEOUT_ERRORS_MD, stat.timeout_errors_total as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_IO_ERRORS_MD, stat.io_errors_total as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_AVAILABILITY_ERRORS_MD, stat.availability_errors_total as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_WAITING_IO_MD, stat.waiting_io as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_API_LATENCY_MD, stat.api_latency_micros as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_HEALTH_MD, stat.health as f64)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_READS_PER_SEC_MD, stat.reads_per_sec)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_READS_KB_PER_SEC_MD, stat.reads_kb_per_sec)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_READS_AWAIT_MD, stat.reads_await)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_WRITES_PER_SEC_MD, stat.writes_per_sec)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_WRITES_KB_PER_SEC_MD, stat.writes_kb_per_sec)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_WRITES_AWAIT_MD, stat.writes_await)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-            PrometheusMetric::from_descriptor(&DRIVE_PERC_UTIL_MD, stat.perc_util)
-                .with_label_owned(DRIVE_LABEL, stat.drive.clone())
-                .with_label_owned(SERVER_LABEL, stat.server.clone()),
-        ]);
+        let server_label = stat.server.as_str();
+        let drive_label = stat.drive.as_str();
+
+        push_drive_metric(&mut metrics, &DRIVE_TOTAL_BYTES_MD, stat.total_bytes as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_USED_BYTES_MD, stat.used_bytes as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_FREE_BYTES_MD, stat.free_bytes as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_USED_INODES_MD, stat.used_inodes as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_FREE_INODES_MD, stat.free_inodes as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_TOTAL_INODES_MD, stat.total_inodes as f64, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_TIMEOUT_ERRORS_MD,
+            stat.timeout_errors_total as f64,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(&mut metrics, &DRIVE_IO_ERRORS_MD, stat.io_errors_total as f64, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_AVAILABILITY_ERRORS_MD,
+            stat.availability_errors_total as f64,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(&mut metrics, &DRIVE_WAITING_IO_MD, stat.waiting_io as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_API_LATENCY_MD, stat.api_latency_micros as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.health as f64, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, stat.reads_per_sec, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_READS_KB_PER_SEC_MD,
+            stat.reads_kb_per_sec,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(&mut metrics, &DRIVE_READS_AWAIT_MD, stat.reads_await, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_WRITES_PER_SEC_MD, stat.writes_per_sec, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_WRITES_KB_PER_SEC_MD,
+            stat.writes_kb_per_sec,
+            server_label,
+            drive_label,
+        );
+        push_drive_metric(&mut metrics, &DRIVE_WRITES_AWAIT_MD, stat.writes_await, server_label, drive_label);
+        push_drive_metric(&mut metrics, &DRIVE_PERC_UTIL_MD, stat.perc_util, server_label, drive_label);
     }
 
     metrics

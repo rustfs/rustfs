@@ -17,9 +17,34 @@
 //! This module renders metrics in the standard Prometheus text format.
 //! Optimized for minimal allocations and fast rendering.
 
+use std::collections::HashMap;
+use std::borrow::Cow;
+use std::sync::{Mutex, OnceLock};
 use crate::MetricType;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
-use std::borrow::Cow;
+
+static NAME_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+
+fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
+    let cache = cache.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap();
+
+    if let Some(existing) = cache.get(value) {
+        *existing
+    } else {
+        let value = Box::leak(value.to_string().into_boxed_str());
+        cache.insert(value.to_string(), value);
+        value
+    }
+}
+
+fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &Cow<'static, str>) -> &'static str {
+    match value {
+        Cow::Borrowed(value) => value,
+        Cow::Owned(value) => intern_string(cache, value),
+    }
+}
 
 /// Report metrics using the `metrics` crate.
 ///
@@ -27,15 +52,10 @@ use std::borrow::Cow;
 /// the `metrics` crate's API. This allows integration with various metrics
 /// exporters (e.g., Prometheus) that are configured globally.
 ///
-/// Note: This function uses `Box::leak` to convert dynamic strings to static strings
-/// for the `metrics` crate macros. This is acceptable because metric names are typically
-/// reused throughout the application lifetime.
 pub fn report_metrics(metrics: &[PrometheusMetric]) {
     for metric in metrics {
-        // Convert Cow to static strings using Box::leak
-        // This is acceptable because metric names are reused throughout the application
-        let name: &'static str = Box::leak(metric.name.clone().into_owned().into_boxed_str());
-        let help: &'static str = Box::leak(metric.help.clone().into_owned().into_boxed_str());
+        let name = into_static_str(&NAME_CACHE, &metric.name);
+        let help = into_static_str(&HELP_CACHE, &metric.help);
 
         // Register metric description (help text)
         // Note: In a real-world scenario, descriptions should ideally be registered once at startup.

@@ -69,15 +69,18 @@ mod tests {
         assert_eq!(metrics.len(), 3);
 
         // Verify CPU metric
-        let cpu = metrics.iter().find(|m| m.value == 45.5);
+        let cpu_metric_name = PROCESS_CPU_PERCENT_MD.get_full_metric_name();
+        let cpu = metrics.iter().find(|m| m.name == cpu_metric_name && m.value == 45.5);
         assert!(cpu.is_some());
 
         // Verify memory metric
-        let memory = metrics.iter().find(|m| m.value == (1024 * 1024 * 256) as f64);
+        let memory_metric_name = PROCESS_MEMORY_BYTES_MD.get_full_metric_name();
+        let memory = metrics.iter().find(|m| m.name == memory_metric_name && m.value == (1024 * 1024 * 256) as f64);
         assert!(memory.is_some());
 
         // Verify uptime metric
-        let uptime = metrics.iter().find(|m| m.value == 7200.0);
+        let uptime_metric_name = PROCESS_UPTIME_SECONDS_MD.get_full_metric_name();
+        let uptime = metrics.iter().find(|m| m.name == uptime_metric_name && m.value == 7200.0);
         assert!(uptime.is_some());
     }
 
@@ -107,7 +110,8 @@ mod tests {
         let metrics = collect_resource_metrics(&stats);
         report_metrics(&metrics);
 
-        let cpu = metrics.iter().find(|m| m.value == 150.0);
+        let cpu_metric_name = PROCESS_CPU_PERCENT_MD.get_full_metric_name();
+        let cpu = metrics.iter().find(|m| m.name == cpu_metric_name && m.value == 150.0);
         assert!(cpu.is_some());
     }
 

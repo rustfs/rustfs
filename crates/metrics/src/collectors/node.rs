@@ -108,16 +108,20 @@ mod tests {
         assert_eq!(metrics.len(), 6);
 
         // Verify node1 disk1 total bytes
+        let node1_total_name = NODE_DISK_TOTAL_BYTES_MD.get_full_metric_name();
         let node1_total = metrics.iter().find(|m| {
-            m.value == 1000000.0
+            m.name == node1_total_name
+                && m.value == 1000000.0
                 && m.labels.iter().any(|(k, v)| *k == "server" && v == "node1:9000")
                 && m.labels.iter().any(|(k, v)| *k == "drive" && v == "/data/disk1")
         });
         assert!(node1_total.is_some());
 
         // Verify node2 disk2 used bytes
+        let node2_used_name = NODE_DISK_USED_BYTES_MD.get_full_metric_name();
         let node2_used = metrics.iter().find(|m| {
-            m.value == 800000.0
+            m.name == node2_used_name
+                && m.value == 800000.0
                 && m.labels.iter().any(|(k, v)| *k == "server" && v == "node2:9000")
                 && m.labels.iter().any(|(k, v)| *k == "drive" && v == "/data/disk2")
         });

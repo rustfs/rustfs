@@ -81,19 +81,23 @@ mod tests {
         assert_eq!(metrics.len(), 6);
 
         // Verify raw capacity
-        let raw_capacity = metrics.iter().find(|m| m.value == 3000.0);
+        let raw_capacity_name = CLUSTER_CAPACITY_RAW_TOTAL_BYTES_MD.get_full_metric_name();
+        let raw_capacity = metrics.iter().find(|m| m.name == raw_capacity_name && m.value == 3000.0);
         assert!(raw_capacity.is_some());
 
         // Verify used capacity
-        let used = metrics.iter().find(|m| m.value == 1200.0);
+        let used_name = CLUSTER_CAPACITY_USED_BYTES_MD.get_full_metric_name();
+        let used = metrics.iter().find(|m| m.name == used_name && m.value == 1200.0);
         assert!(used.is_some());
 
         // Verify object count
-        let objects = metrics.iter().find(|m| m.value == 100.0);
+        let objects_name = CLUSTER_OBJECTS_TOTAL_MD.get_full_metric_name();
+        let objects = metrics.iter().find(|m| m.name == objects_name && m.value == 100.0);
         assert!(objects.is_some());
 
         // Verify bucket count
-        let buckets = metrics.iter().find(|m| m.value == 5.0);
+        let buckets_name = CLUSTER_BUCKETS_TOTAL_MD.get_full_metric_name();
+        let buckets = metrics.iter().find(|m| m.name == buckets_name && m.value == 5.0);
         assert!(buckets.is_some());
     }
 

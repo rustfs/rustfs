@@ -26,6 +26,12 @@ use crate::collectors::{
     collect_resource_metrics,
 };
 use crate::format::report_metrics;
+use crate::constants::{
+    DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL,
+    DEFAULT_NODE_METRICS_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL, ENV_BUCKET_METRICS_INTERVAL,
+    ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
+    ENV_NODE_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
+};
 use rustfs_utils::get_env_opt_u64;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -42,19 +48,71 @@ use tracing::warn;
 ///
 /// # Environment Variables
 /// The collection intervals can be configured via environment variables:
-/// - `RUSTFS_METRICS_CLUSTER_INTERVAL`: Cluster metrics interval in seconds (default: 60)
-/// - `RUSTFS_METRICS_BUCKET_INTERVAL`: Bucket metrics interval in seconds (default: 60)
-/// - `RUSTFS_METRICS_NODE_INTERVAL`: Node/disk metrics interval in seconds (default: 60)
-/// - `RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL`: Bucket replication bandwidth interval in seconds (default: 60)
-/// - `RUSTFS_METRICS_RESOURCE_INTERVAL`: Resource metrics interval in seconds (default: 15)
+/// - `RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`: Cluster metrics interval in seconds (default: 60)
+/// - `RUSTFS_METRICS_BUCKET_INTERVAL_SEC`: Bucket metrics interval in seconds (default: 300)
+/// - `RUSTFS_METRICS_NODE_INTERVAL_SEC`: Node/disk metrics interval in seconds (default: 60)
+/// - `RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL_SEC`: Bucket replication bandwidth interval in seconds (default: 30)
+/// - `RUSTFS_METRICS_RESOURCE_INTERVAL_SEC`: Resource metrics interval in seconds (default: 15)
+/// - `RUSTFS_METRICS_DEFAULT_INTERVAL_SEC`: Optional global default interval in seconds.
+///
+/// Legacy interval names without `_SEC` are still accepted for backward compatibility:
+/// - `RUSTFS_METRICS_CLUSTER_INTERVAL`
+/// - `RUSTFS_METRICS_BUCKET_INTERVAL`
+/// - `RUSTFS_METRICS_NODE_INTERVAL`
+/// - `RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL`
+/// - `RUSTFS_METRICS_RESOURCE_INTERVAL`
 pub fn init_metrics_collectors(token: CancellationToken) {
-    // Read intervals from environment or use defaults
-    let cluster_interval = Duration::from_secs(get_env_opt_u64("RUSTFS_METRICS_CLUSTER_INTERVAL").unwrap_or(60));
-    let bucket_interval = Duration::from_secs(get_env_opt_u64("RUSTFS_METRICS_BUCKET_INTERVAL").unwrap_or(60));
-    let node_interval = Duration::from_secs(get_env_opt_u64("RUSTFS_METRICS_NODE_INTERVAL").unwrap_or(60));
-    let bucket_replication_bandwidth_interval =
-        Duration::from_secs(get_env_opt_u64("RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL").unwrap_or(60));
-    let resource_interval = Duration::from_secs(get_env_opt_u64("RUSTFS_METRICS_RESOURCE_INTERVAL").unwrap_or(15));
+    const LEGACY_CLUSTER_INTERVAL: &str = "RUSTFS_METRICS_CLUSTER_INTERVAL";
+    const LEGACY_BUCKET_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_INTERVAL";
+    const LEGACY_NODE_INTERVAL: &str = "RUSTFS_METRICS_NODE_INTERVAL";
+    const LEGACY_REPLICATION_BANDWIDTH_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL";
+    const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
+    const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
+
+    fn parse_interval(msc: &str, legacy_msc: &str) -> Option<u64> {
+        get_env_opt_u64(msc)
+            .or_else(|| get_env_opt_u64(legacy_msc))
+            .filter(|&v| v > 0)
+    }
+
+    // Read intervals from environment or use defaults, ensuring zero is ignored.
+    let cluster_interval = parse_interval(ENV_CLUSTER_METRICS_INTERVAL, LEGACY_CLUSTER_INTERVAL)
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CLUSTER_METRICS_INTERVAL);
+
+    let bucket_interval = parse_interval(ENV_BUCKET_METRICS_INTERVAL, LEGACY_BUCKET_INTERVAL)
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_BUCKET_METRICS_INTERVAL);
+
+    let bucket_replication_bandwidth_interval = parse_interval(
+        ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+        LEGACY_REPLICATION_BANDWIDTH_INTERVAL,
+    )
+    .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+    .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+    .filter(|&v| v > 0)
+    .map(Duration::from_secs)
+    .unwrap_or(DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL);
+
+    let node_interval = parse_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL)
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_NODE_METRICS_INTERVAL);
+
+    let resource_interval = parse_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL)
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RESOURCE_METRICS_INTERVAL);
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();

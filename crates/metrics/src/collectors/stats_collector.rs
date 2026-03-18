@@ -118,6 +118,10 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
     let mut stats = Vec::with_capacity(buckets.len());
 
     for bucket in buckets {
+        if bucket.name.starts_with('.') {
+            continue;
+        }
+
         // Get size and objects_count from data usage info
         let (size_bytes, objects_count) = data_usage
             .as_ref()
@@ -152,11 +156,22 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
         .get_report(|_| true)
         .bucket_stats
         .into_iter()
-        .map(|(opts, details)| BucketReplicationBandwidthStats {
-            bucket: opts.name,
-            target_arn: opts.replication_arn,
-            limit_bytes_per_sec: details.limit_bytes_per_sec as u64,
-            current_bandwidth_bytes_per_sec: details.current_bandwidth_bytes_per_sec,
+        .map(|(opts, details)| {
+            let target_arn = opts.replication_arn;
+            let limit_bytes_per_sec = u64::try_from(details.limit_bytes_per_sec).unwrap_or_else(|_| {
+                warn!(
+                    "Invalid bandwidth limit value for target {:?}: {}",
+                    target_arn, details.limit_bytes_per_sec
+                );
+                0
+            });
+
+            BucketReplicationBandwidthStats {
+                bucket: opts.name,
+                target_arn,
+                limit_bytes_per_sec,
+                current_bandwidth_bytes_per_sec: details.current_bandwidth_bytes_per_sec,
+            }
         })
         .collect()
 }

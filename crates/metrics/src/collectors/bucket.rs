@@ -102,9 +102,10 @@ mod tests {
         assert_eq!(metrics.len(), 6);
 
         // Verify test-bucket metrics have correct labels
+        let test_bucket_size_name = BUCKET_USAGE_BYTES_MD.get_full_metric_name();
         let test_bucket_size = metrics
             .iter()
-            .find(|m| m.labels.iter().any(|(k, v)| *k == "bucket" && v == "test-bucket"));
+            .find(|m| m.name == test_bucket_size_name && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "test-bucket"));
         assert!(test_bucket_size.is_some());
         assert_eq!(test_bucket_size.map(|m| m.value), Some(1000.0));
     }
@@ -125,7 +126,12 @@ mod tests {
         assert_eq!(metrics.len(), 3);
 
         // Verify quota metric exists
-        let quota_metric = metrics.iter().find(|m| m.value == 10000.0);
+        let quota_metric_name = BUCKET_QUOTA_BYTES_MD.get_full_metric_name();
+        let quota_metric = metrics.iter().find(|m| {
+            m.name == quota_metric_name
+                && m.value == 10000.0
+                && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "quota-bucket")
+        });
         assert!(quota_metric.is_some());
     }
 
@@ -150,7 +156,12 @@ mod tests {
 
         // Zero quota should still produce a quota metric with value 0 for consistent PromQL queries
         assert_eq!(metrics.len(), 3);
-        let quota_metric = metrics.iter().find(|m| m.value == 0.0 && m.labels.len() == 1);
+        let quota_metric_name = BUCKET_QUOTA_BYTES_MD.get_full_metric_name();
+        let quota_metric = metrics.iter().find(|m| {
+            m.name == quota_metric_name
+                && m.value == 0.0
+                && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "no-quota-bucket")
+        });
         assert!(quota_metric.is_some());
     }
 
