@@ -1058,6 +1058,14 @@ fn resolve_rebalance_save_task_result(
     }
 }
 
+fn resolve_rebalance_stats_update_result(result: Result<()>, pool_idx: usize, bucket: &str, object_name: &str) -> Result<()> {
+    result.map_err(|err| {
+        Error::other(format!(
+            "rebalance stats update failed for pool {pool_idx} bucket {bucket} object {object_name}: {err}"
+        ))
+    })
+}
+
 async fn send_rebalance_done_signal(
     done_tx: &tokio::sync::mpsc::Sender<Result<()>>,
     signal: Result<()>,
@@ -1337,7 +1345,12 @@ impl ECStore {
                 return Err(err);
             }
 
-            let _ = self.update_pool_stats(pool_index, bucket.clone(), version).await;
+            resolve_rebalance_stats_update_result(
+                self.update_pool_stats(pool_index, bucket.clone(), version).await,
+                pool_index,
+                bucket.as_str(),
+                version.name.as_str(),
+            )?;
             rebalanced += 1;
         }
 
@@ -1693,9 +1706,9 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_next_rebalance_bucket,
         resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue,
+        resolve_rebalance_stats_update_result, resolve_rebalance_worker_result, send_rebalance_done_signal,
+        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2121,6 +2134,21 @@ mod rebalance_unit_tests {
     #[test]
     fn test_resolve_rebalance_save_task_result_passthrough() {
         assert!(resolve_rebalance_save_task_result(0, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_stats_update_result_passthrough() {
+        assert!(resolve_rebalance_stats_update_result(Ok(()), 0, "bucket", "object").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_stats_update_result_wraps_error_context() {
+        let err = resolve_rebalance_stats_update_result(Err(Error::SlowDown), 2, "bucket-a", "obj.txt")
+            .expect_err("stats update error should include context");
+        assert!(
+            err.to_string()
+                .contains("rebalance stats update failed for pool 2 bucket bucket-a object obj.txt")
+        );
     }
 
     #[tokio::test]
