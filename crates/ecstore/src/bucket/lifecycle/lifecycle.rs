@@ -141,6 +141,7 @@ impl RuleValidate for LifecycleRule {
             .and_then(|t| t.first())
             .and_then(|t| t.storage_class.as_ref())
             .is_some();
+        let has_abort_incomplete_multipart_upload = self.abort_incomplete_multipart_upload.is_some();
         let has_del_marker_expiration = self
             .del_marker_expiration
             .as_ref()
@@ -150,6 +151,7 @@ impl RuleValidate for LifecycleRule {
             && !has_transition
             && !has_noncurrent_expiration
             && !has_noncurrent_transition
+            && !has_abort_incomplete_multipart_upload
             && !has_del_marker_expiration
         {
             return Err(std::io::Error::other(ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION));
@@ -955,6 +957,32 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("expected validation to pass");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_accepts_abort_incomplete_multipart_upload_only_rule() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(2),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-only".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
                 transitions: None,
             }],
         };

@@ -52,7 +52,7 @@ use rustfs_utils::http::{
 };
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -78,6 +78,22 @@ fn validate_complete_multipart_parts(parts: &[CompletePart]) -> S3Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<CompletePart>> {
+    // For duplicate part numbers, keep the last occurrence from the request.
+    // This matches retry/resend semantics where later uploads override earlier ones.
+    let mut seen = HashSet::with_capacity(parts.len());
+    let mut deduped_reversed = Vec::with_capacity(parts.len());
+    for part in parts.into_iter().rev() {
+        if seen.insert(part.part_num) {
+            deduped_reversed.push(part);
+        }
+    }
+    deduped_reversed.reverse();
+
+    validate_complete_multipart_parts(&deduped_reversed)?;
+    Ok(deduped_reversed)
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -261,8 +277,7 @@ impl DefaultMultipartUsecase {
             .map(CompletePart::from)
             .collect::<Vec<_>>();
 
-        validate_complete_multipart_parts(&uploaded_parts_vec)?;
-        let uploaded_parts = uploaded_parts_vec;
+        let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
 
         // TODO: check object lock
 
@@ -1222,7 +1237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_complete_multipart_upload_rejects_duplicate_part_numbers() {
+    async fn execute_complete_multipart_upload_allows_duplicate_part_numbers_by_using_last_occurrence() {
         let multipart_upload = CompletedMultipartUpload {
             parts: Some(vec![
                 CompletedPart {
@@ -1245,7 +1260,7 @@ mod tests {
         let req = build_request(input, Method::POST);
 
         let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
+        assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
     #[tokio::test]
@@ -1273,6 +1288,27 @@ mod tests {
 
         let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
+    }
+
+    #[test]
+    fn normalize_complete_multipart_parts_keeps_last_duplicate_part() {
+        let input = vec![
+            CompletePart {
+                part_num: 1,
+                etag: Some("old".to_string()),
+                ..Default::default()
+            },
+            CompletePart {
+                part_num: 1,
+                etag: Some("new".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let normalized = normalize_complete_multipart_parts(input).expect("normalization should succeed");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].part_num, 1);
+        assert_eq!(normalized[0].etag.as_deref(), Some("new"));
     }
 
     #[tokio::test]
