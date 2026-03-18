@@ -439,19 +439,20 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if obj.is_latest && obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref() {
                         if expiration.expired_object_delete_marker.is_some_and(|v| v) {
-                            if let Some(due) = expiration.next_due(obj) {
-                                if now.unix_timestamp() >= due.unix_timestamp() {
-                                    events.push(Event {
-                                        action: IlmAction::DeleteVersionAction,
-                                        rule_id: rule.id.clone().unwrap_or_default(),
-                                        due: Some(due),
-                                        noncurrent_days: 0,
-                                        newer_noncurrent_versions: 0,
-                                        storage_class: "".into(),
-                                    });
-                                    // Stop after scheduling an expired delete-marker event.
-                                    break;
-                                }
+                            // Preserve explicit date/days scheduling when configured.
+                            // If only ExpiredObjectDeleteMarker=true is set, delete immediately.
+                            let due = expiration.next_due(obj).unwrap_or(now);
+                            if now.unix_timestamp() >= due.unix_timestamp() {
+                                events.push(Event {
+                                    action: IlmAction::DeleteVersionAction,
+                                    rule_id: rule.id.clone().unwrap_or_default(),
+                                    due: Some(due),
+                                    noncurrent_days: 0,
+                                    newer_noncurrent_versions: 0,
+                                    storage_class: "".into(),
+                                });
+                                // Stop after scheduling an expired delete-marker event.
+                                break;
                             }
                         }
                     }
@@ -1229,6 +1230,42 @@ mod tests {
 
         assert_eq!(event.action, IlmAction::DeleteVersionAction);
         assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
+    }
+
+    #[tokio::test]
+    async fn expired_object_delete_marker_without_date_or_days_deletes_immediately() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    expired_object_delete_marker: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-expired-del-marker-immediate".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 1,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let now = base_time + Duration::days(2);
+        let event = lc.eval_inner(&opts, now, 0).await;
+        assert_eq!(event.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event.due, Some(now));
     }
 
     #[tokio::test]
