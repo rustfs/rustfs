@@ -273,15 +273,25 @@ impl<'a> fmt::Display for Masked<'a> {
 ///
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Credentials {
+    #[serde(rename = "accessKey", alias = "access_key", default)]
     pub access_key: String,
+    #[serde(rename = "secretKey", alias = "secret_key", default)]
     pub secret_key: String,
+    #[serde(rename = "sessionToken", alias = "session_token", default)]
     pub session_token: String,
+    #[serde(default, with = "crate::serde_datetime::option")]
     pub expiration: Option<OffsetDateTime>,
+    #[serde(default)]
     pub status: String,
+    #[serde(rename = "parentUser", alias = "parent_user", default)]
     pub parent_user: String,
+    #[serde(default)]
     pub groups: Option<Vec<String>>,
+    #[serde(default)]
     pub claims: Option<HashMap<String, Value>>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
 }
 
@@ -490,5 +500,32 @@ mod tests {
         assert_eq!(format!("{:?}", Masked(Some("中"))), "***");
         assert_eq!(format!("{:?}", Masked(Some("中文"))), "中***|2");
         assert_eq!(format!("{:?}", Masked(Some("中文测试"))), "中***试|4");
+    }
+
+    #[test]
+    fn test_credentials_expiration_serialize_as_rfc3339() {
+        use time::OffsetDateTime;
+
+        let c = Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sk12345678".to_string(),
+            expiration: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&c).expect("serialize");
+        assert!(
+            json.contains('T') && (json.contains('Z') || json.contains("+00:00")),
+            "Credentials expiration should be RFC3339; got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_credentials_deserialize_minio_style_rfc3339_expiration() {
+        let minio_style = r#"{"accessKey":"ak","secretKey":"sk12345678","expiration":"2025-03-07T12:00:00Z"}"#;
+        let c: Credentials = serde_json::from_str(minio_style).expect("deserialize");
+        assert_eq!(c.access_key, "ak");
+        assert!(c.expiration.is_some());
     }
 }

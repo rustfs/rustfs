@@ -113,7 +113,11 @@ impl UserType {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MappedPolicy {
     pub version: i64,
+    /// policy, legacy: policies. Serialize as policy.
+    #[serde(rename = "policy", alias = "policies")]
     pub policies: String,
+    /// updatedAt (RFC3339), legacy: update_at. Serialize as updatedAt.
+    #[serde(rename = "updatedAt", alias = "update_at", with = "rustfs_policy::serde_datetime")]
     pub update_at: OffsetDateTime,
 }
 
@@ -158,6 +162,13 @@ pub struct GroupInfo {
     pub version: i64,
     pub status: String,
     pub members: Vec<String>,
+    /// updatedAt (RFC3339), legacy: update_at. Serialize as updatedAt.
+    #[serde(
+        rename = "updatedAt",
+        alias = "update_at",
+        default,
+        with = "rustfs_policy::serde_datetime::option"
+    )]
     pub update_at: Option<OffsetDateTime>,
 }
 
@@ -169,5 +180,48 @@ impl GroupInfo {
             members,
             update_at: Some(OffsetDateTime::now_utc()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GroupInfo, MappedPolicy};
+
+    /// uses RFC3339 for updatedAt. MappedPolicy must serialize as RFC3339.
+    #[test]
+    fn test_mapped_policy_timestamps_serialize_as_rfc3339() {
+        let mp = MappedPolicy::new("readwrite");
+        let json = serde_json::to_string(&mp).expect("serialize");
+        assert!(json.contains('T'), "MappedPolicy updatedAt should be RFC3339; got: {}", json);
+        assert!(
+            json.contains('Z') || json.contains("+00:00"),
+            "MappedPolicy updatedAt should be RFC3339; got: {}",
+            json
+        );
+    }
+
+    /// Deserialize MappedPolicy from JSON (RFC3339 updatedAt).
+    #[test]
+    fn test_mapped_policy_deserialize_minio_style_rfc3339() {
+        let minio_style = r#"{"version":1,"policy":"readwrite","updatedAt":"2025-03-07T12:00:00Z"}"#;
+        let mp: MappedPolicy = serde_json::from_str(minio_style).expect("deserialize");
+        assert_eq!(mp.policies, "readwrite");
+    }
+
+    /// GroupInfo updatedAt: uses RFC3339.
+    #[test]
+    fn test_group_info_timestamps_serialize_as_rfc3339() {
+        let g = GroupInfo::new(vec!["u1".to_string()]);
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(json.contains('T'), "GroupInfo updatedAt should be RFC3339; got: {}", json);
+    }
+
+    /// Deserialize GroupInfo from JSON (RFC3339 updatedAt).
+    #[test]
+    fn test_group_info_deserialize_minio_style_rfc3339() {
+        let minio_style = r#"{"version":1,"status":"enabled","members":["u1"],"updatedAt":"2025-03-07T12:00:00Z"}"#;
+        let g: GroupInfo = serde_json::from_str(minio_style).expect("deserialize");
+        assert_eq!(g.members, ["u1"]);
+        assert!(g.update_at.is_some());
     }
 }

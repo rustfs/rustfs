@@ -15,13 +15,14 @@
 use crate::admin::console::is_console_path;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
-use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
+use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
 use crate::storage::apply_cors_headers;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use rustfs_utils::get_env_opt_str;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -96,6 +97,64 @@ where
         let mut inner = self.inner.clone();
         Box::pin(async move { inner.call(req).await.map_err(Into::into) })
     }
+}
+
+#[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatLayer;
+
+impl<S> Layer<S> for AdminChunkedContentLengthCompatLayer {
+    type Service = AdminChunkedContentLengthCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AdminChunkedContentLengthCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatService<S> {
+    inner: S,
+}
+
+impl<S, ResBody> Service<HttpRequest<Incoming>> for AdminChunkedContentLengthCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+        if should_force_zero_content_length_for_admin_empty_body(&req) {
+            req.headers_mut()
+                .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+    }
+}
+
+fn should_force_zero_content_length_for_admin_empty_body<B>(req: &HttpRequest<B>) -> bool {
+    req.method() == Method::PUT
+        && is_empty_body_admin_put_path(req.uri().path())
+        && !req.headers().contains_key(http::header::CONTENT_LENGTH)
+}
+
+fn is_empty_body_admin_put_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/minio/admin/v3/set-user-status"
+            | "/minio/admin/v3/set-group-status"
+            | "/rustfs/admin/v3/set-user-status"
+            | "/rustfs/admin/v3/set-group-status"
+    )
 }
 
 #[derive(Clone)]
@@ -220,7 +279,9 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
 
     let path = req.uri().path();
     if path.starts_with(ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_PREFIX)
         || path.starts_with(RUSTFS_ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_V3_PREFIX)
         || path.starts_with(CONSOLE_PREFIX)
         || path.starts_with(RPC_PREFIX)
     {
@@ -253,7 +314,7 @@ pub struct ConditionalCorsLayer {
 
 impl ConditionalCorsLayer {
     pub fn new() -> Self {
-        let cors_origins = std::env::var("RUSTFS_CORS_ALLOWED_ORIGINS").ok().filter(|s| !s.is_empty());
+        let cors_origins = get_env_opt_str("RUSTFS_CORS_ALLOWED_ORIGINS").filter(|s| !s.is_empty());
         Self { cors_origins }
     }
 
@@ -263,6 +324,7 @@ impl ConditionalCorsLayer {
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
         !path.starts_with(ADMIN_PREFIX)
+            && !path.starts_with(MINIO_ADMIN_PREFIX)
             && !path.starts_with(RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
@@ -501,8 +563,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use temp_env::with_var;
+
+    #[test]
+    fn admin_chunked_put_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-user-status?accessKey=test&status=enabled")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn admin_request_with_explicit_content_length_is_left_unchanged() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn non_admin_chunked_put_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
 
     #[test]
     fn test_strip_quotes_from_first_etag_removes_quotes() {
@@ -553,6 +651,7 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/my-bucket/key"));
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
     }
@@ -592,6 +691,14 @@ mod tests {
             resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://allowed.com"
         );
+    }
+
+    #[test]
+    fn test_conditional_cors_layer_reads_env() {
+        with_var("RUSTFS_CORS_ALLOWED_ORIGINS", Some("https://allowed.com"), || {
+            let cors = ConditionalCorsLayer::new();
+            assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
+        });
     }
 
     #[tokio::test]

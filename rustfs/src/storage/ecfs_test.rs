@@ -17,7 +17,7 @@ mod tests {
     use crate::config::workload_profiles::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::ecfs::FS;
-    use crate::storage::ecfs::RUSTFS_OWNER;
+    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::{
         apply_cors_headers, check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal,
         matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
@@ -29,7 +29,10 @@ mod tests {
     use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
     use rustfs_ecstore::store_api::ObjectInfo;
-    use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, RESERVED_METADATA_PREFIX_LOWER};
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+        contains_key_str,
+    };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
         CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
@@ -68,11 +71,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rustfs_owner_constant() {
-        // Test that RUSTFS_OWNER constant is properly defined
-        assert!(!RUSTFS_OWNER.display_name.as_ref().unwrap().is_empty());
-        assert!(!RUSTFS_OWNER.id.as_ref().unwrap().is_empty());
-        assert_eq!(RUSTFS_OWNER.display_name.as_ref().unwrap(), "RustFS Tester");
+    fn test_rustfs_owner_helpers_are_stable() {
+        let owner = rustfs_owner();
+        let initiator = rustfs_initiator();
+
+        assert!(!owner.display_name.as_ref().unwrap().is_empty());
+        assert!(!owner.id.as_ref().unwrap().is_empty());
+        assert_eq!(owner.display_name.as_deref(), Some("rustfs"));
+        assert_eq!(initiator.display_name, owner.display_name);
+        assert_eq!(initiator.id, owner.id);
     }
 
     // Note: Most S3 API methods require complex setup with global state, storage backend,
@@ -440,9 +447,7 @@ mod tests {
             compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
             "2030-01-01T00:00:00Z"
         );
-        assert!(
-            compliance_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"))
-        );
+        assert!(contains_key_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
         let valid_governance_retention = ObjectLockRetention {
@@ -502,7 +507,7 @@ mod tests {
         };
         let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
         assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
-        assert!(on_metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp")));
+        assert!(contains_key_str(&on_metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP));
 
         // [3] Normal case: Legal hold with valid OFF status
         let valid_off_legal_hold = ObjectLockLegalHold {

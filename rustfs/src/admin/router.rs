@@ -14,7 +14,9 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
+use crate::server::{
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
+};
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -41,6 +43,18 @@ pub struct S3Router<T> {
 
 fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
+}
+
+fn is_admin_path(path: &str) -> bool {
+    path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX)
+}
+
+fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX) {
+        return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
+    }
+
+    std::borrow::Cow::Borrowed(path)
 }
 
 impl<T: Operation> S3Router<T> {
@@ -79,6 +93,12 @@ impl<T: Operation> S3Router<T> {
 impl<T: Operation> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
         let route = Self::make_route_str(method, path);
+        self.router.at(&route).is_ok()
+    }
+
+    pub(crate) fn contains_compatible_route(&self, method: Method, path: &str) -> bool {
+        let canonical_path = canonicalize_admin_path(path);
+        let route = Self::make_route_str(method, canonical_path.as_ref());
         self.router.at(&route).is_ok()
     }
 }
@@ -120,7 +140,7 @@ where
             return true;
         }
 
-        path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
+        is_admin_path(path) || path.starts_with(RPC_PREFIX) || is_console_path(path)
     }
 
     // check_access before call
@@ -207,7 +227,8 @@ where
             return Err(s3_error!(InternalError, "console is not enabled"));
         }
 
-        let uri = format!("{}|{}", &req.method, req.uri.path());
+        let canonical_path = canonicalize_admin_path(req.uri.path());
+        let uri = format!("{}|{}", &req.method, canonical_path.as_ref());
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
@@ -235,6 +256,24 @@ pub struct AdminOperation(pub &'static dyn Operation);
 impl Operation for AdminOperation {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         self.0.call(req, params).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
+        assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+        assert_eq!(canonicalize_admin_path("/rustfs/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+    }
+
+    #[test]
+    fn is_admin_path_accepts_rustfs_and_compat_prefixes() {
+        assert!(is_admin_path("/rustfs/admin/v3/info"));
+        assert!(is_admin_path("/minio/admin/v3/info"));
+        assert!(!is_admin_path("/bucket/object"));
     }
 }
 

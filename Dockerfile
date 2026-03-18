@@ -86,12 +86,7 @@ RUN addgroup -g 10001 -S rustfs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_CONSOLE_ADDRESS=":9001" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_CORS_ALLOWED_ORIGINS="*" \
+ENV RUSTFS_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
     RUSTFS_OBS_LOGGER_LEVEL=warn \

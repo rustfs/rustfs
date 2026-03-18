@@ -184,6 +184,7 @@ mod tests {
         build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params,
         parse_list_parts_params,
     };
+    use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
     use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
     use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
@@ -226,8 +227,8 @@ mod tests {
         assert_eq!(parts[0].part_number, Some(1));
         assert_eq!(parts[0].size, Some(11));
         assert_eq!(parts[0].e_tag, Some(to_s3s_etag("etag-1")));
-        assert!(output.owner.is_some());
-        assert!(output.initiator.is_some());
+        assert_eq!(output.owner, Some(rustfs_owner()));
+        assert_eq!(output.initiator, Some(rustfs_initiator()));
     }
 
     #[test]

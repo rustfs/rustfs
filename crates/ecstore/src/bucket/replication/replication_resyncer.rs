@@ -17,6 +17,7 @@ use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
 use crate::bucket::metadata_sys;
+use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replication_pool::GLOBAL_REPLICATION_STATS;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
@@ -50,7 +51,7 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use regex::Regex;
 use rustfs_filemeta::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATION_RESET, ReplicateDecision, ReplicateObjectInfo,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
     ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
@@ -58,8 +59,13 @@ use rustfs_filemeta::{
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    RESERVED_METADATA_PREFIX, RESERVED_METADATA_PREFIX_LOWER, RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE,
-    RUSTFS_REPLICATION_RESET_STATUS, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, headers,
+    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
+};
+use rustfs_utils::http::{
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
+    has_internal_suffix, insert_header_map, insert_str, internal_key_strip_suffix_prefix, is_internal_key,
 };
 use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
@@ -69,7 +75,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::{Cursor, Read};
+use std::sync::{Arc, LazyLock};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
@@ -80,13 +87,28 @@ use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 
-const REPLICATION_DIR: &str = ".replication";
-const RESYNC_FILE_NAME: &str = "resync.bin";
-const RESYNC_META_FORMAT: u16 = 1;
-const RESYNC_META_VERSION: u16 = 1;
+pub(crate) const REPLICATION_DIR: &str = ".replication";
+pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
+pub(crate) const RESYNC_META_FORMAT: u16 = 1;
+pub(crate) const RESYNC_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
+const WIRE_ZERO_TIME_UNIX: i64 = -62_135_596_800;
+
+static WIRE_ZERO_TIME: LazyLock<OffsetDateTime> =
+    LazyLock::new(|| OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).unwrap_or(OffsetDateTime::UNIX_EPOCH));
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
+
+fn wire_time_or_default(value: Option<OffsetDateTime>) -> OffsetDateTime {
+    value.unwrap_or(*WIRE_ZERO_TIME)
+}
+
+fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    match value {
+        Some(v) if v == *WIRE_ZERO_TIME || v == OffsetDateTime::UNIX_EPOCH => None,
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
@@ -139,11 +161,196 @@ impl BucketReplicationResyncStatus {
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        Ok(rmp_serde::to_vec(&self)?)
+        let mut wr = Vec::new();
+        rmp::encode::write_map_len(&mut wr, 4)?;
+        rmp::encode::write_str(&mut wr, "v")?;
+        rmp::encode::write_i32(&mut wr, i32::from(self.version))?;
+        rmp::encode::write_str(&mut wr, "brs")?;
+        rmp::encode::write_map_len(&mut wr, self.targets_map.len() as u32)?;
+        for (arn, status) in &self.targets_map {
+            rmp::encode::write_str(&mut wr, arn)?;
+            status.marshal_wire_msg(&mut wr)?;
+        }
+        rmp::encode::write_str(&mut wr, "id")?;
+        rmp::encode::write_i32(&mut wr, self.id)?;
+        rmp::encode::write_str(&mut wr, "lu")?;
+        write_msgp_time(&mut wr, wire_time_or_default(self.last_update))?;
+        Ok(wr)
     }
 
     pub fn unmarshal_msg(data: &[u8]) -> Result<Self> {
+        let mut rd = Cursor::new(data);
+        let mut out = Self::new();
+        let mut fields = rmp::decode::read_map_len(&mut rd)?;
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_str(&mut rd)?;
+            match key.as_str() {
+                "v" => {
+                    let v: i32 = rmp::decode::read_int(&mut rd)?;
+                    out.version = u16::try_from(v).map_err(|_| Error::other("invalid resync version"))?;
+                }
+                "brs" => {
+                    let map_len = rmp::decode::read_map_len(&mut rd)?;
+                    let mut targets = HashMap::with_capacity(map_len as usize);
+                    for _ in 0..map_len {
+                        let arn = read_msgp_str(&mut rd)?;
+                        let status = TargetReplicationResyncStatus::unmarshal_wire_msg(&mut rd)?;
+                        targets.insert(arn, status);
+                    }
+                    out.targets_map = targets;
+                }
+                "id" => {
+                    out.id = rmp::decode::read_int::<i32, _>(&mut rd)?;
+                }
+                "lu" => {
+                    out.last_update = normalize_wire_time(read_msgp_time_or_nil(&mut rd)?);
+                }
+                _ => skip_msgp_value(&mut rd)?,
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn unmarshal_legacy_msg(data: &[u8]) -> Result<Self> {
         Ok(rmp_serde::from_slice(data)?)
+    }
+}
+
+pub(crate) fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
+    let payload = status.marshal_msg()?;
+    let mut data = Vec::with_capacity(4 + payload.len());
+    let mut major = [0u8; 2];
+    byteorder::LittleEndian::write_u16(&mut major, RESYNC_META_FORMAT);
+    data.extend_from_slice(&major);
+    let mut minor = [0u8; 2];
+    byteorder::LittleEndian::write_u16(&mut minor, RESYNC_META_VERSION);
+    data.extend_from_slice(&minor);
+    data.extend_from_slice(&payload);
+    Ok(data)
+}
+
+pub(crate) fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
+    if data.len() <= 4 {
+        return Err(Error::CorruptedFormat);
+    }
+
+    let mut major = [0u8; 2];
+    major.copy_from_slice(&data[0..2]);
+    if byteorder::LittleEndian::read_u16(&major) != RESYNC_META_FORMAT {
+        return Err(Error::CorruptedFormat);
+    }
+
+    let mut minor = [0u8; 2];
+    minor.copy_from_slice(&data[2..4]);
+    if byteorder::LittleEndian::read_u16(&minor) != RESYNC_META_VERSION {
+        return Err(Error::CorruptedFormat);
+    }
+
+    let status = match BucketReplicationResyncStatus::unmarshal_msg(&data[4..]) {
+        Ok(v) => v,
+        Err(_) => BucketReplicationResyncStatus::unmarshal_legacy_msg(&data[4..])?,
+    };
+    if status.version != RESYNC_META_VERSION {
+        return Err(Error::CorruptedFormat);
+    }
+    Ok(status)
+}
+
+impl TargetReplicationResyncStatus {
+    fn marshal_wire_msg(&self, wr: &mut Vec<u8>) -> Result<()> {
+        rmp::encode::write_map_len(wr, 11)?;
+        rmp::encode::write_str(wr, "st")?;
+        write_msgp_time(wr, wire_time_or_default(self.start_time))?;
+        rmp::encode::write_str(wr, "lst")?;
+        write_msgp_time(wr, wire_time_or_default(self.last_update))?;
+        rmp::encode::write_str(wr, "id")?;
+        rmp::encode::write_str(wr, &self.resync_id)?;
+        rmp::encode::write_str(wr, "rdt")?;
+        write_msgp_time(wr, wire_time_or_default(self.resync_before_date))?;
+        rmp::encode::write_str(wr, "rst")?;
+        rmp::encode::write_i32(wr, resync_status_to_i32(self.resync_status))?;
+        rmp::encode::write_str(wr, "fs")?;
+        rmp::encode::write_i64(wr, self.failed_size)?;
+        rmp::encode::write_str(wr, "frc")?;
+        rmp::encode::write_i64(wr, self.failed_count)?;
+        rmp::encode::write_str(wr, "rs")?;
+        rmp::encode::write_i64(wr, self.replicated_size)?;
+        rmp::encode::write_str(wr, "rrc")?;
+        rmp::encode::write_i64(wr, self.replicated_count)?;
+        rmp::encode::write_str(wr, "bkt")?;
+        rmp::encode::write_str(wr, &self.bucket)?;
+        rmp::encode::write_str(wr, "obj")?;
+        rmp::encode::write_str(wr, &self.object)?;
+        Ok(())
+    }
+
+    fn unmarshal_wire_msg<R: Read>(rd: &mut R) -> Result<Self> {
+        let mut out = Self::new();
+        let mut fields = rmp::decode::read_map_len(rd)?;
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_str(rd)?;
+            match key.as_str() {
+                "st" => out.start_time = normalize_wire_time(read_msgp_time_or_nil(rd)?),
+                "lst" => out.last_update = normalize_wire_time(read_msgp_time_or_nil(rd)?),
+                "id" => out.resync_id = read_msgp_str(rd)?,
+                "rdt" => out.resync_before_date = normalize_wire_time(read_msgp_time_or_nil(rd)?),
+                "rst" => {
+                    let v: i32 = rmp::decode::read_int(rd)?;
+                    out.resync_status = resync_status_from_i32(v)?;
+                }
+                "fs" => out.failed_size = rmp::decode::read_int(rd)?,
+                "frc" => out.failed_count = rmp::decode::read_int(rd)?,
+                "rs" => out.replicated_size = rmp::decode::read_int(rd)?,
+                "rrc" => out.replicated_count = rmp::decode::read_int(rd)?,
+                "bkt" => out.bucket = read_msgp_str(rd)?,
+                "obj" => out.object = read_msgp_str(rd)?,
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
+    let len = rmp::decode::read_str_len(rd)? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(String::from_utf8(buf)?)
+}
+
+fn read_msgp_time_or_nil<R: Read>(rd: &mut R) -> Result<Option<OffsetDateTime>> {
+    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    match marker {
+        rmp::Marker::Null => Ok(None),
+        rmp::Marker::Ext8 => Ok(Some(read_msgp_ext8_time(rd)?)),
+        other => Err(Error::other(format!("expected time ext or nil, got marker: {other:?}"))),
+    }
+}
+
+fn resync_status_to_i32(status: ResyncStatusType) -> i32 {
+    match status {
+        ResyncStatusType::NoResync => 0,
+        ResyncStatusType::ResyncPending => 1,
+        ResyncStatusType::ResyncCanceled => 2,
+        ResyncStatusType::ResyncStarted => 3,
+        ResyncStatusType::ResyncCompleted => 4,
+        ResyncStatusType::ResyncFailed => 5,
+    }
+}
+
+fn resync_status_from_i32(code: i32) -> Result<ResyncStatusType> {
+    match code {
+        0 => Ok(ResyncStatusType::NoResync),
+        1 => Ok(ResyncStatusType::ResyncPending),
+        2 => Ok(ResyncStatusType::ResyncCanceled),
+        3 => Ok(ResyncStatusType::ResyncStarted),
+        4 => Ok(ResyncStatusType::ResyncCompleted),
+        5 => Ok(ResyncStatusType::ResyncFailed),
+        _ => Err(Error::other(format!("invalid resync status code: {code}"))),
     }
 }
 
@@ -617,7 +824,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 
         let keys_to_update: Vec<_> = user_defined
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}").as_str()))
+            .filter(|(k, _)| has_internal_suffix(k, SUFFIX_REPLICATION_RESET))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -695,19 +902,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 }
 
 async fn save_resync_status<S: StorageAPI>(bucket: &str, status: &BucketReplicationResyncStatus, api: Arc<S>) -> Result<()> {
-    let buf = status.marshal_msg()?;
-
-    let mut data = Vec::new();
-
-    let mut major = [0u8; 2];
-    byteorder::LittleEndian::write_u16(&mut major, RESYNC_META_FORMAT);
-    data.extend_from_slice(&major);
-
-    let mut minor = [0u8; 2];
-    byteorder::LittleEndian::write_u16(&mut minor, RESYNC_META_VERSION);
-    data.extend_from_slice(&minor);
-
-    data.extend_from_slice(&buf);
+    let data = encode_resync_file(status)?;
 
     let config_file = path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR, RESYNC_FILE_NAME]);
     save_config(api, &config_file, data).await?;
@@ -900,8 +1095,8 @@ pub fn resync_target(
     let rs = oi
         .user_defined
         .get(target_reset_header(arn).as_str())
-        .or(oi.user_defined.get(RUSTFS_REPLICATION_RESET_STATUS))
-        .map(|s| s.to_string());
+        .cloned()
+        .or_else(|| get_header_map(&oi.user_defined, SUFFIX_REPLICATION_RESET_STATUS));
 
     let mut dec = ResyncTargetDecision::default();
 
@@ -1132,15 +1327,7 @@ impl ObjectInfoExt for ObjectInfo {
                 .user_defined
                 .iter()
                 .filter_map(|(k, v)| {
-                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}")) {
-                        Some((
-                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}-{REPLICATION_RESET}"))
-                                .to_string(),
-                            v.clone(),
-                        ))
-                    } else {
-                        None
-                    }
+                    internal_key_strip_suffix_prefix(k, SUFFIX_REPLICATION_RESET_ARN_PREFIX).map(|arn| (arn, v.clone()))
                 })
                 .collect(),
             ..Default::default()
@@ -1893,7 +2080,7 @@ pub async fn replicate_object<S: StorageAPI>(roi: ReplicateObjectInfo, storage: 
     if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
         let mut eval_metadata = HashMap::new();
         if let Some(ref s) = new_replication_internal {
-            eval_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}replication-status"), s.clone());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, s.clone());
         }
         let popts = ObjectOptions {
             version_id: roi.version_id.map(|v| v.to_string()),
@@ -2549,8 +2736,6 @@ static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
     ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
 ];
 
-const REPLICATION_SSEC_CHECKSUM_HEADER: &str = "X-Rustfs-Replication-Ssec-Crc";
-
 fn is_valid_sse_header(k: &str) -> Option<&str> {
     VALID_SSE_REPLICATION_HEADERS
         .iter()
@@ -2574,7 +2759,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
 
         // In case of SSE-C objects copy the allowed internal headers as well
         if !is_ssec || !has_valid_sse_header {
-            if strings_has_prefix_fold(k, RESERVED_METADATA_PREFIX) {
+            if is_internal_key(k) {
                 continue;
             }
             if is_standard_header(k) {
@@ -2598,7 +2783,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         // Add encrypted CRC to metadata for SSE-C objects
         if is_ssec {
             let encoded = BASE64_STANDARD.encode(checksum_data);
-            meta.insert(REPLICATION_SSEC_CHECKSUM_HEADER.to_string(), encoded);
+            insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
         } else {
             // Get checksum metadata for non-SSE-C objects
             let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
@@ -2658,11 +2843,8 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         if !tags.is_empty() {
             put_op.user_tags = tags;
             // set tag timestamp in opts
-            put_op.internal.tagging_timestamp = if let Some(ts) = object_info
-                .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}tagging-timestamp"))
-            {
-                OffsetDateTime::parse(ts, &Rfc3339)
+            put_op.internal.tagging_timestamp = if let Some(ts) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
+                OffsetDateTime::parse(&ts, &Rfc3339)
                     .map_err(|e| Error::other(format!("Failed to parse tagging timestamp: {}", e)))?
             } else {
                 object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
@@ -2694,28 +2876,24 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         put_op.retain_until_date =
             OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
         // set retention timestamp in opts
-        put_op.internal.retention_timestamp = if let Some(v) = object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-retention-timestamp"))
-        {
-            OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        };
+        put_op.internal.retention_timestamp =
+            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP) {
+                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            };
     }
 
     if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_LEGAL_HOLD) {
         let hold = v.to_uppercase();
         put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
         // set legalhold timestamp in opts
-        put_op.internal.legalhold_timestamp = if let Some(v) = object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}objectlock-legalhold-timestamp"))
-        {
-            OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        };
+        put_op.internal.legalhold_timestamp =
+            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP) {
+                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            };
     }
 
     // Handle SSE-S3 encryption
@@ -2736,7 +2914,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
         // If KMS key ID replication is enabled (as by default)
         // we include the object's KMS key ID. In any case, we
         // always set the SSE-KMS header. If no KMS key ID is
-        // specified, MinIO is supposed to use whatever default
+        // specified, the server uses the default applicable
         // config applies on the site or bucket.
         // TODO: Implement SSE-KMS support with key ID replication
         // let key_id = if kms::replicate_key_id() {
@@ -2859,13 +3037,10 @@ async fn replicate_object_with_multipart<S: StorageAPI>(ctx: MultipartReplicatio
 
     let mut user_metadata = HashMap::new();
 
-    user_metadata.insert(
-        RUSTFS_REPLICATION_ACTUAL_OBJECT_SIZE.to_string(),
-        object_info
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX}actual-size"))
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+    insert_header_map(
+        &mut user_metadata,
+        SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
+        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default(),
     );
 
     cli.complete_multipart_upload(
@@ -2994,6 +3169,9 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::msgp_decode::write_msgp_time;
+    use std::collections::HashMap;
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[test]
@@ -3008,6 +3186,176 @@ mod tests {
     fn test_part_range_spec_rejects_non_positive() {
         assert!(part_range_spec_from_actual_size(0, 0).is_err());
         assert!(part_range_spec_from_actual_size(0, -1).is_err());
+    }
+
+    #[test]
+    fn test_unmarshal_resync_payload() {
+        let start = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid ts");
+        let last = OffsetDateTime::from_unix_timestamp(1_700_000_123).expect("valid ts");
+        let before = OffsetDateTime::from_unix_timestamp(1_699_000_000).expect("valid ts");
+        let bucket_last = OffsetDateTime::from_unix_timestamp(1_700_111_111).expect("valid ts");
+
+        let mut payload = Vec::new();
+        rmp::encode::write_map_len(&mut payload, 4).expect("write map");
+        rmp::encode::write_str(&mut payload, "v").expect("write key");
+        rmp::encode::write_i32(&mut payload, 1).expect("write version");
+        rmp::encode::write_str(&mut payload, "brs").expect("write key");
+        rmp::encode::write_map_len(&mut payload, 1).expect("write target map");
+        rmp::encode::write_str(&mut payload, "arn:replication::1:dest").expect("write arn");
+        rmp::encode::write_map_len(&mut payload, 11).expect("write target");
+        rmp::encode::write_str(&mut payload, "st").expect("write key");
+        write_msgp_time(&mut payload, start).expect("write time");
+        rmp::encode::write_str(&mut payload, "lst").expect("write key");
+        write_msgp_time(&mut payload, last).expect("write time");
+        rmp::encode::write_str(&mut payload, "id").expect("write key");
+        rmp::encode::write_str(&mut payload, "resync-1").expect("write id");
+        rmp::encode::write_str(&mut payload, "rdt").expect("write key");
+        write_msgp_time(&mut payload, before).expect("write time");
+        rmp::encode::write_str(&mut payload, "rst").expect("write key");
+        rmp::encode::write_i32(&mut payload, 3).expect("write status");
+        rmp::encode::write_str(&mut payload, "fs").expect("write key");
+        rmp::encode::write_i64(&mut payload, 11).expect("write fs");
+        rmp::encode::write_str(&mut payload, "frc").expect("write key");
+        rmp::encode::write_i64(&mut payload, 2).expect("write frc");
+        rmp::encode::write_str(&mut payload, "rs").expect("write key");
+        rmp::encode::write_i64(&mut payload, 101).expect("write rs");
+        rmp::encode::write_str(&mut payload, "rrc").expect("write key");
+        rmp::encode::write_i64(&mut payload, 9).expect("write rrc");
+        rmp::encode::write_str(&mut payload, "bkt").expect("write key");
+        rmp::encode::write_str(&mut payload, "bucket-a").expect("write bucket");
+        rmp::encode::write_str(&mut payload, "obj").expect("write key");
+        rmp::encode::write_str(&mut payload, "object-a").expect("write obj");
+        rmp::encode::write_str(&mut payload, "id").expect("write key");
+        rmp::encode::write_i32(&mut payload, 42).expect("write id");
+        rmp::encode::write_str(&mut payload, "lu").expect("write key");
+        write_msgp_time(&mut payload, bucket_last).expect("write lu");
+
+        let got = BucketReplicationResyncStatus::unmarshal_msg(&payload).expect("decode");
+        assert_eq!(got.version, 1);
+        assert_eq!(got.id, 42);
+        assert_eq!(got.last_update, Some(bucket_last));
+        let tgt = got.targets_map.get("arn:replication::1:dest").expect("target exists");
+        assert_eq!(tgt.resync_id, "resync-1");
+        assert_eq!(tgt.resync_status, ResyncStatusType::ResyncStarted);
+        assert_eq!(tgt.bucket, "bucket-a");
+        assert_eq!(tgt.object, "object-a");
+        assert_eq!(tgt.start_time, Some(start));
+        assert_eq!(tgt.last_update, Some(last));
+        assert_eq!(tgt.resync_before_date, Some(before));
+    }
+
+    #[test]
+    fn test_unmarshal_legacy_resync_payload() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.id = 7;
+        status.version = 1;
+        status.last_update = Some(OffsetDateTime::from_unix_timestamp(1_700_222_222).expect("valid ts"));
+        status.targets_map = HashMap::from([(
+            "legacy-arn".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "legacy-1".to_string(),
+                resync_status: ResyncStatusType::ResyncCompleted,
+                ..Default::default()
+            },
+        )]);
+
+        let old_payload = rmp_serde::to_vec(&status).expect("legacy encode");
+        let got = BucketReplicationResyncStatus::unmarshal_legacy_msg(&old_payload).expect("legacy decode");
+        assert_eq!(got.id, 7);
+        assert_eq!(got.version, 1);
+        assert_eq!(got.targets_map["legacy-arn"].resync_id, "legacy-1");
+        assert_eq!(got.targets_map["legacy-arn"].resync_status, ResyncStatusType::ResyncCompleted);
+    }
+
+    #[test]
+    fn test_resync_file_roundtrip_wire_format() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.id = 19;
+        status.last_update = Some(OffsetDateTime::from_unix_timestamp(1_700_333_333).expect("valid ts"));
+        status.targets_map = HashMap::from([(
+            "arn:replication::1:dest".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "wire-1".to_string(),
+                resync_status: ResyncStatusType::ResyncStarted,
+                replicated_count: 5,
+                ..Default::default()
+            },
+        )]);
+
+        let bytes = encode_resync_file(&status).expect("encode file");
+        assert_eq!(&bytes[0..2], &RESYNC_META_FORMAT.to_le_bytes());
+        assert_eq!(&bytes[2..4], &RESYNC_META_VERSION.to_le_bytes());
+
+        let got = decode_resync_file(&bytes).expect("decode file");
+        assert_eq!(got.version, RESYNC_META_VERSION);
+        assert_eq!(got.id, 19);
+        assert_eq!(got.targets_map["arn:replication::1:dest"].resync_id, "wire-1");
+        assert_eq!(got.targets_map["arn:replication::1:dest"].replicated_count, 5);
+    }
+
+    #[test]
+    fn test_resync_file_decodes_legacy_payload() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.id = 7;
+        status.version = RESYNC_META_VERSION;
+        status.targets_map = HashMap::from([(
+            "legacy-arn".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "legacy-v1".to_string(),
+                resync_status: ResyncStatusType::ResyncCompleted,
+                ..Default::default()
+            },
+        )]);
+
+        let legacy_payload = rmp_serde::to_vec(&status).expect("legacy encode");
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&RESYNC_META_FORMAT.to_le_bytes());
+        file_bytes.extend_from_slice(&RESYNC_META_VERSION.to_le_bytes());
+        file_bytes.extend_from_slice(&legacy_payload);
+
+        let got = decode_resync_file(&file_bytes).expect("decode legacy");
+        assert_eq!(got.id, 7);
+        assert_eq!(got.targets_map["legacy-arn"].resync_id, "legacy-v1");
+        assert_eq!(got.targets_map["legacy-arn"].resync_status, ResyncStatusType::ResyncCompleted);
+    }
+
+    #[test]
+    fn test_resync_none_time_encodes_as_wire_zero_and_decodes_to_none() {
+        let wire_zero = OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).expect("valid wire zero timestamp");
+
+        let mut with_none = BucketReplicationResyncStatus::new();
+        with_none.id = 77;
+        with_none.targets_map = HashMap::from([(
+            "arn:replication::1:dest".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "wire-none".to_string(),
+                resync_status: ResyncStatusType::ResyncStarted,
+                replicated_count: 1,
+                ..Default::default()
+            },
+        )]);
+
+        let mut with_zero = with_none.clone();
+        with_zero.last_update = Some(wire_zero);
+        if let Some(target) = with_zero.targets_map.get_mut("arn:replication::1:dest") {
+            target.start_time = Some(wire_zero);
+            target.last_update = Some(wire_zero);
+            target.resync_before_date = Some(wire_zero);
+        }
+
+        let encoded_none = encode_resync_file(&with_none).expect("encode with none");
+        let encoded_zero = encode_resync_file(&with_zero).expect("encode with zero");
+        assert_eq!(encoded_none, encoded_zero);
+
+        let decoded = decode_resync_file(&encoded_none).expect("decode");
+        let target = decoded
+            .targets_map
+            .get("arn:replication::1:dest")
+            .expect("target should exist");
+        assert_eq!(decoded.last_update, None);
+        assert_eq!(target.start_time, None);
+        assert_eq!(target.last_update, None);
+        assert_eq!(target.resync_before_date, None);
     }
 
     #[test]

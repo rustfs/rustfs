@@ -56,6 +56,7 @@ moka = { workspace = true, features = ["future"] }
 # Additional dependencies
 md5 = { workspace = true }
 arc-swap = { workspace = true }
+rustfs-utils = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
@@ -63,6 +64,7 @@ vaultrs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 
 [features]
 default = []

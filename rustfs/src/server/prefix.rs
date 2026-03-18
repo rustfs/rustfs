@@ -36,9 +36,16 @@ pub(crate) const HEALTH_READY_PATH: &str = "/health/ready";
 /// such as configuration, monitoring, and management.
 pub(crate) const ADMIN_PREFIX: &str = "/rustfs/admin";
 
+/// MinIO-compatible administrative prefix accepted by RustFS.
+/// This alias allows stock MinIO admin tooling to reach RustFS handlers.
+pub(crate) const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
+
 /// Environment variable name for overriding the default
 /// administrative prefix path.
 pub(crate) const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
+
+/// MinIO-compatible admin API prefix accepted by RustFS.
+pub(crate) const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 
 /// Predefined console prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle console-related tasks

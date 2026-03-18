@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::storageclass::STANDARD;
-use crate::disk::RUSTFS_META_BUCKET;
+use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use regex::Regex;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS};
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ pub fn clean_metadata_keys(metadata: &mut HashMap<String, String>, key_names: &[
 
 // Check whether the bucket is the metadata bucket
 fn is_meta_bucket(bucket_name: &str) -> bool {
-    bucket_name == RUSTFS_META_BUCKET
+    bucket_name == RUSTFS_META_BUCKET || bucket_name == MIGRATING_META_BUCKET
 }
 
 // Check whether the bucket is reserved
@@ -164,6 +164,8 @@ mod tests {
     fn test_meta_bucket_is_invalid() {
         assert!(is_reserved_or_invalid_bucket(RUSTFS_META_BUCKET, false));
         assert!(is_reserved_or_invalid_bucket(RUSTFS_META_BUCKET, true));
+        assert!(is_reserved_or_invalid_bucket(MIGRATING_META_BUCKET, false));
+        assert!(is_reserved_or_invalid_bucket(MIGRATING_META_BUCKET, true));
     }
 
     #[test]

@@ -31,11 +31,12 @@ process_data_volumes() {
   VOLUME_LIST=""
   for vol in $VOLUME_LIST_RAW; do
       # Helper to manually expand {N..M} since sh doesn't support it on variables
-      if echo "$vol" | grep -E -q "\{[0-9]+\.\.[0-9]+\}"; then
+      if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
            PREFIX=${vol%%\{*}
            SUFFIX=${vol##*\}}
            RANGE=${vol#*\{}
            RANGE=${RANGE%\}}
+           RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
            START=${RANGE%%..*}
            END=${RANGE##*..}
            

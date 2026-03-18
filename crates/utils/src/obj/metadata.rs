@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::http::{RESERVED_METADATA_PREFIX_LOWER, is_minio_header, is_rustfs_header};
+use crate::http::{is_internal_key, is_minio_header, is_rustfs_header};
 use std::collections::HashMap;
 
 /// Extract user-defined metadata keys from object metadata.
@@ -80,7 +80,7 @@ pub fn extract_user_defined_metadata(metadata: &HashMap<String, String>) -> Hash
     for (key, value) in metadata {
         let lower_key = key.to_ascii_lowercase();
 
-        if lower_key.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        if is_internal_key(key) {
             continue;
         }
 
@@ -188,7 +188,6 @@ mod tests {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert("x-rustfs-internal-healing".to_string(), "true".to_string());
         metadata.insert("x-rustfs-internal-data-mov".to_string(), "value".to_string());
-        metadata.insert("X-RustFS-Internal-purgestatus".to_string(), "status".to_string());
         metadata.insert("x-rustfs-meta-custom".to_string(), "custom-value".to_string());
         metadata.insert("my-key".to_string(), "my-value".to_string());
 

@@ -118,41 +118,38 @@ fn bench_encode_performance(c: &mut Criterion) {
         });
         group.finish();
 
-        // Test direct SIMD implementation for large shards (>= 512 bytes)
+        // Test direct reed-solomon-erasure implementation for large shards (>= 512 bytes)
         let shard_size = calc_shard_size(config.data_size, config.data_shards);
-        if shard_size >= 512 {
-            let mut simd_group = c.benchmark_group("encode_simd_direct");
-            simd_group.throughput(Throughput::Bytes(config.data_size as u64));
-            simd_group.sample_size(10);
-            simd_group.measurement_time(Duration::from_secs(5));
+        if shard_size >= 512 && config.parity_shards > 0 {
+            use reed_solomon_erasure::galois_8::ReedSolomon;
 
-            simd_group.bench_with_input(BenchmarkId::new("simd_direct", &config.name), &(&data, &config), |b, (data, config)| {
-                b.iter(|| {
-                    // Direct SIMD implementation
-                    let per_shard_size = calc_shard_size(data.len(), config.data_shards);
-                    match reed_solomon_simd::ReedSolomonEncoder::new(config.data_shards, config.parity_shards, per_shard_size) {
-                        Ok(mut encoder) => {
-                            // Create properly sized buffer and fill with data
-                            let mut buffer = vec![0u8; per_shard_size * config.data_shards];
+            let mut rse_group = c.benchmark_group("encode_rse_direct");
+            rse_group.throughput(Throughput::Bytes(config.data_size as u64));
+            rse_group.sample_size(10);
+            rse_group.measurement_time(Duration::from_secs(5));
+
+            if let Ok(rs) = ReedSolomon::new(config.data_shards, config.parity_shards) {
+                let total_shards = config.data_shards + config.parity_shards;
+                let per_shard_size = calc_shard_size(config.data_size, config.data_shards);
+                let need_total = per_shard_size * total_shards;
+
+                rse_group.bench_with_input(
+                    BenchmarkId::new("rse_direct", &config.name),
+                    &(&data, need_total, per_shard_size),
+                    |b, (data, need_total, per_shard_size)| {
+                        b.iter(|| {
+                            let mut buffer = vec![0u8; *need_total];
                             let copy_len = data.len().min(buffer.len());
                             buffer[..copy_len].copy_from_slice(&data[..copy_len]);
 
-                            // Add data shards with correct shard size
-                            for chunk in buffer.chunks_exact(per_shard_size) {
-                                encoder.add_original_shard(black_box(chunk)).unwrap();
-                            }
-
-                            let result = encoder.encode().unwrap();
-                            black_box(result);
-                        }
-                        Err(_) => {
-                            // SIMD doesn't support this configuration, skip
-                            black_box(());
-                        }
-                    }
-                });
-            });
-            simd_group.finish();
+                            let mut slices: Vec<&mut [u8]> = buffer.chunks_exact_mut(*per_shard_size).collect();
+                            rs.encode(&mut slices).unwrap();
+                            black_box(buffer);
+                        });
+                    },
+                );
+            }
+            rse_group.finish();
         }
     }
 }
@@ -203,47 +200,33 @@ fn bench_decode_performance(c: &mut Criterion) {
         );
         group.finish();
 
-        // Test direct SIMD decoding for large shards
+        // Test direct reed-solomon-erasure decoding for large shards
         let shard_size = calc_shard_size(config.data_size, config.data_shards);
-        if shard_size >= 512 {
-            let mut simd_group = c.benchmark_group("decode_simd_direct");
-            simd_group.throughput(Throughput::Bytes(config.data_size as u64));
-            simd_group.sample_size(10);
-            simd_group.measurement_time(Duration::from_secs(5));
+        if shard_size >= 512 && config.parity_shards > 0 {
+            use reed_solomon_erasure::galois_8::ReedSolomon;
 
-            simd_group.bench_with_input(
-                BenchmarkId::new("simd_direct", &config.name),
-                &(&encoded_shards, &config),
-                |b, (shards, config)| {
-                    b.iter(|| {
-                        let per_shard_size = calc_shard_size(config.data_size, config.data_shards);
-                        match reed_solomon_simd::ReedSolomonDecoder::new(config.data_shards, config.parity_shards, per_shard_size)
-                        {
-                            Ok(mut decoder) => {
-                                // Add available shards (except lost ones)
-                                for (i, shard) in shards.iter().enumerate() {
-                                    if i != config.data_shards - 1 && i != config.data_shards {
-                                        if i < config.data_shards {
-                                            decoder.add_original_shard(i, black_box(shard)).unwrap();
-                                        } else {
-                                            let recovery_idx = i - config.data_shards;
-                                            decoder.add_recovery_shard(recovery_idx, black_box(shard)).unwrap();
-                                        }
-                                    }
-                                }
+            if let Ok(rs) = ReedSolomon::new(config.data_shards, config.parity_shards) {
+                let mut rse_group = c.benchmark_group("decode_rse_direct");
+                rse_group.throughput(Throughput::Bytes(config.data_size as u64));
+                rse_group.sample_size(10);
+                rse_group.measurement_time(Duration::from_secs(5));
 
-                                let result = decoder.decode().unwrap();
-                                black_box(result);
-                            }
-                            Err(_) => {
-                                // SIMD doesn't support this configuration, skip
-                                black_box(());
-                            }
-                        }
-                    });
-                },
-            );
-            simd_group.finish();
+                rse_group.bench_with_input(
+                    BenchmarkId::new("rse_direct", &config.name),
+                    &(&encoded_shards, &config),
+                    |b, (shards, config)| {
+                        b.iter(|| {
+                            let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|s| Some(s.to_vec())).collect();
+                            shards_opt[config.data_shards - 1] = None;
+                            shards_opt[config.data_shards] = None;
+
+                            rs.reconstruct_data(&mut shards_opt).unwrap();
+                            black_box(shards_opt);
+                        });
+                    },
+                );
+                rse_group.finish();
+            }
         }
     }
 }
