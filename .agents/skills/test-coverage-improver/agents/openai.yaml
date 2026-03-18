@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Coverage Improver"
+  short_description: "Find top uncovered risk areas and propose high-impact tests."
+  default_prompt: "Run coverage checks, identify largest gaps, and recommend highest-impact test cases to improve risk coverage."

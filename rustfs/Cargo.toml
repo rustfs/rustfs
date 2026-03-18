@@ -36,6 +36,7 @@ metrics = []
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
+license = []
 full = ["metrics", "ftps", "swift", "webdav"]
 
 [lints]

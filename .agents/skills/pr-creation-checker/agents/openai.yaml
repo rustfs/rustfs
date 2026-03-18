@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Creation Checker"
+  short_description: "Draft RustFS-ready PRs with checks, template, and blockers."
+  default_prompt: "Inspect a branch or diff, verify required PR checks, and produce a compliant English PR title/body plus blockers or readiness status."
