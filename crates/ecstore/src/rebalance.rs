@@ -476,11 +476,8 @@ impl ECStore {
 
                 info!("rebalanceMeta: rebalance meta loaded1");
 
-                if let Err(err) = self.update_rebalance_stats().await {
-                    error!("Failed to update rebalance stats: {}", err);
-                } else {
-                    info!("rebalanceMeta: rebalance meta loaded2");
-                }
+                resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
+                info!("rebalanceMeta: rebalance meta loaded2");
             }
             Err(err) => {
                 if err != Error::ConfigNotFound {
@@ -1068,6 +1065,10 @@ fn resolve_rebalance_stats_update_result(result: Result<()>, pool_idx: usize, bu
             "rebalance stats update failed for pool {pool_idx} bucket {bucket} object {object_name}: {err}"
         ))
     })
+}
+
+fn resolve_load_rebalance_stats_update_result(result: Result<()>) -> Result<()> {
+    result.map_err(|err| Error::other(format!("rebalance metadata stats refresh failed after load: {err}")))
 }
 
 async fn send_rebalance_done_signal(
@@ -1708,11 +1709,12 @@ mod rebalance_unit_tests {
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_worker_result, send_rebalance_done_signal,
-        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue,
     };
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -2160,6 +2162,18 @@ mod rebalance_unit_tests {
             err.to_string()
                 .contains("rebalance stats update failed for pool 2 bucket bucket-a object obj.txt")
         );
+    }
+
+    #[test]
+    fn test_resolve_load_rebalance_stats_update_result_passthrough() {
+        assert!(resolve_load_rebalance_stats_update_result(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_load_rebalance_stats_update_result_wraps_error_context() {
+        let err = resolve_load_rebalance_stats_update_result(Err(Error::SlowDown))
+            .expect_err("load-time stats refresh failure should include context");
+        assert!(err.to_string().contains("rebalance metadata stats refresh failed after load"));
     }
 
     #[tokio::test]
