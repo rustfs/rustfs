@@ -193,3 +193,63 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-redirect";
+    let object_key = "post-redirect-object.txt";
+    let expected_body = b"anonymous-post-redirect-body".to_vec();
+    let redirect_target = "https://example.com/upload/callback?origin=test";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("success_action_redirect", redirect_target.to_string())
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let post_resp = http
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(
+        post_resp.status(),
+        reqwest::StatusCode::SEE_OTHER,
+        "PostObject should return redirect status when success_action_redirect is set"
+    );
+
+    let location = post_resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing redirect location header")?;
+    assert!(
+        location.starts_with(redirect_target),
+        "redirect location should start with requested target, got: {location}"
+    );
+
+    let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = get_out.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice(), "uploaded object body should match");
+
+    Ok(())
+}
