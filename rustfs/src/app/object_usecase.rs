@@ -568,7 +568,8 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        // TODO fix response for POST Policy (multipart/form-data), wait s3s crate update, fix issue #1564
+        // For browser-based POST uploads (multipart/form-data), response status/body handling
+        // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
@@ -719,7 +720,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         // When Object Lock is enabled, automatically enable versioning if not already enabled.
-        // This matches AWS S3 and MinIO behavior.
+        // This matches S3-compatible behavior.
         let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
         if !versioning_config.enabled() {
             let enable_versioning_config = VersioningConfiguration {
@@ -1367,7 +1368,7 @@ impl DefaultObjectUsecase {
                             );
                         }
 
-                        // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
+                        // Create seekable in-memory reader (similar to common S3 SDK bytes readers)
                         let mem_reader = InMemoryAsyncReader::new(buf);
                         Some(StreamingBlob::wrap(bytes_stream(
                             ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),

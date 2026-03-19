@@ -83,3 +83,7 @@ mod checksum_upload_test;
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
+
+// S3 dummy-compat bucket API tests
+#[cfg(test)]
+mod bucket_logging_test;

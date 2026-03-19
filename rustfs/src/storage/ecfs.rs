@@ -265,6 +265,14 @@ impl S3 for FS {
         usecase.execute_delete_bucket_tagging(req).await
     }
 
+    async fn delete_bucket_website(
+        &self,
+        _req: S3Request<DeleteBucketWebsiteInput>,
+    ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        // S3-compatible dummy behavior: return success even without website config state.
+        Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn delete_public_access_block(
         &self,
@@ -301,6 +309,23 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_acl(req).await
+    }
+
+    async fn get_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<GetBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: return empty AccelerateConfiguration.
+        Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -370,6 +395,25 @@ impl S3 for FS {
         usecase.execute_get_bucket_replication(req).await
     }
 
+    async fn get_bucket_request_payment(
+        &self,
+        req: S3Request<GetBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: always return BucketOwner.
+        Ok(S3Response::new(GetBucketRequestPaymentOutput {
+            payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
+        }))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         record_s3_op(S3Operation::GetBucketTagging, &req.input.bucket);
@@ -395,6 +439,20 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketVersioning, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_versioning(req).await
+    }
+
+    async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: website config is absent unless explicitly implemented.
+        Err(s3_error!(NoSuchWebsiteConfiguration))
     }
 
     /// Get bucket notification
@@ -543,7 +601,10 @@ impl S3 for FS {
             .get_bucket_info(&req.input.bucket, &BucketOptions::default())
             .await
             .map_err(crate::error::ApiError::from)?;
-        Err(s3_error!(NotImplemented, "GetBucketLogging is not implemented yet"))
+
+        // Keep S3 compatibility with dummy-handler behavior:
+        // when bucket exists, return success with empty logging configuration.
+        Ok(S3Response::new(GetBucketLoggingOutput::default()))
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
