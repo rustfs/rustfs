@@ -598,6 +598,9 @@ impl ECStore {
         }
 
         let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
+        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &oi, opts) {
+            return Err(err);
+        }
 
         Ok(oi.user_tags)
     }
