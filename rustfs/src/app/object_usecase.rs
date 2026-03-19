@@ -17,7 +17,7 @@
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::workload_profiles::RustFSBufferConfig;
 use crate::error::ApiError;
-use crate::storage::access::{authorize_request, has_bypass_governance_header, req_info_mut};
+use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -262,13 +262,22 @@ impl DefaultObjectUsecase {
         });
     }
 
+    fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
+        if req.extensions.get::<PostObjectRequestMarker>().is_some() {
+            (EventName::ObjectCreatedPost, QuotaOperation::PostObject, "POST")
+        } else {
+            (EventName::ObjectCreatedPut, QuotaOperation::PutObject, "PUT")
+        }
+    }
+
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject);
+        let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
+        let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -313,11 +322,10 @@ impl DefaultObjectUsecase {
         let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
 
         // Validate object key
-        validate_object_key(&key, "PUT")?;
+        validate_object_key(&key, request_method_name)?;
 
         if let Some(size) = content_length {
-            self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
-                .await?;
+            self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
         }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
@@ -3571,6 +3579,37 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[test]
+    fn put_object_execution_context_defaults_to_put() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::PUT);
+
+        let (event_name, quota_operation, method_name) = DefaultObjectUsecase::put_object_execution_context(&req);
+        assert_eq!(event_name, EventName::ObjectCreatedPut);
+        assert!(matches!(quota_operation, QuotaOperation::PutObject));
+        assert_eq!(method_name, "PUT");
+    }
+
+    #[test]
+    fn put_object_execution_context_uses_post_marker() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+
+        let (event_name, quota_operation, method_name) = DefaultObjectUsecase::put_object_execution_context(&req);
+        assert_eq!(event_name, EventName::ObjectCreatedPost);
+        assert!(matches!(quota_operation, QuotaOperation::PostObject));
+        assert_eq!(method_name, "POST");
     }
 
     #[tokio::test]

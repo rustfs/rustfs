@@ -41,6 +41,9 @@ pub(crate) struct ReqInfo {
     pub region: Option<s3s::region::Region>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PostObjectRequestMarker;
+
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
     req.extensions
         .get::<ReqInfo>()
@@ -1168,6 +1171,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
+        req.extensions.insert(PostObjectRequestMarker);
 
         authorize_request(req, post_object_authorize_action()).await
     }
@@ -1485,6 +1489,7 @@ impl S3Access for FS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{HeaderMap, Method, Uri};
     use std::collections::HashMap;
 
     #[test]
@@ -1545,5 +1550,35 @@ mod tests {
             false,
             &Action::S3Action(S3Action::DeleteBucketPolicyAction)
         ));
+    }
+
+    #[tokio::test]
+    async fn post_object_marks_request_extensions() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("post object input should build");
+
+        let mut req = S3Request {
+            input,
+            method: Method::POST,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.extensions.insert(ReqInfo::default());
+
+        let fs = FS::new();
+        let _ = fs.post_object(&mut req).await;
+
+        assert!(
+            req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            "post object request should carry the marker for downstream handling"
+        );
     }
 }
