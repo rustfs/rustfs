@@ -106,7 +106,7 @@ pub struct GetReplicationMetricsHandler {}
 #[async_trait::async_trait]
 impl Operation for GetReplicationMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let _ = validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
+        validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
 
         let queries = extract_query_params(&req.uri);
 
@@ -185,12 +185,14 @@ impl Operation for SetRemoteTargetHandler {
             .await
             .map_err(ApiError::from)?;
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key)
-            .await
-            .map_err(|e| {
-                warn!("get body failed, e: {:?}", e);
-                e
-            })?;
+        let body =
+            match read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await {
+                Ok(body) => body,
+                Err(e) => {
+                    warn!("get body failed, e: {:?}", e);
+                    return Err(e);
+                }
+            };
 
         let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
             error!("Failed to parse BucketTarget from body: {}", e);
@@ -223,6 +225,8 @@ impl Operation for SetRemoteTargetHandler {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
                 warn!("return exists, arn: {}", arn_str);
+                // MinIO-compatible clients encrypt the request payload for this endpoint,
+                // but they parse the success response directly as plain JSON string ARN.
                 return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
             }
         }
@@ -278,6 +282,8 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
+        // MinIO-compatible clients encrypt the request payload for this endpoint,
+        // but they parse the success response directly as plain JSON string ARN.
         Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
     }
 }

@@ -198,7 +198,7 @@ fn test_phase5_admin_info_and_rpc_read_file_contract() {
 }
 
 #[test]
-fn test_replication_set_remote_target_uses_compat_body_decoder() {
+fn test_replication_set_remote_target_compat_contract() {
     let replication_src = include_str!("handlers/replication.rs");
     let handler_marker = "impl Operation for SetRemoteTargetHandler";
     let handler_start = replication_src
@@ -209,5 +209,15 @@ fn test_replication_set_remote_target_uses_compat_body_decoder() {
     assert!(
         handler_block.contains("read_compatible_admin_body("),
         "set-remote-target must decode MinIO-compatible encrypted admin payloads"
+    );
+
+    assert!(
+        handler_block.contains("Body::from(arn_str)"),
+        "set-remote-target must keep ARN success responses as plain JSON string body"
+    );
+
+    assert!(
+        !handler_block.contains("encode_compatible_admin_payload("),
+        "set-remote-target should not re-encrypt ARN success responses"
     );
 }
