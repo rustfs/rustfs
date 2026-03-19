@@ -17,9 +17,17 @@
 //! This module provides a lightweight snapshot of configuration values
 //! that can be accessed globally without needing the full Config struct.
 
-use std::sync::OnceLock;
-
 use super::Config;
+use crate::config::config_struct::resolve_credential;
+use rustfs_config::{
+    DEFAULT_ADDRESS, DEFAULT_BUFFER_PROFILE, DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_KMS_BACKEND,
+    DEFAULT_KMS_ENABLE, DEFAULT_OBS_ENDPOINT, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_ACCESS_KEY_FILE, ENV_RUSTFS_ADDRESS,
+    ENV_RUSTFS_BUFFER_PROFILE, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_CONSOLE_ENABLE, ENV_RUSTFS_KMS_BACKEND,
+    ENV_RUSTFS_KMS_ENABLE, ENV_RUSTFS_OBS_ENDPOINT, ENV_RUSTFS_REGION, ENV_RUSTFS_TLS_PATH,
+};
+use rustfs_credentials::DEFAULT_ACCESS_KEY;
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
+use std::sync::OnceLock;
 
 /// Configuration snapshot for info command display.
 /// This stores key configuration values that can be accessed without
@@ -67,23 +75,24 @@ impl ConfigSnapshot {
 
     /// Create a default snapshot from environment variables and defaults
     pub fn from_env() -> Self {
+        let access_key = resolve_credential(
+            get_env_opt_str(ENV_RUSTFS_ACCESS_KEY),
+            get_env_opt_str(ENV_RUSTFS_ACCESS_KEY_FILE),
+            ENV_RUSTFS_ACCESS_KEY,
+            DEFAULT_ACCESS_KEY,
+        )
+        .unwrap_or_else(|_| DEFAULT_ACCESS_KEY.to_string());
         Self {
-            address: std::env::var("RUSTFS_ADDRESS").unwrap_or_else(|_| rustfs_config::DEFAULT_ADDRESS.to_string()),
-            console_enable: std::env::var("RUSTFS_CONSOLE_ENABLE")
-                .map(|v| v == "true")
-                .unwrap_or(rustfs_config::DEFAULT_CONSOLE_ENABLE),
-            console_address: std::env::var("RUSTFS_CONSOLE_ADDRESS")
-                .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string()),
-            region: std::env::var("RUSTFS_REGION").ok(),
-            access_key: std::env::var("RUSTFS_ACCESS_KEY")
-                .or_else(|_| std::env::var("RUSTFS_ROOT_USER"))
-                .unwrap_or_else(|_| rustfs_credentials::DEFAULT_ACCESS_KEY.to_string()),
-            obs_endpoint: std::env::var("RUSTFS_OBS_ENDPOINT")
-                .unwrap_or_else(|_| rustfs_config::DEFAULT_OBS_ENDPOINT.to_string()),
-            tls_path: std::env::var("RUSTFS_TLS_PATH").ok(),
-            kms_enable: std::env::var("RUSTFS_KMS_ENABLE").map(|v| v == "true").unwrap_or(false),
-            kms_backend: std::env::var("RUSTFS_KMS_BACKEND").unwrap_or_else(|_| "local".to_string()),
-            buffer_profile: std::env::var("RUSTFS_BUFFER_PROFILE").unwrap_or_else(|_| "GeneralPurpose".to_string()),
+            address: get_env_str(ENV_RUSTFS_ADDRESS, DEFAULT_ADDRESS),
+            console_enable: get_env_bool(ENV_RUSTFS_CONSOLE_ENABLE, DEFAULT_CONSOLE_ENABLE),
+            console_address: get_env_str(ENV_RUSTFS_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ADDRESS),
+            region: get_env_opt_str(ENV_RUSTFS_REGION),
+            access_key,
+            obs_endpoint: get_env_str(ENV_RUSTFS_OBS_ENDPOINT, DEFAULT_OBS_ENDPOINT),
+            tls_path: get_env_opt_str(ENV_RUSTFS_TLS_PATH),
+            kms_enable: get_env_bool(ENV_RUSTFS_KMS_ENABLE, DEFAULT_KMS_ENABLE),
+            kms_backend: get_env_str(ENV_RUSTFS_KMS_BACKEND, DEFAULT_KMS_BACKEND),
+            buffer_profile: get_env_str(ENV_RUSTFS_BUFFER_PROFILE, DEFAULT_BUFFER_PROFILE),
         }
     }
 }

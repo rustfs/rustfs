@@ -85,7 +85,6 @@ pub enum WorkloadProfile {
     /// Secure storage: security first, memory constrained for compliance
     SecureStorage,
     /// Custom configuration for specialized requirements
-    #[allow(dead_code)]
     Custom(BufferConfig),
 }
 
@@ -107,7 +106,6 @@ pub struct BufferConfig {
 #[derive(Debug, Clone)]
 pub struct RustFSBufferConfig {
     /// Selected workload profile
-    #[allow(dead_code)]
     pub workload: WorkloadProfile,
     /// Computed buffer configuration (either from profile or custom)
     pub base_config: BufferConfig,
@@ -143,6 +141,25 @@ impl WorkloadProfile {
                 WorkloadProfile::GeneralPurpose
             }
         }
+    }
+
+    /// Create a custom workload profile with specified buffer configuration
+    ///
+    /// # Arguments
+    /// * `min_size` - Minimum buffer size in bytes
+    /// * `max_size` - Maximum buffer size in bytes
+    /// * `default_unknown` - Default size for unknown file size scenarios
+    /// * `thresholds` - File size thresholds and corresponding buffer sizes
+    ///
+    /// # Returns
+    /// A WorkloadProfile::Custom with the specified configuration
+    pub fn custom(min_size: usize, max_size: usize, default_unknown: usize, thresholds: Vec<(i64, usize)>) -> Self {
+        WorkloadProfile::Custom(BufferConfig {
+            min_size,
+            max_size,
+            default_unknown,
+            thresholds,
+        })
     }
 
     /// Get the buffer configuration for this workload profile
@@ -310,7 +327,6 @@ impl BufferConfig {
     }
 
     /// Validate the buffer configuration
-    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.min_size == 0 {
             return Err("min_size must be greater than 0".to_string());
@@ -361,6 +377,29 @@ impl RustFSBufferConfig {
     /// Get the buffer size for a given file size
     pub fn get_buffer_size(&self, file_size: i64) -> usize {
         self.base_config.calculate_buffer_size(file_size)
+    }
+
+    /// Get the current workload profile
+    pub fn workload_profile(&self) -> &WorkloadProfile {
+        &self.workload
+    }
+
+    /// Get the name of the current workload profile
+    pub fn workload_name(&self) -> String {
+        match &self.workload {
+            WorkloadProfile::GeneralPurpose => "GeneralPurpose".to_string(),
+            WorkloadProfile::AiTraining => "AiTraining".to_string(),
+            WorkloadProfile::DataAnalytics => "DataAnalytics".to_string(),
+            WorkloadProfile::WebWorkload => "WebWorkload".to_string(),
+            WorkloadProfile::IndustrialIoT => "IndustrialIoT".to_string(),
+            WorkloadProfile::SecureStorage => "SecureStorage".to_string(),
+            WorkloadProfile::Custom(_) => "Custom".to_string(),
+        }
+    }
+
+    /// Validate the buffer configuration
+    pub fn validate(&self) -> Result<(), String> {
+        self.base_config.validate()
     }
 }
 
@@ -615,6 +654,41 @@ mod tests {
         assert_eq!(WorkloadProfile::from_name("unknown"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name("invalid"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name(""), WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn test_custom_workload_profile() {
+        // Create a custom profile with specific buffer sizes
+        let custom_profile = WorkloadProfile::custom(
+            32 * KI_B,  // min_size: 32KB
+            2 * MI_B,   // max_size: 2MB
+            256 * KI_B, // default_unknown: 256KB
+            vec![
+                (MI_B as i64, 64 * KI_B),       // < 1MB: 64KB
+                (10 * MI_B as i64, 128 * KI_B), // 1MB-10MB: 128KB
+                (i64::MAX, 512 * KI_B),         // >= 10MB: 512KB
+            ],
+        );
+
+        // Verify it's a Custom variant
+        match &custom_profile {
+            WorkloadProfile::Custom(config) => {
+                assert_eq!(config.min_size, 32 * KI_B);
+                assert_eq!(config.max_size, 2 * MI_B);
+                assert_eq!(config.default_unknown, 256 * KI_B);
+                assert_eq!(config.thresholds.len(), 3);
+            }
+            _ => panic!("Expected Custom variant"),
+        }
+
+        // Test buffer size calculation with custom profile
+        let buffer_config = RustFSBufferConfig::new(custom_profile);
+        assert_eq!(buffer_config.get_buffer_size(500 * KI_B as i64), 64 * KI_B);
+        assert_eq!(buffer_config.get_buffer_size(5 * MI_B as i64), 128 * KI_B);
+        assert_eq!(buffer_config.get_buffer_size(100 * MI_B as i64), 512 * KI_B);
+
+        // Test validation
+        assert!(buffer_config.validate().is_ok());
     }
 
     #[test]

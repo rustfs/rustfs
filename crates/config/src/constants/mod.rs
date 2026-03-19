@@ -28,3 +28,4 @@ pub(crate) mod runtime;
 pub(crate) mod scanner;
 pub(crate) mod targets;
 pub(crate) mod tls;
+pub(crate) mod workload;

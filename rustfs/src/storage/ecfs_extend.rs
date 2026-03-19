@@ -119,6 +119,22 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 ///     10 * 1024 * 1024,
 ///     Some(WorkloadProfile::SecureStorage)
 /// );
+///
+/// // Use custom profile for specialized requirements
+/// let custom_profile = WorkloadProfile::custom(
+///     32 * 1024,      // min_size: 32KB
+///     2 * 1024 * 1024, // max_size: 2MB
+///     256 * 1024,     // default_unknown: 256KB
+///     vec![
+///         (1024 * 1024, 64 * 1024),           // < 1MB: 64KB
+///         (10 * 1024 * 1024, 128 * 1024),     // 1MB-10MB: 128KB
+///         (i64::MAX, 512 * 1024),             // >= 10MB: 512KB
+///     ],
+/// );
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     5 * 1024 * 1024,
+///     Some(custom_profile)
+/// );
 /// ```
 ///
 #[allow(dead_code)]

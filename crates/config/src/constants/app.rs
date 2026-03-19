@@ -143,8 +143,42 @@ pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
 
+/// Environment variable for server OBS endpoint.
+pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
+
+/// Environment variable for console server enable.
+pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
+
+/// Environment variable for console server address.
+pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
+
 /// Environment variable for server tls path.
 pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
+
+/// Environment variable for server KMS enable.
+pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
+
+/// Default KMS enable for server-side encryption
+/// This is the default value for enabling KMS encryption for server-side encryption.
+/// Default value: false
+pub const DEFAULT_KMS_ENABLE: bool = false;
+
+/// Environment variable for server KMS backend.
+pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
+
+/// Default KMS backend for server-side encryption
+/// This is the default KMS backend for server-side encryption.
+/// Default value: local
+pub const DEFAULT_KMS_BACKEND: &str = "local";
+
+/// Environment variable for server KMS key directory.
+pub const ENV_RUSTFS_BUFFER_PROFILE: &str = "RUSTFS_BUFFER_PROFILE";
+
+/// Default buffer profile for adaptive buffer sizing
+/// This is the default buffer profile for adaptive buffer sizing.
+/// It is used to identify the workload profile for adaptive buffer sizing.
+/// Default value: GeneralPurpose
+pub const DEFAULT_BUFFER_PROFILE: &str = "GeneralPurpose";
 
 /// Default value for the server TLS path if `ENV_RUSTFS_TLS_PATH` is not set.
 pub const DEFAULT_RUSTFS_TLS_PATH: &str = "";

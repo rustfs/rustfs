@@ -27,7 +27,7 @@ use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 /// 2. File value (if provided, read the content of the file)
 /// 3. Environment variable (if set)
 /// 4. Default value (if none of the above are provided)
-fn resolve_credential<T: AsRef<std::path::Path>>(
+pub(crate) fn resolve_credential<T: AsRef<std::path::Path>>(
     inline_value: Option<String>,
     file_value: Option<T>,
     env_key: &str,

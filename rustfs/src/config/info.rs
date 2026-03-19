@@ -156,6 +156,9 @@ fn format_config_info() -> String {
     // Get config snapshot from global storage
     let snapshot = super::get_or_init_config_snapshot();
 
+    // Get workload profile info
+    let workload_info = get_workload_profile_info();
+
     // Mask the access key for display
     let masked_access_key = &Masked(Some(&snapshot.access_key));
 
@@ -171,7 +174,8 @@ fn format_config_info() -> String {
          TLS Path: {}\n\
          KMS Enabled: {}\n\
          KMS Backend: {}\n\
-         Buffer Profile: {}",
+         Buffer Profile: {}\n\
+         {}",
         snapshot.address,
         snapshot.console_enable,
         snapshot.console_address,
@@ -185,7 +189,30 @@ fn format_config_info() -> String {
         snapshot.tls_path.as_deref().unwrap_or("(not set)"),
         snapshot.kms_enable,
         snapshot.kms_backend,
-        snapshot.buffer_profile
+        snapshot.buffer_profile,
+        workload_info
+    )
+}
+
+/// Get workload profile information from global buffer config
+fn get_workload_profile_info() -> String {
+    use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+
+    if !is_buffer_profile_enabled() {
+        return "Workload Profile: (disabled)".to_string();
+    }
+
+    let config = get_global_buffer_config();
+    let profile = config.workload_profile();
+    let name = config.workload_name();
+    let buffer_config = profile.config();
+
+    format!(
+        "Workload Profile: {}\n\
+         Buffer Min Size: {} bytes\n\
+         Buffer Max Size: {} bytes\n\
+         Default Unknown: {} bytes",
+        name, buffer_config.min_size, buffer_config.max_size, buffer_config.default_unknown
     )
 }
 

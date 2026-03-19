@@ -14,10 +14,14 @@
 
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
-use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK, RUSTFS_REGION};
+use rustfs_config::{
+    DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
+    ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
+};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
 use rustfs_targets::arn::{ARN, TargetIDError};
+use rustfs_utils::get_env_usize;
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
@@ -301,6 +305,7 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
         RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
     };
 
+    // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
         info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
@@ -310,13 +315,45 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
         info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
 
         // Parse the workload profile from configuration string
-        let profile = WorkloadProfile::from_name(&config.buffer_profile);
+        // Support custom profile via RUSTFS_BUFFER_CUSTOM environment variable
+        let profile = if config.buffer_profile.eq_ignore_ascii_case("custom") {
+            // Try to create custom profile from environment variables
+            let min_size = get_env_usize(ENV_RUSTFS_BUFFER_MIN_SIZE, DEFAULT_BUFFER_MIN_SIZE);
+            let max_size = get_env_usize(ENV_RUSTFS_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MAX_SIZE);
+            let default_unknown = get_env_usize(ENV_RUSTFS_BUFFER_DEFAULT_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE);
+
+            info!(
+                "Creating custom buffer profile: min={}, max={}, default={}",
+                min_size, max_size, default_unknown
+            );
+            WorkloadProfile::custom(
+                min_size,
+                max_size,
+                default_unknown,
+                vec![
+                    (1024 * 1024, 64 * 1024),        // < 1MB: 64KB
+                    (100 * 1024 * 1024, 256 * 1024), // 1MB-100MB: 256KB
+                    (i64::MAX, 1024 * 1024),         // >= 100MB: 1MB
+                ],
+            )
+        } else {
+            WorkloadProfile::from_name(&config.buffer_profile)
+        };
 
         // Log the selected profile for operational visibility
         info!("Active buffer profile: {:?}", profile);
 
+        // Create and validate buffer configuration
+        let buffer_config = RustFSBufferConfig::new(profile);
+        if let Err(e) = buffer_config.validate() {
+            warn!("Buffer configuration validation failed: {}", e);
+        }
+
+        // Log the workload profile name
+        info!("Workload profile: {}", buffer_config.workload_name());
+
         // Initialize the global buffer configuration
-        init_global_buffer_config(RustFSBufferConfig::new(profile));
+        init_global_buffer_config(buffer_config);
 
         // Enable buffer profiling globally
         set_buffer_profile_enabled(true);
