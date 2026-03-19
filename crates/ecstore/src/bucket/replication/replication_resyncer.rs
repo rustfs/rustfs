@@ -901,7 +901,11 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     }
 }
 
-async fn save_resync_status<S: StorageAPI>(bucket: &str, status: &BucketReplicationResyncStatus, api: Arc<S>) -> Result<()> {
+pub(crate) async fn save_resync_status<S: StorageAPI>(
+    bucket: &str,
+    status: &BucketReplicationResyncStatus,
+    api: Arc<S>,
+) -> Result<()> {
     let data = encode_resync_file(status)?;
 
     let config_file = path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR, RESYNC_FILE_NAME]);

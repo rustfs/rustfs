@@ -3149,6 +3149,7 @@ name = "e2e_test"
 version = "0.0.5"
 dependencies = [
  "anyhow",
+ "astral-tokio-tar",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",

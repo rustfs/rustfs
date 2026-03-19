@@ -229,18 +229,24 @@ impl RustFSTestEnvironment {
         Ok(())
     }
 
-    /// Wait for RustFS server to be ready by checking TCP connectivity
+    /// Wait for RustFS server to be ready.
+    ///
+    /// A listening TCP port is not sufficient here: the process may accept
+    /// connections before the S3 stack is fully initialized, which causes
+    /// early requests to fail intermittently. Treat readiness as "S3 API
+    /// responds successfully" instead.
     pub async fn wait_for_server_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Waiting for RustFS server to be ready on {}", self.address);
+        let client = self.create_s3_client();
 
-        for i in 0..30 {
-            if TcpStream::connect(&self.address).await.is_ok() {
+        for i in 0..60 {
+            if TcpStream::connect(&self.address).await.is_ok() && client.list_buckets().send().await.is_ok() {
                 info!("✅ RustFS server is ready after {} attempts", i + 1);
                 return Ok(());
             }
 
-            if i == 29 {
-                return Err("RustFS server failed to become ready within 30 seconds".into());
+            if i == 59 {
+                return Err("RustFS server failed to become ready within 60 seconds".into());
             }
 
             sleep(Duration::from_secs(1)).await;

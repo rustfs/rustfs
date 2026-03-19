@@ -39,15 +39,21 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
+use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::replication::BucketStats;
-use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
+use rustfs_ecstore::bucket::replication::{
+    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
+    get_global_replication_pool,
+};
+use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
+use rustfs_filemeta::ReplicationType;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -64,8 +70,10 @@ use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
 use s3s::stream::{ByteStream, DynByteStream};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -107,6 +115,79 @@ struct ReplicationResetTarget {
     arn: String,
     #[serde(rename = "ResetID")]
     reset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicationResetStartRequest {
+    arn: String,
+    reset_id: String,
+    reset_before: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationResetStatusResponse {
+    #[serde(rename = "Targets")]
+    targets: Vec<ReplicationResetStatusTarget>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationResetStatusTarget {
+    #[serde(rename = "Arn")]
+    arn: String,
+    #[serde(rename = "ResetID")]
+    reset_id: String,
+    #[serde(
+        rename = "ResetBeforeDate",
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reset_before_date: Option<OffsetDateTime>,
+    #[serde(
+        rename = "StartTime",
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    start_time: Option<OffsetDateTime>,
+    #[serde(
+        rename = "LastUpdate",
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    last_update: Option<OffsetDateTime>,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "ReplicatedCount")]
+    replicated_count: i64,
+    #[serde(rename = "ReplicatedSize")]
+    replicated_size: i64,
+    #[serde(rename = "FailedCount")]
+    failed_count: i64,
+    #[serde(rename = "FailedSize")]
+    failed_size: i64,
+    #[serde(rename = "Object", skip_serializing_if = "String::is_empty")]
+    object: String,
+    #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationCheckResponse {
+    #[serde(rename = "Targets")]
+    targets: Vec<ReplicationCheckTargetStatus>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationCheckTargetStatus {
+    #[serde(rename = "Arn")]
+    arn: String,
+    #[serde(rename = "Endpoint")]
+    endpoint: String,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,20 +1067,24 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
         None => BucketStats::default(),
     };
 
-    let body = match route {
-        ReplicationExtRoute::MetricsV1 => {
-            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))?
-        }
-        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(&bucket_stats).map_err(|e| s3_error!(InternalError, "{e}"))?,
-        ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
-            return Err(s3_error!(InternalError, "invalid route for metrics response"));
-        }
-    };
+    let body = serialize_replication_metrics_body(&bucket_stats, route)?;
 
     let mut resp = S3Response::with_status(Body::from(body), StatusCode::OK);
     resp.headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(resp)
+}
+
+fn serialize_replication_metrics_body(bucket_stats: &BucketStats, route: ReplicationExtRoute) -> S3Result<Vec<u8>> {
+    match route {
+        ReplicationExtRoute::MetricsV1 => {
+            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))
+        }
+        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(bucket_stats).map_err(|e| s3_error!(InternalError, "{e}")),
+        ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
+            Err(s3_error!(InternalError, "invalid route for metrics response"))
+        }
+    }
 }
 
 async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_req: &ReplicationExtRequest) -> S3Result<()> {
@@ -1038,22 +1123,32 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
     authorize_request(req, action).await
 }
 
-fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetTarget> {
+fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
     let arn = query_value_exact(uri, "arn")
         .filter(|v| !v.is_empty())
         .ok_or_else(|| s3_error!(InvalidRequest, "arn query parameter is required"))?;
 
-    if let Some(older_than) = query_value_exact(uri, "older-than")
-        && !older_than.is_empty()
-    {
-        parse_duration(&older_than).map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
-    }
+    let now = OffsetDateTime::now_utc();
+    let reset_before = match query_value_exact(uri, "older-than").filter(|v| !v.is_empty()) {
+        Some(older_than) => {
+            let duration = parse_duration(&older_than)
+                .map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
+            let duration = time::Duration::try_from(duration)
+                .map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
+            Some(now - duration)
+        }
+        None => Some(now),
+    };
 
     let reset_id = query_value_exact(uri, "reset-id")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    Ok(ReplicationResetTarget { arn, reset_id })
+    Ok(ReplicationResetStartRequest {
+        arn,
+        reset_id,
+        reset_before,
+    })
 }
 
 fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3Result<S3Response<Body>> {
@@ -1062,6 +1157,183 @@ fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3R
     resp.headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(resp)
+}
+
+fn apply_replication_reset_to_targets(targets: &mut BucketTargets, reset: &ReplicationResetStartRequest) -> S3Result<()> {
+    let Some(target) = targets.targets.iter_mut().find(|target| target.arn == reset.arn) else {
+        return Err(s3_error!(InvalidRequest, "replication reset arn is not configured for this bucket"));
+    };
+
+    target.reset_id = reset.reset_id.clone();
+    target.reset_before_date = reset.reset_before;
+    Ok(())
+}
+
+fn build_replication_reset_status_targets(status: &BucketReplicationResyncStatus) -> Vec<ReplicationResetStatusTarget> {
+    let mut targets = status
+        .targets_map
+        .iter()
+        .map(|(arn, target)| ReplicationResetStatusTarget {
+            arn: arn.clone(),
+            reset_id: target.resync_id.clone(),
+            reset_before_date: target.resync_before_date,
+            start_time: target.start_time,
+            last_update: target.last_update,
+            status: target.resync_status.to_string(),
+            replicated_count: target.replicated_count,
+            replicated_size: target.replicated_size,
+            failed_count: target.failed_count,
+            failed_size: target.failed_size,
+            object: target.object.clone(),
+            error: target.error.clone(),
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    targets
+}
+
+fn build_replication_reset_status_response(status: BucketReplicationResyncStatus) -> S3Result<S3Response<Body>> {
+    let data = serde_json::to_vec(&ReplicationResetStatusResponse {
+        targets: build_replication_reset_status_targets(&status),
+    })
+    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
+    resp.headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
+}
+
+fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatus>) -> S3Result<S3Response<Body>> {
+    targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    let data = serde_json::to_vec(&ReplicationCheckResponse { targets }).map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
+    resp.headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
+}
+
+fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
+    let referenced_arns = config
+        .filter_target_arns(&ObjectOpts {
+            op_type: ReplicationType::All,
+            ..Default::default()
+        })
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    targets
+        .targets
+        .into_iter()
+        .filter(|target| target.target_type == BucketTargetType::ReplicationService)
+        .filter(|target| referenced_arns.is_empty() || referenced_arns.contains(&target.arn))
+        .collect()
+}
+
+async fn check_replication_target(bucket: &str, target: &BucketTarget) -> ReplicationCheckTargetStatus {
+    let mut result = ReplicationCheckTargetStatus {
+        arn: target.arn.clone(),
+        endpoint: target.endpoint.clone(),
+        bucket: target.target_bucket.clone(),
+        status: "OK".to_string(),
+        error: None,
+    };
+
+    let target_sys = BucketTargetSys::get();
+    let target_client = match target_sys.get_remote_target_client(bucket, &target.arn).await {
+        Some(client) => client,
+        None => match target_sys.get_remote_target_client_internal(target).await {
+            Ok(client) => std::sync::Arc::new(client),
+            Err(err) => {
+                result.status = "FAILED".to_string();
+                result.error = Some(err.to_string());
+                return result;
+            }
+        },
+    };
+
+    match target_client.bucket_exists(&target.target_bucket).await {
+        Ok(true) => {}
+        Ok(false) => {
+            result.status = "FAILED".to_string();
+            result.error = Some("target bucket does not exist".to_string());
+            return result;
+        }
+        Err(err) => {
+            result.status = "FAILED".to_string();
+            result.error = Some(err.to_string());
+            return result;
+        }
+    }
+
+    match target_client.get_bucket_versioning(&target.target_bucket).await {
+        Ok(Some(_)) => result,
+        Ok(None) => {
+            result.status = "FAILED".to_string();
+            result.error = Some("target bucket versioning is not enabled".to_string());
+            result
+        }
+        Err(err) => {
+            result.status = "FAILED".to_string();
+            result.error = Some(err.to_string());
+            result
+        }
+    }
+}
+
+async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
+    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
+    let targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
+    let replication_targets = filter_replication_check_targets(targets, &config);
+
+    if replication_targets.is_empty() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication check requires at least one configured replication target"
+        ));
+    }
+
+    let mut statuses = Vec::with_capacity(replication_targets.len());
+    for target in &replication_targets {
+        statuses.push(check_replication_target(bucket, target).await);
+    }
+
+    build_replication_check_response(statuses)
+}
+
+async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<()> {
+    let mut targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
+    apply_replication_reset_to_targets(&mut targets, reset)?;
+
+    let json_targets = serde_json::to_vec(&targets).map_err(|e| s3_error!(InternalError, "{e}"))?;
+    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        .await
+        .map_err(ApiError::from)?;
+    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
+
+    let Some(pool) = get_global_replication_pool() else {
+        return Err(s3_error!(InternalError, "replication pool is not initialized"));
+    };
+
+    pool.start_bucket_resync(ResyncOpts {
+        bucket: bucket.to_string(),
+        arn: reset.arn.clone(),
+        resync_id: reset.reset_id.clone(),
+        resync_before: reset.reset_before,
+    })
+    .await
+    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+
+    Ok(())
+}
+
+async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
+    let Some(pool) = get_global_replication_pool() else {
+        return Err(s3_error!(InternalError, "replication pool is not initialized"));
+    };
+
+    pool.get_bucket_resync_status(bucket)
+        .await
+        .map_err(|e| s3_error!(InternalError, "{e}"))
 }
 
 async fn handle_replication_extension_request(
@@ -1085,12 +1357,19 @@ async fn handle_replication_extension_request(
                     "replication validation requires bucket versioning to be enabled"
                 ));
             }
-            Ok(S3Response::with_status(Body::from(String::new()), StatusCode::OK))
+            run_replication_check(&ext_req.bucket).await
         }
-        ReplicationExtRoute::ResetStatus => build_replication_reset_response(Vec::new()),
+        ReplicationExtRoute::ResetStatus => {
+            let status = load_replication_resync_status(&ext_req.bucket).await?;
+            build_replication_reset_status_response(status)
+        }
         ReplicationExtRoute::ResetStart => {
             let target = parse_reset_start_target(&req.uri)?;
-            build_replication_reset_response(vec![target])
+            start_replication_resync(&ext_req.bucket, &target).await?;
+            build_replication_reset_response(vec![ReplicationResetTarget {
+                arn: target.arn,
+                reset_id: target.reset_id,
+            }])
         }
     }
 }
@@ -1468,6 +1747,215 @@ mod tests {
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method_status).is_none());
+    }
+
+    #[test]
+    fn parse_reset_start_target_defaults_reset_before_and_supports_older_than() {
+        let no_window: Uri = "/demo-bucket?replication-reset&arn=arn:target"
+            .parse()
+            .expect("uri should parse");
+        let before_default = OffsetDateTime::now_utc();
+        let parsed_default = parse_reset_start_target(&no_window).expect("default reset request should parse");
+        let after_default = OffsetDateTime::now_utc();
+
+        assert_eq!(parsed_default.arn, "arn:target");
+        assert!(!parsed_default.reset_id.is_empty());
+        let reset_before = parsed_default.reset_before.expect("default reset window should be set");
+        assert!(reset_before >= before_default && reset_before <= after_default);
+
+        let older_than: Uri = "/demo-bucket?replication-reset&arn=arn:target&reset-id=rid-1&older-than=1h"
+            .parse()
+            .expect("uri should parse");
+        let before_window = OffsetDateTime::now_utc();
+        let parsed_window = parse_reset_start_target(&older_than).expect("older-than reset request should parse");
+        let after_window = OffsetDateTime::now_utc();
+
+        assert_eq!(parsed_window.reset_id, "rid-1");
+        let reset_before = parsed_window.reset_before.expect("older-than reset window should be set");
+        assert!(reset_before <= after_window - time::Duration::minutes(59));
+        assert!(reset_before >= before_window - time::Duration::hours(1) - time::Duration::seconds(1));
+    }
+
+    #[test]
+    fn apply_replication_reset_to_targets_updates_matching_target() {
+        let mut targets = BucketTargets {
+            targets: vec![rustfs_ecstore::bucket::target::BucketTarget {
+                arn: "arn:target".to_string(),
+                ..Default::default()
+            }],
+        };
+        let reset = ReplicationResetStartRequest {
+            arn: "arn:target".to_string(),
+            reset_id: "rid-1".to_string(),
+            reset_before: Some(OffsetDateTime::now_utc()),
+        };
+
+        apply_replication_reset_to_targets(&mut targets, &reset).expect("target update should succeed");
+
+        assert_eq!(targets.targets[0].reset_id, "rid-1");
+        assert_eq!(targets.targets[0].reset_before_date, reset.reset_before);
+    }
+
+    #[test]
+    fn build_replication_reset_status_response_serializes_sorted_targets() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:z".to_string(),
+            rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "rid-z".to_string(),
+                resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                failed_count: 2,
+                failed_size: 4,
+                error: Some("boom".to_string()),
+                ..Default::default()
+            },
+        );
+        status.targets_map.insert(
+            "arn:a".to_string(),
+            rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "rid-a".to_string(),
+                resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                replicated_count: 3,
+                replicated_size: 9,
+                ..Default::default()
+            },
+        );
+
+        let response = build_replication_reset_status_response(status).expect("status response should build");
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
+
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
+        assert_eq!(payload["Targets"][0]["Status"], "Completed");
+        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][1]["Status"], "Failed");
+        assert_eq!(payload["Targets"][1]["Error"], "boom");
+    }
+
+    #[test]
+    fn build_replication_check_response_serializes_targets() {
+        let response = build_replication_check_response(vec![
+            ReplicationCheckTargetStatus {
+                arn: "arn:z".to_string(),
+                endpoint: "remote-z:9000".to_string(),
+                bucket: "bucket-z".to_string(),
+                status: "FAILED".to_string(),
+                error: Some("boom".to_string()),
+            },
+            ReplicationCheckTargetStatus {
+                arn: "arn:a".to_string(),
+                endpoint: "remote-a:9000".to_string(),
+                bucket: "bucket-a".to_string(),
+                status: "OK".to_string(),
+                error: None,
+            },
+        ])
+        .expect("response should build");
+
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
+
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
+        assert_eq!(payload["Targets"][0]["Status"], "OK");
+        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][1]["Error"], "boom");
+    }
+
+    #[test]
+    fn build_replication_check_response_rejects_empty_target_list_at_runtime_boundary() {
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![],
+        };
+        let replication_targets = filter_replication_check_targets(BucketTargets::default(), &config);
+
+        assert!(replication_targets.is_empty());
+    }
+
+    #[test]
+    fn filter_replication_check_targets_only_keeps_configured_replication_targets() {
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:replication:a".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:replication:b".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:ilm:c".to_string(),
+                    target_type: BucketTargetType::IlmService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![s3s::dto::ReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: s3s::dto::Destination {
+                    bucket: "arn:replication:b".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: None,
+                prefix: Some(String::new()),
+                priority: None,
+                source_selection_criteria: None,
+                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+            }],
+        };
+
+        let filtered = filter_replication_check_targets(targets, &config);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].arn, "arn:replication:b");
+    }
+
+    #[test]
+    fn serialize_replication_metrics_body_v1_returns_replication_stats_only() {
+        let mut stats = BucketStats {
+            uptime: 99,
+            ..Default::default()
+        };
+        stats.replication_stats.replica_count = 7;
+        stats.proxy_stats.put_total = 3;
+
+        let body =
+            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1).expect("metrics v1 body should serialize");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+
+        assert_eq!(payload["replica_count"], 7);
+        assert!(payload.get("uptime").is_none());
+        assert!(payload.get("proxy_stats").is_none());
+    }
+
+    #[test]
+    fn serialize_replication_metrics_body_v2_returns_full_bucket_stats() {
+        let mut stats = BucketStats {
+            uptime: 99,
+            ..Default::default()
+        };
+        stats.replication_stats.replica_count = 7;
+        stats.proxy_stats.put_total = 3;
+
+        let body =
+            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2).expect("metrics v2 body should serialize");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+
+        assert_eq!(payload["uptime"], 99);
+        assert_eq!(payload["replication_stats"]["replica_count"], 7);
+        assert_eq!(payload["proxy_stats"]["put_total"], 3);
     }
 
     #[test]
