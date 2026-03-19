@@ -87,7 +87,8 @@ use rustfs_utils::http::{
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_SNOWBALL_EXTRACT, AMZ_STORAGE_CLASS,
+        AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -189,6 +190,19 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
+const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
+
+fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
+    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
+}
+
 async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
     let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
         debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
@@ -278,11 +292,7 @@ impl DefaultObjectUsecase {
 
         let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
-        if req
-            .headers
-            .get("X-Amz-Meta-Snowball-Auto-Extract")
-            .is_some_and(|v| v.to_str().unwrap_or_default() == "true")
-        {
+        if is_put_object_extract_requested(&req.headers) {
             return self.execute_put_object_extract(req).await;
         }
 
@@ -3565,7 +3575,7 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -3610,6 +3620,31 @@ mod tests {
         assert_eq!(event_name, EventName::ObjectCreatedPost);
         assert!(matches!(quota_operation, QuotaOperation::PostObject));
         assert_eq!(method_name, "POST");
+    }
+
+    #[test]
+    fn is_put_object_extract_requested_accepts_meta_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+
+        assert!(is_put_object_extract_requested(&headers));
+    }
+
+    #[test]
+    fn is_put_object_extract_requested_accepts_compat_header_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT_COMPAT, HeaderValue::from_static(" TRUE "));
+
+        assert!(is_put_object_extract_requested(&headers));
+    }
+
+    #[test]
+    fn is_put_object_extract_requested_rejects_missing_or_false_value() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_put_object_extract_requested(&headers));
+
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
+        assert!(!is_put_object_extract_requested(&headers));
     }
 
     #[tokio::test]

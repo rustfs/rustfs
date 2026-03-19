@@ -68,6 +68,12 @@ struct ReplicationExtRequest {
     route: ReplicationExtRoute,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MiscExtRoute {
+    ObjectLambda { bucket: String, object: String },
+    ListenNotification { bucket: Option<String> },
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetResponse {
     #[serde(rename = "Targets")]
@@ -106,6 +112,15 @@ fn extract_bucket_for_bucket_level_path(path: &str) -> Option<String> {
     Some(bucket.to_string())
 }
 
+fn extract_bucket_object_path(path: &str) -> Option<(String, String)> {
+    let path = path.strip_prefix('/')?;
+    let (bucket, object) = path.split_once('/')?;
+    if bucket.is_empty() || object.is_empty() {
+        return None;
+    }
+    Some((bucket.to_string(), object.to_string()))
+}
+
 fn parse_replication_extension_request(method: &Method, uri: &Uri) -> Option<ReplicationExtRequest> {
     let bucket = extract_bucket_for_bucket_level_path(uri.path())?;
 
@@ -142,6 +157,29 @@ fn parse_replication_extension_request(method: &Method, uri: &Uri) -> Option<Rep
                 bucket,
                 route: ReplicationExtRoute::Check,
             });
+        }
+    }
+
+    None
+}
+
+fn parse_misc_extension_request(method: &Method, uri: &Uri) -> Option<MiscExtRoute> {
+    if method != Method::GET {
+        return None;
+    }
+
+    if query_value_exact(uri, "lambdaArn").is_some()
+        && let Some((bucket, object)) = extract_bucket_object_path(uri.path())
+    {
+        return Some(MiscExtRoute::ObjectLambda { bucket, object });
+    }
+
+    if query_value_exact(uri, "events").is_some() {
+        if uri.path() == "/" {
+            return Some(MiscExtRoute::ListenNotification { bucket: None });
+        }
+        if let Some(bucket) = extract_bucket_for_bucket_level_path(uri.path()) {
+            return Some(MiscExtRoute::ListenNotification { bucket: Some(bucket) });
         }
     }
 
@@ -280,6 +318,73 @@ async fn handle_replication_extension_request(
     }
 }
 
+async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &MiscExtRoute) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    };
+
+    let (cred, is_owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    let (bucket, object, action) = match route {
+        MiscExtRoute::ObjectLambda { bucket, object } => {
+            (Some(bucket.clone()), Some(object.clone()), Action::S3Action(S3Action::GetObjectAction))
+        }
+        MiscExtRoute::ListenNotification { bucket: Some(bucket) } => {
+            (Some(bucket.clone()), None, Action::S3Action(S3Action::ListenBucketNotificationAction))
+        }
+        MiscExtRoute::ListenNotification { bucket: None } => (None, None, Action::S3Action(S3Action::ListenNotificationAction)),
+    };
+
+    req.extensions.insert(ReqInfo {
+        cred: Some(cred),
+        is_owner,
+        bucket,
+        object,
+        version_id: None,
+        region: get_global_region(),
+    });
+
+    license_check().map_err(|er| match er.kind() {
+        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        _ => {
+            error!("license check failed due to unexpected error: {er}");
+            s3_error!(InternalError, "License validation failed")
+        }
+    })?;
+
+    authorize_request(req, action).await
+}
+
+async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscExtRoute) -> S3Result<S3Response<Body>> {
+    authorize_misc_extension_request(req, route).await?;
+
+    match route {
+        MiscExtRoute::ObjectLambda { bucket, .. } => {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+            };
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
+            Err(s3_error!(NotImplemented, "object lambda route is not implemented"))
+        }
+        MiscExtRoute::ListenNotification { bucket } => {
+            if let Some(bucket_name) = bucket {
+                let Some(store) = new_object_layer_fn() else {
+                    return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+                };
+                store
+                    .get_bucket_info(bucket_name, &BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            Err(s3_error!(NotImplemented, "listen notification route is not implemented"))
+        }
+    }
+}
+
 pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
@@ -360,7 +465,7 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
-        if parse_replication_extension_request(method, uri).is_some() {
+        if parse_replication_extension_request(method, uri).is_some() || parse_misc_extension_request(method, uri).is_some() {
             return true;
         }
 
@@ -394,7 +499,9 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
-        if parse_replication_extension_request(&req.method, &req.uri).is_some() {
+        if parse_replication_extension_request(&req.method, &req.uri).is_some()
+            || parse_misc_extension_request(&req.method, &req.uri).is_some()
+        {
             return match req.credentials {
                 Some(_) => Ok(()),
                 None => Err(s3_error!(AccessDenied, "Signature is required")),
@@ -470,6 +577,9 @@ where
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
             return handle_replication_extension_request(&mut req, &ext_req).await;
+        }
+        if let Some(ext_req) = parse_misc_extension_request(&req.method, &req.uri) {
+            return handle_misc_extension_request(&mut req, &ext_req).await;
         }
 
         // Console requests should be handled by console router first (including OPTIONS)
@@ -586,6 +696,51 @@ mod tests {
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method_status).is_none());
     }
 
+    #[test]
+    fn parse_misc_extension_request_matches_object_lambda_and_listen_notification() {
+        let object_lambda: Uri = "/demo-bucket/path/to/object.txt?lambdaArn=arn%3Atarget"
+            .parse()
+            .expect("uri should parse");
+        let listen_bucket: Uri = "/demo-bucket?events=s3:ObjectCreated:*".parse().expect("uri should parse");
+        let listen_root: Uri = "/?events=s3:ObjectRemoved:*".parse().expect("uri should parse");
+
+        let object_route = parse_misc_extension_request(&Method::GET, &object_lambda).expect("object lambda route should parse");
+        assert_eq!(
+            object_route,
+            MiscExtRoute::ObjectLambda {
+                bucket: "demo-bucket".to_string(),
+                object: "path/to/object.txt".to_string()
+            }
+        );
+
+        let listen_bucket_route =
+            parse_misc_extension_request(&Method::GET, &listen_bucket).expect("bucket listen route should parse");
+        assert_eq!(
+            listen_bucket_route,
+            MiscExtRoute::ListenNotification {
+                bucket: Some("demo-bucket".to_string())
+            }
+        );
+
+        let listen_root_route = parse_misc_extension_request(&Method::GET, &listen_root).expect("root listen route should parse");
+        assert_eq!(listen_root_route, MiscExtRoute::ListenNotification { bucket: None });
+    }
+
+    #[test]
+    fn parse_misc_extension_request_rejects_invalid_paths_or_methods() {
+        let bucket_without_object: Uri = "/demo-bucket?lambdaArn=arn%3Atarget".parse().expect("uri should parse");
+        let wrong_method_lambda: Uri = "/demo-bucket/object?lambdaArn=arn%3Atarget"
+            .parse()
+            .expect("uri should parse");
+        let object_level_listen: Uri = "/demo-bucket/object?events=s3:ObjectCreated:*"
+            .parse()
+            .expect("uri should parse");
+
+        assert!(parse_misc_extension_request(&Method::GET, &bucket_without_object).is_none());
+        assert!(parse_misc_extension_request(&Method::PUT, &wrong_method_lambda).is_none());
+        assert!(parse_misc_extension_request(&Method::GET, &object_level_listen).is_none());
+    }
+
     #[tokio::test]
     async fn check_access_rejects_anonymous_replication_extension_request() {
         let router: S3Router<AdminOperation> = S3Router::new(false);
@@ -593,6 +748,30 @@ mod tests {
             input: Body::from(String::new()),
             method: Method::GET,
             uri: "/demo-bucket?replication-metrics".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("anonymous extension request must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_anonymous_misc_extension_request() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket/path/object.txt?lambdaArn=arn%3Atarget"
+                .parse()
+                .expect("uri should parse"),
             headers: HeaderMap::new(),
             extensions: http::Extensions::new(),
             credentials: None,
