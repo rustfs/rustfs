@@ -2130,9 +2130,6 @@ impl ECStore {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_info = rd.object_info.clone();
 
-        // TODO: check : use size or actual_size ?
-        let _actual_size = object_info.get_actual_size()?;
-
         if object_info.is_multipart() {
             let res = match self
                 .new_multipart_upload(
