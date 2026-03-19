@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::time::{Duration, Instant};
@@ -1120,6 +1123,18 @@ fn ensure_valid_rebalance_pool_index(pool_count: usize, idx: usize) -> Result<()
     Ok(())
 }
 
+fn new_multipart_abort_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
+fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
+    flag.store(false, Ordering::Relaxed);
+}
+
 enum RebalanceTerminalEvent {
     Completed { msg: String },
     Stopped { msg: String },
@@ -1417,7 +1432,12 @@ impl ECStore {
                 }
             };
 
+            let abort_multipart_flag = new_multipart_abort_flag();
+            let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
             defer!(|| async {
+                if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
+                    return;
+                }
                 if let Err(err) = self
                     .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
                     .await
@@ -1487,6 +1507,7 @@ impl ECStore {
                 return Err(err);
             }
 
+            mark_multipart_upload_completed(&abort_multipart_flag);
             return Ok(());
         }
 
@@ -1716,10 +1737,11 @@ mod rebalance_unit_tests {
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
-        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
+        mark_multipart_upload_completed, mark_rebalance_bucket_done, migrate_entry_version, new_multipart_abort_flag,
+        next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_abort_multipart_upload, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
         take_bucket_from_rebalance_queue,
     };
@@ -2460,6 +2482,19 @@ mod rebalance_unit_tests {
         assert!(!should_skip_start_rebalance(true, false));
         assert!(!should_skip_start_rebalance(false, true));
         assert!(!should_skip_start_rebalance(false, false));
+    }
+
+    #[test]
+    fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
+        let flag = new_multipart_abort_flag();
+        assert!(should_abort_multipart_upload(&flag));
+    }
+
+    #[test]
+    fn test_mark_multipart_upload_completed_disables_abort_cleanup() {
+        let flag = new_multipart_abort_flag();
+        mark_multipart_upload_completed(&flag);
+        assert!(!should_abort_multipart_upload(&flag));
     }
 
     #[test]

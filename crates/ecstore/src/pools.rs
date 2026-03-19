@@ -64,7 +64,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
 use time::{Duration, OffsetDateTime};
@@ -276,6 +276,18 @@ fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Opt
     } else {
         spawn_err
     }
+}
+
+fn new_multipart_abort_flag() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
+fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
+    flag.store(false, Ordering::Relaxed);
 }
 
 fn decommission_item_size<T>(size: T) -> usize
@@ -2143,7 +2155,12 @@ impl ECStore {
                 }
             };
 
+            let abort_multipart_flag = new_multipart_abort_flag();
+            let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
             defer!(|| async {
+                if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
+                    return;
+                }
                 if let Err(err) = self
                     .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
                     .await
@@ -2216,6 +2233,7 @@ impl ECStore {
                 return Err(err);
             }
 
+            mark_multipart_upload_completed(&abort_multipart_flag);
             warn!("decommission_object: complete_multipart_upload done {} {}", &bucket, &object_info.name);
             return Ok(());
         }
@@ -2713,13 +2731,14 @@ mod pools_tests {
         decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object, with_decommission_entry_context,
+        is_decommission_cancel_terminal, mark_decommission_bucket_done, mark_multipart_upload_completed,
+        new_multipart_abort_flag, require_decommission_store, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result, should_abort_multipart_upload,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -3118,6 +3137,19 @@ mod pools_tests {
     #[test]
     fn test_decommission_item_size_clamps_negative_values_to_zero() {
         assert_eq!(decommission_item_size(-1_i64), 0);
+    }
+
+    #[test]
+    fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
+        let flag = new_multipart_abort_flag();
+        assert!(should_abort_multipart_upload(&flag));
+    }
+
+    #[test]
+    fn test_mark_multipart_upload_completed_disables_abort_cleanup() {
+        let flag = new_multipart_abort_flag();
+        mark_multipart_upload_completed(&flag);
+        assert!(!should_abort_multipart_upload(&flag));
     }
 
     #[test]
