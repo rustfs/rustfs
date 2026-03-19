@@ -181,10 +181,29 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
         .send()
         .await?;
 
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
     assert_eq!(
-        post_resp.status(),
+        status,
         reqwest::StatusCode::CREATED,
         "PostObject should honor success_action_status=201 when upload is allowed"
+    );
+    assert!(
+        response_body.contains("<PostResponse>"),
+        "201 response should contain PostResponse XML, got: {response_body}"
+    );
+    assert!(
+        response_body.contains(&format!("<Bucket>{bucket}</Bucket>")),
+        "201 response should include bucket in XML, got: {response_body}"
+    );
+    assert!(
+        response_body.contains(&format!("<Key>{object_key}</Key>")),
+        "201 response should include object key in XML, got: {response_body}"
+    );
+    assert!(
+        response_body.contains("<ETag>"),
+        "201 response should include ETag in XML, got: {response_body}"
     );
 
     let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
@@ -246,6 +265,64 @@ async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(
         location.starts_with(redirect_target),
         "redirect location should start with requested target, got: {location}"
     );
+    assert!(
+        location.contains("bucket="),
+        "redirect location should include bucket query parameter, got: {location}"
+    );
+    assert!(
+        location.contains("key="),
+        "redirect location should include key query parameter, got: {location}"
+    );
+    assert!(
+        location.to_ascii_lowercase().contains("etag="),
+        "redirect location should include etag query parameter, got: {location}"
+    );
+
+    let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = get_out.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice(), "uploaded object body should match");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-default-status";
+    let object_key = "post-default-object.txt";
+    let expected_body = b"anonymous-post-default-body".to_vec();
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new().text("key", object_key.to_string()).part(
+        "file",
+        reqwest::multipart::Part::bytes(expected_body.clone())
+            .file_name("upload.txt")
+            .mime_str("text/plain")?,
+    );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NO_CONTENT,
+        "PostObject should default to 204 when no success_action_status is provided"
+    );
+    assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
 
     let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
     let uploaded = get_out.body.collect().await?.into_bytes();
