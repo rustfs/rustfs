@@ -287,6 +287,16 @@ fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &s
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
+fn load_decommission_entry_versions(entry: &MetaCacheEntry, bucket: &str, stage: &str) -> Result<FileInfoVersions> {
+    entry
+        .file_info_versions(bucket)
+        .map_err(|err| with_decommission_entry_context(stage, bucket, &entry.name, err))
+}
+
+fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_error: Option<Error>) -> Result<()> {
+    if let Some(err) = entry_error { Err(err) } else { list_result }
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1281,17 +1291,7 @@ impl ECStore {
             return Ok(());
         }
 
-        let mut fivs = match entry.file_info_versions(&bucket) {
-            Ok(f) => f,
-            Err(err) => {
-                return Err(with_decommission_entry_context(
-                    "file_info_versions",
-                    bucket.as_str(),
-                    entry.name.as_str(),
-                    err,
-                ));
-            }
-        };
+        let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
         fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
 
@@ -1993,21 +1993,31 @@ impl ECStore {
                 }
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
+                let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+                let callback_rx = CancellationToken::new();
                 let versions_found_cb = versions_found.clone();
+                let entry_error_cb = entry_error.clone();
                 let bucket_name = bucket_info.name.clone();
                 let lifecycle_config_cb = lifecycle_config.clone();
                 let lock_retention_cb = lock_retention.clone();
                 let replication_config_cb = replication_config.clone();
                 let store = Arc::clone(self);
+                let callback_rx_cb = callback_rx.clone();
 
                 let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
                     let versions_found = versions_found_cb.clone();
+                    let entry_error = entry_error_cb.clone();
                     let bucket_name = bucket_name.clone();
                     let lifecycle_config = lifecycle_config_cb.clone();
                     let lock_retention = lock_retention_cb.clone();
                     let replication_config = replication_config_cb.clone();
                     let store = Arc::clone(&store);
+                    let callback_rx = callback_rx_cb.clone();
                     Box::pin(async move {
+                        if callback_rx.is_cancelled() {
+                            return;
+                        }
+
                         if !entry.is_object() {
                             return;
                         }
@@ -2016,8 +2026,20 @@ impl ECStore {
                             return;
                         }
 
-                        let Ok(fivs) = entry.file_info_versions(&bucket_name) else {
-                            return;
+                        let fivs = match load_decommission_entry_versions(
+                            &entry,
+                            &bucket_name,
+                            "check_after_decommission.file_info_versions",
+                        ) {
+                            Ok(fivs) => fivs,
+                            Err(err) => {
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err);
+                                    callback_rx.cancel();
+                                }
+                                return;
+                            }
                         };
 
                         let mut remaining = 0;
@@ -2046,8 +2068,11 @@ impl ECStore {
                     })
                 });
 
-                set.list_objects_to_decommission(CancellationToken::new(), bucket_info.clone(), callback)
-                    .await?;
+                let list_result = set
+                    .list_objects_to_decommission(callback_rx, bucket_info.clone(), callback)
+                    .await;
+                let entry_error = entry_error.lock().await.clone();
+                resolve_decommission_check_after_list_result(list_result, entry_error)?;
 
                 let versions_found = versions_found.load(Ordering::Relaxed);
                 if versions_found > 0 {
@@ -2531,16 +2556,18 @@ mod pools_tests {
         decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object, with_decommission_entry_context,
+        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
+        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
+    use rustfs_filemeta::MetaCacheEntry;
     use rustfs_rio::Index;
     use time::{Duration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
@@ -2975,6 +3002,37 @@ mod pools_tests {
         assert!(message.contains("decommission entry update_after failed"));
         assert!(message.contains("bucket bucket-a"));
         assert!(message.contains("object obj.txt"));
+    }
+
+    #[test]
+    fn test_load_decommission_entry_versions_wraps_parse_errors_with_context() {
+        let entry = MetaCacheEntry {
+            name: "obj.txt".to_string(),
+            metadata: vec![1, 2, 3],
+            cached: None,
+            reusable: false,
+        };
+
+        let err = load_decommission_entry_versions(&entry, "bucket-a", "check_after_decommission.file_info_versions")
+            .expect_err("invalid metadata should fail");
+        let message = err.to_string();
+        assert!(message.contains("decommission entry check_after_decommission.file_info_versions failed"));
+        assert!(message.contains("bucket bucket-a"));
+        assert!(message.contains("object obj.txt"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_check_after_list_result_prefers_entry_error() {
+        let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), Some(Error::SlowDown))
+            .expect_err("entry error should win over cancellation");
+        assert!(matches!(err, Error::SlowDown));
+    }
+
+    #[test]
+    fn test_resolve_decommission_check_after_list_result_returns_list_result_without_entry_error() {
+        let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), None)
+            .expect_err("list result should be preserved without entry error");
+        assert!(matches!(err, Error::OperationCanceled));
     }
 
     #[tokio::test]
