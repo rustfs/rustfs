@@ -224,6 +224,10 @@ fn resolve_decommission_bucket_done_save_result(result: Result<()>, idx: usize, 
     result.map_err(|err| Error::other(format!("decommission metadata save failed for pool {idx} bucket {bucket}: {err}")))
 }
 
+fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
+    Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -975,19 +979,23 @@ impl ECStore {
         set: Arc<SetDisks>,
         wk: Arc<Workers>,
         rcfg: Option<String>,
-    ) {
+    ) -> Result<()> {
         warn!("decommission_entry: {} {}", &bucket, &entry.name);
         wk.give().await;
         if entry.is_dir() {
             warn!("decommission_entry: skip dir {}", &entry.name);
-            return;
+            return Ok(());
         }
 
         let mut fivs = match entry.file_info_versions(&bucket) {
             Ok(f) => f,
             Err(err) => {
-                error!("decommission_pool: file_info_versions err {:?}", &err);
-                return;
+                return Err(with_decommission_entry_context(
+                    "file_info_versions",
+                    bucket.as_str(),
+                    entry.name.as_str(),
+                    err,
+                ));
             }
         };
 
@@ -1043,8 +1051,12 @@ impl ECStore {
                 {
                     let mut pool_meta = self.pool_meta.write().await;
                     if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, failure) {
-                        error!("decommission_pool: count_decommission_item err {:?}", err);
-                        return;
+                        return Err(with_decommission_entry_context(
+                            "count_decommission_item",
+                            bucket.as_str(),
+                            entry.name.as_str(),
+                            err,
+                        ));
                     }
                 }
 
@@ -1134,8 +1146,12 @@ impl ECStore {
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommissioned, failure) {
-                    error!("decommission_pool: count_decommission_item err {:?}", err);
-                    return;
+                    return Err(with_decommission_entry_context(
+                        "count_decommission_item",
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                        err,
+                    ));
                 }
             }
 
@@ -1167,8 +1183,12 @@ impl ECStore {
             let mut pool_meta = self.pool_meta.write().await;
 
             if let Err(err) = track_decommission_current_object(&mut pool_meta, idx, bucket.as_str(), entry.name.as_str()) {
-                error!("decommission_entry: track_decommission_current_object err {:?}", err);
-                return;
+                return Err(with_decommission_entry_context(
+                    "track_decommission_current_object",
+                    bucket.as_str(),
+                    entry.name.as_str(),
+                    err,
+                ));
             }
 
             let ok = match resolve_decommission_update_after_result(
@@ -1176,8 +1196,7 @@ impl ECStore {
             ) {
                 Ok(ok) => ok,
                 Err(err) => {
-                    error!("decommission_entry: update_after err {:?}", err);
-                    return;
+                    return Err(with_decommission_entry_context("update_after", bucket.as_str(), entry.name.as_str(), err));
                 }
             };
 
@@ -1191,6 +1210,7 @@ impl ECStore {
         }
 
         warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -1202,6 +1222,7 @@ impl ECStore {
         bi: DecomBucketInfo,
     ) -> Result<()> {
         let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
 
         // let mut vc = None;
         // replication
@@ -1226,16 +1247,27 @@ impl ECStore {
                 let wk = wk.clone();
                 let set = set.clone();
                 let rcfg = rcfg.clone();
+                let entry_error = entry_error.clone();
+                let callback_rx = rx.clone();
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
                     let wk = wk.clone();
                     let set = set.clone();
                     let rcfg = rcfg.clone();
+                    let entry_error = entry_error.clone();
+                    let callback_rx = callback_rx.clone();
 
                     Box::pin(async move {
                         wk.take().await;
-                        this.decommission_entry(idx, entry, bucket, set, wk, rcfg).await
+                        if let Err(err) = this.decommission_entry(idx, entry, bucket, set, wk, rcfg).await {
+                            error!("decommission_pool: decommission_entry failed: {err}");
+                            let mut first_err = entry_error.lock().await;
+                            if first_err.is_none() {
+                                *first_err = Some(err);
+                                callback_rx.cancel();
+                            }
+                        }
                     })
                 }
             });
@@ -1280,6 +1312,10 @@ impl ECStore {
         warn!("decommission_pool: decommission_pool wait {} {}", idx, &bi.name);
 
         wk.wait().await;
+
+        if let Some(err) = entry_error.lock().await.clone() {
+            return Err(err);
+        }
 
         if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
             warn!("decommission_pool: canceled after wait {} {}", idx, &bi.name);
@@ -1944,6 +1980,7 @@ mod pools_tests {
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
         resolve_decommission_bucket_state, resolve_decommission_preflight_heal_result, resolve_decommission_update_after_result,
         should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2262,6 +2299,15 @@ mod pools_tests {
             err.to_string()
                 .contains("decommission metadata save failed for pool 2 bucket bucket-a")
         );
+    }
+
+    #[test]
+    fn test_with_decommission_entry_context_formats_stage_bucket_and_object() {
+        let err = with_decommission_entry_context("update_after", "bucket-a", "obj.txt", Error::SlowDown);
+        let message = err.to_string();
+        assert!(message.contains("decommission entry update_after failed"));
+        assert!(message.contains("bucket bucket-a"));
+        assert!(message.contains("object obj.txt"));
     }
 
     #[tokio::test]
