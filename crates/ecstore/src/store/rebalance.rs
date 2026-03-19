@@ -129,7 +129,7 @@ impl ECStore {
         Ok(())
     }
 
-    async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+    pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
         // // Return a random one first
 
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;

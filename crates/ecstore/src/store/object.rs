@@ -91,6 +91,18 @@ fn copy_source_pool_lookup_opts(opts: &ObjectOptions) -> ObjectOptions {
     lookup_opts
 }
 
+fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.no_lock = no_lock;
+    lookup_opts.skip_decommissioned = true;
+    lookup_opts.skip_rebalancing = true;
+    if lookup_opts.version_id.is_some() {
+        lookup_opts.metadata_chg = true;
+    }
+
+    lookup_opts
+}
+
 impl ECStore {
     async fn get_latest_accessible_object_info_with_idx(
         &self,
@@ -100,6 +112,29 @@ impl ECStore {
     ) -> Result<(ObjectInfo, usize)> {
         let (info, idx) = self.get_latest_object_info_with_idx(bucket, object, opts).await?;
         resolve_latest_object_access(bucket, object, info, idx, opts)
+    }
+
+    async fn select_data_movement_pool_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        opts: &ObjectOptions,
+        no_lock: bool,
+    ) -> Result<usize> {
+        match self
+            .get_pool_info_existing_with_opts(bucket, object, &data_movement_pool_lookup_opts(opts, no_lock))
+            .await
+        {
+            Ok((pinfo, _)) => Ok(pinfo.index),
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(err);
+                }
+
+                self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
+            }
+        }
     }
 
     #[instrument(skip(self, fi, opts))]
@@ -118,7 +153,12 @@ impl ECStore {
             return Err(Error::other(format!("error decommissioning {bucket}/{object}")));
         }
 
-        let idx = self.get_pool_idx_no_lock(bucket, &object, fi.size).await?;
+        let idx = if opts.data_movement && opts.version_id.is_some() {
+            self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true)
+                .await?
+        } else {
+            self.get_pool_idx_no_lock(bucket, &object, fi.size).await?
+        };
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
@@ -180,7 +220,12 @@ impl ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(bucket, &object, data.size()).await?;
+        let idx = if opts.data_movement && opts.version_id.is_some() {
+            self.select_data_movement_pool_idx(bucket, &object, data.size(), opts, false)
+                .await?
+        } else {
+            self.get_pool_idx(bucket, &object, data.size()).await?
+        };
 
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -881,5 +926,37 @@ mod tests {
         assert!(lookup_opts.no_lock);
         assert!(!lookup_opts.metadata_chg);
         assert!(lookup_opts.version_id.is_none());
+    }
+
+    #[test]
+    fn data_movement_pool_lookup_opts_enables_version_aware_lookup_and_skip_flags() {
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let lookup_opts = data_movement_pool_lookup_opts(&opts, false);
+
+        assert!(!lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn data_movement_pool_lookup_opts_keeps_no_lock_for_tiered_moves() {
+        let lookup_opts = data_movement_pool_lookup_opts(
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
     }
 }
