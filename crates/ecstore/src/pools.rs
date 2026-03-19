@@ -278,6 +278,13 @@ fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Opt
     }
 }
 
+fn decommission_item_size<T>(size: T) -> usize
+where
+    usize: TryFrom<T>,
+{
+    usize::try_from(size).unwrap_or_default()
+}
+
 fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
@@ -1520,7 +1527,7 @@ impl ECStore {
 
             {
                 let mut pool_meta = self.pool_meta.write().await;
-                if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommissioned, failure) {
+                if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), failure) {
                     return Err(with_decommission_entry_context(
                         "count_decommission_item",
                         bucket.as_str(),
@@ -2703,16 +2710,16 @@ mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
-        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
-        get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
-        mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
+        ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -3101,6 +3108,16 @@ mod pools_tests {
         let message = err.to_string();
         assert!(message.contains("decommission spawn routines failed"));
         assert!(message.contains("rollback failed"));
+    }
+
+    #[test]
+    fn test_decommission_item_size_converts_positive_values() {
+        assert_eq!(decommission_item_size(42_i64), 42);
+    }
+
+    #[test]
+    fn test_decommission_item_size_clamps_negative_values_to_zero() {
+        assert_eq!(decommission_item_size(-1_i64), 0);
     }
 
     #[test]
