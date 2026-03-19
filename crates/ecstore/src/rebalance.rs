@@ -127,6 +127,18 @@ fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, 
     }
 }
 
+fn rebalance_remote_tiered_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
+    ObjectOptions {
+        versioned: version_id.is_some(),
+        version_id,
+        mod_time: version.mod_time,
+        user_defined: version.metadata.clone(),
+        src_pool_idx,
+        data_movement: true,
+        ..Default::default()
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait MigrationBackend: Send + Sync {
     async fn get_object_reader_for_migration(
@@ -139,6 +151,14 @@ pub(crate) trait MigrationBackend: Send + Sync {
     ) -> Result<GetObjectReader>;
 
     async fn delete_object_for_migration(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn move_remote_version_for_migration(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -156,6 +176,16 @@ impl MigrationBackend for SetDisks {
 
     async fn delete_object_for_migration(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         self.delete_object(bucket, object, opts).await
+    }
+
+    async fn move_remote_version_for_migration(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        self.decommission_tiered_object(bucket, object, fi, opts).await
     }
 }
 
@@ -188,9 +218,37 @@ where
     }
 
     if version.is_remote() {
+        if let Err(err) = set
+            .move_remote_version_for_migration(
+                &bucket,
+                &version.name,
+                version,
+                &rebalance_remote_tiered_opts(version, version_id, pool_index),
+            )
+            .await
+        {
+            if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+                return MigrationVersionResult {
+                    moved: false,
+                    ignored: true,
+                    cleanup_ignored: true,
+                    failed: false,
+                    error: None,
+                };
+            }
+
+            return MigrationVersionResult {
+                moved: false,
+                ignored: false,
+                cleanup_ignored: false,
+                failed: true,
+                error: Some(err),
+            };
+        }
+
         return MigrationVersionResult {
-            moved: false,
-            ignored: true,
+            moved: true,
+            ignored: false,
             cleanup_ignored: false,
             failed: false,
             error: None,
@@ -1742,20 +1800,25 @@ mod rebalance_unit_tests {
     struct MigrationBackendSpy {
         get_object_reader: Mutex<Option<core::result::Result<GetObjectReader, Error>>>,
         delete_object: Mutex<Option<core::result::Result<ObjectInfo, Error>>>,
+        move_remote: Mutex<Option<core::result::Result<(), Error>>>,
         get_calls: AtomicUsize,
         delete_calls: AtomicUsize,
+        move_remote_calls: AtomicUsize,
     }
 
     impl MigrationBackendSpy {
         fn new(
             get_object_reader: Option<core::result::Result<GetObjectReader, Error>>,
             delete_object: Option<core::result::Result<ObjectInfo, Error>>,
+            move_remote: Option<core::result::Result<(), Error>>,
         ) -> Self {
             Self {
                 get_object_reader: Mutex::new(get_object_reader),
                 delete_object: Mutex::new(delete_object),
+                move_remote: Mutex::new(move_remote),
                 get_calls: AtomicUsize::new(0),
                 delete_calls: AtomicUsize::new(0),
+                move_remote_calls: AtomicUsize::new(0),
             }
         }
 
@@ -1765,6 +1828,10 @@ mod rebalance_unit_tests {
 
         fn delete_calls(&self) -> usize {
             self.delete_calls.load(Ordering::SeqCst)
+        }
+
+        fn move_remote_calls(&self) -> usize {
+            self.move_remote_calls.load(Ordering::SeqCst)
         }
 
         fn make_reader() -> GetObjectReader {
@@ -1800,6 +1867,21 @@ mod rebalance_unit_tests {
             }
 
             Ok(ObjectInfo::default())
+        }
+
+        async fn move_remote_version_for_migration(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _fi: &FileInfo,
+            _opts: &ObjectOptions,
+        ) -> Result<()> {
+            self.move_remote_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(result) = self.move_remote.lock().unwrap().take() {
+                return result;
+            }
+
+            Ok(())
         }
     }
 
@@ -1854,8 +1936,51 @@ mod rebalance_unit_tests {
     }
 
     #[tokio::test]
-    async fn test_migrate_entry_version_remote_version_is_ignored() {
-        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())));
+    async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
+        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Ok(())));
+        let version = version_remote();
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            0,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(result.moved);
+        assert!(!result.failed);
+        assert!(result.error.is_none());
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.move_remote_calls(), 1);
+        assert_eq!(backend.get_calls(), 0);
+        assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
+        let backend = MigrationBackendSpy::new(
+            None,
+            Some(Ok(ObjectInfo::default())),
+            Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
+        );
         let version = version_remote();
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
@@ -1882,18 +2007,58 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
-        assert!(!result.cleanup_ignored);
+        assert!(result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.move_remote_calls(), 1);
+        assert_eq!(backend.get_calls(), 0);
+        assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_remote_failure_is_reported() {
+        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Err(Error::SlowDown)));
+        let version = version_remote();
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            0,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(!result.moved);
+        assert!(result.failed);
+        assert!(matches!(result.error, Some(Error::SlowDown)));
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.move_remote_calls(), 1);
         assert_eq!(backend.get_calls(), 0);
         assert_eq!(backend.delete_calls(), 0);
     }
 
     #[tokio::test]
     async fn test_migrate_entry_version_deleted_version_calls_delete_and_moved() {
-        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())));
+        let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), None);
         let version = version_deleted();
         let mut transfer = |_, _, _| async move { Ok(()) };
 
@@ -1920,8 +2085,11 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
-        let backend =
-            MigrationBackendSpy::new(None, Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))));
+        let backend = MigrationBackendSpy::new(
+            None,
+            Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
+            None,
+        );
         let version = version_deleted();
         let mut transfer = |_, _, _| async move { Ok(()) };
 
@@ -1947,8 +2115,11 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_reader_not_found_is_ignored() {
-        let backend =
-            MigrationBackendSpy::new(Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))), None);
+        let backend = MigrationBackendSpy::new(
+            Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
+            None,
+            None,
+        );
         let version = version_normal();
         let mut transfer = |_, _, _| async move { Ok(()) };
 
@@ -1975,7 +2146,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_reader_retries_before_success() {
-        let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None);
+        let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
@@ -2043,6 +2214,16 @@ mod rebalance_unit_tests {
 
         async fn delete_object_for_migration(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
             Ok(ObjectInfo::default())
+        }
+
+        async fn move_remote_version_for_migration(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _fi: &FileInfo,
+            _opts: &ObjectOptions,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -2122,7 +2303,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_transfer_retries_before_success() {
-        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
@@ -2161,7 +2342,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_transfer_fails_after_retries() {
-        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
@@ -2198,7 +2379,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_transfer_not_found_is_ignored() {
-        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
@@ -2234,7 +2415,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
-        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let version = {
             let mut version = version_normal();
             version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
@@ -2276,7 +2457,7 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled() {
-        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let version = {
             let mut version = version_normal();
             version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
