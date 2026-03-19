@@ -301,9 +301,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 /// # Arguments
 /// * `config` - The application configuration options
 pub(crate) fn init_buffer_profile_system(config: &config::Config) {
-    use crate::config::workload_profiles::{
-        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-    };
+    use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {

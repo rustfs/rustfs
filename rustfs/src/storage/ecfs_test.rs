@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::config::workload_profiles::WorkloadProfile;
+    use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::ecfs::FS;
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
@@ -281,9 +281,7 @@ mod tests {
 
     #[test]
     fn test_phase3_default_behavior() {
-        use crate::config::workload_profiles::{
-            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-        };
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -304,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_buffer_size_opt_in() {
-        use crate::config::workload_profiles::{is_buffer_profile_enabled, set_buffer_profile_enabled};
+        use crate::config::{is_buffer_profile_enabled, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;
@@ -336,9 +334,7 @@ mod tests {
 
     #[test]
     fn test_phase4_full_integration() {
-        use crate::config::workload_profiles::{
-            RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-        };
+        use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
         const KB: i64 = 1024;
         const MB: i64 = 1024 * 1024;

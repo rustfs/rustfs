@@ -57,4 +57,5 @@ pub use opt::Opt;
 pub use snapshot::{get_config_snapshot_for_display, init_config_snapshot};
 
 // Re-export workload profiles
-pub mod workload_profiles;
+mod workload_profiles;
+pub use workload_profiles::*;
