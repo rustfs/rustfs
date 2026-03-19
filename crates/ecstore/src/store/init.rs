@@ -15,6 +15,31 @@
 use super::*;
 use crate::error::is_err_decommission_running;
 
+fn require_deployment_id(deployment_id: Option<Uuid>) -> Result<Uuid> {
+    deployment_id.ok_or_else(|| Error::other("deployment id is not initialized"))
+}
+
+fn clone_first_store_pool<T: Clone>(pools: &[T]) -> Result<T> {
+    pools
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::other("no storage pools available"))
+}
+
+fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
+    let pool = endpoints
+        .as_ref()
+        .get(idx)
+        .ok_or_else(|| Error::other(format!("decommission resume pool index {idx} not found")))?;
+    let endpoint = pool
+        .endpoints
+        .as_ref()
+        .first()
+        .ok_or_else(|| Error::other(format!("decommission resume pool index {idx} has no endpoints")))?;
+
+    Ok(endpoint.is_local)
+}
+
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[instrument(level = "debug", skip(endpoint_pools))]
@@ -121,7 +146,7 @@ impl ECStore {
                 return Err(Error::other("deployment_id not same in one pool"));
             }
 
-            if deployment_id.is_some() && deployment_id.unwrap().is_nil() {
+            if deployment_id.is_some_and(|id| id.is_nil()) {
                 deployment_id = Some(Uuid::new_v4());
             }
 
@@ -152,7 +177,7 @@ impl ECStore {
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
-            id: deployment_id.unwrap(),
+            id: require_deployment_id(deployment_id)?,
             disk_map,
             pools,
             peer_sys,
@@ -197,12 +222,11 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
-        if self.load_rebalance_meta().await.is_ok() {
-            self.start_rebalance().await;
-        }
+        self.load_rebalance_meta().await?;
+        self.start_rebalance().await;
 
         let mut meta = PoolMeta::default();
-        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
+        meta.load(clone_first_store_pool(&self.pools)?, self.pools.clone()).await?;
         let update = meta.validate(self.pools.clone())?;
 
         if !update {
@@ -237,7 +261,7 @@ impl ECStore {
 
         if !pool_indices.is_empty() {
             let idx = pool_indices[0];
-            if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
+            if should_resume_local_decommission(&endpoints, idx)? {
                 let store = self.clone();
 
                 tokio::spawn(async move {
@@ -282,5 +306,77 @@ impl ECStore {
 
     pub fn single_pool(&self) -> bool {
         self.pools.len() == 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clone_first_store_pool, require_deployment_id, should_resume_local_decommission};
+    use crate::{
+        disk::endpoint::Endpoint,
+        endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn test_require_deployment_id_returns_uuid() {
+        let id = Uuid::new_v4();
+        let resolved = require_deployment_id(Some(id)).expect("deployment id should pass through");
+        assert_eq!(resolved, id);
+    }
+
+    #[test]
+    fn test_require_deployment_id_rejects_missing_id() {
+        let err = require_deployment_id(None).expect_err("missing deployment id should error");
+        assert!(err.to_string().contains("deployment id is not initialized"));
+    }
+
+    #[test]
+    fn test_clone_first_store_pool_returns_first_pool() {
+        let first = clone_first_store_pool(&[1_u8, 2, 3]).expect("first pool should be returned");
+        assert_eq!(first, 1);
+    }
+
+    #[test]
+    fn test_clone_first_store_pool_rejects_empty_pools() {
+        let err = clone_first_store_pool::<u8>(&[]).expect_err("empty pool list should error");
+        assert!(err.to_string().contains("no storage pools available"));
+    }
+
+    #[test]
+    fn test_should_resume_local_decommission_respects_local_flag() {
+        let mut local_endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("endpoint should parse");
+        local_endpoint.is_local = true;
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![local_endpoint]),
+            cmd_line: "pool-0".to_string(),
+            platform: String::new(),
+        }]);
+
+        assert!(should_resume_local_decommission(&endpoints, 0).expect("local endpoint should resume"));
+    }
+
+    #[test]
+    fn test_should_resume_local_decommission_rejects_unresolvable_pool() {
+        let endpoints = EndpointServerPools::default();
+        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing pool should error");
+        assert!(err.to_string().contains("pool index 0 not found"));
+    }
+
+    #[test]
+    fn test_should_resume_local_decommission_rejects_missing_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(Vec::<Endpoint>::new()),
+            cmd_line: "pool-0".to_string(),
+            platform: String::new(),
+        }]);
+        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing endpoint should error");
+        assert!(err.to_string().contains("pool index 0 has no endpoints"));
     }
 }
