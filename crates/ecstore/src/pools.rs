@@ -224,6 +224,18 @@ fn resolve_decommission_bucket_done_save_result(result: Result<()>, idx: usize, 
     result.map_err(|err| Error::other(format!("decommission metadata save failed for pool {idx} bucket {bucket}: {err}")))
 }
 
+fn resolve_decommission_entry_cleanup_delete_result<T>(result: Result<T>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
+        Err(err) => Err(Error::other(format!("decommission entry cleanup delete failed: {err}"))),
+    }
+}
+
+fn resolve_decommission_entry_reload_result(result: Result<()>) -> Result<()> {
+    result.map_err(|err| Error::other(format!("decommission entry reload pool metadata failed: {err}")))
+}
+
 fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
@@ -1162,8 +1174,8 @@ impl ECStore {
             decommissioned += 1;
         }
 
-        if decommissioned == fivs.versions.len()
-            && let Err(err) = set
+        if decommissioned == fivs.versions.len() {
+            let cleanup_result = set
                 .delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
@@ -1174,9 +1186,15 @@ impl ECStore {
                         ..Default::default()
                     },
                 )
-                .await
-        {
-            error!("decommission_pool: delete_object err {:?}", &err);
+                .await;
+            if let Err(err) = resolve_decommission_entry_cleanup_delete_result(cleanup_result) {
+                return Err(with_decommission_entry_context(
+                    "cleanup_delete_object",
+                    bucket.as_str(),
+                    entry.name.as_str(),
+                    err,
+                ));
+            }
         }
 
         {
@@ -1201,12 +1219,15 @@ impl ECStore {
             };
 
             drop(pool_meta);
-            if ok
-                && let Some(notification_sys) = get_global_notification_sys()
-                && let Err(err) = notification_sys.reload_pool_meta().await
-            {
-                error!("decommission_entry: reload_pool_meta err {:?}", err);
-            }
+            if ok && let Some(notification_sys) = get_global_notification_sys()
+                && let Err(err) = resolve_decommission_entry_reload_result(notification_sys.reload_pool_meta().await) {
+                    return Err(with_decommission_entry_context(
+                        "reload_pool_meta",
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                        err,
+                    ));
+                }
         }
 
         warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
@@ -1978,9 +1999,10 @@ mod pools_tests {
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_valid_decommission_pool_index,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_preflight_heal_result, resolve_decommission_update_after_result,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2299,6 +2321,35 @@ mod pools_tests {
             err.to_string()
                 .contains("decommission metadata save failed for pool 2 bucket bucket-a")
         );
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_cleanup_delete_result_passthrough_ok() {
+        assert!(resolve_decommission_entry_cleanup_delete_result(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_cleanup_delete_result_ignores_not_found() {
+        assert!(resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::FileNotFound)).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_cleanup_delete_result_wraps_error_context() {
+        let err = resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::SlowDown))
+            .expect_err("cleanup delete failure should be wrapped with explicit context");
+        assert!(err.to_string().contains("decommission entry cleanup delete failed"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_reload_result_passthrough_ok() {
+        assert!(resolve_decommission_entry_reload_result(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_entry_reload_result_wraps_error_context() {
+        let err = resolve_decommission_entry_reload_result(Err(Error::SlowDown))
+            .expect_err("reload failure should be wrapped with explicit context");
+        assert!(err.to_string().contains("decommission entry reload pool metadata failed"));
     }
 
     #[test]
