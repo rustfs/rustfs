@@ -59,7 +59,8 @@ pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
-/// Also: `rustfs` with no args becomes `rustfs server` (volumes from env).
+/// Also: `rustfs` with no args becomes `rustfs server` (volumes from env), and `rustfs --info`
+/// is treated as `rustfs info`.
 pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if args.len() < 2 {
         // rustfs -> rustfs server (volumes from RUSTFS_VOLUMES env)
@@ -72,7 +73,9 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     }
     // If first arg is --info, treat it as info subcommand
     if first == "--info" {
-        return args;
+        let mut out = vec![args[0].clone(), "info".to_string()];
+        out.extend(args[2..].iter().cloned());
+        return out;
     }
     // If first arg is a global flag (--help, --version), do nothing
     if first == "--help" || first == "-h" || first == "--version" || first == "-V" {

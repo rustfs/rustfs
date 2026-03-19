@@ -410,14 +410,14 @@ impl RuntimeInfo {
             (0.0, 0.0)
         };
 
-        // Get thread count from std::thread
-        let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        // // Get available CPU parallelism (roughly, logical cores available to the process)
+        let cpu_parallelism = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
 
         Self {
             process_id: pid.as_u32(),
             memory_usage_mb,
             cpu_usage_percent,
-            thread_count,
+            thread_count: cpu_parallelism,
         }
     }
 
@@ -427,7 +427,7 @@ impl RuntimeInfo {
              Process ID: {}\n\
              Memory Usage: {:.2} MB\n\
              CPU Usage: {:.2}%\n\
-             Thread Count: {}",
+             CPU Parallelism (logical cores): {}",
             self.process_id, self.memory_usage_mb, self.cpu_usage_percent, self.thread_count
         )
     }

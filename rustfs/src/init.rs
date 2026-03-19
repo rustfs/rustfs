@@ -15,7 +15,7 @@
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
 use rustfs_config::{
-    DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
+    DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
 use rustfs_ecstore::bucket::metadata_sys;
@@ -342,9 +342,21 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
         info!("Active buffer profile: {:?}", profile);
 
         // Create and validate buffer configuration
-        let buffer_config = RustFSBufferConfig::new(profile);
+        let mut buffer_config = RustFSBufferConfig::new(profile);
         if let Err(e) = buffer_config.validate() {
-            warn!("Buffer configuration validation failed: {}", e);
+            warn!("Buffer configuration validation failed: {}. Falling back to GeneralPurpose profile.", e);
+            // Fall back to a known-good profile to avoid installing an invalid configuration
+            let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
+            info!("Using fallback buffer profile: {:?}", fallback_profile);
+            let fallback_config = RustFSBufferConfig::new(fallback_profile);
+            if let Err(e2) = fallback_config.validate() {
+                error!(
+                    "Fallback buffer configuration validation failed: {}. Aborting buffer profiling initialization.",
+                    e2
+                );
+                panic!("Failed to initialize a valid RustFS buffer configuration");
+            }
+            buffer_config = fallback_config;
         }
 
         // Log the workload profile name

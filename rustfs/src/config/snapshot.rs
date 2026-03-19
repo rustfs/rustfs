@@ -126,16 +126,18 @@ pub fn is_config_snapshot_initialized() -> bool {
     GLOBAL_CONFIG_SNAPSHOT.get().is_some()
 }
 
-/// Get config snapshot for display purposes.
+/// Get config snapshot for display purposes (backward-compatible wrapper).
 ///
 /// - If the global snapshot is initialized (server has started), returns a reference to it.
 /// - If not initialized (e.g., --info command before server starts), returns a temporary
 ///   snapshot created from environment variables WITHOUT updating the global storage.
 ///
-/// This ensures the global snapshot is ONLY set by `init_config_snapshot` during server startup.
+/// Despite its name, this function no longer initializes the global snapshot; it simply
+/// delegates to `get_config_snapshot_for_display` to ensure the global snapshot is ONLY set
+/// by `init_config_snapshot` during server startup.
 #[allow(dead_code)] // kept for backward compatibility
 pub fn get_or_init_config_snapshot() -> &'static ConfigSnapshot {
-    GLOBAL_CONFIG_SNAPSHOT.get_or_init(ConfigSnapshot::from_env)
+    get_config_snapshot_for_display()
 }
 /// Get config snapshot for display, without modifying global state.
 ///
