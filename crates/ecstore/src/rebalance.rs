@@ -20,8 +20,7 @@ use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
 use crate::error::{
-    is_err_data_movement_overwrite, is_err_not_initialized, is_err_object_not_found, is_err_operation_canceled,
-    is_err_version_not_found,
+    is_err_data_movement_overwrite, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found,
 };
 use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
@@ -861,11 +860,11 @@ impl ECStore {
             if let Some(bucket) = next_bucket {
                 info!("Rebalancing bucket: start {}", bucket);
 
-                if let Err(err) = self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await {
-                    if is_err_not_initialized(&err) {
-                        info!("rebalance_bucket: rebalance not initialized, continue");
-                        continue;
-                    }
+                if let Err(err) = resolve_rebalance_bucket_result(
+                    self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await,
+                    pool_index,
+                    &bucket,
+                ) {
                     error!("Error rebalancing bucket {}: {:?}", bucket, err);
                     final_result = Err(resolve_rebalance_terminal_error(
                         err.clone(),
@@ -1120,6 +1119,14 @@ fn resolve_rebalance_bucket_error(entry_error: Option<Error>, worker_error: Opti
     }
 
     Ok(())
+}
+
+fn resolve_rebalance_bucket_result(result: Result<()>, pool_idx: usize, bucket: &str) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_err_operation_canceled(&err) => Err(err),
+        Err(err) => Err(Error::other(format!("rebalance bucket {bucket} failed for pool {pool_idx}: {err}"))),
+    }
 }
 
 fn clone_first_arc<T>(values: &[Arc<T>], err_msg: &str) -> Result<Arc<T>> {
@@ -1619,11 +1626,12 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2278,6 +2286,27 @@ mod rebalance_unit_tests {
             .expect_err("unexpected cleanup errors should be wrapped");
         let message = err.to_string();
         assert!(message.contains("rebalance cleanup delete failed for bucket-a/obj.txt"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_bucket_result_passthrough() {
+        assert!(resolve_rebalance_bucket_result(Ok(()), 2, "bucket-a").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_bucket_result_preserves_operation_canceled() {
+        let err = resolve_rebalance_bucket_result(Err(Error::OperationCanceled), 2, "bucket-a")
+            .expect_err("operation canceled should be preserved");
+        assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_bucket_result_wraps_not_initialized_with_context() {
+        let err = resolve_rebalance_bucket_result(Err(Error::other("errServerNotInitialized")), 2, "bucket-a")
+            .expect_err("not initialized should be surfaced with context");
+        let message = err.to_string();
+        assert!(message.contains("rebalance bucket bucket-a failed for pool 2"));
+        assert!(message.contains("errServerNotInitialized"));
     }
 
     #[tokio::test]
