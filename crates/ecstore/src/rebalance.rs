@@ -837,10 +837,10 @@ impl ECStore {
             if rx.is_cancelled() {
                 info!("Pool {} rebalancing is stopped", pool_index);
                 let err = Error::OperationCanceled;
-                if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
-                    error!("{send_err}");
-                }
-                final_result = Err(err);
+                final_result = Err(resolve_rebalance_terminal_error(
+                    err.clone(),
+                    send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                ));
                 break;
             }
 
@@ -848,10 +848,10 @@ impl ECStore {
                 Ok(bucket) => bucket,
                 Err(err) => {
                     error!("next_rebal_bucket failed for pool {}: {:?}", pool_index, err);
-                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
-                        error!("{send_err}");
-                    }
-                    final_result = Err(err);
+                    final_result = Err(resolve_rebalance_terminal_error(
+                        err.clone(),
+                        send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                    ));
                     break;
                 }
             };
@@ -865,20 +865,20 @@ impl ECStore {
                         continue;
                     }
                     error!("Error rebalancing bucket {}: {:?}", bucket, err);
-                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
-                        error!("{send_err}");
-                    }
-                    final_result = Err(err);
+                    final_result = Err(resolve_rebalance_terminal_error(
+                        err.clone(),
+                        send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                    ));
                     break;
                 }
 
                 info!("Rebalance bucket: done {} ", bucket);
                 if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
                     error!("bucket_rebalance_done failed for pool {}: {:?}", pool_index, err);
-                    if let Err(send_err) = send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await {
-                        error!("{send_err}");
-                    }
-                    final_result = Err(err);
+                    final_result = Err(resolve_rebalance_terminal_error(
+                        err.clone(),
+                        send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                    ));
                     break;
                 }
             } else {
@@ -1080,6 +1080,13 @@ async fn send_rebalance_done_signal(
         .send(signal)
         .await
         .map_err(|err| Error::other(format!("rebalance done signal send failed for pool {pool_idx}: {err}")))
+}
+
+fn resolve_rebalance_terminal_error(primary_err: Error, signal_result: Result<()>) -> Error {
+    match signal_result {
+        Ok(()) => primary_err,
+        Err(signal_err) => Error::other(format!("rebalance terminal signal failed after error {primary_err}: {signal_err}")),
+    }
 }
 
 fn resolve_rebalance_bucket_error(entry_error: Option<Error>, worker_error: Option<Error>) -> Result<()> {
@@ -1712,7 +1719,7 @@ mod rebalance_unit_tests {
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
+        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
         take_bucket_from_rebalance_queue,
     };
@@ -2209,6 +2216,18 @@ mod rebalance_unit_tests {
             .await
             .expect_err("send should fail when receiver is closed");
         assert!(err.to_string().contains("rebalance done signal send failed for pool 5"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_terminal_error_keeps_primary_when_signal_ok() {
+        let err = resolve_rebalance_terminal_error(Error::SlowDown, Ok(()));
+        assert!(matches!(err, Error::SlowDown));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_terminal_error_wraps_signal_failure_context() {
+        let err = resolve_rebalance_terminal_error(Error::SlowDown, Err(Error::OperationCanceled));
+        assert!(err.to_string().contains("rebalance terminal signal failed after error"));
     }
 
     #[test]
