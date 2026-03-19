@@ -14,6 +14,64 @@
 
 use super::*;
 
+struct LatestObjectInfoCandidate {
+    info: Option<ObjectInfo>,
+    idx: usize,
+    err: Option<Error>,
+}
+
+fn resolve_latest_object_info_candidates(
+    mut candidates: Vec<LatestObjectInfoCandidate>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    candidates.sort_by(|a, b| {
+        let a_mod = if let Some(info) = &a.info {
+            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+
+        let b_mod = if let Some(info) = &b.info {
+            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+
+        if a_mod == b_mod {
+            return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
+        }
+
+        b_mod.cmp(&a_mod)
+    });
+
+    for candidate in candidates {
+        if let Some(info) = candidate.info {
+            return Ok((info, candidate.idx));
+        }
+
+        if let Some(err) = candidate.err
+            && !is_err_object_not_found(&err)
+            && !is_err_version_not_found(&err)
+        {
+            return Err(err);
+        }
+    }
+
+    let object = decode_dir_object(object);
+
+    if opts.version_id.is_none() {
+        Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
+    } else {
+        Err(StorageError::VersionNotFound(
+            bucket.to_owned(),
+            object.to_owned(),
+            opts.version_id.clone().unwrap_or_default(),
+        ))
+    }
+}
+
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
     pub(super) async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
@@ -392,27 +450,20 @@ impl ECStore {
         }
 
         let results = join_all(futures).await;
-
-        struct IndexRes {
-            res: Option<ObjectInfo>,
-            idx: usize,
-            err: Option<Error>,
-        }
-
-        let mut idx_res = Vec::with_capacity(self.pools.len());
+        let mut candidates = Vec::with_capacity(self.pools.len());
 
         for (idx, result) in results.into_iter().enumerate() {
             match result {
                 Ok(res) => {
-                    idx_res.push(IndexRes {
-                        res: Some(res),
+                    candidates.push(LatestObjectInfoCandidate {
+                        info: Some(res),
                         idx,
                         err: None,
                     });
                 }
                 Err(e) => {
-                    idx_res.push(IndexRes {
-                        res: None,
+                    candidates.push(LatestObjectInfoCandidate {
+                        info: None,
                         idx,
                         err: Some(e),
                     });
@@ -420,53 +471,10 @@ impl ECStore {
             }
         }
 
-        // TODO: test order
-        idx_res.sort_by(|a, b| {
-            let a_mod = if let Some(o1) = &a.res {
-                o1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                OffsetDateTime::UNIX_EPOCH
-            };
-
-            let b_mod = if let Some(o2) = &b.res {
-                o2.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                OffsetDateTime::UNIX_EPOCH
-            };
-
-            if a_mod == b_mod {
-                return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
-            }
-
-            b_mod.cmp(&a_mod)
-        });
-
-        for res in idx_res.into_iter() {
-            if let Some(obj) = res.res {
-                return Ok((obj, res.idx));
-            }
-
-            if let Some(err) = res.err
-                && !is_err_object_not_found(&err)
-                && !is_err_version_not_found(&err)
-            {
-                return Err(err);
-            }
-
-            // TODO: delete marker
-        }
-
-        let object = decode_dir_object(object);
-
-        if opts.version_id.is_none() {
-            Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
-        } else {
-            Err(StorageError::VersionNotFound(
-                bucket.to_owned(),
-                object.to_owned(),
-                opts.version_id.clone().unwrap_or_default(),
-            ))
-        }
+        // Delete markers are returned as latest object infos here. Higher-level
+        // access paths are responsible for translating them into read/write
+        // semantics such as object-not-found or method-not-allowed.
+        resolve_latest_object_info_candidates(candidates, bucket, object, opts)
     }
 
     pub(super) async fn delete_object_from_all_pools(
@@ -696,5 +704,100 @@ impl ECStore {
         }
 
         Err(Error::DiskNotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
+        ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
+            delete_marker,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_latest_delete_marker() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(20, true)),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let (info, idx) =
+            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_non_not_found_error() {
+        let err = resolve_latest_object_info_candidates(
+            vec![LatestObjectInfoCandidate {
+                info: None,
+                idx: 0,
+                err: Some(Error::ErasureReadQuorum),
+            }],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_version_not_found_for_versioned_lookups() {
+        let err = resolve_latest_object_info_candidates(
+            vec![LatestObjectInfoCandidate {
+                info: None,
+                idx: 0,
+                err: Some(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+            }],
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
     }
 }
