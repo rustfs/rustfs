@@ -171,7 +171,7 @@ pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
 /// Default value: local
 pub const DEFAULT_KMS_BACKEND: &str = "local";
 
-/// Environment variable for server KMS key directory.
+/// Environment variable for selecting the buffer profile used for adaptive buffer sizing.
 pub const ENV_RUSTFS_BUFFER_PROFILE: &str = "RUSTFS_BUFFER_PROFILE";
 
 /// Default buffer profile for adaptive buffer sizing

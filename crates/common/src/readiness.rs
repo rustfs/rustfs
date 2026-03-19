@@ -70,7 +70,11 @@ impl GlobalReadiness {
             1 => SystemStage::StorageReady,
             2 => SystemStage::IamReady,
             3 => SystemStage::FullReady,
-            _ => unreachable!(), // Since we only set values from the enum, this should never happen
+            invalid => {
+                debug_assert!(false, "GlobalReadiness::current_stage: invalid status value {}", invalid);
+                // Fallback to the most conservative stage on invalid values
+                SystemStage::Booting
+            }
         }
     }
 }

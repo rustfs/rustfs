@@ -29,6 +29,11 @@ use rustfs_credentials::DEFAULT_ACCESS_KEY;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
 use std::sync::OnceLock;
 
+/// Fallback snapshot used only for display when the global snapshot
+/// has not yet been initialized (e.g., for the `--info` command).
+/// This avoids leaking memory while still providing a `'static` reference.
+static DISPLAY_CONFIG_SNAPSHOT: OnceLock<ConfigSnapshot> = OnceLock::new();
+
 /// Configuration snapshot for info command display.
 /// This stores key configuration values that can be accessed without
 /// needing the full Config struct.
@@ -152,9 +157,8 @@ pub fn get_config_snapshot_for_display() -> &'static ConfigSnapshot {
     if let Some(snapshot) = GLOBAL_CONFIG_SNAPSHOT.get() {
         snapshot
     } else {
-        // Not initialized - create from env without storing
-        // Use Box::leak to get a static reference for the temporary snapshot
-        // This is acceptable for --info command which is a one-time display operation
-        Box::leak(Box::new(ConfigSnapshot::from_env()))
+        // Not initialized - create from env without storing in the global snapshot.
+        // Use a dedicated OnceLock to cache a single display snapshot without leaking.
+        DISPLAY_CONFIG_SNAPSHOT.get_or_init(ConfigSnapshot::from_env)
     }
 }

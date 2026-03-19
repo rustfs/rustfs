@@ -313,7 +313,9 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
         info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
 
         // Parse the workload profile from configuration string
-        // Support custom profile via RUSTFS_BUFFER_CUSTOM environment variable
+        // Support a custom profile when buffer_profile is set to "custom";
+        // its sizes are controlled via RUSTFS_BUFFER_MIN_SIZE, RUSTFS_BUFFER_MAX_SIZE,
+        // and RUSTFS_BUFFER_DEFAULT_SIZE environment variables.
         let profile = if config.buffer_profile.eq_ignore_ascii_case("custom") {
             // Try to create custom profile from environment variables
             let min_size = get_env_usize(ENV_RUSTFS_BUFFER_MIN_SIZE, DEFAULT_BUFFER_MIN_SIZE);
