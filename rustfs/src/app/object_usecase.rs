@@ -191,6 +191,20 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
+const AMZ_SNOWBALL_PREFIX_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+const AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+const AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
+const AMZ_META_PREFIX_LOWER: &str = "x-amz-meta-";
+const SNOWBALL_PREFIX_SUFFIX_LOWER: &str = "snowball-prefix";
+const SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER: &str = "snowball-ignore-dirs";
+const SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER: &str = "snowball-ignore-errors";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PutObjectExtractOptions {
+    prefix: Option<String>,
+    ignore_dirs: bool,
+    ignore_errors: bool,
+}
 
 fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
     headers
@@ -201,6 +215,51 @@ fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
 
 fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
     header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
+}
+
+fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> Option<String> {
+    if let Some(preferred) = headers.get(preferred_key).and_then(|value| value.to_str().ok()) {
+        return Some(preferred.trim().to_string());
+    }
+
+    for (name, value) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        if key.starts_with(AMZ_META_PREFIX_LOWER)
+            && key.ends_with(suffix_lower)
+            && let Ok(parsed) = value.to_str()
+        {
+            return Some(parsed.trim().to_string());
+        }
+    }
+
+    None
+}
+
+fn snowball_meta_flag_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> bool {
+    snowball_meta_value_by_suffix(headers, preferred_key, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
+    let normalized = prefix.trim().trim_matches('/');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_string())
+}
+
+fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
+    let prefix = snowball_meta_value_by_suffix(headers, AMZ_SNOWBALL_PREFIX_INTERNAL, SNOWBALL_PREFIX_SUFFIX_LOWER)
+        .and_then(|value| normalize_snowball_prefix(&value));
+    let ignore_dirs = snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
+    let ignore_errors =
+        snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
+
+    PutObjectExtractOptions {
+        prefix,
+        ignore_dirs,
+        ignore_errors,
+    }
 }
 
 fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
@@ -3451,11 +3510,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let prefix = req
-            .headers
-            .get("X-Amz-Meta-Rustfs-Snowball-Prefix")
-            .map(|v| v.to_str().unwrap_or_default())
-            .unwrap_or_default();
+        let extract_options = resolve_put_object_extract_options(&req.headers);
         let version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
@@ -3471,81 +3526,105 @@ impl DefaultObjectUsecase {
             let f = match entry {
                 Ok(f) => f,
                 Err(e) => {
+                    if extract_options.ignore_errors {
+                        warn!("Skipping archive entry because read failed and ignore-errors is enabled: {e}");
+                        continue;
+                    }
                     error!("Failed to read archive entry: {}", e);
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
 
+            let fpath = match f.path() {
+                Ok(path) => path,
+                Err(e) => {
+                    if extract_options.ignore_errors {
+                        warn!("Skipping archive entry because path decode failed and ignore-errors is enabled: {e}");
+                        continue;
+                    }
+                    return Err(s3_error!(InvalidArgument, "Failed to decode archive entry path"));
+                }
+            };
+
+            let mut fpath = fpath.to_string_lossy().to_string();
+            if let Some(prefix) = extract_options.prefix.as_deref() {
+                fpath = format!("{prefix}/{fpath}");
+            }
+
             if f.header().entry_type().is_dir() {
+                if !extract_options.ignore_dirs {
+                    debug!("Skipping directory entry during archive extract: {}", fpath);
+                }
                 continue;
             }
 
-            if let Ok(fpath) = f.path() {
-                let mut fpath = fpath.to_string_lossy().to_string();
+            let mut size = f.header().size().unwrap_or_default() as i64;
 
-                if !prefix.is_empty() {
-                    fpath = format!("{prefix}/{fpath}");
-                }
+            debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
-                let mut size = f.header().size().unwrap_or_default() as i64;
+            let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
 
-                debug!("Extracting file: {}, size: {} bytes", fpath, size);
+            let mut metadata = HashMap::new();
 
-                let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
+            let actual_size = size;
 
-                let mut metadata = HashMap::new();
-
-                let actual_size = size;
-
-                if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
-                    insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
-                    insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
-
-                    let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-
-                    reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-                    size = HashReader::SIZE_PRESERVE_LAYER;
-                }
+            if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+                insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-                let mut reader = PutObjReader::new(hrd);
 
-                let obj_info = store
-                    .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
-                    .await
-                    .map_err(ApiError::from)?;
-
-                let manager = get_concurrency_manager();
-                let fpath_clone = fpath.clone();
-                let bucket_clone = bucket.clone();
-                tokio::spawn(async move {
-                    manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
-                });
-
-                let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
-
-                let output = PutObjectOutput {
-                    e_tag,
-                    ..Default::default()
-                };
-
-                let event_args = rustfs_notify::EventArgs {
-                    event_name: EventName::ObjectCreatedPut,
-                    bucket_name: bucket.clone(),
-                    object: obj_info.clone(),
-                    req_params: extract_params_header(&req.headers),
-                    resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
-                    version_id: version_id.clone(),
-                    host: get_request_host(&req.headers),
-                    port: get_request_port(&req.headers),
-                    user_agent: get_request_user_agent(&req.headers),
-                };
-
-                let notify = notify.clone();
-                tokio::spawn(async move {
-                    notify.notify(event_args).await;
-                });
+                reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+                size = HashReader::SIZE_PRESERVE_LAYER;
             }
+
+            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+            let mut reader = PutObjReader::new(hrd);
+
+            let obj_info = match store
+                .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    if extract_options.ignore_errors {
+                        warn!("Skipping archive entry because object write failed and ignore-errors is enabled: {e}");
+                        continue;
+                    }
+                    return Err(ApiError::from(e).into());
+                }
+            };
+
+            let manager = get_concurrency_manager();
+            let fpath_clone = fpath.clone();
+            let bucket_clone = bucket.clone();
+            tokio::spawn(async move {
+                manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
+            });
+
+            let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
+
+            let output = PutObjectOutput {
+                e_tag,
+                ..Default::default()
+            };
+
+            let event_args = rustfs_notify::EventArgs {
+                event_name: EventName::ObjectCreatedPut,
+                bucket_name: bucket.clone(),
+                object: obj_info.clone(),
+                req_params: extract_params_header(&req.headers),
+                resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
+                version_id: version_id.clone(),
+                host: get_request_host(&req.headers),
+                port: get_request_port(&req.headers),
+                user_agent: get_request_user_agent(&req.headers),
+            };
+
+            let notify = notify.clone();
+            tokio::spawn(async move {
+                notify.notify(event_args).await;
+            });
         }
 
         let mut checksums = PutObjectChecksums {
@@ -3592,7 +3671,7 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+    use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -3662,6 +3741,61 @@ mod tests {
 
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
         assert!(!is_put_object_extract_requested(&headers));
+    }
+
+    #[test]
+    fn normalize_snowball_prefix_trims_slashes_and_whitespace() {
+        assert_eq!(normalize_snowball_prefix(" /batch/incoming/ "), Some("batch/incoming".to_string()));
+        assert_eq!(normalize_snowball_prefix("///"), None);
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_defaults_when_headers_missing() {
+        let headers = HeaderMap::new();
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(
+            options,
+            PutObjectExtractOptions {
+                prefix: None,
+                ignore_dirs: false,
+                ignore_errors: false
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_accepts_internal_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_PREFIX_INTERNAL, HeaderValue::from_static("/internal/prefix/"));
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, HeaderValue::from_static("true"));
+        headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, HeaderValue::from_static("TRUE"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("internal/prefix"));
+        assert!(options.ignore_dirs);
+        assert!(options.ignore_errors);
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_accepts_suffix_compatible_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-prefix"),
+            HeaderValue::from_static(" /partner/import "),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-dirs"),
+            HeaderValue::from_static(" true "),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-errors"),
+            HeaderValue::from_static("TRUE"),
+        );
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("partner/import"));
+        assert!(options.ignore_dirs);
+        assert!(options.ignore_errors);
     }
 
     #[tokio::test]
