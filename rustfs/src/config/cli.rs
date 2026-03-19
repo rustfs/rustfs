@@ -212,7 +212,7 @@ pub struct ServerOpts {
     pub kms_enable: bool,
 
     /// KMS backend type (local or vault)
-    #[arg(long, default_value_t = String::from("local"), env = "RUSTFS_KMS_BACKEND")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_KMS_BACKEND.to_string(), env = "RUSTFS_KMS_BACKEND")]
     pub kms_backend: String,
 
     /// KMS key directory for local backend
@@ -238,7 +238,7 @@ pub struct ServerOpts {
 
     /// Workload profile for adaptive buffer sizing
     /// Options: GeneralPurpose, AiTraining, DataAnalytics, WebWorkload, IndustrialIoT, SecureStorage
-    #[arg(long, default_value_t = String::from("GeneralPurpose"), env = "RUSTFS_BUFFER_PROFILE")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_BUFFER_PROFILE.to_string(), env = "RUSTFS_BUFFER_PROFILE")]
     pub buffer_profile: String,
 }
 

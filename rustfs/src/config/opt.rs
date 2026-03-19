@@ -116,21 +116,19 @@ impl Opt {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
             Some(Commands::Info(opts)) => Ok(CommandResult::Info(opts)),
-            Some(Commands::Server(opts)) => {
-                let opt = Self::from_server_opts(*opts);
-                Ok(Server(Box::new(Config::from_opt(opt).map_err(|e| {
-                    clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
-                })?)))
-            }
+            Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
                 // Default to server with empty volumes (will be filled from env)
-                let default_opts = default_server_opts();
-                let opt = Self::from_server_opts(default_opts);
-                Ok(Server(Box::new(Config::from_opt(opt).map_err(|e| {
-                    clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
-                })?)))
+                Self::server_command_result(Self::from_server_opts(default_server_opts()))
             }
         }
+    }
+
+    // Helper to convert Opt to CommandResult::Server with error handling
+    fn server_command_result(opt: Opt) -> Result<CommandResult, clap::Error> {
+        Ok(Server(Box::new(Config::from_opt(opt).map_err(|e| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
+        })?)))
     }
 
     /// Try parse from args, returns error on invalid input.

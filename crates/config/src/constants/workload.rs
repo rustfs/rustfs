@@ -57,7 +57,7 @@ mod tests {
         assert_eq!(KI_B, 1024);
         assert_eq!(MI_B, 1024 * 1024);
         assert_eq!(64 * KI_B, DEFAULT_BUFFER_MIN_SIZE);
-        assert_eq!(1 * MI_B, DEFAULT_BUFFER_MAX_SIZE);
+        assert_eq!(MI_B, DEFAULT_BUFFER_MAX_SIZE);
         assert_eq!(256 * KI_B, DEFAULT_BUFFER_UNKNOWN_SIZE);
     }
 

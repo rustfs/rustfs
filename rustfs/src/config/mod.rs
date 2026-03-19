@@ -54,7 +54,7 @@ pub use cli::{CommandResult, InfoOpts, InfoType};
 pub use config_struct::Config;
 pub use info::execute_info;
 pub use opt::Opt;
-pub use snapshot::{get_or_init_config_snapshot, init_config_snapshot};
+pub use snapshot::{get_config_snapshot_for_display, init_config_snapshot};
 
 // Re-export workload profiles
 pub mod workload_profiles;

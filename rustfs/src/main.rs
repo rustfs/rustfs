@@ -156,7 +156,7 @@ async fn async_main() -> Result<()> {
     let command_result = match config::Opt::parse_command(args) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Command parse failed, error: {}", e);
             std::process::exit(1);
         }
     };

@@ -60,6 +60,19 @@ impl GlobalReadiness {
     pub fn is_ready(&self) -> bool {
         self.status.load(Ordering::SeqCst) == SystemStage::FullReady as u8
     }
+
+    /// Get the current system stage
+    /// # Returns
+    /// The current SystemStage of the service
+    pub fn current_stage(&self) -> SystemStage {
+        match self.status.load(Ordering::SeqCst) {
+            0 => SystemStage::Booting,
+            1 => SystemStage::StorageReady,
+            2 => SystemStage::IamReady,
+            3 => SystemStage::FullReady,
+            _ => unreachable!(), // Since we only set values from the enum, this should never happen
+        }
+    }
 }
 
 #[cfg(test)]

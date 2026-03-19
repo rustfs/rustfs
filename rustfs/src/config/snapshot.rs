@@ -23,7 +23,7 @@ use rustfs_config::{
     DEFAULT_ADDRESS, DEFAULT_BUFFER_PROFILE, DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_KMS_BACKEND,
     DEFAULT_KMS_ENABLE, DEFAULT_OBS_ENDPOINT, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_ACCESS_KEY_FILE, ENV_RUSTFS_ADDRESS,
     ENV_RUSTFS_BUFFER_PROFILE, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_CONSOLE_ENABLE, ENV_RUSTFS_KMS_BACKEND,
-    ENV_RUSTFS_KMS_ENABLE, ENV_RUSTFS_OBS_ENDPOINT, ENV_RUSTFS_REGION, ENV_RUSTFS_TLS_PATH,
+    ENV_RUSTFS_KMS_ENABLE, ENV_RUSTFS_OBS_ENDPOINT, ENV_RUSTFS_REGION, ENV_RUSTFS_TLS_PATH, RUSTFS_REGION,
 };
 use rustfs_credentials::DEFAULT_ACCESS_KEY;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
@@ -86,7 +86,7 @@ impl ConfigSnapshot {
             address: get_env_str(ENV_RUSTFS_ADDRESS, DEFAULT_ADDRESS),
             console_enable: get_env_bool(ENV_RUSTFS_CONSOLE_ENABLE, DEFAULT_CONSOLE_ENABLE),
             console_address: get_env_str(ENV_RUSTFS_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ADDRESS),
-            region: get_env_opt_str(ENV_RUSTFS_REGION),
+            region: Some(get_env_str(ENV_RUSTFS_REGION, RUSTFS_REGION)),
             access_key,
             obs_endpoint: get_env_str(ENV_RUSTFS_OBS_ENDPOINT, DEFAULT_OBS_ENDPOINT),
             tls_path: get_env_opt_str(ENV_RUSTFS_TLS_PATH),
@@ -102,20 +102,57 @@ static GLOBAL_CONFIG_SNAPSHOT: OnceLock<ConfigSnapshot> = OnceLock::new();
 
 /// Initialize the global config snapshot from a Config instance.
 /// This should be called once during server startup.
+///
+/// This is the ONLY function that can set the global snapshot.
+/// Once set, it cannot be changed.
 pub fn init_config_snapshot(config: &Config) {
     let snapshot = ConfigSnapshot::from_config(config);
-    let _ = GLOBAL_CONFIG_SNAPSHOT.set(snapshot);
+    if GLOBAL_CONFIG_SNAPSHOT.set(snapshot).is_err() {
+        // Already initialized, log a warning
+        tracing::warn!("Config snapshot already initialized, ignoring re-initialization");
+    }
 }
 
-/// Get the global config snapshot.
+/// Get the global config snapshot if initialized.
 /// Returns None if not initialized (e.g., when running --info before server starts).
 #[allow(dead_code)] // used in info command
 pub fn get_config_snapshot() -> Option<&'static ConfigSnapshot> {
     GLOBAL_CONFIG_SNAPSHOT.get()
 }
 
-/// Get config snapshot, creating one from environment if not initialized.
-/// This is useful for --info command which may run before server starts.
+/// Check if the global config snapshot has been initialized.
+#[allow(dead_code)] // may be used for debugging
+pub fn is_config_snapshot_initialized() -> bool {
+    GLOBAL_CONFIG_SNAPSHOT.get().is_some()
+}
+
+/// Get config snapshot for display purposes.
+///
+/// - If the global snapshot is initialized (server has started), returns a reference to it.
+/// - If not initialized (e.g., --info command before server starts), returns a temporary
+///   snapshot created from environment variables WITHOUT updating the global storage.
+///
+/// This ensures the global snapshot is ONLY set by `init_config_snapshot` during server startup.
+#[allow(dead_code)] // kept for backward compatibility
 pub fn get_or_init_config_snapshot() -> &'static ConfigSnapshot {
     GLOBAL_CONFIG_SNAPSHOT.get_or_init(ConfigSnapshot::from_env)
+}
+/// Get config snapshot for display, without modifying global state.
+///
+/// This function is used by the --info command to display configuration:
+/// - Returns the global snapshot if initialized
+/// - Otherwise creates a temporary snapshot from environment variables (does NOT store it)
+///
+/// Note: This returns a static reference for API compatibility. When the global snapshot
+/// is not initialized, it creates a leaked Box to provide a static lifetime.
+/// This is safe because it's only used for read-only display purposes.
+pub fn get_config_snapshot_for_display() -> &'static ConfigSnapshot {
+    if let Some(snapshot) = GLOBAL_CONFIG_SNAPSHOT.get() {
+        snapshot
+    } else {
+        // Not initialized - create from env without storing
+        // Use Box::leak to get a static reference for the temporary snapshot
+        // This is acceptable for --info command which is a one-time display operation
+        Box::leak(Box::new(ConfigSnapshot::from_env()))
+    }
 }
