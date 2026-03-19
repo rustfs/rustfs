@@ -215,6 +215,13 @@ fn validate_object_lambda_query(uri: &Uri) -> S3Result<()> {
     if lambda_arns.len() != 1 || lambda_arns[0].trim().is_empty() {
         return Err(s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"));
     }
+
+    let lambda_arn = lambda_arns[0].trim();
+    let arn_parts = lambda_arn.split(':').collect::<Vec<_>>();
+    let is_valid_arn = arn_parts.len() >= 6 && arn_parts[0] == "arn" && !arn_parts[1].is_empty() && !arn_parts[2].is_empty();
+    if !is_valid_arn {
+        return Err(s3_error!(InvalidRequest, "lambdaArn query parameter must be a valid ARN string"));
+    }
     Ok(())
 }
 
@@ -923,10 +930,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_object_lambda_query_rejects_missing_or_empty_arn() {
+    fn validate_object_lambda_query_rejects_missing_empty_or_invalid_arn() {
         let missing: Uri = "/demo-bucket/object.txt".parse().expect("uri should parse");
         let empty: Uri = "/demo-bucket/object.txt?lambdaArn=".parse().expect("uri should parse");
         let duplicated: Uri = "/demo-bucket/object.txt?lambdaArn=a&lambdaArn=b"
+            .parse()
+            .expect("uri should parse");
+        let invalid_format: Uri = "/demo-bucket/object.txt?lambdaArn=not-an-arn"
             .parse()
             .expect("uri should parse");
 
@@ -948,6 +958,21 @@ mod tests {
                 .code(),
             &S3ErrorCode::InvalidRequest
         );
+        assert_eq!(
+            validate_object_lambda_query(&invalid_format)
+                .expect_err("invalid lambdaArn should fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn validate_object_lambda_query_accepts_arn() {
+        let valid: Uri = "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+            .parse()
+            .expect("uri should parse");
+
+        assert!(validate_object_lambda_query(&valid).is_ok());
     }
 
     #[tokio::test]
