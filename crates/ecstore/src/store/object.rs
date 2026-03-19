@@ -71,6 +71,16 @@ fn resolve_latest_object_access(
     Ok((info, idx))
 }
 
+fn delete_pool_lookup_opts(opts: &ObjectOptions) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.no_lock = true;
+    if lookup_opts.version_id.is_some() {
+        lookup_opts.metadata_chg = true;
+    }
+
+    lookup_opts
+}
+
 impl ECStore {
     async fn get_latest_accessible_object_info_with_idx(
         &self,
@@ -275,8 +285,7 @@ impl ECStore {
         let object = encode_dir_object(object);
         let object = object.as_str();
 
-        let mut gopts = opts.clone();
-        gopts.no_lock = true;
+        let gopts = delete_pool_lookup_opts(&opts);
 
         if opts.data_movement {
             let existing_pool_idx = self
@@ -812,5 +821,28 @@ mod tests {
         let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
 
         assert!(matches!(err, Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn delete_pool_lookup_opts_enables_version_aware_lookup() {
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let lookup_opts = delete_pool_lookup_opts(&opts);
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn delete_pool_lookup_opts_keeps_latest_lookup_for_unversioned_delete() {
+        let lookup_opts = delete_pool_lookup_opts(&ObjectOptions::default());
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.metadata_chg);
+        assert!(lookup_opts.version_id.is_none());
     }
 }
