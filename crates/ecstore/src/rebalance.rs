@@ -1067,6 +1067,17 @@ fn resolve_rebalance_stats_update_result(result: Result<()>, pool_idx: usize, bu
     })
 }
 
+fn resolve_rebalance_file_info_versions_result<T, E>(
+    result: std::result::Result<T, E>,
+    bucket: &str,
+    object_name: &str,
+) -> Result<T>
+where
+    E: std::fmt::Display,
+{
+    result.map_err(|err| Error::other(format!("rebalance file_info_versions failed for {bucket}/{object_name}: {err}")))
+}
+
 fn resolve_load_rebalance_stats_update_result(result: Result<()>) -> Result<()> {
     result.map_err(|err| Error::other(format!("rebalance metadata stats refresh failed after load: {err}")))
 }
@@ -1315,14 +1326,8 @@ impl ECStore {
             return Ok(());
         }
 
-        let mut fivs = match entry.file_info_versions(&bucket) {
-            Ok(fivs) => fivs,
-            Err(err) => {
-                error!("rebalance_entry Error getting file info versions: {}", err);
-                info!("rebalance_entry: Error getting file info versions, skipping");
-                return Ok(());
-            }
-        };
+        let mut fivs =
+            resolve_rebalance_file_info_versions_result(entry.file_info_versions(&bucket), bucket.as_str(), entry.name.as_str())?;
 
         fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
 
@@ -1605,10 +1610,11 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2188,6 +2194,21 @@ mod rebalance_unit_tests {
         let err = resolve_load_rebalance_stats_update_result(Err(Error::SlowDown))
             .expect_err("load-time stats refresh failure should include context");
         assert!(err.to_string().contains("rebalance metadata stats refresh failed after load"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_file_info_versions_result_passthrough() {
+        let value = resolve_rebalance_file_info_versions_result::<usize, Error>(Ok(7), "bucket-a", "obj.txt")
+            .expect("ok results should pass through");
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn test_resolve_rebalance_file_info_versions_result_wraps_error_context() {
+        let err = resolve_rebalance_file_info_versions_result::<usize, Error>(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect_err("errors should be wrapped");
+        let message = err.to_string();
+        assert!(message.contains("rebalance file_info_versions failed for bucket-a/obj.txt"));
     }
 
     #[tokio::test]
