@@ -1153,6 +1153,10 @@ fn should_count_rebalance_version_complete(result: &MigrationVersionResult) -> b
     result.cleanup_ignored || (result.moved && !result.failed)
 }
 
+fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usize) -> bool {
+    rebalanced == total_versions
+}
+
 fn should_skip_rebalance_delete_marker(version: &FileInfo, remaining_versions: usize, replication_configured: bool) -> bool {
     version.deleted && remaining_versions == 1 && !replication_configured
 }
@@ -1419,7 +1423,6 @@ impl ECStore {
             .await
             {
                 expired += 1;
-                rebalanced += 1;
                 info!("rebalance_entry {} Entry {} expired by lifecycle, skipping", &bucket, version.name);
                 continue;
             }
@@ -1481,7 +1484,7 @@ impl ECStore {
             }
         }
 
-        if rebalanced == fivs.versions.len() {
+        if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
             resolve_rebalance_entry_cleanup_delete_result(
                 set.delete_object(
                     bucket.as_str(),
@@ -1713,10 +1716,10 @@ mod rebalance_unit_tests {
         resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_replication_config_result,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_count_rebalance_version_complete,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+        should_count_rebalance_version_complete, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2529,6 +2532,16 @@ mod rebalance_unit_tests {
     #[test]
     fn test_should_skip_rebalance_delete_marker_rejects_multiple_remaining_versions() {
         assert!(!should_skip_rebalance_delete_marker(&version_deleted(), 2, false));
+    }
+
+    #[test]
+    fn test_should_cleanup_rebalance_source_entry_accepts_all_versions_completed() {
+        assert!(should_cleanup_rebalance_source_entry(3, 3));
+    }
+
+    #[test]
+    fn test_should_cleanup_rebalance_source_entry_rejects_versions_only_expired_by_lifecycle() {
+        assert!(!should_cleanup_rebalance_source_entry(2, 3));
     }
 
     #[test]
