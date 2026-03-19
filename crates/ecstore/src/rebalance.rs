@@ -30,21 +30,24 @@ use crate::store_api::{
     CompletePart, GetObjectReader, HTTPRangeSpec, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
     PutObjReader,
 };
+use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_common::defer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, WarpReader};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::task::{Context, Poll};
 use time::OffsetDateTime;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -1123,6 +1126,59 @@ fn ensure_valid_rebalance_pool_index(pool_count: usize, idx: usize) -> Result<()
     Ok(())
 }
 
+struct IndexedRebalanceReader<R> {
+    inner: R,
+    index: Option<Index>,
+}
+
+impl<R> IndexedRebalanceReader<R> {
+    fn new(inner: R, index: Option<Index>) -> Self {
+        Self { inner, index }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for IndexedRebalanceReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> EtagResolvable for IndexedRebalanceReader<R> {}
+
+impl<R: AsyncRead + Unpin + Send + Sync> HashReaderDetector for IndexedRebalanceReader<R> {}
+
+impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedRebalanceReader<R> {
+    fn try_get_index(&self) -> Option<&Index> {
+        self.index.as_ref()
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> Reader for IndexedRebalanceReader<R> {}
+
+fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
+    let bytes = index?;
+    let mut decoded = Index::new();
+    if decoded.load(bytes.as_ref()).is_ok() {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
+    use sha2::{Digest, Sha256};
+
+    let sha256hex = if !chunk.is_empty() {
+        Some(hex_simd::encode_to_string(Sha256::digest(&chunk), hex_simd::AsciiCase::Lower))
+    } else {
+        None
+    };
+
+    let reader = IndexedRebalanceReader::new(WarpReader::new(Cursor::new(chunk)), index);
+    let hash_reader = HashReader::new(Box::new(reader), size, actual_size, None, sha256hex, false)?;
+    Ok(PutObjReader::new(hash_reader))
+}
+
 fn new_multipart_abort_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
@@ -1457,8 +1513,10 @@ impl ECStore {
 
                 reader.read_exact(&mut chunk).await?;
 
-                // Read one part from the reader and upload it each time
-                let mut data = PutObjReader::from_vec(chunk);
+                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
+                let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
+                let index = decode_part_index(part.index.as_ref());
+                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
 
                 let pi = match self
                     .put_object_part(
@@ -1512,7 +1570,12 @@ impl ECStore {
         }
 
         let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, actual_size, None, None, false)?;
+        let index = object_info
+            .parts
+            .first()
+            .and_then(|part| decode_part_index(part.index.as_ref()));
+        let reader = IndexedRebalanceReader::new(WarpReader::new(reader), index);
+        let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
@@ -1736,12 +1799,12 @@ mod rebalance_unit_tests {
         GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        mark_multipart_upload_completed, mark_rebalance_bucket_done, migrate_entry_version, new_multipart_abort_flag,
-        next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-        send_rebalance_done_signal, should_abort_multipart_upload, should_pool_participate,
+        decode_part_index, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        is_rebalance_stopped_terminal_event, mark_multipart_upload_completed, mark_rebalance_bucket_done, migrate_entry_version,
+        new_multipart_abort_flag, next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result,
+        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_participants,
+        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_abort_multipart_upload, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
         take_bucket_from_rebalance_queue,
     };
@@ -2495,6 +2558,17 @@ mod rebalance_unit_tests {
         let flag = new_multipart_abort_flag();
         mark_multipart_upload_completed(&flag);
         assert!(!should_abort_multipart_upload(&flag));
+    }
+
+    #[test]
+    fn test_decode_part_index_returns_none_when_absent() {
+        assert!(decode_part_index(None).is_none());
+    }
+
+    #[test]
+    fn test_decode_part_index_returns_none_for_invalid_payload() {
+        let invalid = bytes::Bytes::from_static(b"not-a-valid-index");
+        assert!(decode_part_index(Some(&invalid)).is_none());
     }
 
     #[test]
