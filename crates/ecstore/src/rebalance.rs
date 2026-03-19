@@ -113,6 +113,20 @@ pub(crate) struct MigrationVersionResult {
     pub error: Option<Error>,
 }
 
+fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
+    ObjectOptions {
+        versioned: true,
+        version_id,
+        mod_time: version.mod_time,
+        src_pool_idx,
+        data_movement: true,
+        delete_marker: true,
+        skip_decommissioned: true,
+        delete_replication: version.replication_state_internal.clone(),
+        ..Default::default()
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait MigrationBackend: Send + Sync {
     async fn get_object_reader_for_migration(
@@ -185,20 +199,7 @@ where
 
     if version.deleted {
         if let Err(err) = set
-            .delete_object_for_migration(
-                &bucket,
-                &version.name,
-                ObjectOptions {
-                    versioned: true,
-                    version_id,
-                    mod_time: version.mod_time,
-                    src_pool_idx: pool_index,
-                    data_movement: true,
-                    delete_marker: true,
-                    skip_decommissioned: true,
-                    ..Default::default()
-                },
-            )
+            .delete_object_for_migration(&bucket, &version.name, rebalance_delete_marker_opts(version, version_id, pool_index))
             .await
         {
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
@@ -1712,14 +1713,15 @@ mod rebalance_unit_tests {
         apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
         clone_rebalance_pool_stats, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
         is_rebalance_stopped_terminal_event, load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version,
-        next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
-        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_replication_config_result,
-        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
-        should_count_rebalance_version_complete, should_ignore_rebalance_data_usage_cache, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, with_rebalance_entry_context,
+        next_rebal_bucket_from_stat, rebalance_delete_marker_opts, resolve_load_rebalance_stats_update_result,
+        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
+        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+        resolve_rebalance_participants, resolve_rebalance_replication_config_result, resolve_rebalance_save_task_result,
+        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
+        send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1820,6 +1822,35 @@ mod rebalance_unit_tests {
         version.name = "object.bin".to_string();
         version.transition_status = TRANSITION_COMPLETE.to_string();
         version
+    }
+
+    #[test]
+    fn test_rebalance_delete_marker_opts_preserves_replication_state() {
+        let mod_time = OffsetDateTime::now_utc();
+        let version = FileInfo {
+            mod_time: Some(mod_time),
+            replication_state_internal: Some(rustfs_filemeta::ReplicationState {
+                replica_status: rustfs_filemeta::ReplicationStatusType::Replica,
+                delete_marker: true,
+                replicate_decision_str: "existing".to_string(),
+                ..Default::default()
+            }),
+            ..version_deleted()
+        };
+
+        let opts = rebalance_delete_marker_opts(&version, Some("version-id".to_string()), 7);
+        let replication = opts.delete_replication.expect("replication state should be preserved");
+
+        assert!(opts.versioned);
+        assert!(opts.data_movement);
+        assert!(opts.delete_marker);
+        assert!(opts.skip_decommissioned);
+        assert_eq!(opts.src_pool_idx, 7);
+        assert_eq!(opts.version_id.as_deref(), Some("version-id"));
+        assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
+        assert!(replication.delete_marker);
+        assert_eq!(replication.replicate_decision_str, "existing");
     }
 
     #[tokio::test]
