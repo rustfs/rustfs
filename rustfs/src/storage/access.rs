@@ -366,6 +366,14 @@ fn post_object_authorize_action() -> Action {
     Action::S3Action(S3Action::PutObjectAction)
 }
 
+fn complete_multipart_upload_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
+fn list_parts_authorize_action() -> Action {
+    Action::S3Action(S3Action::ListMultipartUploadPartsAction)
+}
+
 #[async_trait::async_trait]
 impl S3Access for FS {
     // /// Checks whether the current request has accesses to the resources.
@@ -444,15 +452,23 @@ impl S3Access for FS {
     /// Checks whether the AbortMultipartUpload request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn abort_multipart_upload(&self, _req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
-        Ok(())
+    async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await
     }
 
     /// Checks whether the CompleteMultipartUpload request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn complete_multipart_upload(&self, _req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
-        Ok(())
+    async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, complete_multipart_upload_authorize_action()).await
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
@@ -1161,8 +1177,12 @@ impl S3Access for FS {
     /// Checks whether the ListParts request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn list_parts(&self, _req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
-        Ok(())
+    async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, list_parts_authorize_action()).await
     }
 
     /// Checks whether the PostObject request has accesses to the resources.
@@ -1474,8 +1494,35 @@ impl S3Access for FS {
     /// Checks whether the UploadPartCopy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn upload_part_copy(&self, _req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
-        Ok(())
+    async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        {
+            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
+                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Bucket { bucket, key, version_id } => {
+                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
+                }
+            };
+
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
+            req_info.bucket = Some(src_bucket.clone());
+            req_info.object = Some(src_key.clone());
+            req_info.version_id = version_id.clone();
+
+            let tag_conds = self
+                .fetch_tag_conditions(&src_bucket, &src_key, version_id.as_deref(), "upload_part_copy_src")
+                .await?;
+            req.extensions.insert(tag_conds);
+
+            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        }
+
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = None;
+
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.
@@ -1505,6 +1552,16 @@ mod tests {
     #[test]
     fn post_object_uses_put_object_action() {
         assert_eq!(post_object_authorize_action(), Action::S3Action(S3Action::PutObjectAction));
+    }
+
+    #[test]
+    fn complete_multipart_upload_uses_put_object_action() {
+        assert_eq!(complete_multipart_upload_authorize_action(), Action::S3Action(S3Action::PutObjectAction));
+    }
+
+    #[test]
+    fn list_parts_uses_list_multipart_upload_parts_action() {
+        assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
     }
 
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
