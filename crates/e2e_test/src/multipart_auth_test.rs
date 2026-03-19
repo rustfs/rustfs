@@ -91,3 +91,37 @@ async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-auth";
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let post_form = reqwest::multipart::Form::new().text("key", "post-object.txt").part(
+        "file",
+        reqwest::multipart::Part::bytes(b"post-object-body".to_vec())
+            .file_name("post.txt")
+            .mime_str("text/plain")?,
+    );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(
+        post_resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "anonymous PostObject should be rejected"
+    );
+
+    Ok(())
+}
