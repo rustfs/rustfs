@@ -26,6 +26,7 @@ use crate::bucket::{
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
+use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -52,23 +53,23 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
+use rustfs_rio::{HashReader, Index, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::io::{Cursor, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::Write;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::task::{Context, Poll};
 use time::{Duration, OffsetDateTime};
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -279,15 +280,15 @@ fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Opt
 }
 
 fn new_multipart_abort_flag() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
+    data_movement::new_multipart_abort_flag()
 }
 
 fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
-    flag.load(Ordering::Relaxed)
+    data_movement::should_abort_multipart_upload(flag)
 }
 
 fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
-    flag.store(false, Ordering::Relaxed);
+    data_movement::mark_multipart_upload_completed(flag);
 }
 
 fn decommission_item_size<T>(size: T) -> usize
@@ -1104,57 +1105,14 @@ async fn should_skip_lifecycle_for_decommission(
     }
 }
 
-struct IndexedDecommissionReader<R> {
-    inner: R,
-    index: Option<Index>,
-}
-
-impl<R> IndexedDecommissionReader<R> {
-    fn new(inner: R, index: Option<Index>) -> Self {
-        Self { inner, index }
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for IndexedDecommissionReader<R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> EtagResolvable for IndexedDecommissionReader<R> {}
-
-impl<R: AsyncRead + Unpin + Send + Sync> HashReaderDetector for IndexedDecommissionReader<R> {}
-
-impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedDecommissionReader<R> {
-    fn try_get_index(&self) -> Option<&Index> {
-        self.index.as_ref()
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> Reader for IndexedDecommissionReader<R> {}
+type IndexedDecommissionReader<R> = data_movement::IndexedDataMovementReader<R>;
 
 fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
-    let bytes = index?;
-    let mut decoded = Index::new();
-    if decoded.load(bytes.as_ref()).is_ok() {
-        Some(decoded)
-    } else {
-        None
-    }
+    data_movement::decode_part_index(index)
 }
 
 fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
-    use sha2::{Digest, Sha256};
-
-    let sha256hex = if !chunk.is_empty() {
-        Some(hex_simd::encode_to_string(Sha256::digest(&chunk), hex_simd::AsciiCase::Lower))
-    } else {
-        None
-    };
-
-    let reader = IndexedDecommissionReader::new(WarpReader::new(Cursor::new(chunk)), index);
-    let hash_reader = HashReader::new(Box::new(reader), size, actual_size, None, sha256hex, false)?;
-    Ok(PutObjReader::new(hash_reader))
+    data_movement::put_obj_reader_from_chunk(chunk, size, actual_size, index)
 }
 
 impl ECStore {

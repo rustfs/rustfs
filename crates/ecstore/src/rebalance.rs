@@ -15,6 +15,7 @@
 use crate::StorageAPI;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
+use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
@@ -34,20 +35,15 @@ use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_common::defer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
+use rustfs_rio::{HashReader, Index, WarpReader};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
-use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::task::{Context, Poll};
+use std::sync::{Arc, atomic::AtomicBool};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -1126,69 +1122,26 @@ fn ensure_valid_rebalance_pool_index(pool_count: usize, idx: usize) -> Result<()
     Ok(())
 }
 
-struct IndexedRebalanceReader<R> {
-    inner: R,
-    index: Option<Index>,
-}
-
-impl<R> IndexedRebalanceReader<R> {
-    fn new(inner: R, index: Option<Index>) -> Self {
-        Self { inner, index }
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for IndexedRebalanceReader<R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> EtagResolvable for IndexedRebalanceReader<R> {}
-
-impl<R: AsyncRead + Unpin + Send + Sync> HashReaderDetector for IndexedRebalanceReader<R> {}
-
-impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedRebalanceReader<R> {
-    fn try_get_index(&self) -> Option<&Index> {
-        self.index.as_ref()
-    }
-}
-
-impl<R: AsyncRead + Unpin + Send + Sync> Reader for IndexedRebalanceReader<R> {}
+type IndexedRebalanceReader<R> = data_movement::IndexedDataMovementReader<R>;
 
 fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
-    let bytes = index?;
-    let mut decoded = Index::new();
-    if decoded.load(bytes.as_ref()).is_ok() {
-        Some(decoded)
-    } else {
-        None
-    }
+    data_movement::decode_part_index(index)
 }
 
 fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
-    use sha2::{Digest, Sha256};
-
-    let sha256hex = if !chunk.is_empty() {
-        Some(hex_simd::encode_to_string(Sha256::digest(&chunk), hex_simd::AsciiCase::Lower))
-    } else {
-        None
-    };
-
-    let reader = IndexedRebalanceReader::new(WarpReader::new(Cursor::new(chunk)), index);
-    let hash_reader = HashReader::new(Box::new(reader), size, actual_size, None, sha256hex, false)?;
-    Ok(PutObjReader::new(hash_reader))
+    data_movement::put_obj_reader_from_chunk(chunk, size, actual_size, index)
 }
 
 fn new_multipart_abort_flag() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
+    data_movement::new_multipart_abort_flag()
 }
 
 fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
-    flag.load(Ordering::Relaxed)
+    data_movement::should_abort_multipart_upload(flag)
 }
 
 fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
-    flag.store(false, Ordering::Relaxed);
+    data_movement::mark_multipart_upload_completed(flag);
 }
 
 enum RebalanceTerminalEvent {
