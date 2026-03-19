@@ -42,6 +42,7 @@ use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
 use rustfs_madmin::utils::parse_duration;
+use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_common::EventName;
 use s3s::Body;
@@ -58,11 +59,11 @@ use s3s::s3_error;
 use s3s::stream::{ByteStream, DynByteStream};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tower::Service;
-use tracing::error;
+use tracing::{error, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -99,6 +100,14 @@ struct ReplicationResetTarget {
     arn: String,
     #[serde(rename = "ResetID")]
     reset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenNotificationFilter {
+    bucket: Option<String>,
+    event_mask: u64,
+    prefix: Option<String>,
+    suffix: Option<String>,
 }
 
 fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
@@ -272,6 +281,22 @@ fn validate_listen_notification_query(uri: &Uri) -> S3Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_listen_notification_filter(uri: &Uri, bucket: Option<&str>) -> S3Result<ListenNotificationFilter> {
+    let mut event_mask = 0_u64;
+    for event in query_values_exact(uri, "events") {
+        event_mask |= EventName::parse(&event)
+            .map_err(|_| s3_error!(InvalidArgument, "invalid event in events query parameter"))?
+            .mask();
+    }
+
+    Ok(ListenNotificationFilter {
+        bucket: bucket.map(str::to_string),
+        event_mask,
+        prefix: query_value_exact(uri, "prefix").filter(|value| !value.is_empty()),
+        suffix: query_value_exact(uri, "suffix").filter(|value| !value.is_empty()),
+    })
 }
 
 fn validate_misc_extension_request(uri: &Uri, route: &MiscExtRoute) -> S3Result<()> {
@@ -575,8 +600,51 @@ fn listen_notification_keepalive_plan(uri: &Uri) -> (Duration, Bytes) {
     (Duration::from_millis(500), Bytes::from_static(b" "))
 }
 
-fn build_listen_notification_response(uri: &Uri) -> S3Response<Body> {
+fn event_matches_listen_notification(event: &NotificationEvent, filter: &ListenNotificationFilter) -> bool {
+    if let Some(bucket) = &filter.bucket
+        && event.s3.bucket.name != *bucket
+    {
+        return false;
+    }
+
+    if filter.event_mask != 0 && event.event_name.mask() & filter.event_mask == 0 {
+        return false;
+    }
+
+    if let Some(prefix) = &filter.prefix
+        && !event.s3.object.key.starts_with(prefix)
+    {
+        return false;
+    }
+
+    if let Some(suffix) = &filter.suffix
+        && !event.s3.object.key.ends_with(suffix)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<Bytes> {
+    #[derive(serde::Serialize)]
+    struct ListenNotificationEnvelope<'a> {
+        #[serde(rename = "Records")]
+        records: [&'a NotificationEvent; 1],
+    }
+
+    serde_json::to_vec(&ListenNotificationEnvelope { records: [event] })
+        .map(|mut payload| {
+            payload.push(b'\n');
+            Bytes::from(payload)
+        })
+        .map_err(|e| s3_error!(InternalError, "failed to serialize notification event: {e}"))
+}
+
+fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Result<S3Response<Body>> {
     let (interval_duration, payload) = listen_notification_keepalive_plan(uri);
+    let filter = parse_listen_notification_filter(uri, bucket)?;
+    let mut live_events = notification_system().map(|system| system.subscribe_live_events());
 
     let (tx, rx) = mpsc::channel(16);
     let stream: DynByteStream = Box::pin(ListenNotificationStream {
@@ -588,11 +656,45 @@ fn build_listen_notification_response(uri: &Uri) -> S3Response<Body> {
         // Skip the immediate first tick so behavior starts after interval duration.
         ticker.tick().await;
         loop {
-            tokio::select! {
-                _ = tx.closed() => break,
-                _ = ticker.tick() => {
-                    if tx.send(Ok(payload.clone())).await.is_err() {
-                        break;
+            if let Some(events_rx) = live_events.as_mut() {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = ticker.tick() => {
+                        if tx.send(Ok(payload.clone())).await.is_err() {
+                            break;
+                        }
+                    }
+                    event = events_rx.recv() => {
+                        match event {
+                            Ok(event) => {
+                                if !event_matches_listen_notification(&event, &filter) {
+                                    continue;
+                                }
+                                match serialize_listen_notification_event(&event) {
+                                    Ok(serialized) => {
+                                        if tx.send(Ok(serialized)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!("failed to serialize listen notification event: {err}");
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("listen notification stream lagged and skipped {skipped} events");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = ticker.tick() => {
+                        if tx.send(Ok(payload.clone())).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -605,7 +707,7 @@ fn build_listen_notification_response(uri: &Uri) -> S3Response<Body> {
     resp.headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     resp.headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
-    resp
+    Ok(resp)
 }
 
 async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
@@ -799,7 +901,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
                     .await
                     .map_err(ApiError::from)?;
             }
-            Ok(build_listen_notification_response(&req.uri))
+            build_listen_notification_response(&req.uri, bucket.as_deref())
         }
     }
 }
@@ -1422,13 +1524,67 @@ mod tests {
         assert_eq!(payload, Bytes::from_static(b"{\"Records\":[]}\n"));
     }
 
+    #[test]
+    fn parse_listen_notification_filter_expands_event_mask_and_filters() {
+        let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:*&events=s3:ObjectRemoved:Delete&prefix=logs/&suffix=.json"
+            .parse()
+            .expect("uri should parse");
+
+        let filter = parse_listen_notification_filter(&uri, Some("demo-bucket")).expect("filter should parse");
+
+        assert_eq!(filter.bucket.as_deref(), Some("demo-bucket"));
+        assert_eq!(filter.prefix.as_deref(), Some("logs/"));
+        assert_eq!(filter.suffix.as_deref(), Some(".json"));
+        assert_ne!(filter.event_mask & EventName::ObjectCreatedPut.mask(), 0);
+        assert_ne!(filter.event_mask & EventName::ObjectRemovedDelete.mask(), 0);
+        assert_eq!(filter.event_mask & EventName::ObjectAccessedGet.mask(), 0);
+    }
+
+    #[test]
+    fn event_matches_listen_notification_respects_bucket_event_and_object_filters() {
+        let filter = ListenNotificationFilter {
+            bucket: Some("demo-bucket".to_string()),
+            event_mask: EventName::ObjectCreatedPut.mask() | EventName::ObjectCreatedPost.mask(),
+            prefix: Some("logs/".to_string()),
+            suffix: Some(".json".to_string()),
+        };
+
+        let matched = NotificationEvent::new_test_event("demo-bucket", "logs/app.json", EventName::ObjectCreatedPut);
+        assert!(event_matches_listen_notification(&matched, &filter));
+
+        let wrong_bucket = NotificationEvent::new_test_event("other-bucket", "logs/app.json", EventName::ObjectCreatedPut);
+        assert!(!event_matches_listen_notification(&wrong_bucket, &filter));
+
+        let wrong_event = NotificationEvent::new_test_event("demo-bucket", "logs/app.json", EventName::ObjectRemovedDelete);
+        assert!(!event_matches_listen_notification(&wrong_event, &filter));
+
+        let wrong_prefix = NotificationEvent::new_test_event("demo-bucket", "archive/app.json", EventName::ObjectCreatedPut);
+        assert!(!event_matches_listen_notification(&wrong_prefix, &filter));
+
+        let wrong_suffix = NotificationEvent::new_test_event("demo-bucket", "logs/app.txt", EventName::ObjectCreatedPut);
+        assert!(!event_matches_listen_notification(&wrong_suffix, &filter));
+    }
+
+    #[test]
+    fn serialize_listen_notification_event_wraps_records_payload() {
+        let event = NotificationEvent::new_test_event("demo-bucket", "logs/app.json", EventName::ObjectCreatedPut);
+
+        let payload = serialize_listen_notification_event(&event).expect("payload should serialize");
+        let body = std::str::from_utf8(payload.as_ref()).expect("payload should be utf-8");
+
+        assert!(body.contains("\"Records\":["));
+        assert!(body.contains("\"name\":\"demo-bucket\""));
+        assert!(body.contains("\"eventName\":\"ObjectCreatedPut\"") || body.contains("s3:ObjectCreated:Put"));
+        assert!(body.ends_with('\n'));
+    }
+
     #[tokio::test]
     async fn build_listen_notification_response_sets_event_stream_headers() {
         let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put&ping=1"
             .parse()
             .expect("uri should parse");
 
-        let resp = build_listen_notification_response(&uri);
+        let resp = build_listen_notification_response(&uri, Some("demo-bucket")).expect("response should build");
 
         assert_eq!(
             resp.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),

@@ -28,7 +28,7 @@ use rustfs_targets::{StoreError, Target};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Notify the system of monitoring indicators
@@ -108,6 +108,8 @@ pub struct NotificationSystem {
     metrics: Arc<NotificationMetrics>,
     /// Subscriber view
     subscriber_view: NotificationSystemSubscriberView,
+    /// Live event fan-out for in-process streaming consumers.
+    live_event_sender: broadcast::Sender<Arc<Event>>,
 }
 
 impl NotificationSystem {
@@ -115,6 +117,7 @@ impl NotificationSystem {
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
+        let (live_event_sender, _) = broadcast::channel(1024);
         NotificationSystem {
             subscriber_view: NotificationSystemSubscriberView::new(),
             notifier: Arc::new(EventNotifier::new()),
@@ -123,6 +126,7 @@ impl NotificationSystem {
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
             concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics: Arc::new(NotificationMetrics::new()),
+            live_event_sender,
         }
     }
 
@@ -214,6 +218,16 @@ impl NotificationSystem {
             return false;
         }
         self.notifier.has_subscriber(bucket, event).await
+    }
+
+    /// Returns true when at least one in-process consumer is subscribed to live events.
+    pub fn has_live_listeners(&self) -> bool {
+        self.live_event_sender.receiver_count() > 0
+    }
+
+    /// Subscribes to the in-process live event stream.
+    pub fn subscribe_live_events(&self) -> broadcast::Receiver<Arc<Event>> {
+        self.live_event_sender.subscribe()
     }
 
     async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
@@ -500,6 +514,7 @@ impl NotificationSystem {
 
     /// Sends an event
     pub async fn send_event(&self, event: Arc<Event>) {
+        let _ = self.live_event_sender.send(event.clone());
         self.notifier.send(event).await;
     }
 

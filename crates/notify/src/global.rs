@@ -78,8 +78,8 @@ pub mod notifier_global {
             return;
         }
 
-        // Check if any subscribers are interested in the event
-        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
+        // Skip event materialization when neither configured targets nor live listeners exist.
+        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await && !notification_sys.has_live_listeners() {
             // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
             return;
         }
