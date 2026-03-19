@@ -236,6 +236,18 @@ fn resolve_decommission_entry_reload_result(result: Result<()>) -> Result<()> {
     result.map_err(|err| Error::other(format!("decommission entry reload pool metadata failed: {err}")))
 }
 
+fn resolve_decommission_terminal_mark_result(result: Result<()>, stage: &str, pool_label: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("decommission terminal mark {stage} failed for pool {pool_label}: {err}")))
+}
+
+fn resolve_decommission_terminal_mark_after_error_result(result: Result<()>, idx: usize, primary_err: &Error) -> Result<()> {
+    result.map_err(|err| {
+        Error::other(format!(
+            "decommission terminal mark failed after background error on pool {idx}: {primary_err}; mark error: {err}"
+        ))
+    })
+}
+
 fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
@@ -941,7 +953,9 @@ impl ECStore {
         for (idx, canceler) in index_cancelers {
             let store = store.clone();
             tokio::spawn(async move {
-                store.do_decommission_in_routine(canceler, idx).await;
+                if let Err(err) = store.do_decommission_in_routine(canceler, idx).await {
+                    error!("decommission: routine failed for idx {}: {err}", idx);
+                }
             });
         }
 
@@ -1219,15 +1233,17 @@ impl ECStore {
             };
 
             drop(pool_meta);
-            if ok && let Some(notification_sys) = get_global_notification_sys()
-                && let Err(err) = resolve_decommission_entry_reload_result(notification_sys.reload_pool_meta().await) {
-                    return Err(with_decommission_entry_context(
-                        "reload_pool_meta",
-                        bucket.as_str(),
-                        entry.name.as_str(),
-                        err,
-                    ));
-                }
+            if ok
+                && let Some(notification_sys) = get_global_notification_sys()
+                && let Err(err) = resolve_decommission_entry_reload_result(notification_sys.reload_pool_meta().await)
+            {
+                return Err(with_decommission_entry_context(
+                    "reload_pool_meta",
+                    bucket.as_str(),
+                    entry.name.as_str(),
+                    err,
+                ));
+            }
         }
 
         warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
@@ -1349,7 +1365,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) {
+    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
         defer!(|| async {
             let mut cancelers = self.decommission_cancelers.write().await;
             if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
@@ -1363,7 +1379,7 @@ impl ECStore {
             let pool_meta = self.pool_meta.read().await;
             let Some(pool) = pool_meta.pools.get(idx) else {
                 error!("decommission: pool metadata missing for idx {}", idx);
-                return;
+                return Err(Error::other(format!("decommission pool metadata missing for idx {idx}")));
             };
 
             let (failed, canceled) = if let Some(info) = &pool.decommission {
@@ -1380,41 +1396,35 @@ impl ECStore {
 
             if is_err_operation_canceled(&err) || should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
                 warn!("decommission: canceled for pool {}, preserving canceled state", cmd_line);
-                return;
+                return Ok(());
             }
 
-            if let Err(er) = self.decommission_failed(idx).await {
-                error!("decom failed err {:?}", &er);
-            } else {
-                warn!("decommission: decommission_failed  {}", idx);
-            }
+            resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
+            warn!("decommission: decommission_failed {}", idx);
 
-            return;
+            return Ok(());
         }
 
         warn!("decommission: decommission_in_background complete {}", idx);
 
         if should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
             warn!("decommission: canceled for pool {}, skipping terminal state overwrite", cmd_line);
-            return;
+            return Ok(());
         }
 
         match classify_decommission_terminal_state(failed) {
             DecommissionTerminalState::Completed => {
                 warn!("Decommissioning complete for pool {}, marking completed state", cmd_line);
-                if let Err(er) = self.complete_decommission(idx).await {
-                    error!("decom complete err {:?}", &er);
-                }
+                resolve_decommission_terminal_mark_result(self.complete_decommission(idx).await, "completed", &cmd_line)?;
             }
             DecommissionTerminalState::Failed => {
                 warn!("Decommissioning finished with failed items for pool {}, marking failed state", cmd_line);
-                if let Err(er) = self.decommission_failed(idx).await {
-                    error!("decom failed err {:?}", &er);
-                }
+                resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
             }
         }
 
         warn!("Decommissioning complete for pool {}", cmd_line);
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -2001,6 +2011,7 @@ mod pools_tests {
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
         resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
         resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
         track_decommission_current_object, with_decommission_entry_context,
     };
@@ -2350,6 +2361,33 @@ mod pools_tests {
         let err = resolve_decommission_entry_reload_result(Err(Error::SlowDown))
             .expect_err("reload failure should be wrapped with explicit context");
         assert!(err.to_string().contains("decommission entry reload pool metadata failed"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_terminal_mark_result_passthrough_ok() {
+        assert!(resolve_decommission_terminal_mark_result(Ok(()), "completed", "pool-a").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_terminal_mark_result_wraps_error_context() {
+        let err = resolve_decommission_terminal_mark_result(Err(Error::SlowDown), "failed", "pool-a")
+            .expect_err("terminal mark failure should include stage and pool context");
+        let message = err.to_string();
+        assert!(message.contains("decommission terminal mark failed failed for pool pool-a"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_terminal_mark_after_error_result_passthrough_ok() {
+        assert!(resolve_decommission_terminal_mark_after_error_result(Ok(()), 3, &Error::SlowDown).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_terminal_mark_after_error_result_wraps_error_context() {
+        let err = resolve_decommission_terminal_mark_after_error_result(Err(Error::OperationCanceled), 3, &Error::SlowDown)
+            .expect_err("terminal mark after-error failure should include both errors");
+        let message = err.to_string();
+        assert!(message.contains("decommission terminal mark failed after background error on pool 3"));
+        assert!(message.contains("mark error"));
     }
 
     #[test]
