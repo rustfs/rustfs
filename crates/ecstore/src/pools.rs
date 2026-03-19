@@ -2724,7 +2724,7 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
-        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
+        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item, decode_part_index,
         decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
@@ -2738,6 +2738,7 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use crate::error::Error;
+    use rustfs_rio::Index;
     use time::{Duration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
 
@@ -3147,6 +3148,21 @@ mod pools_tests {
         let flag = new_multipart_abort_flag();
         mark_multipart_upload_completed(&flag);
         assert!(!should_abort_multipart_upload(&flag));
+    }
+
+    #[test]
+    fn test_decode_part_index_returns_some_for_valid_payload() {
+        let mut index = Index::new();
+        index.add(0, 0).expect("first index entry should be accepted");
+        index
+            .add(2_097_152, 2_097_152)
+            .expect("second index entry should advance totals");
+
+        let encoded = index.into_vec();
+        let decoded = decode_part_index(Some(&encoded)).expect("valid index payload should decode");
+
+        assert_eq!(decoded.total_uncompressed, 2_097_152);
+        assert_eq!(decoded.total_compressed, 2_097_152);
     }
 
     #[test]

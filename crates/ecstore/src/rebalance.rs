@@ -1813,6 +1813,7 @@ mod rebalance_unit_tests {
     use crate::error::{Error, Result};
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
+    use rustfs_rio::Index;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2569,6 +2570,21 @@ mod rebalance_unit_tests {
     fn test_decode_part_index_returns_none_for_invalid_payload() {
         let invalid = bytes::Bytes::from_static(b"not-a-valid-index");
         assert!(decode_part_index(Some(&invalid)).is_none());
+    }
+
+    #[test]
+    fn test_decode_part_index_returns_some_for_valid_payload() {
+        let mut index = Index::new();
+        index.add(0, 0).expect("first index entry should be accepted");
+        index
+            .add(2_097_152, 2_097_152)
+            .expect("second index entry should advance totals");
+
+        let encoded = index.into_vec();
+        let decoded = decode_part_index(Some(&encoded)).expect("valid index payload should decode");
+
+        assert_eq!(decoded.total_uncompressed, 2_097_152);
+        assert_eq!(decoded.total_compressed, 2_097_152);
     }
 
     #[test]
