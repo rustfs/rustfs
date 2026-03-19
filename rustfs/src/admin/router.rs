@@ -21,6 +21,8 @@ use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
 };
 use crate::storage::access::{ReqInfo, authorize_request};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use http::HeaderValue;
 use hyper::HeaderMap;
 use hyper::Method;
@@ -46,9 +48,16 @@ use s3s::S3ErrorCode;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
+use s3s::StdError;
 use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
+use s3s::stream::{ByteStream, DynByteStream};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc;
+use tokio::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
 use tower::Service;
 use tracing::error;
 use url::form_urlencoded;
@@ -262,6 +271,62 @@ fn validate_misc_extension_request(uri: &Uri, route: &MiscExtRoute) -> S3Result<
     }
 }
 
+struct ListenNotificationStream {
+    inner: ReceiverStream<Result<Bytes, StdError>>,
+}
+
+impl Stream for ListenNotificationStream {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = Pin::into_inner(self);
+        this.inner.poll_next_unpin(cx)
+    }
+}
+
+impl ByteStream for ListenNotificationStream {}
+
+fn listen_notification_keepalive_plan(uri: &Uri) -> (Duration, Bytes) {
+    if let Some(ping_seconds) = query_value_exact(uri, "ping").and_then(|v| v.parse::<u64>().ok()) {
+        return (Duration::from_secs(ping_seconds), Bytes::from_static(b"{\"Records\":[]}\n"));
+    }
+
+    (Duration::from_millis(500), Bytes::from_static(b" "))
+}
+
+fn build_listen_notification_response(uri: &Uri) -> S3Response<Body> {
+    let (interval_duration, payload) = listen_notification_keepalive_plan(uri);
+
+    let (tx, rx) = mpsc::channel(16);
+    let stream: DynByteStream = Box::pin(ListenNotificationStream {
+        inner: ReceiverStream::new(rx),
+    });
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval_duration);
+        // Skip the immediate first tick so behavior starts after interval duration.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = ticker.tick() => {
+                    if tx.send(Ok(payload.clone())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut resp = S3Response::with_status(Body::from(stream), StatusCode::OK);
+    resp.headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    resp.headers
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    resp.headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    resp
+}
+
 async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
     let Some(store) = new_object_layer_fn() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
@@ -457,7 +522,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
                     .await
                     .map_err(ApiError::from)?;
             }
-            Err(s3_error!(NotImplemented, "listen notification route is not implemented"))
+            Ok(build_listen_notification_response(&req.uri))
         }
     }
 }
@@ -929,6 +994,40 @@ mod tests {
             .await
             .expect_err("anonymous extension request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn listen_notification_keepalive_plan_defaults_to_space_keepalive() {
+        let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put".parse().expect("uri should parse");
+        let (interval, payload) = listen_notification_keepalive_plan(&uri);
+        assert_eq!(interval, Duration::from_millis(500));
+        assert_eq!(payload, Bytes::from_static(b" "));
+    }
+
+    #[test]
+    fn listen_notification_keepalive_plan_uses_empty_record_payload_when_ping_is_present() {
+        let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put&ping=3"
+            .parse()
+            .expect("uri should parse");
+        let (interval, payload) = listen_notification_keepalive_plan(&uri);
+        assert_eq!(interval, Duration::from_secs(3));
+        assert_eq!(payload, Bytes::from_static(b"{\"Records\":[]}\n"));
+    }
+
+    #[tokio::test]
+    async fn build_listen_notification_response_sets_event_stream_headers() {
+        let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put&ping=1"
+            .parse()
+            .expect("uri should parse");
+
+        let resp = build_listen_notification_response(&uri);
+
+        assert_eq!(
+            resp.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(resp.headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()), Some("no-cache"));
+        assert_eq!(resp.headers.get("x-accel-buffering").and_then(|v| v.to_str().ok()), Some("no"));
     }
 }
 
