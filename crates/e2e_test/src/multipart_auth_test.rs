@@ -330,3 +330,146 @@ async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<d
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-kms";
+    let object_key = "post-sse-kms-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-kms-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "PostObject should reject SSE-KMS form uploads"
+    );
+    assert!(
+        response_body.contains("<Code>NotImplemented</Code>"),
+        "response should contain NotImplemented code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-invalid-status";
+    let object_key = "post-invalid-status-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("success_action_status", "202")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-invalid-status-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "PostObject should reject unsupported success_action_status values"
+    );
+    assert!(
+        response_body.contains("<Code>MalformedPOSTRequest</Code>"),
+        "response should contain MalformedPOSTRequest code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-invalid-redirect";
+    let object_key = "post-invalid-redirect-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("success_action_redirect", "://invalid-url")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-invalid-redirect-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "PostObject should reject malformed success_action_redirect values"
+    );
+    assert!(
+        response_body.contains("<Code>MalformedPOSTRequest</Code>"),
+        "response should contain MalformedPOSTRequest code, got: {response_body}"
+    );
+
+    Ok(())
+}

@@ -29,6 +29,7 @@ use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
+use url::Url;
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
@@ -372,6 +373,23 @@ fn complete_multipart_upload_authorize_action() -> Action {
 
 fn list_parts_authorize_action() -> Action {
     Action::S3Action(S3Action::ListMultipartUploadPartsAction)
+}
+
+fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()> {
+    if let Some(status) = input.success_action_status
+        && !matches!(status, 200 | 201 | 204)
+    {
+        return Err(s3_error!(MalformedPOSTRequest, "success_action_status must be one of 200, 201, or 204"));
+    }
+
+    if let Some(redirect) = input.success_action_redirect.as_deref().map(str::trim)
+        && !redirect.is_empty()
+        && Url::parse(redirect).is_err()
+    {
+        return Err(s3_error!(MalformedPOSTRequest, "success_action_redirect must be a valid absolute URL"));
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1187,6 +1205,8 @@ impl S3Access for FS {
 
     /// Checks whether the PostObject request has accesses to the resources.
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
+        validate_post_object_success_controls(&req.input)?;
+
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1571,6 +1591,59 @@ mod tests {
     #[test]
     fn list_parts_uses_list_multipart_upload_parts_action() {
         assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_accepts_supported_status_codes() {
+        for status in [200, 201, 204] {
+            let input = PostObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("test-key".to_string())
+                .success_action_status(Some(status))
+                .build()
+                .expect("post object input should build");
+            assert!(
+                validate_post_object_success_controls(&input).is_ok(),
+                "status {status} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_rejects_invalid_status_code() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_status(Some(202))
+            .build()
+            .expect("post object input should build");
+
+        let err = validate_post_object_success_controls(&input).expect_err("status 202 should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::MalformedPOSTRequest);
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_accepts_empty_redirect() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_redirect(Some("".to_string()))
+            .build()
+            .expect("post object input should build");
+        assert!(validate_post_object_success_controls(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_rejects_invalid_redirect() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_redirect(Some("://invalid-url".to_string()))
+            .build()
+            .expect("post object input should build");
+
+        let err = validate_post_object_success_controls(&input).expect_err("invalid redirect should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::MalformedPOSTRequest);
     }
 
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
