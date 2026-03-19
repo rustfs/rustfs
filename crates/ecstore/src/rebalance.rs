@@ -1078,6 +1078,14 @@ where
     result.map_err(|err| Error::other(format!("rebalance file_info_versions failed for {bucket}/{object_name}: {err}")))
 }
 
+fn resolve_rebalance_entry_cleanup_delete_result(result: Result<ObjectInfo>, bucket: &str, object_name: &str) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
+        Err(err) => Err(Error::other(format!("rebalance cleanup delete failed for {bucket}/{object_name}: {err}"))),
+    }
+}
+
 fn resolve_load_rebalance_stats_update_result(result: Result<()>) -> Result<()> {
     result.map_err(|err| Error::other(format!("rebalance metadata stats refresh failed after load: {err}")))
 }
@@ -1384,8 +1392,8 @@ impl ECStore {
         }
 
         if rebalanced == fivs.versions.len() {
-            if let Err(err) = set
-                .delete_object(
+            resolve_rebalance_entry_cleanup_delete_result(
+                set.delete_object(
                     bucket.as_str(),
                     &encode_dir_object(&entry.name),
                     ObjectOptions {
@@ -1395,12 +1403,11 @@ impl ECStore {
                         ..Default::default()
                     },
                 )
-                .await
-            {
-                error!("rebalance_entry: delete_object err {:?}", &err);
-            } else {
-                info!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
-            }
+                .await,
+                bucket.as_str(),
+                entry.name.as_str(),
+            )?;
+            info!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
         }
 
         Ok(())
@@ -1610,11 +1617,11 @@ mod rebalance_unit_tests {
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-        send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue,
+        resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
+        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
+        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2209,6 +2216,30 @@ mod rebalance_unit_tests {
             .expect_err("errors should be wrapped");
         let message = err.to_string();
         assert!(message.contains("rebalance file_info_versions failed for bucket-a/obj.txt"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_entry_cleanup_delete_result_passthrough() {
+        let result = resolve_rebalance_entry_cleanup_delete_result(Ok(ObjectInfo::default()), "bucket-a", "obj.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_entry_cleanup_delete_result_ignores_not_found() {
+        let result = resolve_rebalance_entry_cleanup_delete_result(
+            Err(Error::ObjectNotFound("bucket-a".to_string(), "obj.txt".to_string())),
+            "bucket-a",
+            "obj.txt",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_entry_cleanup_delete_result_wraps_error_context() {
+        let err = resolve_rebalance_entry_cleanup_delete_result(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect_err("unexpected cleanup errors should be wrapped");
+        let message = err.to_string();
+        assert!(message.contains("rebalance cleanup delete failed for bucket-a/obj.txt"));
     }
 
     #[tokio::test]
