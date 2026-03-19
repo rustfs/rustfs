@@ -108,6 +108,7 @@ struct RebalanceBucketConfigs {
 pub(crate) struct MigrationVersionResult {
     pub moved: bool,
     pub ignored: bool,
+    pub cleanup_ignored: bool,
     pub failed: bool,
     pub error: Option<Error>,
 }
@@ -166,6 +167,7 @@ where
         return MigrationVersionResult {
             moved: false,
             ignored: true,
+            cleanup_ignored: false,
             failed: false,
             error: None,
         };
@@ -193,6 +195,7 @@ where
                 return MigrationVersionResult {
                     moved: false,
                     ignored: true,
+                    cleanup_ignored: true,
                     failed: false,
                     error: None,
                 };
@@ -201,6 +204,7 @@ where
             return MigrationVersionResult {
                 moved: false,
                 ignored: false,
+                cleanup_ignored: false,
                 failed: true,
                 error: Some(err),
             };
@@ -209,6 +213,7 @@ where
         return MigrationVersionResult {
             moved: true,
             ignored: false,
+            cleanup_ignored: false,
             failed: false,
             error: None,
         };
@@ -236,6 +241,7 @@ where
                     return MigrationVersionResult {
                         moved: false,
                         ignored: true,
+                        cleanup_ignored: true,
                         failed: false,
                         error: None,
                     };
@@ -248,6 +254,7 @@ where
                     return MigrationVersionResult {
                         moved: false,
                         ignored: true,
+                        cleanup_ignored: false,
                         failed: false,
                         error: None,
                     };
@@ -258,6 +265,7 @@ where
                     return MigrationVersionResult {
                         moved: false,
                         ignored: false,
+                        cleanup_ignored: false,
                         failed: true,
                         error: last_error,
                     };
@@ -272,6 +280,7 @@ where
                 return MigrationVersionResult {
                     moved: false,
                     ignored: true,
+                    cleanup_ignored: true,
                     failed: false,
                     error: None,
                 };
@@ -282,6 +291,7 @@ where
                 return MigrationVersionResult {
                     moved: false,
                     ignored: false,
+                    cleanup_ignored: false,
                     failed: true,
                     error: last_error,
                 };
@@ -293,6 +303,7 @@ where
         return MigrationVersionResult {
             moved: true,
             ignored: false,
+            cleanup_ignored: false,
             failed: false,
             error: None,
         };
@@ -301,6 +312,7 @@ where
     MigrationVersionResult {
         moved: false,
         ignored: false,
+        cleanup_ignored: false,
         failed: true,
         error: last_error,
     }
@@ -1141,7 +1153,7 @@ fn with_rebalance_entry_context(stage: &str, bucket: &str, object_name: &str, er
 }
 
 fn should_count_rebalance_version_complete(result: &MigrationVersionResult) -> bool {
-    result.ignored || (result.moved && !result.failed)
+    result.cleanup_ignored || (result.moved && !result.failed)
 }
 
 fn resolve_rebalance_replication_config_result(
@@ -1832,6 +1844,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -1859,6 +1872,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -1886,6 +1900,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
+        assert!(result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -1912,6 +1927,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
+        assert!(result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -1948,6 +1964,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -2020,6 +2037,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(result.failed);
         assert!(matches!(result.error, Some(Error::SlowDown)));
@@ -2056,6 +2074,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(result.failed);
         assert!(matches!(result.error, Some(Error::SlowDown)));
@@ -2095,6 +2114,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(result.moved);
         assert!(!result.failed);
         assert_eq!(backend.get_calls(), 2);
@@ -2131,6 +2151,7 @@ mod rebalance_unit_tests {
 
         assert!(result.failed);
         assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(result.error.is_some());
         assert_eq!(backend.get_calls(), 2);
@@ -2166,6 +2187,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
+        assert!(result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -2195,6 +2217,7 @@ mod rebalance_unit_tests {
         .await;
 
         assert!(result.ignored);
+        assert!(!result.cleanup_ignored);
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
@@ -2388,12 +2411,23 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_should_count_rebalance_version_complete_for_ignored_result() {
+    fn test_should_count_rebalance_version_complete_for_cleanup_safe_ignored_result() {
         let result = MigrationVersionResult {
             ignored: true,
+            cleanup_ignored: true,
             ..Default::default()
         };
         assert!(should_count_rebalance_version_complete(&result));
+    }
+
+    #[test]
+    fn test_should_count_rebalance_version_complete_rejects_skip_only_ignored_result() {
+        let result = MigrationVersionResult {
+            ignored: true,
+            cleanup_ignored: false,
+            ..Default::default()
+        };
+        assert!(!should_count_rebalance_version_complete(&result));
     }
 
     #[test]
