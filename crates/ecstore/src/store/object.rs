@@ -40,7 +40,7 @@ fn select_data_movement_target_pool(
     }
 }
 
-fn latest_object_reader_delete_marker_error(
+fn latest_object_access_delete_marker_error(
     bucket: &str,
     object: &str,
     info: &ObjectInfo,
@@ -113,7 +113,7 @@ impl ECStore {
         opts.no_lock = true;
 
         let (oi, idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
-        if let Some(err) = latest_object_reader_delete_marker_error(bucket, object.as_str(), &oi, &opts) {
+        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &oi, &opts) {
             return Err(err);
         }
 
@@ -164,6 +164,9 @@ impl ECStore {
         // TODO: nslock
 
         let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
+        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &info, opts) {
+            return Err(err);
+        }
 
         opts.precondition_check(&info)?;
         Ok(info)
@@ -684,29 +687,29 @@ mod tests {
     }
 
     #[test]
-    fn latest_object_reader_delete_marker_error_returns_none_for_live_object() {
+    fn latest_object_access_delete_marker_error_returns_none_for_live_object() {
         let info = ObjectInfo::default();
         let opts = ObjectOptions::default();
 
-        assert!(latest_object_reader_delete_marker_error("bucket", "object", &info, &opts).is_none());
+        assert!(latest_object_access_delete_marker_error("bucket", "object", &info, &opts).is_none());
     }
 
     #[test]
-    fn latest_object_reader_delete_marker_error_returns_not_found_without_version_id() {
+    fn latest_object_access_delete_marker_error_returns_not_found_without_version_id() {
         let info = ObjectInfo {
             delete_marker: true,
             ..Default::default()
         };
         let opts = ObjectOptions::default();
 
-        let err = latest_object_reader_delete_marker_error("bucket", "object", &info, &opts)
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
             .expect("delete marker should stop latest-object reads");
 
         assert!(crate::error::is_err_object_not_found(&err));
     }
 
     #[test]
-    fn latest_object_reader_delete_marker_error_returns_method_not_allowed_for_version_read() {
+    fn latest_object_access_delete_marker_error_returns_method_not_allowed_for_version_read() {
         let info = ObjectInfo {
             delete_marker: true,
             ..Default::default()
@@ -716,14 +719,14 @@ mod tests {
             ..Default::default()
         };
 
-        let err = latest_object_reader_delete_marker_error("bucket", "object", &info, &opts)
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
             .expect("delete marker version reads should be rejected");
 
         assert!(matches!(err, Error::MethodNotAllowed));
     }
 
     #[test]
-    fn latest_object_reader_delete_marker_error_returns_not_found_for_delete_marker_lookup() {
+    fn latest_object_access_delete_marker_error_returns_not_found_for_delete_marker_lookup() {
         let info = ObjectInfo {
             delete_marker: true,
             ..Default::default()
@@ -734,7 +737,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = latest_object_reader_delete_marker_error("bucket", "object", &info, &opts)
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
             .expect("delete marker lookup should keep not-found semantics");
 
         assert!(crate::error::is_err_object_not_found(&err));
