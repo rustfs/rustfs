@@ -248,6 +248,16 @@ fn resolve_decommission_terminal_mark_after_error_result(result: Result<()>, idx
     })
 }
 
+fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Option<Error>) -> Error {
+    if let Some(rollback_err) = rollback_err {
+        Error::other(format!(
+            "decommission spawn routines failed: {spawn_err}; rollback failed: {rollback_err}"
+        ))
+    } else {
+        spawn_err
+    }
+}
+
 fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
@@ -981,15 +991,19 @@ impl ECStore {
 
         self.start_decommission(indices.clone()).await?;
         if let Err(err) = self.spawn_decommission_routines(store, rx, indices.clone()).await {
+            let mut rollback_err: Option<Error> = None;
             for idx in indices {
                 if let Err(cancel_err) = self.decommission_cancel(idx).await {
                     error!(
                         "decommission: failed to rollback decommission state for idx {} after spawn error: {:?}",
                         idx, cancel_err
                     );
+                    if rollback_err.is_none() {
+                        rollback_err = Some(Error::other(format!("decommission rollback failed for idx {idx}: {cancel_err}")));
+                    }
                 }
             }
-            return Err(err);
+            return Err(resolve_decommission_spawn_failure_result(err, rollback_err));
         }
 
         Ok(())
@@ -2011,9 +2025,10 @@ mod pools_tests {
         mark_decommission_bucket_done, require_decommission_store, resolve_decommission_bucket_done_save_result,
         resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object, with_decommission_entry_context,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::error::Error;
     use time::{Duration, OffsetDateTime};
@@ -2388,6 +2403,20 @@ mod pools_tests {
         let message = err.to_string();
         assert!(message.contains("decommission terminal mark failed after background error on pool 3"));
         assert!(message.contains("mark error"));
+    }
+
+    #[test]
+    fn test_resolve_decommission_spawn_failure_result_keeps_primary_without_rollback_error() {
+        let err = resolve_decommission_spawn_failure_result(Error::SlowDown, None);
+        assert!(matches!(err, Error::SlowDown));
+    }
+
+    #[test]
+    fn test_resolve_decommission_spawn_failure_result_wraps_rollback_error() {
+        let err = resolve_decommission_spawn_failure_result(Error::SlowDown, Some(Error::OperationCanceled));
+        let message = err.to_string();
+        assert!(message.contains("decommission spawn routines failed"));
+        assert!(message.contains("rollback failed"));
     }
 
     #[test]
