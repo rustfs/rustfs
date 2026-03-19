@@ -1153,6 +1153,10 @@ fn should_count_rebalance_version_complete(result: &MigrationVersionResult) -> b
     result.cleanup_ignored || (result.moved && !result.failed)
 }
 
+fn should_skip_rebalance_delete_marker(version: &FileInfo, remaining_versions: usize, replication_configured: bool) -> bool {
+    version.deleted && remaining_versions == 1 && !replication_configured
+}
+
 fn resolve_rebalance_replication_config_result(
     result: Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
 ) -> Result<Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>> {
@@ -1421,9 +1425,12 @@ impl ECStore {
             }
 
             let remaining_versions = fivs.versions.len() - expired;
-            if version.deleted && remaining_versions == 1 {
+            if should_skip_rebalance_delete_marker(version, remaining_versions, bucket_configs.replication_config.is_some()) {
                 rebalanced += 1;
-                info!("rebalance_entry Entry {} is deleted and last version, skipping", version.name);
+                info!(
+                    "rebalance_entry Entry {} is deleted and last version without replication, skipping",
+                    version.name
+                );
                 continue;
             }
 
@@ -1708,8 +1715,8 @@ mod rebalance_unit_tests {
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
         resolve_rebalance_worker_result, send_rebalance_done_signal, should_count_rebalance_version_complete,
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
-        with_rebalance_entry_context,
+        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2502,6 +2509,26 @@ mod rebalance_unit_tests {
     #[test]
     fn test_should_count_rebalance_version_complete_rejects_incomplete_result() {
         assert!(!should_count_rebalance_version_complete(&MigrationVersionResult::default()));
+    }
+
+    #[test]
+    fn test_should_skip_rebalance_delete_marker_when_last_remaining_without_replication() {
+        assert!(should_skip_rebalance_delete_marker(&version_deleted(), 1, false));
+    }
+
+    #[test]
+    fn test_should_skip_rebalance_delete_marker_rejects_configured_replication() {
+        assert!(!should_skip_rebalance_delete_marker(&version_deleted(), 1, true));
+    }
+
+    #[test]
+    fn test_should_skip_rebalance_delete_marker_rejects_non_deleted_versions() {
+        assert!(!should_skip_rebalance_delete_marker(&version_normal(), 1, false));
+    }
+
+    #[test]
+    fn test_should_skip_rebalance_delete_marker_rejects_multiple_remaining_versions() {
+        assert!(!should_skip_rebalance_delete_marker(&version_deleted(), 2, false));
     }
 
     #[test]
