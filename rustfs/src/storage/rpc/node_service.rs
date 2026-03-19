@@ -854,12 +854,12 @@ impl Node for NodeService {
 
         warn!("load_rebalance_meta success");
 
-        if start_rebalance {
+        if start_rebalance && store.rebalance_meta.read().await.is_some() {
             warn!("start rebalance");
-            let store = store.clone();
-            spawn(async move {
-                store.start_rebalance().await;
-            });
+            store.start_rebalance().await.map_err(|err| {
+                error!("start_rebalance err {:?}", err);
+                Status::internal(err.to_string())
+            })?;
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {

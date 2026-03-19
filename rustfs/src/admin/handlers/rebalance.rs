@@ -297,7 +297,10 @@ impl Operation for RebalanceStart {
             }
         };
 
-        store.start_rebalance().await;
+        store
+            .start_rebalance()
+            .await
+            .map_err(|e| s3_error!(InternalError, "Failed to start rebalance: {}", e))?;
 
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {

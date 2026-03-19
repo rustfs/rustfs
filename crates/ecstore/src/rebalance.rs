@@ -769,12 +769,9 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn start_rebalance(self: &Arc<Self>) {
+    pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
         info!("start_rebalance: start rebalance");
-        if !ensure_rebalance_not_decommissioning(self.is_decommission_running().await) {
-            info!("start_rebalance: decommission is running, skip start");
-            return;
-        }
+        let decommission_running = self.is_decommission_running().await;
         // let rebalance_meta = self.rebalance_meta.read().await;
 
         let cancel_tx = CancellationToken::new();
@@ -782,17 +779,16 @@ impl ECStore {
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
+            validate_start_rebalance_state(decommission_running, rebalance_meta.is_some())?;
 
-            if let Some(meta) = rebalance_meta.as_mut() {
-                if should_skip_start_rebalance(meta.cancel.is_some(), is_rebalance_in_progress(meta)) {
-                    info!("start_rebalance: already in progress, skip duplicate start");
-                    return;
-                }
-                meta.cancel = Some(cancel_tx)
-            } else {
-                info!("start_rebalance: rebalance_meta is None exit");
-                return;
+            let Some(meta) = rebalance_meta.as_mut() else {
+                return Err(Error::ConfigNotFound);
+            };
+            if should_skip_start_rebalance(meta.cancel.is_some(), is_rebalance_in_progress(meta)) {
+                info!("start_rebalance: already in progress, skip duplicate start");
+                return Ok(());
             }
+            meta.cancel = Some(cancel_tx);
 
             drop(rebalance_meta);
         }
@@ -834,6 +830,7 @@ impl ECStore {
         }
 
         info!("start_rebalance: rebalance started done");
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -1338,6 +1335,17 @@ fn ensure_rebalance_not_decommissioning(decommission_running: bool) -> bool {
     !decommission_running
 }
 
+fn validate_start_rebalance_state(decommission_running: bool, meta_loaded: bool) -> Result<()> {
+    if !ensure_rebalance_not_decommissioning(decommission_running) {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+    if !meta_loaded {
+        return Err(Error::ConfigNotFound);
+    }
+
+    Ok(())
+}
+
 fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool {
     cancel_attached && in_progress
 }
@@ -1779,7 +1787,7 @@ mod rebalance_unit_tests {
         send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
         should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
+        take_bucket_from_rebalance_queue, validate_start_rebalance_state, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -3032,6 +3040,23 @@ mod rebalance_unit_tests {
     #[test]
     fn test_ensure_rebalance_not_decommissioning_allows_idle_decommission() {
         assert!(ensure_rebalance_not_decommissioning(false));
+    }
+
+    #[test]
+    fn test_validate_start_rebalance_state_rejects_running_decommission() {
+        let err = validate_start_rebalance_state(true, true).expect_err("running decommission should block rebalance start");
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn test_validate_start_rebalance_state_rejects_missing_meta() {
+        let err = validate_start_rebalance_state(false, false).expect_err("missing rebalance meta should fail");
+        assert!(matches!(err, Error::ConfigNotFound));
+    }
+
+    #[test]
+    fn test_validate_start_rebalance_state_allows_loaded_meta() {
+        validate_start_rebalance_state(false, true).expect("loaded rebalance meta should allow start");
     }
 
     #[test]

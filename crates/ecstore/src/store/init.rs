@@ -223,7 +223,9 @@ impl ECStore {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
         self.load_rebalance_meta().await?;
-        self.start_rebalance().await;
+        if self.rebalance_meta.read().await.is_some() {
+            self.start_rebalance().await?;
+        }
 
         let mut meta = PoolMeta::default();
         meta.load(clone_first_store_pool(&self.pools)?, self.pools.clone()).await?;
