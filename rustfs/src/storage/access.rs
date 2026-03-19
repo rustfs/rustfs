@@ -617,8 +617,11 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_website(&self, _req: &mut S3Request<DeleteBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_website(&self, req: &mut S3Request<DeleteBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the DeleteObject request has accesses to the resources.
@@ -708,9 +711,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_bucket_accelerate_configuration(
         &self,
-        _req: &mut S3Request<GetBucketAccelerateConfigurationInput>,
+        req: &mut S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketAcl request has accesses to the resources.
@@ -866,8 +872,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketRequestPayment request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_request_payment(&self, _req: &mut S3Request<GetBucketRequestPaymentInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_request_payment(&self, req: &mut S3Request<GetBucketRequestPaymentInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketTagging request has accesses to the resources.
@@ -893,8 +902,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_website(&self, _req: &mut S3Request<GetBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_website(&self, req: &mut S3Request<GetBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetObject request has accesses to the resources.
