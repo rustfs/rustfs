@@ -57,7 +57,31 @@ fn latest_object_access_delete_marker_error(
     })
 }
 
+fn resolve_latest_object_access(
+    bucket: &str,
+    object: &str,
+    info: ObjectInfo,
+    idx: usize,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    if let Some(err) = latest_object_access_delete_marker_error(bucket, object, &info, opts) {
+        return Err(err);
+    }
+
+    Ok((info, idx))
+}
+
 impl ECStore {
+    async fn get_latest_accessible_object_info_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, usize)> {
+        let (info, idx) = self.get_latest_object_info_with_idx(bucket, object, opts).await?;
+        resolve_latest_object_access(bucket, object, info, idx, opts)
+    }
+
     #[instrument(skip(self, fi, opts))]
     pub(crate) async fn decommission_tiered_object(
         &self,
@@ -112,11 +136,9 @@ impl ECStore {
 
         opts.no_lock = true;
 
-        let (oi, idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
-        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &oi, &opts) {
-            return Err(err);
-        }
-
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            .await?;
         self.pools[idx]
             .get_object_reader(bucket, object.as_str(), range, h, &opts)
             .await
@@ -163,11 +185,9 @@ impl ECStore {
 
         // TODO: nslock
 
-        let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
-        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &info, opts) {
-            return Err(err);
-        }
-
+        let (info, _) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
         opts.precondition_check(&info)?;
         Ok(info)
     }
@@ -597,11 +617,7 @@ impl ECStore {
             return self.pools[0].get_object_tags(bucket, object.as_str(), opts).await;
         }
 
-        let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
-        if let Some(err) = latest_object_access_delete_marker_error(bucket, object.as_str(), &oi, opts) {
-            return Err(err);
-        }
-
+        let (oi, _) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
         Ok(oi.user_tags)
     }
 
@@ -619,7 +635,9 @@ impl ECStore {
             return self.pools[0].put_object_tags(bucket, object.as_str(), tags, opts).await;
         }
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
     }
@@ -652,7 +670,9 @@ impl ECStore {
             return self.pools[0].delete_object_tags(bucket, object.as_str(), opts).await;
         }
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
     }
@@ -744,5 +764,45 @@ mod tests {
             .expect("delete marker lookup should keep not-found semantics");
 
         assert!(crate::error::is_err_object_not_found(&err));
+    }
+
+    #[test]
+    fn resolve_latest_object_access_returns_live_object_and_pool_idx() {
+        let info = ObjectInfo::default();
+        let opts = ObjectOptions::default();
+
+        let (resolved, idx) = resolve_latest_object_access("bucket", "object", info, 7, &opts).unwrap();
+
+        assert_eq!(idx, 7);
+        assert!(!resolved.delete_marker);
+    }
+
+    #[test]
+    fn resolve_latest_object_access_rejects_delete_marker_without_version_id() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions::default();
+
+        let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
+
+        assert!(crate::error::is_err_object_not_found(&err));
+    }
+
+    #[test]
+    fn resolve_latest_object_access_rejects_delete_marker_version_read() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
+
+        assert!(matches!(err, Error::MethodNotAllowed));
     }
 }
