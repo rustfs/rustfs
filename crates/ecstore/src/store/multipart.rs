@@ -14,6 +14,10 @@
 
 use super::*;
 
+fn should_reuse_existing_multipart_pool(pool_idx: usize, opts: &ObjectOptions) -> bool {
+    !(opts.data_movement && pool_idx == opts.src_pool_idx)
+}
+
 impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_list_object_parts(
@@ -130,6 +134,9 @@ impl ECStore {
                 .await?;
 
             if !res.uploads.is_empty() {
+                if !should_reuse_existing_multipart_pool(idx, opts) {
+                    continue;
+                }
                 return self.pools[idx].new_multipart_upload(bucket, object, opts).await;
             }
         }
@@ -322,5 +329,42 @@ impl ECStore {
         }
 
         Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_reuse_existing_multipart_pool_allows_regular_uploads_on_source_pool() {
+        let opts = ObjectOptions {
+            src_pool_idx: 1,
+            ..Default::default()
+        };
+
+        assert!(should_reuse_existing_multipart_pool(1, &opts));
+    }
+
+    #[test]
+    fn should_reuse_existing_multipart_pool_rejects_data_movement_source_pool() {
+        let opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 1,
+            ..Default::default()
+        };
+
+        assert!(!should_reuse_existing_multipart_pool(1, &opts));
+    }
+
+    #[test]
+    fn should_reuse_existing_multipart_pool_allows_data_movement_target_pool() {
+        let opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 1,
+            ..Default::default()
+        };
+
+        assert!(should_reuse_existing_multipart_pool(2, &opts));
     }
 }
