@@ -1049,6 +1049,14 @@ fn remaining_versions_after_decommission(fivs: &FileInfoVersions) -> usize {
     fivs.versions.iter().filter(|version| !version.deleted).count()
 }
 
+fn should_skip_decommission_delete_marker(
+    version: &rustfs_filemeta::FileInfo,
+    remaining_versions: usize,
+    replication_configured: bool,
+) -> bool {
+    version.deleted && remaining_versions == 1 && !replication_configured
+}
+
 fn decommission_delete_marker_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
@@ -1320,8 +1328,8 @@ impl ECStore {
                 continue;
             }
 
-            let remaining_versions = fivs.versions.len() - expired;
-            if version.deleted && remaining_versions == 1 && replication_config.is_none() {
+            let remaining_versions = remaining_versions_after_decommission(&fivs).saturating_sub(expired);
+            if should_skip_decommission_delete_marker(version, remaining_versions, replication_config.is_some()) {
                 //
                 decommissioned += 1;
                 info!("decommission_pool: DELETE marked object with no other non-current versions will be skipped");
@@ -2151,6 +2159,43 @@ mod tests {
         };
 
         assert_eq!(remaining_versions_after_decommission(&fivs), 1);
+    }
+
+    #[test]
+    fn should_skip_decommission_delete_marker_when_last_remaining_without_replication() {
+        let version = rustfs_filemeta::FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+
+        assert!(should_skip_decommission_delete_marker(&version, 1, false));
+    }
+
+    #[test]
+    fn should_skip_decommission_delete_marker_rejects_configured_replication() {
+        let version = rustfs_filemeta::FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+
+        assert!(!should_skip_decommission_delete_marker(&version, 1, true));
+    }
+
+    #[test]
+    fn should_skip_decommission_delete_marker_rejects_non_deleted_versions() {
+        let version = rustfs_filemeta::FileInfo::default();
+
+        assert!(!should_skip_decommission_delete_marker(&version, 1, false));
+    }
+
+    #[test]
+    fn should_skip_decommission_delete_marker_rejects_multiple_remaining_versions() {
+        let version = rustfs_filemeta::FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+
+        assert!(!should_skip_decommission_delete_marker(&version, 2, false));
     }
 
     #[test]
