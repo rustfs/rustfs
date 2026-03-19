@@ -297,6 +297,10 @@ fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_e
     if let Some(err) = entry_error { Err(err) } else { list_result }
 }
 
+fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: bool, failure: bool) -> bool {
+    cleanup_ignored || (!ignore && !failure)
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1327,6 +1331,7 @@ impl ECStore {
             let version_id = version.version_id.map(|v| v.to_string());
 
             let mut ignore = false;
+            let mut cleanup_ignored = false;
             let mut failure = false;
             let mut error = None;
             if version.deleted {
@@ -1344,12 +1349,20 @@ impl ECStore {
                             &bucket, &version.name, &version_id, &err
                         );
                         ignore = true;
-                        continue;
+                        cleanup_ignored = true;
+                    } else {
+                        failure = true;
+
+                        error = Some(err)
                     }
+                }
 
-                    failure = true;
-
-                    error = Some(err)
+                if ignore {
+                    if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
+                        decommissioned += 1;
+                    }
+                    info!("decommission_pool: ignore {}", &version.name);
+                    continue;
                 }
 
                 {
@@ -1396,6 +1409,7 @@ impl ECStore {
                         if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err)
                         {
                             ignore = true;
+                            cleanup_ignored = true;
                             break;
                         }
 
@@ -1426,6 +1440,7 @@ impl ECStore {
                     Err(err) => {
                         if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                             ignore = true;
+                            cleanup_ignored = true;
                             break;
                         }
 
@@ -1450,6 +1465,7 @@ impl ECStore {
                 if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
                         ignore = true;
+                        cleanup_ignored = true;
                         break;
                     }
 
@@ -1469,6 +1485,9 @@ impl ECStore {
             }
 
             if ignore {
+                if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
+                    decommissioned += 1;
+                }
                 info!("decommission_pool: ignore {}", &version.name);
                 continue;
             }
@@ -1489,7 +1508,9 @@ impl ECStore {
                 break;
             }
 
-            decommissioned += 1;
+            if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
+                decommissioned += 1;
+            }
         }
 
         if decommissioned == fivs.versions.len() {
@@ -2562,8 +2583,8 @@ mod pools_tests {
         resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
         resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -3033,6 +3054,26 @@ mod pools_tests {
         let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), None)
             .expect_err("list result should be preserved without entry error");
         assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
+    fn test_should_count_decommission_version_complete_for_cleanup_safe_ignored_result() {
+        assert!(should_count_decommission_version_complete(true, true, false));
+    }
+
+    #[test]
+    fn test_should_count_decommission_version_complete_rejects_skip_only_ignored_result() {
+        assert!(!should_count_decommission_version_complete(true, false, false));
+    }
+
+    #[test]
+    fn test_should_count_decommission_version_complete_for_completed_result() {
+        assert!(should_count_decommission_version_complete(false, false, false));
+    }
+
+    #[test]
+    fn test_should_count_decommission_version_complete_rejects_failed_result() {
+        assert!(!should_count_decommission_version_complete(false, false, true));
     }
 
     #[tokio::test]
