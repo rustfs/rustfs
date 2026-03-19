@@ -595,6 +595,22 @@ impl S3 for FS {
         usecase.execute_put_bucket_acl(req).await
     }
 
+    async fn put_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<PutBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: accept configuration payload without persistence.
+        Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let usecase = DefaultBucketUsecase::from_global();
@@ -667,6 +683,22 @@ impl S3 for FS {
         usecase.execute_put_bucket_replication(req).await
     }
 
+    async fn put_bucket_request_payment(
+        &self,
+        req: S3Request<PutBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: accept payer configuration without persistence.
+        Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn put_public_access_block(
         &self,
@@ -689,6 +721,19 @@ impl S3 for FS {
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_versioning(req).await
+    }
+
+    async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        // S3-compatible dummy behavior: accept website configuration payload without persistence.
+        Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self, req))]

@@ -18,7 +18,10 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
-    use aws_sdk_s3::types::BucketLoggingStatus;
+    use aws_sdk_s3::types::{
+        AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, IndexDocument, Payer, RequestPaymentConfiguration,
+        WebsiteConfiguration,
+    };
     use serial_test::serial;
     use std::path::PathBuf;
     use std::process::Command;
@@ -176,6 +179,60 @@ mod tests {
             "GetBucketRequestPayment should return BucketOwner by default"
         );
 
+        let put_accelerate = client
+            .put_bucket_accelerate_configuration()
+            .bucket(bucket)
+            .accelerate_configuration(
+                AccelerateConfiguration::builder()
+                    .status(BucketAccelerateStatus::Suspended)
+                    .build(),
+            )
+            .send()
+            .await;
+        assert!(
+            put_accelerate.is_ok(),
+            "PutBucketAccelerateConfiguration should return success for existing bucket, got: {:?}",
+            put_accelerate.err()
+        );
+
+        let put_request_payment = client
+            .put_bucket_request_payment()
+            .bucket(bucket)
+            .request_payment_configuration(
+                RequestPaymentConfiguration::builder()
+                    .payer(Payer::BucketOwner)
+                    .build()
+                    .expect("failed to build RequestPaymentConfiguration"),
+            )
+            .send()
+            .await;
+        assert!(
+            put_request_payment.is_ok(),
+            "PutBucketRequestPayment should return success for existing bucket, got: {:?}",
+            put_request_payment.err()
+        );
+
+        let put_website = client
+            .put_bucket_website()
+            .bucket(bucket)
+            .website_configuration(
+                WebsiteConfiguration::builder()
+                    .index_document(
+                        IndexDocument::builder()
+                            .suffix("index.html")
+                            .build()
+                            .expect("failed to build IndexDocument"),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert!(
+            put_website.is_ok(),
+            "PutBucketWebsite should return success for existing bucket, got: {:?}",
+            put_website.err()
+        );
+
         let website = client.get_bucket_website().bucket(bucket).send().await;
         assert!(website.is_err(), "GetBucketWebsite should return NoSuchWebsiteConfiguration when unset");
         let website_err = website.err().unwrap();
@@ -260,6 +317,72 @@ mod tests {
             "Unexpected GetBucketRequestPayment error code: {:?}, err: {:?}",
             get_request_payment_code,
             get_request_payment_err
+        );
+
+        let put_accelerate = client
+            .put_bucket_accelerate_configuration()
+            .bucket(missing_bucket)
+            .accelerate_configuration(
+                AccelerateConfiguration::builder()
+                    .status(BucketAccelerateStatus::Suspended)
+                    .build(),
+            )
+            .send()
+            .await;
+        assert!(put_accelerate.is_err(), "PutBucketAccelerateConfiguration should fail for missing bucket");
+        let put_accelerate_err = put_accelerate.err().unwrap();
+        let put_accelerate_code = put_accelerate_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(put_accelerate_code, Some("NoSuchBucket")),
+            "Unexpected PutBucketAccelerateConfiguration error code: {:?}, err: {:?}",
+            put_accelerate_code,
+            put_accelerate_err
+        );
+
+        let put_request_payment = client
+            .put_bucket_request_payment()
+            .bucket(missing_bucket)
+            .request_payment_configuration(
+                RequestPaymentConfiguration::builder()
+                    .payer(Payer::BucketOwner)
+                    .build()
+                    .expect("failed to build RequestPaymentConfiguration"),
+            )
+            .send()
+            .await;
+        assert!(put_request_payment.is_err(), "PutBucketRequestPayment should fail for missing bucket");
+        let put_request_payment_err = put_request_payment.err().unwrap();
+        let put_request_payment_code = put_request_payment_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(put_request_payment_code, Some("NoSuchBucket")),
+            "Unexpected PutBucketRequestPayment error code: {:?}, err: {:?}",
+            put_request_payment_code,
+            put_request_payment_err
+        );
+
+        let put_website = client
+            .put_bucket_website()
+            .bucket(missing_bucket)
+            .website_configuration(
+                WebsiteConfiguration::builder()
+                    .index_document(
+                        IndexDocument::builder()
+                            .suffix("index.html")
+                            .build()
+                            .expect("failed to build IndexDocument"),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert!(put_website.is_err(), "PutBucketWebsite should fail for missing bucket");
+        let put_website_err = put_website.err().unwrap();
+        let put_website_code = put_website_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(put_website_code, Some("NoSuchBucket")),
+            "Unexpected PutBucketWebsite error code: {:?}, err: {:?}",
+            put_website_code,
+            put_website_err
         );
 
         let get_website = client.get_bucket_website().bucket(missing_bucket).send().await;

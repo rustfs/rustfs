@@ -1201,9 +1201,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_bucket_accelerate_configuration(
         &self,
-        _req: &mut S3Request<PutBucketAccelerateConfigurationInput>,
+        req: &mut S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketAcl request has accesses to the resources.
@@ -1336,8 +1339,11 @@ impl S3Access for FS {
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_request_payment(&self, _req: &mut S3Request<PutBucketRequestPaymentInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_request_payment(&self, req: &mut S3Request<PutBucketRequestPaymentInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketTagging request has accesses to the resources.
@@ -1363,8 +1369,11 @@ impl S3Access for FS {
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_website(&self, _req: &mut S3Request<PutBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_website(&self, req: &mut S3Request<PutBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutObject request has accesses to the resources.
