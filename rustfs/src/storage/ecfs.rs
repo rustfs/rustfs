@@ -16,7 +16,12 @@ use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
-    bucket::{metadata::BUCKET_WEBSITE_CONFIG, metadata_sys, tagging::decode_tags_to_map, utils::serialize},
+    bucket::{
+        metadata::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG},
+        metadata_sys,
+        tagging::decode_tags_to_map,
+        utils::serialize,
+    },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
@@ -336,8 +341,14 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: return empty AccelerateConfiguration.
-        Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default()))
+        match metadata_sys::get_accelerate_config(&req.input.bucket).await {
+            Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
+                status: accelerate.status,
+                ..Default::default()
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default())),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -420,10 +431,15 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: always return BucketOwner.
-        Ok(S3Response::new(GetBucketRequestPaymentOutput {
-            payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
-        }))
+        match metadata_sys::get_request_payment_config(&req.input.bucket).await {
+            Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
+                payer: Some(payment.payer),
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
+                payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
+            })),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -618,7 +634,12 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: accept configuration payload without persistence.
+        let accelerate_config = serialize(&req.input.accelerate_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
     }
 
@@ -706,7 +727,12 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: accept payer configuration without persistence.
+        let payment_config = serialize(&req.input.request_payment_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
     }
 

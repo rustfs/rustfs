@@ -200,7 +200,7 @@ mod tests {
             .bucket(bucket)
             .request_payment_configuration(
                 RequestPaymentConfiguration::builder()
-                    .payer(Payer::BucketOwner)
+                    .payer(Payer::Requester)
                     .build()
                     .expect("failed to build RequestPaymentConfiguration"),
             )
@@ -210,6 +210,30 @@ mod tests {
             put_request_payment.is_ok(),
             "PutBucketRequestPayment should return success for existing bucket, got: {:?}",
             put_request_payment.err()
+        );
+
+        let accelerate_after_put = client
+            .get_bucket_accelerate_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("GetBucketAccelerateConfiguration should succeed after put");
+        assert_eq!(
+            accelerate_after_put.status().map(|s| s.as_str()),
+            Some("Suspended"),
+            "GetBucketAccelerateConfiguration should preserve put status"
+        );
+
+        let payment_after_put = client
+            .get_bucket_request_payment()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("GetBucketRequestPayment should succeed after put");
+        assert_eq!(
+            payment_after_put.payer().map(|p| p.as_str()),
+            Some("Requester"),
+            "GetBucketRequestPayment should preserve put payer"
         );
 
         let put_website = client
