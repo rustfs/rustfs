@@ -28,9 +28,9 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
 use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    PublicAccessBlockConfiguration, RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging,
-    VersioningConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
+    ObjectLockConfiguration, PublicAccessBlockConfiguration, RequestPaymentConfiguration, ServerSideEncryptionConfiguration,
+    Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -199,6 +199,13 @@ pub async fn get_website_config(bucket: &str) -> Result<(WebsiteConfiguration, O
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_website_config(bucket).await
+}
+
+pub async fn get_logging_config(bucket: &str) -> Result<(BucketLoggingStatus, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_logging_config(bucket).await
 }
 
 pub async fn get_accelerate_config(bucket: &str) -> Result<(AccelerateConfiguration, OffsetDateTime)> {
@@ -614,6 +621,16 @@ impl BucketMetadataSys {
 
         if let Some(config) = &bm.website_config {
             Ok((config.clone(), bm.website_config_updated_at))
+        } else {
+            Err(Error::ConfigNotFound)
+        }
+    }
+
+    pub async fn get_logging_config(&self, bucket: &str) -> Result<(BucketLoggingStatus, OffsetDateTime)> {
+        let (bm, _) = self.get_config(bucket).await?;
+
+        if let Some(config) = &bm.logging_config {
+            Ok((config.clone(), bm.logging_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }

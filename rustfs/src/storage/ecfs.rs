@@ -17,7 +17,7 @@ use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
     bucket::{
-        metadata::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG},
+        metadata::{BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG},
         metadata_sys,
         tagging::decode_tags_to_map,
         utils::serialize,
@@ -659,9 +659,13 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // Keep S3 compatibility with dummy-handler behavior:
-        // when bucket exists, return success with empty logging configuration.
-        Ok(S3Response::new(GetBucketLoggingOutput::default()))
+        match metadata_sys::get_logging_config(&req.input.bucket).await {
+            Ok((logging, _)) => Ok(S3Response::new(GetBucketLoggingOutput {
+                logging_enabled: logging.logging_enabled,
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketLoggingOutput::default())),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
@@ -673,7 +677,13 @@ impl S3 for FS {
             .get_bucket_info(&req.input.bucket, &BucketOptions::default())
             .await
             .map_err(crate::error::ApiError::from)?;
-        // S3-compatible dummy behavior: accept config payload and return success without persistence.
+
+        let logging_config = serialize(&req.input.bucket_logging_status)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
 

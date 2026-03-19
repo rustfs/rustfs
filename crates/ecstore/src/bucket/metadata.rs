@@ -25,9 +25,9 @@ use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    PublicAccessBlockConfiguration, ReplicationConfiguration, RequestPaymentConfiguration, ServerSideEncryptionConfiguration,
-    Tagging, VersioningConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
+    ObjectLockConfiguration, PublicAccessBlockConfiguration, ReplicationConfiguration, RequestPaymentConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
 use std::collections::HashMap;
@@ -80,6 +80,7 @@ pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 pub const BUCKET_CORS_CONFIG: &str = "cors.xml";
+pub const BUCKET_LOGGING_CONFIG: &str = "logging.xml";
 pub const BUCKET_WEBSITE_CONFIG: &str = "website.xml";
 pub const BUCKET_ACCELERATE_CONFIG: &str = "accelerate.xml";
 pub const BUCKET_REQUEST_PAYMENT_CONFIG: &str = "request-payment.xml";
@@ -103,6 +104,7 @@ pub struct BucketMetadata {
     pub bucket_targets_config_json: Vec<u8>,
     pub bucket_targets_config_meta_json: Vec<u8>,
     pub cors_config_xml: Vec<u8>,
+    pub logging_config_xml: Vec<u8>,
     pub website_config_xml: Vec<u8>,
     pub accelerate_config_xml: Vec<u8>,
     pub request_payment_config_xml: Vec<u8>,
@@ -121,6 +123,7 @@ pub struct BucketMetadata {
     pub bucket_targets_config_updated_at: OffsetDateTime,
     pub bucket_targets_config_meta_updated_at: OffsetDateTime,
     pub cors_config_updated_at: OffsetDateTime,
+    pub logging_config_updated_at: OffsetDateTime,
     pub website_config_updated_at: OffsetDateTime,
     pub accelerate_config_updated_at: OffsetDateTime,
     pub request_payment_config_updated_at: OffsetDateTime,
@@ -141,6 +144,7 @@ pub struct BucketMetadata {
     pub bucket_target_config: Option<BucketTargets>,
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
     pub cors_config: Option<CORSConfiguration>,
+    pub logging_config: Option<BucketLoggingStatus>,
     pub website_config: Option<WebsiteConfiguration>,
     pub accelerate_config: Option<AccelerateConfiguration>,
     pub request_payment_config: Option<RequestPaymentConfiguration>,
@@ -166,6 +170,7 @@ impl Default for BucketMetadata {
             bucket_targets_config_json: Default::default(),
             bucket_targets_config_meta_json: Default::default(),
             cors_config_xml: Default::default(),
+            logging_config_xml: Default::default(),
             website_config_xml: Default::default(),
             accelerate_config_xml: Default::default(),
             request_payment_config_xml: Default::default(),
@@ -183,6 +188,7 @@ impl Default for BucketMetadata {
             bucket_targets_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_targets_config_meta_updated_at: OffsetDateTime::UNIX_EPOCH,
             cors_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            logging_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             website_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             accelerate_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             request_payment_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -201,6 +207,7 @@ impl Default for BucketMetadata {
             bucket_target_config: Default::default(),
             bucket_target_config_meta: Default::default(),
             cors_config: Default::default(),
+            logging_config: Default::default(),
             website_config: Default::default(),
             accelerate_config: Default::default(),
             request_payment_config: Default::default(),
@@ -272,12 +279,14 @@ impl BucketMetadata {
                 "BucketTargetsConfigUpdatedAt" => self.bucket_targets_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketTargetsConfigMetaUpdatedAt" => self.bucket_targets_config_meta_updated_at = read_msgp_time_value(rd)?,
                 "CorsConfigXML" => self.cors_config_xml = read_msgp_bin(rd)?,
+                "LoggingConfigXML" => self.logging_config_xml = read_msgp_bin(rd)?,
                 "WebsiteConfigXML" => self.website_config_xml = read_msgp_bin(rd)?,
                 "AccelerateConfigXML" => self.accelerate_config_xml = read_msgp_bin(rd)?,
                 "RequestPaymentConfigXML" => self.request_payment_config_xml = read_msgp_bin(rd)?,
                 "PublicAccessBlockConfigXML" => self.public_access_block_config_xml = read_msgp_bin(rd)?,
                 "BucketAclConfigJSON" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
+                "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
                 "AccelerateConfigUpdatedAt" => self.accelerate_config_updated_at = read_msgp_time_value(rd)?,
                 "RequestPaymentConfigUpdatedAt" => self.request_payment_config_updated_at = read_msgp_time_value(rd)?,
@@ -295,8 +304,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (12)
-        let map_len: u32 = 37;
+        // Map size: MinIO fields (25) + RustFS extensions (14)
+        let map_len: u32 = 39;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -346,6 +355,7 @@ impl BucketMetadata {
 
         // RustFS extensions
         write_bin_field(wr, "CorsConfigXML", &self.cors_config_xml)?;
+        write_bin_field(wr, "LoggingConfigXML", &self.logging_config_xml)?;
         write_bin_field(wr, "WebsiteConfigXML", &self.website_config_xml)?;
         write_bin_field(wr, "AccelerateConfigXML", &self.accelerate_config_xml)?;
         write_bin_field(wr, "RequestPaymentConfigXML", &self.request_payment_config_xml)?;
@@ -353,6 +363,8 @@ impl BucketMetadata {
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
+        rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
+        write_msgp_time(wr, self.logging_config_updated_at)?;
         rmp::encode::write_str(wr, "WebsiteConfigUpdatedAt")?;
         write_msgp_time(wr, self.website_config_updated_at)?;
         rmp::encode::write_str(wr, "AccelerateConfigUpdatedAt")?;
@@ -443,6 +455,9 @@ impl BucketMetadata {
         if self.public_access_block_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.public_access_block_config_updated_at = self.created
         }
+        if self.logging_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.logging_config_updated_at = self.created
+        }
         if self.website_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.website_config_updated_at = self.created
         }
@@ -507,6 +522,10 @@ impl BucketMetadata {
             BUCKET_CORS_CONFIG => {
                 self.cors_config_xml = data;
                 self.cors_config_updated_at = updated;
+            }
+            BUCKET_LOGGING_CONFIG => {
+                self.logging_config_xml = data;
+                self.logging_config_updated_at = updated;
             }
             BUCKET_WEBSITE_CONFIG => {
                 self.website_config_xml = data;
@@ -635,6 +654,11 @@ impl BucketMetadata {
             && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
         {
             tracing::warn!(bucket = %self.name, config = "cors", error = %e, "parse_all_configs: failed to parse");
+        }
+        if !self.logging_config_xml.is_empty()
+            && let Err(e) = deserialize::<BucketLoggingStatus>(&self.logging_config_xml).map(|c| self.logging_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "logging", error = %e, "parse_all_configs: failed to parse");
         }
         if !self.website_config_xml.is_empty()
             && let Err(e) = deserialize::<WebsiteConfiguration>(&self.website_config_xml).map(|c| self.website_config = Some(c))

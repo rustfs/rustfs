@@ -19,8 +19,8 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::types::{
-        AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, IndexDocument, Payer, RequestPaymentConfiguration,
-        WebsiteConfiguration,
+        AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, IndexDocument, LoggingEnabled, Payer,
+        RequestPaymentConfiguration, WebsiteConfiguration,
     };
     use serial_test::serial;
     use std::path::PathBuf;
@@ -136,7 +136,17 @@ mod tests {
         let put_logging = client
             .put_bucket_logging()
             .bucket(bucket)
-            .bucket_logging_status(BucketLoggingStatus::builder().build())
+            .bucket_logging_status(
+                BucketLoggingStatus::builder()
+                    .logging_enabled(
+                        LoggingEnabled::builder()
+                            .target_bucket(bucket)
+                            .target_prefix("logs/")
+                            .build()
+                            .expect("failed to build LoggingEnabled"),
+                    )
+                    .build(),
+            )
             .send()
             .await;
         assert!(
@@ -151,9 +161,18 @@ mod tests {
             .send()
             .await
             .expect("GetBucketLogging should succeed after PutBucketLogging");
-        assert!(
-            output_after_put.logging_enabled().is_none(),
-            "Dummy PutBucketLogging should keep empty logging configuration"
+        let logging_after_put = output_after_put
+            .logging_enabled()
+            .expect("GetBucketLogging should return persisted logging_enabled");
+        assert_eq!(
+            logging_after_put.target_bucket(),
+            bucket,
+            "GetBucketLogging should preserve target bucket"
+        );
+        assert_eq!(
+            logging_after_put.target_prefix(),
+            "logs/",
+            "GetBucketLogging should preserve target prefix"
         );
 
         let accelerate = client
