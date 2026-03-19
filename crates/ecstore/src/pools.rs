@@ -301,6 +301,10 @@ fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: boo
     cleanup_ignored || (!ignore && !failure)
 }
 
+fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
+    expired == 0 && decommissioned == total_versions
+}
+
 fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool) {
     if let Some(pool) = pool {
         let active = pool
@@ -1324,7 +1328,6 @@ impl ECStore {
             .await
             {
                 expired += 1;
-                decommissioned += 1;
                 continue;
             }
 
@@ -1521,7 +1524,7 @@ impl ECStore {
             }
         }
 
-        if decommissioned == fivs.versions.len() {
+        if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
             let cleanup_result = set
                 .delete_object(
                     bucket.as_str(),
@@ -1542,13 +1545,14 @@ impl ECStore {
                     err,
                 ));
             }
-        } else if decommissioned != fivs.versions.len() {
+        } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(
-                "decommission_pool: source object retained for {}/{} because only {}/{} versions were decommissioned",
+                "decommission_pool: source object retained for {}/{} because only {}/{} versions were decommissioned and {} expired by lifecycle",
                 &bucket,
                 &entry.name,
                 decommissioned,
-                fivs.versions.len()
+                fivs.versions.len(),
+                expired
             );
         }
 
@@ -2628,8 +2632,9 @@ mod pools_tests {
         resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
         resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object, with_decommission_entry_context,
+        should_cleanup_decommission_source_entry, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -3119,6 +3124,16 @@ mod pools_tests {
     #[test]
     fn test_should_count_decommission_version_complete_rejects_failed_result() {
         assert!(!should_count_decommission_version_complete(false, false, true));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_accepts_all_versions_completed() {
+        assert!(should_cleanup_decommission_source_entry(3, 3, 0));
+    }
+
+    #[test]
+    fn test_should_cleanup_decommission_source_entry_rejects_versions_only_expired_by_lifecycle() {
+        assert!(!should_cleanup_decommission_source_entry(2, 3, 1));
     }
 
     #[tokio::test]
