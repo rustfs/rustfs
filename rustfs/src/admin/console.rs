@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_component_details, collect_dependency_readiness, health_check_state};
-use crate::config::build;
 use crate::license::get_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, RUSTFS_ADMIN_PREFIX};
+use crate::version::build;
 use axum::{
     Router,
     body::Body,
