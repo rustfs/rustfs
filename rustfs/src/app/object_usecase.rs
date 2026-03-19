@@ -87,8 +87,8 @@ use rustfs_utils::http::{
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_SNOWBALL_EXTRACT, AMZ_STORAGE_CLASS,
-        AMZ_TAG_COUNT,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
+        AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -203,6 +203,19 @@ fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
     header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
 }
 
+fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
+    input
+        .server_side_encryption
+        .as_ref()
+        .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+        || input.ssekms_key_id.is_some()
+        || headers
+            .get(AMZ_SERVER_SIDE_ENCRYPTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+        || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)
+}
+
 async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
     let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
         debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
@@ -292,6 +305,10 @@ impl DefaultObjectUsecase {
 
         let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
+        if req.extensions.get::<PostObjectRequestMarker>().is_some() && is_post_object_sse_kms_requested(&req.input, &req.headers)
+        {
+            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
+        }
         if is_put_object_extract_requested(&req.headers) {
             return self.execute_put_object_extract(req).await;
         }
@@ -3645,6 +3662,65 @@ mod tests {
 
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
         assert!(!is_put_object_extract_requested(&headers));
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .server_side_encryption(Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)))
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_sse_kms_from_headers() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        req.headers
+            .insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("aws:kms"));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_sse_kms_key_id_header() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        req.headers
+            .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
