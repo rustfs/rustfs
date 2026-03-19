@@ -18,6 +18,10 @@ fn should_reuse_existing_multipart_pool(pool_idx: usize, opts: &ObjectOptions) -
     !(opts.data_movement && pool_idx == opts.src_pool_idx)
 }
 
+fn multipart_data_movement_overwrite_err(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
+    StorageError::DataMovementOverwriteErr(bucket.to_owned(), object.to_owned(), opts.version_id.clone().unwrap_or_default())
+}
+
 impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_list_object_parts(
@@ -140,13 +144,13 @@ impl ECStore {
                 return self.pools[idx].new_multipart_upload(bucket, object, opts).await;
             }
         }
-        let idx = self.get_pool_idx(bucket, object, -1).await?;
+        let idx = if opts.data_movement && opts.version_id.is_some() {
+            self.select_data_movement_pool_idx(bucket, object, -1, opts, false).await?
+        } else {
+            self.get_pool_idx(bucket, object, -1).await?
+        };
         if opts.data_movement && idx == opts.src_pool_idx {
-            return Err(StorageError::DataMovementOverwriteErr(
-                bucket.to_owned(),
-                object.to_owned(),
-                "".to_owned(),
-            ));
+            return Err(multipart_data_movement_overwrite_err(bucket, object, opts));
         }
 
         self.pools[idx].new_multipart_upload(bucket, object, opts).await
@@ -366,5 +370,32 @@ mod tests {
         };
 
         assert!(should_reuse_existing_multipart_pool(2, &opts));
+    }
+
+    #[test]
+    fn multipart_data_movement_overwrite_err_preserves_version_id() {
+        let err = multipart_data_movement_overwrite_err(
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            err,
+            Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
+    }
+
+    #[test]
+    fn multipart_data_movement_overwrite_err_defaults_empty_version_id() {
+        let err = multipart_data_movement_overwrite_err("bucket", "object", &ObjectOptions::default());
+
+        assert_eq!(
+            err,
+            Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), String::new())
+        );
     }
 }

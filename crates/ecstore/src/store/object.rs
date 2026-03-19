@@ -114,7 +114,7 @@ impl ECStore {
         resolve_latest_object_access(bucket, object, info, idx, opts)
     }
 
-    async fn select_data_movement_pool_idx(
+    pub(super) async fn select_data_movement_pool_idx(
         &self,
         bucket: &str,
         object: &str,
