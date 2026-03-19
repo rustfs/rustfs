@@ -14,6 +14,7 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -24,6 +25,7 @@ use crate::storage::access::{ReqInfo, authorize_request};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::HeaderValue;
+use http::header::HeaderName;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -49,6 +51,7 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 use s3s::StdError;
+use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, Timestamp, TimestampFormat};
 use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
@@ -276,6 +279,277 @@ fn validate_misc_extension_request(uri: &Uri, route: &MiscExtRoute) -> S3Result<
         MiscExtRoute::ObjectLambda { .. } => validate_object_lambda_query(uri),
         MiscExtRoute::ListenNotification { .. } => validate_listen_notification_query(uri),
     }
+}
+
+fn query_pairs_without_key(uri: &Uri, excluded_key: &str) -> Vec<(String, String)> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .filter(|(key, _)| key != excluded_key)
+        .collect()
+}
+
+fn uri_without_query_key(uri: &Uri, excluded_key: &str) -> S3Result<Uri> {
+    let filtered = query_pairs_without_key(uri, excluded_key);
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = if filtered.is_empty() {
+        Some(
+            uri.path()
+                .parse()
+                .map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))?,
+        )
+    } else {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(filtered.iter().map(|(key, value)| (key.as_str(), value.as_str())))
+            .finish();
+        Some(
+            format!("{}?{}", uri.path(), query)
+                .parse()
+                .map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))?,
+        )
+    };
+    Uri::from_parts(parts).map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))
+}
+
+fn parse_optional_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<String>> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(|parsed| parsed.to_string())
+                .map_err(|_| s3_error!(InvalidRequest, "request header contains invalid utf-8"))
+        })
+        .transpose()
+}
+
+fn parse_optional_timestamp_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<Timestamp>> {
+    parse_optional_header(headers, name)?
+        .map(|value| {
+            Timestamp::parse(TimestampFormat::HttpDate, &value)
+                .map_err(|_| s3_error!(InvalidRequest, "request timestamp header is invalid"))
+        })
+        .transpose()
+}
+
+fn parse_optional_etag_condition_header<T>(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<T>>
+where
+    T: std::str::FromStr,
+{
+    parse_optional_header(headers, name)?
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|_| s3_error!(InvalidRequest, "request etag condition header is invalid"))
+        })
+        .transpose()
+}
+
+fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: &str) -> S3Result<S3Request<GetObjectInput>> {
+    let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
+    let part_number = query_value_exact(&filtered_uri, "partNumber")
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i32>()
+                .map_err(|_| s3_error!(InvalidArgument, "partNumber query parameter must be a positive integer"))
+        })
+        .transpose()?;
+    let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
+    let range = parse_optional_header(&req.headers, http::header::RANGE)?
+        .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidArgument, "Range header is invalid")))
+        .transpose()?;
+
+    let mut builder = GetObjectInput::builder()
+        .bucket(bucket.to_string())
+        .key(object.to_string())
+        .part_number(part_number)
+        .version_id(version_id)
+        .range(range)
+        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, http::header::IF_MATCH)?)
+        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(
+            &req.headers,
+            http::header::IF_NONE_MATCH,
+        )?)
+        .if_modified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_MODIFIED_SINCE)?)
+        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_UNMODIFIED_SINCE)?);
+
+    builder = builder.sse_customer_algorithm(parse_optional_header(
+        &req.headers,
+        HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"),
+    )?);
+    builder = builder.sse_customer_key(parse_optional_header(
+        &req.headers,
+        HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
+    )?);
+    builder = builder.sse_customer_key_md5(parse_optional_header(
+        &req.headers,
+        HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+    )?);
+
+    let input = builder
+        .build()
+        .map_err(|err| s3_error!(InvalidRequest, "failed to build object lambda get request: {err}"))?;
+
+    Ok(S3Request {
+        input,
+        method: req.method.clone(),
+        uri: filtered_uri,
+        headers: req.headers.clone(),
+        extensions: req.extensions.clone(),
+        credentials: req.credentials.clone(),
+        region: req.region.clone(),
+        service: req.service.clone(),
+        trailing_headers: req.trailing_headers.clone(),
+    })
+}
+
+fn format_timestamp_http_date(value: &Timestamp) -> S3Result<String> {
+    let mut buf = Vec::new();
+    value
+        .format(TimestampFormat::HttpDate, &mut buf)
+        .map_err(|_| s3_error!(InternalError, "failed to format timestamp header"))?;
+    String::from_utf8(buf).map_err(|_| s3_error!(InternalError, "failed to format timestamp header"))
+}
+
+fn insert_string_header(headers: &mut HeaderMap, name: HeaderName, value: String) -> S3Result<()> {
+    let header_value =
+        HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "failed to build response header value"))?;
+    headers.insert(name, header_value);
+    Ok(())
+}
+
+fn convert_get_object_response(resp: S3Response<GetObjectOutput>) -> S3Result<S3Response<Body>> {
+    let mut headers = resp.headers.clone();
+
+    if let Some(accept_ranges) = &resp.output.accept_ranges {
+        insert_string_header(&mut headers, http::header::ACCEPT_RANGES, accept_ranges.clone())?;
+    }
+    if let Some(cache_control) = &resp.output.cache_control {
+        insert_string_header(&mut headers, http::header::CACHE_CONTROL, cache_control.clone())?;
+    }
+    if let Some(content_disposition) = &resp.output.content_disposition {
+        insert_string_header(&mut headers, http::header::CONTENT_DISPOSITION, content_disposition.clone())?;
+    }
+    if let Some(content_encoding) = &resp.output.content_encoding {
+        insert_string_header(&mut headers, http::header::CONTENT_ENCODING, content_encoding.clone())?;
+    }
+    if let Some(content_language) = &resp.output.content_language {
+        insert_string_header(&mut headers, http::header::CONTENT_LANGUAGE, content_language.clone())?;
+    }
+    if let Some(content_length) = resp.output.content_length {
+        insert_string_header(&mut headers, http::header::CONTENT_LENGTH, content_length.to_string())?;
+    }
+    if let Some(content_range) = &resp.output.content_range {
+        insert_string_header(&mut headers, http::header::CONTENT_RANGE, content_range.clone())?;
+    }
+    if let Some(content_type) = &resp.output.content_type {
+        insert_string_header(&mut headers, http::header::CONTENT_TYPE, content_type.to_string())?;
+    }
+    if let Some(etag) = &resp.output.e_tag {
+        headers.insert(
+            http::header::ETAG,
+            etag.to_http_header().map_err(|_| s3_error!(InternalError, "invalid etag"))?,
+        );
+    }
+    if let Some(last_modified) = &resp.output.last_modified {
+        insert_string_header(&mut headers, http::header::LAST_MODIFIED, format_timestamp_http_date(last_modified)?)?;
+    }
+    if let Some(expires) = &resp.output.expires {
+        insert_string_header(&mut headers, http::header::EXPIRES, format_timestamp_http_date(expires)?)?;
+    }
+    if let Some(version_id) = &resp.output.version_id {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-version-id"), version_id.clone())?;
+    }
+    if let Some(server_side_encryption) = &resp.output.server_side_encryption {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-server-side-encryption"),
+            server_side_encryption.as_str().to_string(),
+        )?;
+    }
+    if let Some(sse_customer_algorithm) = &resp.output.sse_customer_algorithm {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"),
+            sse_customer_algorithm.clone(),
+        )?;
+    }
+    if let Some(sse_customer_key_md5) = &resp.output.sse_customer_key_md5 {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+            sse_customer_key_md5.clone(),
+        )?;
+    }
+    if let Some(sse_kms_key_id) = &resp.output.ssekms_key_id {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-server-side-encryption-aws-kms-key-id"),
+            sse_kms_key_id.clone(),
+        )?;
+    }
+    if let Some(checksum_crc32) = &resp.output.checksum_crc32 {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32"), checksum_crc32.clone())?;
+    }
+    if let Some(checksum_crc32c) = &resp.output.checksum_crc32c {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32c"), checksum_crc32c.clone())?;
+    }
+    if let Some(checksum_crc64nvme) = &resp.output.checksum_crc64nvme {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-checksum-crc64nvme"),
+            checksum_crc64nvme.clone(),
+        )?;
+    }
+    if let Some(checksum_sha1) = &resp.output.checksum_sha1 {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha1"), checksum_sha1.clone())?;
+    }
+    if let Some(checksum_sha256) = &resp.output.checksum_sha256 {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha256"), checksum_sha256.clone())?;
+    }
+    if let Some(checksum_type) = &resp.output.checksum_type {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-checksum-type"),
+            checksum_type.as_str().to_string(),
+        )?;
+    }
+    if let Some(storage_class) = &resp.output.storage_class {
+        insert_string_header(
+            &mut headers,
+            HeaderName::from_static("x-amz-storage-class"),
+            storage_class.as_str().to_string(),
+        )?;
+    }
+    if let Some(tag_count) = resp.output.tag_count {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-tagging-count"), tag_count.to_string())?;
+    }
+    if let Some(expiration) = &resp.output.expiration {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-expiration"), expiration.clone())?;
+    }
+    if let Some(restore) = &resp.output.restore {
+        insert_string_header(&mut headers, HeaderName::from_static("x-amz-restore"), restore.clone())?;
+    }
+
+    if let Some(metadata) = &resp.output.metadata {
+        for (key, value) in metadata {
+            let header_name = format!("x-amz-meta-{key}");
+            if let Ok(parsed_name) = HeaderName::from_bytes(header_name.as_bytes()) {
+                let parsed_value = HeaderValue::from_str(value)
+                    .map_err(|_| s3_error!(InternalError, "failed to build metadata response header"))?;
+                headers.insert(parsed_name, parsed_value);
+            }
+        }
+    }
+
+    let body = resp.output.body.map(Body::from).unwrap_or_else(|| Body::from(String::new()));
+
+    Ok(S3Response {
+        output: body,
+        status: resp.status,
+        headers,
+        extensions: resp.extensions,
+    })
 }
 
 struct ListenNotificationStream {
@@ -509,15 +783,11 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
     validate_misc_extension_request(&req.uri, route)?;
 
     match route {
-        MiscExtRoute::ObjectLambda { bucket, .. } => {
-            let Some(store) = new_object_layer_fn() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
-            };
-            store
-                .get_bucket_info(bucket, &BucketOptions::default())
-                .await
-                .map_err(ApiError::from)?;
-            Err(s3_error!(NotImplemented, "object lambda route is not implemented"))
+        MiscExtRoute::ObjectLambda { bucket, object } => {
+            let get_req = build_object_lambda_get_request(req, bucket, object)?;
+            let usecase = DefaultObjectUsecase::from_global();
+            let get_resp = usecase.execute_get_object(get_req).await?;
+            convert_get_object_response(get_resp)
         }
         MiscExtRoute::ListenNotification { bucket } => {
             if let Some(bucket_name) = bucket {
@@ -973,6 +1243,119 @@ mod tests {
             .expect("uri should parse");
 
         assert!(validate_object_lambda_query(&valid).is_ok());
+    }
+
+    #[test]
+    fn build_object_lambda_get_request_removes_lambda_arn_and_preserves_request_inputs() {
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook&versionId=v1&partNumber=7"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.headers
+            .insert(http::header::RANGE, HeaderValue::from_static("bytes=5-10"));
+        req.headers
+            .insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
+
+        let bridged = build_object_lambda_get_request(&req, "demo-bucket", "object.txt").expect("bridge request should build");
+
+        assert_eq!(bridged.uri.path(), "/demo-bucket/object.txt");
+        assert_eq!(bridged.uri.query(), Some("versionId=v1&partNumber=7"));
+        assert_eq!(bridged.input.bucket, "demo-bucket");
+        assert_eq!(bridged.input.key, "object.txt");
+        assert_eq!(bridged.input.version_id.as_deref(), Some("v1"));
+        assert_eq!(bridged.input.part_number, Some(7));
+        assert_eq!(
+            bridged.input.range,
+            Some(Range::Int {
+                first: 5,
+                last: Some(10)
+            })
+        );
+        assert!(bridged.input.if_match.is_some());
+    }
+
+    #[test]
+    fn build_object_lambda_get_request_rejects_invalid_range_header() {
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.headers
+            .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-5"));
+
+        let err = build_object_lambda_get_request(&req, "demo-bucket", "object.txt").expect_err("invalid range must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn convert_get_object_response_maps_core_headers() {
+        let mut resp = S3Response::new(GetObjectOutput {
+            body: Some(Body::from("payload".to_string()).into()),
+            content_length: Some(7),
+            content_type: Some("text/plain".to_string()),
+            accept_ranges: Some("bytes".to_string()),
+            version_id: Some("v1".to_string()),
+            metadata: Some(std::collections::HashMap::from([("custom-key".to_string(), "custom-value".to_string())])),
+            ..Default::default()
+        });
+        resp.status = Some(StatusCode::OK);
+
+        let converted = convert_get_object_response(resp).expect("response conversion should succeed");
+
+        assert_eq!(converted.status, Some(StatusCode::OK));
+        assert_eq!(
+            converted
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
+        assert_eq!(
+            converted
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            converted
+                .headers
+                .get(http::header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(
+            converted
+                .headers
+                .get("x-amz-version-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("v1")
+        );
+        assert_eq!(
+            converted
+                .headers
+                .get("x-amz-meta-custom-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-value")
+        );
     }
 
     #[tokio::test]
