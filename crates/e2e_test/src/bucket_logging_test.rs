@@ -18,6 +18,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::types::BucketLoggingStatus;
     use serial_test::serial;
     use std::path::PathBuf;
     use std::process::Command;
@@ -127,6 +128,29 @@ mod tests {
         assert!(
             output.logging_enabled().is_none(),
             "Default GetBucketLogging should return empty logging configuration"
+        );
+
+        let put_logging = client
+            .put_bucket_logging()
+            .bucket(bucket)
+            .bucket_logging_status(BucketLoggingStatus::builder().build())
+            .send()
+            .await;
+        assert!(
+            put_logging.is_ok(),
+            "PutBucketLogging should return success for existing bucket, got: {:?}",
+            put_logging.err()
+        );
+
+        let output_after_put = client
+            .get_bucket_logging()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("GetBucketLogging should succeed after PutBucketLogging");
+        assert!(
+            output_after_put.logging_enabled().is_none(),
+            "Dummy PutBucketLogging should keep empty logging configuration"
         );
 
         let accelerate = client

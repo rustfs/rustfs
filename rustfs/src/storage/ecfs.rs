@@ -616,7 +616,8 @@ impl S3 for FS {
             .get_bucket_info(&req.input.bucket, &BucketOptions::default())
             .await
             .map_err(crate::error::ApiError::from)?;
-        Err(s3_error!(NotImplemented, "PutBucketLogging is not implemented yet"))
+        // S3-compatible dummy behavior: accept config payload and return success without persistence.
+        Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
 
     async fn put_bucket_encryption(
