@@ -1129,6 +1129,10 @@ fn resolve_rebalance_bucket_result(result: Result<()>, pool_idx: usize, bucket: 
     }
 }
 
+fn with_rebalance_entry_context(stage: &str, bucket: &str, object_name: &str, err: Error) -> Error {
+    Error::other(format!("rebalance entry {stage} failed for {bucket}/{object_name}: {err}"))
+}
+
 fn clone_first_arc<T>(values: &[Arc<T>], err_msg: &str) -> Result<Arc<T>> {
     values.first().cloned().ok_or_else(|| Error::other(err_msg))
 }
@@ -1388,7 +1392,7 @@ impl ECStore {
                     "rebalance_entry {} Error rebalancing entry {}/{:?}: {:?}",
                     &bucket, &version.name, &version.version_id, err
                 );
-                return Err(err);
+                return Err(with_rebalance_entry_context("migrate", bucket.as_str(), version.name.as_str(), err));
             }
 
             resolve_rebalance_stats_update_result(
@@ -1631,7 +1635,7 @@ mod rebalance_unit_tests {
         resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
         send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue,
+        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2307,6 +2311,14 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance bucket bucket-a failed for pool 2"));
         assert!(message.contains("errServerNotInitialized"));
+    }
+
+    #[test]
+    fn test_with_rebalance_entry_context_formats_stage_bucket_and_object() {
+        let err = with_rebalance_entry_context("migrate", "bucket-a", "obj.txt", Error::SlowDown);
+        let message = err.to_string();
+        assert!(message.contains("rebalance entry migrate failed for bucket-a/obj.txt"));
+        assert!(message.contains("Please reduce your request rate"));
     }
 
     #[tokio::test]
