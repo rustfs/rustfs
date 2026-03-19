@@ -131,6 +131,18 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable for server access key.
+pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
+
+/// Environment variable for server access key file.
+pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
+
+/// Environment variable for server secret key.
+pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
+
+/// Environment variable for server secret key file.
+pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
+
 /// Environment variable for server tls path.
 pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
 

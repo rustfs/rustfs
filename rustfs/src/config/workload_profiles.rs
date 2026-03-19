@@ -69,9 +69,10 @@ pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
 }
 
 /// Workload profile types that define buffer sizing strategies
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum WorkloadProfile {
     /// General purpose - default configuration with balanced performance and memory
+    #[default]
     GeneralPurpose,
     /// AI/ML training: optimized for large sequential reads with maximum throughput
     AiTraining,
