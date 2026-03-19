@@ -815,14 +815,18 @@ impl ECStore {
                 }
 
                 if let Err(err) = store.save_rebalance_stats(pool_index, RebalSaveOpt::Stats).await {
-                    error!("{} err: {:?}", msg, err);
+                    let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
+                    error!("{} err: {:?}", msg, wrapped);
+                    if quit {
+                        return Err(wrapped);
+                    }
                 } else {
                     info!(msg);
                 }
 
                 if quit {
                     info!("{}: exiting save_task", msg);
-                    return;
+                    return Ok(());
                 }
 
                 timer.reset();
@@ -1050,10 +1054,10 @@ fn resolve_rebalance_worker_result(
 
 fn resolve_rebalance_save_task_result(
     pool_idx: usize,
-    save_task_result: std::result::Result<(), tokio::task::JoinError>,
+    save_task_result: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     match save_task_result {
-        Ok(()) => Ok(()),
+        Ok(result) => result.map_err(|err| Error::other(format!("rebalance save_task failed for pool {pool_idx}: {err}"))),
         Err(err) => Err(Error::other(format!("rebalance save_task for pool {pool_idx} join error: {err}"))),
     }
 }
@@ -2133,7 +2137,14 @@ mod rebalance_unit_tests {
 
     #[test]
     fn test_resolve_rebalance_save_task_result_passthrough() {
-        assert!(resolve_rebalance_save_task_result(0, Ok(())).is_ok());
+        assert!(resolve_rebalance_save_task_result(0, Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_save_task_result_wraps_inner_error_context() {
+        let err = resolve_rebalance_save_task_result(1, Ok(Err(Error::SlowDown)))
+            .expect_err("inner save-task error should include pool context");
+        assert!(err.to_string().contains("rebalance save_task failed for pool 1"));
     }
 
     #[test]
