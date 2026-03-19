@@ -37,6 +37,7 @@ use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
+use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::action::{Action, S3Action};
 use s3s::Body;
 use s3s::S3Error;
@@ -50,18 +51,35 @@ use s3s::s3_error;
 use tower::Service;
 use tracing::error;
 use url::form_urlencoded;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplicationExtRoute {
     MetricsV1,
     MetricsV2,
     Check,
+    ResetStart,
+    ResetStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplicationExtRequest {
     bucket: String,
     route: ReplicationExtRoute,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationResetResponse {
+    #[serde(rename = "Targets")]
+    targets: Vec<ReplicationResetTarget>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationResetTarget {
+    #[serde(rename = "Arn")]
+    arn: String,
+    #[serde(rename = "ResetID")]
+    reset_id: String,
 }
 
 fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
@@ -91,7 +109,20 @@ fn extract_bucket_for_bucket_level_path(path: &str) -> Option<String> {
 fn parse_replication_extension_request(method: &Method, uri: &Uri) -> Option<ReplicationExtRequest> {
     let bucket = extract_bucket_for_bucket_level_path(uri.path())?;
 
+    if method == Method::PUT && query_value_exact(uri, "replication-reset").as_deref() == Some("") {
+        return Some(ReplicationExtRequest {
+            bucket,
+            route: ReplicationExtRoute::ResetStart,
+        });
+    }
+
     if method == Method::GET {
+        if query_value_exact(uri, "replication-reset-status").as_deref() == Some("") {
+            return Some(ReplicationExtRequest {
+                bucket,
+                route: ReplicationExtRoute::ResetStatus,
+            });
+        }
         if let Some(value) = query_value_exact(uri, "replication-metrics") {
             if value == "2" {
                 return Some(ReplicationExtRequest {
@@ -145,7 +176,7 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
             serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))?
         }
         ReplicationExtRoute::MetricsV2 => serde_json::to_vec(&bucket_stats).map_err(|e| s3_error!(InternalError, "{e}"))?,
-        ReplicationExtRoute::Check => {
+        ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             return Err(s3_error!(InternalError, "invalid route for metrics response"));
         }
     };
@@ -185,8 +216,37 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 | ReplicationExtRoute::Check => {
             Action::S3Action(S3Action::GetReplicationConfigurationAction)
         }
+        ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
+            Action::S3Action(S3Action::ResetBucketReplicationStateAction)
+        }
     };
     authorize_request(req, action).await
+}
+
+fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetTarget> {
+    let arn = query_value_exact(uri, "arn")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| s3_error!(InvalidRequest, "arn query parameter is required"))?;
+
+    if let Some(older_than) = query_value_exact(uri, "older-than")
+        && !older_than.is_empty()
+    {
+        parse_duration(&older_than).map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
+    }
+
+    let reset_id = query_value_exact(uri, "reset-id")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    Ok(ReplicationResetTarget { arn, reset_id })
+}
+
+fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3Result<S3Response<Body>> {
+    let data = serde_json::to_vec(&ReplicationResetResponse { targets }).map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
+    resp.headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
 }
 
 async fn handle_replication_extension_request(
@@ -211,6 +271,11 @@ async fn handle_replication_extension_request(
                 ));
             }
             Ok(S3Response::with_status(Body::from(String::new()), StatusCode::OK))
+        }
+        ReplicationExtRoute::ResetStatus => build_replication_reset_response(Vec::new()),
+        ReplicationExtRoute::ResetStart => {
+            let target = parse_reset_start_target(&req.uri)?;
+            build_replication_reset_response(vec![target])
         }
     }
 }
@@ -480,6 +545,8 @@ mod tests {
         let metrics: Uri = "/demo-bucket?replication-metrics".parse().expect("uri should parse");
         let metrics_v2: Uri = "/demo-bucket?replication-metrics=2".parse().expect("uri should parse");
         let check: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
+        let reset_status: Uri = "/demo-bucket?replication-reset-status".parse().expect("uri should parse");
+        let reset_start: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
 
         let m = parse_replication_extension_request(&Method::GET, &metrics).expect("metrics route should parse");
         assert_eq!(m.bucket, "demo-bucket");
@@ -492,6 +559,14 @@ mod tests {
         let c = parse_replication_extension_request(&Method::GET, &check).expect("check route should parse");
         assert_eq!(c.bucket, "demo-bucket");
         assert_eq!(c.route, ReplicationExtRoute::Check);
+
+        let rs = parse_replication_extension_request(&Method::GET, &reset_status).expect("reset status route should parse");
+        assert_eq!(rs.bucket, "demo-bucket");
+        assert_eq!(rs.route, ReplicationExtRoute::ResetStatus);
+
+        let r = parse_replication_extension_request(&Method::PUT, &reset_start).expect("reset start route should parse");
+        assert_eq!(r.bucket, "demo-bucket");
+        assert_eq!(r.route, ReplicationExtRoute::ResetStart);
     }
 
     #[test]
@@ -501,10 +576,14 @@ mod tests {
             .expect("uri should parse");
         let invalid_value: Uri = "/demo-bucket?replication-metrics=1".parse().expect("uri should parse");
         let wrong_method: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
+        let wrong_method_reset: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
+        let wrong_method_status: Uri = "/demo-bucket?replication-reset-status".parse().expect("uri should parse");
 
         assert!(parse_replication_extension_request(&Method::GET, &object_level).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &invalid_value).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
+        assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
+        assert!(parse_replication_extension_request(&Method::PUT, &wrong_method_status).is_none());
     }
 
     #[tokio::test]
