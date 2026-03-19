@@ -1053,7 +1053,8 @@ fn decommission_delete_marker_opts(
     }
 }
 
-async fn should_skip_lifecycle_for_decommission(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
     bucket: &str,
     version: &rustfs_filemeta::FileInfo,
@@ -1061,6 +1062,7 @@ async fn should_skip_lifecycle_for_decommission(
     lock_retention: Option<DefaultRetention>,
     replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     apply_actions: bool,
+    event_source: &LcEventSrc,
 ) -> bool {
     let Some(lifecycle_config) = lifecycle_config else {
         return false;
@@ -1073,7 +1075,7 @@ async fn should_skip_lifecycle_for_decommission(
     match event.action {
         IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
             if apply_actions && object_info.is_remote() {
-                let _ = apply_expiry_on_transitioned_object(store, &object_info, &event, &LcEventSrc::Decom).await;
+                let _ = apply_expiry_on_transitioned_object(store, &object_info, &event, event_source).await;
             }
             false
         }
@@ -1082,7 +1084,7 @@ async fn should_skip_lifecycle_for_decommission(
         | IlmAction::DeleteAllVersionsAction
         | IlmAction::DelMarkerDeleteAllVersionsAction => {
             if apply_actions {
-                let _ = apply_expiry_rule(&event, &LcEventSrc::Decom, &object_info).await;
+                let _ = apply_expiry_rule(&event, event_source, &object_info).await;
             }
             true
         }
@@ -1297,7 +1299,7 @@ impl ECStore {
         let mut expired: usize = 0;
 
         for version in fivs.versions.iter() {
-            if should_skip_lifecycle_for_decommission(
+            if should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
                 version,
@@ -1305,6 +1307,7 @@ impl ECStore {
                 lock_retention.clone(),
                 replication_config.clone(),
                 true,
+                &LcEventSrc::Decom,
             )
             .await
             {
@@ -2022,7 +2025,7 @@ impl ECStore {
                             if version.deleted {
                                 continue;
                             }
-                            if should_skip_lifecycle_for_decommission(
+                            if should_skip_lifecycle_for_data_movement(
                                 Arc::clone(&store),
                                 &bucket_name,
                                 version,
@@ -2030,6 +2033,7 @@ impl ECStore {
                                 lock_retention.clone(),
                                 replication_config.clone(),
                                 false,
+                                &LcEventSrc::Decom,
                             )
                             .await
                             {

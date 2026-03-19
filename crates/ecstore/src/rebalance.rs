@@ -97,6 +97,13 @@ impl RebalanceStats {
 
 pub type RStats = Vec<Arc<RebalanceStats>>;
 
+#[derive(Debug, Default)]
+struct RebalanceBucketConfigs {
+    lifecycle_config: Option<s3s::dto::BucketLifecycleConfiguration>,
+    lock_retention: Option<s3s::dto::DefaultRetention>,
+    replication_config: Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MigrationVersionResult {
     pub moved: bool,
@@ -1133,6 +1140,32 @@ fn with_rebalance_entry_context(stage: &str, bucket: &str, object_name: &str, er
     Error::other(format!("rebalance entry {stage} failed for {bucket}/{object_name}: {err}"))
 }
 
+fn resolve_rebalance_replication_config_result(
+    result: Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
+) -> Result<Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>> {
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(Error::ConfigNotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+async fn load_rebalance_bucket_configs(bucket: &str) -> Result<RebalanceBucketConfigs> {
+    if bucket == crate::disk::RUSTFS_META_BUCKET {
+        return Ok(RebalanceBucketConfigs::default());
+    }
+
+    let _ = crate::bucket::versioning_sys::BucketVersioningSys::get(bucket).await?;
+
+    Ok(RebalanceBucketConfigs {
+        lifecycle_config: crate::global::GLOBAL_LifecycleSys.get(bucket).await,
+        lock_retention: crate::bucket::object_lock::objectlock_sys::BucketObjectLockSys::get(bucket).await,
+        replication_config: resolve_rebalance_replication_config_result(
+            crate::bucket::metadata_sys::get_replication_config(bucket).await,
+        )?,
+    })
+}
+
 fn clone_first_arc<T>(values: &[Arc<T>], err_msg: &str) -> Result<Arc<T>> {
     values.first().cloned().ok_or_else(|| Error::other(err_msg))
 }
@@ -1327,6 +1360,7 @@ impl ECStore {
         pool_index: usize,
         entry: MetaCacheEntry,
         set: Arc<SetDisks>,
+        bucket_configs: Arc<RebalanceBucketConfigs>,
         // wk: Arc<Workers>,
     ) -> Result<()> {
         info!("rebalance_entry: start rebalance_entry");
@@ -1353,8 +1387,26 @@ impl ECStore {
         fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
 
         let mut rebalanced: usize = 0;
-        let expired: usize = 0;
+        let mut expired: usize = 0;
         for version in fivs.versions.iter() {
+            if crate::pools::should_skip_lifecycle_for_data_movement(
+                self.clone(),
+                &bucket,
+                version,
+                bucket_configs.lifecycle_config.as_ref(),
+                bucket_configs.lock_retention.clone(),
+                bucket_configs.replication_config.clone(),
+                true,
+                &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
+            )
+            .await
+            {
+                expired += 1;
+                rebalanced += 1;
+                info!("rebalance_entry {} Entry {} expired by lifecycle, skipping", &bucket, version.name);
+                continue;
+            }
+
             let remaining_versions = fivs.versions.len() - expired;
             if version.deleted && remaining_versions == 1 {
                 rebalanced += 1;
@@ -1444,6 +1496,7 @@ impl ECStore {
         // }
 
         let pool = clone_arc_by_index(self.pools.as_slice(), pool_index, "invalid rebalance pool index")?;
+        let bucket_configs = Arc::new(load_rebalance_bucket_configs(&bucket).await?);
 
         let mut jobs = Vec::new();
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
@@ -1458,6 +1511,7 @@ impl ECStore {
                 let callback_rx = rx.clone();
                 // let wk = wk.clone();
                 let set = set.clone();
+                let bucket_configs = bucket_configs.clone();
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
@@ -1465,6 +1519,7 @@ impl ECStore {
                     let callback_rx = callback_rx.clone();
                     // let wk = wk.clone();
                     let set = set.clone();
+                    let bucket_configs = bucket_configs.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
                             return;
@@ -1477,7 +1532,7 @@ impl ECStore {
                         // wk.take().await;
                         // tokio::spawn(async move {
                         info!("rebalance_entry: rebalance_entry spawn start2");
-                        if let Err(err) = this.rebalance_entry(bucket, pool_index, entry, set).await {
+                        if let Err(err) = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await {
                             error!("rebalance_entry: rebalance entry failed: {err}");
                             let mut first_err = entry_error.lock().await;
                             if first_err.is_none() {
@@ -1628,14 +1683,14 @@ mod rebalance_unit_tests {
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
+        load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
-        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-        send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, with_rebalance_entry_context,
+        resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_replication_config_result,
+        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache,
+        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1644,6 +1699,7 @@ mod rebalance_unit_tests {
     use rustfs_filemeta::FileInfo;
     use rustfs_filemeta::TRANSITION_COMPLETE;
     use rustfs_rio::Index;
+    use s3s::dto::ReplicationConfiguration;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2319,6 +2375,38 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance entry migrate failed for bucket-a/obj.txt"));
         assert!(message.contains("Please reduce your request rate"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_replication_config_result_passthrough() {
+        let result =
+            resolve_rebalance_replication_config_result(Ok((ReplicationConfiguration::default(), OffsetDateTime::UNIX_EPOCH)))
+                .expect("replication config should pass through");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_replication_config_result_returns_none_for_missing_config() {
+        let result = resolve_rebalance_replication_config_result(Err(Error::ConfigNotFound))
+            .expect("missing replication config should map to None");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_replication_config_result_preserves_other_errors() {
+        let err = resolve_rebalance_replication_config_result(Err(Error::SlowDown))
+            .expect_err("unexpected replication config errors should be preserved");
+        assert!(matches!(err, Error::SlowDown));
+    }
+
+    #[tokio::test]
+    async fn test_load_rebalance_bucket_configs_skips_meta_bucket_lookup() {
+        let configs = load_rebalance_bucket_configs(RUSTFS_META_BUCKET)
+            .await
+            .expect("meta bucket config loading should short-circuit");
+        assert!(configs.lifecycle_config.is_none());
+        assert!(configs.lock_retention.is_none());
+        assert!(configs.replication_config.is_none());
     }
 
     #[tokio::test]
