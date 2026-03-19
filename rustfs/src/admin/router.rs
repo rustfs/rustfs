@@ -14,9 +14,14 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
+use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
 };
+use crate::storage::access::{ReqInfo, authorize_request};
+use http::HeaderValue;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -24,8 +29,18 @@ use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
+use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::replication::BucketStats;
+use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
+use rustfs_ecstore::bucket::versioning::VersioningApi;
+use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::rpc::verify_rpc_signature;
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
+use rustfs_policy::policy::action::{Action, S3Action};
 use s3s::Body;
+use s3s::S3Error;
+use s3s::S3ErrorCode;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
@@ -34,6 +49,171 @@ use s3s::route::S3Route;
 use s3s::s3_error;
 use tower::Service;
 use tracing::error;
+use url::form_urlencoded;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationExtRoute {
+    MetricsV1,
+    MetricsV2,
+    Check,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicationExtRequest {
+    bucket: String,
+    route: ReplicationExtRoute,
+}
+
+fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    uri.query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+}
+
+fn extract_bucket_for_bucket_level_path(path: &str) -> Option<String> {
+    let bucket = path.strip_prefix('/')?;
+    if bucket.is_empty() || bucket.contains('/') {
+        return None;
+    }
+    Some(bucket.to_string())
+}
+
+fn parse_replication_extension_request(method: &Method, uri: &Uri) -> Option<ReplicationExtRequest> {
+    let bucket = extract_bucket_for_bucket_level_path(uri.path())?;
+
+    if method == Method::GET {
+        if let Some(value) = query_value_exact(uri, "replication-metrics") {
+            if value == "2" {
+                return Some(ReplicationExtRequest {
+                    bucket,
+                    route: ReplicationExtRoute::MetricsV2,
+                });
+            }
+            if value.is_empty() {
+                return Some(ReplicationExtRequest {
+                    bucket,
+                    route: ReplicationExtRoute::MetricsV1,
+                });
+            }
+        }
+        if query_value_exact(uri, "replication-check").as_deref() == Some("") {
+            return Some(ReplicationExtRequest {
+                bucket,
+                route: ReplicationExtRoute::Check,
+            });
+        }
+    }
+
+    None
+}
+
+async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+    };
+
+    store
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .map_err(ApiError::from)?;
+
+    match metadata_sys::get_replication_config(bucket).await {
+        Ok(_) => Ok(()),
+        Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
+        Err(err) => Err(ApiError::from(err).into()),
+    }
+}
+
+async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
+    let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+        Some(stats) => stats.get_latest_replication_stats(bucket).await,
+        None => BucketStats::default(),
+    };
+
+    let body = match route {
+        ReplicationExtRoute::MetricsV1 => {
+            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))?
+        }
+        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(&bucket_stats).map_err(|e| s3_error!(InternalError, "{e}"))?,
+        ReplicationExtRoute::Check => {
+            return Err(s3_error!(InternalError, "invalid route for metrics response"));
+        }
+    };
+
+    let mut resp = S3Response::with_status(Body::from(body), StatusCode::OK);
+    resp.headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
+}
+
+async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_req: &ReplicationExtRequest) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    };
+
+    let (cred, is_owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    req.extensions.insert(ReqInfo {
+        cred: Some(cred),
+        is_owner,
+        bucket: Some(ext_req.bucket.clone()),
+        object: None,
+        version_id: None,
+        region: get_global_region(),
+    });
+
+    license_check().map_err(|er| match er.kind() {
+        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        _ => {
+            error!("license check failed due to unexpected error: {er}");
+            s3_error!(InternalError, "License validation failed")
+        }
+    })?;
+
+    let action = match ext_req.route {
+        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 | ReplicationExtRoute::Check => {
+            Action::S3Action(S3Action::GetReplicationConfigurationAction)
+        }
+    };
+    authorize_request(req, action).await
+}
+
+async fn handle_replication_extension_request(
+    req: &mut S3Request<Body>,
+    ext_req: &ReplicationExtRequest,
+) -> S3Result<S3Response<Body>> {
+    authorize_replication_extension_request(req, ext_req).await?;
+    ensure_replication_bucket_ready(&ext_req.bucket).await?;
+
+    match ext_req.route {
+        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
+            build_replication_metrics_response(&ext_req.bucket, ext_req.route).await
+        }
+        ReplicationExtRoute::Check => {
+            let (versioning, _) = metadata_sys::get_versioning_config(&ext_req.bucket)
+                .await
+                .map_err(ApiError::from)?;
+            if !versioning.enabled() && !BucketVersioningSys::enabled(&ext_req.bucket).await {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "replication validation requires bucket versioning to be enabled"
+                ));
+            }
+            Ok(S3Response::with_status(Body::from(String::new()), StatusCode::OK))
+        }
+    }
+}
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -115,6 +295,10 @@ where
     T: Operation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, _: &mut Extensions) -> bool {
+        if parse_replication_extension_request(method, uri).is_some() {
+            return true;
+        }
+
         let path = uri.path();
 
         // Profiling endpoints
@@ -145,6 +329,13 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        if parse_replication_extension_request(&req.method, &req.uri).is_some() {
+            return match req.credentials {
+                Some(_) => Ok(()),
+                None => Err(s3_error!(AccessDenied, "Signature is required")),
+            };
+        }
+
         // Allow unauthenticated access to health check
         let path = req.uri.path();
 
@@ -211,7 +402,11 @@ where
         }
     }
 
-    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+    async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
+            return handle_replication_extension_request(&mut req, &ext_req).await;
+        }
+
         // Console requests should be handled by console router first (including OPTIONS)
         // Console has its own CORS layer configured
         if self.console_enabled && is_console_path(req.uri.path()) {
@@ -262,6 +457,10 @@ impl Operation for AdminOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderMap;
+    use http::Method;
+    use http::Uri;
+    use s3s::S3Request;
 
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
@@ -274,6 +473,60 @@ mod tests {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
         assert!(!is_admin_path("/bucket/object"));
+    }
+
+    #[test]
+    fn parse_replication_extension_request_matches_metrics_and_check() {
+        let metrics: Uri = "/demo-bucket?replication-metrics".parse().expect("uri should parse");
+        let metrics_v2: Uri = "/demo-bucket?replication-metrics=2".parse().expect("uri should parse");
+        let check: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
+
+        let m = parse_replication_extension_request(&Method::GET, &metrics).expect("metrics route should parse");
+        assert_eq!(m.bucket, "demo-bucket");
+        assert_eq!(m.route, ReplicationExtRoute::MetricsV1);
+
+        let v2 = parse_replication_extension_request(&Method::GET, &metrics_v2).expect("metrics v2 route should parse");
+        assert_eq!(v2.bucket, "demo-bucket");
+        assert_eq!(v2.route, ReplicationExtRoute::MetricsV2);
+
+        let c = parse_replication_extension_request(&Method::GET, &check).expect("check route should parse");
+        assert_eq!(c.bucket, "demo-bucket");
+        assert_eq!(c.route, ReplicationExtRoute::Check);
+    }
+
+    #[test]
+    fn parse_replication_extension_request_rejects_object_level_and_invalid_query_values() {
+        let object_level: Uri = "/demo-bucket/path/file?replication-metrics"
+            .parse()
+            .expect("uri should parse");
+        let invalid_value: Uri = "/demo-bucket?replication-metrics=1".parse().expect("uri should parse");
+        let wrong_method: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
+
+        assert!(parse_replication_extension_request(&Method::GET, &object_level).is_none());
+        assert!(parse_replication_extension_request(&Method::GET, &invalid_value).is_none());
+        assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_anonymous_replication_extension_request() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("anonymous extension request must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 }
 
