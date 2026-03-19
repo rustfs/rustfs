@@ -50,21 +50,23 @@ impl SqlQueryExecution {
     }
 
     async fn start(&self) -> QueryResult<Output> {
-        // begin optimize
+        // Time optimize phase
+        let _optimize_timer = self.query_state_machine.time_phase("optimize");
         self.query_state_machine.begin_optimize();
         let physical_plan = self.optimizer.optimize(&self.plan, &self.query_state_machine.session).await?;
         self.query_state_machine.end_optimize();
+        drop(_optimize_timer); // Automatically records duration  
 
-        // begin schedule
+        // Time schedule phase
+        let _schedule_timer = self.query_state_machine.time_phase("schedule");
         self.query_state_machine.begin_schedule();
         let stream = self
             .scheduler
             .schedule(physical_plan.clone(), self.query_state_machine.session.inner().task_ctx())
             .await?
             .stream();
-
-        debug!("Success build result stream.");
         self.query_state_machine.end_schedule();
+        drop(_schedule_timer);
 
         Ok(Output::StreamData(stream))
     }
