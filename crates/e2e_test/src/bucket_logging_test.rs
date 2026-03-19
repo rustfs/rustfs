@@ -199,6 +199,96 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_dummy_bucket_compatibility_endpoints_no_such_bucket() {
+        init_logging();
+        info!("Starting test: dummy-compat bucket APIs should return NoSuchBucket for missing bucket");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = env.create_s3_client();
+        let missing_bucket = "test-dummy-bucket-missing";
+
+        let get_logging = client.get_bucket_logging().bucket(missing_bucket).send().await;
+        assert!(get_logging.is_err(), "GetBucketLogging should fail for missing bucket");
+        let get_logging_err = get_logging.err().unwrap();
+        let get_logging_code = get_logging_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(get_logging_code, Some("NoSuchBucket")),
+            "Unexpected GetBucketLogging error code: {:?}, err: {:?}",
+            get_logging_code,
+            get_logging_err
+        );
+
+        let put_logging = client
+            .put_bucket_logging()
+            .bucket(missing_bucket)
+            .bucket_logging_status(BucketLoggingStatus::builder().build())
+            .send()
+            .await;
+        assert!(put_logging.is_err(), "PutBucketLogging should fail for missing bucket");
+        let put_logging_err = put_logging.err().unwrap();
+        let put_logging_code = put_logging_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(put_logging_code, Some("NoSuchBucket")),
+            "Unexpected PutBucketLogging error code: {:?}, err: {:?}",
+            put_logging_code,
+            put_logging_err
+        );
+
+        let get_accelerate = client
+            .get_bucket_accelerate_configuration()
+            .bucket(missing_bucket)
+            .send()
+            .await;
+        assert!(get_accelerate.is_err(), "GetBucketAccelerateConfiguration should fail for missing bucket");
+        let get_accelerate_err = get_accelerate.err().unwrap();
+        let get_accelerate_code = get_accelerate_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(get_accelerate_code, Some("NoSuchBucket")),
+            "Unexpected GetBucketAccelerateConfiguration error code: {:?}, err: {:?}",
+            get_accelerate_code,
+            get_accelerate_err
+        );
+
+        let get_request_payment = client.get_bucket_request_payment().bucket(missing_bucket).send().await;
+        assert!(get_request_payment.is_err(), "GetBucketRequestPayment should fail for missing bucket");
+        let get_request_payment_err = get_request_payment.err().unwrap();
+        let get_request_payment_code = get_request_payment_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(get_request_payment_code, Some("NoSuchBucket")),
+            "Unexpected GetBucketRequestPayment error code: {:?}, err: {:?}",
+            get_request_payment_code,
+            get_request_payment_err
+        );
+
+        let get_website = client.get_bucket_website().bucket(missing_bucket).send().await;
+        assert!(get_website.is_err(), "GetBucketWebsite should fail for missing bucket");
+        let get_website_err = get_website.err().unwrap();
+        let get_website_code = get_website_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(get_website_code, Some("NoSuchBucket")),
+            "Unexpected GetBucketWebsite error code: {:?}, err: {:?}",
+            get_website_code,
+            get_website_err
+        );
+
+        let delete_website = client.delete_bucket_website().bucket(missing_bucket).send().await;
+        assert!(delete_website.is_err(), "DeleteBucketWebsite should fail for missing bucket");
+        let delete_website_err = delete_website.err().unwrap();
+        let delete_website_code = delete_website_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(delete_website_code, Some("NoSuchBucket")),
+            "Unexpected DeleteBucketWebsite error code: {:?}, err: {:?}",
+            delete_website_code,
+            delete_website_err
+        );
+
+        env.stop_server();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_dummy_bucket_endpoints_http_contracts() {
         init_logging();
         info!("Starting test: dummy-compat bucket API HTTP contracts");

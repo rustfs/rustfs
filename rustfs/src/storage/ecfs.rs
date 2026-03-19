@@ -267,8 +267,17 @@ impl S3 for FS {
 
     async fn delete_bucket_website(
         &self,
-        _req: S3Request<DeleteBucketWebsiteInput>,
+        req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         // S3-compatible dummy behavior: return success even without website config state.
         Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
     }
