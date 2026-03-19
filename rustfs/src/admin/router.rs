@@ -39,6 +39,7 @@ use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_common::EventName;
 use s3s::Body;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -102,6 +103,20 @@ fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
     parse_query_pairs(uri)
         .into_iter()
         .find_map(|(k, v)| if k == key { Some(v) } else { None })
+}
+
+fn query_values_exact(uri: &Uri, key: &str) -> Vec<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .filter_map(|(k, v)| if k == key { Some(v) } else { None })
+        .collect()
+}
+
+fn is_valid_filter_rule_value(value: &str) -> bool {
+    if value.len() > 1024 || value.contains('\\') {
+        return false;
+    }
+    !value.split('/').any(|segment| segment == "." || segment == "..")
 }
 
 fn extract_bucket_for_bucket_level_path(path: &str) -> Option<String> {
@@ -184,6 +199,67 @@ fn parse_misc_extension_request(method: &Method, uri: &Uri) -> Option<MiscExtRou
     }
 
     None
+}
+
+fn validate_object_lambda_query(uri: &Uri) -> S3Result<()> {
+    let lambda_arns = query_values_exact(uri, "lambdaArn");
+    if lambda_arns.len() != 1 || lambda_arns[0].trim().is_empty() {
+        return Err(s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"));
+    }
+    Ok(())
+}
+
+fn validate_listen_notification_query(uri: &Uri) -> S3Result<()> {
+    let events = query_values_exact(uri, "events");
+    if events.is_empty() {
+        return Err(s3_error!(InvalidArgument, "events query parameter is required"));
+    }
+
+    for event in events {
+        EventName::parse(&event).map_err(|_| s3_error!(InvalidArgument, "invalid event in events query parameter"))?;
+    }
+
+    let prefixes = query_values_exact(uri, "prefix");
+    if prefixes.len() > 1 {
+        return Err(s3_error!(InvalidArgument, "prefix query parameter must not be repeated"));
+    }
+    if let Some(prefix) = prefixes.first()
+        && !is_valid_filter_rule_value(prefix)
+    {
+        return Err(s3_error!(InvalidArgument, "invalid prefix filter value"));
+    }
+
+    let suffixes = query_values_exact(uri, "suffix");
+    if suffixes.len() > 1 {
+        return Err(s3_error!(InvalidArgument, "suffix query parameter must not be repeated"));
+    }
+    if let Some(suffix) = suffixes.first()
+        && !is_valid_filter_rule_value(suffix)
+    {
+        return Err(s3_error!(InvalidArgument, "invalid suffix filter value"));
+    }
+
+    let pings = query_values_exact(uri, "ping");
+    if pings.len() > 1 {
+        return Err(s3_error!(InvalidArgument, "ping query parameter must not be repeated"));
+    }
+    if let Some(ping) = pings.first() {
+        let ping_interval = ping
+            .parse::<u64>()
+            .map_err(|_| s3_error!(InvalidArgument, "ping query parameter must be a positive integer"))?;
+        if ping_interval == 0 {
+            return Err(s3_error!(InvalidArgument, "ping query parameter must be greater than zero"));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_misc_extension_request(uri: &Uri, route: &MiscExtRoute) -> S3Result<()> {
+    match route {
+        MiscExtRoute::ObjectLambda { .. } => validate_object_lambda_query(uri),
+        MiscExtRoute::ListenNotification { .. } => validate_listen_notification_query(uri),
+    }
 }
 
 async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
@@ -358,6 +434,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
 
 async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscExtRoute) -> S3Result<S3Response<Body>> {
     authorize_misc_extension_request(req, route).await?;
+    validate_misc_extension_request(&req.uri, route)?;
 
     match route {
         MiscExtRoute::ObjectLambda { bucket, .. } => {
@@ -739,6 +816,73 @@ mod tests {
         assert!(parse_misc_extension_request(&Method::GET, &bucket_without_object).is_none());
         assert!(parse_misc_extension_request(&Method::PUT, &wrong_method_lambda).is_none());
         assert!(parse_misc_extension_request(&Method::GET, &object_level_listen).is_none());
+    }
+
+    #[test]
+    fn validate_listen_notification_query_accepts_valid_values() {
+        let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:*&prefix=logs/&suffix=.json&ping=3"
+            .parse()
+            .expect("uri should parse");
+
+        assert!(validate_listen_notification_query(&uri).is_ok());
+    }
+
+    #[test]
+    fn validate_listen_notification_query_rejects_invalid_event_or_duplicate_filters() {
+        let invalid_event: Uri = "/demo-bucket?events=invalid-event".parse().expect("uri should parse");
+        let duplicate_prefix: Uri = "/demo-bucket?events=s3:ObjectCreated:*&prefix=a&prefix=b"
+            .parse()
+            .expect("uri should parse");
+        let invalid_ping: Uri = "/demo-bucket?events=s3:ObjectCreated:*&ping=0"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(
+            validate_listen_notification_query(&invalid_event)
+                .expect_err("invalid event should fail")
+                .code(),
+            &S3ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            validate_listen_notification_query(&duplicate_prefix)
+                .expect_err("duplicate prefix should fail")
+                .code(),
+            &S3ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            validate_listen_notification_query(&invalid_ping)
+                .expect_err("invalid ping should fail")
+                .code(),
+            &S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn validate_object_lambda_query_rejects_missing_or_empty_arn() {
+        let missing: Uri = "/demo-bucket/object.txt".parse().expect("uri should parse");
+        let empty: Uri = "/demo-bucket/object.txt?lambdaArn=".parse().expect("uri should parse");
+        let duplicated: Uri = "/demo-bucket/object.txt?lambdaArn=a&lambdaArn=b"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(
+            validate_object_lambda_query(&missing)
+                .expect_err("missing lambdaArn should fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_object_lambda_query(&empty)
+                .expect_err("empty lambdaArn should fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_object_lambda_query(&duplicated)
+                .expect_err("duplicated lambdaArn should fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
     }
 
     #[tokio::test]
