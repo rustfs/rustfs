@@ -245,12 +245,17 @@ where
                     };
                 }
 
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: false,
-                    failed: true,
-                    error: Some(err),
-                };
+                last_error = Some(err);
+                if attempt + 1 >= max_attempts {
+                    return MigrationVersionResult {
+                        moved: false,
+                        ignored: false,
+                        failed: true,
+                        error: last_error,
+                    };
+                }
+
+                continue;
             }
         };
 
@@ -1819,6 +1824,114 @@ mod rebalance_unit_tests {
         assert!(result.error.is_none());
         assert_eq!(backend.get_calls(), 1);
         assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_reader_retries_before_success() {
+        let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None);
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let version = version_normal();
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(result.moved);
+        assert!(!result.failed);
+        assert!(result.error.is_none());
+        assert_eq!(backend.get_calls(), 2);
+        assert_eq!(backend.delete_calls(), 0);
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
+    }
+
+    struct AlwaysFailGetBackend {
+        get_calls: AtomicUsize,
+    }
+
+    impl AlwaysFailGetBackend {
+        fn new() -> Self {
+            Self {
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationBackend for AlwaysFailGetBackend {
+        async fn get_object_reader_for_migration(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: http::HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::SlowDown)
+        }
+
+        async fn delete_object_for_migration(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+            Ok(ObjectInfo::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_reader_fails_after_retries() {
+        let backend = AlwaysFailGetBackend::new();
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let version = version_normal();
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.moved);
+        assert!(result.failed);
+        assert!(matches!(result.error, Some(Error::SlowDown)));
+        assert_eq!(backend.get_calls(), 3);
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
