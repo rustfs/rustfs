@@ -1224,6 +1224,10 @@ fn is_rebalance_actively_running(meta: &RebalanceMeta) -> bool {
     meta.cancel.is_some() && is_rebalance_in_progress(meta)
 }
 
+fn should_ignore_rebalance_data_usage_cache(bucket: &str) -> bool {
+    bucket == crate::disk::RUSTFS_META_BUCKET
+}
+
 fn apply_rebalance_save_option(meta: &mut RebalanceMeta, pool_idx: usize, opt: RebalSaveOpt, now: OffsetDateTime) {
     match opt {
         RebalSaveOpt::Stats => {
@@ -1332,9 +1336,17 @@ impl ECStore {
                 let store = self.clone();
                 async move { store.rebalance_object(src_pool_idx, bucket, rd).await }
             };
-            let result =
-                migrate_entry_version(set.as_ref(), bucket.clone(), pool_index, version, version_id, 3, false, &mut transfer)
-                    .await;
+            let result = migrate_entry_version(
+                set.as_ref(),
+                bucket.clone(),
+                pool_index,
+                version,
+                version_id,
+                3,
+                should_ignore_rebalance_data_usage_cache(bucket.as_str()),
+                &mut transfer,
+            )
+            .await;
 
             if result.ignored {
                 info!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
@@ -1589,9 +1601,9 @@ mod rebalance_unit_tests {
         mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
-        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue,
+        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1946,6 +1958,16 @@ mod rebalance_unit_tests {
         assert!(result.error.is_none());
         assert_eq!(backend.get_calls(), 1);
         assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[test]
+    fn test_should_ignore_rebalance_data_usage_cache_true_for_meta_bucket() {
+        assert!(should_ignore_rebalance_data_usage_cache(RUSTFS_META_BUCKET));
+    }
+
+    #[test]
+    fn test_should_ignore_rebalance_data_usage_cache_false_for_regular_bucket() {
+        assert!(!should_ignore_rebalance_data_usage_cache("bucket-a"));
     }
 
     #[test]
