@@ -540,61 +540,37 @@ fn get_workload_profile_info() -> String {
 
 /// Dependency information
 fn format_deps_info() -> String {
-    // Internal RustFS crates with their descriptions
-    let internal_crates = [
-        ("rustfs-appauth", "Application authentication and authorization"),
-        ("rustfs-audit", "Audit target management system"),
-        ("rustfs-checksums", "Client checksums"),
-        ("rustfs-common", "Shared utilities and data structures"),
-        ("rustfs-config", "Configuration management"),
-        ("rustfs-credentials", "Credential management system"),
-        ("rustfs-crypto", "Cryptography and security features"),
-        ("rustfs-ecstore", "Erasure coding storage implementation"),
-        ("rustfs-filemeta", "File metadata management"),
-        ("rustfs-heal", "Erasure set and object healing"),
-        ("rustfs-iam", "Identity and Access Management"),
-        ("rustfs-keystone", "OpenStack Keystone integration"),
-        ("rustfs-kms", "Key Management Service"),
-        ("rustfs-lock", "Distributed locking implementation"),
-        ("rustfs-madmin", "Management dashboard and admin API"),
-        ("rustfs-mcp", "MCP server for S3 operations"),
-        ("rustfs-metrics", "Metrics collection and reporting"),
-        ("rustfs-notify", "Notification system for events"),
-        ("rustfs-obs", "Observability utilities"),
-        ("rustfs-policy", "Policy management"),
-        ("rustfs-protocols", "Protocol implementations (FTPS, SFTP, etc.)"),
-        ("rustfs-protos", "Protocol buffer definitions"),
-        ("rustfs-rio", "Rust I/O utilities and abstractions"),
-        ("rustfs-s3-common", "Common utilities for S3 compatibility"),
-        ("rustfs-s3select-api", "S3 Select API interface"),
-        ("rustfs-s3select-query", "S3 Select query engine"),
-        ("rustfs-scanner", "Scanner for data integrity checks"),
-        ("rustfs-signer", "Client signer"),
-        ("rustfs-targets", "Target-specific configurations"),
-        ("rustfs-trusted-proxies", "Trusted proxies management"),
-        ("rustfs-utils", "Utility functions and helpers"),
-        ("rustfs-workers", "Worker thread pools and task scheduling"),
-        ("rustfs-zip", "ZIP file handling"),
+    let mut output = String::from("=== Build Features ===\n");
+
+    // Check which features are enabled at compile time
+    let features = [
+        ("metrics", cfg!(feature = "metrics"), "Metrics collection and reporting"),
+        ("ftps", cfg!(feature = "ftps"), "FTPS protocol support"),
+        ("swift", cfg!(feature = "swift"), "Swift storage backend"),
+        ("webdav", cfg!(feature = "webdav"), "WebDAV protocol support"),
+        ("license", cfg!(feature = "license"), "License validation"),
+        ("full", cfg!(feature = "full"), "All features enabled"),
     ];
 
-    let mut output = String::from("=== Internal Crates Information ===\n");
-    output.push_str(&format!("Total Internal Crates: {}\n\n", internal_crates.len()));
+    let enabled_count = features.iter().filter(|(_, enabled, _)| *enabled).count();
+    output.push_str(&format!("Enabled Features: {}/{}\n\n", enabled_count, features.len()));
 
-    for (name, description) in internal_crates {
-        output.push_str(&format!("  {} - {}\n", name, description));
+    output.push_str("Feature Status:\n");
+    for (name, enabled, description) in features {
+        let status = if enabled { "[x]" } else { "[ ]" };
+        output.push_str(&format!("  {} {} - {}\n", status, name, description));
     }
 
-    output.push_str("\n--- External Dependencies (Key) ---\n");
-    output.push_str("  axum - Web framework\n");
-    output.push_str("  tokio - Async runtime\n");
-    output.push_str("  hyper - HTTP library\n");
-    output.push_str("  serde - Serialization framework\n");
-    output.push_str("  clap - Command line parser\n");
-    output.push_str("  sysinfo - System information\n");
-    output.push_str("  shadow-rs - Build-time information\n");
-    output.push_str("  datafusion - SQL query engine\n");
-    output.push_str("  tonic - gRPC framework\n");
-    output.push_str("  tower - Service abstraction\n");
+    // Show default features info
+    output.push_str("\n--- Default Features ---\n");
+    output.push_str("  metrics (enabled by default)\n");
+
+    // Show feature dependencies
+    output.push_str("\n--- Feature Dependencies ---\n");
+    output.push_str("  full = metrics + ftps + swift + webdav\n");
+    output.push_str("  ftps -> rustfs-protocols/ftps\n");
+    output.push_str("  swift -> rustfs-protocols/swift\n");
+    output.push_str("  webdav -> rustfs-protocols/webdav\n");
 
     output
 }
