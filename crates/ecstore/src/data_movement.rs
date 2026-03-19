@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
-use crate::store_api::PutObjReader;
+use crate::error::{Error, Result};
+use crate::store::ECStore;
+use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectOptions, PutObjReader};
 use bytes::Bytes;
+use rustfs_common::defer;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
 use std::io::Cursor;
 use std::pin::Pin;
@@ -23,7 +25,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tracing::error;
 
 pub struct IndexedDataMovementReader<R> {
     inner: R,
@@ -88,6 +91,147 @@ pub fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
 
 pub fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
     flag.store(false, Ordering::Relaxed);
+}
+
+pub(crate) async fn migrate_object(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    op_label: &str,
+) -> Result<()> {
+    let object_info = rd.object_info.clone();
+
+    if object_info.is_multipart() {
+        let res = match store
+            .new_multipart_upload(
+                &bucket,
+                &object_info.name,
+                &ObjectOptions {
+                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+                    user_defined: object_info.user_defined.clone(),
+                    src_pool_idx: pool_idx,
+                    data_movement: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                error!("{op_label}: new_multipart_upload err {:?}", &err);
+                return Err(err);
+            }
+        };
+
+        let abort_multipart_flag = new_multipart_abort_flag();
+        let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
+        defer!(|| async {
+            if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
+                return;
+            }
+            if let Err(err) = store
+                .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
+                .await
+            {
+                error!("{op_label}: abort_multipart_upload err {:?}", &err);
+            }
+        });
+
+        let mut parts = vec![CompletePart::default(); object_info.parts.len()];
+        let mut reader = rd.stream;
+
+        for (i, part) in object_info.parts.iter().enumerate() {
+            let mut chunk = vec![0u8; part.size];
+            reader.read_exact(&mut chunk).await?;
+
+            let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
+            let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
+            let index = decode_part_index(part.index.as_ref());
+            let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
+
+            let pi = match store
+                .put_object_part(
+                    &bucket,
+                    &object_info.name,
+                    &res.upload_id,
+                    part.number,
+                    &mut data,
+                    &ObjectOptions {
+                        preserve_etag: Some(part.etag.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(pi) => pi,
+                Err(err) => {
+                    error!("{op_label}: put_object_part {i} err {:?}", &err);
+                    return Err(err);
+                }
+            };
+
+            parts[i] = CompletePart {
+                part_num: pi.part_num,
+                etag: pi.etag,
+                ..Default::default()
+            };
+        }
+
+        if let Err(err) = store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                &object_info.name,
+                &res.upload_id,
+                parts,
+                &ObjectOptions {
+                    data_movement: true,
+                    mod_time: object_info.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            error!("{op_label}: complete_multipart_upload err {:?}", &err);
+            return Err(err);
+        }
+
+        mark_multipart_upload_completed(&abort_multipart_flag);
+        return Ok(());
+    }
+
+    let actual_size = object_info.get_actual_size()?;
+    let index = object_info
+        .parts
+        .first()
+        .and_then(|part| decode_part_index(part.index.as_ref()));
+    let reader = IndexedDataMovementReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
+    let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
+    let mut data = PutObjReader::new(hrd);
+
+    if let Err(err) = store
+        .put_object(
+            &bucket,
+            &object_info.name,
+            &mut data,
+            &ObjectOptions {
+                src_pool_idx: pool_idx,
+                data_movement: true,
+                version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+                mod_time: object_info.mod_time,
+                user_defined: object_info.user_defined.clone(),
+                preserve_etag: object_info.etag.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        error!("{op_label}: put_object err {:?}", &err);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

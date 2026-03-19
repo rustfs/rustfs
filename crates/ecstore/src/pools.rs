@@ -39,8 +39,8 @@ use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    BucketOperations, BucketOptions, CompletePart, GetObjectReader, HealOperations, MakeBucketOptions, MultipartOperations,
-    ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, StorageAPI,
+    BucketOperations, BucketOptions, GetObjectReader, HealOperations, MakeBucketOptions, ObjectIO, ObjectOperations,
+    ObjectOptions, StorageAPI,
 };
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -52,7 +52,6 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
@@ -68,7 +67,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use time::{Duration, OffsetDateTime};
-use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -2063,146 +2061,12 @@ impl ECStore {
     #[tracing::instrument(skip(self, rd))]
     async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
-        let object_info = rd.object_info.clone();
-
-        if object_info.is_multipart() {
-            let res = match self
-                .new_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &ObjectOptions {
-                        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                        user_defined: object_info.user_defined.clone(),
-                        src_pool_idx: pool_idx,
-                        data_movement: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    error!("decommission_object: new_multipart_upload err {:?}", &err);
-                    return Err(err);
-                }
-            };
-
-            let abort_multipart_flag = data_movement::new_multipart_abort_flag();
-            let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
-            defer!(|| async {
-                if !data_movement::should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
-                    return;
-                }
-                if let Err(err) = self
-                    .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
-                    .await
-                {
-                    error!("decommission_object: abort_multipart_upload err {:?}", &err);
-                }
-            });
-
-            let mut parts = vec![CompletePart::default(); object_info.parts.len()];
-
-            let mut reader = rd.stream;
-
-            for (i, part) in object_info.parts.iter().enumerate() {
-                let mut chunk = vec![0u8; part.size];
-
-                reader.read_exact(&mut chunk).await?;
-
-                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
-                let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
-                let index = data_movement::decode_part_index(part.index.as_ref());
-                let mut data = data_movement::put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
-
-                let pi = match self
-                    .put_object_part(
-                        &bucket,
-                        &object_info.name,
-                        &res.upload_id,
-                        part.number,
-                        &mut data,
-                        &ObjectOptions {
-                            preserve_etag: Some(part.etag.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(pi) => pi,
-                    Err(err) => {
-                        error!("decommission_object: put_object_part {} err {:?}", i, &err);
-                        return Err(err);
-                    }
-                };
-
-                warn!("decommission_object: put_object_part {} done {} {}", i, &bucket, &object_info.name);
-
-                parts[i] = CompletePart {
-                    part_num: pi.part_num,
-                    etag: pi.etag,
-
-                    ..Default::default()
-                };
-            }
-
-            if let Err(err) = self
-                .clone()
-                .complete_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &res.upload_id,
-                    parts,
-                    &ObjectOptions {
-                        data_movement: true,
-                        mod_time: object_info.mod_time,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                error!("decommission_object: complete_multipart_upload err {:?}", &err);
-                return Err(err);
-            }
-
-            data_movement::mark_multipart_upload_completed(&abort_multipart_flag);
-            warn!("decommission_object: complete_multipart_upload done {} {}", &bucket, &object_info.name);
-            return Ok(());
+        let object_name = rd.object_info.name.clone();
+        let result = data_movement::migrate_object(self, pool_idx, bucket.clone(), rd, "decommission_object").await;
+        if result.is_ok() {
+            warn!("decommission_object: migrated {} {}", &bucket, &object_name);
         }
-
-        let actual_size = object_info.get_actual_size()?;
-        let index = object_info
-            .parts
-            .first()
-            .and_then(|part| data_movement::decode_part_index(part.index.as_ref()));
-        let reader = data_movement::IndexedDataMovementReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
-        let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
-        let mut data = PutObjReader::new(hrd);
-
-        if let Err(err) = self
-            .put_object(
-                &bucket,
-                &object_info.name,
-                &mut data,
-                &ObjectOptions {
-                    src_pool_idx: pool_idx,
-                    data_movement: true,
-                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                    mod_time: object_info.mod_time,
-                    user_defined: object_info.user_defined.clone(),
-                    preserve_etag: object_info.etag.clone(),
-
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            error!("decommission_object: put_object err {:?}", &err);
-            return Err(err);
-        }
-
-        warn!("decommission_object: put_object done {} {}", &bucket, &object_info.name);
-        Ok(())
+        result
     }
 }
 

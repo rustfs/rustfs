@@ -27,14 +27,9 @@ use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
 use crate::store::ECStore;
-use crate::store_api::{
-    CompletePart, GetObjectReader, HTTPRangeSpec, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
-    PutObjReader,
-};
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
 use http::HeaderMap;
-use rustfs_common::defer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -42,7 +37,6 @@ use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::io::{AsyncReadExt, BufReader};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -1392,145 +1386,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rd))]
     async fn rebalance_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
-        let object_info = rd.object_info.clone();
-
-        let actual_size = object_info.get_actual_size()?;
-
-        if object_info.is_multipart() {
-            let res = match self
-                .new_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &ObjectOptions {
-                        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                        user_defined: object_info.user_defined.clone(),
-                        src_pool_idx: pool_idx,
-                        data_movement: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    error!("rebalance_object: new_multipart_upload err {:?}", &err);
-                    return Err(err);
-                }
-            };
-
-            let abort_multipart_flag = data_movement::new_multipart_abort_flag();
-            let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
-            defer!(|| async {
-                if !data_movement::should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
-                    return;
-                }
-                if let Err(err) = self
-                    .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
-                    .await
-                {
-                    error!("rebalance_object: abort_multipart_upload err {:?}", &err);
-                }
-            });
-
-            let mut parts = vec![CompletePart::default(); object_info.parts.len()];
-
-            let mut reader = rd.stream;
-
-            for (i, part) in object_info.parts.iter().enumerate() {
-                // Read one part from the reader and upload it each time
-
-                let mut chunk = vec![0u8; part.size];
-
-                reader.read_exact(&mut chunk).await?;
-
-                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
-                let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
-                let index = data_movement::decode_part_index(part.index.as_ref());
-                let mut data = data_movement::put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
-
-                let pi = match self
-                    .put_object_part(
-                        &bucket,
-                        &object_info.name,
-                        &res.upload_id,
-                        part.number,
-                        &mut data,
-                        &ObjectOptions {
-                            preserve_etag: Some(part.etag.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(pi) => pi,
-                    Err(err) => {
-                        error!("rebalance_object: put_object_part err {:?}", &err);
-                        return Err(err);
-                    }
-                };
-
-                parts[i] = CompletePart {
-                    part_num: pi.part_num,
-                    etag: pi.etag,
-                    ..Default::default()
-                };
-            }
-
-            if let Err(err) = self
-                .clone()
-                .complete_multipart_upload(
-                    &bucket,
-                    &object_info.name,
-                    &res.upload_id,
-                    parts,
-                    &ObjectOptions {
-                        data_movement: true,
-                        mod_time: object_info.mod_time,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                error!("rebalance_object: complete_multipart_upload err {:?}", &err);
-                return Err(err);
-            }
-
-            data_movement::mark_multipart_upload_completed(&abort_multipart_flag);
-            return Ok(());
-        }
-
-        let reader = BufReader::new(rd.stream);
-        let index = object_info
-            .parts
-            .first()
-            .and_then(|part| data_movement::decode_part_index(part.index.as_ref()));
-        let reader = data_movement::IndexedDataMovementReader::new(WarpReader::new(reader), index);
-        let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
-        let mut data = PutObjReader::new(hrd);
-
-        if let Err(err) = self
-            .put_object(
-                &bucket,
-                &object_info.name,
-                &mut data,
-                &ObjectOptions {
-                    src_pool_idx: pool_idx,
-                    data_movement: true,
-                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                    mod_time: object_info.mod_time,
-                    user_defined: object_info.user_defined.clone(),
-                    preserve_etag: object_info.etag.clone(),
-
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            error!("rebalance_object: put_object err {:?}", &err);
-            return Err(err);
-        }
-
-        Ok(())
+        data_movement::migrate_object(self, pool_idx, bucket, rd, "rebalance_object").await
     }
 
     #[tracing::instrument(skip(self, rx))]
