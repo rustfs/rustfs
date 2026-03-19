@@ -87,3 +87,7 @@ mod group_delete_test;
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
+
+// Multipart control API auth regression tests
+#[cfg(test)]
+mod multipart_auth_test;
