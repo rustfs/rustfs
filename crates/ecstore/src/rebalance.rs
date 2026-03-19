@@ -31,17 +31,16 @@ use crate::store_api::{
     CompletePart, GetObjectReader, HTTPRangeSpec, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
     PutObjReader,
 };
-use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_common::defer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, Index, WarpReader};
+use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::time::{Duration, Instant};
@@ -1122,28 +1121,6 @@ fn ensure_valid_rebalance_pool_index(pool_count: usize, idx: usize) -> Result<()
     Ok(())
 }
 
-type IndexedRebalanceReader<R> = data_movement::IndexedDataMovementReader<R>;
-
-fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
-    data_movement::decode_part_index(index)
-}
-
-fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
-    data_movement::put_obj_reader_from_chunk(chunk, size, actual_size, index)
-}
-
-fn new_multipart_abort_flag() -> Arc<AtomicBool> {
-    data_movement::new_multipart_abort_flag()
-}
-
-fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
-    data_movement::should_abort_multipart_upload(flag)
-}
-
-fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
-    data_movement::mark_multipart_upload_completed(flag);
-}
-
 enum RebalanceTerminalEvent {
     Completed { msg: String },
     Stopped { msg: String },
@@ -1441,10 +1418,10 @@ impl ECStore {
                 }
             };
 
-            let abort_multipart_flag = new_multipart_abort_flag();
+            let abort_multipart_flag = data_movement::new_multipart_abort_flag();
             let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
             defer!(|| async {
-                if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
+                if !data_movement::should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
                     return;
                 }
                 if let Err(err) = self
@@ -1468,8 +1445,8 @@ impl ECStore {
 
                 let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
                 let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
-                let index = decode_part_index(part.index.as_ref());
-                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
+                let index = data_movement::decode_part_index(part.index.as_ref());
+                let mut data = data_movement::put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
 
                 let pi = match self
                     .put_object_part(
@@ -1518,7 +1495,7 @@ impl ECStore {
                 return Err(err);
             }
 
-            mark_multipart_upload_completed(&abort_multipart_flag);
+            data_movement::mark_multipart_upload_completed(&abort_multipart_flag);
             return Ok(());
         }
 
@@ -1526,8 +1503,8 @@ impl ECStore {
         let index = object_info
             .parts
             .first()
-            .and_then(|part| decode_part_index(part.index.as_ref()));
-        let reader = IndexedRebalanceReader::new(WarpReader::new(reader), index);
+            .and_then(|part| data_movement::decode_part_index(part.index.as_ref()));
+        let reader = data_movement::IndexedDataMovementReader::new(WarpReader::new(reader), index);
         let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
         let mut data = PutObjReader::new(hrd);
 
@@ -1752,15 +1729,15 @@ mod rebalance_unit_tests {
         GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
         apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        decode_part_index, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
-        is_rebalance_stopped_terminal_event, mark_multipart_upload_completed, mark_rebalance_bucket_done, migrate_entry_version,
-        new_multipart_abort_flag, next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result,
-        resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_participants,
-        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_abort_multipart_upload, should_pool_participate,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
+        mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_participants, resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result,
+        resolve_rebalance_terminal_error, resolve_rebalance_worker_result, send_rebalance_done_signal, should_pool_participate,
         should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
         take_bucket_from_rebalance_queue,
     };
+    use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::error::{Error, Result};
@@ -2503,26 +2480,26 @@ mod rebalance_unit_tests {
 
     #[test]
     fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
-        let flag = new_multipart_abort_flag();
-        assert!(should_abort_multipart_upload(&flag));
+        let flag = data_movement::new_multipart_abort_flag();
+        assert!(data_movement::should_abort_multipart_upload(&flag));
     }
 
     #[test]
     fn test_mark_multipart_upload_completed_disables_abort_cleanup() {
-        let flag = new_multipart_abort_flag();
-        mark_multipart_upload_completed(&flag);
-        assert!(!should_abort_multipart_upload(&flag));
+        let flag = data_movement::new_multipart_abort_flag();
+        data_movement::mark_multipart_upload_completed(&flag);
+        assert!(!data_movement::should_abort_multipart_upload(&flag));
     }
 
     #[test]
     fn test_decode_part_index_returns_none_when_absent() {
-        assert!(decode_part_index(None).is_none());
+        assert!(data_movement::decode_part_index(None).is_none());
     }
 
     #[test]
     fn test_decode_part_index_returns_none_for_invalid_payload() {
         let invalid = bytes::Bytes::from_static(b"not-a-valid-index");
-        assert!(decode_part_index(Some(&invalid)).is_none());
+        assert!(data_movement::decode_part_index(Some(&invalid)).is_none());
     }
 
     #[test]
@@ -2534,7 +2511,7 @@ mod rebalance_unit_tests {
             .expect("second index entry should advance totals");
 
         let encoded = index.into_vec();
-        let decoded = decode_part_index(Some(&encoded)).expect("valid index payload should decode");
+        let decoded = data_movement::decode_part_index(Some(&encoded)).expect("valid index payload should decode");
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);

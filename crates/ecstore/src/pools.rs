@@ -44,7 +44,6 @@ use crate::store_api::{
 };
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::HeaderMap;
 #[cfg(test)]
@@ -53,7 +52,7 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, Index, WarpReader};
+use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use rustfs_workers::workers::Workers;
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
@@ -66,7 +65,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -277,18 +276,6 @@ fn resolve_decommission_spawn_failure_result(spawn_err: Error, rollback_err: Opt
     } else {
         spawn_err
     }
-}
-
-fn new_multipart_abort_flag() -> Arc<AtomicBool> {
-    data_movement::new_multipart_abort_flag()
-}
-
-fn should_abort_multipart_upload(flag: &Arc<AtomicBool>) -> bool {
-    data_movement::should_abort_multipart_upload(flag)
-}
-
-fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
-    data_movement::mark_multipart_upload_completed(flag);
 }
 
 fn decommission_item_size<T>(size: T) -> usize
@@ -1103,16 +1090,6 @@ async fn should_skip_lifecycle_for_decommission(
         }
         _ => false,
     }
-}
-
-type IndexedDecommissionReader<R> = data_movement::IndexedDataMovementReader<R>;
-
-fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
-    data_movement::decode_part_index(index)
-}
-
-fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
-    data_movement::put_obj_reader_from_chunk(chunk, size, actual_size, index)
 }
 
 impl ECStore {
@@ -2110,10 +2087,10 @@ impl ECStore {
                 }
             };
 
-            let abort_multipart_flag = new_multipart_abort_flag();
+            let abort_multipart_flag = data_movement::new_multipart_abort_flag();
             let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
             defer!(|| async {
-                if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
+                if !data_movement::should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
                     return;
                 }
                 if let Err(err) = self
@@ -2135,8 +2112,8 @@ impl ECStore {
 
                 let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
                 let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
-                let index = decode_part_index(part.index.as_ref());
-                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
+                let index = data_movement::decode_part_index(part.index.as_ref());
+                let mut data = data_movement::put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
 
                 let pi = match self
                     .put_object_part(
@@ -2188,7 +2165,7 @@ impl ECStore {
                 return Err(err);
             }
 
-            mark_multipart_upload_completed(&abort_multipart_flag);
+            data_movement::mark_multipart_upload_completed(&abort_multipart_flag);
             warn!("decommission_object: complete_multipart_upload done {} {}", &bucket, &object_info.name);
             return Ok(());
         }
@@ -2197,8 +2174,8 @@ impl ECStore {
         let index = object_info
             .parts
             .first()
-            .and_then(|part| decode_part_index(part.index.as_ref()));
-        let reader = IndexedDecommissionReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
+            .and_then(|part| data_movement::decode_part_index(part.index.as_ref()));
+        let reader = data_movement::IndexedDataMovementReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
         let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
         let mut data = PutObjReader::new(hrd);
 
@@ -2682,19 +2659,19 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
-        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item, decode_part_index,
+        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
         ensure_decommission_cancel_allowed, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, mark_decommission_bucket_done, mark_multipart_upload_completed,
-        new_multipart_abort_flag, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result, should_abort_multipart_upload,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        is_decommission_cancel_terminal, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
+    use crate::data_movement;
     use crate::error::Error;
     use rustfs_rio::Index;
     use time::{Duration, OffsetDateTime};
@@ -3097,15 +3074,15 @@ mod pools_tests {
 
     #[test]
     fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
-        let flag = new_multipart_abort_flag();
-        assert!(should_abort_multipart_upload(&flag));
+        let flag = data_movement::new_multipart_abort_flag();
+        assert!(data_movement::should_abort_multipart_upload(&flag));
     }
 
     #[test]
     fn test_mark_multipart_upload_completed_disables_abort_cleanup() {
-        let flag = new_multipart_abort_flag();
-        mark_multipart_upload_completed(&flag);
-        assert!(!should_abort_multipart_upload(&flag));
+        let flag = data_movement::new_multipart_abort_flag();
+        data_movement::mark_multipart_upload_completed(&flag);
+        assert!(!data_movement::should_abort_multipart_upload(&flag));
     }
 
     #[test]
@@ -3117,7 +3094,7 @@ mod pools_tests {
             .expect("second index entry should advance totals");
 
         let encoded = index.into_vec();
-        let decoded = decode_part_index(Some(&encoded)).expect("valid index payload should decode");
+        let decoded = data_movement::decode_part_index(Some(&encoded)).expect("valid index payload should decode");
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);
