@@ -1140,6 +1140,10 @@ fn with_rebalance_entry_context(stage: &str, bucket: &str, object_name: &str, er
     Error::other(format!("rebalance entry {stage} failed for {bucket}/{object_name}: {err}"))
 }
 
+fn should_count_rebalance_version_complete(result: &MigrationVersionResult) -> bool {
+    result.ignored || (result.moved && !result.failed)
+}
+
 fn resolve_rebalance_replication_config_result(
     result: Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
 ) -> Result<Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>> {
@@ -1432,6 +1436,9 @@ impl ECStore {
             .await;
 
             if result.ignored {
+                if should_count_rebalance_version_complete(&result) {
+                    rebalanced += 1;
+                }
                 info!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
                 continue;
             }
@@ -1453,7 +1460,9 @@ impl ECStore {
                 bucket.as_str(),
                 version.name.as_str(),
             )?;
-            rebalanced += 1;
+            if should_count_rebalance_version_complete(&result) {
+                rebalanced += 1;
+            }
         }
 
         if rebalanced == fivs.versions.len() {
@@ -1679,18 +1688,19 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        GetObjectReader, HTTPRangeSpec, MigrationBackend, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceInfo,
-        RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
-        apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
-        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
-        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions, RebalSaveOpt,
+        RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option,
+        apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
+        clone_rebalance_pool_stats, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        is_rebalance_stopped_terminal_event, load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version,
+        next_rebal_bucket_from_stat, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_participants, resolve_rebalance_replication_config_result,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_ignore_rebalance_data_usage_cache,
-        should_pool_participate, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
-        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, with_rebalance_entry_context,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_count_rebalance_version_complete,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+        with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2375,6 +2385,39 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance entry migrate failed for bucket-a/obj.txt"));
         assert!(message.contains("Please reduce your request rate"));
+    }
+
+    #[test]
+    fn test_should_count_rebalance_version_complete_for_ignored_result() {
+        let result = MigrationVersionResult {
+            ignored: true,
+            ..Default::default()
+        };
+        assert!(should_count_rebalance_version_complete(&result));
+    }
+
+    #[test]
+    fn test_should_count_rebalance_version_complete_for_moved_result() {
+        let result = MigrationVersionResult {
+            moved: true,
+            ..Default::default()
+        };
+        assert!(should_count_rebalance_version_complete(&result));
+    }
+
+    #[test]
+    fn test_should_count_rebalance_version_complete_rejects_failed_result() {
+        let result = MigrationVersionResult {
+            moved: true,
+            failed: true,
+            ..Default::default()
+        };
+        assert!(!should_count_rebalance_version_complete(&result));
+    }
+
+    #[test]
+    fn test_should_count_rebalance_version_complete_rejects_incomplete_result() {
+        assert!(!should_count_rebalance_version_complete(&MigrationVersionResult::default()));
     }
 
     #[test]
