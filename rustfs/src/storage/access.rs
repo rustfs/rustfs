@@ -359,6 +359,10 @@ fn put_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
 }
 
+fn post_object_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
 #[async_trait::async_trait]
 impl S3Access for FS {
     // /// Checks whether the current request has accesses to the resources.
@@ -1158,6 +1162,16 @@ impl S3Access for FS {
         Ok(())
     }
 
+    /// Checks whether the PostObject request has accesses to the resources.
+    async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, post_object_authorize_action()).await
+    }
+
     /// Checks whether the PutBucketAccelerateConfiguration request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
@@ -1481,6 +1495,11 @@ mod tests {
     #[test]
     fn put_bucket_policy_uses_put_bucket_policy_action() {
         assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
+    }
+
+    #[test]
+    fn post_object_uses_put_object_action() {
+        assert_eq!(post_object_authorize_action(), Action::S3Action(S3Action::PutObjectAction));
     }
 
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
