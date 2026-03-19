@@ -262,7 +262,7 @@ fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOp
     }
 }
 
-fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
+fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
     input
         .server_side_encryption
         .as_ref()
@@ -273,6 +273,10 @@ fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
         || headers.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)
+}
+
+fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
+    is_sse_kms_requested(input, headers)
 }
 
 async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
@@ -368,18 +372,17 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
         }
+        if let Some(ref storage_class) = req.input.storage_class
+            && !is_valid_storage_class(storage_class.as_str())
+        {
+            return Err(s3_error!(InvalidStorageClass));
+        }
         if is_put_object_extract_requested(&req.headers) {
             return self.execute_put_object_extract(req).await;
         }
 
         let input = req.input;
 
-        // Save SSE-C parameters before moving input
-        if let Some(ref storage_class) = input.storage_class
-            && !is_valid_storage_class(storage_class.as_str())
-        {
-            return Err(s3_error!(InvalidStorageClass));
-        }
         let PutObjectInput {
             body,
             bucket,
@@ -3431,6 +3434,9 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
+        if is_sse_kms_requested(&req.input, &req.headers) {
+            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+        }
         let input = req.input;
 
         let PutObjectInput {
@@ -3459,6 +3465,12 @@ impl DefaultObjectUsecase {
                 }
             }
         };
+        if size == -1 {
+            return Err(s3_error!(UnexpectedContent));
+        }
+        validate_object_key(&key, "PUT")?;
+        self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
+            .await?;
 
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -3815,6 +3827,44 @@ mod tests {
 
         let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_extract_sse_kms() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("archive.tar".to_string())
+            .server_side_encryption(Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)))
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_extract_rejects_invalid_storage_class() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("archive.tar".to_string())
+            .storage_class(Some(StorageClass::from_static("INVALID")))
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
     #[tokio::test]
