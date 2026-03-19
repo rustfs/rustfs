@@ -163,6 +163,16 @@ where
 {
     let max_attempts = max_attempts.max(1);
 
+    if ignore_data_usage_cache && bucket == crate::disk::RUSTFS_META_BUCKET && version.name.contains(DATA_USAGE_CACHE_NAME) {
+        return MigrationVersionResult {
+            moved: false,
+            ignored: true,
+            cleanup_ignored: false,
+            failed: false,
+            error: None,
+        };
+    }
+
     if version.is_remote() {
         return MigrationVersionResult {
             moved: false,
@@ -242,19 +252,6 @@ where
                         moved: false,
                         ignored: true,
                         cleanup_ignored: true,
-                        failed: false,
-                        error: None,
-                    };
-                }
-
-                if ignore_data_usage_cache
-                    && bucket == crate::disk::RUSTFS_META_BUCKET
-                    && version.name.contains(DATA_USAGE_CACHE_NAME)
-                {
-                    return MigrationVersionResult {
-                        moved: false,
-                        ignored: true,
-                        cleanup_ignored: false,
                         failed: false,
                         error: None,
                     };
@@ -2196,13 +2193,23 @@ mod rebalance_unit_tests {
 
     #[tokio::test]
     async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
-        let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None);
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
         let version = {
             let mut version = version_normal();
             version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
             version
         };
-        let mut transfer = |_, _, _| async move { Ok(()) };
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
 
         let result = migrate_entry_version(
             &backend,
@@ -2221,6 +2228,49 @@ mod rebalance_unit_tests {
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.get_calls(), 0);
+        assert_eq!(backend.delete_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled() {
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
+        let version = {
+            let mut version = version_normal();
+            version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
+            version
+        };
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let result = migrate_entry_version(
+            &backend,
+            RUSTFS_META_BUCKET.to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            2,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(result.moved);
+        assert!(!result.failed);
+        assert!(result.error.is_none());
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
         assert_eq!(backend.get_calls(), 1);
         assert_eq!(backend.delete_calls(), 0);
     }
