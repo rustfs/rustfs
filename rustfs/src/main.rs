@@ -50,6 +50,7 @@ use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     bucket::metadata_sys::init_bucket_metadata_sys,
+    bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
     endpoints::EndpointServerPools,
@@ -69,7 +70,9 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
-use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustfs_utils::{
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
+};
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -98,6 +101,10 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    if let Err(err) = bootstrap_external_prefix_compat() {
+        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
+    }
+
     let runtime = server::tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
@@ -108,6 +115,41 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+fn bootstrap_external_prefix_compat() -> Result<()> {
+    let env_compat_report = apply_external_env_compat();
+    if env_compat_report.conflict_count() > 0 {
+        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
+        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
+        eprintln!(
+            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
+            env_compat_report.conflict_count(),
+            env_compat_report.conflict_keys.join(", ")
+        );
+    }
+
+    if env_compat_report.mapped_count() == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
+        env_compat_report.mapped_count(),
+        format_external_prefix_mappings(&env_compat_report)
+    );
+
+    Ok(())
+}
+
+fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
+    report
+        .mapped_pairs
+        .iter()
+        .map(|(source_key, rustfs_key)| format!("{source_key}->{rustfs_key}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let config = config::Config::parse()?;
@@ -298,6 +340,7 @@ async fn run(config: config::Config) -> Result<()> {
         })?;
 
     ecconfig::init();
+    ecconfig::try_migrate_server_config(store.clone()).await;
 
     // // Initialize global configuration system
     let mut retry_count = 0;
@@ -398,10 +441,13 @@ async fn run(config: config::Config) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
+    try_migrate_bucket_metadata(store.clone()).await;
+
     if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
+    try_migrate_iam_config(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
     // 3. Initialize IAM System (Blocking load)
@@ -633,4 +679,30 @@ async fn handle_shutdown(
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
     info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_external_prefix_mappings_lists_mapped_pairs() {
+        let report = ExternalEnvCompatReport {
+            mapped_pairs: vec![
+                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
+                (
+                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                ),
+            ],
+            conflict_keys: Vec::new(),
+        };
+
+        let formatted = format_external_prefix_mappings(&report);
+
+        assert_eq!(
+            formatted,
+            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
+    }
 }

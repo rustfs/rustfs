@@ -150,7 +150,7 @@ impl ECStore {
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 
-        let decommission_cancelers = vec![None; pools.len()];
+        let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
             id: deployment_id.unwrap(),
             disk_map,
@@ -269,6 +269,7 @@ impl ECStore {
         init_background_expiry(self.clone()).await;
 
         TransitionState::init(self.clone()).await;
+        crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
         if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);

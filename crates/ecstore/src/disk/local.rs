@@ -697,7 +697,6 @@ impl LocalDisk {
                 match self.read_metadata_with_dmtime(meta_path).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
-                        warn!("read_raw: error: {:?}", err);
                         if err == Error::FileNotFound
                             && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
                             && let Err(e) = access(volume_dir.as_ref()).await
@@ -1493,6 +1492,12 @@ impl DiskAPI for LocalDisk {
         let erasure = &fi.erasure;
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
             let part_path = self.get_object_path(
                 volume,
                 path_join_buf(&[
@@ -1506,7 +1511,7 @@ impl DiskAPI for LocalDisk {
                 .bitrot_verify(
                     &part_path,
                     erasure.shard_file_size(part.size as i64) as usize,
-                    checksum_info.algorithm,
+                    checksum_algo,
                     &checksum_info.hash,
                     erasure.shard_size(),
                 )
@@ -2058,7 +2063,6 @@ impl DiskAPI for LocalDisk {
         let search_version_id = fi.version_id.or(Some(Uuid::nil()));
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        // Note: For non-versioned buckets, fi.version_id is None, but in xl.meta it's stored as Some(Uuid::nil())
         let has_old_data_dir = {
             xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
                 // shard_count == 0 means no other version shares this data_dir

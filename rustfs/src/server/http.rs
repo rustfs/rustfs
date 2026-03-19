@@ -21,7 +21,7 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
-    layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -621,6 +621,7 @@ fn process_connection(
                 None
             })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.

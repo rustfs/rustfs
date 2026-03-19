@@ -15,7 +15,6 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use clap::Parser;
     use serial_test::serial;
 
     #[tokio::test]

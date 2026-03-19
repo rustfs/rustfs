@@ -66,6 +66,7 @@ http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
+reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
@@ -73,6 +74,7 @@ regex = { workspace = true }
 path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
+serde_bytes.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
@@ -120,6 +122,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
 tracing-subscriber = { workspace = true }
+serial_test = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

@@ -88,6 +88,7 @@ use rustfs_kms::{
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
 use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
+use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
@@ -1397,8 +1398,8 @@ impl TestSseDekProvider {
     /// Uses RUSTFS_SSE_S3_MASTER_KEY (base64 32-byte) if set; otherwise a built-in default.
     /// Allows PUT/GET to work without KMS (backward compatible).
     pub fn new_for_local_sse() -> Self {
-        let master_key = match std::env::var("RUSTFS_SSE_S3_MASTER_KEY") {
-            Ok(v) if !v.trim().is_empty() => match BASE64_STANDARD.decode(v.trim()) {
+        let master_key = match get_env_opt_str("RUSTFS_SSE_S3_MASTER_KEY") {
+            Some(v) if !v.trim().is_empty() => match BASE64_STANDARD.decode(v.trim()) {
                 Ok(decoded) if decoded.len() == 32 => {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&decoded[..32]);

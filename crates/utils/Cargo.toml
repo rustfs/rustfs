@@ -26,6 +26,7 @@ categories = ["web-programming", "development-tools", "cryptography"]
 
 [dependencies]
 base64-simd = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
@@ -69,6 +70,7 @@ zstd = { workspace = true, optional = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+temp-env = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
@@ -87,7 +89,7 @@ notify = ["dep:hyper", "dep:s3s", "dep:hashbrown", "dep:thiserror", "dep:serde",
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex"]
 crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
-hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
+hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake2", "dep:blake3", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
 os = ["dep:rustix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
 sys = ["dep:sysinfo"]  # system information features

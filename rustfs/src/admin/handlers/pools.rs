@@ -47,7 +47,10 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
     }
 
     if rebalance_running {
-        return Err(s3_error!(InvalidRequest, "RebalanceAlreadyRunning"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            "Decommission cannot be started, rebalance is already in progress".to_string(),
+        ));
     }
 
     Ok(())
@@ -245,7 +248,7 @@ impl Operation for StartDecommission {
 
         validate_start_decommission_guards(
             store.is_decommission_running().await,
-            store.is_rebalance_conflicting_with_decommission().await,
+            store.is_rebalance_started().await,
         )?;
 
         let query = {

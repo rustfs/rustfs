@@ -361,10 +361,6 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::IAMActionNotAllowed);
         }
 
-        if opts.expiration.is_none() {
-            return Err(IamError::InvalidExpiration);
-        }
-
         // TODO: check allow_site_replicator_account
 
         let policy_buf = if let Some(policy) = opts.session_policy {
@@ -619,6 +615,7 @@ impl<T: Store> IamSys<T> {
         }
 
         let updated_at = self.store.add_user(access_key, args).await?;
+        self.load_user(access_key, UserType::Reg).await?;
 
         self.notify_for_user(access_key, false).await;
 

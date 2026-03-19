@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
@@ -22,7 +23,6 @@ use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use rmp_serde::Serializer as rmpSerializer;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::{
     BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
@@ -30,11 +30,40 @@ use s3s::dto::{
     VersioningConfiguration,
 };
 use serde::Serializer;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
+
+fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
+    let len = rmp::decode::read_str_len(rd)? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(String::from_utf8(buf)?)
+}
+
+fn read_msgp_time_value<R: Read>(rd: &mut R) -> Result<OffsetDateTime> {
+    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    match marker {
+        rmp::Marker::Null => Ok(OffsetDateTime::UNIX_EPOCH),
+        rmp::Marker::Ext8 => read_msgp_ext8_time(rd),
+        _ => Err(Error::other(format!("expected time ext or nil, got marker: {marker:?}"))),
+    }
+}
+
+fn read_msgp_bin<R: Read>(rd: &mut R) -> Result<Vec<u8>> {
+    let len = rmp::decode::read_bin_len(rd)? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_bin_field<W: Write>(wr: &mut W, key: &str, val: &[u8]) -> Result<()> {
+    rmp::encode::write_str(wr, key)?;
+    rmp::encode::write_bin(wr, val)?;
+    Ok(())
+}
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
@@ -54,8 +83,7 @@ pub const BUCKET_CORS_CONFIG: &str = "cors.xml";
 pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "PascalCase", default)]
+#[derive(Debug, Clone)]
 pub struct BucketMetadata {
     pub name: String,
     pub created: OffsetDateTime,
@@ -90,36 +118,21 @@ pub struct BucketMetadata {
     pub public_access_block_config_updated_at: OffsetDateTime,
     pub bucket_acl_config_updated_at: OffsetDateTime,
 
-    #[serde(skip)]
     pub new_field_updated_at: OffsetDateTime,
 
-    #[serde(skip)]
     pub policy_config: Option<BucketPolicy>,
-    #[serde(skip)]
     pub notification_config: Option<NotificationConfiguration>,
-    #[serde(skip)]
     pub lifecycle_config: Option<BucketLifecycleConfiguration>,
-    #[serde(skip)]
     pub object_lock_config: Option<ObjectLockConfiguration>,
-    #[serde(skip)]
     pub versioning_config: Option<VersioningConfiguration>,
-    #[serde(skip)]
     pub sse_config: Option<ServerSideEncryptionConfiguration>,
-    #[serde(skip)]
     pub tagging_config: Option<Tagging>,
-    #[serde(skip)]
     pub quota_config: Option<BucketQuota>,
-    #[serde(skip)]
     pub replication_config: Option<ReplicationConfiguration>,
-    #[serde(skip)]
     pub bucket_target_config: Option<BucketTargets>,
-    #[serde(skip)]
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
-    #[serde(skip)]
     pub cors_config: Option<CORSConfiguration>,
-    #[serde(skip)]
     pub public_access_block_config: Option<PublicAccessBlockConfiguration>,
-    #[serde(skip)]
     pub bucket_acl_config: Option<String>,
 }
 
@@ -198,17 +211,137 @@ impl BucketMetadata {
         self.lock_enabled || (self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
     }
 
+    /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
+    pub fn decode_from<R: Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+
+            let key_len = rmp::decode::read_str_len(rd)?;
+            let mut key_buf = vec![0u8; key_len as usize];
+            rd.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+
+            match key.as_str() {
+                "Name" => self.name = read_msgp_str(rd)?,
+                "Created" => self.created = read_msgp_time_value(rd)?,
+                "LockEnabled" => self.lock_enabled = rmp::decode::read_bool(rd)?,
+                "PolicyConfigJSON" => self.policy_config_json = read_msgp_bin(rd)?,
+                "NotificationConfigXML" => self.notification_config_xml = read_msgp_bin(rd)?,
+                "LifecycleConfigXML" => self.lifecycle_config_xml = read_msgp_bin(rd)?,
+                "ObjectLockConfigXML" => self.object_lock_config_xml = read_msgp_bin(rd)?,
+                "VersioningConfigXML" => self.versioning_config_xml = read_msgp_bin(rd)?,
+                "EncryptionConfigXML" => self.encryption_config_xml = read_msgp_bin(rd)?,
+                "TaggingConfigXML" => self.tagging_config_xml = read_msgp_bin(rd)?,
+                "QuotaConfigJSON" => self.quota_config_json = read_msgp_bin(rd)?,
+                "ReplicationConfigXML" => self.replication_config_xml = read_msgp_bin(rd)?,
+                "BucketTargetsConfigJSON" => self.bucket_targets_config_json = read_msgp_bin(rd)?,
+                "BucketTargetsConfigMetaJSON" => self.bucket_targets_config_meta_json = read_msgp_bin(rd)?,
+                "PolicyConfigUpdatedAt" => self.policy_config_updated_at = read_msgp_time_value(rd)?,
+                "ObjectLockConfigUpdatedAt" => self.object_lock_config_updated_at = read_msgp_time_value(rd)?,
+                "EncryptionConfigUpdatedAt" => self.encryption_config_updated_at = read_msgp_time_value(rd)?,
+                "TaggingConfigUpdatedAt" => self.tagging_config_updated_at = read_msgp_time_value(rd)?,
+                "QuotaConfigUpdatedAt" => self.quota_config_updated_at = read_msgp_time_value(rd)?,
+                "ReplicationConfigUpdatedAt" => self.replication_config_updated_at = read_msgp_time_value(rd)?,
+                "VersioningConfigUpdatedAt" => self.versioning_config_updated_at = read_msgp_time_value(rd)?,
+                "LifecycleConfigUpdatedAt" => self.lifecycle_config_updated_at = read_msgp_time_value(rd)?,
+                "NotificationConfigUpdatedAt" => self.notification_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketTargetsConfigUpdatedAt" => self.bucket_targets_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketTargetsConfigMetaUpdatedAt" => self.bucket_targets_config_meta_updated_at = read_msgp_time_value(rd)?,
+                "CorsConfigXML" => self.cors_config_xml = read_msgp_bin(rd)?,
+                "PublicAccessBlockConfigXML" => self.public_access_block_config_xml = read_msgp_bin(rd)?,
+                "BucketAclConfigJSON" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
+                "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
+                "PublicAccessBlockConfigUpdatedAt" => self.public_access_block_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
+                other => {
+                    tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
+                    skip_msgp_value(rd)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
+    pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
+        // Map size: MinIO fields (25) + RustFS extensions (6)
+        let map_len: u32 = 31;
+        rmp::encode::write_map_len(wr, map_len)?;
+
+        // MinIO field order (same as Go struct)
+        rmp::encode::write_str(wr, "Name")?;
+        rmp::encode::write_str(wr, &self.name)?;
+
+        rmp::encode::write_str(wr, "Created")?;
+        write_msgp_time(wr, self.created)?;
+
+        rmp::encode::write_str(wr, "LockEnabled")?;
+        rmp::encode::write_bool(wr, self.lock_enabled)?;
+
+        write_bin_field(wr, "PolicyConfigJSON", &self.policy_config_json)?;
+        write_bin_field(wr, "NotificationConfigXML", &self.notification_config_xml)?;
+        write_bin_field(wr, "LifecycleConfigXML", &self.lifecycle_config_xml)?;
+        write_bin_field(wr, "ObjectLockConfigXML", &self.object_lock_config_xml)?;
+        write_bin_field(wr, "VersioningConfigXML", &self.versioning_config_xml)?;
+        write_bin_field(wr, "EncryptionConfigXML", &self.encryption_config_xml)?;
+        write_bin_field(wr, "TaggingConfigXML", &self.tagging_config_xml)?;
+        write_bin_field(wr, "QuotaConfigJSON", &self.quota_config_json)?;
+        write_bin_field(wr, "ReplicationConfigXML", &self.replication_config_xml)?;
+        write_bin_field(wr, "BucketTargetsConfigJSON", &self.bucket_targets_config_json)?;
+        write_bin_field(wr, "BucketTargetsConfigMetaJSON", &self.bucket_targets_config_meta_json)?;
+
+        rmp::encode::write_str(wr, "PolicyConfigUpdatedAt")?;
+        write_msgp_time(wr, self.policy_config_updated_at)?;
+        rmp::encode::write_str(wr, "ObjectLockConfigUpdatedAt")?;
+        write_msgp_time(wr, self.object_lock_config_updated_at)?;
+        rmp::encode::write_str(wr, "EncryptionConfigUpdatedAt")?;
+        write_msgp_time(wr, self.encryption_config_updated_at)?;
+        rmp::encode::write_str(wr, "TaggingConfigUpdatedAt")?;
+        write_msgp_time(wr, self.tagging_config_updated_at)?;
+        rmp::encode::write_str(wr, "QuotaConfigUpdatedAt")?;
+        write_msgp_time(wr, self.quota_config_updated_at)?;
+        rmp::encode::write_str(wr, "ReplicationConfigUpdatedAt")?;
+        write_msgp_time(wr, self.replication_config_updated_at)?;
+        rmp::encode::write_str(wr, "VersioningConfigUpdatedAt")?;
+        write_msgp_time(wr, self.versioning_config_updated_at)?;
+        rmp::encode::write_str(wr, "LifecycleConfigUpdatedAt")?;
+        write_msgp_time(wr, self.lifecycle_config_updated_at)?;
+        rmp::encode::write_str(wr, "NotificationConfigUpdatedAt")?;
+        write_msgp_time(wr, self.notification_config_updated_at)?;
+        rmp::encode::write_str(wr, "BucketTargetsConfigUpdatedAt")?;
+        write_msgp_time(wr, self.bucket_targets_config_updated_at)?;
+        rmp::encode::write_str(wr, "BucketTargetsConfigMetaUpdatedAt")?;
+        write_msgp_time(wr, self.bucket_targets_config_meta_updated_at)?;
+
+        // RustFS extensions
+        write_bin_field(wr, "CorsConfigXML", &self.cors_config_xml)?;
+        write_bin_field(wr, "PublicAccessBlockConfigXML", &self.public_access_block_config_xml)?;
+        write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
+        rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
+        write_msgp_time(wr, self.cors_config_updated_at)?;
+        rmp::encode::write_str(wr, "PublicAccessBlockConfigUpdatedAt")?;
+        write_msgp_time(wr, self.public_access_block_config_updated_at)?;
+        rmp::encode::write_str(wr, "BucketAclConfigUpdatedAt")?;
+        write_msgp_time(wr, self.bucket_acl_config_updated_at)?;
+
+        Ok(())
+    }
+
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-
-        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
-
+        self.encode_to(&mut buf)?;
         Ok(buf)
     }
 
     pub fn unmarshal(buf: &[u8]) -> Result<Self> {
-        let t: BucketMetadata = rmp_serde::from_slice(buf)?;
-        Ok(t)
+        let mut bm = Self::default();
+        let mut cur = std::io::Cursor::new(buf);
+        bm.decode_from(&mut cur)?;
+        Ok(bm)
     }
 
     pub fn check_header(buf: &[u8]) -> Result<()> {
@@ -382,50 +515,80 @@ impl BucketMetadata {
     }
 
     fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
-        self.parse_policy_config()?;
-        if !self.notification_config_xml.is_empty() {
-            self.notification_config = Some(deserialize::<NotificationConfiguration>(&self.notification_config_xml)?);
+        if let Err(e) = self.parse_policy_config() {
+            tracing::warn!(bucket = %self.name, config = "policy", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.lifecycle_config_xml.is_empty() {
-            self.lifecycle_config = Some(deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml)?);
+        if !self.notification_config_xml.is_empty()
+            && let Err(e) = deserialize::<NotificationConfiguration>(&self.notification_config_xml)
+                .map(|c| self.notification_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "notification", error = %e, "parse_all_configs: failed to parse");
         }
-
-        if !self.object_lock_config_xml.is_empty() {
-            self.object_lock_config = Some(deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml)?);
+        if !self.lifecycle_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "lifecycle", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.versioning_config_xml.is_empty() {
-            self.versioning_config = Some(deserialize::<VersioningConfiguration>(&self.versioning_config_xml)?);
+        if !self.object_lock_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "object_lock", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.encryption_config_xml.is_empty() {
-            self.sse_config = Some(deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml)?);
+        if !self.versioning_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<VersioningConfiguration>(&self.versioning_config_xml).map(|c| self.versioning_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "versioning", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.tagging_config_xml.is_empty() {
-            self.tagging_config = Some(deserialize::<Tagging>(&self.tagging_config_xml)?);
+        if !self.encryption_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml).map(|c| self.sse_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "encryption", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.quota_config_json.is_empty() {
-            self.quota_config = Some(serde_json::from_slice(&self.quota_config_json)?);
+        if !self.tagging_config_xml.is_empty()
+            && let Err(e) = deserialize::<Tagging>(&self.tagging_config_xml).map(|c| self.tagging_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "tagging", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.replication_config_xml.is_empty() {
-            self.replication_config = Some(deserialize::<ReplicationConfiguration>(&self.replication_config_xml)?);
+        if !self.quota_config_json.is_empty()
+            && let Err(e) = serde_json::from_slice(&self.quota_config_json).map(|c| self.quota_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "quota", error = %e, "parse_all_configs: failed to parse");
         }
-        //let temp = self.bucket_targets_config_json.clone();
+        if !self.replication_config_xml.is_empty()
+            && let Err(e) =
+                deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "replication", error = %e, "parse_all_configs: failed to parse");
+        }
         if !self.bucket_targets_config_json.is_empty() {
-            let bucket_targets: BucketTargets = serde_json::from_slice(&self.bucket_targets_config_json)?;
-            self.bucket_target_config = Some(bucket_targets);
+            if let Err(e) = serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json)
+                .map(|t| self.bucket_target_config = Some(t))
+            {
+                tracing::warn!(bucket = %self.name, config = "bucket_targets", error = %e, "parse_all_configs: failed to parse");
+                self.bucket_target_config = Some(BucketTargets::default());
+            }
         } else {
-            self.bucket_target_config = Some(BucketTargets::default())
+            self.bucket_target_config = Some(BucketTargets::default());
         }
-        if !self.cors_config_xml.is_empty() {
-            self.cors_config = Some(deserialize::<CORSConfiguration>(&self.cors_config_xml)?);
+        if !self.cors_config_xml.is_empty()
+            && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "cors", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.public_access_block_config_xml.is_empty() {
-            self.public_access_block_config =
-                Some(deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)?);
+        if !self.public_access_block_config_xml.is_empty()
+            && let Err(e) = deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)
+                .map(|c| self.public_access_block_config = Some(c))
+        {
+            tracing::warn!(bucket = %self.name, config = "public_access_block", error = %e, "parse_all_configs: failed to parse");
         }
-        if !self.bucket_acl_config_json.is_empty() {
-            let acl = String::from_utf8(self.bucket_acl_config_json.clone())
-                .map_err(|e| Error::other(format!("invalid UTF-8 in bucket ACL: {}", e)))?;
-            self.bucket_acl_config = Some(acl);
+        if !self.bucket_acl_config_json.is_empty()
+            && let Err(e) = String::from_utf8(self.bucket_acl_config_json.clone()).map(|acl| self.bucket_acl_config = Some(acl))
+        {
+            tracing::warn!(bucket = %self.name, config = "bucket_acl", error = %e, "parse_all_configs: failed to parse");
         }
 
         Ok(())
@@ -478,7 +641,6 @@ async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketM
 
     Ok(bm)
 }
-
 fn _write_time<S>(t: &OffsetDateTime, s: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,

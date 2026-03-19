@@ -23,29 +23,10 @@ use rustfs_ecstore::{
 };
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
-use std::{fmt::Debug, sync::LazyLock};
+use std::fmt::Debug;
 use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
-
-const DEFAULT_OWNER_ID: &str = "rustfsadmin";
-const DEFAULT_OWNER_DISPLAY_NAME: &str = "RustFS Tester";
-
-pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
-    display_name: Some(DEFAULT_OWNER_DISPLAY_NAME.to_owned()),
-    id: Some(DEFAULT_OWNER_ID.to_owned()),
-});
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StoredOwner {
-    pub(crate) id: String,
-}
-
-pub(crate) fn default_owner() -> StoredOwner {
-    StoredOwner {
-        id: DEFAULT_OWNER_ID.to_string(),
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct FS {

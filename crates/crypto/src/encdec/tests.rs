@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{decrypt_data, encrypt_data};
+use crate::{decrypt_data, decrypt_stream_io, encrypt_data, encrypt_stream_io};
 
 const PASSWORD: &[u8] = "test_password".as_bytes();
 const LONG_PASSWORD: &[u8] = "very_long_password_with_many_characters_for_testing_purposes_123456789".as_bytes();
@@ -316,4 +316,68 @@ fn test_concurrent_encryption_safety() -> Result<(), crate::Error> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_stream_io_roundtrip() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data = br#"{"Version":1,"policy":"readonly"}"#;
+    let encrypted = encrypt_stream_io(password, data)?;
+    let decrypted = decrypt_stream_io(password, &encrypted)?;
+    assert_eq!(data, decrypted.as_slice());
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_large_data_roundtrip() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data = vec![0xAB; 32 * 1024]; // > SIO_BUF_SIZE to test fragmentation
+    let encrypted = encrypt_stream_io(password, &data)?;
+    let decrypted = decrypt_stream_io(password, &encrypted)?;
+    assert_eq!(data, decrypted);
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_wrong_password_fails() {
+    let password = b"access:secret";
+    let data = br#"{"Version":1}"#;
+    let encrypted = encrypt_stream_io(password, data).expect("encrypt should succeed");
+    let result = decrypt_stream_io(b"wrong:password", &encrypted);
+    assert!(result.is_err(), "decrypt with wrong password should fail");
+}
+
+#[test]
+fn test_stream_io_empty_data() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data: &[u8] = &[];
+    let encrypted = encrypt_stream_io(password, data)?;
+    let decrypted = decrypt_stream_io(password, &encrypted)?;
+    assert!(decrypted.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_header_format() -> Result<(), crate::Error> {
+    let password = b"access:secret";
+    let data = b"test";
+    let encrypted = encrypt_stream_io(password, data)?;
+    // stream_io header: salt(32) + alg_id(1) + nonce_prefix(8) = 41 bytes
+    const STREAM_IO_HEADER_LEN: usize = 41;
+    assert!(encrypted.len() >= STREAM_IO_HEADER_LEN, "encrypted should have at least 41-byte header");
+    assert!(
+        encrypted[32] == 0x00 || encrypted[32] == 0x01 || encrypted[32] == 0x02,
+        "alg_id should be 0x00, 0x01, or 0x02"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stream_io_truncated_data_fails() {
+    let password = b"access:secret";
+    let data = b"test";
+    let encrypted = encrypt_stream_io(password, data).expect("encrypt should succeed");
+    let truncated = &encrypted[..40]; // less than 41-byte header
+    let result = decrypt_stream_io(password, truncated);
+    assert!(result.is_err(), "truncated data should fail decrypt");
 }

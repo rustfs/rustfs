@@ -17,7 +17,7 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info};
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
-    ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Owner, Timestamp,
+    ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
 };
 use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
@@ -265,10 +265,7 @@ pub(crate) fn build_list_objects_v2_output(
             };
 
             if fetch_owner {
-                obj.owner = Some(Owner {
-                    display_name: Some("rustfs".to_owned()),
-                    id: Some("v0.1".to_owned()),
-                });
+                obj.owner = Some(rustfs_owner());
             }
 
             obj
@@ -482,10 +479,16 @@ mod tests {
 
         let contents = output.contents.as_ref().expect("contents should exist");
         let common_prefixes = output.common_prefixes.as_ref().expect("common prefixes should exist");
+        let expected_owner = rustfs_owner();
 
         assert_eq!(contents[0].key.as_deref(), Some("dir%20a/file%2Bb%25.txt"));
         assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix%20a/sub%2B"));
         assert!(contents[0].owner.is_some());
+        assert_eq!(
+            contents[0].owner.as_ref().and_then(|owner| owner.display_name.clone()),
+            expected_owner.display_name
+        );
+        assert_eq!(contents[0].owner.as_ref().and_then(|owner| owner.id.clone()), expected_owner.id);
         assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
     }
 

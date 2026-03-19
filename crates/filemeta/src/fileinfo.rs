@@ -16,7 +16,10 @@ use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_C
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
-use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
+use rustfs_utils::http::{
+    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
+    SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, insert_str,
+};
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -236,6 +239,8 @@ pub struct FileInfo {
     // Combined checksum when object was uploaded
     pub checksum: Option<Bytes>,
     pub versioned: bool,
+    /// True when version meta was parsed via rmp_serde fallback (legacy format).
+    pub uses_legacy_checksum: bool,
 }
 
 impl FileInfo {
@@ -367,58 +372,48 @@ impl FileInfo {
     }
 
     pub fn set_healing(&mut self) {
-        self.metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
+        insert_str(&mut self.metadata, SUFFIX_HEALING, "true".to_string());
     }
 
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}"), version_id.to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_FV_ID, version_id.to_string());
     }
 
     pub fn tier_free_version_id(&self) -> String {
-        self.metadata[&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}")].clone()
+        get_str(&self.metadata, SUFFIX_TIER_FV_ID).unwrap_or_default()
     }
 
     pub fn set_tier_free_version(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"), "".to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_FV_MARKER, "".to_string());
     }
 
     pub fn set_skip_tier_free_version(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"), "".to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_SKIP_FV_ID, "".to_string());
     }
 
     pub fn skip_tier_free_version(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"))
+        contains_key_str(&self.metadata, SUFFIX_TIER_SKIP_FV_ID)
     }
 
     pub fn tier_free_version(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"))
+        contains_key_str(&self.metadata, SUFFIX_TIER_FV_MARKER)
     }
 
     pub fn set_inline_data(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_INLINE_DATA, "true".to_string());
     }
 
     pub fn set_data_moved(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}data-moved").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, "true".to_string());
     }
 
     pub fn inline_data(&self) -> bool {
-        self.metadata
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
-            && !self.is_remote()
+        contains_key_str(&self.metadata, SUFFIX_INLINE_DATA) && !self.is_remote()
     }
 
     /// Check if the object is compressed
     pub fn is_compressed(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
+        contains_key_str(&self.metadata, SUFFIX_COMPRESSION)
     }
 
     /// Check if the object is remote (transitioned to another tier)

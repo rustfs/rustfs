@@ -19,6 +19,8 @@ use std::sync::LazyLock;
 
 /// drive related labels
 pub const DRIVE_LABEL: &str = "drive";
+/// server label
+pub const SERVER_LABEL: &str = "server";
 /// pool index label
 pub const POOL_INDEX_LABEL: &str = "pool_index";
 /// set index label

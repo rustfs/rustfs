@@ -71,6 +71,17 @@ dependencies = [
 
 [[package]]
 name = "ahash"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891477e0c6a8957309ee5c45a6368af3ae14bb510732d2684ffa19af310920f9"
+dependencies = [
+ "getrandom 0.2.17",
+ "once_cell",
+ "version_check",
+]
+
+[[package]]
+name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -285,7 +296,7 @@ version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c8955af33b25f3b175ee10af580577280b4bd01f7e823d94c7cdef7cf8c9aef"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
@@ -442,7 +453,7 @@ version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68bf3e3efbd1278f770d67e5dc410257300b161b93baedb3aae836144edcaf4b"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
@@ -706,9 +717,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.126.0"
+version = "1.127.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7878050a2321d215eec9db8be09f8db59418b53860ae86cc7042b4094d6cb2bb"
+checksum = "151783f64e0dcddeb4965d08e36c276b4400a46caa88805a2e36d497deaf031a"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -731,7 +742,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.4.0",
  "http-body 1.0.1",
- "lru",
+ "lru 0.16.3",
  "percent-encoding",
  "regex-lite",
  "sha2 0.10.9",
@@ -1001,9 +1012,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.4.6"
+version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2b1117b3b2bbe166d11199b540ceed0d0f7676e36e7b962b5a437a9971eac75"
+checksum = "9d73dbfbaa8e4bc57b9045137680b958d274823509a360abfd8e1d514d40c95c"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -2192,7 +2203,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "lock_api",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -2244,7 +2255,7 @@ dependencies = [
  "liblzma",
  "log",
  "object_store",
- "parking_lot",
+ "parking_lot 0.12.5",
  "parquet",
  "rand 0.9.2",
  "regex",
@@ -2277,7 +2288,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot",
+ "parking_lot 0.12.5",
  "tokio",
 ]
 
@@ -2310,7 +2321,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea2df29b9592a5d55b8238eaf67d2f21963d5a08cd1a8b7670134405206caabd"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "arrow-ipc",
  "chrono",
@@ -2468,7 +2479,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
- "parking_lot",
+ "parking_lot 0.12.5",
  "parquet",
  "tokio",
 ]
@@ -2494,7 +2505,7 @@ dependencies = [
  "futures",
  "log",
  "object_store",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rand 0.9.2",
  "tempfile",
  "url",
@@ -2573,7 +2584,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "325a00081898945d48d6194d9ca26120e523c993be3bb7c084061a5a2a72e787"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "datafusion-common",
  "datafusion-doc",
@@ -2594,7 +2605,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "809bbcb1e0dbec5d0ce30d493d135aea7564f1ba4550395f7f94321223df2dae"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "datafusion-common",
  "datafusion-expr-common",
@@ -2636,7 +2647,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-plan",
- "parking_lot",
+ "parking_lot 0.12.5",
  "paste",
 ]
 
@@ -2705,7 +2716,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d3a86264bb9163e7360b6622e789bc7fcbb43672e78a8493f0bc369a41a57c6"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "datafusion-common",
  "datafusion-expr",
@@ -2716,7 +2727,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap 2.13.0",
  "itertools 0.14.0",
- "parking_lot",
+ "parking_lot 0.12.5",
  "paste",
  "petgraph",
  "recursive",
@@ -2744,7 +2755,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ae769ea5d688b4e74e9be5cad6f9d9f295b540825355868a3ab942380dd97ce"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "chrono",
  "datafusion-common",
@@ -2752,7 +2763,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap 2.13.0",
  "itertools 0.14.0",
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -2780,7 +2791,7 @@ version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79949cbb109c2a45c527bfe0d956b9f2916807c05d4d2e66f3fd0af827ac2b61"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow",
  "arrow-ord",
  "arrow-schema",
@@ -2800,7 +2811,7 @@ dependencies = [
  "indexmap 2.13.0",
  "itertools 0.14.0",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "tokio",
 ]
@@ -2833,7 +2844,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-physical-plan",
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -2873,9 +2884,9 @@ dependencies = [
  "http-body-util",
  "libc",
  "log",
- "lru",
+ "lru 0.16.3",
  "mime_guess",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "pin-project-lite",
  "reflink-copy",
@@ -4032,6 +4043,9 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+dependencies = [
+ "ahash 0.7.8",
+]
 
 [[package]]
 name = "hashbrown"
@@ -4501,7 +4515,7 @@ version = "0.11.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "232929e1d75fe899576a3d5c7416ad0d88dbfbb3c3d6aa00873a7408a50ddb88"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "indexmap 2.13.0",
  "is-terminal",
  "itoa",
@@ -4519,7 +4533,7 @@ version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90807d610575744524d9bdc69f3885d96f0e6c3354565b0828354a7ff2a262b8"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "clap",
  "crossbeam-channel",
  "crossbeam-utils",
@@ -4551,6 +4565,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "instant"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -5042,6 +5065,15 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lru"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e999beba7b6e8345721bd280141ed958096a2e4abdf74f67ff4ce49b4b54e47a"
+dependencies = [
+ "hashbrown 0.12.3",
+]
+
+[[package]]
+name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
@@ -5202,7 +5234,7 @@ version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d5312e9ba3771cfa961b585728215e3d972c950a3eed9252aa093d6301277e8"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "portable-atomic",
 ]
 
@@ -5271,7 +5303,7 @@ dependencies = [
  "equivalent",
  "event-listener",
  "futures-util",
- "parking_lot",
+ "parking_lot 0.12.5",
  "portable-atomic",
  "smallvec",
  "tagptr",
@@ -5306,7 +5338,7 @@ dependencies = [
  "libc",
  "log",
  "neli-proc-macros",
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -5629,7 +5661,7 @@ dependencies = [
  "http 1.4.0",
  "humantime",
  "itertools 0.14.0",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "thiserror 2.0.18",
  "tokio",
@@ -5884,12 +5916,37 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d17b78036a60663b797adeaee46f5c9dfebb86948d1255007a1d6be0271ff99"
+dependencies = [
+ "instant",
+ "lock_api",
+ "parking_lot_core 0.8.6",
+]
+
+[[package]]
+name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
  "lock_api",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a2cfe6f0ad2bfc16aefa463b497d5c7a5ecd44a23efa72aa342d90177356dc"
+dependencies = [
+ "cfg-if",
+ "instant",
+ "libc",
+ "redox_syscall 0.2.16",
+ "smallvec",
+ "winapi",
 ]
 
 [[package]]
@@ -5911,7 +5968,7 @@ version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ee96b29972a257b855ff2341b37e61af5f12d6af1158b6dcdb5b31ea07bb3cb"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
@@ -6403,7 +6460,7 @@ dependencies = [
  "fnv",
  "lazy_static",
  "memchr",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 2.0.18",
 ]
 
@@ -6763,7 +6820,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36ea961700fd7260e7fa3701c8287d901b2172c51f9c1421fa0f21d7f7e184b7"
 dependencies = [
  "clocksource",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 1.0.69",
 ]
 
@@ -6829,6 +6886,15 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb5a58c1855b4b6819d59012155603f0b22ad30cad752600aadfcb695265519a"
+dependencies = [
+ "bitflags 1.3.2",
+]
+
+[[package]]
+name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
@@ -6854,6 +6920,21 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reed-solomon-erasure"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7263373d500d4d4f505d43a2a662d475a894aa94503a1ee28e9188b5f3960d4f"
+dependencies = [
+ "cc",
+ "libc",
+ "libm",
+ "lru 0.7.8",
+ "parking_lot 0.11.2",
+ "smallvec",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -7292,6 +7373,7 @@ dependencies = [
  "rustfs-common",
  "rustfs-config",
  "rustfs-credentials",
+ "rustfs-crypto",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-heal",
@@ -7326,6 +7408,7 @@ dependencies = [
  "starshard",
  "subtle",
  "sysinfo",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
@@ -7488,12 +7571,13 @@ dependencies = [
  "md-5 0.11.0-rc.5",
  "moka",
  "num_cpus",
- "parking_lot",
+ "parking_lot 0.12.5",
  "path-absolutize",
  "pin-project-lite",
  "quick-xml 0.39.2",
  "rand 0.10.0",
  "ratelimit",
+ "reed-solomon-erasure",
  "reed-solomon-simd",
  "regex",
  "reqwest 0.13.2",
@@ -7516,8 +7600,10 @@ dependencies = [
  "rustls",
  "s3s",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_urlencoded",
+ "serial_test",
  "sha1 0.11.0-rc.5",
  "sha2 0.11.0-rc.5",
  "shadow-rs",
@@ -7632,8 +7718,10 @@ dependencies = [
  "reqwest 0.13.2",
  "rustfs-credentials",
  "rustfs-policy",
+ "rustfs-utils",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -7655,9 +7743,11 @@ dependencies = [
  "moka",
  "rand 0.10.0",
  "reqwest 0.13.2",
+ "rustfs-utils",
  "serde",
  "serde_json",
  "sha2 0.11.0-rc.5",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7675,7 +7765,7 @@ dependencies = [
  "async-trait",
  "crossbeam-queue",
  "futures",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -7940,7 +8030,7 @@ dependencies = [
  "futures-core",
  "http 1.4.0",
  "object_store",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "rustfs-common",
  "rustfs-ecstore",
@@ -7963,7 +8053,7 @@ dependencies = [
  "datafusion",
  "derive_builder 0.20.2",
  "futures",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustfs-s3select-api",
  "s3s",
  "snafu 0.9.0",
@@ -8065,6 +8155,7 @@ name = "rustfs-utils"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
+ "blake2 0.11.0-rc.5",
  "blake3",
  "brotli",
  "bytes",
@@ -8096,6 +8187,7 @@ dependencies = [
  "siphasher",
  "snap",
  "sysinfo",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8305,7 +8397,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/s3s-project/s3s?rev=c2dc7b16535659904d4efff52c558fc039be1ef3#c2dc7b16535659904d4efff52c558fc039be1ef3"
+source = "git+https://github.com/rustfs/s3s?rev=d9556e3c0036bd3f2b330966009cbaa5aebf19a3#d9556e3c0036bd3f2b330966009cbaa5aebf19a3"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -8518,6 +8610,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8644,7 +8746,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "scc",
  "serial_test_derive",
 ]
@@ -9240,7 +9342,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -9467,7 +9569,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

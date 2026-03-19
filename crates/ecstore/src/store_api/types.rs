@@ -118,11 +118,8 @@ impl ObjectOptions {
     }
 
     pub fn put_replication_state(&self) -> ReplicationState {
-        let rs = match self
-            .user_defined
-            .get(format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_STATUS}").as_str())
-        {
-            Some(v) => v.to_string(),
+        let rs = match rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_STATUS) {
+            Some(v) => v,
             None => return ReplicationState::default(),
         };
 
@@ -341,15 +338,11 @@ impl Clone for ObjectInfo {
 
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
-        self.user_defined
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
+        rustfs_utils::http::contains_key_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
     }
 
     pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
-        let scheme = self
-            .user_defined
-            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
-            .cloned();
+        let scheme = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         if let Some(scheme) = scheme {
             let algorithm = CompressionAlgorithm::from_str(&scheme)?;
@@ -369,7 +362,7 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
+            if let Some(size_str) = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE)
                 && !size_str.is_empty()
             {
                 // Todo: deal with error
@@ -745,15 +738,11 @@ impl ObjectInfo {
                 .user_defined
                 .iter()
                 .filter_map(|(k, v)| {
-                    if k.starts_with(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}")) {
-                        Some((
-                            k.trim_start_matches(&format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-"))
-                                .to_string(),
-                            v.clone(),
-                        ))
-                    } else {
-                        None
-                    }
+                    rustfs_utils::http::internal_key_strip_suffix_prefix(
+                        k,
+                        rustfs_utils::http::SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+                    )
+                    .map(|arn| (arn, v.clone()))
                 })
                 .collect(),
             ..Default::default()
@@ -1035,8 +1024,8 @@ mod tests {
     fn get_actual_size_uses_compressed_metadata_size() {
         let user_defined = {
             let mut map = HashMap::new();
-            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
-            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), "42".to_string());
+            rustfs_utils::http::insert_str(&mut map, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+            rustfs_utils::http::insert_str(&mut map, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "42".to_string());
             map
         };
 
@@ -1072,7 +1061,7 @@ mod tests {
     fn get_actual_size_uses_compressed_parts_actual_size_when_metadata_missing() {
         let user_defined = {
             let mut map = HashMap::new();
-            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            rustfs_utils::http::insert_str(&mut map, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
             map
         };
 
@@ -1100,7 +1089,7 @@ mod tests {
     fn get_actual_size_returns_error_when_compressed_parts_missing_and_size_mismatch() {
         let user_defined = {
             let mut map = HashMap::new();
-            map.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression"), "zstd".to_string());
+            rustfs_utils::http::insert_str(&mut map, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
             map
         };
 

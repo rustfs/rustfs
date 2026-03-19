@@ -18,7 +18,11 @@ set -euo pipefail
 # Disable proxy for localhost requests to avoid interference
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="${NO_PROXY}"
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+# Keep proxy variables for external downloads; NO_PROXY bypasses localhost.
+
+# Ensure user-level Python scripts are discoverable (awscurl/tox installed via --user)
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
+export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
 
 # Configuration
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"

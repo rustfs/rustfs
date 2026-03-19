@@ -17,5 +17,6 @@ pub mod auth;
 pub mod error;
 pub mod format;
 pub mod policy;
+pub mod serde_datetime;
 pub mod service_type;
 pub mod utils;

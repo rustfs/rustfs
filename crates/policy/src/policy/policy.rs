@@ -55,9 +55,9 @@ impl Args<'_> {
 pub struct Policy {
     #[serde(default, rename = "ID")]
     pub id: ID,
-    #[serde(rename = "Version")]
+    #[serde(default, rename = "Version")]
     pub version: String,
-    #[serde(rename = "Statement")]
+    #[serde(default, rename = "Statement")]
     pub statements: Vec<Statement>,
 }
 
@@ -1082,6 +1082,14 @@ mod test {
                 .is_some_and(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false)),
             "Serialized JSON must not contain empty Action for NotAction-only statement"
         );
+    }
+
+    #[test]
+    fn test_parse_empty_policy_object_as_implied_policy() {
+        let policy = Policy::parse_config(b"{}").expect("empty JSON object should parse");
+
+        assert!(policy.version.is_empty());
+        assert!(policy.statements.is_empty());
     }
 
     #[test]
