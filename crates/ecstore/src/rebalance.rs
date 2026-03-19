@@ -154,6 +154,8 @@ where
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
 {
+    let max_attempts = max_attempts.max(1);
+
     if version.is_remote() {
         return MigrationVersionResult {
             moved: false,
@@ -1944,6 +1946,42 @@ mod rebalance_unit_tests {
         assert!(result.failed);
         assert!(matches!(result.error, Some(Error::SlowDown)));
         assert_eq!(backend.get_calls(), 3);
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_zero_max_attempts_still_attempts_once() {
+        let backend = AlwaysFailGetBackend::new();
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let version = version_normal();
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            0,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(!result.ignored);
+        assert!(!result.moved);
+        assert!(result.failed);
+        assert!(matches!(result.error, Some(Error::SlowDown)));
+        assert_eq!(backend.get_calls(), 1);
         assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     }
 
