@@ -18,6 +18,29 @@ use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::primitives::ByteStream;
 use serial_test::serial;
 
+async fn allow_anonymous_put_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let policy_json = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowAnonymousPutObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:PutObject"],
+                "Resource": [format!("arn:aws:s3:::{}/*", bucket)]
+            }
+        ]
+    })
+    .to_string();
+
+    client.put_bucket_policy().bucket(bucket).policy(policy_json).send().await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -122,6 +145,51 @@ async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::e
         reqwest::StatusCode::FORBIDDEN,
         "anonymous PostObject should be rejected"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_honors_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-policy";
+    let object_key = "post-policy-object.txt";
+    let expected_body = b"anonymous-post-body".to_vec();
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("success_action_status", "201")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(
+        post_resp.status(),
+        reqwest::StatusCode::CREATED,
+        "PostObject should honor success_action_status=201 when upload is allowed"
+    );
+
+    let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = get_out.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice(), "uploaded object body should match");
 
     Ok(())
 }
