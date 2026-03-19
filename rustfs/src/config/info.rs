@@ -393,28 +393,36 @@ struct RuntimeInfo {
 
 impl RuntimeInfo {
     fn collect() -> Self {
-        let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
-        let mut sys = sysinfo::System::new();
-        sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[pid]),
-            true,
-            sysinfo::ProcessRefreshKind::everything(),
-        );
+        let (process_id, memory_usage_mb, cpu_usage_percent) =
+            if let Ok(pid) = sysinfo::get_current_pid() {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::everything(),
+                );
 
-        let process = sys.process(pid);
-        let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
-            let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
-            let cpu = p.cpu_usage() as f64;
-            (memory, cpu)
-        } else {
-            (0.0, 0.0)
-        };
+                let process = sys.process(pid);
+                let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
+                    let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
+                    let cpu = p.cpu_usage() as f64;
+                    (memory, cpu)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                (pid.as_u32(), memory_usage_mb, cpu_usage_percent)
+            } else {
+                // Failed to retrieve current PID; degrade gracefully by
+                // skipping per-process stats and using sentinel values.
+                (0, 0.0, 0.0)
+            };
 
         // // Get available CPU parallelism (roughly, logical cores available to the process)
         let cpu_parallelism = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
 
         Self {
-            process_id: pid.as_u32(),
+            process_id,
             memory_usage_mb,
             cpu_usage_percent,
             thread_count: cpu_parallelism,
@@ -422,13 +430,19 @@ impl RuntimeInfo {
     }
 
     fn format(&self) -> String {
+        let pid_display = if self.process_id == 0 {
+            "unknown".to_string()
+        } else {
+            self.process_id.to_string()
+        };
+
         format!(
             "=== Runtime Information ===\n\
              Process ID: {}\n\
              Memory Usage: {:.2} MB\n\
              CPU Usage: {:.2}%\n\
              CPU Parallelism (logical cores): {}",
-            self.process_id, self.memory_usage_mb, self.cpu_usage_percent, self.thread_count
+            pid_display, self.memory_usage_mb, self.cpu_usage_percent, self.thread_count
         )
     }
 }
