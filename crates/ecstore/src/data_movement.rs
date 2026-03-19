@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::store::ECStore;
-use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectOptions, PutObjReader};
+use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
 use rustfs_common::defer;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
@@ -93,6 +93,25 @@ pub fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
     flag.store(false, Ordering::Relaxed);
 }
 
+fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {
+    ObjectOptions {
+        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        user_defined: object_info.user_defined.clone(),
+        preserve_etag: object_info.etag.clone(),
+        src_pool_idx,
+        data_movement: true,
+        ..Default::default()
+    }
+}
+
+fn data_movement_complete_multipart_opts(object_info: &ObjectInfo) -> ObjectOptions {
+    ObjectOptions {
+        data_movement: true,
+        mod_time: object_info.mod_time,
+        ..Default::default()
+    }
+}
+
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -104,17 +123,7 @@ pub(crate) async fn migrate_object(
 
     if object_info.is_multipart() {
         let res = match store
-            .new_multipart_upload(
-                &bucket,
-                &object_info.name,
-                &ObjectOptions {
-                    version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-                    user_defined: object_info.user_defined.clone(),
-                    src_pool_idx: pool_idx,
-                    data_movement: true,
-                    ..Default::default()
-                },
-            )
+            .new_multipart_upload(&bucket, &object_info.name, &data_movement_new_multipart_opts(&object_info, pool_idx))
             .await
         {
             Ok(res) => res,
@@ -185,11 +194,7 @@ pub(crate) async fn migrate_object(
                 &object_info.name,
                 &res.upload_id,
                 parts,
-                &ObjectOptions {
-                    data_movement: true,
-                    mod_time: object_info.mod_time,
-                    ..Default::default()
-                },
+                &data_movement_complete_multipart_opts(&object_info),
             )
             .await
         {
@@ -237,6 +242,8 @@ pub(crate) async fn migrate_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
 
     #[test]
     fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
@@ -275,5 +282,38 @@ mod tests {
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);
+    }
+
+    #[test]
+    fn test_data_movement_new_multipart_opts_preserves_etag_and_version() {
+        let version_id = Uuid::nil();
+        let object_info = ObjectInfo {
+            version_id: Some(version_id),
+            etag: Some("etag-value".to_string()),
+            user_defined: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            ..Default::default()
+        };
+
+        let opts = data_movement_new_multipart_opts(&object_info, 7);
+
+        assert_eq!(opts.version_id.as_deref(), Some(version_id.to_string().as_str()));
+        assert_eq!(opts.preserve_etag.as_deref(), Some("etag-value"));
+        assert_eq!(opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
+        assert_eq!(opts.src_pool_idx, 7);
+        assert!(opts.data_movement);
+    }
+
+    #[test]
+    fn test_data_movement_complete_multipart_opts_preserves_mod_time() {
+        let mod_time = OffsetDateTime::now_utc();
+        let object_info = ObjectInfo {
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+
+        let opts = data_movement_complete_multipart_opts(&object_info);
+
+        assert!(opts.data_movement);
+        assert_eq!(opts.mod_time, Some(mod_time));
     }
 }
