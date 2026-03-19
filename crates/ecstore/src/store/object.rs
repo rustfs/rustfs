@@ -81,6 +81,16 @@ fn delete_pool_lookup_opts(opts: &ObjectOptions) -> ObjectOptions {
     lookup_opts
 }
 
+fn copy_source_pool_lookup_opts(opts: &ObjectOptions) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.no_lock = true;
+    if lookup_opts.version_id.is_some() {
+        lookup_opts.metadata_chg = true;
+    }
+
+    lookup_opts
+}
+
 impl ECStore {
     async fn get_latest_accessible_object_info_with_idx(
         &self,
@@ -224,7 +234,11 @@ impl ECStore {
 
         // TODO: nslock
 
-        let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
+        let pool_idx = self
+            .get_pool_info_existing_with_opts(src_bucket, &src_object, &copy_source_pool_lookup_opts(src_opts))
+            .await?
+            .0
+            .index;
 
         if cp_src_dst_same {
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
@@ -840,6 +854,29 @@ mod tests {
     #[test]
     fn delete_pool_lookup_opts_keeps_latest_lookup_for_unversioned_delete() {
         let lookup_opts = delete_pool_lookup_opts(&ObjectOptions::default());
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.metadata_chg);
+        assert!(lookup_opts.version_id.is_none());
+    }
+
+    #[test]
+    fn copy_source_pool_lookup_opts_enables_version_aware_lookup() {
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let lookup_opts = copy_source_pool_lookup_opts(&opts);
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn copy_source_pool_lookup_opts_keeps_latest_lookup_for_unversioned_copy() {
+        let lookup_opts = copy_source_pool_lookup_opts(&ObjectOptions::default());
 
         assert!(lookup_opts.no_lock);
         assert!(!lookup_opts.metadata_chg);

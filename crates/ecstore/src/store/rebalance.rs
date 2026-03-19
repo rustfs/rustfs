@@ -20,6 +20,16 @@ struct LatestObjectInfoCandidate {
     err: Option<Error>,
 }
 
+fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
+    let object = decode_dir_object(object);
+
+    if let Some(version_id) = &opts.version_id {
+        StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), version_id.clone())
+    } else {
+        StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())
+    }
+}
+
 fn resolve_latest_object_info_candidates(
     mut candidates: Vec<LatestObjectInfoCandidate>,
     bucket: &str,
@@ -59,17 +69,7 @@ fn resolve_latest_object_info_candidates(
         }
     }
 
-    let object = decode_dir_object(object);
-
-    if opts.version_id.is_none() {
-        Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
-    } else {
-        Err(StorageError::VersionNotFound(
-            bucket.to_owned(),
-            object.to_owned(),
-            opts.version_id.clone().unwrap_or_default(),
-        ))
-    }
+    Err(pool_lookup_not_found_error(bucket, object, opts))
 }
 
 impl ECStore {
@@ -406,7 +406,7 @@ impl ECStore {
             return Ok((def_pool, Vec::new()));
         }
 
-        Err(Error::ObjectNotFound(bucket.to_owned(), object.to_owned()))
+        Err(pool_lookup_not_found_error(bucket, object, opts))
     }
 
     async fn pools_with_object(&self, pools: &[PoolObjInfo], opts: &ObjectOptions) -> Vec<PoolErr> {
@@ -794,6 +794,30 @@ mod tests {
             },
         )
         .unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
+    }
+
+    #[test]
+    fn pool_lookup_not_found_error_returns_object_not_found_for_latest_lookup() {
+        let err = pool_lookup_not_found_error("bucket", "object", &ObjectOptions::default());
+
+        assert_eq!(err, Error::ObjectNotFound("bucket".to_string(), "object".to_string()));
+    }
+
+    #[test]
+    fn pool_lookup_not_found_error_returns_version_not_found_for_versioned_lookup() {
+        let err = pool_lookup_not_found_error(
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             err,
