@@ -562,7 +562,7 @@ impl ECStore {
 
         //opts.skip_decommissioned = true;
         //opts.no_lock = true;
-        let idx = self.get_pool_idx_existing_with_opts(bucket, &object, opts).await?;
+        let (_, idx) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
 
         self.pools[idx].transition_object(bucket, &object, opts).await
     }
@@ -581,7 +581,9 @@ impl ECStore {
 
         //opts.skip_decommissioned = true;
         //opts.nolock = true;
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx]
             .clone()
@@ -604,7 +606,9 @@ impl ECStore {
         let mut opts = opts.clone();
         opts.metadata_chg = true;
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .await?;
 
         self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
     }
