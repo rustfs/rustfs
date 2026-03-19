@@ -108,8 +108,10 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
 fn data_movement_complete_multipart_opts(object_info: &ObjectInfo) -> ObjectOptions {
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
+        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         data_movement: true,
         mod_time: object_info.mod_time,
+        preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
 }
@@ -312,11 +314,13 @@ mod tests {
     }
 
     #[test]
-    fn test_data_movement_complete_multipart_opts_preserves_mod_time() {
+    fn test_data_movement_complete_multipart_opts_preserves_mod_time_version_and_etag() {
         let mod_time = OffsetDateTime::now_utc();
+        let version_id = Uuid::nil();
         let object_info = ObjectInfo {
-            version_id: Some(Uuid::nil()),
+            version_id: Some(version_id),
             mod_time: Some(mod_time),
+            etag: Some("etag-value".to_string()),
             ..Default::default()
         };
 
@@ -325,6 +329,8 @@ mod tests {
         assert!(opts.versioned);
         assert!(opts.data_movement);
         assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(opts.version_id.as_deref(), Some(version_id.to_string().as_str()));
+        assert_eq!(opts.preserve_etag.as_deref(), Some("etag-value"));
     }
 
     #[test]
