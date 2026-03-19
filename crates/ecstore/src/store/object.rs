@@ -545,8 +545,12 @@ impl ECStore {
             return Ok(());
         }
 
-        let idx = self
-            .get_pool_idx_existing_with_opts(bucket, object.as_str(), &ObjectOptions::default())
+        let opts = ObjectOptions {
+            version_id: Some(version_id.to_string()),
+            ..Default::default()
+        };
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
 
         let _ = self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
