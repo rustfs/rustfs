@@ -74,6 +74,14 @@ pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
     }
 }
 
+fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
+    if version_id.is_none() || version_id == Some(Uuid::nil()) {
+        Some(Uuid::nil().to_string())
+    } else {
+        None
+    }
+}
+
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
 
@@ -162,6 +170,21 @@ impl FileMeta {
                 b.cmp(a)
             }
         });
+    }
+
+    fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
+        let key = data_key_for_version(version_id);
+        if let Some(data) = self.data.find(key.as_str())? {
+            return Ok(Some(data));
+        }
+
+        if let Some(legacy_key) = legacy_data_key_for_version(version_id)
+            && legacy_key != key
+        {
+            return self.data.find(legacy_key.as_str());
+        }
+
+        Ok(None)
     }
 
     // Find version
@@ -709,10 +732,7 @@ impl FileMeta {
             }
 
             if read_data && fi.inline_data() {
-                fi.data = self
-                    .data
-                    .find(data_key_for_version(fi.version_id).as_str())?
-                    .map(bytes::Bytes::from);
+                fi.data = self.find_inline_data_for_version(fi.version_id)?.map(bytes::Bytes::from);
             }
 
             found_fi = Some(fi);
@@ -1069,6 +1089,28 @@ mod test {
         // Verify inline data contents
         let inline_data = fm.data.as_slice();
         assert!(!inline_data.is_empty(), "Inline data should not be empty");
+    }
+
+    #[test]
+    fn test_into_fileinfo_reads_legacy_nil_uuid_inline_key() {
+        let mut fm = FileMeta::new();
+        let mut fi = FileInfo::new("test", 2, 1);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.data = Some(Bytes::from_static(b"legacy-inline"));
+        fi.set_inline_data();
+        fm.add_version(fi).unwrap();
+
+        let current_key = data_key_for_version(Some(Uuid::nil()));
+        let legacy_key = legacy_data_key_for_version(Some(Uuid::nil())).unwrap();
+        let payload = fm.data.find(current_key.as_str()).unwrap().unwrap();
+
+        fm.data.remove_key(current_key.as_str()).unwrap();
+        fm.data.replace(legacy_key.as_str(), payload.clone()).unwrap();
+
+        let restored = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+
+        assert!(restored.inline_data());
+        assert_eq!(restored.data, Some(Bytes::from(payload)));
     }
 
     #[test]
