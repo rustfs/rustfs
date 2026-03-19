@@ -16,7 +16,7 @@
 //! This module introduces explicit dependency injection entry points
 //! for storage, IAM, and KMS handles.
 
-use crate::config::workload_profiles::{RustFSBufferConfig, get_global_buffer_config};
+use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use rustfs_ecstore::config::{Config, get_global_server_config};
