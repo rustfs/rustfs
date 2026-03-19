@@ -234,14 +234,12 @@ mod tests {
         );
 
         let website = client.get_bucket_website().bucket(bucket).send().await;
-        assert!(website.is_err(), "GetBucketWebsite should return NoSuchWebsiteConfiguration when unset");
-        let website_err = website.err().unwrap();
-        let website_code = website_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(website_code, Some("NoSuchWebsiteConfiguration")),
-            "Unexpected GetBucketWebsite error code: {:?}, err: {:?}",
-            website_code,
-            website_err
+        assert!(website.is_ok(), "GetBucketWebsite should return persisted website configuration");
+        let website_output = website.unwrap();
+        assert_eq!(
+            website_output.index_document().map(|doc| doc.suffix()),
+            Some("index.html"),
+            "GetBucketWebsite should preserve index document suffix"
         );
 
         client
@@ -250,6 +248,20 @@ mod tests {
             .send()
             .await
             .expect("DeleteBucketWebsite should return success");
+
+        let website_after_delete = client.get_bucket_website().bucket(bucket).send().await;
+        assert!(
+            website_after_delete.is_err(),
+            "GetBucketWebsite should return NoSuchWebsiteConfiguration after deletion"
+        );
+        let website_err = website_after_delete.err().unwrap();
+        let website_code = website_err.as_service_error().and_then(|e| e.code());
+        assert!(
+            matches!(website_code, Some("NoSuchWebsiteConfiguration")),
+            "Unexpected GetBucketWebsite error code: {:?}, err: {:?}",
+            website_code,
+            website_err
+        );
 
         env.stop_server();
     }

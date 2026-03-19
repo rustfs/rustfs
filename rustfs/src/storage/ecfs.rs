@@ -16,8 +16,8 @@ use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
-    bucket::tagging::decode_tags_to_map,
-    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    bucket::{metadata::BUCKET_WEBSITE_CONFIG, metadata_sys, tagging::decode_tags_to_map, utils::serialize},
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
 };
@@ -278,7 +278,10 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: return success even without website config state.
+        metadata_sys::delete(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
     }
 
@@ -460,8 +463,16 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: website config is absent unless explicitly implemented.
-        Err(s3_error!(NoSuchWebsiteConfiguration))
+        match metadata_sys::get_website_config(&req.input.bucket).await {
+            Ok((website, _)) => Ok(S3Response::new(GetBucketWebsiteOutput {
+                error_document: website.error_document,
+                index_document: website.index_document,
+                redirect_all_requests_to: website.redirect_all_requests_to,
+                routing_rules: website.routing_rules,
+            })),
+            Err(StorageError::ConfigNotFound) => Err(s3_error!(NoSuchWebsiteConfiguration)),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     /// Get bucket notification
@@ -732,7 +743,12 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        // S3-compatible dummy behavior: accept website configuration payload without persistence.
+        let website_config = serialize(&req.input.website_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
         Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
 
