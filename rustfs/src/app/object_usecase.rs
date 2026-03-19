@@ -15,7 +15,7 @@
 //! Object application use-case contracts.
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::config::workload_profiles::RustFSBufferConfig;
+use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{

@@ -151,8 +151,30 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 }
 
 async fn async_main() -> Result<()> {
-    // Parse the obtained parameters
-    let config = config::Config::parse()?;
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let command_result = match config::Opt::parse_command(args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Command parse failed, error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Handle info command
+    if let config::CommandResult::Info(opts) = command_result {
+        config::execute_info(&opts);
+        return Ok(());
+    }
+
+    // Get config for server command
+    let config = match command_result {
+        config::CommandResult::Server(cfg) => cfg,
+        config::CommandResult::Info(_) => unreachable!(),
+    };
+
+    // Initialize the global config snapshot for info command
+    config::init_config_snapshot(&config);
 
     // Initialize the configuration
     init_license(config.license.clone());
@@ -211,7 +233,7 @@ async fn async_main() -> Result<()> {
     }
 
     // Run parameters
-    match run(config).await {
+    match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("Server encountered an error and is shutting down: {}", e);
