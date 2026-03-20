@@ -311,6 +311,18 @@ fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str)
     result.map_err(|err| Error::other(format!("decommission pool meta reload failed during {stage}: {err}")))
 }
 
+fn ensure_pool_not_left_in_cmdline_after_decommission(position: usize, cmd_line: &str, completed: bool) -> Result<()> {
+    if completed {
+        return Err(Error::other(format!(
+            "pool({}) = {} is decommissioned, please remove from server command line",
+            position + 1,
+            cmd_line
+        )));
+    }
+
+    Ok(())
+}
+
 fn resolve_decommission_listing_worker_result(
     set_idx: usize,
     worker_result: std::result::Result<(), tokio::task::JoinError>,
@@ -870,18 +882,7 @@ impl PoolMeta {
         // Determine whether the selected pool should be removed from the retired list.
         for k in specified_pools.keys() {
             if let Some(pi) = remembered_pools.get(k) {
-                if pi.completed {
-                    error!(
-                        "pool({}) = {} is decommissioned, please remove from server command line",
-                        pi.position + 1,
-                        k
-                    );
-                    // return Err(Error::other(format!(
-                    //     "pool({}) = {} is decommissioned, please remove from server command line",
-                    //     pi.position + 1,
-                    //     k
-                    // )));
-                }
+                ensure_pool_not_left_in_cmdline_after_decommission(pi.position, k, pi.completed)?;
             } else {
                 // If the previous pool no longer exists, allow updates because a new pool may have been added.
                 update = true;
@@ -2190,6 +2191,22 @@ impl ECStore {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_pool_not_left_in_cmdline_after_decommission_allows_active_pool() {
+        assert!(ensure_pool_not_left_in_cmdline_after_decommission(0, "http://node{1...4}/disk{1...4}", false).is_ok());
+    }
+
+    #[test]
+    fn ensure_pool_not_left_in_cmdline_after_decommission_rejects_completed_pool() {
+        let err = ensure_pool_not_left_in_cmdline_after_decommission(1, "http://node{1...4}/disk{1...4}", true)
+            .expect_err("completed decommissioned pool should fail validation");
+
+        assert!(
+            err.to_string()
+                .contains("pool(2) = http://node{1...4}/disk{1...4} is decommissioned, please remove from server command line")
+        );
+    }
 
     #[test]
     fn determine_decommission_final_state_marks_failures_and_cancellations() {
