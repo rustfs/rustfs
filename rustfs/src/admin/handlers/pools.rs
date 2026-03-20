@@ -53,6 +53,18 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
     Ok(())
 }
 
+fn contextualize_admin_pool_api_error(
+    err: crate::error::ApiError,
+    operation: &str,
+    pool_context: impl std::fmt::Display,
+) -> crate::error::ApiError {
+    crate::error::ApiError {
+        code: err.code,
+        message: format!("admin {operation} failed for {pool_context}: {}", err.message),
+        source: err.source,
+    }
+}
+
 fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
     let idx = pool.parse::<usize>().ok()?;
     (idx < endpoint_count).then_some(idx)
@@ -283,7 +295,12 @@ impl Operation for StartDecommission {
         let pools_indices = dedup_indices(&parsed_indices);
 
         if !pools_indices.is_empty() {
-            store.decommission(ctx.clone(), pools_indices).await.map_err(ApiError::from)?;
+            let pool_context = format!("pools {:?}", &pools_indices);
+            store
+                .decommission(ctx.clone(), pools_indices)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
@@ -353,7 +370,11 @@ impl Operation for CancelDecommission {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        store.decommission_cancel(idx).await.map_err(ApiError::from)?;
+        store
+            .decommission_cancel(idx)
+            .await
+            .map_err(ApiError::from)
+            .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
@@ -361,7 +382,7 @@ impl Operation for CancelDecommission {
 
 #[cfg(test)]
 mod pools_handler_tests {
-    use super::{dedup_indices, parse_pool_idx_by_id, validate_start_decommission_guards};
+    use super::{contextualize_admin_pool_api_error, dedup_indices, parse_pool_idx_by_id, validate_start_decommission_guards};
 
     #[test]
     fn test_parse_pool_idx_by_id_rejects_non_numeric() {
@@ -407,6 +428,35 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_allows_when_idle() {
         assert!(validate_start_decommission_guards(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_contextualize_admin_pool_api_error_preserves_code_and_adds_pool_context() {
+        let err = crate::error::ApiError {
+            code: s3s::S3ErrorCode::InvalidRequest,
+            message: "decommission already running".to_string(),
+            source: None,
+        };
+
+        let err = contextualize_admin_pool_api_error(err, "start decommission", "pools [1, 3]");
+
+        assert_eq!(err.code, s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "admin start decommission failed for pools [1, 3]: decommission already running"
+        );
+    }
+
+    #[test]
+    fn test_contextualize_admin_pool_api_error_preserves_source() {
+        let err = contextualize_admin_pool_api_error(
+            crate::error::ApiError::other(std::io::Error::other("boom")),
+            "cancel decommission",
+            "pool 2",
+        );
+
+        assert!(err.message.contains("admin cancel decommission failed for pool 2"));
+        assert!(err.source.is_some());
     }
 
     #[test]
