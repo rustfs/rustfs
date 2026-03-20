@@ -715,6 +715,61 @@ async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_condit
 
 #[tokio::test]
 #[serial]
+async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-policy-bucket-mismatch";
+    let object_key = "post-policy-bucket-mismatch-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("bucket", "different-bucket")
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = reqwest::Client::new()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+    assert!(
+        response_body.contains("different-bucket"),
+        "response should mention the conflicting bucket field, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
