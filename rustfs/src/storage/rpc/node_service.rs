@@ -788,7 +788,7 @@ impl Node for NodeService {
         let Some(store) = new_object_layer_fn() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
-                error_info: Some("errServerNotInitialized".to_string()),
+                error_info: Some(rebalance_not_initialized_failure("reload pool metadata")),
             }));
         };
         match store.reload_pool_meta().await {
@@ -798,7 +798,7 @@ impl Node for NodeService {
             })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
-                error_info: Some(err.to_string()),
+                error_info: Some(rebalance_failure_info("reload pool metadata", &err)),
             })),
         }
     }
@@ -1969,6 +1969,12 @@ mod tests {
         // Should fail because object layer is not initialized in test
         assert!(!reload_response.success);
         assert!(reload_response.error_info.is_some());
+        assert!(
+            reload_response
+                .error_info
+                .unwrap()
+                .contains("failed to reload pool metadata: errServerNotInitialized")
+        );
     }
 
     #[tokio::test]
@@ -2029,6 +2035,13 @@ mod tests {
         let message = rebalance_not_initialized_failure("load rebalance metadata");
 
         assert_eq!(message, "failed to load rebalance metadata: errServerNotInitialized");
+    }
+
+    #[test]
+    fn test_rebalance_not_initialized_failure_formats_reload_context() {
+        let message = rebalance_not_initialized_failure("reload pool metadata");
+
+        assert_eq!(message, "failed to reload pool metadata: errServerNotInitialized");
     }
 
     #[tokio::test]
