@@ -252,6 +252,10 @@ fn rebalance_admin_internal_error(operation: &str, err: impl std::fmt::Display) 
     s3_error!(InternalError, "Failed to {}: {}", operation, err)
 }
 
+fn rebalance_admin_not_initialized_error(operation: &str) -> S3Error {
+    rebalance_admin_internal_error(operation, "Not init")
+}
+
 fn resolve_rebalance_status_meta_load_error(pool_idx: usize, err: StorageError) -> S3Error {
     if err == StorageError::ConfigNotFound {
         return s3_error!(NoSuchResource, "Pool rebalance is not started");
@@ -286,7 +290,7 @@ impl Operation for RebalanceStart {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Not init"));
+            return Err(rebalance_admin_not_initialized_error("start rebalance"));
         };
 
         validate_start_rebalance_guards(
@@ -362,7 +366,7 @@ impl Operation for RebalanceStatus {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Not init"));
+            return Err(rebalance_admin_not_initialized_error("load rebalance status"));
         };
 
         validate_rebalance_status_pool_guard(store.pools.len())?;
@@ -434,7 +438,7 @@ impl Operation for RebalanceStop {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(s3_error!(InternalError, "Not init"));
+            return Err(rebalance_admin_not_initialized_error("stop rebalance"));
         };
 
         validate_stop_rebalance_guards(store.is_rebalance_conflicting_with_decommission().await)?;
@@ -511,9 +515,9 @@ mod rebalance_handler_tests {
     use super::calculate_rebalance_progress;
     use super::{
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses,
-        rebalance_admin_internal_error, rebalance_pool_used, rebalance_remaining_buckets, rebalance_used_pct,
-        resolve_rebalance_status_meta_load_error, validate_rebalance_status_pool_guard, validate_start_rebalance_guards,
-        validate_stop_rebalance_guards,
+        rebalance_admin_internal_error, rebalance_admin_not_initialized_error, rebalance_pool_used, rebalance_remaining_buckets,
+        rebalance_used_pct, resolve_rebalance_status_meta_load_error, validate_rebalance_status_pool_guard,
+        validate_start_rebalance_guards, validate_stop_rebalance_guards,
     };
     use rustfs_ecstore::{
         error::StorageError,
@@ -883,6 +887,30 @@ mod rebalance_handler_tests {
 
         assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("Failed to persist rebalance stop metadata: disk offline"));
+    }
+
+    #[test]
+    fn test_rebalance_admin_not_initialized_error_formats_start_context() {
+        let err = rebalance_admin_not_initialized_error("start rebalance");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to start rebalance: Not init"));
+    }
+
+    #[test]
+    fn test_rebalance_admin_not_initialized_error_formats_status_context() {
+        let err = rebalance_admin_not_initialized_error("load rebalance status");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to load rebalance status: Not init"));
+    }
+
+    #[test]
+    fn test_rebalance_admin_not_initialized_error_formats_stop_context() {
+        let err = rebalance_admin_not_initialized_error("stop rebalance");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to stop rebalance: Not init"));
     }
 
     #[test]
