@@ -363,6 +363,8 @@ pub enum MetricName {
     ProcessNetworkIOPerInterface,
     /// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
     ProcessStatus,
+    /// Process GPU memory usage in bytes
+    ProcessGpuMemoryUsage,
 
     // Custom metrics
     Custom(String),
@@ -692,6 +694,7 @@ impl MetricName {
             Self::ProcessDiskIO => "disk_io".to_string(),
             Self::ProcessNetworkIO => "network_io".to_string(),
             Self::ProcessNetworkIOPerInterface => "network_io_per_interface".to_string(),
+            Self::ProcessGpuMemoryUsage => "gpu_memory_usage".to_string(),
             Self::ProcessStatus => "status".to_string(),
 
             Self::Custom(name) => name.clone(),

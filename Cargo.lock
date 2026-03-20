@@ -7816,6 +7816,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-utils",
  "sysinfo",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",

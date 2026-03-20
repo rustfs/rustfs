@@ -82,6 +82,8 @@ mod scanner;
 mod stats_collector;
 mod system_cpu;
 mod system_drive;
+#[cfg(feature = "gpu")]
+mod system_gpu;
 mod system_memory;
 mod system_network;
 mod system_process;
@@ -109,6 +111,8 @@ pub use system_drive::{
     DriveCountStats, DriveDetailedStats, ProcessDiskStats, collect_drive_count_metrics, collect_drive_detailed_metrics,
     collect_process_disk_metrics,
 };
+#[cfg(feature = "gpu")]
+pub use system_gpu::{GpuCollector, GpuError, GpuStats, collect_gpu_metrics};
 pub use system_memory::{MemoryStats, ProcessMemoryStats, collect_memory_metrics, collect_process_memory_metrics};
 pub use system_network::{NetworkStats, ProcessNetworkStats, collect_network_metrics, collect_process_network_metrics};
 pub use system_process::{

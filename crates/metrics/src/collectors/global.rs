@@ -96,48 +96,36 @@ pub fn init_metrics_collectors(token: CancellationToken) {
     const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
     const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
 
-    fn parse_interval(msc: &str, legacy_msc: &str) -> Option<u64> {
-        get_env_opt_u64(msc)
-            .or_else(|| get_env_opt_u64(legacy_msc))
-            .filter(|&v| v > 0)
-    }
-
-    // Read intervals from environment or use defaults, ensuring zero is ignored.
-    let cluster_interval = parse_interval(ENV_CLUSTER_METRICS_INTERVAL, LEGACY_CLUSTER_INTERVAL)
-        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_CLUSTER_METRICS_INTERVAL);
-
-    let bucket_interval = parse_interval(ENV_BUCKET_METRICS_INTERVAL, LEGACY_BUCKET_INTERVAL)
-        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_BUCKET_METRICS_INTERVAL);
-
-    let bucket_replication_bandwidth_interval =
-        parse_interval(ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, LEGACY_REPLICATION_BANDWIDTH_INTERVAL)
+    /// Parse metrics interval from environment variables with fallback to default.
+    ///
+    /// Priority: primary_env > legacy_env > default_env > legacy_default > default_value
+    fn parse_metrics_interval(primary_env: &str, legacy_env: &str, default_interval: Duration) -> Duration {
+        get_env_opt_u64(primary_env)
+            .or_else(|| get_env_opt_u64(legacy_env))
             .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
             .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
             .filter(|&v| v > 0)
             .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL);
+            .unwrap_or(default_interval)
+    }
 
-    let node_interval = parse_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL)
-        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_NODE_METRICS_INTERVAL);
+    // Read intervals from environment or use defaults
+    let cluster_interval =
+        parse_metrics_interval(ENV_CLUSTER_METRICS_INTERVAL, LEGACY_CLUSTER_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL);
 
-    let resource_interval = parse_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL)
-        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
-        .or_else(|| get_env_opt_u64(LEGACY_DEFAULT_INTERVAL))
-        .filter(|&v| v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_RESOURCE_METRICS_INTERVAL);
+    let bucket_interval =
+        parse_metrics_interval(ENV_BUCKET_METRICS_INTERVAL, LEGACY_BUCKET_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL);
+
+    let bucket_replication_bandwidth_interval = parse_metrics_interval(
+        ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+        LEGACY_REPLICATION_BANDWIDTH_INTERVAL,
+        DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+    );
+
+    let node_interval = parse_metrics_interval(ENV_NODE_METRICS_INTERVAL, LEGACY_NODE_INTERVAL, DEFAULT_NODE_METRICS_INTERVAL);
+
+    let resource_interval =
+        parse_metrics_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL);
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();
@@ -339,6 +327,26 @@ fn collect_system_monitoring_metrics(pid: Pid) -> Vec<crate::format::PrometheusM
             per_interface,
         };
         metrics.extend(collect_process_network_metrics(&network_stats, Some(&labels)));
+
+        // Collect GPU metrics (if gpu feature is enabled)
+        #[cfg(feature = "gpu")]
+        {
+            use crate::collectors::{GpuCollector, collect_gpu_metrics};
+
+            match GpuCollector::new(pid) {
+                Ok(collector) => match collector.collect() {
+                    Ok(gpu_stats) => {
+                        metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
+                    }
+                    Err(e) => {
+                        warn!("GPU metrics collection failed: {}", e);
+                    }
+                },
+                Err(e) => {
+                    warn!("GPU collector initialization failed: {}", e);
+                }
+            }
+        }
     }
 
     metrics

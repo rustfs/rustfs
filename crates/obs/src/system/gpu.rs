@@ -20,7 +20,30 @@ use nvml_wrapper::enums::device::UsedGpuMemory;
 use sysinfo::Pid;
 use tracing::warn;
 
-/// `GpuCollector` is responsible for collecting GPU memory usage metrics.
+/// `GpuCollector` is responsible for collecting GPU memory usage metrics (DEPRECATED).
+///
+/// **Deprecated**: Use `rustfs_metrics::collectors::GpuCollector` instead.
+/// This struct will be removed in version 0.3.0.
+///
+/// # Migration Guide
+///
+/// Before:
+/// ```ignore
+/// use rustfs_obs::system::gpu::GpuCollector;
+/// let collector = GpuCollector::new(pid)?;
+/// ```
+///
+/// After:
+/// ```ignore
+/// use rustfs_metrics::collectors::GpuCollector;
+/// let collector = GpuCollector::new(pid)?;
+/// ```
+///
+/// Note: Enable `gpu` feature in rustfs-metrics Cargo.toml.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use rustfs_metrics::collectors::GpuCollector instead. This will be removed in v0.3.0."
+)]
 pub struct GpuCollector {
     nvml: Nvml,
     pid: Pid,

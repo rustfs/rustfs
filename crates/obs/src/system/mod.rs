@@ -14,6 +14,21 @@
 
 //! System monitoring module (DEPRECATED).
 //!
+//! **GPU Metrics Migration**
+//!
+//! GPU metrics collection has been moved to `rustfs-metrics` with feature flag `gpu`.
+//!
+//! Before:
+//! ```ignore
+//! use rustfs_obs::system::gpu::GpuCollector;
+//! ```
+//!
+//! After:
+//! ```ignore
+//! // Enable gpu feature in Cargo.toml: rustfs-metrics = { features = ["gpu"] }
+//! use rustfs_metrics::collectors::GpuCollector;
+//! ```
+//!
 //! **Deprecation Notice**: This module has been migrated to `rustfs-metrics`.
 //! Please use `rustfs_metrics::init_metrics_system()` instead.
 //!
