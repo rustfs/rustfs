@@ -70,4 +70,3 @@ pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
-serde_json = { workspace = true }

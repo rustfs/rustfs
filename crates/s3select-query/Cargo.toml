@@ -37,3 +37,6 @@ s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lib]
+doctest = false

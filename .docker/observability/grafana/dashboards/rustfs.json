@@ -91,7 +91,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_process_uptime_seconds{job=~\"$job\"}",
+          "expr": "gauge_rustfs_process_uptime_seconds{job=~\"$job\"}",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -223,7 +223,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_buckets_total{job=~\"$job\"})",
+          "expr": "sum(gauge_rustfs_cluster_buckets_total{job=~\"$job\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -289,7 +289,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_objects_total{job=~\"$job\"})",
+          "expr": "sum(gauge_rustfs_cluster_objects_total{job=~\"$job\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -427,7 +427,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"})",
+          "expr": "sum(gauge_rustfs_cluster_capacity_used_bytes{job=~\"$job\"})",
           "legendFormat": "Used",
           "range": true,
           "refId": "A"
@@ -438,7 +438,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "sum(gauge_rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
           "hide": false,
           "legendFormat": "Total",
           "range": true,
@@ -450,7 +450,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "sum(gauge_rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(gauge_rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "Percent",
@@ -1971,7 +1971,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (gauge_rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "legendFormat": "{{drive}} (bytes)",
           "range": true,
           "refId": "A"
@@ -1982,7 +1982,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (gauge_rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(gauge_rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "{{drive}} (percent)",
@@ -4048,5 +4048,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 11
+  "version": 12
 }

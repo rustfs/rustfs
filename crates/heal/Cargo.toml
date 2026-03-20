@@ -50,3 +50,6 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 http = { workspace = true }
+
+[lib]
+doctest = false

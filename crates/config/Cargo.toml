@@ -37,3 +37,6 @@ constants = ["dep:const-str"]
 notify = ["dep:const-str", "constants"]
 observability = ["constants"]
 opa = ["constants"]
+
+[lib]
+doctest = false

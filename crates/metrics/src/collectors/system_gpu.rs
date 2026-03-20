@@ -77,7 +77,6 @@ pub enum GpuError {
 /// GPU metrics collector.
 ///
 /// Collects GPU memory usage metrics for a specific process using NVML.
-
 pub struct GpuCollector {
     /// NVML instance for GPU access
     nvml: Nvml,
@@ -170,7 +169,6 @@ impl GpuCollector {
 /// let labels = vec![("process_pid", Cow::Borrowed("1234"))];
 /// let metrics = collect_gpu_metrics(&stats, &labels);
 /// ```
-
 pub fn collect_gpu_metrics(stats: &GpuStats, labels: &[(&'static str, Cow<'static, str>)]) -> Vec<PrometheusMetric> {
     let mut metric = PrometheusMetric::from_descriptor(&PROCESS_GPU_MEMORY_USAGE_MD, stats.memory_usage as f64);
     metric.labels.extend(labels.iter().map(|(k, v)| (*k, v.clone())));
@@ -178,7 +176,6 @@ pub fn collect_gpu_metrics(stats: &GpuStats, labels: &[(&'static str, Cow<'stati
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 

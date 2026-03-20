@@ -1227,8 +1227,6 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.2.17",
- "memmap2 0.9.10",
- "rayon-core",
 ]
 
 [[package]]
@@ -7600,7 +7598,6 @@ dependencies = [
  "rustls",
  "s3s",
  "serde",
- "serde_bytes",
  "serde_json",
  "serde_urlencoded",
  "serial_test",
@@ -7876,7 +7873,6 @@ dependencies = [
  "rustfs-config",
  "rustfs-utils",
  "serde",
- "serde_json",
  "sysinfo",
  "temp-env",
  "tempfile",
@@ -7934,7 +7930,6 @@ dependencies = [
  "hex",
  "hmac 0.13.0-rc.5",
  "http 1.4.0",
- "http-body 1.0.1",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -8158,7 +8153,6 @@ version = "0.0.5"
 dependencies = [
  "base64-simd",
  "blake2 0.11.0-rc.5",
- "blake3",
  "brotli",
  "bytes",
  "convert_case 0.11.0",
@@ -8609,16 +8603,6 @@ checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
 dependencies = [
  "ordered-float",
  "serde",
-]
-
-[[package]]
-name = "serde_bytes"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
-dependencies = [
- "serde",
- "serde_core",
 ]
 
 [[package]]

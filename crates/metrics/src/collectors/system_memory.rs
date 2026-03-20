@@ -154,7 +154,7 @@ mod tests {
     fn test_collect_process_memory_metrics_with_labels() {
         let stats = ProcessMemoryStats {
             resident: 256 * 1024 * 1024,
-            virtual_mem: 1 * 1024 * 1024 * 1024,
+            virtual_mem: 1024 * 1024 * 1024,
         };
 
         let labels = vec![("process_pid", Cow::Borrowed("12345"))];

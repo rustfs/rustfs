@@ -56,3 +56,6 @@ tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { workspace = true, features = ["test-util"] }
+
+[lib]
+doctest = false
