@@ -70,6 +70,20 @@ pub struct NotificationPeerErr {
     pub err: Option<Error>,
 }
 
+fn collect_unreachable_peer_failures<T>(clients: &[Option<T>], operation: &str) -> Vec<String> {
+    clients
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, client)| {
+            if client.is_none() {
+                Some(format!("peer[{idx}] {operation} failed: peer is not reachable"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 impl NotificationSys {
     pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
         if self.all_peer_clients.is_empty() {
@@ -378,7 +392,7 @@ impl NotificationSys {
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut failures = Vec::new();
+        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "reload_pool_meta");
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
             futures.push(client.reload_pool_meta());
@@ -397,7 +411,7 @@ impl NotificationSys {
 
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
-        let mut failures = Vec::new();
+        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "load_rebalance_meta");
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for (i, client) in self.peer_clients.iter().flatten().enumerate() {
             warn!(
@@ -431,7 +445,7 @@ impl NotificationSys {
         // self.load_rebalance_meta(false).await;
         // warn!("notification stop_rebalance load_rebalance_meta done");
 
-        let mut failures = Vec::new();
+        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "stop_rebalance");
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
@@ -867,6 +881,22 @@ mod tests {
     #[test]
     fn aggregate_notification_failures_returns_ok_when_empty() {
         assert!(aggregate_notification_failures("stop_rebalance", Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn collect_unreachable_peer_failures_ignores_reachable_slots() {
+        let failures = collect_unreachable_peer_failures(&[Some(()), Some(())], "stop_rebalance");
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn collect_unreachable_peer_failures_reports_missing_peers_with_operation_context() {
+        let failures = collect_unreachable_peer_failures(&[Some(()), None, None], "load_rebalance_meta");
+
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("peer[1] load_rebalance_meta failed"));
+        assert!(failures[1].contains("peer[2] load_rebalance_meta failed"));
+        assert!(failures.iter().all(|failure| failure.contains("peer is not reachable")));
     }
 
     #[test]
