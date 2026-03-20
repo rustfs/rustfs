@@ -33,7 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{self, AsyncWriteExt};
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 use tower::Service;
 use tracing::warn;
 
@@ -245,7 +245,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    let copied = match copy_body_to_writer(req.into_body().into_data_stream(), &mut file).await {
+    let copied = match write_body_chunks_to_writer(req.into_body().into_data_stream(), &mut file).await {
         Ok(copied) => copied,
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}")),
     };
@@ -260,14 +260,21 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     empty_ok()
 }
 
-async fn copy_body_to_writer<S, E, W>(body: S, writer: &mut W) -> io::Result<u64>
+async fn write_body_chunks_to_writer<S, E, W>(body: S, writer: &mut W) -> io::Result<u64>
 where
     S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
     E: Into<BoxError>,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut reader = StreamReader::new(body.map_err(io::Error::other));
-    tokio::io::copy(&mut reader, writer).await
+    let mut body = body;
+    let mut copied = 0_u64;
+
+    while let Some(bytes) = body.try_next().await.map_err(io::Error::other)? {
+        copied += bytes.len() as u64;
+        writer.write_all(&bytes).await?;
+    }
+
+    Ok(copied)
 }
 
 fn parse_query<T>(req: &Request<Incoming>) -> Result<T, RpcErrorResponse>
@@ -325,14 +332,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_body_to_writer_streams_all_chunks() {
+    async fn write_body_chunks_to_writer_streams_all_chunks() {
         let (mut reader, mut writer) = tokio::io::duplex(64);
         let body = iter(vec![
             Ok::<Bytes, io::Error>(Bytes::from_static(b"hello ")),
             Ok(Bytes::from_static(b"world")),
         ]);
 
-        let copied = copy_body_to_writer(body, &mut writer).await.expect("copy succeeds");
+        let copied = write_body_chunks_to_writer(body, &mut writer).await.expect("copy succeeds");
         drop(writer);
 
         let mut out = Vec::new();
