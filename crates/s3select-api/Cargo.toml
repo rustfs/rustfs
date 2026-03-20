@@ -46,3 +46,6 @@ tokio-util.workspace = true
 tracing.workspace = true
 transform-stream.workspace = true
 url.workspace = true
+
+[lib]
+doctest = false

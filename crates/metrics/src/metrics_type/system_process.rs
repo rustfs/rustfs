@@ -186,3 +186,67 @@ pub static PROCESS_VIRTUAL_MEMORY_MAX_BYTES_MD: LazyLock<MetricDescriptor> = Laz
         subsystems::SYSTEM_PROCESS,
     )
 });
+
+// ============================================================================
+// Process-level system monitoring metrics (migrated from rustfs-obs::system)
+// ============================================================================
+
+/// Process CPU usage percentage (0-100)
+pub static PROCESS_CPU_USAGE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessCPUUsage,
+        "The percentage of CPU in use by the process",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
+
+/// Process CPU utilization percentage (considering multiple cores)
+pub static PROCESS_CPU_UTILIZATION_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessCPUUtilization,
+        "The amount of CPU in use by the process (considering multiple cores)",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
+
+/// Process disk I/O bytes
+pub static PROCESS_DISK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessDiskIO,
+        "Disk bytes transferred by the process",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
+
+/// Process network I/O bytes
+pub static PROCESS_NETWORK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessNetworkIO,
+        "Network bytes transferred by the process",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
+
+/// Process network I/O bytes per interface
+pub static PROCESS_NETWORK_IO_PER_INTERFACE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessNetworkIOPerInterface,
+        "Network bytes transferred by the process (per interface)",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
+
+/// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
+pub static PROCESS_STATUS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ProcessStatus,
+        "Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)",
+        &[],
+        subsystems::SYSTEM_PROCESS,
+    )
+});
