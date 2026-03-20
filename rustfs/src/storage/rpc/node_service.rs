@@ -807,7 +807,7 @@ impl Node for NodeService {
         let Some(store) = new_object_layer_fn() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
-                error_info: Some("errServerNotInitialized".to_string()),
+                error_info: Some(rebalance_not_initialized_failure("stop rebalance")),
             }));
         };
 
@@ -839,7 +839,7 @@ impl Node for NodeService {
         let Some(store) = new_object_layer_fn() else {
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
-                error_info: Some("errServerNotInitialized".to_string()),
+                error_info: Some(rebalance_not_initialized_failure("load rebalance metadata")),
             }));
         };
 
@@ -884,6 +884,10 @@ impl Node for NodeService {
 
 fn rebalance_failure_info(operation: &str, err: impl std::fmt::Display) -> String {
     format!("failed to {operation}: {err}")
+}
+
+fn rebalance_not_initialized_failure(operation: &str) -> String {
+    rebalance_failure_info(operation, "errServerNotInitialized")
 }
 
 #[cfg(test)]
@@ -2011,6 +2015,20 @@ mod tests {
         let message = rebalance_failure_info("start rebalance", std::io::Error::other("boom"));
 
         assert_eq!(message, "failed to start rebalance: boom");
+    }
+
+    #[test]
+    fn test_rebalance_not_initialized_failure_formats_stop_context() {
+        let message = rebalance_not_initialized_failure("stop rebalance");
+
+        assert_eq!(message, "failed to stop rebalance: errServerNotInitialized");
+    }
+
+    #[test]
+    fn test_rebalance_not_initialized_failure_formats_load_context() {
+        let message = rebalance_not_initialized_failure("load rebalance metadata");
+
+        assert_eq!(message, "failed to load rebalance metadata: errServerNotInitialized");
     }
 
     #[tokio::test]
