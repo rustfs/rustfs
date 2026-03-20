@@ -21,9 +21,11 @@
 use super::{InfoOpts, InfoType};
 use crate::version::build;
 use rustfs_credentials::Masked;
+use serde::Serialize;
 use std::fmt;
 
 /// CPU information
+#[derive(Serialize)]
 struct CpuInfo {
     /// Number of logical CPU cores
     core_count: usize,
@@ -59,19 +61,10 @@ impl CpuInfo {
             usage_percent,
         }
     }
-
-    fn format(&self) -> String {
-        format!(
-            "CPU Cores: {}\n\
-             CPU Brand: {}\n\
-             CPU Frequency: {} MHz\n\
-             CPU Usage: {:.1}%",
-            self.core_count, self.brand, self.frequency_mhz, self.usage_percent
-        )
-    }
 }
 
 /// Memory information
+#[derive(Serialize)]
 struct MemoryInfo {
     /// Total system memory in bytes
     total_bytes: u64,
@@ -129,25 +122,10 @@ impl MemoryInfo {
             format!("{} B", bytes)
         }
     }
-
-    fn format(&self) -> String {
-        format!(
-            "Total Memory: {}\n\
-             Used Memory: {} ({:.1}%)\n\
-             Available Memory: {}\n\
-             Total Swap: {}\n\
-             Used Swap: {}",
-            Self::format_bytes(self.total_bytes),
-            Self::format_bytes(self.used_bytes),
-            self.usage_percent,
-            Self::format_bytes(self.available_bytes),
-            Self::format_bytes(self.total_swap_bytes),
-            Self::format_bytes(self.used_swap_bytes)
-        )
-    }
 }
 
 /// Disk information
+#[derive(Serialize)]
 struct DiskInfo {
     /// Disk mount point
     mount_point: String,
@@ -195,30 +173,10 @@ impl DiskInfo {
             })
             .collect()
     }
-
-    fn format(&self) -> String {
-        format!(
-            "  [{}] {}\n\
-               Mount: {}\n\
-               Type: {}\n\
-               Total: {}\n\
-               Used: {} ({:.1}%)\n\
-               Available: {}\n\
-               Removable: {}",
-            if self.is_removable { "R" } else { "F" },
-            self.name,
-            self.mount_point,
-            self.file_system,
-            MemoryInfo::format_bytes(self.total_bytes),
-            MemoryInfo::format_bytes(self.used_bytes),
-            self.usage_percent,
-            MemoryInfo::format_bytes(self.available_bytes),
-            self.is_removable
-        )
-    }
 }
 
 /// Service disk information (disk where the service data is stored)
+#[derive(Serialize)]
 struct ServiceDiskInfo {
     /// Disk mount point
     mount_point: String,
@@ -289,14 +247,16 @@ impl ServiceDiskInfo {
         };
 
         format!(
-            "=== Service Disk Information ===\n\
-             Disk: {}\n\
-             Mount Point: {}\n\
-             File System: {}\n\
-             Total Space: {}\n\
-             Used Space: {} ({:.1}%)\n\
-             Available Space: {}\n\
-             Served Volumes: {}",
+            "## Service Disk Information\n\n\
+             | Property | Value |\n\
+             |----------|-------|\n\
+             | Disk | {} |\n\
+             | Mount Point | {} |\n\
+             | File System | {} |\n\
+             | Total Space | {} |\n\
+             | Used Space | {} ({:.1}%) |\n\
+             | Available Space | {} |\n\
+             | Served Volumes | {} |",
             self.name,
             self.mount_point,
             self.file_system,
@@ -310,6 +270,7 @@ impl ServiceDiskInfo {
 }
 
 /// System basic information
+#[derive(Serialize)]
 struct SystemInfo {
     os_type: String,
     os_version: String,
@@ -344,37 +305,64 @@ impl SystemInfo {
     }
 
     fn format(&self) -> String {
-        let disks_str = if self.disks.is_empty() {
-            "  (no disks found)".to_string()
-        } else {
-            self.disks.iter().map(|d| d.format()).collect::<Vec<_>>().join("\n")
-        };
+        let mut output = String::new();
 
-        format!(
-            "=== System Information ===\n\
-             OS: {}\n\
-             OS Version: {}\n\
-             Architecture: {}\n\
-             Hostname: {}\n\
-             Kernel Version: {}\n\
-             \n\
-             === CPU Information ===\n\
-             {}\n\
-             \n\
-             === Memory Information ===\n\
-             {}\n\
-             \n\
-             === Disk Information ===\n\
-             {}",
-            self.os_type,
-            self.os_version,
-            self.architecture,
-            self.hostname,
-            self.kernel_version,
-            self.cpu.format(),
-            self.memory.format(),
-            disks_str
-        )
+        // System Information Table
+        output.push_str("## System Information\n\n");
+        output.push_str("| Property | Value |\n");
+        output.push_str("|----------|-------|\n");
+        output.push_str(&format!("| OS | {} |\n", self.os_type));
+        output.push_str(&format!("| OS Version | {} |\n", self.os_version));
+        output.push_str(&format!("| Architecture | {} |\n", self.architecture));
+        output.push_str(&format!("| Hostname | {} |\n", self.hostname));
+        output.push_str(&format!("| Kernel Version | {} |\n", self.kernel_version));
+
+        // CPU Information Table
+        output.push_str("\n## CPU Information\n\n");
+        output.push_str("| Property | Value |\n");
+        output.push_str("|----------|-------|\n");
+        output.push_str(&format!("| Cores | {} |\n", self.cpu.core_count));
+        output.push_str(&format!("| Brand | {} |\n", self.cpu.brand));
+        output.push_str(&format!("| Frequency | {} MHz |\n", self.cpu.frequency_mhz));
+        output.push_str(&format!("| Usage | {:.1}% |\n", self.cpu.usage_percent));
+
+        // Memory Information Table
+        output.push_str("\n## Memory Information\n\n");
+        output.push_str("| Property | Value |\n");
+        output.push_str("|----------|-------|\n");
+        output.push_str(&format!("| Total | {} |\n", MemoryInfo::format_bytes(self.memory.total_bytes)));
+        output.push_str(&format!(
+            "| Used | {} ({:.1}%) |\n",
+            MemoryInfo::format_bytes(self.memory.used_bytes),
+            self.memory.usage_percent
+        ));
+        output.push_str(&format!("| Available | {} |\n", MemoryInfo::format_bytes(self.memory.available_bytes)));
+        output.push_str(&format!("| Total Swap | {} |\n", MemoryInfo::format_bytes(self.memory.total_swap_bytes)));
+        output.push_str(&format!("| Used Swap | {} |\n", MemoryInfo::format_bytes(self.memory.used_swap_bytes)));
+
+        // Disk Information Table
+        output.push_str("\n## Disk Information\n\n");
+        if self.disks.is_empty() {
+            output.push_str("*No disks found*\n");
+        } else {
+            output.push_str("| Name | Mount Point | Type | Total | Used | Available | Usage | Removable |\n");
+            output.push_str("|------|-------------|------|-------|------|-----------|-------|----------|\n");
+            for disk in &self.disks {
+                output.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {:.1}% | {} |\n",
+                    disk.name,
+                    disk.mount_point,
+                    disk.file_system,
+                    MemoryInfo::format_bytes(disk.total_bytes),
+                    MemoryInfo::format_bytes(disk.used_bytes),
+                    MemoryInfo::format_bytes(disk.available_bytes),
+                    disk.usage_percent,
+                    disk.is_removable
+                ));
+            }
+        }
+
+        output
     }
 }
 impl fmt::Display for SystemInfo {
@@ -384,6 +372,7 @@ impl fmt::Display for SystemInfo {
 }
 
 /// Runtime information
+#[derive(Serialize)]
 struct RuntimeInfo {
     process_id: u32,
     memory_usage_mb: f64,
@@ -436,11 +425,13 @@ impl RuntimeInfo {
         };
 
         format!(
-            "=== Runtime Information ===\n\
-             Process ID: {}\n\
-             Memory Usage: {:.2} MB\n\
-             CPU Usage: {:.2}%\n\
-             CPU Parallelism (logical cores): {}",
+            "## Runtime Information\n\n\
+             | Property | Value |\n\
+             |----------|-------|\n\
+             | Process ID | {} |\n\
+             | Memory Usage | {:.2} MB |\n\
+             | CPU Usage | {:.2}% |\n\
+             | CPU Parallelism | {} |",
             pid_display, self.memory_usage_mb, self.cpu_usage_percent, self.thread_count
         )
     }
@@ -457,16 +448,18 @@ struct BuildInfo;
 impl BuildInfo {
     fn format() -> String {
         format!(
-            "=== Build Information ===\n\
-             Version: {}\n\
-             Build Time: {}\n\
-             Build Profile: {}\n\
-             Build OS: {}\n\
-             Rust Version: {}\n\
-             Git Branch: {}\n\
-             Git Commit: {}\n\
-             Git Tag: {}\n\
-             Git Status: {}",
+            "## Build Information\n\n\
+             | Property | Value |\n\
+             |----------|-------|\n\
+             | Version | {} |\n\
+             | Build Time | {} |\n\
+             | Build Profile | {} |\n\
+             | Build OS | {} |\n\
+             | Rust Version | {} |\n\
+             | Git Branch | {} |\n\
+             | Git Commit | {} |\n\
+             | Git Tag | {} |\n\
+             | Git Status | {} |",
             build::PKG_VERSION,
             build::BUILD_TIME,
             build::BUILD_RUST_CHANNEL,
@@ -486,6 +479,214 @@ impl fmt::Display for BuildInfo {
     }
 }
 
+// ============================================================================
+// JSON Output Structures
+// ============================================================================
+
+/// Build information for JSON output
+#[derive(Serialize)]
+struct BuildInfoJson {
+    version: &'static str,
+    build_time: &'static str,
+    build_profile: &'static str,
+    build_os: &'static str,
+    rust_version: &'static str,
+    git_branch: &'static str,
+    git_commit: &'static str,
+    git_tag: &'static str,
+    git_status: &'static str,
+}
+
+impl BuildInfo {
+    fn collect_json() -> BuildInfoJson {
+        BuildInfoJson {
+            version: build::PKG_VERSION,
+            build_time: build::BUILD_TIME,
+            build_profile: build::BUILD_RUST_CHANNEL,
+            build_os: build::BUILD_OS,
+            rust_version: build::RUST_VERSION,
+            git_branch: build::BRANCH,
+            git_commit: build::COMMIT_HASH,
+            git_tag: build::TAG,
+            git_status: build::GIT_STATUS_FILE,
+        }
+    }
+}
+
+/// Configuration information for JSON output
+#[derive(Serialize)]
+struct ConfigInfoJson {
+    address: String,
+    console_enable: bool,
+    console_address: String,
+    region: Option<String>,
+    access_key: String,
+    obs_endpoint: String,
+    tls_path: Option<String>,
+    kms_enable: bool,
+    kms_backend: String,
+    buffer_profile: String,
+    workload_profile: Option<WorkloadProfileJson>,
+}
+
+/// Workload profile information for JSON output
+#[derive(Serialize)]
+struct WorkloadProfileJson {
+    name: String,
+    buffer_min_size: usize,
+    buffer_max_size: usize,
+    default_unknown: usize,
+}
+
+fn collect_config_info_json() -> ConfigInfoJson {
+    let snapshot = super::get_config_snapshot_for_display();
+
+    // Get workload profile info
+    let workload_profile = {
+        use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+        if is_buffer_profile_enabled() {
+            let config = get_global_buffer_config();
+            let profile = config.workload_profile();
+            let buffer_config = profile.config();
+            Some(WorkloadProfileJson {
+                name: config.workload_name().to_string(),
+                buffer_min_size: buffer_config.min_size,
+                buffer_max_size: buffer_config.max_size,
+                default_unknown: buffer_config.default_unknown,
+            })
+        } else {
+            None
+        }
+    };
+
+    ConfigInfoJson {
+        address: snapshot.address.clone(),
+        console_enable: snapshot.console_enable,
+        console_address: snapshot.console_address.clone(),
+        region: snapshot.region.clone(),
+        access_key: snapshot.access_key.clone(),
+        obs_endpoint: snapshot.obs_endpoint.clone(),
+        tls_path: snapshot.tls_path.clone(),
+        kms_enable: snapshot.kms_enable,
+        kms_backend: snapshot.kms_backend.clone(),
+        buffer_profile: snapshot.buffer_profile.clone(),
+        workload_profile,
+    }
+}
+
+/// Feature information for JSON output
+#[derive(Serialize)]
+struct FeatureInfoJson {
+    name: &'static str,
+    enabled: bool,
+    description: &'static str,
+}
+
+/// Dependency information for JSON output
+#[derive(Serialize)]
+struct DepsInfoJson {
+    enabled_count: usize,
+    total_count: usize,
+    features: Vec<FeatureInfoJson>,
+}
+
+fn collect_deps_info_json() -> DepsInfoJson {
+    let features = vec![
+        FeatureInfoJson {
+            name: "metrics",
+            enabled: cfg!(feature = "metrics"),
+            description: "Metrics collection and reporting",
+        },
+        FeatureInfoJson {
+            name: "ftps",
+            enabled: cfg!(feature = "ftps"),
+            description: "FTPS protocol support",
+        },
+        FeatureInfoJson {
+            name: "swift",
+            enabled: cfg!(feature = "swift"),
+            description: "Swift storage backend",
+        },
+        FeatureInfoJson {
+            name: "webdav",
+            enabled: cfg!(feature = "webdav"),
+            description: "WebDAV protocol support",
+        },
+        FeatureInfoJson {
+            name: "license",
+            enabled: cfg!(feature = "license"),
+            description: "License validation",
+        },
+        FeatureInfoJson {
+            name: "full",
+            enabled: cfg!(feature = "full"),
+            description: "All features enabled",
+        },
+    ];
+
+    let enabled_count = features.iter().filter(|f| f.enabled).count();
+    let total_count = features.len();
+
+    DepsInfoJson {
+        enabled_count,
+        total_count,
+        features,
+    }
+}
+
+/// All information combined for JSON output
+#[derive(Serialize)]
+struct AllInfoJson {
+    system: SystemInfo,
+    runtime: RuntimeInfo,
+    build: BuildInfoJson,
+    config: ConfigInfoJson,
+    deps: DepsInfoJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_disk: Option<ServiceDiskInfo>,
+}
+
+/// Print info as JSON
+fn print_info_json<T: Serialize>(info: &T) {
+    match serde_json::to_string_pretty(info) {
+        Ok(json) => println!("{}", json),
+        Err(e) => eprintln!("Failed to serialize info to JSON: {}", e),
+    }
+}
+
+/// Execute info command with JSON output
+fn execute_info_json(info_type: Option<InfoType>, volumes: &[String]) {
+    match info_type {
+        None => {
+            // Output all info as nested JSON object
+            let all_info = AllInfoJson {
+                system: SystemInfo::collect(),
+                runtime: RuntimeInfo::collect(),
+                build: BuildInfo::collect_json(),
+                config: collect_config_info_json(),
+                deps: collect_deps_info_json(),
+                service_disk: ServiceDiskInfo::collect(volumes),
+            };
+            print_info_json(&all_info);
+        }
+        Some(InfoType::System) => {
+            print_info_json(&SystemInfo::collect());
+        }
+        Some(InfoType::Runtime) => {
+            print_info_json(&RuntimeInfo::collect());
+        }
+        Some(InfoType::Build) => {
+            print_info_json(&BuildInfo::collect_json());
+        }
+        Some(InfoType::Config) => {
+            print_info_json(&collect_config_info_json());
+        }
+        Some(InfoType::Deps) => {
+            print_info_json(&collect_deps_info_json());
+        }
+    }
+}
+
 /// Configuration information display
 fn format_config_info() -> String {
     // Get config snapshot for display (from global if initialized, otherwise from env)
@@ -497,30 +698,34 @@ fn format_config_info() -> String {
     // Mask the access key for display
     let masked_access_key = &Masked(Some(&snapshot.access_key));
 
+    let obs_endpoint = if snapshot.obs_endpoint.is_empty() {
+        "(not set)"
+    } else {
+        &snapshot.obs_endpoint
+    };
+
     format!(
-        "=== Configuration Information ===\n\
-         Server Address: {}\n\
-         Console Enable: {}\n\
-         Console Address: {}\n\
-         Region: {}\n\
-         Access Key: {}\n\
-         Secret Key: ****\n\
-         OBS Endpoint: {}\n\
-         TLS Path: {}\n\
-         KMS Enabled: {}\n\
-         KMS Backend: {}\n\
-         Buffer Profile: {}\n\
+        "## Configuration Information\n\n\
+         | Property | Value |\n\
+         |----------|-------|\n\
+         | Server Address | {} |\n\
+         | Console Enable | {} |\n\
+         | Console Address | {} |\n\
+         | Region | {} |\n\
+         | Access Key | {} |\n\
+         | Secret Key | **** |\n\
+         | OBS Endpoint | {} |\n\
+         | TLS Path | {} |\n\
+         | KMS Enabled | {} |\n\
+         | KMS Backend | {} |\n\
+         | Buffer Profile | {} |\n\
          {}",
         snapshot.address,
         snapshot.console_enable,
         snapshot.console_address,
         snapshot.region.as_deref().unwrap_or("(not set)"),
         masked_access_key,
-        if snapshot.obs_endpoint.is_empty() {
-            "(not set)"
-        } else {
-            &snapshot.obs_endpoint
-        },
+        obs_endpoint,
         snapshot.tls_path.as_deref().unwrap_or("(not set)"),
         snapshot.kms_enable,
         snapshot.kms_backend,
@@ -534,7 +739,7 @@ fn get_workload_profile_info() -> String {
     use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
 
     if !is_buffer_profile_enabled() {
-        return "Workload Profile: (disabled)".to_string();
+        return "| Workload Profile | (disabled) |".to_string();
     }
 
     let config = get_global_buffer_config();
@@ -543,18 +748,16 @@ fn get_workload_profile_info() -> String {
     let buffer_config = profile.config();
 
     format!(
-        "Workload Profile: {}\n\
-         Buffer Min Size: {} bytes\n\
-         Buffer Max Size: {} bytes\n\
-         Default Unknown: {} bytes",
+        "| Workload Profile | {} |\n\
+         | Buffer Min Size | {} bytes |\n\
+         | Buffer Max Size | {} bytes |\n\
+         | Default Unknown | {} bytes |",
         name, buffer_config.min_size, buffer_config.max_size, buffer_config.default_unknown
     )
 }
 
 /// Dependency information
 fn format_deps_info() -> String {
-    let mut output = String::from("=== Build Features ===\n");
-
     // Check which features are enabled at compile time
     let features = [
         ("metrics", cfg!(feature = "metrics"), "Metrics collection and reporting"),
@@ -566,24 +769,36 @@ fn format_deps_info() -> String {
     ];
 
     let enabled_count = features.iter().filter(|(_, enabled, _)| *enabled).count();
-    output.push_str(&format!("Enabled Features: {}/{}\n\n", enabled_count, features.len()));
 
-    output.push_str("Feature Status:\n");
+    let mut output = format!(
+        "## Build Features\n\n\
+         | Property | Value |\n\
+         |----------|-------|\n\
+         | Enabled Features | {}/{} |\n\n",
+        enabled_count,
+        features.len()
+    );
+
+    output.push_str("### Feature Status\n\n");
+    output.push_str("| Feature | Status | Description |\n");
+    output.push_str("|---------|--------|-------------|\n");
     for (name, enabled, description) in features {
-        let status = if enabled { "[x]" } else { "[ ]" };
-        output.push_str(&format!("  {} {} - {}\n", status, name, description));
+        let status = if enabled { "✓" } else { "✗" };
+        output.push_str(&format!("| {} | {} | {} |\n", name, status, description));
     }
 
-    // Show default features info
-    output.push_str("\n--- Default Features ---\n");
-    output.push_str("  metrics (enabled by default)\n");
+    output.push_str("\n### Default Features\n\n");
+    output.push_str("| Feature | Note |\n");
+    output.push_str("|---------|------|\n");
+    output.push_str("| metrics | enabled by default |\n");
 
-    // Show feature dependencies
-    output.push_str("\n--- Feature Dependencies ---\n");
-    output.push_str("  full = metrics + ftps + swift + webdav\n");
-    output.push_str("  ftps -> rustfs-protocols/ftps\n");
-    output.push_str("  swift -> rustfs-protocols/swift\n");
-    output.push_str("  webdav -> rustfs-protocols/webdav\n");
+    output.push_str("\n### Feature Dependencies\n\n");
+    output.push_str("| Feature | Dependencies |\n");
+    output.push_str("|---------|-------------|\n");
+    output.push_str("| full | metrics + ftps + swift + webdav |\n");
+    output.push_str("| ftps | rustfs-protocols/ftps |\n");
+    output.push_str("| swift | rustfs-protocols/swift |\n");
+    output.push_str("| webdav | rustfs-protocols/webdav |\n");
 
     output
 }
@@ -601,6 +816,13 @@ pub fn execute_info_with_volumes(opts: &InfoOpts, volumes: &[String]) {
         opts.info_type
     };
 
+    // JSON output path
+    if opts.json {
+        execute_info_json(info_type, volumes);
+        return;
+    }
+
+    // Markdown output path (default)
     match info_type {
         None => {
             // Display all information
