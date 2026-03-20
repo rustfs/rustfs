@@ -33,6 +33,7 @@ pub mod request;
 pub mod scanner;
 pub mod system_cpu;
 pub mod system_drive;
+pub mod system_gpu;
 pub mod system_memory;
 pub mod system_network;
 pub mod system_process;

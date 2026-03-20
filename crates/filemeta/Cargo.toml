@@ -51,3 +51,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[lib]
+doctest = false
