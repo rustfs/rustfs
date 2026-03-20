@@ -88,6 +88,10 @@ fn resolve_notification_peer_result<T>(operation: &str, peer: &str, result: Resu
     result.err().map(|err| format!("peer {peer} {operation} failed: {err}"))
 }
 
+fn notification_not_initialized_error(operation: &str) -> Error {
+    Error::other(format!("{operation}: object layer not initialized"))
+}
+
 impl NotificationSys {
     pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
         if self.all_peer_clients.is_empty() {
@@ -443,7 +447,7 @@ impl NotificationSys {
         warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
-            return Err(Error::other("stop_rebalance: not init"));
+            return Err(notification_not_initialized_error("stop_rebalance"));
         };
 
         // warn!("notification stop_rebalance load_rebalance_meta");
@@ -920,6 +924,14 @@ mod tests {
 
         assert!(failure.contains("peer peer-a:9000 load_rebalance_meta(start=true) failed"));
         assert!(failure.contains("boom"));
+    }
+
+    #[test]
+    fn notification_not_initialized_error_wraps_operation_context() {
+        let err = notification_not_initialized_error("stop_rebalance");
+        let message = err.to_string();
+
+        assert!(message.contains("stop_rebalance: object layer not initialized"));
     }
 
     #[test]
