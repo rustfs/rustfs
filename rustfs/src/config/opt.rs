@@ -113,7 +113,18 @@ impl Opt {
         let _ = apply_external_env_compat();
         let args: Vec<String> = args.into_iter().map(|a| a.into().to_string_lossy().into_owned()).collect();
         let args = preprocess_args_for_legacy(args);
-        let cli = Cli::try_parse_from(args)?;
+        let cli = match Cli::try_parse_from(args) {
+            Ok(cli) => cli,
+            Err(e) => {
+                // Handle help and version display - these are not real errors
+                if e.kind() == clap::error::ErrorKind::DisplayHelp || e.kind() == clap::error::ErrorKind::DisplayVersion {
+                    // Print the help/version message and exit successfully
+                    e.print().ok();
+                    std::process::exit(0);
+                }
+                return Err(e);
+            }
+        };
         match cli.command {
             Some(Commands::Info(opts)) => Ok(CommandResult::Info(opts)),
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
