@@ -35,3 +35,6 @@ hyper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+
+[lib]
+doctest = false

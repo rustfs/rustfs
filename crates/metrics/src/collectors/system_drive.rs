@@ -18,9 +18,14 @@
 //!
 //! Collects detailed drive/disk metrics including capacity, I/O statistics,
 //! error counts, and health status.
+//!
+//! This module provides both system-level and process-level disk metrics,
+//! with process-level metrics migrated from `rustfs-obs::system`.
 
 use crate::format::PrometheusMetric;
 use crate::metrics_type::system_drive::*;
+use crate::metrics_type::system_process::PROCESS_DISK_IO_MD;
+use std::borrow::Cow;
 
 /// Detailed drive statistics for a single drive.
 #[derive(Debug, Clone, Default)]
@@ -161,6 +166,44 @@ pub fn collect_drive_count_metrics(stats: &DriveCountStats) -> Vec<PrometheusMet
         PrometheusMetric::from_descriptor(&DRIVE_ONLINE_COUNT_MD, stats.online_count as f64),
         PrometheusMetric::from_descriptor(&DRIVE_COUNT_MD, stats.total_count as f64),
     ]
+}
+
+/// Process disk I/O statistics.
+///
+/// Contains disk I/O metrics for a specific process.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessDiskStats {
+    /// Bytes read from disk
+    pub read_bytes: u64,
+    /// Bytes written to disk
+    pub written_bytes: u64,
+}
+
+/// Collects process disk I/O metrics from the given stats.
+///
+/// Returns a vector of Prometheus metrics for process disk I/O statistics.
+/// Each metric includes a `direction` label ("read" or "write").
+///
+/// # Arguments
+///
+/// * `stats` - Process disk I/O statistics
+/// * `labels` - Optional additional labels (e.g., process attributes)
+pub fn collect_process_disk_metrics(
+    stats: &ProcessDiskStats,
+    labels: Option<&[(&'static str, Cow<'static, str>)]>,
+) -> Vec<PrometheusMetric> {
+    let mut read_metric = PrometheusMetric::from_descriptor(&PROCESS_DISK_IO_MD, stats.read_bytes as f64);
+    let mut write_metric = PrometheusMetric::from_descriptor(&PROCESS_DISK_IO_MD, stats.written_bytes as f64);
+
+    read_metric.labels.push(("direction", Cow::Borrowed("read")));
+    write_metric.labels.push(("direction", Cow::Borrowed("write")));
+
+    if let Some(l) = labels {
+        read_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+        write_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    vec![read_metric, write_metric]
 }
 
 #[cfg(test)]
