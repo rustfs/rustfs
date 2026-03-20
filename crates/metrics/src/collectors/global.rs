@@ -16,13 +16,31 @@
 //!
 //! This module provides the entry point for initializing all metrics collectors.
 //! The actual statistics collection functions are in `stats_collector.rs`.
+//!
+//! System monitoring collectors (migrated from `rustfs-obs::system`):
+//! - Process CPU metrics
+//! - Process memory metrics
+//! - Process disk I/O metrics
+//! - Process network I/O metrics
 
 use crate::collectors::stats_collector::{
     collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats, collect_disk_stats,
     collect_process_stats,
 };
 use crate::collectors::{
-    collect_bucket_metrics, collect_bucket_replication_bandwidth_metrics, collect_cluster_metrics, collect_node_metrics,
+    // System monitoring collectors (migrated from rustfs-obs::system)
+    ProcessCpuStats,
+    ProcessDiskStats,
+    ProcessMemoryStats,
+    ProcessNetworkStats,
+    collect_bucket_metrics,
+    collect_bucket_replication_bandwidth_metrics,
+    collect_cluster_metrics,
+    collect_node_metrics,
+    collect_process_cpu_metrics,
+    collect_process_disk_metrics,
+    collect_process_memory_metrics,
+    collect_process_network_metrics,
     collect_resource_metrics,
 };
 use crate::constants::{
@@ -33,9 +51,18 @@ use crate::constants::{
 };
 use crate::format::report_metrics;
 use rustfs_utils::get_env_opt_u64;
+use std::borrow::Cow;
 use std::time::Duration;
+use sysinfo::{Pid, System};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// Default interval for system monitoring metrics (15 seconds)
+const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(15);
+/// Environment variable for system monitoring interval
+const ENV_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_METRICS_SYSTEM_INTERVAL_SEC";
+/// Legacy environment variable for system monitoring interval
+const LEGACY_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_OBS_METRICS_SYSTEM_INTERVAL_MS";
 
 /// Initialize all metrics collectors.
 ///
@@ -207,4 +234,112 @@ pub fn init_metrics_collectors(token: CancellationToken) {
             }
         }
     });
+
+    // Spawn task for system monitoring metrics (migrated from rustfs-obs::system)
+    let system_interval = get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
+        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000)) // Convert ms to seconds
+        .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
+        .filter(|&v| v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SYSTEM_METRICS_INTERVAL);
+
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        // Get current process PID
+        let pid = match sysinfo::get_current_pid() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Failed to get current PID for system monitoring: {}", e);
+                return;
+            }
+        };
+
+        let mut interval = tokio::time::interval(system_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Collect system monitoring metrics
+                    let metrics = collect_system_monitoring_metrics(pid);
+                    report_metrics(&metrics);
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("System monitoring metrics collection cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Collect all system monitoring metrics for a process.
+///
+/// This function collects CPU, memory, disk I/O, and network I/O metrics
+/// for the specified process PID.
+///
+/// # Arguments
+/// * `pid` - The process ID to monitor
+///
+/// # Returns
+/// A vector of Prometheus metrics for the process.
+fn collect_system_monitoring_metrics(pid: Pid) -> Vec<crate::format::PrometheusMetric> {
+    let mut metrics = Vec::new();
+    let mut system = System::new();
+
+    // Refresh process information
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+
+    if let Some(process) = system.process(pid) {
+        // Create labels with process attributes
+        let labels: Vec<(&'static str, Cow<'static, str>)> = vec![
+            ("process_pid", Cow::Owned(pid.as_u32().to_string())),
+            ("process_executable_name", Cow::Owned(process.name().to_string_lossy().to_string())),
+        ];
+
+        // Collect CPU metrics
+        let cpu_stats = ProcessCpuStats {
+            usage: process.cpu_usage() as f64,
+            utilization: process.cpu_usage() as f64, // Same as usage for single process
+        };
+        metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(&labels)));
+
+        // Collect memory metrics
+        let memory_stats = ProcessMemoryStats {
+            resident: process.memory(),
+            virtual_mem: process.virtual_memory(),
+        };
+        metrics.extend(collect_process_memory_metrics(&memory_stats, Some(&labels)));
+
+        // Collect disk I/O metrics
+        let disk_usage = process.disk_usage();
+        let disk_stats = ProcessDiskStats {
+            read_bytes: disk_usage.read_bytes,
+            written_bytes: disk_usage.written_bytes,
+        };
+        metrics.extend(collect_process_disk_metrics(&disk_stats, Some(&labels)));
+
+        // Collect network I/O metrics
+        // Note: sysinfo 0.38.x provides network info via Networks new type
+        // We use Networks::new_with_refreshed_list() to get network interfaces
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        let mut total_received = 0u64;
+        let mut total_transmitted = 0u64;
+        let mut per_interface = Vec::new();
+
+        for (interface_name, data) in networks.iter() {
+            let received = data.received();
+            let transmitted = data.transmitted();
+            total_received += received;
+            total_transmitted += transmitted;
+            per_interface.push((interface_name.to_string(), received, transmitted));
+        }
+
+        let network_stats = ProcessNetworkStats {
+            total_received,
+            total_transmitted,
+            per_interface,
+        };
+        metrics.extend(collect_process_network_metrics(&network_stats, Some(&labels)));
+    }
+
+    metrics
 }

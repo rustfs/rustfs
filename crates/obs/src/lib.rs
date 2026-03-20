@@ -53,6 +53,24 @@
 //! #   // Guard will be dropped here, flushing telemetry data
 //! # }
 //! ```
+//!
+//! ## Deprecation Notice
+//!
+//! The `SystemObserver` module has been migrated to `rustfs-metrics`.
+//! Please use `rustfs_metrics::init_metrics_system()` for system monitoring.
+//!
+//! ```ignore
+//! // Old (deprecated):
+//! use rustfs_obs::SystemObserver;
+//! SystemObserver::init_process_observer().await?;
+//!
+//! // New:
+//! use tokio_util::sync::CancellationToken;
+//! use rustfs_metrics::init_metrics_system;
+//!
+//! let token = CancellationToken::new();
+//! init_metrics_system(token.clone());
+//! ```
 mod cleaner;
 mod config;
 mod error;
@@ -64,5 +82,6 @@ pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
+#[allow(deprecated)]
 pub use system::SystemObserver;
 pub use telemetry::{OtelGuard, Recorder};

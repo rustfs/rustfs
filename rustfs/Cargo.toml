@@ -33,6 +33,7 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+metrics-gpu = ["metrics", "rustfs-metrics/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]

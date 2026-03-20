@@ -350,6 +350,20 @@ pub enum MetricName {
     ProcessVirtualMemoryBytes,
     ProcessVirtualMemoryMaxBytes,
 
+    // Process-level system monitoring metrics (migrated from rustfs-obs::system)
+    /// Process CPU usage percentage (0-100)
+    ProcessCPUUsage,
+    /// Process CPU utilization percentage (considering multiple cores)
+    ProcessCPUUtilization,
+    /// Process disk I/O bytes
+    ProcessDiskIO,
+    /// Process network I/O bytes
+    ProcessNetworkIO,
+    /// Process network I/O bytes per interface
+    ProcessNetworkIOPerInterface,
+    /// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
+    ProcessStatus,
+
     // Custom metrics
     Custom(String),
 }
@@ -671,6 +685,14 @@ impl MetricName {
             Self::ProcessResidentMemoryBytes => "resident_memory_bytes".to_string(),
             Self::ProcessVirtualMemoryBytes => "virtual_memory_bytes".to_string(),
             Self::ProcessVirtualMemoryMaxBytes => "virtual_memory_max_bytes".to_string(),
+
+            // Process-level system monitoring metrics (migrated from rustfs-obs::system)
+            Self::ProcessCPUUsage => "cpu_usage".to_string(),
+            Self::ProcessCPUUtilization => "cpu_utilization".to_string(),
+            Self::ProcessDiskIO => "disk_io".to_string(),
+            Self::ProcessNetworkIO => "network_io".to_string(),
+            Self::ProcessNetworkIOPerInterface => "network_io_per_interface".to_string(),
+            Self::ProcessStatus => "status".to_string(),
 
             Self::Custom(name) => name.clone(),
         }

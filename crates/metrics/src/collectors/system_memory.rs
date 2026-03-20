@@ -19,13 +19,15 @@
 //! Collects memory-related metrics including total, used, free,
 //! buffers, cache, shared, and available memory.
 //!
-//! This collector reuses the metric descriptors defined in `metrics_type::system_memory`
-//! to avoid duplication of metric names, types, and help text.
+//! This module provides both system-level and process-level memory metrics,
+//! with process-level metrics migrated from `rustfs-obs::system`.
 
 use crate::format::PrometheusMetric;
 use crate::metrics_type::system_memory::*;
+use crate::metrics_type::system_process::{PROCESS_RESIDENT_MEMORY_BYTES_MD, PROCESS_VIRTUAL_MEMORY_BYTES_MD};
+use std::borrow::Cow;
 
-/// Memory statistics for a node.
+/// System memory statistics.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStats {
     /// Total memory in bytes
@@ -46,6 +48,17 @@ pub struct MemoryStats {
     pub available: u64,
 }
 
+/// Process memory statistics.
+///
+/// Contains memory usage metrics for a specific process.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessMemoryStats {
+    /// Resident memory size in bytes
+    pub resident: u64,
+    /// Virtual memory size in bytes
+    pub virtual_mem: u64,
+}
+
 /// Collects memory metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::system_memory` module.
@@ -61,6 +74,30 @@ pub fn collect_memory_metrics(stats: &MemoryStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&MEM_SHARED_MD, stats.shared as f64),
         PrometheusMetric::from_descriptor(&MEM_AVAILABLE_MD, stats.available as f64),
     ]
+}
+
+/// Collects process memory metrics from the given stats.
+///
+/// Uses the metric descriptors from `metrics_type::system_process` module.
+/// Returns a vector of Prometheus metrics for process memory statistics.
+///
+/// # Arguments
+///
+/// * `stats` - Process memory statistics
+/// * `labels` - Optional additional labels (e.g., process attributes)
+pub fn collect_process_memory_metrics(
+    stats: &ProcessMemoryStats,
+    labels: Option<&[(&'static str, Cow<'static, str>)]>,
+) -> Vec<PrometheusMetric> {
+    let mut resident_metric = PrometheusMetric::from_descriptor(&PROCESS_RESIDENT_MEMORY_BYTES_MD, stats.resident as f64);
+    let mut virtual_metric = PrometheusMetric::from_descriptor(&PROCESS_VIRTUAL_MEMORY_BYTES_MD, stats.virtual_mem as f64);
+
+    if let Some(l) = labels {
+        resident_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+        virtual_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    vec![resident_metric, virtual_metric]
 }
 
 #[cfg(test)]
@@ -97,6 +134,36 @@ mod tests {
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_collect_process_memory_metrics() {
+        let stats = ProcessMemoryStats {
+            resident: 512 * 1024 * 1024,         // 512 MB
+            virtual_mem: 2 * 1024 * 1024 * 1024, // 2 GB
+        };
+
+        let metrics = collect_process_memory_metrics(&stats, None);
+        report_metrics(&metrics);
+
+        assert_eq!(metrics.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_process_memory_metrics_with_labels() {
+        let stats = ProcessMemoryStats {
+            resident: 256 * 1024 * 1024,
+            virtual_mem: 1 * 1024 * 1024 * 1024,
+        };
+
+        let labels = vec![("process_pid", Cow::Borrowed("12345"))];
+
+        let metrics = collect_process_memory_metrics(&stats, Some(&labels));
+        assert_eq!(metrics.len(), 2);
+
+        for metric in &metrics {
+            assert_eq!(metric.labels.len(), 1);
         }
     }
 }

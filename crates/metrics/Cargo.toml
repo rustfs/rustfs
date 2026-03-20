@@ -25,6 +25,11 @@ keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+gpu = ["dep:nvml-wrapper"]
+full = ["gpu"]
+
 [dependencies]
 rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true }
@@ -33,6 +38,7 @@ sysinfo = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
 
 [lints]
 workspace = true

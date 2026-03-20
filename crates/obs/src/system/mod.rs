@@ -12,6 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! System monitoring module (DEPRECATED).
+//!
+//! **Deprecation Notice**: This module has been migrated to `rustfs-metrics`.
+//! Please use `rustfs_metrics::init_metrics_system()` instead.
+//!
+//! This module will be removed in a future version (planned for v0.3.0).
+//!
+//! # Migration Guide
+//!
+//! Before:
+//! ```ignore
+//! use rustfs_obs::SystemObserver;
+//! SystemObserver::init_process_observer().await?;
+//! ```
+//!
+//! After:
+//! ```ignore
+//! use tokio_util::sync::CancellationToken;
+//! use rustfs_metrics::init_metrics_system;
+//!
+//! let token = CancellationToken::new();
+//! init_metrics_system(token.clone());
+//! ```
+
 use crate::{GlobalError, observability_metric_enabled};
 use opentelemetry::{global::meter, metrics::Meter};
 use sysinfo::Pid;
@@ -22,12 +46,28 @@ mod collector;
 mod gpu;
 mod metrics;
 
+/// System observer for process monitoring (DEPRECATED).
+///
+/// **Deprecated**: Use `rustfs_metrics::init_metrics_system()` instead.
+/// This struct will be removed in a future version.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use rustfs_metrics::init_metrics_system() instead. This module will be removed in v0.3.0."
+)]
 pub struct SystemObserver {}
 
+#[allow(deprecated)]
 impl SystemObserver {
-    /// Initialize the indicator collector for the current process
+    /// Initialize the indicator collector for the current process (DEPRECATED).
+    ///
+    /// **Deprecated**: Use `rustfs_metrics::init_metrics_system()` instead.
+    ///
     /// This function will create a new `Collector` instance and start collecting metrics.
     /// It will run indefinitely until the process is terminated.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use rustfs_metrics::init_metrics_system() instead. See module documentation for migration guide."
+    )]
     pub async fn init_process_observer() -> Result<(), GlobalError> {
         if observability_metric_enabled() {
             let meter = meter("system");
@@ -37,9 +77,16 @@ impl SystemObserver {
         Ok(())
     }
 
-    /// Initialize the metric collector for the specified PID process
+    /// Initialize the metric collector for the specified PID process (DEPRECATED).
+    ///
+    /// **Deprecated**: Use `rustfs_metrics` collectors directly instead.
+    ///
     /// This function will create a new `Collector` instance and start collecting metrics.
     /// It will run indefinitely until the process is terminated.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use rustfs_metrics collectors directly instead. This function will be removed in v0.3.0."
+    )]
     pub async fn init_process_observer_for_pid(meter: Meter, pid: Pid) -> Result<(), GlobalError> {
         let interval_ms = rustfs_utils::get_env_u64(
             rustfs_config::observability::ENV_OBS_METRICS_SYSTEM_INTERVAL_MS,

@@ -2473,7 +2473,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (gauge_rustfs_process_cpu_usage{job=~\"$job\"})",
+          "expr": "sum by (job) (process_cpu_usage_percent{job=~\"$job\"})",
           "legendFormat": "{{job}}",
           "range": true,
           "refId": "A"
@@ -2572,7 +2572,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (gauge_rustfs_process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum by (job) (rustfs_process_memory_bytes{job=~\"$job\"})",
           "legendFormat": "{{job}}",
           "range": true,
           "refId": "B"
@@ -2670,7 +2670,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(gauge_rustfs_process_network_io{job=~\"$job\", direction=\"received\"}[5m]))",
+          "expr": "sum by (job) (rate(process_network_io_byte{job=~\"$job\", direction=\"received\"}[5m]))",
           "legendFormat": "RX - {{job}}",
           "range": true,
           "refId": "C"
@@ -2681,7 +2681,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(gauge_rustfs_process_network_io{job=~\"$job\", direction=\"transmitted\"}[5m]))",
+          "expr": "sum by (job) (rate(process_network_io_byte{job=~\"$job\", direction=\"transmitted\"}[5m]))",
           "legendFormat": "TX - {{job}}",
           "range": true,
           "refId": "D"
@@ -3339,7 +3339,7 @@
                   "index": 0,
                   "text": "INACTIVE"
                 },
-                "to": 1e-09
+                "to": 1e-9
               },
               "type": "range"
             }
