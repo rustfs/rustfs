@@ -41,14 +41,26 @@ fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize)
 }
 
 const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
+const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
     matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
 }
 
+async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = rx.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
 async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
     for attempt in 0..=LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES {
+        if rx.is_cancelled() {
+            return;
+        }
+
         match store.decommission(rx.clone(), pool_indices.clone()).await {
             Ok(()) => return,
             Err(err) if is_err_decommission_running(&err) => {
@@ -311,8 +323,9 @@ impl ECStore {
                 let store = self.clone();
 
                 tokio::spawn(async move {
-                    // wait  3 minutes for cluster init
-                    tokio::time::sleep(Duration::from_secs(60 * 3)).await;
+                    if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                        return;
+                    }
                     resume_local_decommission_after_init(store, rx, pool_indices).await;
                 });
             }
@@ -344,13 +357,15 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, clone_first_store_pool, require_deployment_id,
-        should_resume_local_decommission, should_retry_local_decommission_resume,
+        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
         endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         error::StorageError,
     };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     #[test]
@@ -431,5 +446,18 @@ mod tests {
     #[test]
     fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
         assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_local_decommission_resume_delay_returns_true_after_delay() {
+        let rx = CancellationToken::new();
+        assert!(wait_for_local_decommission_resume_delay(&rx, Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_local_decommission_resume_delay_returns_false_when_cancelled() {
+        let rx = CancellationToken::new();
+        rx.cancel();
+        assert!(!wait_for_local_decommission_resume_delay(&rx, Duration::from_secs(1)).await);
     }
 }
