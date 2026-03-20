@@ -307,6 +307,10 @@ fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_e
     if let Some(err) = entry_error { Err(err) } else { list_result }
 }
 
+fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("decommission pool meta reload failed during {stage}: {err}")))
+}
+
 fn resolve_decommission_listing_worker_result(
     set_idx: usize,
     worker_result: std::result::Result<(), tokio::task::JoinError>,
@@ -1226,7 +1230,8 @@ impl ECStore {
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys.reload_pool_meta().await?;
+            let stage = format!("decommission_cancel for pool {idx}");
+            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
 
         Ok(())
@@ -1851,7 +1856,8 @@ impl ECStore {
             drop(pool_meta);
 
             if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await?;
+                let stage = format!("decommission_failed for pool {idx}");
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
             }
         }
 
@@ -1877,7 +1883,8 @@ impl ECStore {
             pool_meta.save(self.pools.clone()).await?;
             drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
-                notification_sys.reload_pool_meta().await?;
+                let stage = format!("complete_decommission for pool {idx}");
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
             }
         }
 
@@ -2024,7 +2031,7 @@ impl ECStore {
         pool_meta.save(self.pools.clone()).await?;
 
         if let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys.reload_pool_meta().await?;
+            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, "start_decommission")?;
         }
 
         Ok(())
@@ -2696,12 +2703,12 @@ mod pools_tests {
         require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        should_cleanup_decommission_source_entry, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, should_cleanup_decommission_source_entry,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -3196,6 +3203,20 @@ mod pools_tests {
         let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), None)
             .expect_err("list result should be preserved without entry error");
         assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
+    fn test_resolve_decommission_pool_meta_reload_result_passthrough_ok() {
+        assert!(resolve_decommission_pool_meta_reload_result(Ok(()), "start_decommission").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_decommission_pool_meta_reload_result_wraps_error_context() {
+        let err = resolve_decommission_pool_meta_reload_result(Err(Error::SlowDown), "decommission_failed for pool 3")
+            .expect_err("reload failure should be wrapped with stage context");
+        let message = err.to_string();
+        assert!(message.contains("decommission pool meta reload failed during decommission_failed for pool 3"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
     }
 
     #[test]
