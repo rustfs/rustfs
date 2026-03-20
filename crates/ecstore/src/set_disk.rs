@@ -163,6 +163,19 @@ fn build_tiered_decommission_file_info(
     (updated, write_quorum)
 }
 
+fn resolve_tiered_decommission_write_quorum_result(
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+    bucket: &str,
+    object: &str,
+) -> Result<()> {
+    if let Some(err) = reduce_write_quorum_errs(errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+        return Err(to_object_err(err.into(), vec![bucket, object]));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct SetDisks {
     pub locker_owner: String,
@@ -1066,10 +1079,7 @@ impl ObjectOperations for SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err.into());
-        }
-        Ok(())
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 
     #[tracing::instrument(skip(self))]
@@ -4281,6 +4291,31 @@ mod tests {
         assert_eq!(updated.erasure.parity_blocks, 4);
         assert_eq!(write_quorum, 12);
         assert_ne!(updated.erasure.distribution, original.erasure.distribution);
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_allows_successful_quorum() {
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), None];
+
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_wraps_object_context() {
+        let errs = vec![
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object").expect_err("expected error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
     }
 
     #[test]
