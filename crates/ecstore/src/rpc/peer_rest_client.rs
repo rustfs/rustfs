@@ -620,14 +620,7 @@ impl PeerRestClient {
         let request = Request::new(ReloadPoolMetaRequest {});
 
         let response = client.reload_pool_meta(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
-
-        Ok(())
+        resolve_peer_rest_success("reload_pool_meta", response.success, response.error_info)
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
@@ -635,14 +628,7 @@ impl PeerRestClient {
         let request = Request::new(StopRebalanceRequest {});
 
         let response = client.stop_rebalance(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
-
-        Ok(())
+        resolve_peer_rest_success("stop_rebalance", response.success, response.error_info)
     }
 
     pub async fn load_rebalance_meta(&self, start_rebalance: bool) -> Result<()> {
@@ -652,14 +638,7 @@ impl PeerRestClient {
         let response = client.load_rebalance_meta(request).await?.into_inner();
 
         warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
-        }
-
-        Ok(())
+        resolve_peer_rest_success("load_rebalance_meta", response.success, response.error_info)
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
@@ -675,5 +654,44 @@ impl PeerRestClient {
         }
 
         Ok(())
+    }
+}
+
+fn resolve_peer_rest_success(operation: &str, success: bool, error_info: Option<String>) -> Result<()> {
+    if success {
+        return Ok(());
+    }
+
+    match error_info {
+        Some(msg) if !msg.trim().is_empty() => Err(Error::other(msg)),
+        _ => Err(Error::other(format!("peer {operation} failed without remote error details"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_peer_rest_success;
+    use crate::error::Error;
+
+    #[test]
+    fn resolve_peer_rest_success_returns_ok_when_successful() {
+        assert!(resolve_peer_rest_success("stop_rebalance", true, None).is_ok());
+    }
+
+    #[test]
+    fn resolve_peer_rest_success_preserves_remote_error_info() {
+        let err = resolve_peer_rest_success("load_rebalance_meta", false, Some("remote failure".to_string()))
+            .expect_err("remote error info should be returned");
+        assert_eq!(err.to_string(), Error::other("remote failure").to_string());
+    }
+
+    #[test]
+    fn resolve_peer_rest_success_falls_back_to_operation_context_without_error_info() {
+        let err = resolve_peer_rest_success("reload_pool_meta", false, Some("   ".to_string()))
+            .expect_err("blank remote error info should use fallback context");
+        assert!(
+            err.to_string()
+                .contains("peer reload_pool_meta failed without remote error details")
+        );
     }
 }
