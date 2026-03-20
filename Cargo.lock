@@ -3157,6 +3157,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers",
+ "flate2",
  "futures",
  "md5",
  "rand 0.10.0",
@@ -3181,6 +3182,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

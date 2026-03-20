@@ -22,6 +22,7 @@ use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
 };
 use crate::storage::access::{ReqInfo, authorize_request};
+use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::HeaderValue;
@@ -39,7 +40,7 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, TargetClient};
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::replication::{
@@ -50,14 +51,22 @@ use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTarge
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::{Config, get_global_server_config};
+use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
-use rustfs_ecstore::{global::get_global_region, new_object_layer_fn};
-use rustfs_filemeta::ReplicationType;
+use rustfs_ecstore::{
+    global::{get_global_deployment_id, get_global_region},
+    new_object_layer_fn,
+};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_common::EventName;
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+};
 use s3s::Body;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -72,8 +81,10 @@ use s3s::s3_error;
 use s3s::stream::{ByteStream, DynByteStream};
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use time::OffsetDateTime;
+use std::time::SystemTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -168,12 +179,6 @@ struct ReplicationResetStatusTarget {
     object: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-struct ReplicationCheckResponse {
-    #[serde(rename = "Targets")]
-    targets: Vec<ReplicationCheckTargetStatus>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -1066,6 +1071,7 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
         Some(stats) => stats.get_latest_replication_stats(bucket).await,
         None => BucketStats::default(),
     };
+    let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
     let body = serialize_replication_metrics_body(&bucket_stats, route)?;
 
@@ -1073,6 +1079,25 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
     resp.headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok(resp)
+}
+
+fn replication_metrics_uptime_seconds() -> i64 {
+    GLOBAL_BOOT_TIME
+        .get()
+        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+        .map(|uptime| uptime.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn apply_replication_metrics_runtime_fields(
+    mut bucket_stats: BucketStats,
+    route: ReplicationExtRoute,
+    uptime_seconds: i64,
+) -> BucketStats {
+    if route == ReplicationExtRoute::MetricsV2 {
+        bucket_stats.uptime = uptime_seconds;
+    }
+    bucket_stats
 }
 
 fn serialize_replication_metrics_body(bucket_stats: &BucketStats, route: ReplicationExtRoute) -> S3Result<Vec<u8>> {
@@ -1205,11 +1230,55 @@ fn build_replication_reset_status_response(status: BucketReplicationResyncStatus
 
 fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatus>) -> S3Result<S3Response<Body>> {
     targets.sort_by(|left, right| left.arn.cmp(&right.arn));
-    let data = serde_json::to_vec(&ReplicationCheckResponse { targets }).map_err(|e| s3_error!(InternalError, "{e}"))?;
-    let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
-    resp.headers
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(resp)
+
+    if let Some(target) = targets.into_iter().find(|target| target.status != "OK") {
+        let detail = target.error.unwrap_or_else(|| target.status.to_lowercase());
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication check failed for target {} (bucket {}): {}",
+            target.arn,
+            target.bucket,
+            detail
+        ));
+    }
+
+    Ok(S3Response::with_status(Body::empty(), StatusCode::OK))
+}
+
+fn validate_replication_check_config_targets(
+    targets: &BucketTargets,
+    config: &s3s::dto::ReplicationConfiguration,
+) -> S3Result<()> {
+    let configured_arns = targets
+        .targets
+        .iter()
+        .filter(|target| target.target_type == BucketTargetType::ReplicationService)
+        .map(|target| target.arn.as_str())
+        .collect::<HashSet<_>>();
+
+    for rule in &config.rules {
+        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
+        let configured_arn = if config.role.is_empty() {
+            rule.destination.bucket.as_str()
+        } else {
+            config.role.as_str()
+        };
+
+        if configured_arns.contains(configured_arn) {
+            continue;
+        }
+
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication config with rule ID {} has a stale target",
+            rule.id.clone().unwrap_or_default()
+        ));
+    }
+
+    Ok(())
 }
 
 fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
@@ -1238,17 +1307,22 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
         error: None,
     };
 
-    let target_sys = BucketTargetSys::get();
-    let target_client = match target_sys.get_remote_target_client(bucket, &target.arn).await {
-        Some(client) => client,
-        None => match target_sys.get_remote_target_client_internal(target).await {
-            Ok(client) => std::sync::Arc::new(client),
-            Err(err) => {
-                result.status = "FAILED".to_string();
-                result.error = Some(err.to_string());
-                return result;
-            }
-        },
+    if target.target_bucket == bucket
+        && !target.deployment_id.is_empty()
+        && get_global_deployment_id().as_deref() == Some(target.deployment_id.as_str())
+    {
+        result.status = "FAILED".to_string();
+        result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
+        return result;
+    }
+
+    let target_client = match resolve_replication_target_client(bucket, target).await {
+        Ok(client) => client,
+        Err(err) => {
+            result.status = "FAILED".to_string();
+            result.error = Some(err);
+            return result;
+        }
     };
 
     match target_client.bucket_exists(&target.target_bucket).await {
@@ -1266,23 +1340,207 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
     }
 
     match target_client.get_bucket_versioning(&target.target_bucket).await {
-        Ok(Some(_)) => result,
+        Ok(Some(_)) => {}
         Ok(None) => {
             result.status = "FAILED".to_string();
             result.error = Some("target bucket versioning is not enabled".to_string());
-            result
+            return result;
         }
         Err(err) => {
             result.status = "FAILED".to_string();
             result.error = Some(err.to_string());
-            result
+            return result;
         }
+    }
+
+    let probe_key = format!(".rustfs-replication-check-{}", Uuid::new_v4());
+    let (probe_version_id, probe_time) =
+        match put_replication_probe_object(&target_client, &target.target_bucket, &probe_key).await {
+            Ok(output) => output,
+            Err(err) => {
+                result.status = "FAILED".to_string();
+                result.error = Some(format!("target replicate object check failed: {err}"));
+                return result;
+            }
+        };
+
+    if let Err(err) = delete_replication_probe_object(
+        &target_client,
+        &target.target_bucket,
+        &probe_key,
+        probe_version_id.as_deref(),
+        build_replication_probe_remove_options(probe_time, true),
+    )
+    .await
+    {
+        result.status = "FAILED".to_string();
+        result.error = Some(format!("target replicate delete-marker check failed: {err}"));
+        return result;
+    }
+
+    if let Err(err) = delete_replication_probe_object(
+        &target_client,
+        &target.target_bucket,
+        &probe_key,
+        probe_version_id.as_deref(),
+        build_replication_probe_remove_options(probe_time, false),
+    )
+    .await
+    {
+        result.status = "FAILED".to_string();
+        result.error = Some(format!("target delete object version check failed: {err}"));
+        return result;
+    }
+
+    result
+}
+
+async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) -> Result<Arc<TargetClient>, String> {
+    let target_sys = BucketTargetSys::get();
+    match target_sys.get_remote_target_client(bucket, &target.arn).await {
+        Some(client) => Ok(client),
+        None => target_sys
+            .get_remote_target_client_internal(target)
+            .await
+            .map(Arc::new)
+            .map_err(|err| err.to_string()),
+    }
+}
+
+fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
+    PutObjectOptions {
+        internal: rustfs_ecstore::bucket::bucket_target_sys::AdvancedPutOptions {
+            source_version_id: Uuid::new_v4().to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            source_mtime: now,
+            replication_request: true,
+            replication_validity_check: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn build_replication_probe_remove_options(now: OffsetDateTime, replication_delete_marker: bool) -> RemoveObjectOptions {
+    RemoveObjectOptions {
+        force_delete: false,
+        governance_bypass: false,
+        replication_delete_marker,
+        replication_mtime: Some(now),
+        replication_status: ReplicationStatusType::Replica,
+        replication_request: true,
+        replication_validity_check: true,
+    }
+}
+
+async fn put_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+) -> Result<(Option<String>, OffsetDateTime), String> {
+    let now = OffsetDateTime::now_utc();
+    let options = build_replication_probe_put_options(now);
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
+    insert_header(
+        &mut headers,
+        SUFFIX_SOURCE_MTIME,
+        options.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
+    );
+    insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+    headers.insert(
+        HeaderName::from_static(AMZ_BUCKET_REPLICATION_STATUS),
+        HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+    );
+
+    target_client
+        .client
+        .put_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.unwrap(), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map(|output| (output.version_id().map(ToOwned::to_owned), now))
+        .map_err(|err| err.to_string())
+}
+
+async fn delete_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    version_id: Option<&str>,
+    options: RemoveObjectOptions,
+) -> Result<(), String> {
+    let mut headers = HeaderMap::new();
+    if options.replication_delete_marker {
+        insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
+    }
+    if let Some(replication_mtime) = options.replication_mtime {
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, replication_mtime.format(&Rfc3339).unwrap_or_default());
+    }
+    headers.insert(
+        HeaderName::from_static(AMZ_BUCKET_REPLICATION_STATUS),
+        HeaderValue::from_static(options.replication_status.as_str()),
+    );
+    if options.replication_request {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    }
+    if options.replication_validity_check {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+    }
+
+    target_client
+        .client
+        .delete_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .set_version_id(version_id.map(ToOwned::to_owned))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.unwrap(), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
+    match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((config, _)) => Ok(config
+            .object_lock_enabled
+            .as_ref()
+            .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
+        Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Ok(false),
+        Err(err) => Err(ApiError::from(err).into()),
     }
 }
 
 async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
+    if !BucketVersioningSys::enabled(bucket).await {
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication check requires source bucket versioning to be enabled"
+        ));
+    }
+
+    let source_requires_object_lock = source_bucket_requires_object_lock(bucket).await?;
     let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
     let targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
+    validate_replication_check_config_targets(&targets, &config)?;
     let replication_targets = filter_replication_check_targets(targets, &config);
 
     if replication_targets.is_empty() {
@@ -1294,10 +1552,42 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
 
     let mut statuses = Vec::with_capacity(replication_targets.len());
     for target in &replication_targets {
-        statuses.push(check_replication_target(bucket, target).await);
+        let mut status = check_replication_target(bucket, target).await;
+        if status.status == "OK" && source_requires_object_lock {
+            let target_lock_enabled = match target_client_object_lock_enabled(bucket, target).await {
+                Ok(enabled) => enabled,
+                Err(err) => {
+                    status.status = "FAILED".to_string();
+                    status.error = Some(err);
+                    false
+                }
+            };
+            if status.status == "OK" && !target_lock_enabled {
+                status.status = "FAILED".to_string();
+                status.error = Some("target bucket object lock is not enabled".to_string());
+            }
+        }
+        statuses.push(status);
     }
 
     build_replication_check_response(statuses)
+}
+
+async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) -> Result<bool, String> {
+    let target_client = resolve_replication_target_client(bucket, target).await?;
+
+    target_client
+        .client
+        .get_object_lock_configuration()
+        .bucket(&target.target_bucket)
+        .send()
+        .await
+        .map(|res| {
+            res.object_lock_configuration()
+                .and_then(|cfg| cfg.object_lock_enabled())
+                .is_some_and(|state| state.as_str() == "Enabled")
+        })
+        .map_err(|err| format!("target object lock check failed: {err}"))
 }
 
 async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<()> {
@@ -1835,8 +2125,34 @@ mod tests {
     }
 
     #[test]
-    fn build_replication_check_response_serializes_targets() {
+    fn build_replication_check_response_returns_empty_body_on_success() {
         let response = build_replication_check_response(vec![
+            ReplicationCheckTargetStatus {
+                arn: "arn:a".to_string(),
+                endpoint: "remote-a:9000".to_string(),
+                bucket: "bucket-a".to_string(),
+                status: "OK".to_string(),
+                error: None,
+            },
+            ReplicationCheckTargetStatus {
+                arn: "arn:z".to_string(),
+                endpoint: "remote-z:9000".to_string(),
+                bucket: "bucket-z".to_string(),
+                status: "OK".to_string(),
+                error: None,
+            },
+        ])
+        .expect("response should build");
+
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn build_replication_check_response_surfaces_first_failure() {
+        let err = build_replication_check_response(vec![
             ReplicationCheckTargetStatus {
                 arn: "arn:z".to_string(),
                 endpoint: "remote-z:9000".to_string(),
@@ -1852,17 +2168,10 @@ mod tests {
                 error: None,
             },
         ])
-        .expect("response should build");
+        .expect_err("failed target should surface as request error");
 
-        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
-            .expect("body should read")
-            .to_bytes();
-        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
-
-        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
-        assert_eq!(payload["Targets"][0]["Status"], "OK");
-        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
-        assert_eq!(payload["Targets"][1]["Error"], "boom");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("arn:z"));
     }
 
     #[test]
@@ -1923,6 +2232,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_replication_check_config_targets_rejects_stale_enabled_rule_target() {
+        let targets = BucketTargets {
+            targets: vec![BucketTarget {
+                arn: "arn:replication:a".to_string(),
+                target_type: BucketTargetType::ReplicationService,
+                ..Default::default()
+            }],
+        };
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![s3s::dto::ReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: s3s::dto::Destination {
+                    bucket: "arn:replication:missing".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: Some("rule-stale".to_string()),
+                prefix: Some(String::new()),
+                priority: None,
+                source_selection_criteria: None,
+                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+            }],
+        };
+
+        let err = validate_replication_check_config_targets(&targets, &config).expect_err("stale target should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("rule-stale"));
+    }
+
+    #[test]
     fn serialize_replication_metrics_body_v1_returns_replication_stats_only() {
         let mut stats = BucketStats {
             uptime: 99,
@@ -1956,6 +2299,44 @@ mod tests {
         assert_eq!(payload["uptime"], 99);
         assert_eq!(payload["replication_stats"]["replica_count"], 7);
         assert_eq!(payload["proxy_stats"]["put_total"], 3);
+    }
+
+    #[test]
+    fn apply_replication_metrics_runtime_fields_only_overrides_v2_uptime() {
+        let stats = BucketStats {
+            uptime: 99,
+            ..Default::default()
+        };
+
+        let v1 = apply_replication_metrics_runtime_fields(stats.clone(), ReplicationExtRoute::MetricsV1, 42);
+        let v2 = apply_replication_metrics_runtime_fields(stats, ReplicationExtRoute::MetricsV2, 42);
+
+        assert_eq!(v1.uptime, 99);
+        assert_eq!(v2.uptime, 42);
+    }
+
+    #[test]
+    fn build_replication_probe_put_options_sets_replication_flags() {
+        let now = OffsetDateTime::from_unix_timestamp(42).expect("timestamp should build");
+        let options = build_replication_probe_put_options(now);
+
+        assert_eq!(options.internal.replication_status, ReplicationStatusType::Replica);
+        assert!(options.internal.replication_request);
+        assert!(options.internal.replication_validity_check);
+        assert_eq!(options.internal.source_mtime, now);
+        assert!(!options.internal.source_version_id.is_empty());
+    }
+
+    #[test]
+    fn build_replication_probe_remove_options_sets_replication_flags() {
+        let now = OffsetDateTime::from_unix_timestamp(42).expect("timestamp should build");
+        let options = build_replication_probe_remove_options(now, true);
+
+        assert!(options.replication_delete_marker);
+        assert_eq!(options.replication_status, ReplicationStatusType::Replica);
+        assert!(options.replication_request);
+        assert!(options.replication_validity_check);
+        assert_eq!(options.replication_mtime, Some(now));
     }
 
     #[test]

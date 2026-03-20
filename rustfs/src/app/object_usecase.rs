@@ -248,6 +248,21 @@ fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
     Some(normalized.to_string())
 }
 
+fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> String {
+    let path = path.trim_matches('/');
+    let mut key = match prefix {
+        Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
+        Some(prefix) => prefix.to_string(),
+        None => path.to_string(),
+    };
+
+    if is_dir && !key.ends_with('/') {
+        key.push('/');
+    }
+
+    key
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
     let prefix = snowball_meta_value_by_suffix(headers, AMZ_SNOWBALL_PREFIX_INTERNAL, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .and_then(|value| normalize_snowball_prefix(&value));
@@ -3533,6 +3548,10 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
+        let req_params = extract_params_header(&req.headers);
+        let host = get_request_host(&req.headers);
+        let port = get_request_port(&req.headers);
+        let user_agent = get_request_user_agent(&req.headers);
 
         while let Some(entry) = entries.next().await {
             let f = match entry {
@@ -3558,29 +3577,29 @@ impl DefaultObjectUsecase {
                 }
             };
 
-            let mut fpath = fpath.to_string_lossy().to_string();
-            if let Some(prefix) = extract_options.prefix.as_deref() {
-                fpath = format!("{prefix}/{fpath}");
-            }
-
-            if f.header().entry_type().is_dir() {
-                if !extract_options.ignore_dirs {
-                    debug!("Skipping directory entry during archive extract: {}", fpath);
-                }
-                continue;
-            }
+            let is_dir = f.header().entry_type().is_dir();
+            let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
 
             let mut size = f.header().size().unwrap_or_default() as i64;
 
             debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
-            let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
+            let mut reader: Box<dyn Reader> = if is_dir {
+                if extract_options.ignore_dirs {
+                    debug!("Skipping directory entry during archive extract: {}", fpath);
+                    continue;
+                }
+                size = 0;
+                Box::new(WarpReader::new(std::io::Cursor::new(Vec::new())))
+            } else {
+                Box::new(WarpReader::new(f))
+            };
 
             let mut metadata = HashMap::new();
 
             let actual_size = size;
 
-            if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+            if !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
                 insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -3625,12 +3644,12 @@ impl DefaultObjectUsecase {
                 event_name: EventName::ObjectCreatedPut,
                 bucket_name: bucket.clone(),
                 object: obj_info.clone(),
-                req_params: extract_params_header(&req.headers),
+                req_params: req_params.clone(),
                 resp_elements: extract_resp_elements(&S3Response::new(output.clone())),
                 version_id: version_id.clone(),
-                host: get_request_host(&req.headers),
-                port: get_request_port(&req.headers),
-                user_agent: get_request_user_agent(&req.headers),
+                host: host.clone(),
+                port,
+                user_agent: user_agent.clone(),
             };
 
             let notify = notify.clone();
@@ -3759,6 +3778,16 @@ mod tests {
     fn normalize_snowball_prefix_trims_slashes_and_whitespace() {
         assert_eq!(normalize_snowball_prefix(" /batch/incoming/ "), Some("batch/incoming".to_string()));
         assert_eq!(normalize_snowball_prefix("///"), None);
+    }
+
+    #[test]
+    fn normalize_extract_entry_key_applies_prefix_and_directory_suffix() {
+        assert_eq!(
+            normalize_extract_entry_key("nested/path.txt", Some("imports"), false),
+            "imports/nested/path.txt"
+        );
+        assert_eq!(normalize_extract_entry_key("nested/dir/", Some("imports"), true), "imports/nested/dir/");
+        assert_eq!(normalize_extract_entry_key("top-level", None, false), "top-level");
     }
 
     #[test]

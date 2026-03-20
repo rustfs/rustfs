@@ -15,11 +15,14 @@
 //! Regression coverage for anonymous access on multipart control APIs.
 
 use crate::common::{RustFSTestEnvironment, init_logging};
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
+use flate2::{Compression, write::GzEncoder};
 use serial_test::serial;
 use std::io::Cursor;
+use std::io::Write;
 
 fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
     let expiration = (Utc::now() + ChronoDuration::hours(1))
@@ -61,6 +64,32 @@ async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
     }
 
     builder.into_inner().await.expect("tar builder should finalize").into_inner()
+}
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("gzip encoder should accept input");
+    encoder.finish().expect("gzip encoder should finish")
+}
+
+fn zstd_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::Encoder::new(Vec::new(), 0).expect("zstd encoder should initialize");
+    encoder.write_all(data).expect("zstd encoder should accept input");
+    encoder.finish().expect("zstd encoder should finish")
+}
+
+fn assert_s3_error_code<T: std::fmt::Debug>(
+    result: Result<T, aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>,
+    code: &str,
+) {
+    let err = result.expect_err("request should fail");
+    match err {
+        SdkError::ServiceError(service_err) => {
+            let s3_err = service_err.into_err();
+            assert_eq!(s3_err.meta().code(), Some(code), "unexpected S3 error: {s3_err:?}");
+        }
+        other_err => panic!("Expected service error {code}, got: {other_err:?}"),
+    }
 }
 
 async fn allow_anonymous_put_object(
@@ -734,6 +763,24 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
     let beta_body = beta.body.collect().await?.into_bytes();
     assert_eq!(beta_body.as_ref(), b"beta-body");
 
+    let ignored_dir = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/ignored/"))
+        .send()
+        .await
+        .expect_err("directory marker should be skipped when ignore-dirs is enabled");
+    match ignored_dir {
+        SdkError::ServiceError(service_err) => {
+            let s3_err = service_err.into_err();
+            assert!(
+                s3_err.is_no_such_key() || s3_err.meta().code() == Some("NoSuchVersion"),
+                "Error should be NoSuchKey or NoSuchVersion, got: {s3_err:?}"
+            );
+        }
+        other_err => panic!("Expected ServiceError with missing-object code, got: {other_err:?}"),
+    }
+
     Ok(())
 }
 
@@ -775,6 +822,288 @@ async fn test_signed_put_object_extract_accepts_compat_header() -> Result<(), Bo
         .await?;
     let gamma_body = gamma.body.collect().await?.into_bytes();
     assert_eq!(gamma_body.as_ref(), b"gamma-body");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_directory_markers_by_default()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-dirs";
+    let archive_key = "dirs.tar";
+    let extracted_prefix = "imports/tree";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("nested/file.txt", b"file-body")], &["empty/", "nested/"]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let empty_dir = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/empty/"))
+        .send()
+        .await?;
+    let empty_dir_body = empty_dir.body.collect().await?.into_bytes();
+    assert!(empty_dir_body.is_empty(), "directory marker object should be empty");
+
+    let nested_dir = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/nested/"))
+        .send()
+        .await?;
+    let nested_dir_body = nested_dir.body.collect().await?.into_bytes();
+    assert!(nested_dir_body.is_empty(), "nested directory marker object should be empty");
+
+    let nested_file = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/nested/file.txt"))
+        .send()
+        .await?;
+    let nested_file_body = nested_file.body.collect().await?.into_bytes();
+    assert_eq!(nested_file_body.as_ref(), b"file-body");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_expands_tar_gz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-tar-gz";
+    let archive_key = "bundle.tar.gz";
+    let extracted_prefix = "imports/gzip";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("delta.txt", b"delta-body"), ("nested/epsilon.txt", b"epsilon-body")], &[]).await;
+    let tar_gz_bytes = gzip_bytes(&tar_bytes);
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_gz_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let delta = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/delta.txt"))
+        .send()
+        .await?;
+    let delta_body = delta.body.collect().await?.into_bytes();
+    assert_eq!(delta_body.as_ref(), b"delta-body");
+
+    let epsilon = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/nested/epsilon.txt"))
+        .send()
+        .await?;
+    let epsilon_body = epsilon.body.collect().await?.into_bytes();
+    assert_eq!(epsilon_body.as_ref(), b"epsilon-body");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_expands_tgz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-tgz";
+    let archive_key = "bundle.tgz";
+    let extracted_prefix = "imports/tgz";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("phi.txt", b"phi-body"), ("nested/psi.txt", b"psi-body")], &[]).await;
+    let tgz_bytes = gzip_bytes(&tar_bytes);
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tgz_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let phi = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/phi.txt"))
+        .send()
+        .await?;
+    let phi_body = phi.body.collect().await?.into_bytes();
+    assert_eq!(phi_body.as_ref(), b"phi-body");
+
+    let psi = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/nested/psi.txt"))
+        .send()
+        .await?;
+    let psi_body = psi.body.collect().await?.into_bytes();
+    assert_eq!(psi_body.as_ref(), b"psi-body");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-tzst";
+    let archive_key = "bundle.tzst";
+    let extracted_prefix = "imports/tzst";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("omega.txt", b"omega-body"), ("nested/sigma.txt", b"sigma-body")], &[]).await;
+    let tzst_bytes = zstd_bytes(&tar_bytes);
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tzst_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let omega = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/omega.txt"))
+        .send()
+        .await?;
+    let omega_body = omega.body.collect().await?.into_bytes();
+    assert_eq!(omega_body.as_ref(), b"omega-body");
+
+    let sigma = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/nested/sigma.txt"))
+        .send()
+        .await?;
+    let sigma_body = sigma.body.collect().await?.into_bytes();
+    assert_eq!(sigma_body.as_ref(), b"sigma-body");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-no-ext";
+    let archive_key = "bundle";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("plain.txt", b"plain-body")], &[]).await;
+
+    let result = admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await;
+
+    assert_s3_error_code(result, "InvalidArgument");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_rejects_invalid_tar_gz_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-bad-gzip";
+    let archive_key = "broken.tar.gz";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let result = admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from_static(b"not-a-gzip-stream"))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await;
+
+    assert_s3_error_code(result, "InvalidArgument");
 
     Ok(())
 }
