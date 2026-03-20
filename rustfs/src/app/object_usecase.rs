@@ -83,7 +83,7 @@ use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION,
-    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, AMZ_WEBSITE_REDIRECT_LOCATION,
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -401,9 +401,14 @@ impl DefaultObjectUsecase {
         let PutObjectInput {
             body,
             bucket,
+            cache_control,
             key,
             content_length,
+            content_disposition,
+            content_encoding,
+            content_language,
             content_type,
+            expires,
             tagging,
             metadata,
             version_id,
@@ -413,6 +418,10 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
+            website_redirect_location,
             ..
         } = input;
 
@@ -508,8 +517,30 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
+        if let Some(cache_control) = cache_control {
+            metadata.insert("cache-control".to_string(), cache_control.to_string());
+        }
+        if let Some(content_disposition) = content_disposition {
+            metadata.insert("content-disposition".to_string(), content_disposition.to_string());
+        }
+        if let Some(content_encoding) = content_encoding {
+            metadata.insert("content-encoding".to_string(), content_encoding.to_string());
+        }
+        if let Some(content_language) = content_language {
+            metadata.insert("content-language".to_string(), content_language.to_string());
+        }
         if let Some(content_type) = content_type {
             metadata.insert("content-type".to_string(), content_type.to_string());
+        }
+        if let Some(expires) = expires {
+            let mut formatted = Vec::new();
+            expires
+                .format(TimestampFormat::HttpDate, &mut formatted)
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+            metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
+        }
+        if let Some(website_redirect_location) = website_redirect_location {
+            metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location.to_string());
         }
 
         extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
@@ -521,6 +552,31 @@ impl DefaultObjectUsecase {
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
             .map_err(ApiError::from)?;
+
+        if object_lock_legal_hold_status.is_some() || object_lock_mode.is_some() || object_lock_retain_until_date.is_some() {
+            validate_bucket_object_lock_enabled(&bucket).await?;
+
+            let retention = match (object_lock_mode, object_lock_retain_until_date) {
+                (Some(mode), retain_until_date) => Some(ObjectLockRetention {
+                    mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
+                    retain_until_date,
+                }),
+                (None, Some(retain_until_date)) => Some(ObjectLockRetention {
+                    mode: None,
+                    retain_until_date: Some(retain_until_date),
+                }),
+                (None, None) => None,
+            };
+
+            let mut eval_metadata = parse_object_lock_retention(retention)?;
+            eval_metadata.extend(parse_object_lock_legal_hold(
+                object_lock_legal_hold_status.map(|status| ObjectLockLegalHold { status: Some(status) }),
+            )?);
+
+            if !eval_metadata.is_empty() {
+                opts.eval_metadata = Some(eval_metadata);
+            }
+        }
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
@@ -3067,6 +3123,7 @@ impl DefaultObjectUsecase {
         let cache_control = metadata_map.get("cache-control").cloned();
         let content_disposition = metadata_map.get("content-disposition").cloned();
         let content_language = metadata_map.get("content-language").cloned();
+        let website_redirect_location = metadata_map.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned();
         let expires = info.expires.map(Timestamp::from);
 
         // Calculate tag count from user_tags already in ObjectInfo
@@ -3084,6 +3141,7 @@ impl DefaultObjectUsecase {
             cache_control,
             content_disposition,
             content_language,
+            website_redirect_location,
             expires,
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
