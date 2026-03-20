@@ -3150,6 +3150,7 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -3160,6 +3161,7 @@ dependencies = [
  "flatbuffers",
  "flate2",
  "futures",
+ "http 1.4.0",
  "md5",
  "rand 0.10.0",
  "rcgen",
@@ -3171,7 +3173,9 @@ dependencies = [
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
+ "rustfs-signer",
  "rustls",
+ "s3s",
  "serde",
  "serde_json",
  "serial_test",
@@ -3182,7 +3186,9 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
+ "walkdir",
  "zstd",
 ]
 

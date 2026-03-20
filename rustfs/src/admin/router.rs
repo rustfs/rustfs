@@ -40,7 +40,10 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
-use rustfs_ecstore::bucket::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, TargetClient};
+use rustfs_ecstore::bucket::bandwidth::monitor::BandwidthDetails;
+use rustfs_ecstore::bucket::bucket_target_sys::{
+    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
+};
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::replication::{
@@ -50,12 +53,13 @@ use rustfs_ecstore::bucket::replication::{
 use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::config::com::read_config_without_migrate;
 use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{
-    global::{get_global_deployment_id, get_global_region},
+    global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},
     new_object_layer_fn,
 };
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
@@ -80,7 +84,7 @@ use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
 use s3s::stream::{ByteStream, DynByteStream};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -136,6 +140,11 @@ struct ReplicationResetStartRequest {
     reset_before: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ReplicationResetStatusRequest {
+    arn: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationResetStatusResponse {
     #[serde(rename = "Targets")]
@@ -161,11 +170,11 @@ struct ReplicationResetStatusTarget {
     )]
     start_time: Option<OffsetDateTime>,
     #[serde(
-        rename = "LastUpdate",
+        rename = "EndTime",
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
-    last_update: Option<OffsetDateTime>,
+    end_time: Option<OffsetDateTime>,
     #[serde(rename = "Status")]
     status: String,
     #[serde(rename = "ReplicatedCount")]
@@ -176,6 +185,8 @@ struct ReplicationResetStatusTarget {
     failed_count: i64,
     #[serde(rename = "FailedSize")]
     failed_size: i64,
+    #[serde(rename = "Bucket", skip_serializing_if = "String::is_empty")]
+    bucket: String,
     #[serde(rename = "Object", skip_serializing_if = "String::is_empty")]
     object: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
@@ -194,6 +205,16 @@ struct ReplicationCheckTargetStatus {
     status: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationCheckFailureContext {
+    BucketCheck,
+    VersioningCheck,
+    ReplicateObject,
+    ReplicateDeleteMarker,
+    DeleteObjectVersion,
+    ObjectLockCheck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,8 +619,26 @@ fn resolve_object_lambda_webhook_config_from_server_config(
     })
 }
 
-fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambdaWebhookConfig> {
+async fn load_current_server_config() -> S3Result<Config> {
+    if let Some(system) = notification_system() {
+        return Ok(system.config.read().await.clone());
+    }
+
+    if let Some(store) = new_object_layer_fn() {
+        match read_config_without_migrate(store).await {
+            Ok(config) => return Ok(config),
+            Err(err) => {
+                warn!("failed to reload current server config for object lambda request: {err}");
+            }
+        }
+    }
+
     let config = get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    Ok(config)
+}
+
+async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambdaWebhookConfig> {
+    let config = load_current_server_config().await?;
     let arn = parse_object_lambda_arn(uri)?;
     resolve_object_lambda_webhook_config_from_server_config(&config, &arn)
 }
@@ -997,7 +1036,7 @@ async fn invoke_object_lambda_target(
     object: &str,
     get_resp: S3Response<GetObjectOutput>,
 ) -> S3Result<S3Response<Body>> {
-    let lambda_config = resolve_object_lambda_webhook_config(&req.uri)?;
+    let lambda_config = resolve_object_lambda_webhook_config(&req.uri).await?;
     let client = build_object_lambda_http_client(&lambda_config)?;
     let lambda_arn = query_value_exact(&req.uri, "lambdaArn")
         .filter(|value| !value.trim().is_empty())
@@ -1207,6 +1246,7 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
         Some(stats) => stats.get_latest_replication_stats(bucket).await,
         None => BucketStats::default(),
     };
+    let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
     let body = serialize_replication_metrics_body(&bucket_stats, route)?;
@@ -1223,6 +1263,42 @@ fn replication_metrics_uptime_seconds() -> i64 {
         .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
         .map(|uptime| uptime.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn collect_replication_metrics_bandwidth(bucket: &str) -> HashMap<String, BandwidthDetails> {
+    get_global_bucket_monitor()
+        .map(|monitor| {
+            monitor
+                .get_report(|name| name == bucket)
+                .bucket_stats
+                .into_iter()
+                .filter_map(|(opts, details)| {
+                    if opts.replication_arn.is_empty() {
+                        None
+                    } else {
+                        Some((opts.replication_arn, details))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_replication_metrics_bandwidth_report(
+    mut bucket_stats: BucketStats,
+    bandwidth_report: HashMap<String, BandwidthDetails>,
+) -> BucketStats {
+    for (arn, details) in bandwidth_report {
+        let stat = bucket_stats
+            .replication_stats
+            .stats
+            .entry(arn)
+            .or_default();
+        stat.bandwidth_limit_bytes_per_sec = details.limit_bytes_per_sec;
+        stat.current_bandwidth_bytes_per_sec = details.current_bandwidth_bytes_per_sec;
+    }
+
+    bucket_stats
 }
 
 fn apply_replication_metrics_runtime_fields(
@@ -1287,7 +1363,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
 fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
     let arn = query_value_exact(uri, "arn")
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| s3_error!(InvalidRequest, "arn query parameter is required"))?;
+        .unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
     let reset_before = match query_value_exact(uri, "older-than").filter(|v| !v.is_empty()) {
@@ -1312,6 +1388,80 @@ fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest>
     })
 }
 
+fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> Vec<String> {
+    let mut arns = Vec::new();
+    let mut seen = HashSet::new();
+
+    for rule in &config.rules {
+        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
+        let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|status| {
+            status.status
+                == s3s::dto::ExistingObjectReplicationStatus::from_static(
+                    s3s::dto::ExistingObjectReplicationStatus::ENABLED,
+                )
+        });
+        if !existing_object_enabled {
+            continue;
+        }
+
+        let arn = if config.role.is_empty() {
+            rule.destination.bucket.clone()
+        } else {
+            config.role.clone()
+        };
+
+        if seen.insert(arn.clone()) {
+            arns.push(arn);
+        }
+
+        if !config.role.is_empty() {
+            break;
+        }
+    }
+
+    arns
+}
+
+fn resolve_replication_reset_target_arn(
+    config: &s3s::dto::ReplicationConfiguration,
+    requested_arn: &str,
+) -> S3Result<String> {
+    let resettable_arns = collect_resettable_replication_target_arns(config);
+
+    if requested_arn.is_empty() {
+        return match resettable_arns.as_slice() {
+            [] => Err(s3_error!(
+                InvalidRequest,
+                "replication reset requires a target with existing object replication enabled"
+            )),
+            [arn] => Ok(arn.clone()),
+            _ => Err(s3_error!(
+                InvalidRequest,
+                "arn query parameter is required when multiple replication targets are configured"
+            )),
+        };
+    }
+
+    let (has_arn, existing_object_enabled) = config.has_existing_object_replication(requested_arn);
+    if !has_arn {
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication reset arn is not configured for this bucket"
+        ));
+    }
+    if !existing_object_enabled {
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication reset requires existing object replication to be enabled for the target"
+        ));
+    }
+
+    Ok(requested_arn.to_string())
+}
+
 fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3Result<S3Response<Body>> {
     let data = serde_json::to_vec(&ReplicationResetResponse { targets }).map_err(|e| s3_error!(InternalError, "{e}"))?;
     let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
@@ -1330,21 +1480,32 @@ fn apply_replication_reset_to_targets(targets: &mut BucketTargets, reset: &Repli
     Ok(())
 }
 
-fn build_replication_reset_status_targets(status: &BucketReplicationResyncStatus) -> Vec<ReplicationResetStatusTarget> {
+fn parse_reset_status_target(uri: &Uri) -> ReplicationResetStatusRequest {
+    ReplicationResetStatusRequest {
+        arn: query_value_exact(uri, "arn").filter(|v| !v.is_empty()),
+    }
+}
+
+fn build_replication_reset_status_targets(
+    status: &BucketReplicationResyncStatus,
+    arn_filter: Option<&str>,
+) -> Vec<ReplicationResetStatusTarget> {
     let mut targets = status
         .targets_map
         .iter()
+        .filter(|(arn, _)| arn_filter.is_none_or(|filter| *arn == filter))
         .map(|(arn, target)| ReplicationResetStatusTarget {
             arn: arn.clone(),
             reset_id: target.resync_id.clone(),
             reset_before_date: target.resync_before_date,
             start_time: target.start_time,
-            last_update: target.last_update,
+            end_time: target.last_update,
             status: target.resync_status.to_string(),
             replicated_count: target.replicated_count,
             replicated_size: target.replicated_size,
             failed_count: target.failed_count,
             failed_size: target.failed_size,
+            bucket: target.bucket.clone(),
             object: target.object.clone(),
             error: target.error.clone(),
         })
@@ -1353,9 +1514,12 @@ fn build_replication_reset_status_targets(status: &BucketReplicationResyncStatus
     targets
 }
 
-fn build_replication_reset_status_response(status: BucketReplicationResyncStatus) -> S3Result<S3Response<Body>> {
+fn build_replication_reset_status_response(
+    status: BucketReplicationResyncStatus,
+    arn_filter: Option<&str>,
+) -> S3Result<S3Response<Body>> {
     let data = serde_json::to_vec(&ReplicationResetStatusResponse {
-        targets: build_replication_reset_status_targets(&status),
+        targets: build_replication_reset_status_targets(&status, arn_filter),
     })
     .map_err(|e| s3_error!(InternalError, "{e}"))?;
     let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
@@ -1379,6 +1543,57 @@ fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatu
     }
 
     Ok(S3Response::with_status(Body::empty(), StatusCode::OK))
+}
+
+fn format_replication_check_client_error(err: &S3ClientError, context: ReplicationCheckFailureContext) -> String {
+    if err.code.as_deref() == Some("AccessDenied") {
+        return match context {
+            ReplicationCheckFailureContext::ReplicateObject => {
+                "s3:ReplicateObject permissions missing for replication user".to_string()
+            }
+            ReplicationCheckFailureContext::ReplicateDeleteMarker => {
+                "s3:ReplicateDelete permissions missing for replication user".to_string()
+            }
+            ReplicationCheckFailureContext::DeleteObjectVersion => {
+                "s3:ReplicateDelete/s3:DeleteObject permissions missing for replication user".to_string()
+            }
+            ReplicationCheckFailureContext::BucketCheck => "target bucket check failed: access denied".to_string(),
+            ReplicationCheckFailureContext::VersioningCheck => {
+                "target bucket versioning check failed: access denied".to_string()
+            }
+            ReplicationCheckFailureContext::ObjectLockCheck => "target object lock check failed: access denied".to_string(),
+        };
+    }
+
+    let context = match context {
+        ReplicationCheckFailureContext::BucketCheck => "target bucket check failed",
+        ReplicationCheckFailureContext::VersioningCheck => "target bucket versioning check failed",
+        ReplicationCheckFailureContext::ReplicateObject => "target replicate object check failed",
+        ReplicationCheckFailureContext::ReplicateDeleteMarker => "target replicate delete-marker check failed",
+        ReplicationCheckFailureContext::DeleteObjectVersion => "target delete object version check failed",
+        ReplicationCheckFailureContext::ObjectLockCheck => "target object lock check failed",
+    };
+
+    match (err.code.as_deref(), err.message.as_deref()) {
+        (Some("NoSuchBucket" | "NotFound"), _) => format!("{context}: target bucket does not exist"),
+        (Some(code), Some(message)) if !message.is_empty() => format!("{context}: {code}: {message}"),
+        (Some(code), _) => format!("{context}: {code}"),
+        (None, Some(message)) if !message.is_empty() => format!("{context}: {message}"),
+        _ => format!("{context}: {}", err.error),
+    }
+}
+
+fn is_object_lock_not_enabled_error(err: &S3ClientError) -> bool {
+    matches!(
+        err.code.as_deref(),
+        Some("ObjectLockConfigurationNotFoundError" | "ObjectLockConfigurationNotFound")
+    ) || err
+        .message
+        .as_deref()
+        .is_some_and(|message| {
+            message.contains("Object Lock configuration does not exist")
+                || message.contains("Object Lock is not enabled for this bucket")
+        })
 }
 
 fn validate_replication_check_config_targets(
@@ -1470,7 +1685,10 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
         }
         Err(err) => {
             result.status = "FAILED".to_string();
-            result.error = Some(err.to_string());
+            result.error = Some(format_replication_check_client_error(
+                &err,
+                ReplicationCheckFailureContext::BucketCheck,
+            ));
             return result;
         }
     }
@@ -1479,12 +1697,15 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
         Ok(Some(_)) => {}
         Ok(None) => {
             result.status = "FAILED".to_string();
-            result.error = Some("target bucket versioning is not enabled".to_string());
+            result.error = Some(format!("target bucket {} is not versioned", target.target_bucket));
             return result;
         }
         Err(err) => {
             result.status = "FAILED".to_string();
-            result.error = Some(err.to_string());
+            result.error = Some(format_replication_check_client_error(
+                &err,
+                ReplicationCheckFailureContext::VersioningCheck,
+            ));
             return result;
         }
     }
@@ -1495,7 +1716,10 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
             Ok(output) => output,
             Err(err) => {
                 result.status = "FAILED".to_string();
-                result.error = Some(format!("target replicate object check failed: {err}"));
+                result.error = Some(format_replication_check_client_error(
+                    &err,
+                    ReplicationCheckFailureContext::ReplicateObject,
+                ));
                 return result;
             }
         };
@@ -1510,7 +1734,10 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
     .await
     {
         result.status = "FAILED".to_string();
-        result.error = Some(format!("target replicate delete-marker check failed: {err}"));
+        result.error = Some(format_replication_check_client_error(
+            &err,
+            ReplicationCheckFailureContext::ReplicateDeleteMarker,
+        ));
         return result;
     }
 
@@ -1524,7 +1751,10 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
     .await
     {
         result.status = "FAILED".to_string();
-        result.error = Some(format!("target delete object version check failed: {err}"));
+        result.error = Some(format_replication_check_client_error(
+            &err,
+            ReplicationCheckFailureContext::DeleteObjectVersion,
+        ));
         return result;
     }
 
@@ -1573,7 +1803,7 @@ async fn put_replication_probe_object(
     target_client: &TargetClient,
     target_bucket: &str,
     probe_key: &str,
-) -> Result<(Option<String>, OffsetDateTime), String> {
+) -> Result<(Option<String>, OffsetDateTime), S3ClientError> {
     let now = OffsetDateTime::now_utc();
     let options = build_replication_probe_put_options(now);
     let mut headers = HeaderMap::new();
@@ -1607,7 +1837,7 @@ async fn put_replication_probe_object(
         .send()
         .await
         .map(|output| (output.version_id().map(ToOwned::to_owned), now))
-        .map_err(|err| err.to_string())
+        .map_err(S3ClientError::from)
 }
 
 async fn delete_replication_probe_object(
@@ -1616,7 +1846,7 @@ async fn delete_replication_probe_object(
     probe_key: &str,
     version_id: Option<&str>,
     options: RemoveObjectOptions,
-) -> Result<(), String> {
+) -> Result<(), S3ClientError> {
     let mut headers = HeaderMap::new();
     if options.replication_delete_marker {
         insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
@@ -1651,7 +1881,7 @@ async fn delete_replication_probe_object(
         .send()
         .await
         .map(|_| ())
-        .map_err(|err| err.to_string())
+        .map_err(S3ClientError::from)
 }
 
 async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
@@ -1694,13 +1924,16 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
                 Ok(enabled) => enabled,
                 Err(err) => {
                     status.status = "FAILED".to_string();
-                    status.error = Some(err);
+                    status.error = Some(format_replication_check_client_error(
+                        &err,
+                        ReplicationCheckFailureContext::ObjectLockCheck,
+                    ));
                     false
                 }
             };
             if status.status == "OK" && !target_lock_enabled {
                 status.status = "FAILED".to_string();
-                status.error = Some("target bucket object lock is not enabled".to_string());
+                status.error = Some(format!("target bucket {} is not object lock enabled", target.target_bucket));
             }
         }
         statuses.push(status);
@@ -1709,26 +1942,42 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
     build_replication_check_response(statuses)
 }
 
-async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) -> Result<bool, String> {
-    let target_client = resolve_replication_target_client(bucket, target).await?;
+async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) -> Result<bool, S3ClientError> {
+    let target_client = resolve_replication_target_client(bucket, target)
+        .await
+        .map_err(S3ClientError::new)?;
 
-    target_client
+    match target_client
         .client
         .get_object_lock_configuration()
         .bucket(&target.target_bucket)
         .send()
         .await
-        .map(|res| {
+    {
+        Ok(res) => Ok(
             res.object_lock_configuration()
                 .and_then(|cfg| cfg.object_lock_enabled())
-                .is_some_and(|state| state.as_str() == "Enabled")
-        })
-        .map_err(|err| format!("target object lock check failed: {err}"))
+                .is_some_and(|state| state.as_str() == "Enabled"),
+        ),
+        Err(err) => {
+            let err = S3ClientError::from(err);
+            if is_object_lock_not_enabled_error(&err) {
+                Ok(false)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
-async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<()> {
+async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<ReplicationResetTarget> {
+    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
+    let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
+    let mut resolved_reset = reset.clone();
+    resolved_reset.arn = resolved_arn.clone();
+
     let mut targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
-    apply_replication_reset_to_targets(&mut targets, reset)?;
+    apply_replication_reset_to_targets(&mut targets, &resolved_reset)?;
 
     let json_targets = serde_json::to_vec(&targets).map_err(|e| s3_error!(InternalError, "{e}"))?;
     metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
@@ -1742,14 +1991,17 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
 
     pool.start_bucket_resync(ResyncOpts {
         bucket: bucket.to_string(),
-        arn: reset.arn.clone(),
+        arn: resolved_arn.clone(),
         resync_id: reset.reset_id.clone(),
         resync_before: reset.reset_before,
     })
     .await
     .map_err(|e| s3_error!(InternalError, "{e}"))?;
 
-    Ok(())
+    Ok(ReplicationResetTarget {
+        arn: resolved_arn,
+        reset_id: reset.reset_id.clone(),
+    })
 }
 
 async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
@@ -1786,16 +2038,14 @@ async fn handle_replication_extension_request(
             run_replication_check(&ext_req.bucket).await
         }
         ReplicationExtRoute::ResetStatus => {
+            let status_req = parse_reset_status_target(&req.uri);
             let status = load_replication_resync_status(&ext_req.bucket).await?;
-            build_replication_reset_status_response(status)
+            build_replication_reset_status_response(status, status_req.arn.as_deref())
         }
         ReplicationExtRoute::ResetStart => {
             let target = parse_reset_start_target(&req.uri)?;
-            start_replication_resync(&ext_req.bucket, &target).await?;
-            build_replication_reset_response(vec![ReplicationResetTarget {
-                arn: target.arn,
-                reset_id: target.reset_id,
-            }])
+            let target = start_replication_resync(&ext_req.bucket, &target).await?;
+            build_replication_reset_response(vec![target])
         }
     }
 }
@@ -2115,6 +2365,7 @@ mod tests {
     use http::Method;
     use http::Uri;
     use s3s::S3Request;
+    use time::macros::datetime;
 
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
@@ -2177,14 +2428,12 @@ mod tests {
 
     #[test]
     fn parse_reset_start_target_defaults_reset_before_and_supports_older_than() {
-        let no_window: Uri = "/demo-bucket?replication-reset&arn=arn:target"
-            .parse()
-            .expect("uri should parse");
+        let no_window: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
         let before_default = OffsetDateTime::now_utc();
         let parsed_default = parse_reset_start_target(&no_window).expect("default reset request should parse");
         let after_default = OffsetDateTime::now_utc();
 
-        assert_eq!(parsed_default.arn, "arn:target");
+        assert!(parsed_default.arn.is_empty());
         assert!(!parsed_default.reset_id.is_empty());
         let reset_before = parsed_default.reset_before.expect("default reset window should be set");
         assert!(reset_before >= before_default && reset_before <= after_default);
@@ -2200,6 +2449,117 @@ mod tests {
         let reset_before = parsed_window.reset_before.expect("older-than reset window should be set");
         assert!(reset_before <= after_window - time::Duration::minutes(59));
         assert!(reset_before >= before_window - time::Duration::hours(1) - time::Duration::seconds(1));
+    }
+
+    #[test]
+    fn resolve_replication_reset_target_arn_uses_single_existing_object_target_by_default() {
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![s3s::dto::ReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: s3s::dto::Destination {
+                    bucket: "arn:replication:a".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
+                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
+                        s3s::dto::ExistingObjectReplicationStatus::ENABLED,
+                    ),
+                }),
+                filter: None,
+                id: Some("rule-a".to_string()),
+                prefix: Some(String::new()),
+                priority: None,
+                source_selection_criteria: None,
+                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+            }],
+        };
+
+        let resolved = resolve_replication_reset_target_arn(&config, "").expect("single target should resolve");
+        assert_eq!(resolved, "arn:replication:a");
+    }
+
+    #[test]
+    fn resolve_replication_reset_target_arn_requires_arn_for_multiple_targets() {
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                s3s::dto::ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: None,
+                    destination: s3s::dto::Destination {
+                        bucket: "arn:replication:a".to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
+                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
+                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
+                        ),
+                    }),
+                    filter: None,
+                    id: Some("rule-a".to_string()),
+                    prefix: Some(String::new()),
+                    priority: None,
+                    source_selection_criteria: None,
+                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                },
+                s3s::dto::ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: None,
+                    destination: s3s::dto::Destination {
+                        bucket: "arn:replication:b".to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
+                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
+                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
+                        ),
+                    }),
+                    filter: None,
+                    id: Some("rule-b".to_string()),
+                    prefix: Some(String::new()),
+                    priority: None,
+                    source_selection_criteria: None,
+                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                },
+            ],
+        };
+
+        let err = resolve_replication_reset_target_arn(&config, "").expect_err("multiple targets should require arn");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("arn query parameter is required"));
+    }
+
+    #[test]
+    fn resolve_replication_reset_target_arn_rejects_target_without_existing_object_replication() {
+        let config = s3s::dto::ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![s3s::dto::ReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: s3s::dto::Destination {
+                    bucket: "arn:replication:a".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
+                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
+                        s3s::dto::ExistingObjectReplicationStatus::DISABLED,
+                    ),
+                }),
+                filter: None,
+                id: Some("rule-a".to_string()),
+                prefix: Some(String::new()),
+                priority: None,
+                source_selection_criteria: None,
+                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+            }],
+        };
+
+        let err = resolve_replication_reset_target_arn(&config, "arn:replication:a")
+            .expect_err("target without existing object replication should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("existing object replication"));
     }
 
     #[test]
@@ -2229,9 +2589,11 @@ mod tests {
             "arn:z".to_string(),
             rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
+                last_update: Some(datetime!(2025-01-03 00:00 UTC)),
                 resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
+                bucket: "bucket-z".to_string(),
                 error: Some("boom".to_string()),
                 ..Default::default()
             },
@@ -2240,24 +2602,74 @@ mod tests {
             "arn:a".to_string(),
             rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
+                last_update: Some(datetime!(2025-01-02 00:00 UTC)),
                 resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
+                bucket: "bucket-a".to_string(),
                 ..Default::default()
             },
         );
 
-        let response = build_replication_reset_status_response(status).expect("status response should build");
+        let response = build_replication_reset_status_response(status, None).expect("status response should build");
         let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
             .expect("body should read")
             .to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
 
         assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
+        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-a");
         assert_eq!(payload["Targets"][0]["Status"], "Completed");
+        assert_eq!(payload["Targets"][0]["EndTime"], "2025-01-02T00:00:00Z");
         assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][1]["Bucket"], "bucket-z");
         assert_eq!(payload["Targets"][1]["Status"], "Failed");
+        assert_eq!(payload["Targets"][1]["EndTime"], "2025-01-03T00:00:00Z");
         assert_eq!(payload["Targets"][1]["Error"], "boom");
+    }
+
+    #[test]
+    fn build_replication_reset_status_response_filters_targets_by_arn() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:z".to_string(),
+            rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "rid-z".to_string(),
+                last_update: Some(datetime!(2025-02-03 00:00 UTC)),
+                resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                failed_count: 2,
+                failed_size: 4,
+                bucket: "bucket-z".to_string(),
+                error: Some("boom".to_string()),
+                ..Default::default()
+            },
+        );
+        status.targets_map.insert(
+            "arn:a".to_string(),
+            rustfs_ecstore::bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "rid-a".to_string(),
+                last_update: Some(datetime!(2025-02-02 00:00 UTC)),
+                resync_status: rustfs_ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                replicated_count: 3,
+                replicated_size: 9,
+                bucket: "bucket-a".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let response =
+            build_replication_reset_status_response(status, Some("arn:z")).expect("status response should build");
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be json");
+
+        assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][0]["Bucket"], "bucket-z");
+        assert_eq!(payload["Targets"][0]["Status"], "Failed");
+        assert_eq!(payload["Targets"][0]["EndTime"], "2025-02-03T00:00:00Z");
+        assert_eq!(payload["Targets"][0]["Error"], "boom");
     }
 
     #[test]
@@ -2319,6 +2731,95 @@ mod tests {
         let replication_targets = filter_replication_check_targets(BucketTargets::default(), &config);
 
         assert!(replication_targets.is_empty());
+    }
+
+    #[test]
+    fn format_replication_check_client_error_prefers_structured_access_denied() {
+        let err = S3ClientError::with_metadata(
+            "AccessDenied: denied",
+            None,
+            Some("AccessDenied".to_string()),
+            Some("denied".to_string()),
+        );
+
+        let formatted =
+            format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+        assert_eq!(formatted, "target bucket check failed: access denied");
+    }
+
+    #[test]
+    fn format_replication_check_client_error_uses_remote_code_and_message() {
+        let err = S3ClientError::with_metadata(
+            "InvalidRequest: bucket versioning is suspended",
+            None,
+            Some("InvalidRequest".to_string()),
+            Some("bucket versioning is suspended".to_string()),
+        );
+
+        let formatted =
+            format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+        assert_eq!(
+            formatted,
+            "target bucket versioning check failed: InvalidRequest: bucket versioning is suspended"
+        );
+    }
+
+    #[test]
+    fn format_replication_check_client_error_maps_replicate_permission_failures() {
+        let err = S3ClientError::with_metadata(
+            "AccessDenied: denied",
+            None,
+            Some("AccessDenied".to_string()),
+            Some("denied".to_string()),
+        );
+
+        let replicate_object =
+            format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+        assert_eq!(
+            replicate_object,
+            "s3:ReplicateObject permissions missing for replication user"
+        );
+
+        let replicate_delete =
+            format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateDeleteMarker);
+        assert_eq!(
+            replicate_delete,
+            "s3:ReplicateDelete permissions missing for replication user"
+        );
+
+        let delete_object =
+            format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion);
+        assert_eq!(
+            delete_object,
+            "s3:ReplicateDelete/s3:DeleteObject permissions missing for replication user"
+        );
+    }
+
+    #[test]
+    fn is_object_lock_not_enabled_error_recognizes_missing_configuration() {
+        let code_only = S3ClientError::with_metadata(
+            "ObjectLockConfigurationNotFoundError: missing",
+            None,
+            Some("ObjectLockConfigurationNotFoundError".to_string()),
+            Some("missing".to_string()),
+        );
+        assert!(is_object_lock_not_enabled_error(&code_only));
+
+        let message_only = S3ClientError::with_metadata(
+            "Object Lock is not enabled for this bucket",
+            None,
+            None,
+            Some("Object Lock is not enabled for this bucket".to_string()),
+        );
+        assert!(is_object_lock_not_enabled_error(&message_only));
+
+        let access_denied = S3ClientError::with_metadata(
+            "AccessDenied: denied",
+            None,
+            Some("AccessDenied".to_string()),
+            Some("denied".to_string()),
+        );
+        assert!(!is_object_lock_not_enabled_error(&access_denied));
     }
 
     #[test]
@@ -2417,6 +2918,57 @@ mod tests {
         assert_eq!(payload["replica_count"], 7);
         assert!(payload.get("uptime").is_none());
         assert!(payload.get("proxy_stats").is_none());
+    }
+
+    #[test]
+    fn apply_replication_metrics_bandwidth_report_updates_existing_target_stats() {
+        let mut stats = BucketStats::default();
+        stats
+            .replication_stats
+            .stats
+            .entry("arn:replication:a".to_string())
+            .or_default()
+            .replicated_count = 3;
+
+        let bandwidth_report = HashMap::from([(
+            "arn:replication:a".to_string(),
+            BandwidthDetails {
+                limit_bytes_per_sec: 2048,
+                current_bandwidth_bytes_per_sec: 1536.5,
+            },
+        )]);
+
+        let updated = apply_replication_metrics_bandwidth_report(stats, bandwidth_report);
+        let stat = updated
+            .replication_stats
+            .stats
+            .get("arn:replication:a")
+            .expect("target stats should exist");
+
+        assert_eq!(stat.replicated_count, 3);
+        assert_eq!(stat.bandwidth_limit_bytes_per_sec, 2048);
+        assert_eq!(stat.current_bandwidth_bytes_per_sec, 1536.5);
+    }
+
+    #[test]
+    fn apply_replication_metrics_bandwidth_report_creates_missing_target_stats() {
+        let bandwidth_report = HashMap::from([(
+            "arn:replication:b".to_string(),
+            BandwidthDetails {
+                limit_bytes_per_sec: 4096,
+                current_bandwidth_bytes_per_sec: 1024.25,
+            },
+        )]);
+
+        let updated = apply_replication_metrics_bandwidth_report(BucketStats::default(), bandwidth_report);
+        let stat = updated
+            .replication_stats
+            .stats
+            .get("arn:replication:b")
+            .expect("target stats should be created from bandwidth report");
+
+        assert_eq!(stat.bandwidth_limit_bytes_per_sec, 4096);
+        assert_eq!(stat.current_bandwidth_bytes_per_sec, 1024.25);
     }
 
     #[test]

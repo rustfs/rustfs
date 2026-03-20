@@ -1,0 +1,378 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::common::{RustFSTestEnvironment, init_logging};
+use aws_sdk_s3::primitives::ByteStream;
+use http::header::{CONTENT_TYPE, HOST};
+use reqwest::StatusCode;
+use rustfs_signer::sign_v4;
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use s3s::Body;
+use serial_test::serial;
+use std::collections::HashMap;
+use std::error::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::time::{Duration, timeout};
+
+#[derive(Debug)]
+struct CapturedWebhookRequest {
+    headers: HashMap<String, String>,
+    payload: serde_json::Value,
+}
+
+fn find_header_terminator(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(HashMap<String, String>, Vec<u8>), Box<dyn Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err("webhook request ended before headers were fully received".into());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(pos) = find_header_terminator(&buffer) {
+            break pos;
+        }
+    };
+
+    let header_bytes = &buffer[..header_end];
+    let header_text = std::str::from_utf8(header_bytes)?;
+    let mut lines = header_text.split("\r\n");
+    let _request_line = lines.next().ok_or("missing request line")?;
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').ok_or("invalid header line")?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .ok_or("missing content-length header")?
+        .parse::<usize>()?;
+    let body_offset = header_end + 4;
+    while buffer.len().saturating_sub(body_offset) < content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err("webhook request ended before body was fully received".into());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok((headers, buffer[body_offset..body_offset + content_length].to_vec()))
+}
+
+async fn spawn_object_lambda_webhook_server(
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<CapturedWebhookRequest>,
+        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let webhook_url = format!("http://{address}/transform");
+    let (request_tx, request_rx) = oneshot::channel();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let Ok(Ok((headers, body))) = timeout(Duration::from_secs(2), read_http_request(&mut stream)).await else {
+                continue;
+            };
+            let payload: serde_json::Value = serde_json::from_slice(&body)?;
+
+            let output_route = payload["getObjectContext"]["outputRoute"]
+                .as_str()
+                .ok_or("missing outputRoute in webhook payload")?
+                .to_string();
+            let output_token = payload["getObjectContext"]["outputToken"]
+                .as_str()
+                .ok_or("missing outputToken in webhook payload")?
+                .to_string();
+
+            let _ = request_tx.send(CapturedWebhookRequest { headers, payload });
+
+            let response_body = b"transformed through object lambda";
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nx-amz-request-route: {output_route}\r\nx-amz-request-token: {output_token}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response_head.as_bytes()).await?;
+            stream.write_all(response_body).await?;
+            stream.shutdown().await?;
+
+            return Ok(());
+        }
+    });
+
+    Ok((webhook_url, request_rx, handle))
+}
+
+async fn signed_request(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_len,
+        access_key,
+        secret_key,
+        "",
+        "us-east-1",
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = reqwest::Client::new();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+async fn configure_webhook_target(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+    endpoint: &str,
+    auth_token: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let queue_dir = format!("{}/notify-queue", env.temp_dir);
+    tokio::fs::create_dir_all(&queue_dir).await?;
+    let payload = serde_json::json!({
+        "key_values": [
+            { "key": "endpoint", "value": endpoint },
+            { "key": "auth_token", "value": auth_token },
+            { "key": "queue_dir", "value": queue_dir }
+        ]
+    });
+    let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{}", env.url, target_name);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(payload.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("failed to configure object lambda webhook target: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn list_notification_targets(
+    env: &RustFSTestEnvironment,
+) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/target/list", env.url);
+    let response = signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "failed to list notification targets: {status} {}",
+            String::from_utf8_lossy(body.as_ref())
+        )
+        .into());
+    }
+
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn list_target_arns(env: &RustFSTestEnvironment) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/target/arns", env.url);
+    let response = signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "failed to list target arns: {status} {}",
+            String::from_utf8_lossy(body.as_ref())
+        )
+        .into());
+    }
+
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn wait_for_target_visibility(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+) -> Result<(serde_json::Value, Vec<String>), Box<dyn Error + Send + Sync>> {
+    let mut last_targets = serde_json::Value::Null;
+    let mut last_arns = Vec::new();
+
+    for _ in 0..20 {
+        last_targets = list_notification_targets(env).await?;
+        last_arns = list_target_arns(env).await?;
+
+        let listed = last_targets["notification_endpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry["account_id"].as_str() == Some(target_name)
+                    && entry["service"]
+                        .as_str()
+                        .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
+            });
+
+        if listed {
+            return Ok((last_targets, last_arns));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!(
+        "target {target_name} did not become visible in admin APIs; targets={last_targets}, arns={last_arns:?}"
+    )
+    .into())
+}
+
+async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
+    let path = format!("{}/.rustfs.sys/config/config.json", env.temp_dir);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(err) => format!("failed to read persisted config at {path}: {err}"),
+    }
+}
+
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e";
+    let key = "input.txt";
+    let object_body = b"hello object lambda";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(object_body))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    let (visible_targets, visible_arns) = wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!(
+        "{}/{}/{}?lambdaArn={}",
+        env.url,
+        bucket,
+        key,
+        urlencoding::encode(lambda_arn)
+    );
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let persisted_config = read_persisted_server_config(&env).await;
+        return Err(format!(
+            "object lambda request failed: {status} {body}; visible_targets={visible_targets}; visible_arns={visible_arns:?}; persisted_config={persisted_config}"
+        )
+        .into());
+    }
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(response.text().await?, "transformed through object lambda");
+
+    let captured = timeout(Duration::from_secs(10), request_rx).await??;
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer secret-token")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-rustfs-object-lambda-bucket")
+            .map(String::as_str),
+        Some(bucket)
+    );
+    assert_eq!(
+        captured.headers.get("x-rustfs-object-lambda-key").map(String::as_str),
+        Some(key)
+    );
+
+    assert_eq!(
+        captured.payload["configuration"]["accessPointArn"].as_str(),
+        Some(lambda_arn)
+    );
+    let expected_request_url = format!("/{bucket}/{key}?lambdaArn={}", urlencoding::encode(lambda_arn));
+    assert_eq!(captured.payload["userRequest"]["url"].as_str(), Some(expected_request_url.as_str()));
+
+    let input_s3_url = captured.payload["getObjectContext"]["inputS3Url"]
+        .as_str()
+        .ok_or("missing inputS3Url in object lambda payload")?;
+    assert!(!input_s3_url.contains("lambdaArn="));
+
+    let source_response = reqwest::get(input_s3_url).await?;
+    assert_eq!(source_response.status(), StatusCode::OK);
+    assert_eq!(source_response.bytes().await?.as_ref(), object_body);
+
+    webhook_handle.await??;
+
+    Ok(())
+}

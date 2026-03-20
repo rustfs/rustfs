@@ -24,6 +24,7 @@
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Once;
@@ -33,6 +34,7 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
@@ -63,15 +65,10 @@ pub fn workspace_root() -> PathBuf {
 }
 
 /// Resolve the RustFS binary relative to the workspace.
-/// Always builds the binary to ensure it's up to date.
 pub fn rustfs_binary_path() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
-
-    // Always build the binary to ensure it's up to date
-    info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary();
 
     let mut binary_path = workspace_root();
     binary_path.push("target");
@@ -79,8 +76,74 @@ pub fn rustfs_binary_path() -> PathBuf {
     binary_path.push(profile_dir);
     binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
 
+    let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
+    if binary_path.is_file() && (!source_is_newer || running_inside_e2e_test_binary()) {
+        if source_is_newer {
+            warn!(
+                "RustFS binary at {:?} appears older than workspace sources; reusing it inside cargo test to avoid nested builds",
+                binary_path
+            );
+        }
+        info!("Using existing RustFS binary at {:?}", binary_path);
+        return binary_path;
+    }
+
+    info!("Building RustFS binary to ensure it's up to date...");
+    build_rustfs_binary();
+
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
+}
+
+fn workspace_sources_newer_than_binary(binary_path: &PathBuf) -> bool {
+    let Ok(binary_meta) = std::fs::metadata(binary_path) else {
+        return true;
+    };
+    let Ok(binary_modified) = binary_meta.modified() else {
+        return true;
+    };
+
+    let workspace = workspace_root();
+    let watch_roots = [
+        workspace.join("Cargo.toml"),
+        workspace.join("Cargo.lock"),
+        workspace.join("rustfs"),
+        workspace.join("crates"),
+    ];
+
+    watch_roots.iter().any(|path| path_is_newer_than(binary_modified, path))
+}
+
+fn running_inside_e2e_test_binary() -> bool {
+    std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
+}
+
+fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &PathBuf) -> bool {
+    if path.is_file() {
+        return std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map(|modified| modified > binary_modified)
+            .unwrap_or(false);
+    }
+
+    if !path.is_dir() {
+        return false;
+    }
+
+    WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name();
+            name != OsStr::new("target") && name != OsStr::new(".git")
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .any(|entry| {
+            std::fs::metadata(entry.path())
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified > binary_modified)
+                .unwrap_or(false)
+        })
 }
 
 /// Build the RustFS binary using cargo
@@ -237,7 +300,10 @@ impl RustFSTestEnvironment {
         info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path).args(&args).spawn()?;
+        let process = Command::new(&binary_path)
+            .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
+            .args(&args)
+            .spawn()?;
 
         self.process = Some(process);
 
@@ -508,6 +574,7 @@ impl RustFSTestClusterEnvironment {
                 .env("RUSTFS_ACCESS_KEY", &self.access_key)
                 .env("RUSTFS_SECRET_KEY", &self.secret_key)
                 .env("RUSTFS_CONSOLE_ENABLE", "false")
+                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
                 .current_dir(&node.data_dir)
                 .spawn()?;
 

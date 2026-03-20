@@ -91,3 +91,7 @@ mod bucket_logging_test;
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
+
+// Object lambda end-to-end regression tests
+#[cfg(test)]
+mod object_lambda_test;
