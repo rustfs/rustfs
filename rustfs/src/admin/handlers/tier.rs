@@ -29,7 +29,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::{
     config::storageclass,
     tier::{
-        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
+        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS, TierConfigMgr},
         tier_admin::TierCreds,
         tier_config::{TierConfig, TierType},
         tier_handlers::{
@@ -75,6 +75,21 @@ pub struct AddTierQuery {
 }
 
 pub struct AddTier {}
+
+fn extract_required_tier_name(query: &AddTierQuery) -> S3Result<&str> {
+    query
+        .tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .ok_or_else(|| s3_error!(InvalidRequest, "tier is required"))
+}
+
+fn get_tier_info(tier_config_mgr: &TierConfigMgr, tier_name: &str) -> S3Result<TierConfig> {
+    tier_config_mgr
+        .get(tier_name)
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found."))
+}
 
 pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -486,7 +501,8 @@ impl Operation for VerifyTier {
 
         let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-        tier_config_mgr.verify(&query.tier.unwrap()).await;
+        let tier_name = extract_required_tier_name(&query)?;
+        tier_config_mgr.verify(tier_name).await;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -528,7 +544,8 @@ impl Operation for GetTierInfo {
 
         let tier_config_mgr_handle = resolve_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
-        let info = tier_config_mgr.get(&query.tier.unwrap());
+        let tier_name = extract_required_tier_name(&query)?;
+        let info = get_tier_info(&tier_config_mgr, tier_name)?;
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
@@ -612,5 +629,68 @@ impl Operation for ClearTier {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn extract_required_tier_name_rejects_missing_tier() {
+        let err = extract_required_tier_name(&AddTierQuery::default()).expect_err("missing tier should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn extract_required_tier_name_rejects_blank_tier() {
+        let query = AddTierQuery {
+            tier: Some("   ".to_string()),
+            ..Default::default()
+        };
+
+        let err = extract_required_tier_name(&query).expect_err("blank tier should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn get_tier_info_reports_missing_tier() {
+        let tier_config_mgr = TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: HashMap::new(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        };
+
+        let err = get_tier_info(&tier_config_mgr, "WARM").expect_err("missing tier should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::Custom("TierNotFound".into()));
+        assert_eq!(err.message(), Some("tier not found."));
+    }
+
+    #[test]
+    fn get_tier_info_returns_existing_tier() {
+        let tier_name = "WARM".to_string();
+        let mut tiers = HashMap::new();
+        tiers.insert(
+            tier_name.clone(),
+            TierConfig {
+                name: tier_name.clone(),
+                ..Default::default()
+            },
+        );
+        let tier_config_mgr = TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers,
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        };
+
+        let info = get_tier_info(&tier_config_mgr, &tier_name).expect("existing tier should be returned");
+
+        assert_eq!(info.name, tier_name);
     }
 }
