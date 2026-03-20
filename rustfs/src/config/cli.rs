@@ -126,6 +126,10 @@ pub struct InfoOpts {
     #[arg(long, conflicts_with = "info_type")]
     pub all: bool,
 
+    /// Output in JSON format (default: markdown table)
+    #[arg(long)]
+    pub json: bool,
+
     /// Type of information to display
     #[arg(value_enum, conflicts_with = "all")]
     pub info_type: Option<InfoType>,
