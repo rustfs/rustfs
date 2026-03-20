@@ -598,7 +598,7 @@ impl ECStore {
             let rebalance_meta = self.rebalance_meta.read().await;
             if let Some(meta) = rebalance_meta.as_ref() {
                 let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
-                meta.save(pool).await?;
+                resolve_rebalance_meta_save_result(meta.save(pool).await, "update_rebalance_stats")?;
             }
         }
 
@@ -669,7 +669,7 @@ impl ECStore {
         };
 
         let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
-        meta.save(pool).await?;
+        resolve_rebalance_meta_save_result(meta.save(pool).await, "init_rebalance_meta")?;
 
         info!("init_rebalance_meta: rebalance meta saved");
 
@@ -762,7 +762,7 @@ impl ECStore {
 
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
-            meta_to_save.save(pool).await?;
+            resolve_rebalance_meta_save_result(meta_to_save.save(pool).await, "stop_rebalance")?;
         }
 
         Ok(())
@@ -1130,6 +1130,10 @@ fn resolve_rebalance_save_task_result(
         Ok(result) => result.map_err(|err| Error::other(format!("rebalance save_task failed for pool {pool_idx}: {err}"))),
         Err(err) => Err(Error::other(format!("rebalance save_task for pool {pool_idx} join error: {err}"))),
     }
+}
+
+fn resolve_rebalance_meta_save_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("rebalance meta save failed during {stage}: {err}")))
 }
 
 fn resolve_rebalance_stats_update_result(result: Result<()>, pool_idx: usize, bucket: &str, object_name: &str) -> Result<()> {
@@ -1699,7 +1703,8 @@ impl ECStore {
             "save_rebalance_stats: save rebalance meta, pool_idx: {}, opt: {:?}, meta: {:?}",
             pool_idx, opt, meta_to_save
         );
-        meta_to_save.save(pool).await?;
+        let stage = format!("save_rebalance_stats for pool {pool_idx} opt {opt:?}");
+        resolve_rebalance_meta_save_result(meta_to_save.save(pool).await, stage.as_str())?;
 
         Ok(())
     }
@@ -1786,12 +1791,13 @@ mod rebalance_unit_tests {
         next_rebal_bucket_from_stat, rebalance_delete_marker_opts, resolve_load_rebalance_stats_update_result,
         resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
         resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-        resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
-        resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
-        send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
-        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-        should_skip_rebalance_delete_marker, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-        take_bucket_from_rebalance_queue, validate_start_rebalance_state, with_rebalance_entry_context,
+        resolve_rebalance_meta_save_result, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
+        resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
+        should_count_rebalance_version_complete, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+        should_preserve_rebalance_stopped_state, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
+        stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
+        with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -2597,6 +2603,20 @@ mod rebalance_unit_tests {
         let err = resolve_rebalance_save_task_result(1, Ok(Err(Error::SlowDown)))
             .expect_err("inner save-task error should include pool context");
         assert!(err.to_string().contains("rebalance save_task failed for pool 1"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_meta_save_result_passthrough() {
+        assert!(resolve_rebalance_meta_save_result(Ok(()), "stop_rebalance").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_rebalance_meta_save_result_wraps_error_context() {
+        let err = resolve_rebalance_meta_save_result(Err(Error::SlowDown), "init_rebalance_meta")
+            .expect_err("meta save failure should include stage context");
+        let message = err.to_string();
+        assert!(message.contains("rebalance meta save failed during init_rebalance_meta"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
     }
 
     #[test]
