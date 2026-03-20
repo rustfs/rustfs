@@ -55,6 +55,10 @@ async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay:
     }
 }
 
+fn resolve_store_init_stage_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("store init failed during {stage}: {err}")))
+}
+
 async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
     for attempt in 0..=LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES {
         if rx.is_cancelled() {
@@ -278,13 +282,16 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
-        self.load_rebalance_meta().await?;
+        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
         if self.rebalance_meta.read().await.is_some() {
-            self.start_rebalance().await?;
+            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
         }
 
         let mut meta = PoolMeta::default();
-        meta.load(clone_first_store_pool(&self.pools)?, self.pools.clone()).await?;
+        resolve_store_init_stage_result(
+            meta.load(clone_first_store_pool(&self.pools)?, self.pools.clone()).await,
+            "load_pool_meta",
+        )?;
         let update = meta.validate(self.pools.clone())?;
 
         if !update {
@@ -294,7 +301,7 @@ impl ECStore {
             }
         } else {
             let new_meta = PoolMeta::new(&self.pools, &meta);
-            new_meta.save(self.pools.clone()).await?;
+            resolve_store_init_stage_result(new_meta.save(self.pools.clone()).await, "save_validated_pool_meta")?;
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 *pool_meta = new_meta;
@@ -357,7 +364,8 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, clone_first_store_pool, require_deployment_id,
-        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        resolve_store_init_stage_result, should_resume_local_decommission, should_retry_local_decommission_resume,
+        wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
@@ -446,6 +454,20 @@ mod tests {
     #[test]
     fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
         assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[test]
+    fn test_resolve_store_init_stage_result_passthrough_ok() {
+        resolve_store_init_stage_result(Ok(()), "load_rebalance_meta").expect("successful stage should pass through");
+    }
+
+    #[test]
+    fn test_resolve_store_init_stage_result_wraps_error_context() {
+        let err = resolve_store_init_stage_result(Err(StorageError::SlowDown), "start_rebalance")
+            .expect_err("failed stage should be wrapped");
+        let err_message = err.to_string();
+        assert!(err_message.contains("store init failed during start_rebalance"));
+        assert!(err_message.contains(&StorageError::SlowDown.to_string()));
     }
 
     #[tokio::test]
