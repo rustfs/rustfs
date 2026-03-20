@@ -1178,7 +1178,7 @@ impl HotObjectCache {
         #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::counter;
-            counter!("rustfs_object_cache_invalidations").increment(1);
+            counter!("rustfs_object_cache_invalidations_total").increment(1);
         }
     }
 

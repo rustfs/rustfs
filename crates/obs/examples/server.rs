@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use opentelemetry::global;
-use rustfs_obs::{SystemObserver, init_obs};
+use rustfs_obs::init_obs;
 use std::time::{Duration, SystemTime};
-use tracing::{Level, error, info, instrument};
+use tracing::{Level, info, instrument};
 
 #[tokio::main]
 async fn main() {
@@ -42,11 +42,6 @@ async fn run(service_name: String) {
         start_time.elapsed().unwrap().as_secs_f64(),
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
-
-    match SystemObserver::init_process_observer().await {
-        Ok(_) => info!("Process observer initialized successfully"),
-        Err(e) => error!("Failed to initialize process observer: {:?}", e),
-    }
 
     put_object("bucket".to_string(), "object".to_string(), "user".to_string()).await;
     info!("Logging is completed");

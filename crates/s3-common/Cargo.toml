@@ -31,3 +31,6 @@ workspace = true
 metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[lib]
+doctest = false

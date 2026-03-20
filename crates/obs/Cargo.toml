@@ -28,14 +28,9 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 [lints]
 workspace = true
 
-[features]
-default = []
-gpu = ["dep:nvml-wrapper"]
-full = ["gpu"]
-
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
-rustfs-utils = { workspace = true, features = ["ip", "path"] }
+rustfs-utils = { workspace = true, features = ["ip"] }
 flate2 = { workspace = true }
 glob = { workspace = true }
 jiff = { workspace = true }
@@ -44,7 +39,6 @@ crossbeam-channel = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
 num_cpus = { workspace = true }
-nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
@@ -58,7 +52,6 @@ tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-sysinfo = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 
@@ -70,4 +63,3 @@ pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
-serde_json = { workspace = true }
