@@ -23,6 +23,7 @@ use crate::disk::{
 };
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use crate::{
     disk::error::{Error, Result},
     rpc::build_auth_headers,
@@ -51,11 +52,35 @@ use std::{
     time::Duration,
 };
 use tokio::time;
-use tokio::{io::AsyncWrite, net::TcpStream, time::timeout};
+use tokio::{
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; buffer_size];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            writer.flush().await?;
+            return Ok(copied);
+        }
+
+        writer.write_all(&buffer[..bytes_read]).await?;
+        copied += bytes_read as u64;
+    }
+}
 
 #[derive(Debug)]
 pub struct RemoteDisk {
@@ -986,7 +1011,7 @@ impl DiskAPI for RemoteDisk {
 
         let mut reader = HttpReader::new(url, Method::GET, headers, Some(opts)).await?;
 
-        tokio::io::copy(&mut reader, wr).await?;
+        copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await?;
 
         Ok(())
     }
@@ -1417,6 +1442,7 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use std::sync::Once;
+    use tokio::io::duplex;
     use tokio::net::TcpListener;
     use tracing::Level;
     use uuid::Uuid;
@@ -1572,6 +1598,24 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         assert!(!remote_disk.is_online().await);
+    }
+
+    #[tokio::test]
+    async fn test_copy_stream_with_buffer_copies_full_payload() {
+        let payload = b"walk-dir-stream".repeat(1024);
+        let expected = payload.clone();
+        let (mut write_half, mut read_half) = duplex(128);
+
+        let copy_task = tokio::spawn(async move {
+            let mut cursor = Cursor::new(payload);
+            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.unwrap();
+        });
+
+        let mut copied = Vec::new();
+        read_half.read_to_end(&mut copied).await.unwrap();
+        copy_task.await.unwrap();
+
+        assert_eq!(copied, expected);
     }
 
     #[tokio::test]
