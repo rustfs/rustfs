@@ -814,14 +814,14 @@ impl Node for NodeService {
         if let Err(err) = store.stop_rebalance().await {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
-                error_info: Some(format!("failed to stop rebalance: {err}")),
+                error_info: Some(rebalance_failure_info("stop rebalance", &err)),
             }));
         }
 
         if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
-                error_info: Some(format!("failed to save rebalance stop metadata: {err}")),
+                error_info: Some(rebalance_failure_info("save rebalance stop metadata", &err)),
             }));
         }
 
@@ -847,19 +847,25 @@ impl Node for NodeService {
 
         warn!("handle LoadRebalanceMetaRequest");
 
-        store.load_rebalance_meta().await.map_err(|err| {
+        if let Err(err) = store.load_rebalance_meta().await {
             error!("load_rebalance_meta err {:?}", err);
-            Status::internal(err.to_string())
-        })?;
+            return Ok(Response::new(LoadRebalanceMetaResponse {
+                success: false,
+                error_info: Some(rebalance_failure_info("load rebalance metadata", &err)),
+            }));
+        }
 
         warn!("load_rebalance_meta success");
 
         if start_rebalance && store.rebalance_meta.read().await.is_some() {
             warn!("start rebalance");
-            store.start_rebalance().await.map_err(|err| {
+            if let Err(err) = store.start_rebalance().await {
                 error!("start_rebalance err {:?}", err);
-                Status::internal(err.to_string())
-            })?;
+                return Ok(Response::new(LoadRebalanceMetaResponse {
+                    success: false,
+                    error_info: Some(rebalance_failure_info("start rebalance", &err)),
+                }));
+            }
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {
@@ -874,6 +880,10 @@ impl Node for NodeService {
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
         todo!()
     }
+}
+
+fn rebalance_failure_info(operation: &str, err: impl std::fmt::Display) -> String {
+    format!("failed to {operation}: {err}")
 }
 
 #[cfg(test)]
@@ -1987,6 +1997,20 @@ mod tests {
         assert!(!load_response.success);
         assert!(load_response.error_info.is_some());
         assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
+    }
+
+    #[test]
+    fn test_rebalance_failure_info_formats_operation_context() {
+        let message = rebalance_failure_info("load rebalance metadata", "boom");
+
+        assert_eq!(message, "failed to load rebalance metadata: boom");
+    }
+
+    #[test]
+    fn test_rebalance_failure_info_uses_display_output() {
+        let message = rebalance_failure_info("start rebalance", std::io::Error::other("boom"));
+
+        assert_eq!(message, "failed to start rebalance: boom");
     }
 
     #[tokio::test]
