@@ -37,6 +37,15 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
+fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = src
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("Expected marker `{}` in source", start_marker));
+    let after_start = &src[start..];
+    let end = after_start.find(end_marker).unwrap_or(after_start.len());
+    &after_start[..end]
+}
+
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
@@ -200,11 +209,11 @@ fn test_phase5_admin_info_and_rpc_read_file_contract() {
 #[test]
 fn test_replication_set_remote_target_compat_contract() {
     let replication_src = include_str!("handlers/replication.rs");
-    let handler_marker = "impl Operation for SetRemoteTargetHandler";
-    let handler_start = replication_src
-        .find(handler_marker)
-        .expect("Expected impl Operation for SetRemoteTargetHandler in handlers/replication.rs");
-    let handler_block = &replication_src[handler_start..];
+    let handler_block = extract_block_between_markers(
+        replication_src,
+        "impl Operation for SetRemoteTargetHandler",
+        "pub struct ListRemoteTargetHandler",
+    );
 
     assert!(
         handler_block.contains("read_compatible_admin_body("),
