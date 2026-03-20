@@ -14,7 +14,8 @@
 
 #![allow(clippy::map_entry)]
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry;
+use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{enqueue_transition_immediate, init_background_expiry};
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -127,6 +128,15 @@ async fn has_xlmeta_files(path: &std::path::Path) -> bool {
     }
 
     false
+}
+
+async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEventSrc) -> Result<ObjectInfo> {
+    let object_info = result?;
+    if is_meta_bucketname(&object_info.bucket) {
+        return Ok(object_info);
+    }
+    enqueue_transition_immediate(&object_info, src).await;
+    Ok(object_info)
 }
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -243,7 +253,7 @@ impl ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_put_object(bucket, object, data, opts).await
+        enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
     }
 }
 
@@ -301,8 +311,12 @@ impl ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-            .await
+        enqueue_transition_after_write(
+            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                .await,
+            LcEventSrc::S3CopyObject,
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -520,8 +534,12 @@ impl MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        self.handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
-            .await
+        enqueue_transition_after_write(
+            self.handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+                .await,
+            LcEventSrc::S3CompleteMultipartUpload,
+        )
+        .await
     }
 }
 

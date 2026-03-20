@@ -2453,7 +2453,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let sopts = StatObjectOptions {
+        let mut sopts = StatObjectOptions {
             version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
             internal: AdvancedGetOptions {
                 replication_proxy_request: "false".to_string(),

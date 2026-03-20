@@ -1817,19 +1817,53 @@ impl ObjectOperations for SetDisks {
         //}
 
         let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let rs: Option<HTTPRangeSpec> = None;
-        let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
-        if let Err(err) = gr {
-            return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
-        }
-        let gr = gr.unwrap();
-
-        for part_info in &oi.parts {
-            let reader = BufReader::new(Cursor::new(vec![] /*gr.stream*/));
+        let parts = oi.parts.clone();
+        let mut part_offset: i64 = 0;
+        for part_info in &parts {
+            let mut part_opts = opts.clone();
+            part_opts.part_number = Some(part_info.number);
+            if part_info.actual_size <= 0 {
+                return set_restore_header_fn(
+                    &mut oi,
+                    Some(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size))),
+                )
+                .await;
+            }
+            let part_end = match part_offset.checked_add(part_info.actual_size - 1) {
+                Some(end) => end,
+                None => {
+                    return set_restore_header_fn(
+                        &mut oi,
+                        Some(Error::other("multipart restore part range overflow".to_string())),
+                    )
+                    .await;
+                }
+            };
+            let rs = Some(HTTPRangeSpec {
+                is_suffix_length: false,
+                start: part_offset,
+                end: part_end,
+            });
+            part_offset = match part_end.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    return set_restore_header_fn(
+                        &mut oi,
+                        Some(Error::other("multipart restore part offset overflow".to_string())),
+                    )
+                    .await;
+                }
+            };
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &part_opts).await;
+            if let Err(err) = gr {
+                return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
+            }
+            let gr = gr.unwrap();
+            let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::new(
                 Box::new(WarpReader::new(reader)),
-                part_info.size as i64,
-                part_info.size as i64,
+                part_info.actual_size,
+                part_info.actual_size,
                 None,
                 None,
                 false,
@@ -1842,7 +1876,7 @@ impl ObjectOperations for SetDisks {
             //if let Err(err) = p_info {
             //    return set_restore_header_fn(&mut oi, err).await;
             //}
-            if p_info.size != part_info.size {
+            if p_info.size as i64 != part_info.actual_size {
                 return set_restore_header_fn(
                     &mut oi,
                     Some(Error::other(ObjectApiError::InvalidObjectState(GenericError {
