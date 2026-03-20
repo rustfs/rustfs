@@ -424,6 +424,74 @@ The benchmark for the fixed current branch used:
   /Users/weisd/project/github/rustfs_rpc/target-linux/release/rustfs 256 512
 ```
 
+## Update: download failure root cause and validation
+
+After the upload regression was fixed, download benchmarking exposed a separate
+correctness issue: object GET requests failed with `unexpected EOF` or
+`Connection closed by foreign host`, even for an `8MB` object.
+
+The failure was traced to remote shard writes not being fully finalized. The
+write path in `crates/ecstore/src/erasure_coding/encode.rs` returned after
+`Erasure::encode()` finished producing shard data, but it did not call
+`shutdown()` on the per-disk writers. For local files this was mostly benign,
+but for remote disks the writer is `rustfs_rio::HttpWriter`, which only
+finishes the HTTP `PUT` body and waits for the response during shutdown.
+
+Observed symptom before the fix:
+
+- object uploads appeared to succeed
+- only one node's `part.1` files had the expected `699312` bytes
+- the other remote `part.1` files existed but were `0` bytes
+- later `read_file_stream` calls returned `500 Internal Server Error`
+- outer object GETs advertised the full content length but streamed `0` bytes
+
+The fix was committed as:
+
+```text
+f268e4e4 fix: shutdown erasure writers after encode
+```
+
+It restores explicit writer shutdown in `Erasure::encode()` and adds a
+regression test that verifies writers which only commit data during shutdown
+are finalized correctly.
+
+Targeted verification after this fix:
+
+```bash
+cargo test -p rustfs-ecstore encode_shutdowns_writers_after_small_shards -- --nocapture
+cargo test -p rustfs-ecstore test_bitrot_ -- --nocapture
+```
+
+Real-world validation after rebuilding the Linux `aarch64` binary locally with
+`cargo zigbuild`:
+
+```text
+8MB download: success
+speed: ~68.15 MiB/s
+```
+
+All sixteen `part.1` files for that validation object were `699312` bytes after
+the fix, instead of only the first node containing data.
+
+Post-fix benchmark averages:
+
+```text
+encodefixhead upload   256MB  1.608s
+encodefixhead upload   512MB  2.940s
+encodefixhead download 256MB  1.376s
+encodefixhead download 512MB  2.654s
+```
+
+Compared to the previously measured upload-only `vectoredfix` build:
+
+- `256MB` upload is slower (`1.461s -> 1.608s`)
+- `512MB` upload is slightly slower (`2.805s -> 2.940s`)
+- uploads remain much faster than the regressed `v1345`
+
+This is expected and should be treated as the more accurate result, because the
+new build waits for remote shard writers to finish correctly instead of
+returning before all remote `PUT` bodies are fully finalized.
+
 ## Current repo status
 
 At handoff time:
@@ -433,7 +501,7 @@ git branch --show-current
 # rpc-transfer-optimization
 
 git rev-parse --short HEAD
-# ba8d3521
+# f268e4e4
 ```
 
 The merge from `origin/main` is already complete and validated with:
