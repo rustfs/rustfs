@@ -35,6 +35,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
@@ -648,17 +649,16 @@ fn process_connection(
 
                         // Log trace context extraction for debugging distributed tracing
                         if parent_context.has_active_span() {
-                            let span_context = parent_context.span().span_context();
+                            let span_ref = parent_context.span();
                             debug!(
-                                trace_id = %span_context.trace_id(),
-                                parent_span_id = %span_context.span_id(),
-                                sampled = span_context.is_sampled(),
+                                trace_id = %span_ref.span_context().trace_id(),
+                                parent_span_id = %span_ref.span_context().span_id(),
+                                sampled = span_ref.span_context().is_sampled(),
                                 "Extracted trace context from incoming request headers"
                             );
                         } else {
                             debug!("No trace context found in request headers, will create root span");
                         }
-
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
