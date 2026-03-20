@@ -993,27 +993,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        info!("read_file {}/{}", volume, path);
-
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
-        let disk = self.disk_ref().await;
-
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(&disk),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            0,
-            0
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        self.read_file_stream(volume, path, 0, 0).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

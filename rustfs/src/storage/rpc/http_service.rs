@@ -164,19 +164,29 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
     };
 
     global_internode_metrics().record_incoming_request();
-    let metrics = global_internode_metrics().clone();
-    let stream = bytes_stream(
-        ReaderStream::with_capacity(file, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
-            metrics.record_sent_bytes(bytes.len());
-            bytes
-        }),
-        query.length,
-    );
+    let stream = read_file_body_stream(file, query.length);
 
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::from(StreamingBlob::wrap(stream)))
         .expect("failed to build read file stream response")
+}
+
+fn read_file_body_stream<R>(reader: R, length: usize) -> Pin<Box<dyn futures::Stream<Item = io::Result<Bytes>> + Send + Sync>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+{
+    let metrics = global_internode_metrics().clone();
+    let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+        metrics.record_sent_bytes(bytes.len());
+        bytes
+    });
+
+    if length == 0 {
+        Box::pin(stream)
+    } else {
+        Box::pin(bytes_stream(stream, length))
+    }
 }
 
 async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
@@ -306,8 +316,9 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::iter;
+    use tokio_stream::StreamExt;
 
     #[test]
     fn internode_rpc_path_matches_rpc_prefix() {
@@ -347,5 +358,37 @@ mod tests {
 
         assert_eq!(copied, 11);
         assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_body_stream_keeps_full_stream_when_length_is_zero() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer.write_all(b"hello world").await.expect("write succeeds");
+        });
+
+        let mut stream = read_file_body_stream(reader, 0);
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.expect("chunk succeeds"));
+        }
+
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_body_stream_truncates_to_requested_length() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            writer.write_all(b"hello world").await.expect("write succeeds");
+        });
+
+        let mut stream = read_file_body_stream(reader, 5);
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.expect("chunk succeeds"));
+        }
+
+        assert_eq!(out, b"hello");
     }
 }
