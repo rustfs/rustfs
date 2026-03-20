@@ -1217,13 +1217,11 @@ fn should_skip_rebalance_delete_marker(version: &FileInfo, remaining_versions: u
     version.deleted && remaining_versions == 1 && !replication_configured
 }
 
-fn resolve_rebalance_replication_config_result(
-    result: Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
-) -> Result<Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>> {
+fn resolve_rebalance_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(config) => Ok(Some(config)),
         Err(Error::ConfigNotFound) => Ok(None),
-        Err(err) => Err(err),
+        Err(err) => Err(Error::other(format!("rebalance {stage} config load failed for bucket {bucket}: {err}"))),
     }
 }
 
@@ -1232,12 +1230,18 @@ async fn load_rebalance_bucket_configs(bucket: &str) -> Result<RebalanceBucketCo
         return Ok(RebalanceBucketConfigs::default());
     }
 
-    let _ = crate::bucket::versioning_sys::BucketVersioningSys::get(bucket).await?;
+    let _ = resolve_rebalance_optional_bucket_config_result(
+        bucket,
+        "versioning",
+        crate::bucket::versioning_sys::BucketVersioningSys::get(bucket).await,
+    )?;
 
     Ok(RebalanceBucketConfigs {
         lifecycle_config: crate::global::GLOBAL_LifecycleSys.get(bucket).await,
         lock_retention: crate::bucket::object_lock::objectlock_sys::BucketObjectLockSys::get(bucket).await,
-        replication_config: resolve_rebalance_replication_config_result(
+        replication_config: resolve_rebalance_optional_bucket_config_result(
+            bucket,
+            "replication",
             crate::bucket::metadata_sys::get_replication_config(bucket).await,
         )?,
     })
@@ -1782,7 +1786,7 @@ mod rebalance_unit_tests {
         next_rebal_bucket_from_stat, rebalance_delete_marker_opts, resolve_load_rebalance_stats_update_result,
         resolve_next_rebalance_bucket, resolve_rebalance_bucket_error, resolve_rebalance_bucket_result,
         resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-        resolve_rebalance_participants, resolve_rebalance_replication_config_result, resolve_rebalance_save_task_result,
+        resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants, resolve_rebalance_save_task_result,
         resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error, resolve_rebalance_worker_result,
         send_rebalance_done_signal, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
         should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
@@ -2765,25 +2769,31 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_resolve_rebalance_replication_config_result_passthrough() {
-        let result =
-            resolve_rebalance_replication_config_result(Ok((ReplicationConfiguration::default(), OffsetDateTime::UNIX_EPOCH)))
-                .expect("replication config should pass through");
+    fn test_resolve_rebalance_optional_bucket_config_result_passthrough() {
+        let result = resolve_rebalance_optional_bucket_config_result(
+            "bucket-a",
+            "replication",
+            Ok((ReplicationConfiguration::default(), OffsetDateTime::UNIX_EPOCH)),
+        )
+        .expect("bucket config should pass through");
         assert!(result.is_some());
     }
 
     #[test]
-    fn test_resolve_rebalance_replication_config_result_returns_none_for_missing_config() {
-        let result = resolve_rebalance_replication_config_result(Err(Error::ConfigNotFound))
-            .expect("missing replication config should map to None");
+    fn test_resolve_rebalance_optional_bucket_config_result_returns_none_for_missing_config() {
+        let result = resolve_rebalance_optional_bucket_config_result::<()>("bucket-a", "versioning", Err(Error::ConfigNotFound))
+            .expect("missing bucket config should map to None");
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_resolve_rebalance_replication_config_result_preserves_other_errors() {
-        let err = resolve_rebalance_replication_config_result(Err(Error::SlowDown))
-            .expect_err("unexpected replication config errors should be preserved");
-        assert!(matches!(err, Error::SlowDown));
+    fn test_resolve_rebalance_optional_bucket_config_result_wraps_other_errors() {
+        let err = resolve_rebalance_optional_bucket_config_result::<()>("bucket-a", "replication", Err(Error::SlowDown))
+            .expect_err("unexpected bucket config errors should be wrapped with context");
+        assert!(
+            err.to_string()
+                .contains("rebalance replication config load failed for bucket bucket-a")
+        );
     }
 
     #[tokio::test]

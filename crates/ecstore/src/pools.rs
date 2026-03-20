@@ -242,6 +242,16 @@ fn resolve_decommission_bucket_done_save_result(result: Result<()>, idx: usize, 
     result.map_err(|err| Error::other(format!("decommission metadata save failed for pool {idx} bucket {bucket}: {err}")))
 }
 
+fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(Error::ConfigNotFound) => Ok(None),
+        Err(err) => Err(Error::other(format!(
+            "decommission {stage} config load failed for bucket {bucket}: {err}"
+        ))),
+    }
+}
+
 fn resolve_decommission_entry_cleanup_delete_result<T>(result: Result<T>) -> Result<()> {
     match result {
         Ok(_) => Ok(()),
@@ -1079,6 +1089,22 @@ fn decommission_delete_marker_opts(
     }
 }
 
+fn decommission_remote_tiered_opts(
+    version: &rustfs_filemeta::FileInfo,
+    version_id: Option<String>,
+    src_pool_idx: usize,
+) -> ObjectOptions {
+    ObjectOptions {
+        versioned: version_id.is_some(),
+        version_id,
+        mod_time: version.mod_time,
+        user_defined: version.metadata.clone(),
+        src_pool_idx,
+        data_movement: true,
+        ..Default::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
@@ -1406,14 +1432,7 @@ impl ECStore {
                             bucket.as_str(),
                             &version.name,
                             version,
-                            &ObjectOptions {
-                                version_id: version_id.clone(),
-                                mod_time: version.mod_time,
-                                user_defined: version.metadata.clone(),
-                                src_pool_idx: idx,
-                                data_movement: true,
-                                ..Default::default()
-                            },
+                            &decommission_remote_tiered_opts(version, version_id.clone(), idx),
                         )
                         .await
                     {
@@ -1611,14 +1630,18 @@ impl ECStore {
         let mut replication_config = None;
 
         if bi.name != RUSTFS_META_BUCKET {
-            let _ = BucketVersioningSys::get(&bi.name).await?;
+            let _ = resolve_decommission_optional_bucket_config_result(
+                &bi.name,
+                "versioning",
+                BucketVersioningSys::get(&bi.name).await,
+            )?;
             lifecycle_config = GLOBAL_LifecycleSys.get(&bi.name).await;
             lock_retention = BucketObjectLockSys::get(&bi.name).await;
-            replication_config = match metadata_sys::get_replication_config(&bi.name).await {
-                Ok(config) => Some(config),
-                Err(Error::ConfigNotFound) => None,
-                Err(err) => return Err(err),
-            };
+            replication_config = resolve_decommission_optional_bucket_config_result(
+                &bi.name,
+                "replication",
+                metadata_sys::get_replication_config(&bi.name).await,
+            )?;
         }
 
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
@@ -2018,11 +2041,11 @@ impl ECStore {
                 if bucket_info.name != RUSTFS_META_BUCKET {
                     lifecycle_config = GLOBAL_LifecycleSys.get(&bucket_info.name).await;
                     lock_retention = BucketObjectLockSys::get(&bucket_info.name).await;
-                    replication_config = match metadata_sys::get_replication_config(&bucket_info.name).await {
-                        Ok(config) => Some(config),
-                        Err(Error::ConfigNotFound) => None,
-                        Err(err) => return Err(err),
-                    };
+                    replication_config = resolve_decommission_optional_bucket_config_result(
+                        &bucket_info.name,
+                        "replication",
+                        metadata_sys::get_replication_config(&bucket_info.name).await,
+                    )?;
                 }
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
@@ -2229,6 +2252,25 @@ mod tests {
         assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn decommission_remote_tiered_opts_preserves_versioning_context() {
+        let mod_time = OffsetDateTime::now_utc();
+        let version = rustfs_filemeta::FileInfo {
+            mod_time: Some(mod_time),
+            metadata: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            ..Default::default()
+        };
+
+        let opts = decommission_remote_tiered_opts(&version, Some("version-id".to_string()), 9);
+
+        assert!(opts.versioned);
+        assert!(opts.data_movement);
+        assert_eq!(opts.src_pool_idx, 9);
+        assert_eq!(opts.version_id.as_deref(), Some("version-id"));
+        assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
     }
 
     #[test]
@@ -2629,12 +2671,12 @@ mod pools_tests {
         is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
         require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        should_cleanup_decommission_source_entry, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
-        with_decommission_entry_context,
+        resolve_decommission_entry_reload_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, should_cleanup_decommission_source_entry,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
+        track_decommission_current_object, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -2955,6 +2997,31 @@ mod pools_tests {
         assert!(
             err.to_string()
                 .contains("decommission metadata save failed for pool 2 bucket bucket-a")
+        );
+    }
+
+    #[test]
+    fn test_resolve_decommission_optional_bucket_config_result_passthrough() {
+        let result = resolve_decommission_optional_bucket_config_result("bucket-a", "replication", Ok(42_u8))
+            .expect("bucket config should pass through");
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn test_resolve_decommission_optional_bucket_config_result_returns_none_for_missing_config() {
+        let result =
+            resolve_decommission_optional_bucket_config_result::<()>("bucket-a", "versioning", Err(Error::ConfigNotFound))
+                .expect("missing bucket config should map to None");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_decommission_optional_bucket_config_result_wraps_other_errors() {
+        let err = resolve_decommission_optional_bucket_config_result::<()>("bucket-a", "replication", Err(Error::SlowDown))
+            .expect_err("unexpected bucket config errors should be wrapped with context");
+        assert!(
+            err.to_string()
+                .contains("decommission replication config load failed for bucket bucket-a")
         );
     }
 

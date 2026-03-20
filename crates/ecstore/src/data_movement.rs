@@ -16,7 +16,6 @@ use crate::error::{Error, Result};
 use crate::store::ECStore;
 use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
-use rustfs_common::defer;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader};
 use std::io::Cursor;
 use std::pin::Pin;
@@ -129,6 +128,19 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
     }
 }
 
+fn resolve_data_movement_abort_result(
+    op_label: &str,
+    bucket: &str,
+    object: &str,
+    upload_id: &str,
+    primary_err: Error,
+    abort_err: Error,
+) -> Error {
+    Error::other(format!(
+        "{op_label}: abort_multipart_upload failed for {bucket}/{object} upload {upload_id} after error {primary_err}: {abort_err}"
+    ))
+}
+
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -151,75 +163,90 @@ pub(crate) async fn migrate_object(
         };
 
         let abort_multipart_flag = new_multipart_abort_flag();
-        let abort_multipart_flag_in_defer = abort_multipart_flag.clone();
-        defer!(|| async {
-            if !should_abort_multipart_upload(&abort_multipart_flag_in_defer) {
-                return;
+        let multipart_result: Result<()> = async {
+            let mut parts = vec![CompletePart::default(); object_info.parts.len()];
+            let mut reader = rd.stream;
+
+            for (i, part) in object_info.parts.iter().enumerate() {
+                let mut chunk = vec![0u8; part.size];
+                reader.read_exact(&mut chunk).await?;
+
+                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
+                let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
+                let index = decode_part_index(part.index.as_ref());
+                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
+
+                let pi = match store
+                    .put_object_part(
+                        &bucket,
+                        &object_info.name,
+                        &res.upload_id,
+                        part.number,
+                        &mut data,
+                        &ObjectOptions {
+                            preserve_etag: Some(part.etag.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(pi) => pi,
+                    Err(err) => {
+                        error!("{op_label}: put_object_part {i} err {:?}", &err);
+                        return Err(err);
+                    }
+                };
+
+                parts[i] = CompletePart {
+                    part_num: pi.part_num,
+                    etag: pi.etag,
+                    ..Default::default()
+                };
             }
+
             if let Err(err) = store
-                .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
-                .await
-            {
-                error!("{op_label}: abort_multipart_upload err {:?}", &err);
-            }
-        });
-
-        let mut parts = vec![CompletePart::default(); object_info.parts.len()];
-        let mut reader = rd.stream;
-
-        for (i, part) in object_info.parts.iter().enumerate() {
-            let mut chunk = vec![0u8; part.size];
-            reader.read_exact(&mut chunk).await?;
-
-            let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
-            let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
-            let index = decode_part_index(part.index.as_ref());
-            let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
-
-            let pi = match store
-                .put_object_part(
+                .clone()
+                .complete_multipart_upload(
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
-                    part.number,
-                    &mut data,
-                    &ObjectOptions {
-                        preserve_etag: Some(part.etag.clone()),
-                        ..Default::default()
-                    },
+                    parts,
+                    &data_movement_complete_multipart_opts(&object_info),
                 )
                 .await
             {
-                Ok(pi) => pi,
-                Err(err) => {
-                    error!("{op_label}: put_object_part {i} err {:?}", &err);
-                    return Err(err);
-                }
-            };
+                error!("{op_label}: complete_multipart_upload err {:?}", &err);
+                return Err(err);
+            }
 
-            parts[i] = CompletePart {
-                part_num: pi.part_num,
-                etag: pi.etag,
-                ..Default::default()
-            };
+            mark_multipart_upload_completed(&abort_multipart_flag);
+            Ok(())
+        }
+        .await;
+
+        if let Err(primary_err) = multipart_result {
+            if should_abort_multipart_upload(&abort_multipart_flag) {
+                return match store
+                    .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
+                    .await
+                {
+                    Ok(()) => Err(primary_err),
+                    Err(abort_err) => {
+                        error!("{op_label}: abort_multipart_upload err {:?}", &abort_err);
+                        Err(resolve_data_movement_abort_result(
+                            op_label,
+                            bucket.as_str(),
+                            object_info.name.as_str(),
+                            res.upload_id.as_str(),
+                            primary_err,
+                            abort_err,
+                        ))
+                    }
+                };
+            }
+            return Err(primary_err);
         }
 
-        if let Err(err) = store
-            .clone()
-            .complete_multipart_upload(
-                &bucket,
-                &object_info.name,
-                &res.upload_id,
-                parts,
-                &data_movement_complete_multipart_opts(&object_info),
-            )
-            .await
-        {
-            error!("{op_label}: complete_multipart_upload err {:?}", &err);
-            return Err(err);
-        }
-
-        mark_multipart_upload_completed(&abort_multipart_flag);
         return Ok(());
     }
 
@@ -265,6 +292,23 @@ mod tests {
         let flag = new_multipart_abort_flag();
         mark_multipart_upload_completed(&flag);
         assert!(!should_abort_multipart_upload(&flag));
+    }
+
+    #[test]
+    fn test_resolve_data_movement_abort_result_wraps_abort_context() {
+        let err = resolve_data_movement_abort_result(
+            "rebalance_object",
+            "bucket-a",
+            "object-a",
+            "upload-1",
+            Error::SlowDown,
+            Error::OperationCanceled,
+        );
+        let message = err.to_string();
+        assert!(message.contains("rebalance_object: abort_multipart_upload failed"));
+        assert!(message.contains("bucket-a/object-a"));
+        assert!(message.contains("upload upload-1"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
     }
 
     #[test]
