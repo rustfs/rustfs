@@ -40,6 +40,50 @@ fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize)
     Ok(endpoint.is_local)
 }
 
+const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
+const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
+    matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
+}
+
+async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
+    for attempt in 0..=LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES {
+        match store.decommission(rx.clone(), pool_indices.clone()).await {
+            Ok(()) => return,
+            Err(err) if is_err_decommission_running(&err) => {
+                if let Err(spawn_err) = store
+                    .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
+                    .await
+                {
+                    error!(
+                        "store init spawn_decommission_routines err after resume for pools {:?}: {}",
+                        pool_indices, spawn_err
+                    );
+                }
+                return;
+            }
+            Err(err) if should_retry_local_decommission_resume(&err, attempt) => {
+                warn!(
+                    "store init decommission resume missing config for pools {:?}, retry {}/{}: {}",
+                    pool_indices,
+                    attempt + 1,
+                    LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES + 1,
+                    err
+                );
+                tokio::select! {
+                    _ = rx.cancelled() => return,
+                    _ = tokio::time::sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
+                }
+            }
+            Err(err) => {
+                error!("store init decommission err: {}", err);
+                return;
+            }
+        }
+    }
+}
+
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[instrument(level = "debug", skip(endpoint_pools))]
@@ -269,22 +313,7 @@ impl ECStore {
                 tokio::spawn(async move {
                     // wait  3 minutes for cluster init
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
-
-                    if let Err(err) = store.decommission(rx.clone(), pool_indices.clone()).await {
-                        if is_err_decommission_running(&err) {
-                            if let Err(spawn_err) = store
-                                .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
-                                .await
-                            {
-                                error!("store init spawn_decommission_routines err: {}", spawn_err);
-                            }
-                            return;
-                        }
-
-                        error!("store init decommission err: {}", err);
-
-                        // TODO: check config err
-                    }
+                    resume_local_decommission_after_init(store, rx, pool_indices).await;
                 });
             }
         }
@@ -313,10 +342,14 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{clone_first_store_pool, require_deployment_id, should_resume_local_decommission};
+    use super::{
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, clone_first_store_pool, require_deployment_id,
+        should_resume_local_decommission, should_retry_local_decommission_resume,
+    };
     use crate::{
         disk::endpoint::Endpoint,
         endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+        error::StorageError,
     };
     use uuid::Uuid;
 
@@ -380,5 +413,23 @@ mod tests {
         }]);
         let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing endpoint should error");
         assert!(err.to_string().contains("pool index 0 has no endpoints"));
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_accepts_config_not_found_before_retry_limit() {
+        assert!(should_retry_local_decommission_resume(&StorageError::ConfigNotFound, 0));
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_rejects_config_not_found_at_retry_limit() {
+        assert!(!should_retry_local_decommission_resume(
+            &StorageError::ConfigNotFound,
+            LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
+        ));
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
+        assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
     }
 }
