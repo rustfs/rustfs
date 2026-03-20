@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
@@ -21,6 +21,7 @@ use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_common::internode_metrics::global_internode_metrics;
 use rustfs_utils::get_env_opt_str;
 use std::io::{self, Error};
+use std::io::IoSlice;
 use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -28,6 +29,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
+use tokio_util::sync::PollSender;
 use tracing::error;
 
 /// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
@@ -267,12 +269,16 @@ pin_project! {
         method: Method,
         headers: HeaderMap,
         err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
-        sender: tokio::sync::mpsc::Sender<Option<Bytes>>,
+        sender: PollSender<Option<Bytes>>,
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
+        pending_chunk: BytesMut,
         finish:bool,
 
     }
 }
+
+const HTTP_WRITER_CHANNEL_CAPACITY: usize = 8;
+const HTTP_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
@@ -283,7 +289,7 @@ impl HttpWriter {
         let headers_clone = headers.clone();
         let track_internode_metrics = is_internode_rpc_url(&url);
 
-        let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
 
         let handle = tokio::spawn(async move {
@@ -342,8 +348,9 @@ impl HttpWriter {
             method,
             headers,
             err_rx,
-            sender,
+            sender: PollSender::new(sender),
             handle,
+            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
             finish: false,
         })
     }
@@ -365,8 +372,36 @@ fn is_internode_rpc_url(url: &str) -> bool {
     url.contains("/rustfs/rpc/")
 }
 
+fn poll_send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
+    Error::other(format!("{context}: {err}"))
+}
+
+fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
+    Error::other(format!("{context}: {err}"))
+}
+
+impl HttpWriter {
+    fn poll_send_pending_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pending_chunk.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.sender.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let chunk = self.pending_chunk.split().freeze();
+                self.sender
+                    .send_item(Some(chunk))
+                    .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(poll_send_error_to_io(e, "HttpWriter send error"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl AsyncWrite for HttpWriter {
-    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         // http_log!(
         //     "[HttpWriter::poll_write] url: {}, method: {:?}, buf.len: {}",
         //     self.url,
@@ -377,26 +412,104 @@ impl AsyncWrite for HttpWriter {
             return Poll::Ready(Err(e));
         }
 
-        self.sender
-            .try_send(Some(Bytes::copy_from_slice(buf)))
-            .map_err(|e| Error::other(format!("HttpWriter send error: {e}")))?;
+        let this = self.as_mut().get_mut();
+
+        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+            match this.poll_send_pending_chunk(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if buf.len() >= HTTP_WRITER_BUFFER_SIZE && this.pending_chunk.is_empty() {
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(Some(Bytes::copy_from_slice(buf)))
+                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        this.pending_chunk.extend_from_slice(buf);
 
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.as_mut().get_mut().poll_send_pending_chunk(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
+            return Poll::Ready(Err(e));
+        }
+
+        let this = self.as_mut().get_mut();
+
+        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+            match this.poll_send_pending_chunk(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let total_len = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+        if total_len == 0 {
+            return Poll::Ready(Ok(0));
+        }
+
+        if bufs.len() == 1 && this.pending_chunk.is_empty() && total_len >= HTTP_WRITER_BUFFER_SIZE {
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(Some(Bytes::copy_from_slice(bufs[0].as_ref())))
+                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    return Poll::Ready(Ok(total_len));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        for buf in bufs {
+            this.pending_chunk.extend_from_slice(buf);
+        }
+
+        Poll::Ready(Ok(total_len))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
         if !self.finish {
             // http_log!("[HttpWriter::poll_shutdown] url: {}, method: {:?}", url, method);
-            self.sender
-                .try_send(None)
-                .map_err(|e| Error::other(format!("HttpWriter shutdown error: {e}")))?;
+            let this = self.as_mut().get_mut();
+            match this.sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.sender
+                        .send_item(None)
+                        .map_err(|e| send_error_to_io(e, "HttpWriter shutdown error"))?;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error"))),
+                Poll::Pending => return Poll::Pending,
+            }
             // http_log!(
             //     "[HttpWriter::poll_shutdown] sent shutdown signal to HTTP request, url: {}, method: {:?}",
             //     url,
@@ -407,7 +520,7 @@ impl AsyncWrite for HttpWriter {
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
-        match Pin::new(&mut self.get_mut().handle).poll_unpin(_cx) {
+        match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
             Poll::Ready(Ok(_)) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
@@ -434,6 +547,7 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
     use http_body_util::BodyExt as _;
+    use std::io::IoSlice;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -510,6 +624,43 @@ mod tests {
 
         assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_handles_many_small_writes() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        let chunk = b"0123456789abcdef";
+        let mut expected = Vec::new();
+        for _ in 0..256 {
+            writer.write_all(chunk).await.unwrap();
+            expected.extend_from_slice(chunk);
+        }
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[expected]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_supports_vectored_writes() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await;
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        let bufs = [IoSlice::new(b"hello "), IoSlice::new(b"world")];
+        let written = writer.write_vectored(&bufs).await.unwrap();
+        assert_eq!(written, 11);
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"hello world".to_vec()]);
 
         handle.abort();
     }
