@@ -234,7 +234,7 @@ percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.0", features = ["serde"] }
-ratelimit = "0.10.0"
+ratelimit = "0.10.1"
 rayon = "1.11.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
@@ -267,19 +267,19 @@ transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.22.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
-vaultrs = { version = "0.7.4" }
+vaultrs = { version = "0.8.0" }
 walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "8.2.0"
+zip = "8.3.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["gzip-http", "reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
