@@ -84,6 +84,10 @@ fn collect_unreachable_peer_failures<T>(clients: &[Option<T>], operation: &str) 
         .collect()
 }
 
+fn resolve_notification_peer_result<T>(operation: &str, peer: &str, result: Result<T>) -> Option<String> {
+    result.err().map(|err| format!("peer {peer} {operation} failed: {err}"))
+}
+
 impl NotificationSys {
     pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
         if self.all_peer_clients.is_empty() {
@@ -399,10 +403,10 @@ impl NotificationSys {
         }
 
         let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification reload_pool_meta err {:?}", err);
-                failures.push(format!("peer reload_pool_meta failed: {err}"));
+        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
+            if let Some(failure) = resolve_notification_peer_result("reload_pool_meta", client.grid_host.as_str(), result) {
+                error!("notification reload_pool_meta err {}", failure);
+                failures.push(failure);
             }
         }
 
@@ -411,7 +415,8 @@ impl NotificationSys {
 
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
-        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "load_rebalance_meta");
+        let operation = format!("load_rebalance_meta(start={start})");
+        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, operation.as_str());
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for (i, client) in self.peer_clients.iter().flatten().enumerate() {
             warn!(
@@ -422,10 +427,10 @@ impl NotificationSys {
         }
 
         let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification load_rebalance_meta err {:?}", err);
-                failures.push(format!("peer load_rebalance_meta failed: {err}"));
+        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
+            if let Some(failure) = resolve_notification_peer_result(operation.as_str(), client.grid_host.as_str(), result) {
+                error!("notification load_rebalance_meta err {}", failure);
+                failures.push(failure);
             } else {
                 warn!("notification load_rebalance_meta success");
             }
@@ -453,10 +458,10 @@ impl NotificationSys {
         }
 
         let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification stop_rebalance err {:?}", err);
-                failures.push(format!("peer stop_rebalance failed: {err}"));
+        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
+            if let Some(failure) = resolve_notification_peer_result("stop_rebalance", client.grid_host.as_str(), result) {
+                error!("notification stop_rebalance err {}", failure);
+                failures.push(failure);
             }
         }
 
@@ -897,6 +902,24 @@ mod tests {
         assert!(failures[0].contains("peer[1] load_rebalance_meta failed"));
         assert!(failures[1].contains("peer[2] load_rebalance_meta failed"));
         assert!(failures.iter().all(|failure| failure.contains("peer is not reachable")));
+    }
+
+    #[test]
+    fn resolve_notification_peer_result_returns_none_on_success() {
+        assert!(resolve_notification_peer_result("stop_rebalance", "peer-a", Ok(())).is_none());
+    }
+
+    #[test]
+    fn resolve_notification_peer_result_wraps_peer_and_operation_context() {
+        let failure = resolve_notification_peer_result(
+            "load_rebalance_meta(start=true)",
+            "peer-a:9000",
+            Err::<(), _>(Error::other("boom")),
+        )
+        .expect("error result should produce failure message");
+
+        assert!(failure.contains("peer peer-a:9000 load_rebalance_meta(start=true) failed"));
+        assert!(failure.contains("boom"));
     }
 
     #[test]
