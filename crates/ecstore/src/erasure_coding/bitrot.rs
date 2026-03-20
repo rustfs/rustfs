@@ -160,14 +160,13 @@ where
 
         self.inner.write_all(buf).await?;
 
-        self.inner.flush().await?;
-
         let n = buf.len();
 
         Ok(n)
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.flush().await?;
         self.inner.shutdown().await
     }
 }
@@ -362,6 +361,40 @@ mod tests {
     use super::BitrotWriter;
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        flushes: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn test_bitrot_read_write_ok() {
@@ -470,5 +503,28 @@ mod tests {
         }
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_writer_flushes_once_on_shutdown() {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let writer = CountingWriter {
+            flushes: flushes.clone(),
+            shutdowns: shutdowns.clone(),
+            writes: Vec::new(),
+        };
+        let mut bitrot_writer = BitrotWriter::new(writer, 8, HashAlgorithm::None);
+
+        bitrot_writer.write(b"12345678").await.unwrap();
+        bitrot_writer.write(b"abc").await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+
+        bitrot_writer.shutdown().await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
 }
