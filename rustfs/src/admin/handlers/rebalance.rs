@@ -35,7 +35,7 @@ use rustfs_ecstore::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
-    Body, S3Request, S3Response, S3Result,
+    Body, S3Error, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -248,6 +248,18 @@ fn validate_rebalance_status_pool_guard(pool_count: usize) -> S3Result<()> {
     Ok(())
 }
 
+fn rebalance_admin_internal_error(operation: &str, err: impl std::fmt::Display) -> S3Error {
+    s3_error!(InternalError, "Failed to {}: {}", operation, err)
+}
+
+fn resolve_rebalance_status_meta_load_error(pool_idx: usize, err: StorageError) -> S3Error {
+    if err == StorageError::ConfigNotFound {
+        return s3_error!(NoSuchResource, "Pool rebalance is not started");
+    }
+
+    rebalance_admin_internal_error(&format!("load rebalance metadata from pool {}", pool_idx), err)
+}
+
 pub struct RebalanceStart {}
 
 #[async_trait::async_trait]
@@ -286,21 +298,21 @@ impl Operation for RebalanceStart {
         let bucket_infos = store
             .list_bucket(&BucketOptions::default())
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to list buckets: {}", e))?;
+            .map_err(|e| rebalance_admin_internal_error("list buckets for rebalance", e))?;
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
         let id = match store.init_rebalance_meta(buckets).await {
             Ok(id) => id,
             Err(e) => {
-                return Err(s3_error!(InternalError, "Failed to init rebalance meta: {}", e));
+                return Err(rebalance_admin_internal_error("initialize rebalance metadata", e));
             }
         };
 
         store
             .start_rebalance()
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to start rebalance: {}", e))?;
+            .map_err(|e| rebalance_admin_internal_error("start rebalance", e))?;
 
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
@@ -308,12 +320,13 @@ impl Operation for RebalanceStart {
             notification_sys
                 .load_rebalance_meta(true)
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to propagate rebalance meta: {}", e))?;
+                .map_err(|e| rebalance_admin_internal_error("propagate rebalance metadata", e))?;
             warn!("RebalanceStart Loading rebalance meta done");
         }
 
         let resp = RebalanceResp { id };
-        let data = serde_json::to_string(&resp).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+        let data =
+            serde_json::to_string(&resp).map_err(|e| rebalance_admin_internal_error("serialize rebalance start response", e))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -362,11 +375,7 @@ impl Operation for RebalanceStatus {
 
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(first_pool).await {
-            if err == StorageError::ConfigNotFound {
-                return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
-            }
-
-            return Err(s3_error!(InternalError, "Failed to load rebalance meta: {}", err));
+            return Err(resolve_rebalance_status_meta_load_error(0, err));
         }
 
         // Compute disk usage percentage
@@ -389,8 +398,8 @@ impl Operation for RebalanceStatus {
             pools: build_rebalance_pool_statuses(now, stop_time, meta.percent_free_goal, &meta.pool_stats, &disk_stats),
         };
 
-        let data =
-            serde_json::to_string(&admin_status).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+        let data = serde_json::to_string(&admin_status)
+            .map_err(|e| rebalance_admin_internal_error("serialize rebalance status response", e))?;
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -434,17 +443,17 @@ impl Operation for RebalanceStop {
             notification_sys
                 .stop_rebalance()
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+                .map_err(|e| rebalance_admin_internal_error("stop rebalance via notification system", e))?;
         } else {
             store
                 .stop_rebalance()
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+                .map_err(|e| rebalance_admin_internal_error("stop rebalance", e))?;
 
             store
                 .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
+                .map_err(|e| rebalance_admin_internal_error("persist rebalance stop metadata", e))?;
         }
 
         warn!("handle RebalanceStop save_rebalance_stats done ");
@@ -453,7 +462,7 @@ impl Operation for RebalanceStop {
             notification_sys
                 .load_rebalance_meta(false)
                 .await
-                .map_err(|e| s3_error!(InternalError, "Failed to refresh rebalance meta: {}", e))?;
+                .map_err(|e| rebalance_admin_internal_error("refresh rebalance metadata", e))?;
             warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
 
@@ -501,11 +510,15 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
-        rebalance_remaining_buckets, rebalance_used_pct, validate_rebalance_status_pool_guard, validate_start_rebalance_guards,
+        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses,
+        rebalance_admin_internal_error, rebalance_pool_used, rebalance_remaining_buckets, rebalance_used_pct,
+        resolve_rebalance_status_meta_load_error, validate_rebalance_status_pool_guard, validate_start_rebalance_guards,
         validate_stop_rebalance_guards,
     };
-    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats};
+    use rustfs_ecstore::{
+        error::StorageError,
+        rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats},
+    };
     use time::OffsetDateTime;
 
     #[test]
@@ -862,6 +875,31 @@ mod rebalance_handler_tests {
     #[test]
     fn test_validate_rebalance_status_pool_guard_allows_non_empty() {
         assert!(validate_rebalance_status_pool_guard(1).is_ok());
+    }
+
+    #[test]
+    fn test_rebalance_admin_internal_error_formats_operation_context() {
+        let err = rebalance_admin_internal_error("persist rebalance stop metadata", "disk offline");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to persist rebalance stop metadata: disk offline"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_status_meta_load_error_maps_config_not_found() {
+        let err = resolve_rebalance_status_meta_load_error(0, StorageError::ConfigNotFound);
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("Pool rebalance is not started"));
+    }
+
+    #[test]
+    fn test_resolve_rebalance_status_meta_load_error_wraps_pool_context() {
+        let err = resolve_rebalance_status_meta_load_error(2, StorageError::DiskNotFound);
+        let message = err.message().expect("message should be present");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert!(message.starts_with("Failed to load rebalance metadata from pool 2:"));
     }
 
     #[test]
