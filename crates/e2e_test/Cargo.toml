@@ -46,6 +46,7 @@ bytes.workspace = true
 serial_test = { workspace = true }
 aws-sdk-s3.workspace = true
 aws-config = { workspace = true }
+aws-smithy-http-client.workspace = true
 async-trait = { workspace = true }
 flate2.workspace = true
 reqwest = { workspace = true }

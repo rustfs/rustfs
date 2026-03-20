@@ -23,6 +23,7 @@
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
+use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Once;
@@ -37,6 +38,23 @@ use uuid::Uuid;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
+
+fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
+    let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
+    let mut config = Config::builder()
+        .credentials_provider(credentials)
+        .region(Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .force_path_style(true)
+        .behavior_version_latest();
+
+    if endpoint_url.starts_with("http://") {
+        config = config.http_client(SmithyHttpClientBuilder::new().build_http());
+    }
+
+    config.build()
+}
+
 pub fn workspace_root() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // e2e_test
@@ -257,16 +275,7 @@ impl RustFSTestEnvironment {
 
     /// Create an AWS S3 client configured for this RustFS instance
     pub fn create_s3_client(&self) -> Client {
-        let credentials = Credentials::new(&self.access_key, &self.secret_key, None, None, "e2e-test");
-        let config = Config::builder()
-            .credentials_provider(credentials)
-            .region(Region::new("us-east-1"))
-            .endpoint_url(&self.url)
-            .force_path_style(true)
-            .behavior_version_latest()
-            .build();
-
-        Client::from_conf(config)
+        Client::from_conf(build_test_s3_config(&self.url, &self.access_key, &self.secret_key, "e2e-test"))
     }
 
     /// Create test bucket
@@ -568,15 +577,12 @@ impl RustFSTestClusterEnvironment {
         if node_idx >= self.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        let credentials = Credentials::new(&self.access_key, &self.secret_key, None, None, "cluster-test");
-        let config = Config::builder()
-            .credentials_provider(credentials)
-            .region(Region::new("us-east-1"))
-            .endpoint_url(&self.nodes[node_idx].url)
-            .force_path_style(true)
-            .behavior_version_latest()
-            .build();
-        Ok(Client::from_conf(config))
+        Ok(Client::from_conf(build_test_s3_config(
+            &self.nodes[node_idx].url,
+            &self.access_key,
+            &self.secret_key,
+            "cluster-test",
+        )))
     }
 
     /// Create S3 clients for all nodes in the RustFS cluster and collect them into a vector.
