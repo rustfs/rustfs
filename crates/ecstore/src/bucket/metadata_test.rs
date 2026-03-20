@@ -98,6 +98,143 @@ async fn unmarshal_test_bucket_metadata() {
     assert!(bm.bucket_acl_config_json.is_empty());
 }
 
+#[test]
+fn unmarshal_legacy_compact_time_bucket_metadata() {
+    use faster_hex::hex_decode;
+
+    let legacy_hex = concat!(
+        "83",
+        "a44e616d65",
+        "a474657374",
+        "a743726561746564",
+        "99cd07e9cd01100c1021ce2026b1fa000000",
+        "ab4c6f636b456e61626c6564",
+        "c2"
+    );
+
+    let mut bytes = vec![0u8; legacy_hex.len() / 2];
+    hex_decode(legacy_hex.as_bytes(), &mut bytes).expect("valid hex");
+
+    let bm = BucketMetadata::unmarshal(&bytes).expect("legacy compact time should decode");
+
+    assert_eq!(bm.name, "test");
+    assert_eq!(bm.created.unix_timestamp(), 1759148193);
+    assert_eq!(bm.created.nanosecond(), 539406842);
+    assert!(!bm.lock_enabled);
+}
+
+#[test]
+fn unmarshal_bin_wrapped_ext_time_bucket_metadata() {
+    use faster_hex::hex_decode;
+
+    let wrapped_hex = concat!(
+        "83",
+        "a44e616d65",
+        "a464616461",
+        "a743726561746564",
+        "c40fc70c05fffffff1886e090000000000",
+        "ab4c6f636b456e61626c6564",
+        "c2"
+    );
+
+    let mut bytes = vec![0u8; wrapped_hex.len() / 2];
+    hex_decode(wrapped_hex.as_bytes(), &mut bytes).expect("valid hex");
+
+    let bm = BucketMetadata::unmarshal(&bytes).expect("bin-wrapped ext time should decode");
+
+    assert_eq!(bm.name, "dada");
+    assert_eq!(bm.created.unix_timestamp(), -62135596800);
+    assert!(!bm.lock_enabled);
+}
+
+#[test]
+fn unmarshal_legacy_rmp_serde_field_aliases_and_byte_arrays() {
+    use faster_hex::hex_decode;
+
+    let legacy_hex = concat!(
+        "85",
+        "a44e616d65",
+        "a474657374",
+        "a743726561746564",
+        "99cd07e9cd01100c1021ce2026b1fa000000",
+        "ab4c6f636b456e61626c6564",
+        "c2",
+        "b0506f6c696379436f6e6669674a736f6e",
+        "93010203",
+        "bb4275636b657454617267657473436f6e6669674d6574614a736f6e",
+        "920405"
+    );
+
+    let mut bytes = vec![0u8; legacy_hex.len() / 2];
+    hex_decode(legacy_hex.as_bytes(), &mut bytes).expect("valid hex");
+
+    let bm = BucketMetadata::unmarshal(&bytes).expect("legacy field aliases and byte arrays should decode");
+
+    assert_eq!(bm.name, "test");
+    assert_eq!(bm.created.unix_timestamp(), 1759148193);
+    assert_eq!(bm.created.nanosecond(), 539406842);
+    assert_eq!(bm.policy_config_json, vec![1, 2, 3]);
+    assert_eq!(bm.bucket_targets_config_meta_json, vec![4, 5]);
+    assert!(!bm.lock_enabled);
+}
+
+#[test]
+fn unmarshal_legacy_bin16_and_array16_bucket_metadata() {
+    let policy = vec![b'x'; 257];
+    let targets_meta: Vec<u8> = (0u8..=16).collect();
+
+    let mut bytes = Vec::new();
+    rmp::encode::write_map_len(&mut bytes, 5).unwrap();
+    rmp::encode::write_str(&mut bytes, "Name").unwrap();
+    rmp::encode::write_str(&mut bytes, "test-bucket").unwrap();
+    rmp::encode::write_str(&mut bytes, "Created").unwrap();
+    bytes.extend_from_slice(&[
+        0xc7, 0x0c, 0x05, 0x00, 0x00, 0x00, 0x00, 0x65, 0x92, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    rmp::encode::write_str(&mut bytes, "LockEnabled").unwrap();
+    bytes.push(0x01);
+    rmp::encode::write_str(&mut bytes, "PolicyConfigJson").unwrap();
+    rmp::encode::write_bin(&mut bytes, &policy).unwrap();
+    rmp::encode::write_str(&mut bytes, "BucketTargetsConfigMetaJson").unwrap();
+    rmp::encode::write_array_len(&mut bytes, targets_meta.len() as u32).unwrap();
+    for byte in &targets_meta {
+        rmp::encode::write_uint(&mut bytes, u64::from(*byte)).unwrap();
+    }
+
+    let bm = BucketMetadata::unmarshal(&bytes).expect("legacy bin16 and array16 should decode");
+
+    assert_eq!(bm.name, "test-bucket");
+    assert_eq!(bm.created.unix_timestamp(), 1704067200);
+    assert!(bm.lock_enabled);
+    assert_eq!(bm.policy_config_json, policy);
+    assert_eq!(bm.bucket_targets_config_meta_json, targets_meta);
+}
+
+#[test]
+fn unmarshal_legacy_numeric_bool_bucket_metadata() {
+    use faster_hex::hex_decode;
+
+    let legacy_hex = concat!(
+        "83",
+        "a44e616d65",
+        "ab746573742d6275636b6574",
+        "a743726561746564",
+        "c70c05000000006592008000000000",
+        "ab4c6f636b456e61626c6564",
+        "01"
+    );
+
+    let mut bytes = vec![0u8; legacy_hex.len() / 2];
+    hex_decode(legacy_hex.as_bytes(), &mut bytes).expect("valid hex");
+
+    let bm = BucketMetadata::unmarshal(&bytes).expect("legacy numeric bool should decode");
+
+    assert_eq!(bm.name, "test-bucket");
+    assert_eq!(bm.created.unix_timestamp(), 1704067200);
+    assert_eq!(bm.created.nanosecond(), 0);
+    assert!(bm.lock_enabled);
+}
+
 #[tokio::test]
 async fn marshal_msg_complete_example() {
     // Create a complete BucketMetadata with various configurations

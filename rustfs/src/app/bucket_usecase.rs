@@ -19,8 +19,8 @@ use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::ecfs::{RUSTFS_OWNER, default_owner};
 use crate::storage::helper::OperationHelper;
+use crate::storage::s3_api::bucket::{build_list_buckets_output, build_list_objects_v2_output};
 use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
@@ -59,7 +59,6 @@ use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{collections::HashSet, fmt::Display, sync::Arc};
 use tracing::{debug, error, info, instrument, warn};
-use urlencoding::encode;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -67,6 +66,17 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
 
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
+
+fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
+    if is_owner {
+        return Ok(S3Response::new(CreateBucketOutput::default()));
+    }
+
+    Err(s3_error!(
+        BucketAlreadyExists,
+        "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
+    ))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -147,8 +157,8 @@ impl DefaultBucketUsecase {
         }
 
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-        let requester_id = match req_info_ref(&req) {
-            Ok(r) => r.cred.as_ref().map(|c| c.access_key.clone()),
+        let requester_is_owner = match req_info_ref(&req) {
+            Ok(r) => r.is_owner,
             Err(_) => {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
             }
@@ -179,18 +189,7 @@ impl DefaultBucketUsecase {
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
-                let is_owner = requester_id.as_deref().is_some_and(|req_id| req_id == default_owner().id);
-
-                if is_owner {
-                    let output = CreateBucketOutput::default();
-                    let result = Ok(S3Response::new(output));
-                    let _ = helper.complete(&result);
-                    return result;
-                }
-                let result = Err(s3_error!(
-                    BucketAlreadyExists,
-                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
-                ));
+                let result = create_bucket_exists_response(requester_is_owner);
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -396,20 +395,7 @@ impl DefaultBucketUsecase {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
         };
 
-        let buckets: Vec<Bucket> = bucket_infos
-            .iter()
-            .map(|v| Bucket {
-                creation_date: v.created.map(Timestamp::from),
-                name: Some(v.name.clone()),
-                ..Default::default()
-            })
-            .collect();
-
-        Ok(S3Response::new(ListBucketsOutput {
-            buckets: Some(buckets),
-            owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
-        }))
+        Ok(S3Response::new(build_list_buckets_output(&bucket_infos)))
     }
 
     pub async fn execute_delete_bucket_encryption(
@@ -1423,84 +1409,18 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        // warn!("object_infos objects {:?}", object_infos.objects);
-
-        // Apply URL encoding if encoding_type is "url"
-        // Note: S3 URL encoding should encode special characters but preserve path separators (/)
-        let should_encode = encoding_type.as_ref().map(|e| e.as_str() == "url").unwrap_or(false);
-
-        // Helper function to encode S3 keys/prefixes (preserving /)
-        // S3 URL encoding encodes special characters but keeps '/' unencoded
-        let encode_s3_name = |name: &str| -> String {
-            name.split('/')
-                .map(|part| encode(part).to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-
-        let objects: Vec<Object> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty())
-            .map(|v| {
-                let key = if should_encode {
-                    encode_s3_name(&v.name)
-                } else {
-                    v.name.to_owned()
-                };
-                let mut obj = Object {
-                    key: Some(key),
-                    last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.get_actual_size().unwrap_or_default()),
-                    e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
-                    ..Default::default()
-                };
-
-                if fetch_owner.is_some_and(|v| v) {
-                    obj.owner = Some(Owner {
-                        display_name: Some("rustfs".to_owned()),
-                        id: Some("v0.1".to_owned()),
-                    });
-                }
-                obj
-            })
-            .collect();
-
-        let common_prefixes: Vec<CommonPrefix> = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| {
-                let prefix = if should_encode { encode_s3_name(&v) } else { v };
-                CommonPrefix { prefix: Some(prefix) }
-            })
-            .collect();
-
-        // KeyCount should include both objects and common prefixes per S3 API spec
-        let key_count = (objects.len() + common_prefixes.len()) as i32;
-
-        // Encode next_continuation_token to base64
-        let next_continuation_token = object_infos
-            .next_continuation_token
-            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
-
-        let output = ListObjectsV2Output {
-            is_truncated: Some(object_infos.is_truncated),
-            continuation_token: response_continuation_token,
-            next_continuation_token,
-            start_after: response_start_after,
-            key_count: Some(key_count),
-            max_keys: Some(max_keys),
-            contents: Some(objects),
+        let output = build_list_objects_v2_output(
+            object_infos,
+            fetch_owner.unwrap_or_default(),
+            max_keys,
+            bucket,
+            prefix,
             delimiter,
-            encoding_type: encoding_type.clone(),
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            ..Default::default()
-        };
+            encoding_type,
+            response_continuation_token,
+            response_start_after,
+        );
 
-        // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
     }
 
@@ -1670,6 +1590,12 @@ mod tests {
         }
     }
 
+    fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
+        let mut req = build_request(input, method);
+        req.extensions.insert(req_info);
+        req
+    }
+
     #[test]
     fn resolve_notification_region_prefers_global_region() {
         let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
@@ -1686,6 +1612,36 @@ mod tests {
     fn resolve_notification_region_defaults_value() {
         let binding = resolve_notification_region(None, None);
         assert_eq!(binding, RUSTFS_REGION);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_ok_for_owner() {
+        let response = create_bucket_exists_response(true).expect("owner recreate should succeed");
+        assert_eq!(response.output.location, None);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
+        let err = create_bucket_exists_response(false).expect_err("non-owner recreate should fail");
+        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
+    }
+
+    #[test]
+    fn build_request_with_req_info_preserves_owner_state() {
+        let input = CreateBucketInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+        let req = build_request_with_req_info(
+            input,
+            Method::PUT,
+            ReqInfo {
+                is_owner: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
     }
 
     #[tokio::test]

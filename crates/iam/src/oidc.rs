@@ -761,13 +761,20 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
         return Err(format!("invalid config_url scheme: {}", url.scheme()));
     }
     let host = url.host_str().ok_or_else(|| "config_url missing host".to_string())?;
-    let path = url.path().trim_end_matches('/');
+    let path = url.path();
 
-    if path.contains("/.well-known/") && !path.ends_with("/.well-known/openid-configuration") {
+    // Strip `/.well-known/openid-configuration` (with optional trailing slash) if present.
+    // Everything else is preserved exactly so the issuer URL matches the provider's discovery
+    // document (e.g. Authentik includes a trailing slash, Keycloak does not).
+    let normalized_path = path
+        .strip_suffix('/')
+        .unwrap_or(path)
+        .strip_suffix("/.well-known/openid-configuration")
+        .unwrap_or(if path == "/" { "" } else { path });
+
+    if normalized_path.contains("/.well-known/") {
         return Err("config_url uses an unsupported .well-known discovery URL".into());
     }
-
-    let normalized_path = path.strip_suffix("/.well-known/openid-configuration").unwrap_or(path);
 
     let mut issuer = format!("{}://{host}", url.scheme());
     if let Some(port) = url.port() {
@@ -886,20 +893,57 @@ mod tests {
 
     #[test]
     fn test_normalize_config_url() {
+        // --- Well-known suffix stripping ---
+        // Bare well-known URL → stripped to just the host
         assert_eq!(
             normalize_config_url("https://idp.example.com/.well-known/openid-configuration").unwrap(),
             "https://idp.example.com"
         );
+        // Trailing slash after well-known suffix is also stripped
         assert_eq!(
             normalize_config_url("https://idp.example.com/.well-known/openid-configuration/").unwrap(),
             "https://idp.example.com"
+        );
+        // Well-known under a sub-path (Keycloak realms)
+        assert_eq!(
+            normalize_config_url("https://keycloak.example.com/realms/myrealm/.well-known/openid-configuration").unwrap(),
+            "https://keycloak.example.com/realms/myrealm"
+        );
+
+        // --- Providers WITHOUT trailing slash (Keycloak, Auth0, Okta, Google) ---
+        assert_eq!(
+            normalize_config_url("https://keycloak.example.com/realms/myrealm").unwrap(),
+            "https://keycloak.example.com/realms/myrealm"
         );
         assert_eq!(
             normalize_config_url("https://idp.example.com/custom/realm").unwrap(),
             "https://idp.example.com/custom/realm"
         );
+
+        // --- Providers WITH trailing slash (Authentik) ---
+        assert_eq!(
+            normalize_config_url("https://auth.example.com/application/o/myapp/").unwrap(),
+            "https://auth.example.com/application/o/myapp/"
+        );
+
+        // --- Root-level issuer (bare host) ---
+        assert_eq!(normalize_config_url("https://idp.example.com").unwrap(), "https://idp.example.com");
+        assert_eq!(normalize_config_url("https://idp.example.com/").unwrap(), "https://idp.example.com");
+
+        // --- Custom port ---
+        assert_eq!(
+            normalize_config_url("https://idp.example.com:8443/auth/realms/test").unwrap(),
+            "https://idp.example.com:8443/auth/realms/test"
+        );
+        assert_eq!(
+            normalize_config_url("http://localhost:8080/application/o/app/").unwrap(),
+            "http://localhost:8080/application/o/app/"
+        );
+
+        // --- Error cases ---
         assert!(normalize_config_url("https://idp.example.com/.well-known/invalid").is_err());
         assert!(normalize_config_url("gopher://idp.example.com").is_err());
+        assert!(normalize_config_url("not-a-url").is_err());
     }
 
     #[test]

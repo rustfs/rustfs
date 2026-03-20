@@ -16,9 +16,12 @@
 //!
 //! Collects aggregate metrics across the entire RustFS cluster including
 //! total capacity, usage, and object counts.
+//!
+//! This collector reuses the metric descriptors defined in `metrics_type::cluster`
+//! to avoid duplication of metric names, types, and help text.
 
-use crate::MetricType;
 use crate::format::PrometheusMetric;
+use crate::metrics_type::cluster::*;
 
 /// Cluster capacity and usage statistics for metrics collection.
 ///
@@ -41,88 +44,19 @@ pub struct ClusterStats {
     pub buckets_count: u64,
 }
 
-// Static metric definitions to avoid allocations
-const METRIC_RAW_CAPACITY: &str = "rustfs_cluster_capacity_raw_total_bytes";
-const METRIC_USABLE_CAPACITY: &str = "rustfs_cluster_capacity_usable_total_bytes";
-const METRIC_USED: &str = "rustfs_cluster_capacity_used_bytes";
-const METRIC_FREE: &str = "rustfs_cluster_capacity_free_bytes";
-const METRIC_OBJECTS: &str = "rustfs_cluster_objects_total";
-const METRIC_BUCKETS: &str = "rustfs_cluster_buckets_total";
-
-const HELP_RAW_CAPACITY: &str = "Total raw storage capacity in bytes across all disks";
-const HELP_USABLE_CAPACITY: &str = "Total usable storage capacity in bytes (accounting for erasure coding)";
-const HELP_USED: &str = "Total used storage capacity in bytes";
-const HELP_FREE: &str = "Total free storage capacity in bytes";
-const HELP_OBJECTS: &str = "Total number of objects in the cluster";
-const HELP_BUCKETS: &str = "Total number of buckets in the cluster";
-
-/// Number of metrics produced by this collector.
-const METRIC_COUNT: usize = 6;
-
-/// Collects cluster-wide metrics from the provided statistics.
+/// Collects cluster-wide metrics from the provided cluster statistics.
 ///
-/// # Metrics Produced
-///
-/// - `rustfs_cluster_capacity_raw_total_bytes`: Total raw storage capacity across all disks
-/// - `rustfs_cluster_capacity_usable_total_bytes`: Usable capacity after erasure coding overhead
-/// - `rustfs_cluster_capacity_used_bytes`: Currently used storage capacity
-/// - `rustfs_cluster_capacity_free_bytes`: Available free storage capacity
-/// - `rustfs_cluster_objects_total`: Total number of objects in the cluster
-/// - `rustfs_cluster_buckets_total`: Total number of buckets in the cluster
-///
-/// # Arguments
-///
-/// * `stats` - Cluster statistics containing capacity and usage data
-///
-/// # Example
-///
-/// ```
-/// use rustfs_metrics::collectors::{collect_cluster_metrics, ClusterStats};
-///
-/// let stats = ClusterStats {
-///     raw_capacity_bytes: 10_000_000_000,
-///     usable_capacity_bytes: 8_000_000_000,
-///     used_bytes: 2_000_000_000,
-///     free_bytes: 6_000_000_000,
-///     objects_count: 1000,
-///     buckets_count: 10,
-/// };
-/// let metrics = collect_cluster_metrics(&stats);
-/// assert_eq!(metrics.len(), 6);
-/// ```
-#[must_use]
-#[inline]
+/// Uses the metric descriptors from `metrics_type::cluster` module.
+/// Returns a vector of Prometheus metrics for cluster statistics.
 pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
-    let mut metrics = Vec::with_capacity(METRIC_COUNT);
-
-    metrics.push(PrometheusMetric::new(
-        METRIC_RAW_CAPACITY,
-        MetricType::Gauge,
-        HELP_RAW_CAPACITY,
-        stats.raw_capacity_bytes as f64,
-    ));
-    metrics.push(PrometheusMetric::new(
-        METRIC_USABLE_CAPACITY,
-        MetricType::Gauge,
-        HELP_USABLE_CAPACITY,
-        stats.usable_capacity_bytes as f64,
-    ));
-    metrics.push(PrometheusMetric::new(METRIC_USED, MetricType::Gauge, HELP_USED, stats.used_bytes as f64));
-    metrics.push(PrometheusMetric::new(METRIC_FREE, MetricType::Gauge, HELP_FREE, stats.free_bytes as f64));
-    metrics.push(PrometheusMetric::new(
-        METRIC_OBJECTS,
-        MetricType::Gauge,
-        HELP_OBJECTS,
-        stats.objects_count as f64,
-    ));
-    metrics.push(PrometheusMetric::new(
-        METRIC_BUCKETS,
-        MetricType::Gauge,
-        HELP_BUCKETS,
-        stats.buckets_count as f64,
-    ));
-
-    metrics
+    vec![
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_RAW_TOTAL_BYTES_MD, stats.raw_capacity_bytes as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USABLE_TOTAL_BYTES_MD, stats.usable_capacity_bytes as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USED_BYTES_MD, stats.used_bytes as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_FREE_BYTES_MD, stats.free_bytes as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_OBJECTS_TOTAL_MD, stats.objects_count as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_BUCKETS_TOTAL_MD, stats.buckets_count as f64),
+    ]
 }
 
 #[cfg(test)]
@@ -147,24 +81,24 @@ mod tests {
         assert_eq!(metrics.len(), 6);
 
         // Verify raw capacity
-        let raw_capacity = metrics.iter().find(|m| m.name == METRIC_RAW_CAPACITY);
+        let raw_capacity_name = CLUSTER_CAPACITY_RAW_TOTAL_BYTES_MD.get_full_metric_name();
+        let raw_capacity = metrics.iter().find(|m| m.name == raw_capacity_name && m.value == 3000.0);
         assert!(raw_capacity.is_some());
-        assert_eq!(raw_capacity.map(|m| m.value), Some(3000.0));
 
         // Verify used capacity
-        let used = metrics.iter().find(|m| m.name == METRIC_USED);
+        let used_name = CLUSTER_CAPACITY_USED_BYTES_MD.get_full_metric_name();
+        let used = metrics.iter().find(|m| m.name == used_name && m.value == 1200.0);
         assert!(used.is_some());
-        assert_eq!(used.map(|m| m.value), Some(1200.0));
 
         // Verify object count
-        let objects = metrics.iter().find(|m| m.name == METRIC_OBJECTS);
+        let objects_name = CLUSTER_OBJECTS_TOTAL_MD.get_full_metric_name();
+        let objects = metrics.iter().find(|m| m.name == objects_name && m.value == 100.0);
         assert!(objects.is_some());
-        assert_eq!(objects.map(|m| m.value), Some(100.0));
 
         // Verify bucket count
-        let buckets = metrics.iter().find(|m| m.name == METRIC_BUCKETS);
+        let buckets_name = CLUSTER_BUCKETS_TOTAL_MD.get_full_metric_name();
+        let buckets = metrics.iter().find(|m| m.name == buckets_name && m.value == 5.0);
         assert!(buckets.is_some());
-        assert_eq!(buckets.map(|m| m.value), Some(5.0));
     }
 
     #[test]

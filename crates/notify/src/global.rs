@@ -111,15 +111,11 @@ pub mod notifier_global {
         suffix: &str,
         target_ids: &[TargetID],
     ) -> Result<(), NotificationError> {
-        // Construct pattern, simple splicing of prefixes and suffixes
-        let mut pattern = String::new();
-        if !prefix.is_empty() {
-            pattern.push_str(prefix);
-        }
-        pattern.push('*');
-        if !suffix.is_empty() {
-            pattern.push_str(suffix);
-        }
+        // Construct pattern using proper pattern function
+        let pattern = crate::rules::pattern::new_pattern(
+            if prefix.is_empty() { None } else { Some(prefix) },
+            if suffix.is_empty() { None } else { Some(suffix) },
+        );
 
         // Create BucketNotificationConfig
         let mut bucket_config = BucketNotificationConfig::new(region);

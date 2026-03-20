@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Change Verification"
+  short_description: "Prioritize risks and verify code changes before merge."
+  default_prompt: "Inspect a patch or diff, identify correctness/security/regression risks, and return prioritized findings with file/line evidence and fixes."

@@ -792,7 +792,7 @@ impl ObjectIO for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 
@@ -3016,7 +3016,7 @@ impl MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 

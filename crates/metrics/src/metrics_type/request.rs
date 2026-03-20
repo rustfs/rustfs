@@ -16,6 +16,12 @@
 
 use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
+/// name label
+pub const NAME_LABEL: &str = "name";
+/// type label
+pub const TYPE_LABEL: &str = "type";
+/// le label (for histogram buckets)
+pub const LE_LABEL: &str = "le";
 
 pub static API_REJECTED_AUTH_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(

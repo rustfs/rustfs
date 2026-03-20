@@ -44,7 +44,7 @@ use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use license::init_license;
+use license::{current_license, init_license, license_status};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -151,8 +151,30 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 }
 
 async fn async_main() -> Result<()> {
-    // Parse the obtained parameters
-    let config = config::Config::parse()?;
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let command_result = match config::Opt::parse_command(args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Command parse failed, error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Handle info command
+    if let config::CommandResult::Info(opts) = command_result {
+        config::execute_info(&opts);
+        return Ok(());
+    }
+
+    // Get config for server command
+    let config = match command_result {
+        config::CommandResult::Server(cfg) => cfg,
+        config::CommandResult::Info(_) => unreachable!(),
+    };
+
+    // Initialize the global config snapshot for info command
+    config::init_config_snapshot(&config);
 
     // Initialize the configuration
     init_license(config.license.clone());
@@ -176,6 +198,11 @@ async fn async_main() -> Result<()> {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
+    }
+
+    info!("license status: {}", license_status());
+    if let Some(token) = current_license() {
+        info!("runtime license loaded: {}", token.name);
     }
 
     // print startup logo
@@ -206,7 +233,7 @@ async fn async_main() -> Result<()> {
     }
 
     // Run parameters
-    match run(config).await {
+    match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("Server encountered an error and is shutting down: {}", e);

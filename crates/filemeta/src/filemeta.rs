@@ -74,6 +74,14 @@ pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
     }
 }
 
+fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
+    if version_id.is_none() || version_id == Some(Uuid::nil()) {
+        Some(Uuid::nil().to_string())
+    } else {
+        None
+    }
+}
+
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
 
@@ -164,6 +172,21 @@ impl FileMeta {
         });
     }
 
+    fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
+        let key = data_key_for_version(version_id);
+        if let Some(data) = self.data.find(key.as_str())? {
+            return Ok(Some(data));
+        }
+
+        if let Some(legacy_key) = legacy_data_key_for_version(version_id)
+            && legacy_key != key
+        {
+            return self.data.find(legacy_key.as_str());
+        }
+
+        Ok(None)
+    }
+
     // Find version
     pub fn find_version(&self, vid: Option<Uuid>) -> Result<(usize, FileMetaVersion)> {
         let vid = vid.unwrap_or_default();
@@ -247,13 +270,21 @@ impl FileMeta {
             fi.version_id = Some(Uuid::nil());
         }
 
+        let version_key = data_key_for_version(fi.version_id);
+        let mut next_data = self.data.clone();
+
         if let Some(ref data) = fi.data {
-            self.data.replace(&data_key_for_version(fi.version_id), data.to_vec())?;
+            next_data.replace(&version_key, data.to_vec())?;
+        } else {
+            let _ = next_data.remove_key(&version_key)?;
         }
 
         let version = FileMetaVersion::from(fi);
 
-        self.add_version_filemata(version)
+        self.add_version_filemata(version)?;
+        self.data = next_data;
+
+        Ok(())
     }
 
     pub fn add_version_filemata(&mut self, version: FileMetaVersion) -> Result<()> {
@@ -700,11 +731,8 @@ impl FileMeta {
                 fi.successor_mod_time = succ_mod_time;
             }
 
-            if read_data {
-                fi.data = self
-                    .data
-                    .find(data_key_for_version(fi.version_id).as_str())?
-                    .map(bytes::Bytes::from);
+            if read_data && fi.inline_data() {
+                fi.data = self.find_inline_data_for_version(fi.version_id)?.map(bytes::Bytes::from);
             }
 
             found_fi = Some(fi);
@@ -1061,6 +1089,28 @@ mod test {
         // Verify inline data contents
         let inline_data = fm.data.as_slice();
         assert!(!inline_data.is_empty(), "Inline data should not be empty");
+    }
+
+    #[test]
+    fn test_into_fileinfo_reads_legacy_nil_uuid_inline_key() {
+        let mut fm = FileMeta::new();
+        let mut fi = FileInfo::new("test", 2, 1);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.data = Some(Bytes::from_static(b"legacy-inline"));
+        fi.set_inline_data();
+        fm.add_version(fi).unwrap();
+
+        let current_key = data_key_for_version(Some(Uuid::nil()));
+        let legacy_key = legacy_data_key_for_version(Some(Uuid::nil())).unwrap();
+        let payload = fm.data.find(current_key.as_str()).unwrap().unwrap();
+
+        fm.data.remove_key(current_key.as_str()).unwrap();
+        fm.data.replace(legacy_key.as_str(), payload.clone()).unwrap();
+
+        let restored = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+
+        assert!(restored.inline_data());
+        assert_eq!(restored.data, Some(Bytes::from(payload)));
     }
 
     #[test]
@@ -1487,6 +1537,57 @@ mod test {
 
         // Verify integrity under normal conditions
         assert!(fm.validate_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_add_version_clears_stale_inline_data_for_null_version() {
+        let mut fm = FileMeta::new();
+
+        let mut inline_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        inline_fi.mod_time = Some(OffsetDateTime::now_utc());
+        inline_fi.data = Some(Bytes::new());
+        inline_fi.set_inline_data();
+        fm.add_version(inline_fi).unwrap();
+
+        let inline_version = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+        assert!(inline_version.inline_data());
+        assert_eq!(inline_version.data, Some(Bytes::new()));
+
+        let mut disk_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        disk_fi.mod_time = Some(OffsetDateTime::now_utc() + time::Duration::seconds(1));
+        disk_fi.size = 1024;
+        fm.add_version(disk_fi).unwrap();
+
+        let latest = fm.into_fileinfo("bucket", "test", "", true, false, true).unwrap();
+        assert!(!latest.inline_data());
+        assert!(latest.data.is_none());
+        assert!(
+            fm.data
+                .find(data_key_for_version(latest.version_id).as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_add_version_keeps_inline_data_when_version_insert_fails() {
+        let mut fm = FileMeta::new();
+
+        let mut inline_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        inline_fi.mod_time = Some(OffsetDateTime::now_utc());
+        inline_fi.data = Some(Bytes::from_static(b"inline"));
+        inline_fi.set_inline_data();
+        fm.add_version(inline_fi).unwrap();
+
+        let before = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        assert_eq!(before, Some(Bytes::from_static(b"inline").to_vec()));
+
+        let invalid_disk_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        let err = fm.add_version(invalid_disk_fi).unwrap_err();
+        assert!(err.to_string().contains("file meta version invalid"));
+
+        let after = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        assert_eq!(after, Some(Bytes::from_static(b"inline").to_vec()));
     }
 
     #[test]

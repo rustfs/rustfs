@@ -13,32 +13,33 @@
 // limitations under the License.
 
 //! Bucket replication bandwidth metrics collector.
+//!
+//! Collects bandwidth metrics for bucket replication targets.
+//!
+//! This collector reuses the metric descriptors defined in `metrics_type::bucket_replication`
+//! to avoid duplication of metric names, types, and help text.
 
-use crate::MetricType;
 use crate::format::PrometheusMetric;
+use crate::metrics_type::bucket_replication::{BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD};
 use std::borrow::Cow;
 
-/// Bucket replication bandwidth stats for one replication target.
+/// Bucket replication bandwidth statistics for metrics collection.
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationBandwidthStats {
+    /// Name of the bucket
     pub bucket: String,
+    /// Target ARN for replication
     pub target_arn: String,
-    pub limit_bytes_per_sec: i64,
+    /// Configured bandwidth limit in bytes per second
+    pub limit_bytes_per_sec: u64,
+    /// Current bandwidth in bytes per second (EWMA)
     pub current_bandwidth_bytes_per_sec: f64,
 }
 
-const BUCKET_LABEL: &str = "bucket";
-const TARGET_ARN_LABEL: &str = "targetArn";
-
-const METRIC_BANDWIDTH_LIMIT: &str = "rustfs_bucket_replication_bandwidth_limit_bytes_per_second";
-const METRIC_BANDWIDTH_CURRENT: &str = "rustfs_bucket_replication_bandwidth_current_bytes_per_second";
-
-const HELP_BANDWIDTH_LIMIT: &str = "Configured bandwidth limit for replication in bytes per second";
-const HELP_BANDWIDTH_CURRENT: &str = "Current replication bandwidth in bytes per second (EWMA)";
-
-/// Collect bucket replication bandwidth metrics for Prometheus/OpenTelemetry export.
-#[must_use]
-#[inline]
+/// Collects bucket replication bandwidth metrics from the provided statistics.
+///
+/// Uses the metric descriptors from `metrics_type::bucket_replication` module.
+/// Returns a vector of Prometheus metrics for replication bandwidth.
 pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBandwidthStats]) -> Vec<PrometheusMetric> {
     if stats.is_empty() {
         return Vec::new();
@@ -50,25 +51,15 @@ pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBa
         let target_arn_label: Cow<'static, str> = Cow::Owned(stat.target_arn.clone());
 
         metrics.push(
-            PrometheusMetric::new(
-                METRIC_BANDWIDTH_LIMIT,
-                MetricType::Gauge,
-                HELP_BANDWIDTH_LIMIT,
-                stat.limit_bytes_per_sec as f64,
-            )
-            .with_label(BUCKET_LABEL, bucket_label.clone())
-            .with_label(TARGET_ARN_LABEL, target_arn_label.clone()),
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_LIMIT_MD, stat.limit_bytes_per_sec as f64)
+                .with_label("bucket", bucket_label.clone())
+                .with_label("targetArn", target_arn_label.clone()),
         );
 
         metrics.push(
-            PrometheusMetric::new(
-                METRIC_BANDWIDTH_CURRENT,
-                MetricType::Gauge,
-                HELP_BANDWIDTH_CURRENT,
-                stat.current_bandwidth_bytes_per_sec,
-            )
-            .with_label(BUCKET_LABEL, bucket_label)
-            .with_label(TARGET_ARN_LABEL, target_arn_label),
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_CURRENT_MD, stat.current_bandwidth_bytes_per_sec)
+                .with_label("bucket", bucket_label)
+                .with_label("targetArn", target_arn_label),
         );
     }
 
@@ -91,23 +82,27 @@ mod tests {
         let metrics = collect_bucket_replication_bandwidth_metrics(&stats);
         assert_eq!(metrics.len(), 2);
 
-        let limit_metric = metrics.iter().find(|m| m.name == METRIC_BANDWIDTH_LIMIT);
+        let limit_metric_name = BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name();
+        let limit_metric = metrics.iter().find(|m| {
+            m.name == limit_metric_name && m.value == 1_048_576.0 && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "b1")
+        });
         assert!(limit_metric.is_some());
-        assert_eq!(limit_metric.map(|m| m.value), Some(1_048_576.0));
         assert!(
             limit_metric
                 .and_then(|m| {
                     m.labels
                         .iter()
-                        .find(|(k, _)| *k == TARGET_ARN_LABEL)
+                        .find(|(k, _)| *k == "targetArn")
                         .map(|(_, v)| v.as_ref() == "arn:rustfs:replication:us-east-1:1:test-2")
                 })
                 .unwrap_or(false)
         );
 
-        let current_metric = metrics.iter().find(|m| m.name == METRIC_BANDWIDTH_CURRENT);
+        let current_metric_name = BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name();
+        let current_metric = metrics.iter().find(|m| {
+            m.name == current_metric_name && m.value == 204_800.0 && m.labels.iter().any(|(k, v)| *k == "bucket" && v == "b1")
+        });
         assert!(current_metric.is_some());
-        assert_eq!(current_metric.map(|m| m.value), Some(204_800.0));
     }
 
     #[test]

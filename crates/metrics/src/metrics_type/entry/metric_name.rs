@@ -183,6 +183,9 @@ pub enum MetricName {
     ConfigStandardParity,
 
     // Erasure coding set related metrics
+    ErasureSetSize,
+    ErasureSetParity,
+    ErasureSetDataShards,
     ErasureSetOverallWriteQuorum,
     ErasureSetOverallHealth,
     ErasureSetReadQuorum,
@@ -502,6 +505,9 @@ impl MetricName {
             Self::ConfigStandardParity => "standard_parity".to_string(),
 
             // Erasure coding set related metrics
+            Self::ErasureSetSize => "size".to_string(),
+            Self::ErasureSetParity => "parity".to_string(),
+            Self::ErasureSetDataShards => "data_shards".to_string(),
             Self::ErasureSetOverallWriteQuorum => "overall_write_quorum".to_string(),
             Self::ErasureSetOverallHealth => "overall_health".to_string(),
             Self::ErasureSetReadQuorum => "read_quorum".to_string(),

@@ -37,7 +37,6 @@ chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
-quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 rayon = { workspace = true }
 rumqttc = { workspace = true }
 rustc-hash = { workspace = true }
@@ -48,6 +47,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 url = { workspace = true }
 wildmatch = { workspace = true, features = ["serde"] }
+
+# quick-xml dependencies for custom S3KeyFilter XML deserialization
+# Custom deserializer implemented for S3KeyFilter to handle both XML structures:
+# - Direct FilterRule elements under S3Key (AWS S3 format)
+# - FilterRuleList wrapper format
+# This makes quick-xml 0.39.2 work correctly with Filter elements
+quick-xml = { workspace = true, features = ["serialize", "serde-types", "encoding"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
