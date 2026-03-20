@@ -31,3 +31,6 @@ workspace = true
 [dependencies]
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 tracing.workspace = true
+
+[lib]
+doctest = false

@@ -58,3 +58,6 @@ path = "tests/unit/mod.rs"
 [[test]]
 name = "integration_tests"
 path = "tests/integration/mod.rs"
+
+[lib]
+doctest = false

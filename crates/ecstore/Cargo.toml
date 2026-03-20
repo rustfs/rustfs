@@ -74,7 +74,6 @@ regex = { workspace = true }
 path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
-serde_bytes.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
@@ -134,3 +133,6 @@ harness = false
 [[bench]]
 name = "comparison_benchmark"
 harness = false
+
+[lib]
+doctest = false

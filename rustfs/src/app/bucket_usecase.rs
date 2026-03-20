@@ -25,6 +25,7 @@ use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
+use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
     lifecycle::bucket_lifecycle_ops::validate_transition_tier,
@@ -197,7 +198,7 @@ impl DefaultBucketUsecase {
         }
 
         let output = CreateBucketOutput::default();
-
+        counter!("rustfs_create_bucket_total").increment(1);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         result

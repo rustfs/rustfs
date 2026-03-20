@@ -56,3 +56,6 @@ crypto = [
     "dep:rand",
     "dep:sha2",
 ]
+
+[lib]
+doctest = false

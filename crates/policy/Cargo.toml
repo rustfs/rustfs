@@ -54,3 +54,6 @@ pollster.workspace = true
 pollster.workspace = true
 test-case.workspace = true
 temp-env = { workspace = true }
+
+[lib]
+doctest = false

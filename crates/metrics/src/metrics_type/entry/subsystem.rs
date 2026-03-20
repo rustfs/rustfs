@@ -32,6 +32,7 @@ pub enum MetricSubsystem {
     SystemCpu,
     SystemProcess,
 
+    SystemGpu,
     // debug related subsystems
     DebugGo,
 
@@ -74,6 +75,7 @@ impl MetricSubsystem {
             Self::SystemProcess => "/system/process",
 
             // debug related subsystems
+            Self::SystemGpu => "/system/gpu",
             Self::DebugGo => "/debug/go",
 
             // cluster related subsystems
@@ -120,6 +122,7 @@ impl MetricSubsystem {
             "/system/cpu" => Self::SystemCpu,
             "/system/process" => Self::SystemProcess,
 
+            "/system/gpu" => Self::SystemGpu,
             // Debug related subsystems
             "/debug/go" => Self::DebugGo,
 
@@ -181,6 +184,7 @@ pub mod subsystems {
     pub const API_REQUESTS: MetricSubsystem = MetricSubsystem::ApiRequests;
     pub const BUCKET_API: MetricSubsystem = MetricSubsystem::BucketApi;
     pub const BUCKET_REPLICATION: MetricSubsystem = MetricSubsystem::BucketReplication;
+    pub const SYSTEM_GPU: MetricSubsystem = MetricSubsystem::SystemGpu;
     pub const SYSTEM_NETWORK_INTERNODE: MetricSubsystem = MetricSubsystem::SystemNetworkInternode;
     pub const SYSTEM_DRIVE: MetricSubsystem = MetricSubsystem::SystemDrive;
     pub const SYSTEM_MEMORY: MetricSubsystem = MetricSubsystem::SystemMemory;
