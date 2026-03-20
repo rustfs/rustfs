@@ -646,6 +646,19 @@ fn process_connection(
                             propagator.extract(&HeaderMapCarrier::new(request.headers()))
                         });
 
+                        // Log trace context extraction for debugging distributed tracing
+                        if parent_context.has_active_span() {
+                            let span_context = parent_context.span().span_context();
+                            debug!(
+                                trace_id = %span_context.trace_id(),
+                                parent_span_id = %span_context.span_id(),
+                                sampled = span_context.is_sampled(),
+                                "Extracted trace context from incoming request headers"
+                            );
+                        } else {
+                            debug!("No trace context found in request headers, will create root span");
+                        }
+
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info

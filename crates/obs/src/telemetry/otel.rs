@@ -51,7 +51,8 @@ use metrics::counter;
 use opentelemetry::{global, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry::propagation::CompositePropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
@@ -358,7 +359,16 @@ fn build_tracer_provider(
 
     let provider = builder.build();
     global::set_tracer_provider(provider.clone());
-    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    // Configure composite propagator to support multiple trace context formats:
+    // - W3C TraceContext (traceparent header) - standard format for distributed tracing
+    // - W3C Baggage (baggage header) - for propagating user-defined key-value pairs
+    let propagator = CompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]);
+    global::set_text_map_propagator(propagator);
+
     Ok(Some(provider))
 }
 
