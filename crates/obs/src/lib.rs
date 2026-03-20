@@ -16,20 +16,12 @@
 //!
 //! provides tools for system and service monitoring
 //!
-//! ## feature mark
-//! - `default`: default monitoring function
-//! - `gpu`: gpu monitoring function
-//! - `full`: includes all functions
+//! ## Features
 //!
-//! to enable gpu monitoring add in cargo toml
-//!
-//! ```toml
-//! # using gpu monitoring
-//! rustfs-obs = { version = "0.1.0", features = ["gpu"] }
-//!
-//! # use all functions
-//! rustfs-obs = { version = "0.1.0", features = ["full"] }
-//! ```
+//! This crate provides observability tools for RustFS:
+//! - Logging with tracing
+//! - Metrics collection
+//! - Distributed tracing
 //!
 //! ## Usage
 //!
@@ -54,34 +46,26 @@
 //! # }
 //! ```
 //!
-//! ## Deprecation Notice
+//! ## System Monitoring Migration
 //!
-//! The `SystemObserver` module has been migrated to `rustfs-metrics`.
-//! Please use `rustfs_metrics::init_metrics_system()` for system monitoring.
+//! The system monitoring functionality has been migrated to `rustfs-metrics`.
+//! Use `rustfs_metrics::init_metrics_collectors()` for system metrics collection.
 //!
 //! ```ignore
-//! // Old (deprecated):
-//! use rustfs_obs::SystemObserver;
-//! SystemObserver::init_process_observer().await?;
-//!
-//! // New:
 //! use tokio_util::sync::CancellationToken;
-//! use rustfs_metrics::init_metrics_system;
+//! use rustfs_metrics::init_metrics_collectors;
 //!
 //! let token = CancellationToken::new();
-//! init_metrics_system(token.clone());
+//! init_metrics_collectors(token.clone());
 //! ```
 mod cleaner;
 mod config;
 mod error;
 mod global;
-mod system;
 mod telemetry;
 
 pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
-#[allow(deprecated)]
-pub use system::SystemObserver;
 pub use telemetry::{OtelGuard, Recorder};
