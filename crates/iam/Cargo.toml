@@ -58,3 +58,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
+
+[lib]
+doctest = false
