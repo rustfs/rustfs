@@ -72,6 +72,61 @@ fn resolve_latest_object_info_candidates(
     Err(pool_lookup_not_found_error(bucket, object, opts))
 }
 
+async fn build_server_pools_available_space(
+    bucket: &str,
+    size: i64,
+    n_sets: &[usize],
+    infos: &[Vec<Option<DiskInfo>>],
+) -> ServerPoolsAvailableSpace {
+    let mut server_pools = vec![PoolAvailableSpace::default(); infos.len()];
+
+    for (i, zinfo) in infos.iter().enumerate() {
+        if zinfo.is_empty() {
+            server_pools[i] = PoolAvailableSpace {
+                index: i,
+                ..Default::default()
+            };
+
+            continue;
+        }
+
+        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
+            server_pools[i] = PoolAvailableSpace {
+                index: i,
+                ..Default::default()
+            };
+
+            continue;
+        }
+
+        let mut available = 0;
+        let mut max_used_pct = 0;
+        for disk in zinfo.iter().flatten() {
+            if disk.total == 0 {
+                continue;
+            }
+
+            available += disk.total - disk.used;
+
+            let pct_used = disk.used * 100 / disk.total;
+
+            if pct_used > max_used_pct {
+                max_used_pct = pct_used;
+            }
+        }
+
+        available *= n_sets[i] as u64;
+
+        server_pools[i] = PoolAvailableSpace {
+            index: i,
+            available,
+            max_used_pct,
+        }
+    }
+
+    ServerPoolsAvailableSpace(server_pools)
+}
+
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
     pub(super) async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
@@ -159,67 +214,26 @@ impl ECStore {
     async fn get_server_pools_available_space(&self, bucket: &str, object: &str, size: i64) -> ServerPoolsAvailableSpace {
         let mut n_sets = vec![0; self.pools.len()];
         let mut infos = vec![Vec::new(); self.pools.len()];
-
-        // TODO: add concurrency
-        for (idx, pool) in self.pools.iter().enumerate() {
+        let pool_inputs = join_all(self.pools.iter().enumerate().map(|(idx, pool)| async move {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
-                continue;
+                return (idx, 0, Vec::new());
             }
 
-            n_sets[idx] = pool.set_count;
+            let disk_infos = match pool.get_disks_by_key(object).get_disks(0, 0).await {
+                Ok(disks) => get_disk_infos(&disks).await,
+                Err(_) => Vec::new(),
+            };
 
-            if let Ok(disks) = pool.get_disks_by_key(object).get_disks(0, 0).await {
-                let disk_infos = get_disk_infos(&disks).await;
-                infos[idx] = disk_infos;
-            }
+            (idx, pool.set_count, disk_infos)
+        }))
+        .await;
+
+        for (idx, set_count, disk_infos) in pool_inputs {
+            n_sets[idx] = set_count;
+            infos[idx] = disk_infos;
         }
 
-        let mut server_pools = vec![PoolAvailableSpace::default(); self.pools.len()];
-        for (i, zinfo) in infos.iter().enumerate() {
-            if zinfo.is_empty() {
-                server_pools[i] = PoolAvailableSpace {
-                    index: i,
-                    ..Default::default()
-                };
-
-                continue;
-            }
-
-            if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-                server_pools[i] = PoolAvailableSpace {
-                    index: i,
-                    ..Default::default()
-                };
-
-                continue;
-            }
-
-            let mut available = 0;
-            let mut max_used_pct = 0;
-            for disk in zinfo.iter().flatten() {
-                if disk.total == 0 {
-                    continue;
-                }
-
-                available += disk.total - disk.used;
-
-                let pct_used = disk.used * 100 / disk.total;
-
-                if pct_used > max_used_pct {
-                    max_used_pct = pct_used;
-                }
-            }
-
-            available *= n_sets[i] as u64;
-
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                available,
-                max_used_pct,
-            }
-        }
-
-        ServerPoolsAvailableSpace(server_pools)
+        build_server_pools_available_space(bucket, size, &n_sets, &infos).await
     }
 
     pub(super) async fn is_suspended(&self, idx: usize) -> bool {
@@ -710,11 +724,22 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::DiskInfo;
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {
             mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
             delete_marker,
+            ..Default::default()
+        }
+    }
+
+    fn disk_info(total: u64, used: u64, free: u64) -> DiskInfo {
+        DiskInfo {
+            total,
+            used,
+            free,
+            free_inodes: 1_024,
             ..Default::default()
         }
     }
@@ -823,5 +848,38 @@ mod tests {
             err,
             Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_returns_zero_for_empty_pool_info() {
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &[Vec::new()]).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].index, 0);
+        assert_eq!(spaces.0[0].available, 0);
+        assert_eq!(spaces.0[0].max_used_pct, 0);
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_computes_available_capacity_and_max_used_pct() {
+        let infos = vec![vec![Some(disk_info(1_000, 100, 900)), Some(disk_info(1_000, 200, 800))]];
+
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[2], &infos).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].index, 0);
+        assert_eq!(spaces.0[0].available, 3_400);
+        assert_eq!(spaces.0[0].max_used_pct, 20);
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_skips_capacity_guard_for_meta_bucket() {
+        let infos = vec![vec![Some(disk_info(10, 9, 1)), Some(disk_info(10, 9, 1))]];
+
+        let spaces = build_server_pools_available_space(crate::disk::RUSTFS_META_BUCKET, 1_024, &[1], &infos).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].available, 2);
+        assert_eq!(spaces.0[0].max_used_pct, 90);
     }
 }
