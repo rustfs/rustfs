@@ -307,6 +307,13 @@ fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_e
     if let Some(err) = entry_error { Err(err) } else { list_result }
 }
 
+fn resolve_decommission_listing_worker_result(
+    set_idx: usize,
+    worker_result: std::result::Result<(), tokio::task::JoinError>,
+) -> Result<()> {
+    worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))
+}
+
 fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: bool, failure: bool) -> bool {
     cleanup_ignored || (!ignore && !failure)
 }
@@ -1624,6 +1631,7 @@ impl ECStore {
     ) -> Result<()> {
         let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+        let mut listing_workers = Vec::with_capacity(pool.disk_set.len());
 
         let mut lifecycle_config = None;
         let mut lock_retention = None;
@@ -1692,7 +1700,7 @@ impl ECStore {
             let bi = bi.clone();
             let set_id = set_idx;
             let wk_clone = wk.clone();
-            tokio::spawn(async move {
+            let worker = tokio::spawn(async move {
                 loop {
                     if rx_clone.is_cancelled() {
                         warn!("decommission_pool: cancel {}", set_id);
@@ -1722,11 +1730,27 @@ impl ECStore {
 
                 wk_clone.give().await;
             });
+            listing_workers.push((set_id, worker));
         }
 
         warn!("decommission_pool: decommission_pool wait {} {}", idx, &bi.name);
 
+        let mut listing_worker_error = None;
+        for (set_id, worker) in listing_workers {
+            if let Err(err) = resolve_decommission_listing_worker_result(set_id, worker.await) {
+                rx.cancel();
+                wk.give().await;
+                if listing_worker_error.is_none() {
+                    listing_worker_error = Some(err);
+                }
+            }
+        }
+
         wk.wait().await;
+
+        if let Some(err) = listing_worker_error {
+            return Err(err);
+        }
 
         if let Some(err) = entry_error.lock().await.clone() {
             return Err(err);
@@ -2671,12 +2695,13 @@ mod pools_tests {
         is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
         require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_reload_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, should_cleanup_decommission_source_entry,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state, take_decommission_canceler,
-        track_decommission_current_object, with_decommission_entry_context,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        should_cleanup_decommission_source_entry, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, take_decommission_canceler, track_decommission_current_object,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::error::Error;
@@ -3171,6 +3196,26 @@ mod pools_tests {
         let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), None)
             .expect_err("list result should be preserved without entry error");
         assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
+    fn test_resolve_decommission_listing_worker_result_passthrough_ok() {
+        assert!(resolve_decommission_listing_worker_result(2, Ok(())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_decommission_listing_worker_result_wraps_join_error_context() {
+        let join_error = tokio::spawn(async {
+            panic!("listing worker panic");
+        })
+        .await
+        .expect_err("panic task should return JoinError");
+
+        let err = resolve_decommission_listing_worker_result(4, Err(join_error))
+            .expect_err("join error should be wrapped with context");
+        let message = err.to_string();
+        assert!(message.contains("decommission listing worker 4 task join error"));
+        assert!(message.contains("panic"));
     }
 
     #[test]
