@@ -30,6 +30,10 @@ fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions)
     }
 }
 
+fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
+}
+
 fn resolve_latest_object_info_candidates(
     mut candidates: Vec<LatestObjectInfoCandidate>,
     bucket: &str,
@@ -534,7 +538,10 @@ impl ECStore {
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
         let mut meta = PoolMeta::default();
-        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
+        resolve_store_rebalance_pool_meta_reload_result(
+            meta.load(self.pools[0].clone(), self.pools.clone()).await,
+            "reload_pool_meta",
+        )?;
 
         let mut pool_meta = self.pool_meta.write().await;
         *pool_meta = meta;
@@ -848,6 +855,21 @@ mod tests {
             err,
             Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_store_rebalance_pool_meta_reload_result_passthrough_ok() {
+        resolve_store_rebalance_pool_meta_reload_result(Ok(()), "reload_pool_meta")
+            .expect("successful pool meta reload should pass through");
+    }
+
+    #[test]
+    fn resolve_store_rebalance_pool_meta_reload_result_wraps_error_context() {
+        let err = resolve_store_rebalance_pool_meta_reload_result(Err(Error::SlowDown), "reload_pool_meta")
+            .expect_err("failed pool meta reload should be wrapped");
+        let err_message = err.to_string();
+        assert!(err_message.contains("store rebalance pool meta reload failed during reload_pool_meta"));
+        assert!(err_message.contains(&Error::SlowDown.to_string()));
     }
 
     #[tokio::test]
