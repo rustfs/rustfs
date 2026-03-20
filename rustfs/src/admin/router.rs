@@ -62,10 +62,11 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_signer::pre_sign_v4;
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
 };
 use s3s::Body;
 use s3s::S3Error;
@@ -211,7 +212,12 @@ struct ObjectLambdaWebhookConfig {
     client_key: String,
     client_ca: String,
     skip_tls_verify: bool,
+    response_header_timeout: Option<Duration>,
 }
+
+const LAMBDA_WEBHOOK_SUB_SYS: &str = "lambda_webhook";
+const WEBHOOK_RESPONSE_HEADER_TIMEOUT: &str = "response_header_timeout";
+const OBJECT_LAMBDA_PRESIGN_EXPIRES_SECS: i64 = 3600;
 
 fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
     uri.query()
@@ -549,13 +555,15 @@ fn resolve_object_lambda_webhook_config_from_server_config(
     config: &Config,
     arn: &rustfs_targets::arn::ARN,
 ) -> S3Result<ObjectLambdaWebhookConfig> {
-    if !arn.target_id.name.eq_ignore_ascii_case("webhook") {
+    let target_name = arn.target_id.name.to_ascii_lowercase();
+    if target_name != "webhook" && !target_name.starts_with("webhook-") {
         return Err(s3_error!(NotImplemented, "object lambda target type is not supported"));
     }
 
     let subsystem = config
         .0
-        .get(NOTIFY_WEBHOOK_SUB_SYS)
+        .get(LAMBDA_WEBHOOK_SUB_SYS)
+        .or_else(|| config.0.get(NOTIFY_WEBHOOK_SUB_SYS))
         .ok_or_else(|| s3_error!(InvalidRequest, "object lambda webhook subsystem is not configured"))?;
     let kvs = subsystem
         .get(&arn.target_id.id)
@@ -570,6 +578,15 @@ fn resolve_object_lambda_webhook_config_from_server_config(
         return Err(s3_error!(InvalidRequest, "object lambda target endpoint is empty"));
     }
 
+    let response_header_timeout = match kvs.lookup(WEBHOOK_RESPONSE_HEADER_TIMEOUT) {
+        Some(value) if value.trim().is_empty() => None,
+        Some(value) => Some(
+            parse_duration(&value)
+                .map_err(|_| s3_error!(InvalidRequest, "object lambda target response_header_timeout is invalid"))?,
+        ),
+        None => None,
+    };
+
     Ok(ObjectLambdaWebhookConfig {
         endpoint: Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?,
         auth_token: kvs.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
@@ -577,6 +594,7 @@ fn resolve_object_lambda_webhook_config_from_server_config(
         client_key: kvs.lookup(WEBHOOK_CLIENT_KEY).unwrap_or_default(),
         client_ca: kvs.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
         skip_tls_verify: config_enable_is_on(&kvs.lookup(WEBHOOK_SKIP_TLS_VERIFY).unwrap_or_default()),
+        response_header_timeout,
     })
 }
 
@@ -587,9 +605,11 @@ fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambdaWebho
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+    let mut builder = reqwest::Client::builder().user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+
+    if let Some(timeout) = config.response_header_timeout {
+        builder = builder.timeout(timeout);
+    }
 
     if config.skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
@@ -621,6 +641,124 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
     builder
         .build()
         .map_err(|e| s3_error!(InternalError, "failed to build object lambda http client: {e}"))
+}
+
+fn extract_request_scheme(headers: &HeaderMap, uri: &Uri) -> String {
+    get_source_scheme(headers)
+        .and_then(|value| {
+            value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| uri.scheme_str().map(str::to_owned))
+        .unwrap_or_else(|| "http".to_string())
+        .to_ascii_lowercase()
+}
+
+fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| uri.authority().map(|authority| authority.as_str().to_string()))
+}
+
+fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
+    let credentials = req
+        .credentials
+        .as_ref()
+        .ok_or_else(|| s3_error!(AccessDenied, "object lambda source URL requires authenticated credentials"))?;
+    let host = extract_request_host(&req.headers, &req.uri)
+        .ok_or_else(|| s3_error!(InvalidRequest, "object lambda source URL requires a valid host header"))?;
+    let scheme = extract_request_scheme(&req.headers, &req.uri);
+    let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
+    let path_and_query = filtered_uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| filtered_uri.path().to_string());
+    let source_uri = format!("{scheme}://{host}{path_and_query}")
+        .parse::<Uri>()
+        .map_err(|e| s3_error!(InvalidRequest, "failed to construct object lambda source URL: {e}"))?;
+    let region = req
+        .region
+        .clone()
+        .or_else(get_global_region)
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
+
+    let presigned = pre_sign_v4(
+        http::Request::builder()
+            .method(Method::GET)
+            .uri(source_uri)
+            .header(http::header::HOST, host)
+            .body(Body::default())
+            .map_err(|e| s3_error!(InvalidRequest, "failed to build object lambda source request: {e}"))?,
+        &credentials.access_key,
+        credentials.secret_key.expose(),
+        &session_token,
+        &region,
+        OBJECT_LAMBDA_PRESIGN_EXPIRES_SECS,
+        OffsetDateTime::now_utc(),
+    );
+
+    Ok(presigned.uri().to_string())
+}
+
+fn build_object_lambda_event_payload(
+    req: &S3Request<Body>,
+    lambda_arn: &str,
+    input_s3_url: &str,
+    output_route: &str,
+    output_token: &str,
+) -> S3Result<Vec<u8>> {
+    let request_headers = req
+        .headers
+        .iter()
+        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    serde_json::to_vec(&serde_json::json!({
+        "getObjectContext": {
+            "inputS3Url": input_s3_url,
+            "outputRoute": output_route,
+            "outputToken": output_token,
+        },
+        "configuration": {
+            "accessPointArn": lambda_arn,
+        },
+        "userRequest": {
+            "url": req.uri.to_string(),
+            "headers": request_headers,
+        },
+        "protocolVersion": "rustfs-object-lambda-1.0",
+    }))
+    .map_err(|e| s3_error!(InternalError, "failed to serialize object lambda payload: {e}"))
+}
+
+fn validate_object_lambda_response_auth_headers(headers: &HeaderMap, output_route: &str, output_token: &str) -> S3Result<()> {
+    let route = headers
+        .get("x-amz-request-route")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let token = headers
+        .get("x-amz-request-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+
+    if route == Some(output_route) && token == Some(output_token) {
+        return Ok(());
+    }
+
+    Err(s3_error!(
+        InvalidRequest,
+        "object lambda target response is missing or contains invalid authorization headers"
+    ))
 }
 
 fn format_timestamp_http_date(value: &Timestamp) -> S3Result<String> {
@@ -799,6 +937,8 @@ fn clear_object_lambda_variant_headers(headers: &mut HeaderMap) {
         HeaderName::from_static("x-amz-checksum-sha256"),
         HeaderName::from_static("x-amz-checksum-type"),
         HeaderName::from_static("x-amz-tagging-count"),
+        HeaderName::from_static("x-amz-request-route"),
+        HeaderName::from_static("x-amz-request-token"),
     ] {
         headers.remove(name);
     }
@@ -827,6 +967,30 @@ fn is_disallowed_object_lambda_response_header(name: &HeaderName) -> bool {
     )
 }
 
+fn build_object_lambda_passthrough_response(
+    mut response_headers: HeaderMap,
+    lambda_headers: &HeaderMap,
+    status: StatusCode,
+    body: Body,
+) -> S3Response<Body> {
+    clear_object_lambda_variant_headers(&mut response_headers);
+    for (name, value) in lambda_headers {
+        if !is_disallowed_object_lambda_response_header(name)
+            && name != "x-amz-request-route"
+            && name != "x-amz-request-token"
+        {
+            response_headers.insert(name.clone(), value.clone());
+        }
+    }
+
+    S3Response {
+        output: body,
+        status: Some(status),
+        headers: response_headers,
+        extensions: Extensions::new(),
+    }
+}
+
 async fn invoke_object_lambda_target(
     req: &S3Request<Body>,
     bucket: &str,
@@ -835,29 +999,29 @@ async fn invoke_object_lambda_target(
 ) -> S3Result<S3Response<Body>> {
     let lambda_config = resolve_object_lambda_webhook_config(&req.uri)?;
     let client = build_object_lambda_http_client(&lambda_config)?;
+    let lambda_arn = query_value_exact(&req.uri, "lambdaArn")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"))?;
+    let input_s3_url = build_object_lambda_source_url(req)?;
+    let output_route = Uuid::new_v4().to_string();
+    let output_token = Uuid::new_v4().to_string();
+    let event_payload = build_object_lambda_event_payload(req, &lambda_arn, &input_s3_url, &output_route, &output_token)?;
 
     let S3Response {
-        mut output,
+        output,
         headers: upstream_headers,
         ..
     } = get_resp;
 
-    let mut response_headers = build_get_object_response_headers(&output, &upstream_headers)?;
-    let source_content_type = output.content_type.as_ref().map(ToString::to_string);
-    let source_version_id = output.version_id.clone();
-    let source_etag = output.e_tag.as_ref().and_then(|etag| etag.to_http_header().ok());
-    let source_body = output
-        .body
-        .take()
-        .map(Body::from)
-        .unwrap_or_else(|| Body::from(String::new()));
+    let response_headers = build_get_object_response_headers(&output, &upstream_headers)?;
 
     let mut request_builder = client
         .post(lambda_config.endpoint)
         .header("x-rustfs-object-lambda-bucket", bucket)
         .header("x-rustfs-object-lambda-key", object)
         .header("x-rustfs-object-lambda-request-uri", req.uri.to_string())
-        .body(reqwest::Body::wrap_stream(source_body));
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(event_payload);
 
     if !lambda_config.auth_token.is_empty() {
         let tokens = lambda_config.auth_token.split_whitespace().collect::<Vec<_>>();
@@ -870,20 +1034,8 @@ async fn invoke_object_lambda_target(
         };
     }
 
-    if let Some(version_id) = source_version_id.as_deref() {
+    if let Some(version_id) = output.version_id.as_deref() {
         request_builder = request_builder.header("x-rustfs-object-lambda-version-id", version_id);
-    }
-    if let Some(content_type) = source_content_type.as_deref() {
-        request_builder = request_builder.header(http::header::CONTENT_TYPE, content_type);
-    }
-    if let Some(content_length) = output.content_length {
-        request_builder = request_builder.header(http::header::CONTENT_LENGTH, content_length.to_string());
-    }
-    if let Some(etag) = source_etag {
-        request_builder = request_builder.header(http::header::ETAG, etag);
-    }
-    if let Some(range) = req.headers.get(http::header::RANGE) {
-        request_builder = request_builder.header(http::header::RANGE, range.clone());
     }
 
     let lambda_response = request_builder
@@ -891,29 +1043,13 @@ async fn invoke_object_lambda_target(
         .await
         .map_err(|e| s3_error!(InternalError, "object lambda target request failed: {e}"))?;
 
-    if !lambda_response.status().is_success() {
-        return Err(s3_error!(
-            InternalError,
-            "object lambda target returned unsuccessful status: {}",
-            lambda_response.status()
-        ));
-    }
-
-    clear_object_lambda_variant_headers(&mut response_headers);
-    for (name, value) in lambda_response.headers() {
-        if !is_disallowed_object_lambda_response_header(name) {
-            response_headers.insert(name.clone(), value.clone());
-        }
-    }
-
     let status = lambda_response.status();
+    let lambda_headers = lambda_response.headers().clone();
+    if status.is_success() {
+        validate_object_lambda_response_auth_headers(&lambda_headers, &output_route, &output_token)?;
+    }
     let body = Body::from(StreamingBlob::wrap(lambda_response.bytes_stream()));
-    Ok(S3Response {
-        output: body,
-        status: Some(status),
-        headers: response_headers,
-        extensions: Extensions::new(),
-    })
+    Ok(build_object_lambda_passthrough_response(response_headers, &lambda_headers, status, body))
 }
 
 struct ListenNotificationStream {
@@ -2475,7 +2611,7 @@ mod tests {
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
         let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
-            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
                 rustfs_ecstore::config::KVS(vec![
@@ -2503,6 +2639,130 @@ mod tests {
         assert_eq!(resolved.endpoint.as_str(), "https://example.com/transform");
         assert_eq!(resolved.auth_token, "secret-token");
         assert!(!resolved.skip_tls_verify);
+        assert!(resolved.response_header_timeout.is_none());
+    }
+
+    #[test]
+    fn resolve_object_lambda_webhook_config_from_server_config_accepts_named_webhook_target() {
+        let arn = "arn:acme:s3-object-lambda::transformer:webhook-csv"
+            .parse::<rustfs_targets::arn::ARN>()
+            .expect("arn should parse");
+        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
+            std::collections::HashMap::from([(
+                "transformer".to_string(),
+                rustfs_ecstore::config::KVS(vec![
+                    rustfs_ecstore::config::KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "on".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://example.com/transform-csv".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let resolved = resolve_object_lambda_webhook_config_from_server_config(&config, &arn).expect("config should resolve");
+        assert_eq!(resolved.endpoint.as_str(), "https://example.com/transform-csv");
+    }
+
+    #[test]
+    fn resolve_object_lambda_webhook_config_from_server_config_parses_response_header_timeout() {
+        let arn = "arn:acme:s3-object-lambda::transformer:webhook"
+            .parse::<rustfs_targets::arn::ARN>()
+            .expect("arn should parse");
+        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
+            std::collections::HashMap::from([(
+                "transformer".to_string(),
+                rustfs_ecstore::config::KVS(vec![
+                    rustfs_ecstore::config::KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "on".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://example.com/transform".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_RESPONSE_HEADER_TIMEOUT.to_string(),
+                        value: "2s".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let resolved = resolve_object_lambda_webhook_config_from_server_config(&config, &arn).expect("config should resolve");
+        assert_eq!(resolved.response_header_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn resolve_object_lambda_webhook_config_from_server_config_accepts_notify_webhook_fallback() {
+        let arn = "arn:acme:s3-object-lambda::transformer:webhook"
+            .parse::<rustfs_targets::arn::ARN>()
+            .expect("arn should parse");
+        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            std::collections::HashMap::from([(
+                "transformer".to_string(),
+                rustfs_ecstore::config::KVS(vec![
+                    rustfs_ecstore::config::KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "on".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://example.com/notify-transform".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let resolved = resolve_object_lambda_webhook_config_from_server_config(&config, &arn).expect("config should resolve");
+        assert_eq!(resolved.endpoint.as_str(), "https://example.com/notify-transform");
+    }
+
+    #[test]
+    fn resolve_object_lambda_webhook_config_from_server_config_rejects_invalid_response_header_timeout() {
+        let arn = "arn:acme:s3-object-lambda::transformer:webhook"
+            .parse::<rustfs_targets::arn::ARN>()
+            .expect("arn should parse");
+        let config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
+            std::collections::HashMap::from([(
+                "transformer".to_string(),
+                rustfs_ecstore::config::KVS(vec![
+                    rustfs_ecstore::config::KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "on".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://example.com/transform".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    rustfs_ecstore::config::KV {
+                        key: WEBHOOK_RESPONSE_HEADER_TIMEOUT.to_string(),
+                        value: "definitely-not-a-duration".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let err = resolve_object_lambda_webhook_config_from_server_config(&config, &arn)
+            .expect_err("invalid timeout should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -2519,7 +2779,7 @@ mod tests {
             .parse::<rustfs_targets::arn::ARN>()
             .expect("arn should parse");
         let disabled_config = rustfs_ecstore::config::Config(std::collections::HashMap::from([(
-            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            LAMBDA_WEBHOOK_SUB_SYS.to_string(),
             std::collections::HashMap::from([(
                 "transformer".to_string(),
                 rustfs_ecstore::config::KVS(vec![
@@ -2556,6 +2816,150 @@ mod tests {
         assert!(headers.get(http::header::CONTENT_TYPE).is_none());
         assert!(headers.get("x-amz-meta-demo").is_none());
         assert_eq!(headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()), Some("v1"));
+    }
+
+    #[test]
+    fn build_object_lambda_passthrough_response_preserves_target_status_and_filters_headers() {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("7"));
+        upstream_headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        upstream_headers.insert("x-amz-meta-demo", HeaderValue::from_static("value"));
+        upstream_headers.insert("x-amz-version-id", HeaderValue::from_static("v1"));
+
+        let mut lambda_headers = HeaderMap::new();
+        lambda_headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        lambda_headers.insert("x-rustfs-lambda-error", HeaderValue::from_static("upstream"));
+        lambda_headers.insert(http::header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        lambda_headers.insert("x-amz-request-route", HeaderValue::from_static("route-token"));
+        lambda_headers.insert("x-amz-request-token", HeaderValue::from_static("request-token"));
+
+        let response = build_object_lambda_passthrough_response(
+            upstream_headers,
+            &lambda_headers,
+            StatusCode::BAD_GATEWAY,
+            Body::from("lambda failed".to_string()),
+        );
+
+        assert_eq!(response.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(
+            response.headers.get(http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-rustfs-lambda-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("upstream")
+        );
+        assert!(response.headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(response.headers.get("x-amz-meta-demo").is_none());
+        assert!(response.headers.get(http::header::CONNECTION).is_none());
+        assert!(response.headers.get("x-amz-request-route").is_none());
+        assert!(response.headers.get("x-amz-request-token").is_none());
+        assert_eq!(
+            response.headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn build_object_lambda_source_url_presigns_request_without_lambda_arn() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook&versionId=v1"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::from_iter([(http::header::HOST, HeaderValue::from_static("localhost:9000"))]),
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "rustfsadmin".to_string(),
+                secret_key: s3s::auth::SecretKey::from("rustfssecret"),
+            }),
+            region: get_global_region(),
+            service: None,
+            trailing_headers: None,
+        };
+
+        let source_url = build_object_lambda_source_url(&req).expect("source url should build");
+        let source_url = Url::parse(&source_url).expect("source url should parse");
+        let query_pairs = source_url.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(source_url.scheme(), "http");
+        assert_eq!(source_url.host_str(), Some("localhost"));
+        assert_eq!(source_url.port_or_known_default(), Some(9000));
+        assert_eq!(source_url.path(), "/demo-bucket/object.txt");
+        assert_eq!(query_pairs.get("versionId").map(|value| value.as_ref()), Some("v1"));
+        assert!(!query_pairs.contains_key("lambdaArn"));
+        let expires = query_pairs
+            .get("X-Amz-Expires")
+            .and_then(|value| value.parse::<u64>().ok());
+        assert_eq!(expires, Some(3600));
+        assert_eq!(
+            query_pairs.get("X-Amz-Algorithm").map(|value| value.as_ref()),
+            Some("AWS4-HMAC-SHA256")
+        );
+        assert!(query_pairs.contains_key("X-Amz-Signature"));
+    }
+
+    #[test]
+    fn build_object_lambda_event_payload_contains_required_context() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+                .parse()
+                .expect("uri should parse"),
+            headers: HeaderMap::from_iter([(http::header::HOST, HeaderValue::from_static("localhost:9000"))]),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let payload = build_object_lambda_event_payload(
+            &req,
+            "arn:acme:s3-object-lambda::transformer:webhook",
+            "https://example.com/source",
+            "route-123",
+            "token-456",
+        )
+        .expect("payload should serialize");
+        let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload should be json");
+
+        assert_eq!(payload["getObjectContext"]["inputS3Url"], "https://example.com/source");
+        assert_eq!(payload["getObjectContext"]["outputRoute"], "route-123");
+        assert_eq!(payload["getObjectContext"]["outputToken"], "token-456");
+        assert_eq!(
+            payload["configuration"]["accessPointArn"],
+            "arn:acme:s3-object-lambda::transformer:webhook"
+        );
+        assert_eq!(
+            payload["userRequest"]["url"],
+            "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+        );
+    }
+
+    #[test]
+    fn validate_object_lambda_response_auth_headers_rejects_missing_or_mismatched_values() {
+        let mut matching = HeaderMap::new();
+        matching.insert("x-amz-request-route", HeaderValue::from_static("route-123"));
+        matching.insert("x-amz-request-token", HeaderValue::from_static("token-456"));
+        assert!(validate_object_lambda_response_auth_headers(&matching, "route-123", "token-456").is_ok());
+
+        let missing = HeaderMap::new();
+        let err = validate_object_lambda_response_auth_headers(&missing, "route-123", "token-456")
+            .expect_err("missing auth headers should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let mut mismatched = HeaderMap::new();
+        mismatched.insert("x-amz-request-route", HeaderValue::from_static("route-123"));
+        mismatched.insert("x-amz-request-token", HeaderValue::from_static("wrong-token"));
+        let err = validate_object_lambda_response_auth_headers(&mismatched, "route-123", "token-456")
+            .expect_err("mismatched auth headers should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]

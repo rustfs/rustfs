@@ -7397,6 +7397,7 @@ dependencies = [
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
+ "rustfs-signer",
  "rustfs-targets",
  "rustfs-trusted-proxies",
  "rustfs-utils",
