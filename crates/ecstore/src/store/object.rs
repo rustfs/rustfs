@@ -137,6 +137,10 @@ impl ECStore {
         }
     }
 
+    fn resolve_decommission_target_pool_idx_result(result: Result<usize>, bucket: &str, object: &str) -> Result<usize> {
+        result.map_err(|err| Error::other(format!("failed to select decommission target pool for {bucket}/{object}: {err}")))
+    }
+
     #[instrument(skip(self, fi, opts))]
     pub(crate) async fn decommission_tiered_object(
         &self,
@@ -154,10 +158,17 @@ impl ECStore {
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
-            self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true)
-                .await?
+            Self::resolve_decommission_target_pool_idx_result(
+                self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true).await,
+                bucket,
+                &object,
+            )?
         } else {
-            self.get_pool_idx_no_lock(bucket, &object, fi.size).await?
+            Self::resolve_decommission_target_pool_idx_result(
+                self.get_pool_idx_no_lock(bucket, &object, fi.size).await,
+                bucket,
+                &object,
+            )?
         };
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -880,6 +891,25 @@ mod tests {
         let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
 
         assert!(matches!(err, Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn resolve_decommission_target_pool_idx_result_passthrough_ok() {
+        let idx = ECStore::resolve_decommission_target_pool_idx_result(Ok(3), "bucket", "object").unwrap();
+
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn resolve_decommission_target_pool_idx_result_wraps_error_context() {
+        let err = ECStore::resolve_decommission_target_pool_idx_result(Err(Error::other("boom")), "bucket", "object")
+            .expect_err("expected contextual error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to select decommission target pool"), "{rendered}");
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
+        assert!(rendered.contains("boom"), "{rendered}");
     }
 
     #[test]
