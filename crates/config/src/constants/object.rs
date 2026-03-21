@@ -272,11 +272,11 @@ pub const DEFAULT_PRIORITY_SCHEDULING_ENABLE: bool = true;
 /// potential deadlock situations (circular lock wait chains).
 /// This has some performance overhead and is intended for debugging.
 ///
-/// Default: false (disabled, can be overridden by `RUSTFS_ENABLE_DEADLOCK_DETECTION`).
-pub const ENV_ENABLE_DEADLOCK_DETECTION: &str = "RUSTFS_ENABLE_DEADLOCK_DETECTION";
+/// Default: false (disabled, can be overridden by `RUSTFS_DEADLOCK_DETECTION_ENABLE`).
+pub const ENV_DEADLOCK_DETECTION_ENABLE: &str = "RUSTFS_DEADLOCK_DETECTION_ENABLE";
 
 /// Default: deadlock detection is disabled for performance.
-pub const DEFAULT_ENABLE_DEADLOCK_DETECTION: bool = false;
+pub const DEFAULT_DEADLOCK_DETECTION_ENABLE: bool = false;
 
 /// Environment variable for deadlock detection check interval in seconds.
 ///

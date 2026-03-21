@@ -76,7 +76,7 @@ pub struct DeadlockDetectorConfig {
 impl Default for DeadlockDetectorConfig {
     fn default() -> Self {
         Self {
-            enabled: rustfs_config::DEFAULT_ENABLE_DEADLOCK_DETECTION,
+            enabled: rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
             check_interval: Duration::from_secs(rustfs_config::DEFAULT_DEADLOCK_CHECK_INTERVAL),
             hang_threshold: Duration::from_secs(rustfs_config::DEFAULT_DEADLOCK_HANG_THRESHOLD),
             capture_backtrace: false,
@@ -88,8 +88,8 @@ impl DeadlockDetectorConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_ENABLE_DEADLOCK_DETECTION,
-            rustfs_config::DEFAULT_ENABLE_DEADLOCK_DETECTION,
+            rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
+            rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
         );
         let check_interval = Duration::from_secs(rustfs_utils::get_env_u64(
             rustfs_config::ENV_DEADLOCK_CHECK_INTERVAL,
@@ -581,8 +581,8 @@ pub fn init_deadlock_detector() {
 #[allow(dead_code)]
 pub fn is_deadlock_detection_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_ENABLE_DEADLOCK_DETECTION,
-        rustfs_config::DEFAULT_ENABLE_DEADLOCK_DETECTION,
+        rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
     )
 }
 

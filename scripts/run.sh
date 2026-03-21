@@ -240,7 +240,7 @@ export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
 # Priority scheduling: small requests get higher priority
 export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
 # Deadlock detection: disabled by default (has performance overhead)
-# export RUSTFS_ENABLE_DEADLOCK_DETECTION=false
+# export RUSTFS_DEADLOCK_DETECTION_ENABLE=false
 
 # --- Scenario 1: Home NAS / Small Storage Server ---
 # Hardware: 4-8 cores, 8-16GB RAM, 1-4 HDDs, 1Gbps network
@@ -281,7 +281,7 @@ export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
 # export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
 # export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
-# export RUSTFS_ENABLE_DEADLOCK_DETECTION=true  # Enable for debugging
+# export RUSTFS_DEADLOCK_DETECTION_ENABLE=true  # Enable for debugging
 
 # --- Scenario 5: Low Power / Embedded Storage ---
 # Hardware: 2-4 cores (ARM/x86), 2-4GB RAM, SD card/eMMC, 100Mbps-1Gbps
@@ -298,7 +298,7 @@ export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
 # --- Scenario 6: Debugging / Troubleshooting ---
 # Enable all diagnostic features
 # export RUSTFS_GET_OBJECT_TIMEOUT=15
-# export RUSTFS_ENABLE_DEADLOCK_DETECTION=true
+# export RUSTFS_DEADLOCK_DETECTION_ENABLE=true
 # export RUSTFS_DEADLOCK_CHECK_INTERVAL=3
 # export RUSTFS_DEADLOCK_HANG_THRESHOLD=5
 
