@@ -121,6 +121,18 @@ use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
+
+/// Get the duplex buffer size from environment variable or use default.
+///
+/// This function reads `RUSTFS_DUPLEX_BUFFER_SIZE` environment variable
+/// to allow runtime configuration of the duplex pipe buffer size.
+/// A larger buffer (e.g., 4MB) helps prevent backpressure-related hangs
+/// when reading large objects (20-26MB) under high concurrency.
+///
+/// Default: 4MB (4 * 1024 * 1024 bytes)
+pub fn get_duplex_buffer_size() -> usize {
+    rustfs_utils::get_env_usize(rustfs_config::ENV_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_DUPLEX_BUFFER_SIZE)
+}
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
@@ -512,7 +524,9 @@ impl ObjectIO for SetDisks {
             return Ok(gr);
         }
 
-        let (rd, wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+        let duplex_buffer_size = get_duplex_buffer_size();
+        let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
+        debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
         let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
 

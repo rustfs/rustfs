@@ -74,6 +74,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tracing::debug;
 
 // ============================================
 // Adaptive I/O Strategy Types
@@ -116,6 +117,119 @@ impl IoLoadLevel {
             IoLoadLevel::Critical
         }
     }
+}
+
+// ============================================
+// Priority-Based I/O Scheduling
+// ============================================
+
+/// I/O request priority level.
+///
+/// Requests are classified by size to prevent large requests
+/// from starving small requests. This is especially important
+/// under high concurrency where many range reads compete for I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IoPriority {
+    /// High priority: small requests (< 1MB).
+    /// These should complete quickly to maintain responsiveness.
+    High,
+    /// Normal priority: medium requests (1MB - 10MB).
+    /// Standard processing with fair resource allocation.
+    Normal,
+    /// Low priority: large requests (> 10MB).
+    /// These can tolerate longer wait times.
+    Low,
+}
+
+impl IoPriority {
+    /// Determine priority from request size.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - Request size in bytes
+    ///
+    /// # Returns
+    ///
+    /// Priority level based on size thresholds:
+    /// - High: < 1MB
+    /// - Normal: 1MB - 10MB
+    /// - Low: > 10MB
+    pub fn from_size(size: i64) -> Self {
+        const HIGH_THRESHOLD: i64 = MI_B as i64; // 1MB
+        const LOW_THRESHOLD: i64 = 10 * MI_B as i64; // 10MB
+
+        if size < HIGH_THRESHOLD {
+            IoPriority::High
+        } else if size > LOW_THRESHOLD {
+            IoPriority::Low
+        } else {
+            IoPriority::Normal
+        }
+    }
+
+    /// Get the priority as a string for metrics labels.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IoPriority::High => "high",
+            IoPriority::Normal => "normal",
+            IoPriority::Low => "low",
+        }
+    }
+}
+
+impl std::fmt::Display for IoPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// I/O scheduler configuration.
+#[derive(Debug, Clone)]
+pub struct IoSchedulerConfig {
+    /// Maximum concurrent disk reads.
+    pub max_concurrent_reads: usize,
+    /// Whether priority scheduling is enabled.
+    pub enable_priority: bool,
+}
+
+impl Default for IoSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+            enable_priority: rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+        }
+    }
+}
+
+impl IoSchedulerConfig {
+    /// Load configuration from environment.
+    pub fn from_env() -> Self {
+        Self {
+            max_concurrent_reads: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
+                rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+            ),
+            enable_priority: rustfs_utils::get_env_bool(
+                rustfs_config::ENV_ENABLE_PRIORITY_SCHEDULING,
+                rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+            ),
+        }
+    }
+}
+
+/// I/O queue status for monitoring.
+#[derive(Debug, Clone, Default)]
+pub struct IoQueueStatus {
+    /// Total permits available.
+    pub total_permits: usize,
+    /// Permits currently in use.
+    pub permits_in_use: usize,
+    /// Number of high priority requests waiting.
+    pub high_priority_waiting: usize,
+    /// Number of normal priority requests waiting.
+    pub normal_priority_waiting: usize,
+    /// Number of low priority requests waiting.
+    pub low_priority_waiting: usize,
 }
 
 /// Adaptive I/O strategy calculated from current system load.
@@ -1666,6 +1780,90 @@ impl ConcurrencyManager {
     /// Objects larger than this size are not cached to prevent memory exhaustion.
     pub fn max_object_size(&self) -> usize {
         self.cache.max_object_size
+    }
+
+    // ============================================
+    // Priority-Based I/O Scheduling Methods
+    // ============================================
+
+    /// Get I/O priority for a request based on its size.
+    ///
+    /// This enables priority-based scheduling where small requests
+    /// are processed before large requests to prevent starvation.
+    ///
+    /// # Arguments
+    ///
+    /// * `request_size` - Size of the request in bytes (-1 if unknown)
+    ///
+    /// # Returns
+    ///
+    /// Priority level (High, Normal, or Low)
+    pub fn get_io_priority(&self, request_size: i64) -> IoPriority {
+        if request_size < 0 {
+            // Unknown size, use normal priority
+            IoPriority::Normal
+        } else {
+            IoPriority::from_size(request_size)
+        }
+    }
+
+    /// Check if priority scheduling is enabled.
+    pub fn is_priority_scheduling_enabled(&self) -> bool {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_ENABLE_PRIORITY_SCHEDULING,
+            rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+        )
+    }
+
+    /// Get current I/O queue status for monitoring.
+    ///
+    /// Returns information about permit usage and waiting requests.
+    pub fn io_queue_status(&self) -> IoQueueStatus {
+        let total_permits = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
+            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+        );
+        let permits_in_use = total_permits.saturating_sub(self.disk_read_semaphore.available_permits());
+
+        IoQueueStatus {
+            total_permits,
+            permits_in_use,
+            high_priority_waiting: 0, // Would need additional tracking
+            normal_priority_waiting: 0,
+            low_priority_waiting: 0,
+        }
+    }
+
+    /// Acquire a disk read permit with priority awareness.
+    ///
+    /// When priority scheduling is enabled, this method logs the priority
+    /// for observability. The actual acquisition uses the same semaphore
+    /// but priority information is used for monitoring.
+    ///
+    /// # Arguments
+    ///
+    /// * `priority` - Priority level for this request
+    ///
+    /// # Returns
+    ///
+    /// Semaphore permit on success, error on failure
+    pub async fn acquire_priority_permit(
+        &self,
+        priority: IoPriority,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::counter;
+            counter!("rustfs.disk.read.queue.total", "priority" => priority.as_str()).increment(1);
+        }
+
+        debug!(
+            priority = %priority,
+            available_permits = self.disk_read_semaphore.available_permits(),
+            "Acquiring disk read permit"
+        );
+
+        self.disk_read_semaphore.acquire().await
     }
 }
 

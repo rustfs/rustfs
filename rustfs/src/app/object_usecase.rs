@@ -30,6 +30,7 @@ use crate::storage::options::{
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
+use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimedGetObjectResult, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -932,9 +933,22 @@ impl DefaultObjectUsecase {
 
         let request_start = std::time::Instant::now();
 
+        // Load timeout configuration
+        let timeout_config = TimeoutConfig::from_env();
+        let request_deadline = if timeout_config.is_timeout_enabled() {
+            Some(request_start + timeout_config.get_object_timeout)
+        } else {
+            None
+        };
+
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+        // Register with deadlock detector if enabled
+        let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
+        let request_id = format!("get-{}-{}", req.input.bucket, req.input.key);
+        deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
 
         #[cfg(feature = "metrics")]
         {
@@ -943,7 +957,10 @@ impl DefaultObjectUsecase {
             gauge!("rustfs.concurrent.get.object.requests").set(concurrent_requests as f64);
         }
 
-        debug!("GetObject request started with {} concurrent requests", concurrent_requests);
+        debug!(
+            "GetObject request started with {} concurrent requests, timeout={:?}",
+            concurrent_requests, timeout_config.get_object_timeout
+        );
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
         // mc get 3
@@ -1485,10 +1502,27 @@ impl DefaultObjectUsecase {
             histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
         }
 
+        // Check for timeout before returning
+        if let Some(deadline) = request_deadline {
+            if std::time::Instant::now() > deadline {
+                warn!(
+                    "GetObject request exceeded timeout: key={} duration={:?} timeout={:?}",
+                    cache_key,
+                    request_start.elapsed(),
+                    timeout_config.get_object_timeout
+                );
+                #[cfg(feature = "metrics")]
+                counter!("rustfs.get.object.timeout.total").increment(1);
+            }
+        }
+
         debug!(
             "GetObject completed: key={} size={} duration={:?} buffer={}",
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
+
+        // Unregister from deadlock detector
+        deadlock_detector.unregister_request(&request_id);
 
         let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
