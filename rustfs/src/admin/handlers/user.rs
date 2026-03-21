@@ -45,7 +45,7 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::io::{Read as _, Write};
 use std::{collections::HashMap, io::Cursor, str::from_utf8};
-use tracing::warn;
+use tracing::{debug, warn};
 use zip::{ZipArchive, ZipWriter, result::ZipError, write::SimpleFileOptions};
 
 #[derive(Debug, Deserialize, Default)]
@@ -66,11 +66,50 @@ pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     Ok(())
 }
 
+/// Returns the IAM parent user identity for a temporary (Console/STS) session credential.
+///
+/// Prefers `parent_user` when non-empty; otherwise reads the JWT `parent` claim.
+/// Returns [`None`] when neither is available.
+fn temp_identity_parent(requester: &Credentials) -> Option<&str> {
+    if !requester.parent_user.is_empty() {
+        return Some(requester.parent_user.as_str());
+    }
+    requester
+        .claims
+        .as_ref()
+        .and_then(|c| c.get("parent"))
+        .and_then(|v| v.as_str())
+}
+
+/// How the IAM parent identity was resolved for logging (no JWT claim values).
+fn parent_identity_source(requester: &Credentials) -> &'static str {
+    if !requester.parent_user.is_empty() {
+        "parent_user_field"
+    } else if requester.claims.as_ref().and_then(|c| c.get("parent")).is_some() {
+        "jwt_parent"
+    } else {
+        "none"
+    }
+}
+
+/// Returns `true` when admin policy checks should use `deny_only` mode (only explicit **Deny** blocks;
+/// absence of **Allow** does not deny).
+///
+/// Eligible cases:
+/// - **Long-term credentials**: target is the requester's own `access_key` and there is no `parent_user`.
+/// - **Console/STS session (temp)**: target equals the IAM user this session represents, resolved via
+///   [`temp_identity_parent`] as `parent_user` when set, else the JWT claim `parent` (some stores
+///   persist only the token).
+///
+/// Service accounts always use full Allow/Deny evaluation.
 fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> bool {
-    target_access_key == requester.access_key
-        && requester.parent_user.is_empty()
-        && !requester.is_temp()
-        && !requester.is_service_account()
+    if requester.is_service_account() {
+        return false;
+    }
+    if requester.is_temp() {
+        return temp_identity_parent(requester).is_some_and(|p| p == target_access_key);
+    }
+    target_access_key == requester.access_key && requester.parent_user.is_empty()
 }
 
 fn should_reject_group_import_name(group_name: &str, group_lookup: &rustfs_iam::error::Error) -> bool {
@@ -159,6 +198,21 @@ impl Operation for AddUser {
         }
 
         let check_deny_only = should_check_deny_only(ak, &cred);
+
+        debug!(
+            target = "rustfs::admin::handlers::user",
+            operation = "AddUser",
+            query_access_key = %ak,
+            signer_access_key = %cred.access_key,
+            is_temp = cred.is_temp(),
+            is_service_account = cred.is_service_account(),
+            parent_user = %cred.parent_user,
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
+            check_deny_only,
+            is_owner = owner,
+            "authorization context before validate_admin_request (no secrets)"
+        );
 
         // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
@@ -419,6 +473,21 @@ impl Operation for GetUserInfo {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let check_deny_only = should_check_deny_only(ak, &cred);
+
+        debug!(
+            target = "rustfs::admin::handlers::user",
+            operation = "GetUserInfo",
+            query_access_key = %ak,
+            signer_access_key = %cred.access_key,
+            is_temp = cred.is_temp(),
+            is_service_account = cred.is_service_account(),
+            parent_user = %cred.parent_user,
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
+            check_deny_only,
+            is_owner = owner,
+            "authorization context before validate_admin_request (no secrets)"
+        );
 
         // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
@@ -1143,13 +1212,43 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_check_deny_only_for_temp_credentials() {
+    fn test_should_not_check_deny_only_for_temp_without_parent() {
+        // Session token present but no parent_user — not a well-formed self session for deny_only.
         let cred = Credentials {
             access_key: "alice".to_string(),
             session_token: "temp-token".to_string(),
             ..Default::default()
         };
         assert!(!should_check_deny_only("alice", &cred));
+    }
+
+    #[test]
+    fn test_should_check_deny_only_for_temp_when_target_matches_parent_user() {
+        // Console/AssumeRole: signing AK is a session key; IAM user is parent_user.
+        let cred = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "1923".to_string(),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("1923", &cred));
+        assert!(!should_check_deny_only("1924", &cred));
+        assert!(!should_check_deny_only("VV0V3VYJK2PV6EG45X2Y", &cred));
+    }
+
+    #[test]
+    fn test_should_check_deny_only_for_temp_when_parent_only_in_jwt_claims() {
+        // STS identity may omit `parentUser` on disk; `check_key_valid` still fills `claims["parent"]`.
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String("1923".to_string()));
+        let cred = Credentials {
+            access_key: "39KNO04Z34D6T4AGL6E6".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        assert!(should_check_deny_only("1923", &cred));
+        assert!(!should_check_deny_only("1924", &cred));
     }
 
     #[test]
