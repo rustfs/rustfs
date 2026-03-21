@@ -33,6 +33,7 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
+    versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
@@ -360,7 +361,14 @@ impl DefaultMultipartUsecase {
         let manager = get_concurrency_manager();
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
-        let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_mpu_version.clone()
+        } else if BucketVersioningSys::prefix_suspended(&bucket, &key).await {
+            Some("null".to_string())
+        } else {
+            None
+        };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
         tokio::spawn(async move {

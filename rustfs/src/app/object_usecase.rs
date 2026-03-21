@@ -688,9 +688,10 @@ impl DefaultObjectUsecase {
 
         Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
 
-        // Per S3 spec: only return VersionId when versioning is Enabled (not Suspended or default)
         let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_version
+        } else if BucketVersioningSys::prefix_suspended(&bucket, &key).await {
+            Some("null".to_string())
         } else {
             None
         };
