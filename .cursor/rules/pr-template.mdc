@@ -5,16 +5,19 @@ alwaysApply: true
 
 # Pull Request Template Requirements
 
-When creating a pull request (using `gh pr create`), you MUST strictly follow the PR template at `.github/pull_request_template.md`. Every section must be filled in — do NOT leave any section blank.
+When creating a pull request (using `gh pr create`), follow the body structure in [`.github/pull_request_template.md`](../../.github/pull_request_template.md). Repository workflow rules are in [`.github/AGENTS.md`](../../.github/AGENTS.md); treat those as authoritative for PR operations.
 
-## Required Sections
+- Keep **all section headings** from the template.
+- Fill in **applicable** sections with concrete content; for sections that do not apply, use `N/A` (see `.github/AGENTS.md`).
 
-1. **Type of Change**: Check exactly one box that matches the change type (Bug Fix, New Feature, etc.)
-2. **Related Issues**: Link related issue numbers (e.g., `Closes #123`)
-3. **Summary of Changes**: Write 2-5 sentences describing what changed and why
-4. **Checklist**: Check all items that apply; `make pre-commit` must always be checked
-5. **Impact**: Check applicable boxes; if none apply, leave all unchecked but add "No breaking changes" under Additional Notes
-6. **Additional Notes**: Add testing steps, deployment notes, or "N/A" if nothing extra
+## Sections (align with the template)
+
+1. **Type of Change**: Check the box(es) that match the change. Prefer a single primary category; if the PR mixes types, pick the dominant one or note the mix briefly in **Summary** or **Additional Notes** (team convention).
+2. **Related Issues**: Link related issue numbers (e.g., `Closes #123`).
+3. **Summary of Changes**: Describe what changed and why (typically a short paragraph).
+4. **Checklist**: Check all items that apply; `make pre-commit` must be checked when you are submitting the PR.
+5. **Impact**: Check applicable boxes. If nothing applies, you may leave them unchecked and state **no breaking changes** or `N/A` in **Additional Notes**, as appropriate.
+6. **Additional Notes**: Testing steps, deployment notes, or `N/A` when there is nothing extra.
 
 ## Example
 

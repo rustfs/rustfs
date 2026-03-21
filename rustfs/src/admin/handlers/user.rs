@@ -66,14 +66,10 @@ pub fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     Ok(())
 }
 
-/// Returns true when admin policy checks should use `deny_only` mode (only explicit Deny blocks).
+/// Returns the IAM parent user identity for a temporary (Console/STS) session credential.
 ///
-/// Eligible cases:
-/// - **Long-term credentials**: target is the requester's own `access_key` and there is no `parent_user`.
-/// - **Console/STS session (temp)**: target equals the IAM user this session represents, resolved as
-///   `parent_user` when set, else the JWT claim `parent` (some stores persist only the token).
-///
-/// Service accounts always use full Allow/Deny evaluation.
+/// Prefers `parent_user` when non-empty; otherwise reads the JWT `parent` claim.
+/// Returns [`None`] when neither is available.
 fn temp_identity_parent(requester: &Credentials) -> Option<&str> {
     if !requester.parent_user.is_empty() {
         return Some(requester.parent_user.as_str());
@@ -85,6 +81,16 @@ fn temp_identity_parent(requester: &Credentials) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// Returns `true` when admin policy checks should use `deny_only` mode (only explicit **Deny** blocks;
+/// absence of **Allow** does not deny).
+///
+/// Eligible cases:
+/// - **Long-term credentials**: target is the requester's own `access_key` and there is no `parent_user`.
+/// - **Console/STS session (temp)**: target equals the IAM user this session represents, resolved via
+///   [`temp_identity_parent`] as `parent_user` when set, else the JWT claim `parent` (some stores
+///   persist only the token).
+///
+/// Service accounts always use full Allow/Deny evaluation.
 fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> bool {
     if requester.is_service_account() {
         return false;
