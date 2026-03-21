@@ -14,6 +14,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -21,6 +22,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_credentials::Credentials;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -79,7 +81,7 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
     Ok(())
 }
 
-async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
+async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
@@ -88,7 +90,9 @@ async fn validate_replication_admin_request(req: &S3Request<Body>, action: Admin
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
+
+    Ok(cred)
 }
 
 #[allow(dead_code)]
@@ -156,7 +160,7 @@ pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let cred = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
 
         let queries = extract_query_params(&req.uri);
 
@@ -181,14 +185,14 @@ impl Operation for SetRemoteTargetHandler {
             .await
             .map_err(ApiError::from)?;
 
-        let mut input = req.input;
-        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "remote target configuration body too large or failed to read"));
-            }
-        };
+        let body =
+            match read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await {
+                Ok(body) => body,
+                Err(e) => {
+                    warn!("get body failed, e: {:?}", e);
+                    return Err(e);
+                }
+            };
 
         let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
             error!("Failed to parse BucketTarget from body: {}", e);
@@ -221,6 +225,8 @@ impl Operation for SetRemoteTargetHandler {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
                 warn!("return exists, arn: {}", arn_str);
+                // MinIO-compatible clients encrypt the request payload for this endpoint,
+                // but they parse the success response directly as plain JSON string ARN.
                 return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
             }
         }
@@ -276,6 +282,8 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
+        // MinIO-compatible clients encrypt the request payload for this endpoint,
+        // but they parse the success response directly as plain JSON string ARN.
         Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
     }
 }
@@ -342,7 +350,7 @@ pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let _ = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
 
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
