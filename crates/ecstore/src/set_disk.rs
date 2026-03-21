@@ -537,7 +537,7 @@ impl ObjectIO for SetDisks {
 
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
-            let acquire_start = std::time::Instant::now();
+            let acquire_start = Instant::now();
 
             // Record lock wait for deadlock detection
             if is_deadlock_detection_enabled() {
@@ -565,12 +565,8 @@ impl ObjectIO for SetDisks {
             let _lock_id = record_lock_acquire(bucket, object, "read");
 
             // Record lock statistics
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::{counter, histogram};
-                counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
-                histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
-            }
+            metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
+            metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
 
             Some(guard)
         } else {
@@ -629,11 +625,7 @@ impl ObjectIO for SetDisks {
                 record_lock_release(bucket, object, &lock_id, "read");
 
                 // Record early lock release statistics
-                #[cfg(feature = "metrics")]
-                {
-                    use metrics::counter;
-                    counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
-                }
+                metrics::counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
             }
             // Explicitly drop the lock guard to release the lock early
             drop(read_lock_guard);
@@ -885,7 +877,7 @@ impl ObjectIO for SetDisks {
             pfi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    pfi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
+                    pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
                 }
 
                 pfi.set_inline_data();
@@ -1227,7 +1219,7 @@ impl ObjectOperations for SetDisks {
         let mut unique_objects: HashSet<String> = HashSet::new();
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(rustfs_lock::ObjectKey::new(bucket, dobj.object_name.clone()));
+                batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
             }
         }
 
@@ -2891,8 +2883,7 @@ impl MultipartOperations for SetDisks {
         // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
         // This optimizes from O(n^2) to O(n) when processing many parts
         use std::collections::HashMap;
-        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
-            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+        let part_lookup: HashMap<usize, &ObjectPartInfo> = curr_fi.parts.iter().map(|part| (part.number, part)).collect();
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let Some(ext_part) = part_lookup.get(&p.part_num) else {
@@ -3579,12 +3570,11 @@ async fn disks_with_all_parts(
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
-                let checksum_algo =
-                    if meta.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                    } else {
-                        checksum_info.algorithm
-                    };
+                let checksum_algo = if meta.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+                    HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
                 let data_len = data.len();
                 let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
