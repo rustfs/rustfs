@@ -81,6 +81,17 @@ fn temp_identity_parent(requester: &Credentials) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// How the IAM parent identity was resolved for logging (no JWT claim values).
+fn parent_identity_source(requester: &Credentials) -> &'static str {
+    if !requester.parent_user.is_empty() {
+        "parent_user_field"
+    } else if requester.claims.as_ref().and_then(|c| c.get("parent")).is_some() {
+        "jwt_parent"
+    } else {
+        "none"
+    }
+}
+
 /// Returns `true` when admin policy checks should use `deny_only` mode (only explicit **Deny** blocks;
 /// absence of **Allow** does not deny).
 ///
@@ -196,8 +207,8 @@ impl Operation for AddUser {
             is_temp = cred.is_temp(),
             is_service_account = cred.is_service_account(),
             parent_user = %cred.parent_user,
-            parent_claim = ?cred.claims.as_ref().and_then(|c| c.get("parent")),
-            temp_identity_parent = ?temp_identity_parent(&cred),
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
             check_deny_only,
             is_owner = owner,
             "authorization context before validate_admin_request (no secrets)"
@@ -471,8 +482,8 @@ impl Operation for GetUserInfo {
             is_temp = cred.is_temp(),
             is_service_account = cred.is_service_account(),
             parent_user = %cred.parent_user,
-            parent_claim = ?cred.claims.as_ref().and_then(|c| c.get("parent")),
-            temp_identity_parent = ?temp_identity_parent(&cred),
+            parent_identity_source = %parent_identity_source(&cred),
+            jwt_parent_claim_present = cred.claims.as_ref().and_then(|c| c.get("parent")).is_some(),
             check_deny_only,
             is_owner = owner,
             "authorization context before validate_admin_request (no secrets)"
