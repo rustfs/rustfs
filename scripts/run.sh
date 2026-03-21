@@ -215,14 +215,98 @@ export RUSTFS_TRUST_SYSTEM_CA=true
 # export RUSTFS_FTPS_ADDRESS="0.0.0.0:8022"
 # export RUSTFS_FTPS_CERTS_DIR="${current_dir}/deploy/certs/ftps"
 
-# Use default timeout (60 seconds)
-# No environment variable needed
+# ============================================
+# Concurrent Request Optimization Configuration
+# ============================================
+# These settings optimize GetObject performance under high concurrency.
+# Most features are enabled by default with sensible values.
+# Uncomment and adjust based on your scenario.
 
-# Increase timeout for high-latency network storage
-#export RUSTFS_LOCK_ACQUIRE_TIMEOUT=120
+# --- Default Configuration (Recommended for most cases) ---
+# Request timeout: 30 seconds (prevents indefinite hangs)
+export RUSTFS_GET_OBJECT_TIMEOUT=30
+# Disk read timeout: 10 seconds
+export RUSTFS_DISK_READ_TIMEOUT=10
+# Lock acquire timeout: 5 seconds
+export RUSTFS_LOCK_ACQUIRE_TIMEOUT=5
+# Duplex buffer size: 4MB (4x larger than original 1MB)
+export RUSTFS_DUPLEX_BUFFER_SIZE=4194304
+# I/O buffer size: 128KB
+export RUSTFS_IO_BUFFER_SIZE=131072
+# Max concurrent disk reads: 64
+export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
+# Lock optimization: release read lock after metadata read
+export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# Priority scheduling: small requests get higher priority
+export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# Deadlock detection: disabled by default (has performance overhead)
+# export RUSTFS_ENABLE_DEADLOCK_DETECTION=false
 
-# Reduce timeout for low-latency local storage
-export RUSTFS_LOCK_ACQUIRE_TIMEOUT=30
+# --- Scenario 1: Home NAS / Small Storage Server ---
+# Hardware: 4-8 cores, 8-16GB RAM, 1-4 HDDs, 1Gbps network
+# Typical concurrency: 5-20 requests
+# export RUSTFS_GET_OBJECT_TIMEOUT=30
+# export RUSTFS_DUPLEX_BUFFER_SIZE=4194304
+# export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
+# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+
+# --- Scenario 2: Medium Enterprise Storage ---
+# Hardware: 8-16 cores, 32-64GB RAM, 4-12 HDDs/SSDs, 10Gbps network
+# Typical concurrency: 20-100 requests
+# export RUSTFS_GET_OBJECT_TIMEOUT=60
+# export RUSTFS_DUPLEX_BUFFER_SIZE=8388608
+# export RUSTFS_IO_BUFFER_SIZE=262144
+# export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=128
+# export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=16
+# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+
+# --- Scenario 3: Large Enterprise / Cloud Storage ---
+# Hardware: 32+ cores, 128+GB RAM, NVMe SSD array, 25-100Gbps network
+# Typical concurrency: 100-1000 requests
+# export RUSTFS_GET_OBJECT_TIMEOUT=120
+# export RUSTFS_DUPLEX_BUFFER_SIZE=16777216
+# export RUSTFS_IO_BUFFER_SIZE=524288
+# export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=256
+# export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=32
+# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+
+# --- Scenario 4: Kopia Backup Optimized ---
+# Problem: Kopia sends 20-30 concurrent range requests for 20-26MB objects
+# Solution: Larger buffer, lock optimization, priority scheduling
+# export RUSTFS_GET_OBJECT_TIMEOUT=45
+# export RUSTFS_DUPLEX_BUFFER_SIZE=8388608
+# export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
+# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_ENABLE_DEADLOCK_DETECTION=true  # Enable for debugging
+
+# --- Scenario 5: Low Power / Embedded Storage ---
+# Hardware: 2-4 cores (ARM/x86), 2-4GB RAM, SD card/eMMC, 100Mbps-1Gbps
+# Typical concurrency: 1-5 requests
+# export RUSTFS_GET_OBJECT_TIMEOUT=60
+# export RUSTFS_DISK_READ_TIMEOUT=20
+# export RUSTFS_DUPLEX_BUFFER_SIZE=2097152
+# export RUSTFS_IO_BUFFER_SIZE=65536
+# export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=16
+# export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=4
+# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+
+# --- Scenario 6: Debugging / Troubleshooting ---
+# Enable all diagnostic features
+# export RUSTFS_GET_OBJECT_TIMEOUT=15
+# export RUSTFS_ENABLE_DEADLOCK_DETECTION=true
+# export RUSTFS_DEADLOCK_CHECK_INTERVAL=3
+# export RUSTFS_DEADLOCK_HANG_THRESHOLD=5
+
+# --- Backpressure Configuration ---
+# High watermark: trigger backpressure when buffer usage exceeds this percentage
+export RUSTFS_BACKPRESSURE_HIGH_WATERMARK=80
+# Low watermark: release backpressure when buffer usage drops below this percentage
+export RUSTFS_BACKPRESSURE_LOW_WATERMARK=50
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"

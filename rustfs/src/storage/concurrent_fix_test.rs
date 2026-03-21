@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_request_resource_tracker() {
-        let tracker = RequestResourceTracker::new("req-1", "GetObject bucket/key");
+        let tracker = RequestResourceTracker::new("req-1".to_string(), "GetObject bucket/key");
         assert!(tracker.elapsed() < Duration::from_secs(1));
         assert!(!tracker.is_hung(Duration::from_secs(10)));
     }

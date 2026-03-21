@@ -148,7 +148,20 @@ mod write;
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
 pub fn get_lock_acquire_timeout() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_LOCK_ACQUIRE_TIMEOUT,
+        rustfs_config::DEFAULT_LOCK_ACQUIRE_TIMEOUT,
+    ))
+}
+
+/// Check if lock optimization is enabled.
+/// When enabled, read locks are released after metadata read instead of
+/// being held for the entire data transfer duration.
+pub fn is_lock_optimization_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
+    )
 }
 
 fn build_tiered_decommission_file_info(
@@ -463,6 +476,10 @@ impl ObjectIO for SetDisks {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        // Check if lock optimization is enabled
+        // When enabled, read locks are released after metadata read
+        let lock_optimization_enabled = is_lock_optimization_enabled();
+
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
             Some(
@@ -524,6 +541,17 @@ impl ObjectIO for SetDisks {
             return Ok(gr);
         }
 
+        // Lock optimization: release read lock after metadata read if enabled
+        // This reduces lock contention by not holding the lock during data transfer
+        let read_lock_guard = if lock_optimization_enabled {
+            // Explicitly drop the lock guard to release the lock early
+            drop(read_lock_guard);
+            debug!(bucket, object, "Lock optimization: released read lock after metadata read");
+            None
+        } else {
+            read_lock_guard
+        };
+
         let duplex_buffer_size = get_duplex_buffer_size();
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
@@ -537,9 +565,10 @@ impl ObjectIO for SetDisks {
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
         // Move the read-lock guard into the task so it lives for the duration of the read
+        // Note: when lock optimization is enabled, read_lock_guard is None
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
-            let _guard = read_lock_guard; // keep guard alive until task ends
+            let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,

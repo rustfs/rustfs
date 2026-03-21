@@ -185,6 +185,7 @@ impl std::fmt::Display for IoPriority {
 
 /// I/O scheduler configuration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct IoSchedulerConfig {
     /// Maximum concurrent disk reads.
     pub max_concurrent_reads: usize,
@@ -196,11 +197,12 @@ impl Default for IoSchedulerConfig {
     fn default() -> Self {
         Self {
             max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-            enable_priority: rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+            enable_priority: rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
         }
     }
 }
 
+#[allow(dead_code)]
 impl IoSchedulerConfig {
     /// Load configuration from environment.
     pub fn from_env() -> Self {
@@ -210,8 +212,8 @@ impl IoSchedulerConfig {
                 rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
             ),
             enable_priority: rustfs_utils::get_env_bool(
-                rustfs_config::ENV_ENABLE_PRIORITY_SCHEDULING,
-                rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+                rustfs_config::ENV_PRIORITY_SCHEDULING_ENABLE,
+                rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
             ),
         }
     }
@@ -219,6 +221,7 @@ impl IoSchedulerConfig {
 
 /// I/O queue status for monitoring.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct IoQueueStatus {
     /// Total permits available.
     pub total_permits: usize,
@@ -1389,6 +1392,7 @@ impl std::fmt::Debug for ConcurrencyManager {
     }
 }
 
+#[allow(dead_code)]
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
@@ -1810,8 +1814,8 @@ impl ConcurrencyManager {
     /// Check if priority scheduling is enabled.
     pub fn is_priority_scheduling_enabled(&self) -> bool {
         rustfs_utils::get_env_bool(
-            rustfs_config::ENV_ENABLE_PRIORITY_SCHEDULING,
-            rustfs_config::DEFAULT_ENABLE_PRIORITY_SCHEDULING,
+            rustfs_config::ENV_PRIORITY_SCHEDULING_ENABLE,
+            rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
         )
     }
 

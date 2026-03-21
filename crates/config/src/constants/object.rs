@@ -248,11 +248,11 @@ pub const DEFAULT_IO_BUFFER_SIZE: usize = 128 * 1024;
 /// is read, rather than being held for the entire data transfer.
 /// This significantly reduces lock contention under high concurrency.
 ///
-/// Default: true (enabled, can be overridden by `RUSTFS_ENABLE_LOCK_OPTIMIZATION`).
-pub const ENV_ENABLE_LOCK_OPTIMIZATION: &str = "RUSTFS_ENABLE_LOCK_OPTIMIZATION";
+/// Default: true (enabled, can be overridden by `RUSTFS_LOCK_OPTIMIZATION_ENABLE`).
+pub const ENV_LOCK_OPTIMIZATION_ENABLE: &str = "RUSTFS_LOCK_OPTIMIZATION_ENABLE";
 
 /// Default: lock optimization is enabled.
-pub const DEFAULT_ENABLE_LOCK_OPTIMIZATION: bool = true;
+pub const DEFAULT_LOCK_OPTIMIZATION_ENABLE: bool = true;
 
 /// Environment variable to enable/disable priority-based I/O scheduling.
 ///
@@ -260,11 +260,11 @@ pub const DEFAULT_ENABLE_LOCK_OPTIMIZATION: bool = true;
 /// than larger requests (> 10MB), preventing "starvation" of small
 /// requests by large ones.
 ///
-/// Default: true (enabled, can be overridden by `RUSTFS_ENABLE_PRIORITY_SCHEDULING`).
-pub const ENV_ENABLE_PRIORITY_SCHEDULING: &str = "RUSTFS_ENABLE_PRIORITY_SCHEDULING";
+/// Default: true (enabled, can be overridden by `RUSTFS_PRIORITY_SCHEDULING_ENABLE`).
+pub const ENV_PRIORITY_SCHEDULING_ENABLE: &str = "RUSTFS_PRIORITY_SCHEDULING_ENABLE";
 
 /// Default: priority scheduling is enabled.
-pub const DEFAULT_ENABLE_PRIORITY_SCHEDULING: bool = true;
+pub const DEFAULT_PRIORITY_SCHEDULING_ENABLE: bool = true;
 
 /// Environment variable to enable/disable deadlock detection.
 ///

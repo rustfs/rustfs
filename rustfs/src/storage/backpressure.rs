@@ -39,7 +39,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, duplex};
+use tokio::io::{DuplexStream, duplex};
 use tracing::{debug, warn};
 
 #[cfg(feature = "metrics")]
@@ -123,6 +123,7 @@ impl std::fmt::Display for BackpressureState {
 
 /// Backpressure event for monitoring.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BackpressureEvent {
     /// Event timestamp.
     pub timestamp: Instant,
@@ -138,6 +139,7 @@ pub struct BackpressureEvent {
 
 /// Backpressure event type.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum BackpressureEventType {
     /// Entered high watermark state.
     HighWatermarkReached,
@@ -151,6 +153,7 @@ pub enum BackpressureEventType {
 
 /// Snapshot of backpressure state.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BackpressureSnapshot {
     /// Buffer capacity in bytes.
     pub buffer_capacity: usize,
@@ -183,6 +186,7 @@ pub struct BackpressurePipe {
     total_read: Arc<AtomicUsize>,
 }
 
+#[allow(dead_code)]
 impl BackpressurePipe {
     /// Create a new backpressure-aware pipe with default configuration.
     pub fn new() -> Self {
@@ -345,6 +349,7 @@ pub struct BackpressureMonitor {
     in_high_watermark: Arc<AtomicBool>,
 }
 
+#[allow(dead_code)]
 impl BackpressureMonitor {
     /// Create a new monitor with default configuration.
     pub fn new() -> Self {

@@ -36,9 +36,9 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[cfg(feature = "metrics")]
 use metrics::histogram;
@@ -57,7 +57,7 @@ pub struct LockOptimizeConfig {
 impl Default for LockOptimizeConfig {
     fn default() -> Self {
         Self {
-            enabled: rustfs_config::DEFAULT_ENABLE_LOCK_OPTIMIZATION,
+            enabled: rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
             acquire_timeout: Duration::from_secs(rustfs_config::DEFAULT_LOCK_ACQUIRE_TIMEOUT),
         }
     }
@@ -67,8 +67,8 @@ impl LockOptimizeConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_ENABLE_LOCK_OPTIMIZATION,
-            rustfs_config::DEFAULT_ENABLE_LOCK_OPTIMIZATION,
+            rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
+            rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
         );
         let acquire_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
             rustfs_config::ENV_LOCK_ACQUIRE_TIMEOUT,
@@ -95,6 +95,7 @@ pub struct LockStats {
     pub max_hold_time_us: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl LockStats {
     /// Create new lock statistics.
     pub fn new() -> Self {
@@ -174,6 +175,7 @@ pub struct OptimizedLockGuard<G> {
     stats: Arc<LockStats>,
 }
 
+#[allow(dead_code)]
 impl<G> OptimizedLockGuard<G> {
     /// Create a new optimized lock guard.
     pub fn new(guard: G, resource: impl Into<String>) -> Self {
@@ -259,6 +261,7 @@ pub struct LockScopeGuard<G> {
     guard: Option<G>,
 }
 
+#[allow(dead_code)]
 impl<G> LockScopeGuard<G> {
     /// Create a new scope guard.
     pub fn new(guard: G) -> Self {
@@ -284,11 +287,13 @@ impl<G> Drop for LockScopeGuard<G> {
 /// 2. Read metadata
 /// 3. Release lock (if optimization enabled)
 /// 4. Transfer data (without lock)
+#[allow(dead_code)]
 pub struct LockOptimizer {
     /// Configuration.
     config: LockOptimizeConfig,
 }
 
+#[allow(dead_code)]
 impl LockOptimizer {
     /// Create a new lock optimizer with default configuration.
     pub fn new() -> Self {
@@ -366,10 +371,11 @@ impl Default for LockOptimizer {
 }
 
 /// Check if lock optimization is enabled globally.
+#[allow(dead_code)]
 pub fn is_lock_optimization_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_ENABLE_LOCK_OPTIMIZATION,
-        rustfs_config::DEFAULT_ENABLE_LOCK_OPTIMIZATION,
+        rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
     )
 }
 
