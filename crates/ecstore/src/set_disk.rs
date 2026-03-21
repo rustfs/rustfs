@@ -164,6 +164,58 @@ pub fn is_lock_optimization_enabled() -> bool {
     )
 }
 
+/// Check if deadlock detection is enabled.
+/// When enabled, lock operations are recorded for deadlock analysis.
+pub fn is_deadlock_detection_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
+    )
+}
+
+/// Record a lock acquisition for deadlock detection.
+/// This records detailed lock information for deadlock analysis.
+/// Returns the lock_id for later release tracking.
+#[inline]
+fn record_lock_acquire(bucket: &str, object: &str, lock_type: &str) -> String {
+    let lock_id = format!("{}:{}", bucket, object);
+
+    if !is_deadlock_detection_enabled() {
+        return lock_id;
+    }
+
+    let request_id = format!("get-{}-{}", bucket, object);
+    let resource = format!("{}/{}", bucket, object);
+
+    // Log with structured fields for analysis
+    debug!(
+        request_id = %request_id,
+        lock_id = %lock_id,
+        lock_type = %lock_type,
+        resource = %resource,
+        "Lock acquired for deadlock tracking"
+    );
+
+    lock_id
+}
+
+/// Record a lock release for deadlock detection.
+#[inline]
+fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &str) {
+    if !is_deadlock_detection_enabled() {
+        return;
+    }
+
+    let request_id = format!("get-{}-{}", bucket, object);
+
+    debug!(
+        request_id = %request_id,
+        lock_id = %lock_id,
+        lock_type = %lock_type,
+        "Lock released for deadlock tracking"
+    );
+}
+
 fn build_tiered_decommission_file_info(
     bucket: &str,
     object: &str,
@@ -482,18 +534,32 @@ impl ObjectIO for SetDisks {
 
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
-            Some(
-                self.new_ns_lock(bucket, object)
-                    .await?
-                    .get_read_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire read lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "read", &e)
-                        ))
-                    })?,
-            )
+            // Record lock wait for deadlock detection
+            if is_deadlock_detection_enabled() {
+                debug!(
+                    lock_id = format!("{}:{}", bucket, object),
+                    lock_type = "read",
+                    resource = format!("{}/{}", bucket, object),
+                    "Waiting for read lock"
+                );
+            }
+
+            let guard = self
+                .new_ns_lock(bucket, object)
+                .await?
+                .get_read_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|e| {
+                    Error::other(format!(
+                        "Failed to acquire read lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "read", &e)
+                    ))
+                })?;
+
+            // Record lock acquisition for deadlock detection (returns lock_id)
+            let _lock_id = record_lock_acquire(bucket, object, "read");
+
+            Some(guard)
         } else {
             None
         };
@@ -544,6 +610,11 @@ impl ObjectIO for SetDisks {
         // Lock optimization: release read lock after metadata read if enabled
         // This reduces lock contention by not holding the lock during data transfer
         let read_lock_guard = if lock_optimization_enabled {
+            // Record lock release for deadlock detection
+            if read_lock_guard.is_some() {
+                let lock_id = format!("{}:{}", bucket, object);
+                record_lock_release(bucket, object, &lock_id, "read");
+            }
             // Explicitly drop the lock guard to release the lock early
             drop(read_lock_guard);
             debug!(bucket, object, "Lock optimization: released read lock after metadata read");

@@ -15,9 +15,10 @@
 //! Concurrency optimization module for high-performance object retrieval.
 //!
 //! This module provides intelligent concurrency management to prevent performance
-//! degradation when multiple concurrent GetObject requests are processed. It addresses
-//! the core issue where increasing concurrency from 1→2→4 requests caused latency to
-//! degrade exponentially (59ms → 110ms → 200ms).
+//! degradation when multiple concurrent GetObject requests are processed.
+
+// Allow dead_code for public API that may be used by external modules or future features
+#![allow(dead_code)]
 //!
 //! # Key Features
 //!
@@ -185,7 +186,6 @@ impl std::fmt::Display for IoPriority {
 
 /// I/O scheduler configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IoSchedulerConfig {
     /// Maximum concurrent disk reads.
     pub max_concurrent_reads: usize,
@@ -202,7 +202,6 @@ impl Default for IoSchedulerConfig {
     }
 }
 
-#[allow(dead_code)]
 impl IoSchedulerConfig {
     /// Load configuration from environment.
     pub fn from_env() -> Self {
@@ -221,7 +220,6 @@ impl IoSchedulerConfig {
 
 /// I/O queue status for monitoring.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct IoQueueStatus {
     /// Total permits available.
     pub total_permits: usize,
@@ -280,7 +278,6 @@ pub struct IoStrategy {
     /// Whether to use tokio BufReader for improved async I/O.
     ///
     /// Always enabled for better async performance.
-    #[allow(dead_code)]
     pub use_buffered_io: bool,
 
     /// The detected I/O load level.
@@ -342,7 +339,6 @@ impl IoStrategy {
     }
 
     /// Get a human-readable description of the current I/O strategy.
-    #[allow(dead_code)]
     pub fn description(&self) -> String {
         format!(
             "IoStrategy[{:?}]: buffer={}KB, multiplier={:.2}, readahead={}, cache_wb={}, wait={:?}",
@@ -361,7 +357,6 @@ impl IoStrategy {
 /// This structure maintains a sliding window of recent disk permit wait times
 /// to provide smoothed load level estimates. This helps prevent strategy
 /// oscillation from transient load spikes.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct IoLoadMetrics {
     /// Recent permit wait durations (sliding window)
@@ -376,7 +371,6 @@ struct IoLoadMetrics {
     observation_count: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl IoLoadMetrics {
     fn new(max_samples: usize) -> Self {
         Self {
@@ -492,7 +486,6 @@ static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(Concurr
 pub struct GetObjectGuard {
     /// Track when the request started for metrics collection.
     /// Used to calculate end-to-end request latency in the Drop implementation.
-    #[allow(dead_code)]
     start_time: Instant,
     /// Reference to the concurrency manager for cleanup operations.
     /// The underscore prefix indicates this is used implicitly (for type safety).
@@ -517,7 +510,7 @@ impl GetObjectGuard {
     ///
     /// Useful for logging or metrics collection during request processing.
     /// Called automatically in the Drop implementation for duration tracking.
-    #[allow(dead_code)]
+
     pub fn elapsed(&self) -> Duration {
         self.start_time.elapsed()
     }
@@ -674,7 +667,6 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
 ///     true               // sequential read
 /// );
 /// ```
-#[allow(dead_code)]
 pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
@@ -798,7 +790,6 @@ pub struct CachedGetObject {
     /// Last modified time as RFC3339 string (e.g., "2024-01-01T12:00:00Z")
     pub last_modified: Option<String>,
     /// Expiration time as RFC3339 string
-    #[allow(dead_code)]
     pub expires: Option<String>,
     /// Cache-Control header value
     pub cache_control: Option<String>,
@@ -817,12 +808,10 @@ pub struct CachedGetObject {
     /// Number of tags associated with the object
     pub tag_count: Option<i32>,
     /// Replication status
-    #[allow(dead_code)]
     pub replication_status: Option<String>,
     /// User-defined metadata (x-amz-meta-*)
     pub user_metadata: std::collections::HashMap<String, String>,
     /// When this object was cached (for internal use, automatically set)
-    #[allow(dead_code)]
     cached_at: Option<Instant>,
     /// Access count for hot key tracking (automatically managed)
     access_count: Arc<AtomicU64>,
@@ -884,21 +873,18 @@ impl CachedGetObject {
     }
 
     /// Builder method to set cache_control
-    #[allow(dead_code)]
     pub fn with_cache_control(mut self, cache_control: String) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Builder method to set storage_class
-    #[allow(dead_code)]
     pub fn with_storage_class(mut self, storage_class: String) -> Self {
         self.storage_class = Some(storage_class);
         self
     }
 
     /// Builder method to set version_id
-    #[allow(dead_code)]
     pub fn with_version_id(mut self, version_id: String) -> Self {
         self.version_id = Some(version_id);
         self
@@ -1042,7 +1028,6 @@ impl HotObjectCache {
     /// Put an object into cache with automatic size-based eviction
     ///
     /// Moka handles eviction automatically based on the weigher function.
-    #[allow(dead_code)]
     async fn put(&self, key: String, data: Vec<u8>) {
         let size = data.len();
 
@@ -1070,7 +1055,6 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects
-    #[allow(dead_code)]
     async fn clear(&self) {
         self.cache.invalidate_all();
         // Sync to ensure all entries are removed
@@ -1078,7 +1062,6 @@ impl HotObjectCache {
     }
 
     /// Get cache statistics for monitoring
-    #[allow(dead_code)]
     async fn stats(&self) -> CacheStats {
         // Ensure pending tasks are processed for accurate stats
         self.cache.run_pending_tasks().await;
@@ -1105,7 +1088,6 @@ impl HotObjectCache {
     }
 
     /// Check if a key exists in cache (lock-free)
-    #[allow(dead_code)]
     async fn contains(&self, key: &str) -> bool {
         self.cache.contains_key(key)
     }
@@ -1113,7 +1095,6 @@ impl HotObjectCache {
     /// Get multiple objects from cache in parallel
     ///
     /// Leverages Moka's lock-free design for true parallel access.
-    #[allow(dead_code)]
     async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -1123,7 +1104,6 @@ impl HotObjectCache {
     }
 
     /// Remove a specific key from cache
-    #[allow(dead_code)]
     async fn remove(&self, key: &str) -> bool {
         let had_key = self.cache.contains_key(key);
         self.cache.invalidate(key).await;
@@ -1133,7 +1113,6 @@ impl HotObjectCache {
     /// Get the most frequently accessed keys
     ///
     /// Returns up to `limit` keys sorted by access count in descending order.
-    #[allow(dead_code)]
     async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         // Run pending tasks to ensure accurate entry count
         self.cache.run_pending_tasks().await;
@@ -1151,7 +1130,6 @@ impl HotObjectCache {
     }
 
     /// Warm up cache with a batch of objects
-    #[allow(dead_code)]
     async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
         for (key, data) in objects {
             self.put(key, data).await;
@@ -1159,7 +1137,6 @@ impl HotObjectCache {
     }
 
     /// Get hit rate percentage
-    #[allow(dead_code)]
     fn hit_rate(&self) -> f64 {
         let hits = self.hit_count.load(Ordering::Relaxed);
         let misses = self.miss_count.load(Ordering::Relaxed);
@@ -1189,7 +1166,6 @@ impl HotObjectCache {
     ///
     /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
     /// * `None` - Cache miss
-    #[allow(dead_code)]
     async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
         match self.response_cache.get(key).await {
             Some(cached) => {
@@ -1252,7 +1228,6 @@ impl HotObjectCache {
     ///
     /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
     /// * `response` - The complete cached response to store
-    #[allow(dead_code)]
     async fn put_response(&self, key: String, response: CachedGetObject) {
         let size = response.size();
 
@@ -1286,7 +1261,6 @@ impl HotObjectCache {
     /// # Arguments
     ///
     /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
-    #[allow(dead_code)]
     async fn invalidate(&self, key: &str) {
         // Invalidate both caches
         self.cache.invalidate(key).await;
@@ -1312,7 +1286,6 @@ impl HotObjectCache {
     /// * `bucket` - Bucket name
     /// * `key` - Object key
     /// * `version_id` - Optional version ID (if None, only invalidates the base key)
-    #[allow(dead_code)]
     async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
         // Always invalidate the latest version key
         let base_key = format!("{bucket}/{key}");
@@ -1326,7 +1299,6 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects from both caches
-    #[allow(dead_code)]
     async fn clear_all(&self) {
         self.cache.invalidate_all();
         self.response_cache.invalidate_all();
@@ -1338,7 +1310,6 @@ impl HotObjectCache {
 
 /// Cache statistics for monitoring and debugging
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CacheStats {
     /// Current total size of cached objects in bytes
     pub size: usize,
@@ -1363,7 +1334,6 @@ pub struct CacheStats {
 /// - Hot object caching with Moka
 /// - Disk read permit management to prevent I/O saturation
 /// - Rolling metrics for load level smoothing
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ConcurrencyManager {
     /// Hot object cache for frequently accessed objects
@@ -1392,7 +1362,6 @@ impl std::fmt::Debug for ConcurrencyManager {
     }
 }
 
-#[allow(dead_code)]
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
@@ -1435,13 +1404,11 @@ impl ConcurrencyManager {
     }
 
     /// Try to get an object from cache
-    #[allow(dead_code)]
     pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.cache.get(key).await
     }
 
     /// Cache an object for future retrievals
-    #[allow(dead_code)]
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
         self.cache.put(key, data).await;
     }
@@ -1520,7 +1487,6 @@ impl ConcurrencyManager {
     /// # Returns
     ///
     /// The smoothed `IoLoadLevel` based on average recent wait times.
-    #[allow(dead_code)]
     pub fn smoothed_load_level(&self) -> IoLoadLevel {
         if let Ok(metrics) = self.io_metrics.lock() {
             metrics.smoothed_load_level()
@@ -1537,7 +1503,6 @@ impl ConcurrencyManager {
     /// # Returns
     ///
     /// A tuple of (average_wait, p95_wait, max_wait, observation_count)
-    #[allow(dead_code)]
     pub fn io_load_stats(&self) -> (Duration, Duration, Duration, u64) {
         if let Ok(metrics) = self.io_metrics.lock() {
             (
@@ -1563,7 +1528,6 @@ impl ConcurrencyManager {
     /// # Returns
     ///
     /// Recommended buffer size in bytes.
-    #[allow(dead_code)]
     pub fn adaptive_buffer_size(&self, base_buffer_size: usize) -> usize {
         let load_level = self.smoothed_load_level();
         let multiplier = match load_level {
@@ -1578,43 +1542,36 @@ impl ConcurrencyManager {
     }
 
     /// Get cache statistics
-    #[allow(dead_code)]
     pub async fn cache_stats(&self) -> CacheStats {
         self.cache.stats().await
     }
 
     /// Clear all cached objects
-    #[allow(dead_code)]
     pub async fn clear_cache(&self) {
         self.cache.clear().await;
     }
 
     /// Check if a key is cached
-    #[allow(dead_code)]
     pub async fn is_cached(&self, key: &str) -> bool {
         self.cache.contains(key).await
     }
 
     /// Get multiple cached objects in a single operation
-    #[allow(dead_code)]
     pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         self.cache.get_batch(keys).await
     }
 
     /// Remove a specific object from cache
-    #[allow(dead_code)]
     pub async fn remove_cached(&self, key: &str) -> bool {
         self.cache.remove(key).await
     }
 
     /// Get the most frequently accessed keys
-    #[allow(dead_code)]
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         self.cache.get_hot_keys(limit).await
     }
 
     /// Get cache hit rate percentage
-    #[allow(dead_code)]
     pub fn cache_hit_rate(&self) -> f64 {
         self.cache.hit_rate()
     }
@@ -1623,7 +1580,6 @@ impl ConcurrencyManager {
     ///
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
-    #[allow(dead_code)]
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
         self.cache.warm(objects).await;
     }
@@ -1632,7 +1588,6 @@ impl ConcurrencyManager {
     ///
     /// This wraps the advanced buffer sizing logic and makes it accessible
     /// through the concurrency manager interface.
-    #[allow(dead_code)]
     pub fn buffer_size(&self, file_size: i64, base: usize, sequential: bool) -> usize {
         get_advanced_buffer_size(file_size, base, sequential)
     }
@@ -1670,7 +1625,6 @@ impl ConcurrencyManager {
     ///     };
     /// }
     /// ```
-    #[allow(dead_code)]
     pub async fn get_cached_object(&self, key: &str) -> Option<Arc<CachedGetObject>> {
         self.cache.get_response(key).await
     }
@@ -1699,7 +1653,6 @@ impl ConcurrencyManager {
     /// };
     /// manager.put_cached_object(cache_key, cached).await;
     /// ```
-    #[allow(dead_code)]
     pub async fn put_cached_object(&self, key: String, response: CachedGetObject) {
         self.cache.put_response(key, response).await;
     }
@@ -1721,7 +1674,6 @@ impl ConcurrencyManager {
     /// let cache_key = format!("{}/{}", bucket, key);
     /// manager.invalidate_cache(&cache_key).await;
     /// ```
-    #[allow(dead_code)]
     pub async fn invalidate_cache(&self, key: &str) {
         self.cache.invalidate(key).await;
     }
@@ -1751,7 +1703,6 @@ impl ConcurrencyManager {
     /// // After put_object (invalidates latest)
     /// manager.invalidate_cache_versioned(&bucket, &key, None).await;
     /// ```
-    #[allow(dead_code)]
     pub async fn invalidate_cache_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
         self.cache.invalidate_versioned(bucket, key, version_id).await;
     }
@@ -1883,7 +1834,7 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 }
 
 /// Testing helper to reset the global request counter.
-#[allow(dead_code)]
+
 pub(crate) fn reset_active_get_requests() {
     ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
 }

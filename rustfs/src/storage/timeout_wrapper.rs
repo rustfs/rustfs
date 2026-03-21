@@ -16,8 +16,9 @@
 //!
 //! This module provides timeout protection for GetObject requests to prevent
 //! indefinite hangs caused by deadlocks, resource exhaustion, or slow I/O.
-//!
-//! # Key Features
+
+// Allow dead_code for public API that may be used by external modules or future features
+#![allow(dead_code)]
 //!
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
@@ -51,7 +52,6 @@ use metrics::{counter, histogram};
 
 /// Timeout configuration for GetObject requests.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TimeoutConfig {
     /// GetObject request overall timeout (default 30s).
     /// After this duration, the request is cancelled and returns 504.
@@ -101,7 +101,6 @@ impl TimeoutConfig {
 
 /// Information about a timeout event.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TimeoutInfo {
     /// Request ID for correlation.
     pub request_id: String,
@@ -125,7 +124,6 @@ pub struct TimeoutInfo {
 
 /// Result of a timed GetObject operation.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum TimedGetObjectResult<T, E> {
     /// Operation completed successfully within timeout.
     Success(T),
@@ -137,7 +135,6 @@ pub enum TimedGetObjectResult<T, E> {
 
 /// Request timeout wrapper for async operations.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct RequestTimeoutWrapper {
     /// Configuration.
     config: TimeoutConfig,
@@ -151,7 +148,6 @@ pub struct RequestTimeoutWrapper {
 
 impl RequestTimeoutWrapper {
     /// Create a new timeout wrapper with the given configuration.
-    #[allow(dead_code)]
     pub fn new(config: TimeoutConfig) -> Self {
         Self {
             config,
@@ -162,7 +158,6 @@ impl RequestTimeoutWrapper {
     }
 
     /// Create a new timeout wrapper with a specific request ID.
-    #[allow(dead_code)]
     pub fn with_request_id(config: TimeoutConfig, request_id: impl Into<String>) -> Self {
         Self {
             config,
@@ -173,39 +168,33 @@ impl RequestTimeoutWrapper {
     }
 
     /// Get the request ID.
-    #[allow(dead_code)]
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
 
     /// Get the cancellation token.
     /// This can be cloned and passed to sub-tasks for cooperative cancellation.
-    #[allow(dead_code)]
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
 
     /// Check if the operation has been cancelled.
-    #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
 
     /// Check if the timeout has been exceeded.
-    #[allow(dead_code)]
     pub fn is_timeout(&self) -> bool {
         self.config.is_timeout_enabled() && self.elapsed() >= self.config.get_object_timeout
     }
 
     /// Get elapsed time since the request started.
-    #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {
         self.start_time.elapsed()
     }
 
     /// Get remaining time before timeout.
     /// Returns None if timeout is disabled or already exceeded.
-    #[allow(dead_code)]
     pub fn remaining_time(&self) -> Option<Duration> {
         if !self.config.is_timeout_enabled() {
             return None;
@@ -226,7 +215,6 @@ impl RequestTimeoutWrapper {
     /// - `TimedGetObjectResult::Success(T)` if the operation completed within timeout
     /// - `TimedGetObjectResult::Timeout(TimeoutInfo)` if the operation timed out
     /// - `TimedGetObjectResult::Error(E)` if the operation failed
-    #[allow(dead_code)]
     pub async fn execute_with_timeout<F, Fut, T, E>(self, operation: F) -> TimedGetObjectResult<T, E>
     where
         F: FnOnce(CancellationToken) -> Fut,
@@ -337,7 +325,6 @@ impl RequestTimeoutWrapper {
     ///
     /// This is an extended version of `execute_with_timeout` that includes
     /// bucket and key information for better timeout logging.
-    #[allow(dead_code)]
     pub async fn execute_with_timeout_and_context<F, Fut, T, E>(
         self,
         bucket: impl Into<String>,
@@ -457,13 +444,11 @@ impl RequestTimeoutWrapper {
 }
 
 /// Get the duplex buffer size from environment or default.
-#[allow(dead_code)]
 pub fn get_duplex_buffer_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_DUPLEX_BUFFER_SIZE)
 }
 
 /// Get the I/O buffer size from environment or default.
-#[allow(dead_code)]
 pub fn get_io_buffer_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_IO_BUFFER_SIZE, rustfs_config::DEFAULT_IO_BUFFER_SIZE)
 }

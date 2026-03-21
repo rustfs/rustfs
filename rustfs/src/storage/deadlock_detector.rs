@@ -43,6 +43,9 @@
 //! detector.unregister_request(request_id);
 //! ```
 
+// Allow dead_code for public API that may be used by external modules or future features
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -61,7 +64,6 @@ pub type LockId = String;
 
 /// Deadlock detector configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DeadlockDetectorConfig {
     /// Whether deadlock detection is enabled.
     pub enabled: bool,
@@ -111,7 +113,6 @@ impl DeadlockDetectorConfig {
 
 /// Lock information for tracking.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct LockInfo {
     /// Lock identifier.
     pub id: LockId,
@@ -125,7 +126,6 @@ pub struct LockInfo {
 
 /// Lock type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum LockType {
     /// Read lock (shared).
     Read,
@@ -144,7 +144,6 @@ impl std::fmt::Display for LockType {
 
 /// Resource type being tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum ResourceType {
     /// Lock resource.
     Lock,
@@ -199,7 +198,6 @@ impl RequestResourceTracker {
 
 /// Deadlock detection result.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DeadlockInfo {
     /// Time of detection.
     pub detected_at: Instant,
@@ -213,7 +211,6 @@ pub struct DeadlockInfo {
 
 /// Edge in the lock wait graph.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WaitGraphEdge {
     /// Request that is waiting.
     pub from: RequestId,
@@ -225,7 +222,6 @@ pub struct WaitGraphEdge {
 
 /// Resource usage snapshot.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct ResourceUsage {
     /// Total memory used (bytes).
     pub memory_bytes: usize,
@@ -253,7 +249,6 @@ pub struct DeadlockDetector {
     running: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)]
 impl DeadlockDetector {
     /// Create a new deadlock detector.
     pub fn new(config: DeadlockDetectorConfig) -> Self {
@@ -571,14 +566,12 @@ pub fn get_deadlock_detector() -> Arc<DeadlockDetector> {
 }
 
 /// Initialize and start the global deadlock detector.
-#[allow(dead_code)]
 pub fn init_deadlock_detector() {
     let detector = get_deadlock_detector();
     detector.start();
 }
 
 /// Check if deadlock detection is enabled.
-#[allow(dead_code)]
 pub fn is_deadlock_detection_enabled() -> bool {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
