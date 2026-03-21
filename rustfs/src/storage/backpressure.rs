@@ -74,8 +74,10 @@ impl Default for BackpressureConfig {
 impl BackpressureConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
-        let buffer_size =
-            rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE);
+        let buffer_size = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+            rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+        );
         let high_watermark = rustfs_utils::get_env_u32(
             rustfs_config::ENV_OBJECT_BACKPRESSURE_HIGH_WATERMARK,
             rustfs_config::DEFAULT_OBJECT_BACKPRESSURE_HIGH_WATERMARK,

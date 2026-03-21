@@ -30,7 +30,7 @@ use crate::storage::options::{
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
-use crate::storage::timeout_wrapper::TimeoutConfig;
+use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -931,15 +931,14 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_start = std::time::Instant::now();
-
-        // Load timeout configuration
+        // Create timeout wrapper for enhanced timeout tracking
         let timeout_config = TimeoutConfig::from_env();
-        let request_deadline = if timeout_config.is_timeout_enabled() {
-            Some(request_start + timeout_config.get_object_timeout)
-        } else {
-            None
-        };
+        let wrapper =
+            RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{}-{}", req.input.bucket, req.input.key));
+
+        // Get cancellation token for cooperative cancellation
+        let _cancel_token = wrapper.cancel_token();
+        let request_start = std::time::Instant::now();
 
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
@@ -947,17 +946,16 @@ impl DefaultObjectUsecase {
 
         // Register with deadlock detector if enabled
         let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
-        let request_id = format!("get-{}-{}", req.input.bucket, req.input.key);
+        let request_id = wrapper.request_id().to_string();
         deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
 
         // Check for request timeout before proceeding
-        if let Some(deadline) = request_deadline
-            && std::time::Instant::now() >= deadline
-        {
+        if wrapper.is_timeout() {
             warn!(
                 bucket = %req.input.bucket,
                 key = %req.input.key,
                 timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out before processing"
             );
             deadlock_detector.unregister_request(&request_id);
@@ -1143,14 +1141,13 @@ impl DefaultObjectUsecase {
         let permit_wait_duration = permit_wait_start.elapsed();
 
         // Check timeout after acquiring permit
-        if let Some(deadline) = request_deadline
-            && std::time::Instant::now() >= deadline
-        {
+        if wrapper.is_timeout() {
             warn!(
                 bucket = %bucket,
                 key = %key,
                 wait_ms = permit_wait_duration.as_millis(),
                 timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out while waiting for disk permit"
             );
             deadlock_detector.unregister_request(&request_id);
@@ -1203,13 +1200,12 @@ impl DefaultObjectUsecase {
         );
 
         // Check timeout before reading object
-        if let Some(deadline) = request_deadline
-            && std::time::Instant::now() >= deadline
-        {
+        if wrapper.is_timeout() {
             warn!(
                 bucket = %bucket,
                 key = %key,
                 timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out before reading object"
             );
             deadlock_detector.unregister_request(&request_id);
@@ -1557,13 +1553,11 @@ impl DefaultObjectUsecase {
         }
 
         // Check for timeout before returning
-        if let Some(deadline) = request_deadline
-            && std::time::Instant::now() > deadline
-        {
+        if wrapper.is_timeout() {
             warn!(
                 "GetObject request exceeded timeout: key={} duration={:?} timeout={:?}",
                 cache_key,
-                request_start.elapsed(),
+                wrapper.elapsed(),
                 timeout_config.get_object_timeout
             );
             #[cfg(feature = "metrics")]

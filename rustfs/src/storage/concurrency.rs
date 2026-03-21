@@ -510,7 +510,6 @@ impl GetObjectGuard {
     ///
     /// Useful for logging or metrics collection during request processing.
     /// Called automatically in the Drop implementation for duration tracking.
-
     pub fn elapsed(&self) -> Duration {
         self.start_time.elapsed()
     }
@@ -1834,7 +1833,6 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 }
 
 /// Testing helper to reset the global request counter.
-
 pub(crate) fn reset_active_get_requests() {
     ACTIVE_GET_REQUESTS.store(0, Ordering::Relaxed);
 }

@@ -131,7 +131,10 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 ///
 /// Default: 4MB (4 * 1024 * 1024 bytes)
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE)
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+    )
 }
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);

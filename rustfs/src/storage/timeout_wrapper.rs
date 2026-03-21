@@ -81,10 +81,14 @@ impl TimeoutConfig {
     pub fn from_env() -> Self {
         let get_object_timeout =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_GET_TIMEOUT, rustfs_config::DEFAULT_OBJECT_GET_TIMEOUT);
-        let lock_acquire_timeout =
-            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT);
-        let disk_read_timeout =
-            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT);
+        let lock_acquire_timeout = rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+            rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+        );
+        let disk_read_timeout = rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
+            rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT,
+        );
 
         Self {
             get_object_timeout: Duration::from_secs(get_object_timeout),
@@ -445,7 +449,10 @@ impl RequestTimeoutWrapper {
 
 /// Get the duplex buffer size from environment or default.
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE)
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+    )
 }
 
 /// Get the I/O buffer size from environment or default.
