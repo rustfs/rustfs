@@ -195,6 +195,17 @@ fn awscurl_binary_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("awscurl"))
 }
 
+pub fn awscurl_available() -> bool {
+    let path = awscurl_binary_path();
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&path).is_file()))
+        .unwrap_or(false)
+}
+
 // Global initialization
 static INIT: Once = Once::new();
 
