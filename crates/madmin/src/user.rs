@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::BackendInfo;
 
@@ -492,6 +493,30 @@ impl<'de> Deserialize<'de> for SRSessionPolicy {
     }
 }
 
+fn deserialize_vec_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_optional_service_account_expiration<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let expiration = Option::<String>::deserialize(deserializer)?;
+    let Some(expiration) = expiration else {
+        return Ok(None);
+    };
+
+    let expiration = OffsetDateTime::parse(&expiration, &Rfc3339).map_err(D::Error::custom)?;
+    if expiration.unix_timestamp() == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(expiration))
+}
+
 /// SRSvcAccCreate - create operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SRSvcAccCreate {
@@ -503,6 +528,7 @@ pub struct SRSvcAccCreate {
     #[serde(rename = "secretKey")]
     pub secret_key: String,
 
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub groups: Vec<String>,
 
     pub claims: HashMap<String, serde_json::Value>,
@@ -516,7 +542,11 @@ pub struct SRSvcAccCreate {
 
     pub description: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_service_account_expiration"
+    )]
     pub expiration: Option<OffsetDateTime>,
 
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
