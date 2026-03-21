@@ -33,6 +33,15 @@ struct CapturedWebhookRequest {
     payload: serde_json::Value,
 }
 
+struct WebhookResponseSpec {
+    status_line: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+    include_auth_headers: bool,
+    auth_route_override: Option<String>,
+    auth_token_override: Option<String>,
+}
+
 fn find_header_terminator(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -92,6 +101,27 @@ async fn spawn_object_lambda_webhook_server(
     ),
     Box<dyn Error + Send + Sync>,
 > {
+    spawn_object_lambda_webhook_server_with_response(WebhookResponseSpec {
+        status_line: "200 OK".to_string(),
+        body: b"transformed through object lambda".to_vec(),
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        include_auth_headers: true,
+        auth_route_override: None,
+        auth_token_override: None,
+    })
+    .await
+}
+
+async fn spawn_object_lambda_webhook_server_with_response(
+    response_spec: WebhookResponseSpec,
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<CapturedWebhookRequest>,
+        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let webhook_url = format!("http://{address}/transform");
@@ -116,13 +146,23 @@ async fn spawn_object_lambda_webhook_server(
 
             let _ = request_tx.send(CapturedWebhookRequest { headers, payload });
 
-            let response_body = b"transformed through object lambda";
-            let response_head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nx-amz-request-route: {output_route}\r\nx-amz-request-token: {output_token}\r\nconnection: close\r\n\r\n",
-                response_body.len()
+            let mut response_head = format!(
+                "HTTP/1.1 {}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                response_spec.status_line,
+                response_spec.body.len()
             );
+            for (name, value) in &response_spec.headers {
+                response_head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            if response_spec.include_auth_headers {
+                let auth_route = response_spec.auth_route_override.as_deref().unwrap_or(&output_route);
+                let auth_token = response_spec.auth_token_override.as_deref().unwrap_or(&output_token);
+                response_head.push_str(&format!("x-amz-request-route: {auth_route}\r\n"));
+                response_head.push_str(&format!("x-amz-request-token: {auth_token}\r\n"));
+            }
+            response_head.push_str("\r\n");
             stream.write_all(response_head.as_bytes()).await?;
-            stream.write_all(response_body).await?;
+            stream.write_all(&response_spec.body).await?;
             stream.shutdown().await?;
 
             return Ok(());
@@ -284,6 +324,53 @@ async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
     }
 }
 
+async fn read_listen_notification_event(
+    response: reqwest::Response,
+    expected_key: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut response = response;
+    let mut pending = String::new();
+    loop {
+        let chunk = timeout(Duration::from_secs(12), response.chunk()).await??;
+        let Some(chunk) = chunk else {
+            return Err("listen_notification stream ended before payload".into());
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        pending.push_str(&String::from_utf8(chunk.to_vec())?);
+
+        while let Some(newline) = pending.find('\n') {
+            let line = pending.drain(..=newline).collect::<String>();
+            let payload = line.trim();
+            if payload.is_empty() {
+                continue;
+            }
+
+            let json: serde_json::Value = serde_json::from_str(payload)?;
+            let Some(records) = json["Records"].as_array() else {
+                continue;
+            };
+            if records.is_empty() {
+                continue;
+            }
+
+            let has_expected_key = records.iter().any(|record| {
+                let Some(object_key) = record["s3"]["object"]["key"].as_str() else {
+                    return false;
+                };
+                let decoded = urlencoding::decode(object_key)
+                    .map(|decoded| decoded.into_owned())
+                    .unwrap_or_else(|_| object_key.to_string());
+                decoded == expected_key
+            });
+            if has_expected_key {
+                return Ok(payload.to_string());
+            }
+        }
+    }
+}
+
 
 #[tokio::test]
 #[serial]
@@ -373,6 +460,221 @@ async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), B
     assert_eq!(source_response.bytes().await?.as_ref(), object_body);
 
     webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server_with_response(WebhookResponseSpec {
+        status_line: "418 I'm a teapot".to_string(),
+        body: b"lambda upstream rejected".to_vec(),
+        headers: vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("x-rustfs-debug".to_string(), "passthrough".to_string()),
+            ("x-amz-request-route".to_string(), "should-not-leak".to_string()),
+            ("x-amz-request-token".to_string(), "should-not-leak".to_string()),
+        ],
+        include_auth_headers: false,
+        auth_route_override: None,
+        auth_token_override: None,
+    })
+    .await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-failure";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!(
+        "{}/{}/{}?lambdaArn={}",
+        env.url,
+        bucket,
+        key,
+        urlencoding::encode(lambda_arn)
+    );
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(
+        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response.headers().get("x-rustfs-debug").and_then(|value| value.to_str().ok()),
+        Some("passthrough")
+    );
+    assert!(response.headers().get("x-amz-request-route").is_none());
+    assert!(response.headers().get("x-amz-request-token").is_none());
+    assert_eq!(response.text().await?, "lambda upstream rejected");
+
+    webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_rejects_success_response_without_auth_headers() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server_with_response(WebhookResponseSpec {
+        status_line: "200 OK".to_string(),
+        body: b"missing auth headers".to_vec(),
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        include_auth_headers: false,
+        auth_route_override: None,
+        auth_token_override: None,
+    })
+    .await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-missing-auth";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!(
+        "{}/{}/{}?lambdaArn={}",
+        env.url,
+        bucket,
+        key,
+        urlencoding::encode(lambda_arn)
+    );
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(body.contains("authorization headers"), "unexpected error body: {body}");
+
+    webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_headers(
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server_with_response(WebhookResponseSpec {
+        status_line: "200 OK".to_string(),
+        body: b"mismatched auth headers".to_vec(),
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        include_auth_headers: true,
+        auth_route_override: Some("wrong-route".to_string()),
+        auth_token_override: Some("wrong-token".to_string()),
+    })
+    .await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-mismatched-auth";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!(
+        "{}/{}/{}?lambdaArn={}",
+        env.url,
+        bucket,
+        key,
+        urlencoding::encode(lambda_arn)
+    );
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.text().await?;
+    assert!(body.contains("authorization headers"), "unexpected error body: {body}");
+
+    webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "listen-notification-e2e";
+    let key = "logs/app.json";
+    let client = env.create_s3_client();
+
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let listen_url = format!(
+        "{}/{bucket}?events={}&prefix={}&suffix={}&ping=1",
+        env.url,
+        urlencoding::encode("s3:ObjectCreated:Put"),
+        urlencoding::encode("logs/"),
+        urlencoding::encode(".json"),
+    );
+    let response = signed_request(http::Method::GET, &listen_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let read_task = tokio::spawn(read_listen_notification_event(response, key));
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"listen notification body"))
+        .send()
+        .await?;
+
+    let payload = timeout(Duration::from_secs(12), read_task).await???;
+    assert!(!payload.is_empty(), "listen_notification payload should not be empty");
 
     Ok(())
 }

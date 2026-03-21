@@ -95,3 +95,7 @@ mod multipart_auth_test;
 // Object lambda end-to-end regression tests
 #[cfg(test)]
 mod object_lambda_test;
+
+// Replication extension end-to-end regression tests
+#[cfg(test)]
+mod replication_extension_test;

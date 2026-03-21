@@ -69,8 +69,8 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_signer::pre_sign_v4;
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
 };
 use s3s::Body;
 use s3s::S3Error;
@@ -1125,14 +1125,18 @@ fn event_matches_listen_notification(event: &NotificationEvent, filter: &ListenN
         return false;
     }
 
+    let object_key = urlencoding::decode(&event.s3.object.key)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| event.s3.object.key.clone());
+
     if let Some(prefix) = &filter.prefix
-        && !event.s3.object.key.starts_with(prefix)
+        && !object_key.starts_with(prefix)
     {
         return false;
     }
 
     if let Some(suffix) = &filter.suffix
-        && !event.s3.object.key.ends_with(suffix)
+        && !object_key.ends_with(suffix)
     {
         return false;
     }
@@ -1816,7 +1820,7 @@ async fn put_replication_probe_object(
     insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
     insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
     headers.insert(
-        HeaderName::from_static(AMZ_BUCKET_REPLICATION_STATUS),
+        HeaderName::from_static("x-amz-replication-status"),
         HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
     );
 
@@ -1855,7 +1859,7 @@ async fn delete_replication_probe_object(
         insert_header(&mut headers, SUFFIX_SOURCE_MTIME, replication_mtime.format(&Rfc3339).unwrap_or_default());
     }
     headers.insert(
-        HeaderName::from_static(AMZ_BUCKET_REPLICATION_STATUS),
+        HeaderName::from_static("x-amz-replication-status"),
         HeaderValue::from_static(options.replication_status.as_str()),
     );
     if options.replication_request {
@@ -3730,6 +3734,19 @@ mod tests {
 
         let wrong_suffix = NotificationEvent::new_test_event("demo-bucket", "logs/app.txt", EventName::ObjectCreatedPut);
         assert!(!event_matches_listen_notification(&wrong_suffix, &filter));
+    }
+
+    #[test]
+    fn event_matches_listen_notification_decodes_object_key_before_filtering() {
+        let filter = ListenNotificationFilter {
+            bucket: Some("demo-bucket".to_string()),
+            event_mask: EventName::ObjectCreatedPut.mask(),
+            prefix: Some("logs/".to_string()),
+            suffix: Some(".json".to_string()),
+        };
+
+        let encoded = NotificationEvent::new_test_event("demo-bucket", "logs%2Fapp.json", EventName::ObjectCreatedPut);
+        assert!(event_matches_listen_notification(&encoded, &filter));
     }
 
     #[test]
