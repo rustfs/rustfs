@@ -794,6 +794,15 @@ impl<T: Store> IamSys<T> {
                     return combined.is_allowed(args).await;
                 }
             }
+
+            if args.deny_only {
+                let combined_policy = Policy::default();
+                let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+                if has_session_policy {
+                    return is_allowed_sp && combined_policy.is_allowed(args).await;
+                }
+                return combined_policy.is_allowed(args).await;
+            }
             return false;
         }
 
@@ -803,9 +812,14 @@ impl<T: Store> IamSys<T> {
             } else {
                 let (a, c) = self.store.merge_policies(&policies.join(",")).await;
                 if a.is_empty() {
-                    return false;
+                    if args.deny_only {
+                        Policy::default()
+                    } else {
+                        return false;
+                    }
+                } else {
+                    c
                 }
-                c
             }
         };
 
@@ -1035,17 +1049,20 @@ mod tests {
     use rustfs_credentials::Credentials;
     use rustfs_policy::auth::UserIdentity;
     use rustfs_policy::policy::Args;
-    use rustfs_policy::policy::action::{Action, S3Action};
+    use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use serde_json::Value;
     use std::collections::HashMap;
     use time::OffsetDateTime;
 
-    /// Mock Store that populates cache in load_all so STS temp credentials
-    /// without args.groups still get group-attached policies via parent user (groups fallback).
+    /// Mock Store for STS tests: either group-attached policies via parent user, or no IAM policies.
     #[derive(Clone)]
-    struct StsGroupsFallbackMockStore;
+    struct StsTestMockStore {
+        /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
+        empty_policies: bool,
+    }
 
     #[async_trait::async_trait]
-    impl Store for StsGroupsFallbackMockStore {
+    impl Store for StsTestMockStore {
         fn has_watcher(&self) -> bool {
             false
         }
@@ -1175,13 +1192,47 @@ mod tests {
         }
 
         async fn load_all(&self, cache: &Cache) -> Result<()> {
-            const PARENT_USER: &str = "sts-fallback-test-parent";
-            const GROUP_NAME: &str = "testgroup";
-
             let policy_docs = get_default_policyes();
             cache
                 .policy_docs
                 .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
+
+            if self.empty_policies {
+                const PARENT_USER: &str = "sts-empty-parent-policy-test";
+                let creds = Credentials {
+                    access_key: PARENT_USER.to_string(),
+                    secret_key: "longenoughsecret".to_string(),
+                    session_token: String::new(),
+                    expiration: None,
+                    status: "on".to_string(),
+                    parent_user: String::new(),
+                    groups: None,
+                    claims: None,
+                    name: None,
+                    description: None,
+                };
+                let parent_identity = UserIdentity {
+                    version: 1,
+                    credentials: creds,
+                    update_at: Some(OffsetDateTime::now_utc()),
+                };
+                let mut users = HashMap::new();
+                users.insert(PARENT_USER.to_string(), parent_identity);
+                cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
+
+                cache.groups.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache
+                    .group_policies
+                    .store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.build_user_group_memberships();
+                return Ok(());
+            }
+
+            const PARENT_USER: &str = "sts-fallback-test-parent";
+            const GROUP_NAME: &str = "testgroup";
 
             let creds = Credentials {
                 access_key: PARENT_USER.to_string(),
@@ -1231,7 +1282,7 @@ mod tests {
     /// would be denied.
     #[tokio::test]
     async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
-        let store = StsGroupsFallbackMockStore;
+        let store = StsTestMockStore { empty_policies: false };
         let cache_manager = IamCache::new(store).await;
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1257,13 +1308,93 @@ mod tests {
         );
     }
 
+    /// Regression: `deny_only` with empty IAM policies must still evaluate `sessionPolicy-extracted`
+    /// so session policy Deny cannot be bypassed (see PR #2250 review).
+    #[tokio::test]
+    async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let session_policy_json = r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["admin:CreateUser"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}"#;
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String(session_policy_json.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::CreateUserAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            !allowed,
+            "session policy Deny must be evaluated even when IAM policies are empty and deny_only is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let session_policy_json = r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#;
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String(session_policy_json.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::CreateUserAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            allowed,
+            "deny_only with no matching Deny in session policy should still allow self-service-style checks"
+        );
+    }
+
     /// Regression test for cross-node IAM notifications:
     /// `load_user` must populate user cache, and regular-user mapped policy must be written to
     /// `user_policies` (not `sts_policies`), otherwise list-users and bucket-scoped user listing
     /// may miss users on follower nodes.
     #[tokio::test]
     async fn test_load_user_notification_populates_user_and_policy_caches() {
-        let store = StsGroupsFallbackMockStore;
+        let store = StsTestMockStore { empty_policies: false };
         let cache_manager = IamCache::new(store).await;
         let iam_sys = IamSys::new(cache_manager);
 
