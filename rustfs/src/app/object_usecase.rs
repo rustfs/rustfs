@@ -1156,6 +1156,32 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
         }
 
+        // Monitor I/O queue status for congestion detection
+        let queue_status = manager.io_queue_status();
+        let queue_utilization = if queue_status.total_permits > 0 {
+            (queue_status.permits_in_use as f64 / queue_status.total_permits as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Log warning if queue is congested (> 80% utilization)
+        if queue_utilization > 80.0 {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                queue_utilization = format!("{:.1}%", queue_utilization),
+                permits_in_use = queue_status.permits_in_use,
+                total_permits = queue_status.total_permits,
+                "I/O queue congestion detected"
+            );
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs.io.queue.congestion.total").increment(1);
+            }
+        }
+
         // Calculate adaptive I/O strategy from permit wait time
         // This adjusts buffer sizes, read-ahead, and caching behavior based on load
         // Use 256KB as the base buffer size for strategy calculation
@@ -1166,12 +1192,34 @@ impl DefaultObjectUsecase {
         // Small requests (< 1MB) get high priority, large requests (> 10MB) get low priority
         let io_priority = manager.get_io_priority(io_strategy.buffer_size as i64);
 
+        // Log priority information for observability
+        if manager.is_priority_scheduling_enabled() {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                priority = %io_priority,
+                request_size = io_strategy.buffer_size,
+                "I/O priority assigned"
+            );
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs.io.priority.assigned.total", "priority" => io_priority.as_str()).increment(1);
+            }
+        }
+
         // Record detailed I/O metrics for monitoring
         #[cfg(feature = "metrics")]
         {
             use metrics::{counter, gauge, histogram};
             // Record permit wait time histogram
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
+            // Record I/O queue utilization
+            gauge!("rustfs.io.queue.utilization").set(queue_utilization);
+            gauge!("rustfs.io.queue.permits_in_use").set(queue_status.permits_in_use as f64);
+            gauge!("rustfs.io.queue.permits_available")
+                .set(queue_status.total_permits.saturating_sub(queue_status.permits_in_use) as f64);
             // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
             let load_level_value = match io_strategy.load_level {
                 crate::storage::concurrency::IoLoadLevel::Low => 0.0,

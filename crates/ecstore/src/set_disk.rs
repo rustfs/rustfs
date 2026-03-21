@@ -537,6 +537,8 @@ impl ObjectIO for SetDisks {
 
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
+            let acquire_start = std::time::Instant::now();
+
             // Record lock wait for deadlock detection
             if is_deadlock_detection_enabled() {
                 debug!(
@@ -559,8 +561,16 @@ impl ObjectIO for SetDisks {
                     ))
                 })?;
 
-            // Record lock acquisition for deadlock detection (returns lock_id)
+            // Record lock acquisition for deadlock detection
             let _lock_id = record_lock_acquire(bucket, object, "read");
+
+            // Record lock statistics
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::{counter, histogram};
+                counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
+                histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+            }
 
             Some(guard)
         } else {
@@ -617,6 +627,13 @@ impl ObjectIO for SetDisks {
             if read_lock_guard.is_some() {
                 let lock_id = format!("{}:{}", bucket, object);
                 record_lock_release(bucket, object, &lock_id, "read");
+
+                // Record early lock release statistics
+                #[cfg(feature = "metrics")]
+                {
+                    use metrics::counter;
+                    counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
+                }
             }
             // Explicitly drop the lock guard to release the lock early
             drop(read_lock_guard);
