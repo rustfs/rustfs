@@ -1120,6 +1120,7 @@ mod tests {
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
+    use rustfs_madmin::user::SRSvcAccCreate;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -1203,6 +1204,57 @@ mod tests {
         assert_eq!(imported_service_account_status("disabled").as_deref(), Some("off"));
         assert_eq!(imported_service_account_status("enabled").as_deref(), Some("on"));
         assert!(imported_service_account_status("unknown").is_none());
+    }
+
+    #[test]
+    fn test_service_account_import_accepts_null_groups_and_epoch_expiration() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcalpha",
+                "secretKey": "svcAlphaSecret123",
+                "groups": null,
+                "claims": {
+                    "accessKey": "svcalpha",
+                    "parent": "useralpha",
+                    "sa-policy": "inherited-policy"
+                },
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "1970-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let svc = svc_accts.get("svcalpha").unwrap();
+
+        assert!(svc.groups.is_empty());
+        assert!(svc.expiration.is_none());
+    }
+
+    #[test]
+    fn test_service_account_import_preserves_non_zero_expiration() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcalpha",
+                "secretKey": "svcAlphaSecret123",
+                "groups": [],
+                "claims": {},
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "2030-01-02T03:04:05Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let svc = svc_accts.get("svcalpha").unwrap();
+
+        assert_eq!(svc.expiration.map(|expiration| expiration.unix_timestamp()), Some(1893553445));
     }
 
     #[test]
