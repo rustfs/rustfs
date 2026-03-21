@@ -637,7 +637,7 @@ fn process_connection(
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
-                        let trace_id = request
+                        let request_id = request
                             .headers()
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
@@ -651,8 +651,8 @@ fn process_connection(
                         if parent_context.has_active_span() {
                             let span_ref = parent_context.span();
                             debug!(
-                                trace_id = %span_ref.span_context().trace_id(),
-                                parent_span_id = %span_ref.span_context().span_id(),
+                                otel_trace_id = %span_ref.span_context().trace_id(),
+                                otel_parent_span_id = %span_ref.span_context().span_id(),
                                 sampled = span_ref.span_context().is_sampled(),
                                 "Extracted trace context from incoming request headers"
                             );
@@ -666,7 +666,7 @@ fn process_connection(
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let span = tracing::info_span!("http-request",
-                            trace_id = %trace_id,
+                            request_id = %request_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             real_ip = %real_ip,

@@ -326,7 +326,8 @@ pub(super) fn init_observability_http(
 ///
 /// Returns `None` when the endpoint is empty or trace export is disabled.
 /// When enabled, the provider is also registered as the global tracer provider
-/// and installs the W3C trace-context propagator.
+/// and installs a composite propagator supporting both W3C TraceContext
+/// (traceparent header) and W3C Baggage (baggage header) propagation.
 fn build_tracer_provider(
     trace_ep: &str,
     config: &OtelConfig,
