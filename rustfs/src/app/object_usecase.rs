@@ -1392,6 +1392,7 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
             part_number: None,
             parts: &info.parts,
+            etag: info.etag.as_deref(),
         };
 
         let (server_side_encryption, sse_customer_algorithm, sse_customer_key_md5, ssekms_key_id, encryption_applied) =
@@ -2258,6 +2259,7 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5: copy_source_sse_customer_key_md5.as_ref(),
             part_number: None,
             parts: &src_info.parts,
+            etag: src_info.etag.as_deref(),
         };
 
         if let Some(material) = sse_decryption(decryption_request).await? {

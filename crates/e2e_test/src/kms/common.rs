@@ -22,11 +22,11 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging};
+use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -49,6 +49,19 @@ pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
 pub fn init_logging() {
     common_init_logging();
     // Additional KMS-specific logging configuration can be added here if needed
+}
+
+pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
+    if awscurl_available() {
+        return false;
+    }
+
+    info!("Skipping {} because awscurl is not available in PATH", test_name);
+    true
+}
+
+pub fn sse_customer_key_md5_base64(key: &str) -> String {
+    BASE64.encode(md5::compute(key).0)
 }
 
 // KMS-specific helper functions
@@ -133,10 +146,10 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "usage": "EncryptDecrypt",
         "status": "Active",
         "metadata": HashMap::<String, String>::new(),
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": key_data.to_vec(),
+        "encrypted_key_material": BASE64.encode(key_data),
         "nonce": Vec::<u8>::new()
     });
 
@@ -155,7 +168,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
 
@@ -324,8 +337,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     let wrong_key = "98765432109876543210987654321098";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
     let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
-    let test_key_md5 = format!("{:x}", md5::compute(test_key));
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
+    let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
     let test_data = b"Test data for error scenarios";
     let object_key = "test-error-object";
 
@@ -687,7 +700,7 @@ pub async fn test_multipart_upload_with_config(
 /// Create a standard SSE-C encryption configuration for testing
 pub fn create_sse_c_config() -> EncryptionType {
     let key = "01234567890123456789012345678901"; // 32-byte key
-    let key_md5 = format!("{:x}", md5::compute(key));
+    let key_md5 = sse_customer_key_md5_base64(key);
     EncryptionType::SSEC {
         key: key.to_string(),
         key_md5,
