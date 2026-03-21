@@ -197,7 +197,7 @@ impl Default for IoSchedulerConfig {
     fn default() -> Self {
         Self {
             max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-            enable_priority: rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
+            enable_priority: rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
         }
     }
 }
@@ -211,8 +211,8 @@ impl IoSchedulerConfig {
                 rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
             ),
             enable_priority: rustfs_utils::get_env_bool(
-                rustfs_config::ENV_PRIORITY_SCHEDULING_ENABLE,
-                rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
+                rustfs_config::ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE,
+                rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
             ),
         }
     }
@@ -1765,8 +1765,8 @@ impl ConcurrencyManager {
     /// Check if priority scheduling is enabled.
     pub fn is_priority_scheduling_enabled(&self) -> bool {
         rustfs_utils::get_env_bool(
-            rustfs_config::ENV_PRIORITY_SCHEDULING_ENABLE,
-            rustfs_config::DEFAULT_PRIORITY_SCHEDULING_ENABLE,
+            rustfs_config::ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
         )
     }
 

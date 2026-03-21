@@ -131,7 +131,7 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 ///
 /// Default: 4MB (4 * 1024 * 1024 bytes)
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(rustfs_config::ENV_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_DUPLEX_BUFFER_SIZE)
+    rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE)
 }
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
@@ -149,8 +149,8 @@ mod write;
 /// Defaults to 30 seconds if not set or invalid
 pub fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
-        rustfs_config::ENV_LOCK_ACQUIRE_TIMEOUT,
-        rustfs_config::DEFAULT_LOCK_ACQUIRE_TIMEOUT,
+        rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
     ))
 }
 
@@ -159,8 +159,8 @@ pub fn get_lock_acquire_timeout() -> Duration {
 /// being held for the entire data transfer duration.
 pub fn is_lock_optimization_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
-        rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
     )
 }
 
@@ -168,8 +168,8 @@ pub fn is_lock_optimization_enabled() -> bool {
 /// When enabled, lock operations are recorded for deadlock analysis.
 pub fn is_deadlock_detection_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
-        rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
     )
 }
 

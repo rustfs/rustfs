@@ -59,8 +59,8 @@ pub struct LockOptimizeConfig {
 impl Default for LockOptimizeConfig {
     fn default() -> Self {
         Self {
-            enabled: rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
-            acquire_timeout: Duration::from_secs(rustfs_config::DEFAULT_LOCK_ACQUIRE_TIMEOUT),
+            enabled: rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+            acquire_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT),
         }
     }
 }
@@ -69,12 +69,12 @@ impl LockOptimizeConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
-            rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
+            rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
         );
         let acquire_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_LOCK_ACQUIRE_TIMEOUT,
-            rustfs_config::DEFAULT_LOCK_ACQUIRE_TIMEOUT,
+            rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+            rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
         ));
 
         Self {
@@ -370,8 +370,8 @@ impl Default for LockOptimizer {
 /// Check if lock optimization is enabled globally.
 pub fn is_lock_optimization_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_LOCK_OPTIMIZATION_ENABLE,
-        rustfs_config::DEFAULT_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
     )
 }
 

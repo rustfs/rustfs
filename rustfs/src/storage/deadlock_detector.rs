@@ -78,9 +78,9 @@ pub struct DeadlockDetectorConfig {
 impl Default for DeadlockDetectorConfig {
     fn default() -> Self {
         Self {
-            enabled: rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
-            check_interval: Duration::from_secs(rustfs_config::DEFAULT_DEADLOCK_CHECK_INTERVAL),
-            hang_threshold: Duration::from_secs(rustfs_config::DEFAULT_DEADLOCK_HANG_THRESHOLD),
+            enabled: rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
+            check_interval: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DEADLOCK_CHECK_INTERVAL),
+            hang_threshold: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DEADLOCK_HANG_THRESHOLD),
             capture_backtrace: false,
         }
     }
@@ -90,16 +90,16 @@ impl DeadlockDetectorConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
-            rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
+            rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
         );
         let check_interval = Duration::from_secs(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_DEADLOCK_CHECK_INTERVAL,
-            rustfs_config::DEFAULT_DEADLOCK_CHECK_INTERVAL,
+            rustfs_config::ENV_OBJECT_DEADLOCK_CHECK_INTERVAL,
+            rustfs_config::DEFAULT_OBJECT_DEADLOCK_CHECK_INTERVAL,
         ));
         let hang_threshold = Duration::from_secs(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_DEADLOCK_HANG_THRESHOLD,
-            rustfs_config::DEFAULT_DEADLOCK_HANG_THRESHOLD,
+            rustfs_config::ENV_OBJECT_DEADLOCK_HANG_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_DEADLOCK_HANG_THRESHOLD,
         ));
 
         Self {
@@ -574,8 +574,8 @@ pub fn init_deadlock_detector() {
 /// Check if deadlock detection is enabled.
 pub fn is_deadlock_detection_enabled() -> bool {
     rustfs_utils::get_env_bool(
-        rustfs_config::ENV_DEADLOCK_DETECTION_ENABLE,
-        rustfs_config::DEFAULT_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
     )
 }
 
