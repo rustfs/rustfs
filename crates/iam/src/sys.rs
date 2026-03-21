@@ -794,6 +794,12 @@ impl<T: Store> IamSys<T> {
                     return combined.is_allowed(args).await;
                 }
             }
+            // Deny-only self-service admin: JWT may only carry `parent`/`exp` (no `policy` claim) and
+            // IAM DB may have no STS policy rows yet — still evaluate empty policy so
+            // `Policy::is_allowed` with `deny_only` can allow when no explicit Deny matches.
+            if args.deny_only {
+                return Policy::default().is_allowed(args).await;
+            }
             return false;
         }
 
@@ -803,9 +809,14 @@ impl<T: Store> IamSys<T> {
             } else {
                 let (a, c) = self.store.merge_policies(&policies.join(",")).await;
                 if a.is_empty() {
-                    return false;
+                    if args.deny_only {
+                        Policy::default()
+                    } else {
+                        return false;
+                    }
+                } else {
+                    c
                 }
-                c
             }
         };
 
