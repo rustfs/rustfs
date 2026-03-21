@@ -838,6 +838,7 @@ impl LocalDisk {
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
+            get_global_file_cache().invalidate(&xlpath).await;
             return Ok(());
         }
 
@@ -848,6 +849,7 @@ impl LocalDisk {
 
         self.write_all_private(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), buf.into(), true, &volume_dir)
             .await?;
+        get_global_file_cache().invalidate(&xlpath).await;
 
         Ok(())
     }
