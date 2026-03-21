@@ -16,8 +16,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::BackendInfo;
 

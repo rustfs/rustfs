@@ -1254,10 +1254,7 @@ mod tests {
         let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
         let svc = svc_accts.get("svcalpha").unwrap();
 
-        assert_eq!(
-            svc.expiration.map(|expiration| expiration.unix_timestamp()),
-            Some(1893553445)
-        );
+        assert_eq!(svc.expiration.map(|expiration| expiration.unix_timestamp()), Some(1893553445));
     }
 
     #[test]
