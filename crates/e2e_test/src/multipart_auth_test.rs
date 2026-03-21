@@ -1065,8 +1065,8 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("success_action_redirect"),
         "response should mention success_action_redirect, got: {response_body}"
@@ -1513,8 +1513,8 @@ async fn test_anonymous_post_object_rejects_cache_control_missing_from_policy_co
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("cache-control"),
         "response should mention cache-control, got: {response_body}"
@@ -1678,8 +1678,8 @@ async fn test_anonymous_post_object_rejects_content_language_missing_from_policy
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("content-language"),
         "response should mention content-language, got: {response_body}"
@@ -1843,8 +1843,8 @@ async fn test_anonymous_post_object_rejects_content_encoding_missing_from_policy
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("content-encoding"),
         "response should mention content-encoding, got: {response_body}"
@@ -1954,8 +1954,8 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_missing_fr
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("x-amz-website-redirect-location"),
         "response should mention x-amz-website-redirect-location, got: {response_body}"
@@ -2008,8 +2008,8 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_policy_mis
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("x-amz-website-redirect-location"),
         "response should mention x-amz-website-redirect-location mismatch, got: {response_body}"
@@ -2120,8 +2120,8 @@ async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch()
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("expires"),
         "response should mention Expires mismatch, got: {response_body}"
@@ -2173,8 +2173,8 @@ async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_co
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("expires"),
         "response should mention Expires, got: {response_body}"
@@ -2305,8 +2305,8 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_policy_mismatc
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response_body.contains("InvalidPolicyDocument"));
     assert!(
         response_body_lower.contains("x-amz-object-lock-retain-until-date"),
         "response should mention x-amz-object-lock-retain-until-date mismatch, got: {response_body}"
