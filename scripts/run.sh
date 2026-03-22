@@ -53,7 +53,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
 # RustFS OR OTEL exporter configuration
 #export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/traces # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
 #export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:14318/v1/traces
@@ -224,83 +224,83 @@ export RUSTFS_TRUST_SYSTEM_CA=true
 
 # --- Default Configuration (Recommended for most cases) ---
 # Request timeout: 30 seconds (prevents indefinite hangs)
-export RUSTFS_GET_OBJECT_TIMEOUT=30
+export RUSTFS_OBJECT_GET_TIMEOUT=30
 # Disk read timeout: 10 seconds
-export RUSTFS_DISK_READ_TIMEOUT=10
+export RUSTFS_OBJECT_DISK_READ_TIMEOUT=10
 # Lock acquire timeout: 5 seconds
-export RUSTFS_LOCK_ACQUIRE_TIMEOUT=5
+export RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT=5
 # Duplex buffer size: 4MB (4x larger than original 1MB)
-export RUSTFS_DUPLEX_BUFFER_SIZE=4194304
+export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=4194304
 # I/O buffer size: 128KB
 export RUSTFS_OBJECT_IO_BUFFER_SIZE=131072
 # Max concurrent disk reads: 64
 export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
 # Lock optimization: release read lock after metadata read
-export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
+export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
 # Priority scheduling: small requests get higher priority
-export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 # Deadlock detection: disabled by default (has performance overhead)
-# export RUSTFS_DEADLOCK_DETECTION_ENABLE=false
+# export RUSTFS_OBJECT_DEADLOCK_DETECTION_ENABLE=false
 
 # --- Scenario 1: Home NAS / Small Storage Server ---
 # Hardware: 4-8 cores, 8-16GB RAM, 1-4 HDDs, 1Gbps network
 # Typical concurrency: 5-20 requests
-# export RUSTFS_GET_OBJECT_TIMEOUT=30
-# export RUSTFS_DUPLEX_BUFFER_SIZE=4194304
+# export RUSTFS_OBJECT_GET_TIMEOUT=30
+# export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=4194304
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
-# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
-# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 
 # --- Scenario 2: Medium Enterprise Storage ---
 # Hardware: 8-16 cores, 32-64GB RAM, 4-12 HDDs/SSDs, 10Gbps network
 # Typical concurrency: 20-100 requests
-# export RUSTFS_GET_OBJECT_TIMEOUT=60
-# export RUSTFS_DUPLEX_BUFFER_SIZE=8388608
+# export RUSTFS_OBJECT_GET_TIMEOUT=60
+# export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=8388608
 # export RUSTFS_OBJECT_IO_BUFFER_SIZE=262144
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=128
 # export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=16
-# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
-# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 
 # --- Scenario 3: Large Enterprise / Cloud Storage ---
 # Hardware: 32+ cores, 128+GB RAM, NVMe SSD array, 25-100Gbps network
 # Typical concurrency: 100-1000 requests
-# export RUSTFS_GET_OBJECT_TIMEOUT=120
-# export RUSTFS_DUPLEX_BUFFER_SIZE=16777216
+# export RUSTFS_OBJECT_GET_TIMEOUT=120
+# export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=16777216
 # export RUSTFS_OBJECT_IO_BUFFER_SIZE=524288
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=256
 # export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=32
-# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
-# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 
 # --- Scenario 4: Kopia Backup Optimized ---
 # Problem: Kopia sends 20-30 concurrent range requests for 20-26MB objects
 # Solution: Larger buffer, lock optimization, priority scheduling
-# export RUSTFS_GET_OBJECT_TIMEOUT=45
-# export RUSTFS_DUPLEX_BUFFER_SIZE=8388608
+# export RUSTFS_OBJECT_GET_TIMEOUT=45
+# export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=8388608
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=64
-# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
-# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
-# export RUSTFS_DEADLOCK_DETECTION_ENABLE=true  # Enable for debugging
+# export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_OBJECT_DEADLOCK_DETECTION_ENABLE=true  # Enable for debugging
 
 # --- Scenario 5: Low Power / Embedded Storage ---
 # Hardware: 2-4 cores (ARM/x86), 2-4GB RAM, SD card/eMMC, 100Mbps-1Gbps
 # Typical concurrency: 1-5 requests
-# export RUSTFS_GET_OBJECT_TIMEOUT=60
-# export RUSTFS_DISK_READ_TIMEOUT=20
-# export RUSTFS_DUPLEX_BUFFER_SIZE=2097152
+# export RUSTFS_OBJECT_GET_TIMEOUT=60
+# export RUSTFS_OBJECT_DISK_READ_TIMEOUT=20
+# export RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=2097152
 # export RUSTFS_OBJECT_IO_BUFFER_SIZE=65536
 # export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=16
 # export RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=4
-# export RUSTFS_LOCK_OPTIMIZATION_ENABLE=true
-# export RUSTFS_PRIORITY_SCHEDULING_ENABLE=true
+# export RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE=true
+# export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 
 # --- Scenario 6: Debugging / Troubleshooting ---
 # Enable all diagnostic features
-# export RUSTFS_GET_OBJECT_TIMEOUT=15
-# export RUSTFS_DEADLOCK_DETECTION_ENABLE=true
-# export RUSTFS_DEADLOCK_CHECK_INTERVAL=3
-# export RUSTFS_DEADLOCK_HANG_THRESHOLD=5
+# export RUSTFS_OBJECT_GET_TIMEOUT=15
+# export RUSTFS_OBJECT_DEADLOCK_DETECTION_ENABLE=true
+# export RUSTFS_OBJECT_DEADLOCK_CHECK_INTERVAL=3
+# export RUSTFS_OBJECT_DEADLOCK_HANG_THRESHOLD=5
 
 # --- Backpressure Configuration ---
 # High watermark: trigger backpressure when buffer usage exceeds this percentage
