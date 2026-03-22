@@ -492,6 +492,61 @@ This is expected and should be treated as the more accurate result, because the
 new build waits for remote shard writers to finish correctly instead of
 returning before all remote `PUT` bodies are fully finalized.
 
+## Follow-up optimization: batch internode PUT body writes
+
+After the correctness fixes above, the next bottleneck moved into the internode
+upload server path in `rustfs/src/storage/rpc/http_service.rs`.
+
+Profiling showed:
+
+- the client-side `HttpWriter` sent each large `1.398MB` shard in only `2`
+  HTTP body chunks
+- by the time the request reached `handle_put_file()`, hyper had re-chunked the
+  body into roughly `23-25` smaller chunks
+- `flush()` was negligible; most time was spent in repeated
+  `writer.write_all(&bytes).await` calls on the server
+
+To address that, `write_body_chunks_to_writer()` was changed to aggregate
+incoming HTTP body chunks into a `BytesMut` buffer sized to
+`DEFAULT_READ_BUFFER_SIZE`, and only then write to the underlying file.
+
+Commit:
+
+```bash
+git rev-parse --short 0d0e8fdf
+# 0d0e8fdf
+```
+
+Verification:
+
+```bash
+cargo test -p rustfs-rio http_ -- --nocapture
+cargo test -p rustfs --bin rustfs http_service::tests -- --nocapture
+```
+
+Both passed.
+
+Benchmarks:
+
+```text
+profhttp3 upload 256MB   avg 1.850s
+aggverify upload 256MB   avg 0.430s
+agg512b   upload 512MB   avg 0.778s
+encodefixhead upload 512MB avg 2.940s
+```
+
+Correctness validation for the batched-write build:
+
+- uploaded objects are present with the expected `256MiB` size
+- downloaded object MD5 matches the source file exactly
+
+Interpretation:
+
+- the aggregation change materially reduces server-side internode upload write
+  overhead
+- the gain persists beyond `256MB`; `512MB` uploads improved from `2.940s` to
+  `0.778s` in the same benchmark harness
+
 ## Current repo status
 
 At handoff time:
