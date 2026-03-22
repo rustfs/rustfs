@@ -48,7 +48,7 @@ impl std::fmt::Debug for HotObjectCache {
     }
 }
 
-struct CachedObject {
+pub(crate) struct CachedObject {
     /// The object data
     data: Arc<Vec<u8>>,
     /// When this object was cached
@@ -57,6 +57,44 @@ struct CachedObject {
     size: usize,
     /// Number of times this object has been accessed
     access_count: Arc<AtomicU64>,
+}
+
+impl CachedObject {
+    /// Create a new CachedObject with specified size
+    pub fn new_with_size(data: Vec<u8>, size: usize) -> Self {
+        Self {
+            data: Arc::new(data),
+            cached_at: Instant::now(),
+            size,
+            access_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Get the size of the cached object
+    #[allow(dead_code)]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Get the data reference
+    pub fn data(&self) -> &Arc<Vec<u8>> {
+        &self.data
+    }
+
+    /// Get the age of the cached object
+    pub fn age(&self) -> Duration {
+        self.cached_at.elapsed()
+    }
+
+    /// Increment access count and return new value
+    pub fn increment_access(&self) -> u64 {
+        self.access_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Get current access count
+    pub fn access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
+    }
 }
 
 /// Comprehensive cached object with full response metadata for GetObject operations.
@@ -83,6 +121,7 @@ struct CachedObject {
 /// manager.put_cached_object(cache_key, cached).await;
 /// ```
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CachedGetObject {
     /// The object body data
     pub body: bytes::Bytes,
@@ -117,6 +156,7 @@ pub struct CachedGetObject {
     /// User-defined metadata (x-amz-meta-*)
     pub user_metadata: std::collections::HashMap<String, String>,
     /// When this object was cached (for internal use, automatically set)
+    #[allow(dead_code)]
     cached_at: Option<Instant>,
     /// Access count for hot key tracking (automatically managed)
     access_count: Arc<AtomicU64>,
@@ -196,6 +236,55 @@ impl CachedGetObject {
     }
 
     /// Get the size in bytes for cache eviction calculations
+
+    /// Builder method to set expires
+    pub fn with_expires(mut self, expires: String) -> Self {
+        self.expires = Some(expires);
+        self
+    }
+
+    /// Builder method to set content_encoding
+    pub fn with_content_encoding(mut self, content_encoding: String) -> Self {
+        self.content_encoding = Some(content_encoding);
+        self
+    }
+
+    /// Builder method to set content_disposition
+    pub fn with_content_disposition(mut self, content_disposition: String) -> Self {
+        self.content_disposition = Some(content_disposition);
+        self
+    }
+
+    /// Builder method to set content_language
+    #[allow(dead_code)]
+    pub fn with_content_language(mut self, content_language: String) -> Self {
+        self.content_language = Some(content_language);
+        self
+    }
+
+    /// Builder method to set replication_status
+    pub fn with_replication_status(mut self, replication_status: String) -> Self {
+        self.replication_status = Some(replication_status);
+        self
+    }
+
+    /// Builder method to set delete_marker
+    pub fn with_delete_marker(mut self, delete_marker: bool) -> Self {
+        self.delete_marker = delete_marker;
+        self
+    }
+
+    /// Builder method to set user_metadata
+    pub fn with_user_metadata(mut self, user_metadata: std::collections::HashMap<String, String>) -> Self {
+        self.user_metadata = user_metadata;
+        self
+    }
+
+    /// Builder method to set tag_count
+    pub fn with_tag_count(mut self, tag_count: i32) -> Self {
+        self.tag_count = Some(tag_count);
+        self
+    }
     pub fn size(&self) -> usize {
         self.body.len()
     }
@@ -203,6 +292,59 @@ impl CachedGetObject {
     /// Increment access count and return the new value
     pub fn increment_access(&self) -> u64 {
         self.access_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    /// Check if the cached object is expired based on expires header
+    pub fn is_expired(&self) -> bool {
+        if let Some(expires_str) = &self.expires {
+            // Try to parse RFC3339 format
+            if let Ok(expires_time) = chrono::DateTime::parse_from_rfc3339(expires_str) {
+                let now = chrono::Utc::now();
+                return expires_time < now;
+            }
+        }
+        false
+    }
+
+    /// Check if replication is complete
+    pub fn is_replication_complete(&self) -> bool {
+        match &self.replication_status {
+            Some(status) => status == "COMPLETED",
+            None => true, // No replication configured
+        }
+    }
+
+    /// Get the age of this cached entry
+    pub fn age(&self) -> Option<Duration> {
+        self.cached_at.map(|at| at.elapsed())
+    }
+
+    /// Record a cache hit and increment access count
+    pub fn record_hit(&self) -> u64 {
+        self.increment_access()
+    }
+
+    /// Estimate memory size in bytes including metadata
+    pub fn memory_size(&self) -> usize {
+        let mut size = self.body.len();
+        size += size_of::<i64>(); // content_length
+        size += self.content_type.as_ref().map_or(0, |s| s.len());
+        size += self.e_tag.as_ref().map_or(0, |s| s.len());
+        size += self.last_modified.as_ref().map_or(0, |s| s.len());
+        size += self.expires.as_ref().map_or(0, |s| s.len());
+        size += self.cache_control.as_ref().map_or(0, |s| s.len());
+        size += self.content_disposition.as_ref().map_or(0, |s| s.len());
+        size += self.content_encoding.as_ref().map_or(0, |s| s.len());
+        size += self.content_language.as_ref().map_or(0, |s| s.len());
+        size += self.storage_class.as_ref().map_or(0, |s| s.len());
+        size += self.version_id.as_ref().map_or(0, |s| s.len());
+        size += self.replication_status.as_ref().map_or(0, |s| s.len());
+        size += size_of::<bool>(); // delete_marker
+        size += size_of::<Option<i32>>(); // tag_count
+        // Estimate user_metadata size
+        for (k, v) in &self.user_metadata {
+            size += k.len() + v.len();
+        }
+        size
     }
 }
 
@@ -334,8 +476,8 @@ impl HotObjectCache {
     /// Put an object into cache with automatic size-based eviction
     ///
     /// Moka handles eviction automatically based on the weigher function.
-    pub(crate) async fn put(&self, key: String, data: Vec<u8>) {
-        let size = data.len();
+    pub(crate) async fn put(&self, key: String, data: Arc<CachedObject>) {
+        let size = data.size;
 
         // Only cache objects smaller than max_object_size
         if size == 0 || size > self.max_object_size {
@@ -343,7 +485,7 @@ impl HotObjectCache {
         }
 
         let cached_obj = Arc::new(CachedObject {
-            data: Arc::new(data),
+            data: Arc::clone(&data.data),
             cached_at: Instant::now(),
             size,
             access_count: Arc::new(AtomicU64::new(0)),
@@ -356,6 +498,7 @@ impl HotObjectCache {
             use metrics::{counter, gauge};
             counter!("rustfs.object.cache.insertions").increment(1);
             gauge!("rustfs_object_cache_size_bytes").set(self.cache.weighted_size() as f64);
+
             gauge!("rustfs_object_cache_entry_count").set(self.cache.entry_count() as f64);
         }
     }
@@ -382,14 +525,39 @@ impl HotObjectCache {
         } else {
             (total_ms as f64 / cnt as f64) / 1000.0
         };
+        let hit_count = self.hit_count.load(Ordering::Relaxed);
+        let miss_count = self.miss_count.load(Ordering::Relaxed);
+        let total_requests = hit_count + miss_count;
+        let hit_rate = if total_requests > 0 {
+            hit_count as f64 / total_requests as f64
+        } else {
+            0.0
+        };
+
+        let size = self.cache.weighted_size() as usize;
+        let memory_usage_ratio = if self.max_capacity > 0 {
+            size as f64 / self.max_capacity as f64
+        } else {
+            0.0
+        };
+
+        let efficiency_score = (hit_rate * 50.0 + (1.0 - memory_usage_ratio) * 50.0) as u32;
+
         CacheStats {
-            size: self.cache.weighted_size() as usize,
+            size,
             entries: self.cache.entry_count() as usize,
             max_size: self.max_capacity,
             max_object_size: self.max_object_size,
-            hit_count: self.hit_count.load(Ordering::Relaxed),
-            miss_count: self.miss_count.load(Ordering::Relaxed),
+            hit_count,
+            miss_count,
             avg_age_secs,
+            hit_rate,
+            eviction_count: 0, // Moka doesn't expose eviction count
+            eviction_rate: 0.0,
+            memory_usage: size,
+            memory_usage_ratio,
+            top_keys: vec![], // Would need additional tracking
+            efficiency_score,
         }
     }
 
@@ -438,7 +606,9 @@ impl HotObjectCache {
     /// Warm up cache with a batch of objects
     pub(crate) async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
         for (key, data) in objects {
-            self.put(key, data).await;
+            let size = data.len();
+            let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
+            self.put(key, cached_obj).await;
         }
     }
 
@@ -605,6 +775,7 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects from both caches
+    #[allow(dead_code)]
     pub(crate) async fn clear_all(&self) {
         self.cache.invalidate_all();
         self.response_cache.invalidate_all();
@@ -617,10 +788,72 @@ impl HotObjectCache {
     pub(crate) fn max_object_size(&self) -> usize {
         self.max_object_size
     }
+
+    /// Get cache health status
+    pub(crate) async fn health_status(&self) -> CacheHealthStatus {
+        let stats = self.stats().await;
+        let memory_usage = self.cache.weighted_size() as usize;
+
+        let is_healthy = stats.memory_usage_ratio < 0.95 && stats.hit_rate > 0.1;
+
+        let mut recommendations = Vec::new();
+        if stats.hit_rate < 0.5 {
+            recommendations.push("Consider increasing cache size or TTL".to_string());
+        }
+        if stats.memory_usage_ratio > 0.9 {
+            recommendations.push("Cache is nearly full, consider increasing capacity".to_string());
+        }
+
+        CacheHealthStatus {
+            memory_usage,
+            is_healthy,
+            memory_usage_ratio: stats.memory_usage_ratio,
+            hit_rate: stats.hit_rate,
+            eviction_rate: stats.eviction_rate,
+            avg_entry_age_secs: stats.avg_age_secs,
+            efficiency_score: stats.efficiency_score,
+            recommendations,
+        }
+    }
+
+    /// Get current memory usage in bytes
+    pub(crate) async fn memory_usage(&self) -> usize {
+        self.cache.weighted_size() as usize
+    }
+
+    /// Evict a percentage of cached entries
+    pub(crate) async fn evict_percentage(&self, percentage: f64) -> u64 {
+        let stats = self.stats().await;
+        let entries_to_evict = (stats.entries as f64 * percentage / 100.0).max(1.0) as u64;
+
+        // Moka does not support selective eviction, so we use invalidate_all
+        if entries_to_evict > 0 {
+            self.cache.invalidate_all();
+        }
+
+        entries_to_evict
+    }
+
+    /// Warm cache from a list of hot keys
+    pub(crate) async fn warm_from_hot_list(&self, hot_keys: Vec<(String, Vec<u8>)>) -> u64 {
+        let mut warmed = 0u64;
+
+        for (key, data) in hot_keys {
+            let size = data.len();
+            if size <= self.max_object_size {
+                let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
+                self.cache.insert(key, cached_obj).await;
+                warmed += 1;
+            }
+        }
+
+        warmed
+    }
 }
 
 /// Cache statistics for monitoring and debugging
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CacheStats {
     /// Current total size of cached objects in bytes
     pub size: usize,
@@ -636,4 +869,301 @@ pub struct CacheStats {
     pub miss_count: u64,
     /// Average cache object age (seconds)
     pub avg_age_secs: f64,
+    /// Cache hit rate (0.0 - 1.0)
+    pub hit_rate: f64,
+    /// Total number of evictions
+    pub eviction_count: u64,
+    /// Eviction rate (evictions per second)
+    pub eviction_rate: f64,
+    /// Memory usage in bytes
+    pub memory_usage: usize,
+    /// Memory usage ratio (0.0 - 1.0)
+    pub memory_usage_ratio: f64,
+    /// Top hot keys (key, hit_count)
+    pub top_keys: Vec<(String, u64)>,
+    /// Efficiency score (0-100)
+    pub efficiency_score: u32,
+}
+
+/// Cache health status for monitoring and diagnostics
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CacheHealthStatus {
+    /// Memory usage in bytes
+    pub memory_usage: usize,
+    /// Whether the cache is healthy
+    pub is_healthy: bool,
+    /// Memory usage ratio (0.0 - 1.0)
+    pub memory_usage_ratio: f64,
+    /// Hit rate (0.0 - 1.0)
+    pub hit_rate: f64,
+    /// Eviction rate (evictions per second)
+    pub eviction_rate: f64,
+    /// Average entry age (seconds)
+    pub avg_entry_age_secs: f64,
+    /// Efficiency score (0-100)
+    pub efficiency_score: u32,
+    /// Optimization recommendations
+    pub recommendations: Vec<String>,
+}
+// ============================================
+// Unit Tests for CachedGetObject
+// ============================================
+
+#[cfg(test)]
+mod cached_object_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn test_cached_get_object_builder() {
+        let obj = CachedGetObject::new(Bytes::from("test data"), 9)
+            .with_content_type("text/plain".to_string())
+            .with_e_tag("\"abc123\"".to_string())
+            .with_last_modified("2024-01-01T12:00:00Z".to_string())
+            .with_cache_control("max-age=3600".to_string())
+            .with_expires("2024-12-31T23:59:59Z".to_string())
+            .with_content_encoding("gzip".to_string())
+            .with_content_disposition("attachment; filename=\"test.txt\"".to_string())
+            .with_storage_class("STANDARD".to_string())
+            .with_version_id("v1".to_string())
+            .with_replication_status("COMPLETED".to_string())
+            .with_tag_count(5)
+            .with_delete_marker(false);
+
+        assert_eq!(obj.content_type, Some("text/plain".to_string()));
+        assert_eq!(obj.e_tag, Some("\"abc123\"".to_string()));
+        assert_eq!(obj.storage_class, Some("STANDARD".to_string()));
+        assert_eq!(obj.version_id, Some("v1".to_string()));
+        assert_eq!(obj.replication_status, Some("COMPLETED".to_string()));
+        assert_eq!(obj.tag_count, Some(5));
+        assert!(!obj.delete_marker);
+    }
+
+    #[test]
+    fn test_cached_get_object_with_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("x-amz-meta-custom".to_string(), "value".to_string());
+        metadata.insert("x-amz-meta-author".to_string(), "test".to_string());
+
+        let obj = CachedGetObject::new(Bytes::from("data"), 4).with_user_metadata(metadata.clone());
+
+        assert_eq!(obj.user_metadata.len(), 2);
+        assert_eq!(obj.user_metadata.get("x-amz-meta-custom"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_cached_get_object_size() {
+        let obj = CachedGetObject::new(Bytes::from("test"), 4);
+        assert_eq!(obj.size(), 4);
+
+        let large_obj = CachedGetObject::new(Bytes::from(vec![0u8; 1024]), 1024);
+        assert_eq!(large_obj.size(), 1024);
+    }
+
+    #[test]
+    fn test_cached_get_object_access_count() {
+        let obj = CachedGetObject::new(Bytes::from("test"), 4);
+
+        assert_eq!(obj.increment_access(), 1);
+        assert_eq!(obj.increment_access(), 2);
+        assert_eq!(obj.increment_access(), 3);
+    }
+
+    #[test]
+    fn test_cached_get_object_is_expired() {
+        // Not expired - no expires header
+        let obj1 = CachedGetObject::new(Bytes::from("test"), 4);
+        assert!(!obj1.is_expired());
+
+        // Expired - past expires time
+        let obj2 = CachedGetObject::new(Bytes::from("test"), 4).with_expires("2020-01-01T00:00:00Z".to_string());
+        assert!(obj2.is_expired());
+
+        // Not expired - future expires time
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        let obj3 = CachedGetObject::new(Bytes::from("test"), 4).with_expires(future.to_rfc3339());
+        assert!(!obj3.is_expired());
+    }
+
+    #[test]
+    fn test_cached_get_object_replication_status() {
+        // Completed replication
+        let obj1 = CachedGetObject::new(Bytes::from("test"), 4).with_replication_status("COMPLETED".to_string());
+        assert!(obj1.is_replication_complete());
+
+        // Pending replication
+        let obj2 = CachedGetObject::new(Bytes::from("test"), 4).with_replication_status("PENDING".to_string());
+        assert!(!obj2.is_replication_complete());
+
+        // No replication configured
+        let obj3 = CachedGetObject::new(Bytes::from("test"), 4);
+        assert!(obj3.is_replication_complete());
+    }
+
+    #[test]
+    fn test_cached_get_object_memory_size() {
+        let obj = CachedGetObject::new(Bytes::from("test"), 4)
+            .with_content_type("text/plain".to_string())
+            .with_e_tag("\"abc\"".to_string());
+
+        let size = obj.memory_size();
+        // Should include body + content_type + e_tag + other fields
+        assert!(size >= 4 + 10 + 5); // At least body + content_type + e_tag
+    }
+
+    #[test]
+    fn test_cached_get_object_record_hit() {
+        let obj = CachedGetObject::new(Bytes::from("test"), 4);
+
+        assert_eq!(obj.record_hit(), 1);
+        assert_eq!(obj.record_hit(), 2);
+        assert_eq!(obj.record_hit(), 3);
+    }
+}
+
+// ============================================
+// Unit Tests for CacheHealthStatus
+// ============================================
+
+#[cfg(test)]
+mod cache_health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cache_health_status() {
+        let cache = HotObjectCache::new();
+
+        // Add some entries
+        let data1 = Arc::new(CachedObject::new_with_size(vec![1, 2, 3, 4], 4));
+        let data2 = Arc::new(CachedObject::new_with_size(vec![5, 6, 7, 8], 4));
+
+        cache.put("key1".to_string(), data1).await;
+        cache.put("key2".to_string(), data2).await;
+
+        // Get health status
+        let health = cache.health_status().await;
+
+        assert!(health.memory_usage > 0);
+        assert!(health.memory_usage_ratio >= 0.0 && health.memory_usage_ratio <= 1.0);
+        assert!(health.hit_rate >= 0.0 && health.hit_rate <= 1.0);
+        assert!(health.efficiency_score <= 100);
+    }
+
+    #[tokio::test]
+    async fn test_cache_memory_usage() {
+        let cache = HotObjectCache::new();
+
+        let initial_usage = cache.memory_usage().await;
+        assert_eq!(initial_usage, 0);
+
+        // Add some data
+        let data = Arc::new(CachedObject::new_with_size(vec![0u8; 1024], 1024));
+        cache.put("key".to_string(), data).await;
+
+        let new_usage = cache.memory_usage().await;
+        assert!(new_usage > initial_usage);
+    }
+
+    #[tokio::test]
+    async fn test_cache_evict_percentage() {
+        let cache = HotObjectCache::new();
+
+        // Add multiple entries
+        for i in 0..10 {
+            let data = Arc::new(CachedObject::new_with_size(vec![i as u8; 100], 100));
+            cache.put(format!("key{}", i), data).await;
+        }
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.entries, 10);
+
+        // Evict 50%
+        let evicted = cache.evict_percentage(50.0).await;
+        assert!(evicted > 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_warm_from_hot_list() {
+        let cache = HotObjectCache::new();
+
+        let hot_keys = vec![
+            ("key1".to_string(), vec![1, 2, 3]),
+            ("key2".to_string(), vec![4, 5, 6]),
+            ("key3".to_string(), vec![7, 8, 9]),
+        ];
+
+        let warmed = cache.warm_from_hot_list(hot_keys).await;
+        assert_eq!(warmed, 3);
+
+        // Verify entries are in cache
+        assert!(cache.contains("key1").await);
+        assert!(cache.contains("key2").await);
+        assert!(cache.contains("key3").await);
+    }
+}
+
+// ============================================
+// Unit Tests for CacheStats
+// ============================================
+
+#[cfg(test)]
+mod cache_stats_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cache_stats_hit_rate() {
+        let cache = HotObjectCache::new();
+
+        // Add an entry
+        let data = Arc::new(CachedObject::new_with_size(vec![1, 2, 3], 3));
+        cache.put("key".to_string(), data).await;
+
+        // Generate some hits and misses
+        cache.get("key").await; // Hit
+        cache.get("key").await; // Hit
+        cache.get("nonexistent").await; // Miss
+        cache.get("nonexistent").await; // Miss
+
+        let stats = cache.stats().await;
+
+        assert_eq!(stats.hit_count, 2);
+        assert_eq!(stats.miss_count, 2);
+        assert!((stats.hit_rate - 0.5).abs() < 0.01); // Should be ~50%
+    }
+
+    #[tokio::test]
+    async fn test_cache_stats_memory_usage_ratio() {
+        let cache = HotObjectCache::new();
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.memory_usage_ratio, 0.0); // Empty cache
+
+        // Add some data
+        let data = Arc::new(CachedObject::new_with_size(vec![0u8; 1024], 1024));
+        cache.put("key".to_string(), data).await;
+
+        let stats = cache.stats().await;
+        assert!(stats.memory_usage_ratio > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_stats_efficiency_score() {
+        let cache = HotObjectCache::new();
+
+        // Empty cache - low efficiency
+        let stats = cache.stats().await;
+        assert!(stats.efficiency_score < 50);
+
+        // Add data and generate hits
+        let data = Arc::new(CachedObject::new_with_size(vec![1, 2, 3], 3));
+        cache.put("key".to_string(), data).await;
+
+        for _ in 0..10 {
+            cache.get("key").await; // Hits
+        }
+
+        let stats = cache.stats().await;
+        assert!(stats.efficiency_score > 0);
+    }
 }

@@ -14,8 +14,11 @@
 
 //! Concurrency manager for coordinating concurrent GetObject requests.
 
-use super::io_schedule::{IoLoadLevel, IoLoadMetrics, IoPriority, IoQueueStatus, IoStrategy, get_advanced_buffer_size};
-use super::object_cache::{CacheStats, CachedGetObject, HotObjectCache};
+use super::io_schedule::{
+    IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
+    get_advanced_buffer_size,
+};
+use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache};
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,6 +39,9 @@ pub struct ConcurrencyManager {
     cache_enabled: bool,
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
+    /// I/O priority queue for request scheduling
+    #[allow(dead_code)]
+    priority_queue: Arc<IoPriorityQueue<()>>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -73,6 +79,7 @@ impl ConcurrencyManager {
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
+            priority_queue: Arc::new(IoPriorityQueue::new(IoPriorityQueueConfig::default())),
         }
     }
 
@@ -102,7 +109,9 @@ impl ConcurrencyManager {
 
     /// Cache an object for future retrievals
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
-        self.cache.put(key, data).await;
+        let size = data.len();
+        let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
+        self.cache.put(key, cached_obj).await;
     }
 
     /// Acquire a permit to perform a disk read operation
@@ -478,6 +487,10 @@ impl ConcurrencyManager {
             high_priority_waiting: 0, // Would need additional tracking
             normal_priority_waiting: 0,
             low_priority_waiting: 0,
+            high_priority_processed: 0,
+            normal_priority_processed: 0,
+            low_priority_processed: 0,
+            starvation_events: 0,
         }
     }
 
@@ -522,5 +535,171 @@ impl ConcurrencyManager {
 impl Default for ConcurrencyManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================
+// Integration Tests for ConcurrencyManager
+// ============================================
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn test_concurrency_manager_priority_queue_integration() {
+        let manager = ConcurrencyManager::new();
+
+        // Test priority determination
+        let small_size = 100 * 1024; // 100KB
+        let large_size = 200 * 1024 * 1024; // 200MB
+
+        let small_priority = manager.get_io_priority(small_size as i64);
+        let large_priority = manager.get_io_priority(large_size as i64);
+
+        assert_eq!(small_priority, IoPriority::High);
+        assert_eq!(large_priority, IoPriority::Low);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_cache_operations() {
+        let manager = ConcurrencyManager::new();
+
+        // Test cache put and get
+        let obj = CachedGetObject::new(Bytes::from("test data"), 9)
+            .with_content_type("text/plain".to_string())
+            .with_e_tag("\"abc123\"".to_string());
+
+        manager.put_cached_object("test-key".to_string(), obj).await;
+
+        let cached = manager.get_cached_object("test-key").await;
+        assert!(cached.is_some());
+
+        let cached_obj = cached.unwrap();
+        assert_eq!(cached_obj.content_type, Some("text/plain".to_string()));
+        assert_eq!(cached_obj.e_tag, Some("\"abc123\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_cache_stats() {
+        let manager = ConcurrencyManager::new();
+
+        // Add some objects
+        for i in 0..5 {
+            let obj = CachedGetObject::new(Bytes::from(format!("data{}", i)), 5);
+            manager.put_cached_object(format!("key{}", i), obj).await;
+        }
+
+        // Get stats
+        let stats = manager.cache_stats().await;
+        assert!(stats.entries >= 5);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_io_queue_status() {
+        let manager = ConcurrencyManager::new();
+
+        let status = manager.io_queue_status();
+
+        // Initial state should have no waiting requests
+        assert_eq!(status.high_priority_waiting, 0);
+        assert_eq!(status.normal_priority_waiting, 0);
+        assert_eq!(status.low_priority_waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_disk_read_permit() {
+        let manager = ConcurrencyManager::new();
+
+        // Acquire permit
+        let permit = manager.acquire_disk_read_permit().await;
+        assert!(permit.is_ok());
+
+        // Permit should be released when dropped
+        drop(permit);
+
+        // Should be able to acquire again
+        let permit2 = manager.acquire_disk_read_permit().await;
+        assert!(permit2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_priority_scheduling() {
+        let manager = ConcurrencyManager::new();
+
+        // Test if priority scheduling is enabled
+        let enabled = manager.is_priority_scheduling_enabled();
+        assert!(enabled); // Should be enabled by default
+
+        // Test priority determination for different sizes
+        assert_eq!(manager.get_io_priority(500 * 1024), IoPriority::High); // 500KB
+        assert_eq!(manager.get_io_priority(5 * 1024 * 1024), IoPriority::Normal); // 5MB
+        assert_eq!(manager.get_io_priority(50 * 1024 * 1024), IoPriority::Low); // 50MB
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_cache_invalidation() {
+        let manager = ConcurrencyManager::new();
+
+        // Add an object
+        let obj = CachedGetObject::new(Bytes::from("test"), 4);
+        manager.put_cached_object("test-key".to_string(), obj).await;
+
+        // Verify it's cached
+        assert!(manager.is_cached("test-key").await);
+
+        // Invalidate
+        manager.invalidate_cache("test-key").await;
+
+        // Should not be cached anymore
+        assert!(!manager.is_cached("test-key").await);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_cache_clear() {
+        let manager = ConcurrencyManager::new();
+
+        // Add multiple objects
+        for i in 0..10 {
+            let obj = CachedGetObject::new(Bytes::from(format!("data{}", i)), 5);
+            manager.put_cached_object(format!("key{}", i), obj).await;
+        }
+
+        // Clear cache
+        manager.clear_cache().await;
+
+        // Verify all are removed
+        let stats = manager.cache_stats().await;
+        assert_eq!(stats.entries, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_io_strategy() {
+        let manager = ConcurrencyManager::new();
+
+        // Test I/O strategy calculation
+        let low_wait = std::time::Duration::from_millis(5);
+        let high_wait = std::time::Duration::from_millis(100);
+
+        let strategy_low = manager.calculate_io_strategy(low_wait, 128 * 1024);
+        let strategy_high = manager.calculate_io_strategy(high_wait, 128 * 1024);
+
+        // Under low load, should use larger buffers
+        assert!(strategy_low.buffer_size >= strategy_high.buffer_size);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_manager_adaptive_buffer_size() {
+        let manager = ConcurrencyManager::new();
+
+        let base_size = 128 * 1024; // 128KB
+
+        // Test adaptive buffer sizing
+        let size1 = manager.adaptive_buffer_size(base_size);
+
+        // Should return a reasonable buffer size
+        assert!(size1 > 0);
+        assert!(size1 <= 2 * 1024 * 1024); // Not more than 2MB
     }
 }

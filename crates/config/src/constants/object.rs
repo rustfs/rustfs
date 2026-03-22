@@ -333,3 +333,112 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
+
+// ============================================================================
+// I/O priority scheduling configuration
+// ============================================================================
+
+/// Environment variable for I/O high priority size threshold in bytes.
+///
+/// Requests smaller than this threshold are classified as high priority.
+/// High priority requests are processed first to prevent starvation of small requests.
+///
+/// Default: 1048576 (1 MB, can be overridden by `RUSTFS_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD`).
+pub const ENV_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD: &str = "RUSTFS_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD";
+
+/// Default high priority size threshold: 1 MB.
+pub const DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD: usize = 1024 * 1024;
+
+/// Environment variable for I/O low priority size threshold in bytes.
+///
+/// Requests larger than this threshold are classified as low priority.
+/// Low priority requests are processed last to avoid blocking small requests.
+///
+/// Default: 104857600 (100 MB, can be overridden by `RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD`).
+pub const ENV_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: &str = "RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD";
+
+/// Default low priority size threshold: 100 MB.
+pub const DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: usize = 100 * 1024 * 1024;
+
+/// Environment variable for high priority queue capacity.
+///
+/// Maximum number of requests that can be queued in the high priority queue.
+///
+/// Default: 32 (can be overridden by `RUSTFS_OBJECT_IO_QUEUE_HIGH_CAPACITY`).
+pub const ENV_OBJECT_IO_QUEUE_HIGH_CAPACITY: &str = "RUSTFS_OBJECT_IO_QUEUE_HIGH_CAPACITY";
+
+/// Default high priority queue capacity: 32.
+pub const DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY: usize = 32;
+
+/// Environment variable for normal priority queue capacity.
+///
+/// Maximum number of requests that can be queued in the normal priority queue.
+///
+/// Default: 64 (can be overridden by `RUSTFS_OBJECT_IO_QUEUE_NORMAL_CAPACITY`).
+pub const ENV_OBJECT_IO_QUEUE_NORMAL_CAPACITY: &str = "RUSTFS_OBJECT_IO_QUEUE_NORMAL_CAPACITY";
+
+/// Default normal priority queue capacity: 64.
+pub const DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY: usize = 64;
+
+/// Environment variable for low priority queue capacity.
+///
+/// Maximum number of requests that can be queued in the low priority queue.
+///
+/// Default: 16 (can be overridden by `RUSTFS_OBJECT_IO_QUEUE_LOW_CAPACITY`).
+pub const ENV_OBJECT_IO_QUEUE_LOW_CAPACITY: &str = "RUSTFS_OBJECT_IO_QUEUE_LOW_CAPACITY";
+
+/// Default low priority queue capacity: 16.
+pub const DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY: usize = 16;
+
+/// Environment variable for starvation prevention check interval in milliseconds.
+///
+/// How often the system checks for starving low-priority requests.
+/// When a low-priority request has been waiting longer than the starvation threshold,
+/// it is promoted to normal priority.
+///
+/// Default: 100 ms (can be overridden by `RUSTFS_OBJECT_IO_STARVATION_PREVENTION_INTERVAL`).
+pub const ENV_OBJECT_IO_STARVATION_PREVENTION_INTERVAL: &str = "RUSTFS_OBJECT_IO_STARVATION_PREVENTION_INTERVAL";
+
+/// Default starvation prevention interval: 100 ms.
+pub const DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL: u64 = 100;
+
+/// Environment variable for starvation threshold in seconds.
+///
+/// Maximum time a low-priority request can wait before being promoted to normal priority.
+/// This prevents indefinite starvation of low-priority requests.
+///
+/// Default: 5 seconds (can be overridden by `RUSTFS_OBJECT_IO_STARVATION_THRESHOLD_SECS`).
+pub const ENV_OBJECT_IO_STARVATION_THRESHOLD_SECS: &str = "RUSTFS_OBJECT_IO_STARVATION_THRESHOLD_SECS";
+
+/// Default starvation threshold: 5 seconds.
+pub const DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS: u64 = 5;
+
+/// Environment variable for load sampling window size.
+///
+/// Number of recent samples used to calculate I/O load metrics.
+///
+/// Default: 100 samples (can be overridden by `RUSTFS_OBJECT_IO_LOAD_SAMPLE_WINDOW`).
+pub const ENV_OBJECT_IO_LOAD_SAMPLE_WINDOW: &str = "RUSTFS_OBJECT_IO_LOAD_SAMPLE_WINDOW";
+
+/// Default load sampling window: 100 samples.
+pub const DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW: usize = 100;
+
+/// Environment variable for high load wait time threshold in milliseconds.
+///
+/// When average wait time exceeds this threshold, the system is considered to be under high load.
+///
+/// Default: 50 ms (can be overridden by `RUSTFS_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS`).
+pub const ENV_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS: &str = "RUSTFS_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS";
+
+/// Default high load threshold: 50 ms.
+pub const DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS: u64 = 50;
+
+/// Environment variable for low load wait time threshold in milliseconds.
+///
+/// When average wait time is below this threshold, the system is considered to be under low load.
+///
+/// Default: 10 ms (can be overridden by `RUSTFS_OBJECT_IO_LOAD_LOW_THRESHOLD_MS`).
+pub const ENV_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: &str = "RUSTFS_OBJECT_IO_LOAD_LOW_THRESHOLD_MS";
+
+/// Default low load threshold: 10 ms.
+pub const DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: u64 = 10;

@@ -27,7 +27,8 @@ pub mod request_guard;
 // I/O scheduling types
 #[allow(unused_imports)]
 pub use io_schedule::{
-    IoLoadLevel, IoPriority, IoQueueStatus, IoStrategy, get_advanced_buffer_size, get_concurrency_aware_buffer_size,
+    IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
+    IoStrategy, get_advanced_buffer_size, get_concurrency_aware_buffer_size,
 };
 
 // Request tracking
@@ -35,7 +36,7 @@ pub use request_guard::GetObjectGuard;
 
 // Cache types
 #[allow(unused_imports)]
-pub use object_cache::{CacheStats, CachedGetObject};
+pub use object_cache::{CacheHealthStatus, CacheStats, CachedGetObject};
 
 // Concurrency manager
 pub use manager::ConcurrencyManager;

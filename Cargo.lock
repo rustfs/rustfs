@@ -7270,6 +7270,7 @@ dependencies = [
  "base64 0.22.1",
  "base64-simd",
  "bytes",
+ "chrono",
  "clap",
  "const-str",
  "datafusion",
