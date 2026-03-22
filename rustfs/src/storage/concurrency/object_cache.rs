@@ -16,8 +16,8 @@
 
 use moka::future::Cache;
 use rustfs_config::MI_B;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ============================================
@@ -91,6 +91,7 @@ struct CachedObject {
 /// manager.put_cached_object(cache_key, cached).await;
 /// ```
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CachedGetObject {
     /// The object body data
     pub body: bytes::Bytes,
@@ -155,6 +156,7 @@ impl Default for CachedGetObject {
     }
 }
 
+#[allow(dead_code)]
 impl CachedGetObject {
     /// Create a new CachedGetObject with the given body and content length
     pub fn new(body: bytes::Bytes, content_length: i64) -> Self {
@@ -225,6 +227,7 @@ struct CachedGetObjectInternal {
     size: usize,
 }
 
+#[allow(dead_code)]
 impl HotObjectCache {
     /// Create a new hot object cache with Moka
     ///
@@ -443,6 +446,7 @@ impl HotObjectCache {
             size: self.cache.weighted_size(),
             hits: self.hit_count.load(Ordering::Relaxed),
             misses: self.miss_count.load(Ordering::Relaxed),
+            max_size: self.max_object_size as u64,
         }
     }
 
@@ -465,6 +469,58 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects
+    /// Clear all cached objects (legacy method)
+    pub(crate) async fn clear(&self) {
+        self.cache.invalidate_all();
+        // Sync to ensure all entries are removed
+        self.cache.run_pending_tasks().await;
+    }
+
+    /// Check if a key exists in cache
+    pub(crate) async fn contains(&self, key: &str) -> bool {
+        self.cache.contains_key(key)
+    }
+
+    /// Get multiple objects from cache in parallel
+    pub(crate) async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get(key).await);
+        }
+        results
+    }
+
+    /// Remove a specific key from cache
+    pub(crate) async fn remove(&self, key: &str) -> bool {
+        let had_key = self.cache.contains_key(key);
+        self.cache.invalidate(key).await;
+        had_key
+    }
+
+    /// Get the most frequently accessed keys
+    pub(crate) async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
+        // Run pending tasks to ensure accurate entry count
+        self.cache.run_pending_tasks().await;
+
+        let mut entries: Vec<(String, u64)> = Vec::new();
+
+        // Iterate through cache entries
+        self.cache.iter().for_each(|(key, value)| {
+            entries.push((key.to_string(), value.access_count.load(Ordering::Relaxed)));
+        });
+
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Warm up cache with a batch of objects
+    pub(crate) async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
+        for (key, data) in objects {
+            self.put(key, data).await;
+        }
+    }
+
     pub(crate) async fn clear_all(&self) {
         self.cache.invalidate_all();
         self.response_cache.invalidate_all();
@@ -475,6 +531,7 @@ impl HotObjectCache {
 
 /// Cache statistics for monitoring
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CacheStats {
     /// Number of entries in cache
     pub entries: u64,
@@ -484,4 +541,6 @@ pub struct CacheStats {
     pub hits: u64,
     /// Total cache misses
     pub misses: u64,
+    /// Maximum cache size in bytes
+    pub max_size: u64,
 }

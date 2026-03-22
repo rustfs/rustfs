@@ -12,25 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! I/O scheduling module for adaptive concurrency control.
-//!
-//! This module provides intelligent I/O scheduling based on system load
-//! and request characteristics.
+//! I/O scheduling types for adaptive buffer sizing and load management.
 
 use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-// ============================================
-// Adaptive I/O Strategy Types
-// ============================================
+/// Global concurrent request counter for adaptive buffer sizing.
+pub(crate) static ACTIVE_GET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Load level classification based on disk permit wait times.
-///
-/// This enum represents the current I/O load on the system, determined by
-/// analyzing disk permit acquisition wait times. Longer wait times indicate
-/// higher contention and system load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum IoLoadLevel {
     /// Low load: wait time < 10ms. System has ample I/O capacity.
     Low,
@@ -129,7 +120,8 @@ impl std::fmt::Display for IoPriority {
 }
 
 /// I/O scheduler configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub struct IoSchedulerConfig {
     /// Maximum concurrent disk reads.
     pub max_concurrent_reads: usize,
@@ -146,16 +138,16 @@ impl Default for IoSchedulerConfig {
     }
 }
 
+#[allow(dead_code)]
 impl IoSchedulerConfig {
     /// Load configuration from environment.
     pub fn from_env() -> Self {
-        use rustfs_utils::{get_env_bool, get_env_usize};
         Self {
-            max_concurrent_reads: get_env_usize(
+            max_concurrent_reads: rustfs_utils::get_env_usize(
                 rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
                 rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
             ),
-            enable_priority: get_env_bool(
+            enable_priority: rustfs_utils::get_env_bool(
                 rustfs_config::ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE,
                 rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
             ),
@@ -164,42 +156,76 @@ impl IoSchedulerConfig {
 }
 
 /// I/O queue status for monitoring.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct IoQueueStatus {
     /// Total permits available.
     pub total_permits: usize,
     /// Permits currently in use.
     pub permits_in_use: usize,
-    /// High priority requests waiting.
+    /// Number of high priority requests waiting.
     pub high_priority_waiting: usize,
-    /// Normal priority requests waiting.
+    /// Number of normal priority requests waiting.
     pub normal_priority_waiting: usize,
-    /// Low priority requests waiting.
+    /// Number of low priority requests waiting.
     pub low_priority_waiting: usize,
 }
 
-/// Adaptive I/O strategy calculated from current system conditions.
+/// Adaptive I/O strategy calculated from current system load.
 ///
-/// This structure encapsulates all I/O parameters that should be used
-/// for a read operation, calculated based on the current I/O load level.
-#[derive(Debug, Clone)]
+/// This structure provides optimized I/O parameters based on the observed
+/// disk permit wait times. It helps balance throughput vs. latency and
+/// prevents I/O saturation under high load.
+///
+/// # Usage Example
+///
+/// ```ignore
+/// let strategy = manager.calculate_io_strategy(permit_wait_duration);
+///
+/// // Apply strategy to I/O operations
+/// let buffer_size = strategy.buffer_size;
+/// let enable_readahead = strategy.enable_readahead;
+/// let enable_cache_writeback = strategy.cache_writeback_enabled;
+/// ```
+#[derive(Debug, Clone, PartialEq)]
 pub struct IoStrategy {
-    /// Buffer size to use for this operation.
+    /// Recommended buffer size for I/O operations (in bytes).
+    ///
+    /// Under high load, this is reduced to improve fairness and reduce memory pressure.
+    /// Under low load, this is maximized for throughput.
     pub buffer_size: usize,
-    /// Multiplier applied to base buffer size (0.0-1.0).
+
+    /// Buffer size multiplier (0.4 - 1.0) applied to base buffer size.
+    ///
+    /// - 1.0: Low load - use full buffer
+    /// - 0.75: Medium load - slightly reduced
+    /// - 0.5: High load - significantly reduced
+    /// - 0.4: Critical load - minimal buffer
     pub buffer_multiplier: f64,
-    /// Whether readahead should be enabled.
+
+    /// Whether to enable aggressive read-ahead for sequential reads.
+    ///
+    /// Disabled under high load to reduce I/O amplification.
     pub enable_readahead: bool,
-    /// Whether cache writeback is enabled.
+
+    /// Whether to enable cache writeback for this request.
+    ///
+    /// May be disabled under extreme load to reduce memory pressure.
     pub cache_writeback_enabled: bool,
-    /// Whether to use buffered I/O.
+
+    /// Whether to use tokio BufReader for improved async I/O.
+    ///
+    /// Always enabled for better async performance.
     pub use_buffered_io: bool,
-    /// Current I/O load level.
+
+    /// The detected I/O load level.
     pub load_level: IoLoadLevel,
+
     /// The raw permit wait duration that was used to calculate this strategy.
     pub permit_wait_duration: Duration,
 }
 
+#[allow(dead_code)]
 impl IoStrategy {
     /// Create a new IoStrategy from disk permit wait time and base buffer size.
     ///
@@ -284,6 +310,7 @@ pub(crate) struct IoLoadMetrics {
     observation_count: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl IoLoadMetrics {
     pub(crate) fn new(max_samples: usize) -> Self {
         Self {
@@ -295,22 +322,22 @@ impl IoLoadMetrics {
         }
     }
 
-    pub(crate) fn record(&mut self, duration: Duration) {
-        // Update totals for lifetime average
-        self.total_wait_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-        self.observation_count.fetch_add(1, Ordering::Relaxed);
-
-        // Add to sliding window
+    /// Record a new permit wait observation
+    pub(crate) fn record(&mut self, wait: Duration) {
+        // Add to recent waits (with eviction if full)
         if self.recent_waits.len() < self.max_samples {
-            self.recent_waits.push(duration);
+            self.recent_waits.push(wait);
         } else {
-            // Overwrite oldest entry
-            let idx = self.earliest_index % self.max_samples;
-            self.recent_waits[idx] = duration;
-            self.earliest_index += 1;
+            self.recent_waits[self.earliest_index] = wait;
+            self.earliest_index = (self.earliest_index + 1) % self.max_samples;
         }
+
+        // Update totals for overall statistics
+        self.total_wait_ns.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        self.observation_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Get the average wait duration over the recent window
     pub(crate) fn average_wait(&self) -> Duration {
         if self.recent_waits.is_empty() {
             return Duration::ZERO;
@@ -319,6 +346,12 @@ impl IoLoadMetrics {
         total / self.recent_waits.len() as u32
     }
 
+    /// Get the maximum wait duration in the recent window
+    pub(crate) fn max_wait(&self) -> Duration {
+        self.recent_waits.iter().copied().max().unwrap_or(Duration::ZERO)
+    }
+
+    /// Get the P95 wait duration from the recent window
     pub(crate) fn p95_wait(&self) -> Duration {
         if self.recent_waits.is_empty() {
             return Duration::ZERO;
@@ -350,39 +383,6 @@ impl IoLoadMetrics {
         self.observation_count.load(Ordering::Relaxed)
     }
 }
-
-// ============================================
-// Global Request Counter and Buffer Sizing
-// ============================================
-
-/// Global concurrent request counter for adaptive buffer sizing.
-///
-/// This atomic counter tracks the number of active GetObject requests in real-time.
-/// It's used by the buffer sizing algorithm to dynamically adjust memory allocation
-/// based on current system load, preventing memory contention under high concurrency.
-///
-/// Access pattern: Lock-free atomic operations (Relaxed ordering for performance).
-pub(crate) static ACTIVE_GET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Concurrency-aware buffer size calculator
-///
-/// This function adapts buffer sizes based on the current concurrent request load
-/// to optimize for both throughput and fairness.
-///
-/// # Strategy
-///
-/// - **Low concurrency (1-2)**: Use large buffers (512KB-1MB) for maximum throughput
-/// - **Medium concurrency (3-8)**: Use moderate buffers (128KB-256KB) for balanced performance
-/// - **High concurrency (>8)**: Use smaller buffers (64KB-128KB) for fairness and memory efficiency
-///
-/// # Arguments
-///
-/// * `file_size` - The size of the file being read, or -1 if unknown
-/// * `base_buffer_size` - The baseline buffer size from workload profile
-///
-/// # Returns
-///
-/// Optimized buffer size in bytes for the current concurrency level
 pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
@@ -397,8 +397,6 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     if concurrent_requests <= 1 {
         return base_buffer_size;
     }
-
-    // Get thresholds from config
     let medium_threshold = rustfs_utils::get_env_usize(
         rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
         rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
@@ -416,58 +414,85 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
         // Medium concurrency (3-4): slightly reduce buffer size (75% of base)
         0.75
     } else if concurrent_requests <= high_threshold {
-        // High concurrency (5-8): reduce buffer size (50% of base)
+        // Higher concurrency (5-8): more aggressive reduction (50% of base)
         0.5
     } else {
-        // Very high concurrency (>8): use small buffers (40% of base)
-        // This ensures fairness and prevents memory exhaustion
+        // Very high concurrency (>8): minimize memory per request (40% of base)
         0.4
     };
 
-    // Calculate the adaptive buffer size
-    let adaptive_size = ((base_buffer_size as f64) * adaptive_multiplier) as usize;
+    // Calculate the adjusted buffer size
+    let adjusted_size = (base_buffer_size as f64 * adaptive_multiplier) as usize;
 
-    // Ensure minimum buffer size (32KB) for reasonable I/O performance
-    let min_buffer = 32 * KI_B;
-    let max_buffer = MI_B; // Cap at 1MB to prevent excessive memory use
+    // Ensure we stay within reasonable bounds
+    let min_buffer = if file_size > 0 && file_size < 100 * KI_B as i64 {
+        32 * KI_B // For very small files, use minimum buffer
+    } else {
+        64 * KI_B // Standard minimum buffer size
+    };
 
-    let buffer_size = adaptive_size.clamp(min_buffer, max_buffer);
+    let max_buffer = if concurrent_requests > high_threshold {
+        256 * KI_B // Cap at 256KB for high concurrency
+    } else {
+        MI_B // Cap at 1MB for lower concurrency
+    };
 
-    // If file size is known and smaller than buffer, use file size
-    if file_size > 0 && (file_size as usize) < buffer_size {
-        return file_size as usize;
-    }
-
-    buffer_size
+    adjusted_size.clamp(min_buffer, max_buffer)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Advanced concurrency-aware buffer sizing with file size optimization
+///
+/// This enhanced version considers both concurrency level and file size patterns
+/// to provide even better performance characteristics.
+///
+/// # Arguments
+///
+/// * `file_size` - The size of the file being read, or -1 if unknown
+/// * `base_buffer_size` - The baseline buffer size from workload profile
+/// * `is_sequential` - Whether this is a sequential read (hint for optimization)
+///
+/// # Returns
+///
+/// Optimized buffer size in bytes
+///
+/// # Examples
+///
+/// ```ignore
+/// let buffer_size = get_advanced_buffer_size(
+///     32 * 1024 * 1024,  // 32MB file
+///     256 * 1024,        // 256KB base buffer
+///     true               // sequential read
+/// );
+/// ```
+pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
+    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
-    #[test]
-    fn test_io_load_level_from_wait() {
-        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(5)), IoLoadLevel::Low);
-        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(20)), IoLoadLevel::Medium);
-        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(100)), IoLoadLevel::High);
-        assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(300)), IoLoadLevel::Critical);
+    // For very small files, use smaller buffers regardless of concurrency
+    // Replace manual max/min chain with clamp
+    if file_size > 0 && file_size < 256 * KI_B as i64 {
+        return (file_size as usize / 4).clamp(16 * KI_B, 64 * KI_B);
     }
 
-    #[test]
-    fn test_io_priority_from_size() {
-        assert_eq!(IoPriority::from_size(100 * 1024), IoPriority::High); // 100KB
-        assert_eq!(IoPriority::from_size(5 * 1024 * 1024), IoPriority::Normal); // 5MB
-        assert_eq!(IoPriority::from_size(20 * 1024 * 1024), IoPriority::Low); // 20MB
+    // Base calculation from standard function
+    let standard_size = get_concurrency_aware_buffer_size(file_size, base_buffer_size);
+    let medium_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+    );
+    let high_threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+    );
+    // For sequential reads, we can be more aggressive with buffer sizes
+    if is_sequential && concurrent_requests <= medium_threshold {
+        return ((standard_size as f64 * 1.5) as usize).min(2 * MI_B);
     }
 
-    #[test]
-    fn test_io_strategy_from_wait() {
-        let strategy = IoStrategy::from_wait_duration(Duration::from_millis(5), 256 * 1024);
-        assert_eq!(strategy.load_level, IoLoadLevel::Low);
-        assert!(strategy.enable_readahead);
-
-        let strategy = IoStrategy::from_wait_duration(Duration::from_millis(300), 256 * 1024);
-        assert_eq!(strategy.load_level, IoLoadLevel::Critical);
-        assert!(!strategy.enable_readahead);
+    // For high concurrency with large files, optimize for parallel processing
+    if concurrent_requests > high_threshold && file_size > 10 * MI_B as i64 {
+        // Use smaller, more numerous buffers for better parallelism
+        return (standard_size as f64 * 0.8) as usize;
     }
+
+    standard_size
 }

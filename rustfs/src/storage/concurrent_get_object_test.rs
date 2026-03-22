@@ -326,7 +326,7 @@ mod tests {
         let stats = manager.cache_stats().await;
         assert_eq!(stats.entries, 1, "Should have exactly 1 entry after insert");
         assert!(
-            stats.size >= data.len(),
+            stats.size >= data.len() as u64,
             "Cache size should be at least data length (may include overhead)"
         );
 
@@ -774,7 +774,7 @@ mod tests {
         // Verify cache stats
         let stats = manager.cache_stats().await;
         assert_eq!(stats.entries, 1, "Should have exactly 1 cached entry");
-        assert!(stats.size >= object_data.len(), "Cache size should reflect object size");
+        assert!(stats.size >= object_data.len() as u64, "Cache size should reflect object size");
 
         // Second access should hit cache
         let second_access = manager.get_cached(&cache_key).await;
