@@ -20,21 +20,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// ============================================
-// Hot Object Cache Types
-// ============================================
-
 /// Hot object cache for frequently accessed objects.
-///
-/// This cache uses Moka, a high-performance, lock-free cache library,
-/// to provide sub-5ms response times for frequently accessed objects.
-/// The cache automatically evicts entries based on size (100MB max),
-/// TTL (5 minutes), and TTI (2 minutes).
 pub(crate) struct HotObjectCache {
     /// Moka cache instance for simple byte data (legacy)
     cache: Cache<String, Arc<CachedObject>>,
     /// Moka cache instance for full GetObject responses with metadata
     response_cache: Cache<String, Arc<CachedGetObjectInternal>>,
+    /// Maximum total cache capacity in bytes
+    max_capacity: usize,
     /// Maximum size of individual objects to cache (10MB by default)
     max_object_size: usize,
     /// Global cache hit counter
@@ -47,6 +40,7 @@ impl std::fmt::Debug for HotObjectCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use std::sync::atomic::Ordering;
         f.debug_struct("HotObjectCache")
+            .field("max_capacity", &self.max_capacity)
             .field("max_object_size", &self.max_object_size)
             .field("hit_count", &self.hit_count.load(Ordering::Relaxed))
             .field("miss_count", &self.miss_count.load(Ordering::Relaxed))
@@ -54,16 +48,14 @@ impl std::fmt::Debug for HotObjectCache {
     }
 }
 
-/// Cached object with access tracking.
-///
-/// This structure wraps the actual data with metadata for cache management.
-#[derive(Clone)]
 struct CachedObject {
-    /// The cached data
+    /// The object data
     data: Arc<Vec<u8>>,
     /// When this object was cached
     cached_at: Instant,
-    /// Access count for hot object detection
+    /// Object size in bytes
+    size: usize,
+    /// Number of times this object has been accessed
     access_count: Arc<AtomicU64>,
 }
 
@@ -91,7 +83,6 @@ struct CachedObject {
 /// manager.put_cached_object(cache_key, cached).await;
 /// ```
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct CachedGetObject {
     /// The object body data
     pub body: bytes::Bytes,
@@ -156,7 +147,6 @@ impl Default for CachedGetObject {
     }
 }
 
-#[allow(dead_code)]
 impl CachedGetObject {
     /// Create a new CachedGetObject with the given body and content length
     pub fn new(body: bytes::Bytes, content_length: i64) -> Self {
@@ -227,7 +217,6 @@ struct CachedGetObjectInternal {
     size: usize,
 }
 
-#[allow(dead_code)]
 impl HotObjectCache {
     /// Create a new hot object cache with Moka
     ///
@@ -235,42 +224,45 @@ impl HotObjectCache {
     /// - Size-based eviction (100MB max)
     /// - TTL of 5 minutes
     /// - TTI of 2 minutes
+    /// - Weigher function for accurate size tracking
     pub(crate) fn new() -> Self {
-        let max_capacity = rustfs_utils::get_env_usize(
+        let max_capacity = rustfs_utils::get_env_u64(
             rustfs_config::ENV_OBJECT_CACHE_CAPACITY_MB,
-            rustfs_config::DEFAULT_OBJECT_CACHE_CAPACITY_MB as usize,
+            rustfs_config::DEFAULT_OBJECT_CACHE_CAPACITY_MB,
         );
-        let cache_ttl_secs =
-            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
         let cache_tti_secs =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTI_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTI_SECS);
+        let cache_ttl_secs =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
 
-        // Create Moka cache with size-based eviction
+        // Legacy simple byte cache
         let cache = Cache::builder()
-            .max_capacity(max_capacity as u64 * MI_B as u64)
+            .max_capacity(max_capacity * MI_B as u64)
             .weigher(|_key: &String, value: &Arc<CachedObject>| -> u32 {
                 // Weight based on actual data size
-                value.data.len().min(u32::MAX as usize) as u32
+                value.size.min(u32::MAX as usize) as u32
             })
             .time_to_live(Duration::from_secs(cache_ttl_secs))
             .time_to_idle(Duration::from_secs(cache_tti_secs))
             .build();
 
-        // Create response cache with same configuration
+        // Full response cache with metadata
         let response_cache = Cache::builder()
-            .max_capacity((max_capacity * MI_B) as u64)
-            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 { value.size.min(u32::MAX as usize) as u32 })
+            .max_capacity(max_capacity * MI_B as u64)
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
+                // Weight based on actual data size
+                value.size.min(u32::MAX as usize) as u32
+            })
             .time_to_live(Duration::from_secs(cache_ttl_secs))
             .time_to_idle(Duration::from_secs(cache_tti_secs))
             .build();
-
         let max_object_size = rustfs_utils::get_env_usize(
             rustfs_config::ENV_OBJECT_CACHE_MAX_OBJECT_SIZE_MB,
             rustfs_config::DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB,
         ) * MI_B;
-
         Self {
             cache,
+            max_capacity: (max_capacity * MI_B as u64) as usize,
             response_cache,
             max_object_size,
             hit_count: Arc::new(AtomicU64::new(0)),
@@ -278,23 +270,25 @@ impl HotObjectCache {
         }
     }
 
-    /// Soft expiration determination
-    fn should_expire(&self, obj: &Arc<CachedObject>) -> bool {
+    /// Soft expiration determination, the number of hits is insufficient and exceeds the soft TTL
+    pub(crate) fn should_expire(&self, obj: &Arc<CachedObject>) -> bool {
         let age_secs = obj.cached_at.elapsed().as_secs();
         let cache_ttl_secs =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_CACHE_TTL_SECS, rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS);
-        let hot_object_min_hits = rustfs_utils::get_env_usize(
+        let hot_object_min_hits_to_extend = rustfs_utils::get_env_usize(
             rustfs_config::ENV_OBJECT_HOT_MIN_HITS_TO_EXTEND,
             rustfs_config::DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND,
         );
         if age_secs >= cache_ttl_secs {
             let hits = obj.access_count.load(Ordering::Relaxed);
-            return hits < hot_object_min_hits as u64;
+            return hits < hot_object_min_hits_to_extend as u64;
         }
         false
     }
 
-    /// Get an object from cache
+    /// Get an object from cache with lock-free concurrent access
+    ///
+    /// Moka provides lock-free reads, significantly improving concurrent performance.
     pub(crate) async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         match self.cache.get(key).await {
             Some(cached) => {
@@ -303,9 +297,18 @@ impl HotObjectCache {
                     self.miss_count.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
+                // Update access count
                 cached.access_count.fetch_add(1, Ordering::Relaxed);
                 self.hit_count.fetch_add(1, Ordering::Relaxed);
 
+                // IMPORTANT: Do NOT add high cardinality labels to metrics!
+                // Previously, this metric was tagged with individual file URIs/keys,
+                // causing unbounded memory growth in RustFS's own process. The metrics
+                // crate maintains an internal HashMap for all metric series, and each
+                // unique file path creates a new entry that is never cleaned up.
+                // This HashMap grows unbounded with unique file access, causing memory
+                // leaks in RustFS itself (and also in downstream systems like Prometheus).
+                // Only use low cardinality labels like operation type or status.
                 #[cfg(all(feature = "metrics", not(test)))]
                 {
                     use metrics::counter;
@@ -328,160 +331,76 @@ impl HotObjectCache {
         }
     }
 
-    /// Put an object into cache
+    /// Put an object into cache with automatic size-based eviction
+    ///
+    /// Moka handles eviction automatically based on the weigher function.
     pub(crate) async fn put(&self, key: String, data: Vec<u8>) {
-        if data.len() > self.max_object_size {
+        let size = data.len();
+
+        // Only cache objects smaller than max_object_size
+        if size == 0 || size > self.max_object_size {
             return;
         }
 
-        let cached = Arc::new(CachedObject {
+        let cached_obj = Arc::new(CachedObject {
             data: Arc::new(data),
             cached_at: Instant::now(),
+            size,
             access_count: Arc::new(AtomicU64::new(0)),
         });
 
-        self.cache.insert(key, cached).await;
-    }
-
-    /// Get a cached GetObject response
-    pub(crate) async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
-        match self.response_cache.get(key).await {
-            Some(cached) => {
-                let age_secs = cached.cached_at.elapsed().as_secs();
-                let cache_ttl_secs = rustfs_utils::get_env_u64(
-                    rustfs_config::ENV_OBJECT_CACHE_TTL_SECS,
-                    rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS,
-                );
-                let hot_object_min_hits = rustfs_utils::get_env_usize(
-                    rustfs_config::ENV_OBJECT_HOT_MIN_HITS_TO_EXTEND,
-                    rustfs_config::DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND,
-                );
-
-                if age_secs >= cache_ttl_secs {
-                    let hits = cached.data.access_count.load(Ordering::Relaxed);
-                    if hits < hot_object_min_hits as u64 {
-                        self.response_cache.invalidate(key).await;
-                        self.miss_count.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    }
-                }
-
-                cached.data.increment_access();
-                self.hit_count.fetch_add(1, Ordering::Relaxed);
-
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_response_cache_hits").increment(1);
-                }
-
-                Some(Arc::clone(&cached.data))
-            }
-            None => {
-                self.miss_count.fetch_add(1, Ordering::Relaxed);
-
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_response_cache_misses").increment(1);
-                }
-
-                None
-            }
-        }
-    }
-
-    /// Put a GetObject response into cache
-    pub(crate) async fn put_response(&self, key: String, response: CachedGetObject) {
-        let size = response.size();
-        if size > self.max_object_size {
-            return;
-        }
-
-        let cached_internal = Arc::new(CachedGetObjectInternal {
-            data: Arc::new(response),
-            cached_at: Instant::now(),
-            size,
-        });
-
-        self.response_cache.insert(key.clone(), cached_internal).await;
+        self.cache.insert(key.clone(), cached_obj).await;
 
         #[cfg(all(feature = "metrics", not(test)))]
         {
             use metrics::{counter, gauge};
-            counter!("rustfs_object_response_cache_insertions").increment(1);
-            gauge!("rustfs_object_response_cache_size_bytes").set(self.response_cache.weighted_size() as f64);
-            gauge!("rustfs_object_response_cache_entry_count").set(self.response_cache.entry_count() as f64);
+            counter!("rustfs.object.cache.insertions").increment(1);
+            gauge!("rustfs_object_cache_size_bytes").set(self.cache.weighted_size() as f64);
+            gauge!("rustfs_object_cache_entry_count").set(self.cache.entry_count() as f64);
         }
-    }
-
-    /// Invalidate a cache entry
-    pub(crate) async fn invalidate(&self, key: &str) {
-        self.cache.invalidate(key).await;
-        self.response_cache.invalidate(key).await;
-
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::counter;
-            counter!("rustfs_object_cache_invalidations_total").increment(1);
-        }
-    }
-
-    /// Invalidate cache entries for versioned object
-    pub(crate) async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
-        let base_key = format!("{bucket}/{key}");
-        self.invalidate(&base_key).await;
-
-        if let Some(vid) = version_id {
-            let versioned_key = format!("{base_key}?versionId={vid}");
-            self.invalidate(&versioned_key).await;
-        }
-    }
-
-    /// Get cache statistics
-    pub(crate) async fn stats(&self) -> CacheStats {
-        self.cache.run_pending_tasks().await;
-        CacheStats {
-            entries: self.cache.entry_count(),
-            size: self.cache.weighted_size(),
-            hits: self.hit_count.load(Ordering::Relaxed),
-            misses: self.miss_count.load(Ordering::Relaxed),
-            max_size: self.max_object_size as u64,
-        }
-    }
-
-    /// Get hit rate percentage
-    pub(crate) fn hit_rate(&self) -> f64 {
-        let hits = self.hit_count.load(Ordering::Relaxed);
-        let misses = self.miss_count.load(Ordering::Relaxed);
-        let total = hits + misses;
-
-        if total == 0 {
-            0.0
-        } else {
-            (hits as f64 / total as f64) * 100.0
-        }
-    }
-
-    /// Get maximum cacheable object size
-    pub(crate) fn max_object_size(&self) -> usize {
-        self.max_object_size
     }
 
     /// Clear all cached objects
-    /// Clear all cached objects (legacy method)
     pub(crate) async fn clear(&self) {
         self.cache.invalidate_all();
         // Sync to ensure all entries are removed
         self.cache.run_pending_tasks().await;
     }
 
-    /// Check if a key exists in cache
+    /// Get cache statistics for monitoring
+    pub(crate) async fn stats(&self) -> CacheStats {
+        // Ensure pending tasks are processed for accurate stats
+        self.cache.run_pending_tasks().await;
+        let mut total_ms: u128 = 0;
+        let mut cnt: u64 = 0;
+        self.cache.iter().for_each(|(_, v)| {
+            total_ms += v.cached_at.elapsed().as_millis();
+            cnt += 1;
+        });
+        let avg_age_secs = if cnt == 0 {
+            0.0
+        } else {
+            (total_ms as f64 / cnt as f64) / 1000.0
+        };
+        CacheStats {
+            size: self.cache.weighted_size() as usize,
+            entries: self.cache.entry_count() as usize,
+            max_size: self.max_capacity,
+            max_object_size: self.max_object_size,
+            hit_count: self.hit_count.load(Ordering::Relaxed),
+            miss_count: self.miss_count.load(Ordering::Relaxed),
+            avg_age_secs,
+        }
+    }
+
+    /// Check if a key exists in cache (lock-free)
     pub(crate) async fn contains(&self, key: &str) -> bool {
         self.cache.contains_key(key)
     }
 
     /// Get multiple objects from cache in parallel
+    ///
+    /// Leverages Moka's lock-free design for true parallel access.
     pub(crate) async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -498,6 +417,8 @@ impl HotObjectCache {
     }
 
     /// Get the most frequently accessed keys
+    ///
+    /// Returns up to `limit` keys sorted by access count in descending order.
     pub(crate) async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         // Run pending tasks to ensure accurate entry count
         self.cache.run_pending_tasks().await;
@@ -521,26 +442,198 @@ impl HotObjectCache {
         }
     }
 
+    /// Get hit rate percentage
+    pub(crate) fn hit_rate(&self) -> f64 {
+        let hits = self.hit_count.load(Ordering::Relaxed);
+        let misses = self.miss_count.load(Ordering::Relaxed);
+        let total = hits + misses;
+
+        if total == 0 {
+            0.0
+        } else {
+            (hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    // ============================================
+    // Response Cache Methods (CachedGetObject)
+    // ============================================
+
+    /// Get a cached GetObject response with full metadata
+    ///
+    /// This method retrieves a complete GetObject response from the response cache,
+    /// including body data and all response metadata (e_tag, last_modified, etc.).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
+    /// * `None` - Cache miss
+    pub(crate) async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
+        match self.response_cache.get(key).await {
+            Some(cached) => {
+                // Check soft expiration
+                let age_secs = cached.cached_at.elapsed().as_secs();
+                let cache_ttl_secs = rustfs_utils::get_env_u64(
+                    rustfs_config::ENV_OBJECT_CACHE_TTL_SECS,
+                    rustfs_config::DEFAULT_OBJECT_CACHE_TTL_SECS,
+                );
+                let hot_object_min_hits = rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+                    rustfs_config::DEFAULT_OBJECT_HOT_MIN_HITS_TO_EXTEND,
+                );
+
+                if age_secs >= cache_ttl_secs {
+                    let hits = cached.data.access_count.load(Ordering::Relaxed);
+                    if hits < hot_object_min_hits as u64 {
+                        self.response_cache.invalidate(key).await;
+                        self.miss_count.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+
+                // Update access count
+                cached.data.increment_access();
+                self.hit_count.fetch_add(1, Ordering::Relaxed);
+
+                // IMPORTANT: Do NOT add high cardinality labels to metrics!
+                // See HotObjectCache::get() for details. The metrics crate's internal
+                // HashMap grows unbounded with high cardinality labels, causing memory
+                // leaks in RustFS's own process.
+                #[cfg(all(feature = "metrics", not(test)))]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_response_cache_hits").increment(1);
+                }
+
+                Some(Arc::clone(&cached.data))
+            }
+            None => {
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+
+                #[cfg(all(feature = "metrics", not(test)))]
+                {
+                    use metrics::counter;
+                    counter!("rustfs_object_response_cache_misses").increment(1);
+                }
+
+                None
+            }
+        }
+    }
+
+    /// Put a GetObject response into the response cache
+    ///
+    /// This method caches a complete GetObject response including body and metadata.
+    /// Objects larger than `max_object_size` or empty objects are not cached.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
+    /// * `response` - The complete cached response to store
+    pub(crate) async fn put_response(&self, key: String, response: CachedGetObject) {
+        let size = response.size();
+
+        // Only cache objects smaller than max_object_size
+        if size == 0 || size > self.max_object_size {
+            return;
+        }
+
+        let cached_internal = Arc::new(CachedGetObjectInternal {
+            data: Arc::new(response),
+            cached_at: Instant::now(),
+            size,
+        });
+
+        self.response_cache.insert(key.clone(), cached_internal).await;
+
+        #[cfg(all(feature = "metrics", not(test)))]
+        {
+            use metrics::{counter, gauge};
+            counter!("rustfs_object_response_cache_insertions").increment(1);
+            gauge!("rustfs_object_response_cache_size_bytes").set(self.response_cache.weighted_size() as f64);
+            gauge!("rustfs_object_response_cache_entry_count").set(self.response_cache.entry_count() as f64);
+        }
+    }
+
+    /// Invalidate a cache entry for a specific object
+    ///
+    /// This method removes both the simple byte cache entry and the response cache entry
+    /// for the given key. Used when objects are modified or deleted.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
+    pub(crate) async fn invalidate(&self, key: &str) {
+        // Invalidate both caches
+        self.cache.invalidate(key).await;
+        self.response_cache.invalidate(key).await;
+
+        #[cfg(all(feature = "metrics", not(test)))]
+        {
+            use metrics::counter;
+            counter!("rustfs_object_cache_invalidations_total").increment(1);
+        }
+    }
+
+    /// Invalidate cache entries for an object and its latest version
+    ///
+    /// For versioned buckets, this invalidates both:
+    /// - The specific version key: "{bucket}/{key}?versionId={version_id}"
+    /// - The latest version key: "{bucket}/{key}"
+    ///
+    /// This ensures that after a write/delete, clients don't receive stale data.
+    ///
+    /// # Arguments
+    ///
+    /// * `bucket` - Bucket name
+    /// * `key` - Object key
+    /// * `version_id` - Optional version ID (if None, only invalidates the base key)
+    pub(crate) async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
+        // Always invalidate the latest version key
+        let base_key = format!("{bucket}/{key}");
+        self.invalidate(&base_key).await;
+
+        // Also invalidate the specific version if provided
+        if let Some(vid) = version_id {
+            let versioned_key = format!("{base_key}?versionId={vid}");
+            self.invalidate(&versioned_key).await;
+        }
+    }
+
+    /// Clear all cached objects from both caches
     pub(crate) async fn clear_all(&self) {
         self.cache.invalidate_all();
         self.response_cache.invalidate_all();
+        // Sync to ensure all entries are removed
         self.cache.run_pending_tasks().await;
         self.response_cache.run_pending_tasks().await;
     }
+
+    /// Get the maximum object size for caching
+    pub(crate) fn max_object_size(&self) -> usize {
+        self.max_object_size
+    }
 }
 
-/// Cache statistics for monitoring
+/// Cache statistics for monitoring and debugging
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CacheStats {
-    /// Number of entries in cache
-    pub entries: u64,
-    /// Total size in bytes
-    pub size: u64,
-    /// Total cache hits
-    pub hits: u64,
-    /// Total cache misses
-    pub misses: u64,
-    /// Maximum cache size in bytes
-    pub max_size: u64,
+    /// Current total size of cached objects in bytes
+    pub size: usize,
+    /// Number of cached entries
+    pub entries: usize,
+    /// Maximum allowed cache size in bytes
+    pub max_size: usize,
+    /// Maximum allowed object size in bytes
+    pub max_object_size: usize,
+    /// Total number of cache hits
+    pub hit_count: u64,
+    /// Total number of cache misses
+    pub miss_count: u64,
+    /// Average cache object age (seconds)
+    pub avg_age_secs: f64,
 }
