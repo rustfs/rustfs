@@ -2071,6 +2071,9 @@ impl DiskAPI for LocalDisk {
             return Err(err);
         }
 
+        get_global_file_cache().invalidate(&src_file_path).await;
+        get_global_file_cache().invalidate(&dst_file_path).await;
+
         if let Some(src_file_path_parent) = src_file_path.parent() {
             if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
                 let _ = remove_std(src_file_path_parent);
