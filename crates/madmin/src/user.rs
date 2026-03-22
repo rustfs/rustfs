@@ -508,8 +508,12 @@ where
     let Some(expiration) = expiration else {
         return Ok(None);
     };
+    let expiration = expiration.trim();
+    if expiration.is_empty() {
+        return Ok(None);
+    }
 
-    let expiration = OffsetDateTime::parse(&expiration, &Rfc3339).map_err(D::Error::custom)?;
+    let expiration = OffsetDateTime::parse(expiration, &Rfc3339).map_err(D::Error::custom)?;
     if expiration.unix_timestamp() == 0 {
         return Ok(None);
     }
@@ -1271,5 +1275,24 @@ mod tests {
         };
 
         assert!(long_req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sr_svc_acc_create_deserialize_empty_expiration_as_none() {
+        let payload = r#"{
+            "parent": "useralpha",
+            "accessKey": "svcalpha",
+            "secretKey": "svcAlphaSecret123",
+            "groups": [],
+            "claims": {},
+            "sessionPolicy": null,
+            "status": "on",
+            "name": "uploaderKey",
+            "description": "alpha upload key",
+            "expiration": "   "
+        }"#;
+
+        let svc: SRSvcAccCreate = serde_json::from_str(payload).unwrap();
+        assert!(svc.expiration.is_none());
     }
 }
