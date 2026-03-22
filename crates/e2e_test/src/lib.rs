@@ -66,6 +66,11 @@ mod compression_test;
 // Regression test for Issue #1878: DeleteMarkers not visible immediately after delete_objects
 #[cfg(test)]
 mod delete_objects_versioning_test;
+
+// Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
+#[cfg(test)]
+mod list_object_versions_regression_test;
+
 #[cfg(test)]
 mod protocols;
 
