@@ -14,7 +14,7 @@
 
 //! Regression coverage for anonymous access on multipart control APIs.
 
-use crate::common::{RustFSTestEnvironment, init_logging};
+use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use async_compression::tokio::write::{BzEncoder, XzEncoder};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -155,7 +155,7 @@ async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<
         .send()
         .await?;
 
-    let http = reqwest::Client::new();
+    let http = local_http_client();
     let base = format!("{}/{}/{}", env.url, bucket, key);
     let upload_id = "dummy-upload-id";
 
@@ -226,7 +226,7 @@ async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::e
             .mime_str("text/plain")?,
     );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -267,7 +267,7 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -333,6 +333,7 @@ async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(
         );
 
     let http = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -400,7 +401,7 @@ async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<d
             .mime_str("text/plain")?,
     );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -448,7 +449,7 @@ async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std:
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -496,7 +497,7 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> R
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -544,7 +545,7 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -599,7 +600,7 @@ async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_cond
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -608,10 +609,10 @@ async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_cond
     let status = post_resp.status();
     let response_body = post_resp.text().await?;
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
     assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
+        response_body.contains("<Code>AccessDenied</Code>"),
+        "response should contain AccessDenied code, got: {response_body}"
     );
     assert!(
         response_body.contains("success_action_status"),
@@ -656,7 +657,7 @@ async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_condit
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -680,8 +681,8 @@ async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_condit
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -710,7 +711,7 @@ async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -765,7 +766,7 @@ async fn test_anonymous_post_object_rejects_content_length_range_violation()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -820,7 +821,7 @@ async fn test_anonymous_post_object_rejects_success_action_status_policy_mismatc
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -878,7 +879,7 @@ async fn test_anonymous_post_object_accepts_success_action_status_exact_policy_m
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -934,7 +935,7 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_policy_misma
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -994,6 +995,7 @@ async fn test_anonymous_post_object_accepts_success_action_redirect_exact_policy
         );
 
     let http = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -1055,7 +1057,7 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1065,8 +1067,8 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("success_action_redirect"),
         "response should mention success_action_redirect, got: {response_body}"
@@ -1111,7 +1113,7 @@ async fn test_anonymous_post_object_accepts_metadata_field_covered_by_starts_wit
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1166,7 +1168,7 @@ async fn test_anonymous_post_object_accepts_content_type_field_exact_policy_matc
                 .mime_str(content_type)?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1224,7 +1226,7 @@ async fn test_anonymous_post_object_accepts_content_type_field_covered_by_starts
                 .mime_str(content_type)?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1282,7 +1284,7 @@ async fn test_anonymous_post_object_accepts_content_disposition_field_exact_poli
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1338,7 +1340,7 @@ async fn test_anonymous_post_object_rejects_content_disposition_policy_mismatch(
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1348,8 +1350,8 @@ async fn test_anonymous_post_object_rejects_content_disposition_policy_mismatch(
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("content-disposition"),
         "response should mention content-disposition mismatch, got: {response_body}"
@@ -1394,7 +1396,7 @@ async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_mat
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1418,8 +1420,8 @@ async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_mat
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1450,7 +1452,7 @@ async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1460,8 +1462,8 @@ async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch()
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("cache-control"),
         "response should mention cache-control mismatch, got: {response_body}"
@@ -1503,7 +1505,7 @@ async fn test_anonymous_post_object_rejects_cache_control_missing_from_policy_co
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1513,8 +1515,8 @@ async fn test_anonymous_post_object_rejects_cache_control_missing_from_policy_co
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("cache-control"),
         "response should mention cache-control, got: {response_body}"
@@ -1559,7 +1561,7 @@ async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1615,7 +1617,7 @@ async fn test_anonymous_post_object_rejects_content_language_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1625,8 +1627,8 @@ async fn test_anonymous_post_object_rejects_content_language_policy_mismatch()
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("content-language"),
         "response should mention content-language mismatch, got: {response_body}"
@@ -1668,7 +1670,7 @@ async fn test_anonymous_post_object_rejects_content_language_missing_from_policy
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1678,8 +1680,8 @@ async fn test_anonymous_post_object_rejects_content_language_missing_from_policy
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("content-language"),
         "response should mention content-language, got: {response_body}"
@@ -1724,7 +1726,7 @@ async fn test_anonymous_post_object_accepts_content_encoding_field_exact_policy_
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1780,7 +1782,7 @@ async fn test_anonymous_post_object_rejects_content_encoding_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1790,8 +1792,8 @@ async fn test_anonymous_post_object_rejects_content_encoding_policy_mismatch()
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("content-encoding"),
         "response should mention content-encoding mismatch, got: {response_body}"
@@ -1833,7 +1835,7 @@ async fn test_anonymous_post_object_rejects_content_encoding_missing_from_policy
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1843,8 +1845,8 @@ async fn test_anonymous_post_object_rejects_content_encoding_missing_from_policy
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("content-encoding"),
         "response should mention content-encoding, got: {response_body}"
@@ -1889,7 +1891,7 @@ async fn test_anonymous_post_object_accepts_website_redirect_location_exact_poli
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1944,7 +1946,7 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_missing_fr
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -1954,8 +1956,8 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_missing_fr
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("x-amz-website-redirect-location"),
         "response should mention x-amz-website-redirect-location, got: {response_body}"
@@ -1998,7 +2000,7 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_policy_mis
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2008,8 +2010,8 @@ async fn test_anonymous_post_object_rejects_website_redirect_location_policy_mis
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("x-amz-website-redirect-location"),
         "response should mention x-amz-website-redirect-location mismatch, got: {response_body}"
@@ -2054,7 +2056,7 @@ async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2078,8 +2080,8 @@ async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -2110,7 +2112,7 @@ async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2120,8 +2122,8 @@ async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch()
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("expires"),
         "response should mention Expires mismatch, got: {response_body}"
@@ -2163,7 +2165,7 @@ async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_co
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2173,8 +2175,8 @@ async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_co
     let response_body = post_resp.text().await?;
     let response_body_lower = response_body.to_ascii_lowercase();
 
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(response_body.contains("AccessDenied"));
     assert!(
         response_body_lower.contains("expires"),
         "response should mention Expires, got: {response_body}"
@@ -2185,8 +2187,8 @@ async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_co
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_accepts_object_lock_retention_fields()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_accepts_object_lock_retention_fields() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -2226,7 +2228,7 @@ async fn test_anonymous_post_object_accepts_object_lock_retention_fields()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2238,7 +2240,12 @@ async fn test_anonymous_post_object_accepts_object_lock_retention_fields()
     assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
     assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
 
-    let retention = admin_client.get_object_retention().bucket(bucket).key(object_key).send().await?;
+    let retention = admin_client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(object_key)
+        .send()
+        .await?;
     let retention = retention.retention().expect("retention should be present");
     assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
     let retain_until_out = retention
@@ -2295,7 +2302,7 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_policy_mismatc
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2356,7 +2363,7 @@ async fn test_anonymous_post_object_rejects_object_lock_mode_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2415,7 +2422,7 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_p
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2438,8 +2445,8 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_p
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -2476,7 +2483,7 @@ async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2488,7 +2495,12 @@ async fn test_anonymous_post_object_accepts_object_lock_legal_hold_field()
     assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
     assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
 
-    let legal_hold = admin_client.get_object_legal_hold().bucket(bucket).key(object_key).send().await?;
+    let legal_hold = admin_client
+        .get_object_legal_hold()
+        .bucket(bucket)
+        .key(object_key)
+        .send()
+        .await?;
     assert_eq!(
         legal_hold
             .legal_hold()
@@ -2543,7 +2555,7 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_policy_mismat
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2601,7 +2613,7 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_missing_from_
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2657,7 +2669,7 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2669,7 +2681,12 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
     assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
     assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
 
-    let tagging_output = admin_client.get_object_tagging().bucket(bucket).key(object_key).send().await?;
+    let tagging_output = admin_client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(object_key)
+        .send()
+        .await?;
     let tag_set = tagging_output.tag_set();
     assert_eq!(tag_set.len(), 2);
     assert!(tag_set.iter().any(|tag| tag.key() == "project" && tag.value() == "alpha"));
@@ -2684,8 +2701,8 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_tagging_field_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_tagging_field_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -2716,7 +2733,7 @@ async fn test_anonymous_post_object_rejects_tagging_field_policy_mismatch()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2769,7 +2786,7 @@ async fn test_anonymous_post_object_rejects_tagging_field_missing_from_policy_co
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2822,7 +2839,7 @@ async fn test_anonymous_post_object_rejects_metadata_field_missing_from_policy_c
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2879,7 +2896,7 @@ async fn test_anonymous_post_object_rejects_metadata_field_exact_policy_mismatch
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2938,7 +2955,7 @@ async fn test_anonymous_post_object_accepts_metadata_field_exact_policy_match()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -2995,7 +3012,7 @@ async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_condit
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -3047,7 +3064,7 @@ async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Re
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -3102,7 +3119,7 @@ async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -3127,8 +3144,8 @@ async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_content_type_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_content_type_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -3159,7 +3176,7 @@ async fn test_anonymous_post_object_rejects_content_type_policy_mismatch()
                 .mime_str("application/octet-stream")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -3215,7 +3232,7 @@ async fn test_anonymous_post_object_rejects_content_type_missing_from_policy_con
                 .mime_str("text/plain")?,
         );
 
-    let post_resp = reqwest::Client::new()
+    let post_resp = local_http_client()
         .post(format!("{}/{}", env.url, bucket))
         .multipart(post_form)
         .send()
@@ -3685,11 +3702,7 @@ async fn test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_e
         .prefix(format!("{extracted_prefix}/"))
         .send()
         .await?;
-    let keys: Vec<_> = listed
-        .contents()
-        .iter()
-        .filter_map(|entry| entry.key())
-        .collect();
+    let keys: Vec<_> = listed.contents().iter().filter_map(|entry| entry.key()).collect();
     assert_eq!(keys, vec![format!("{extracted_prefix}/valid.txt")]);
 
     Ok(())

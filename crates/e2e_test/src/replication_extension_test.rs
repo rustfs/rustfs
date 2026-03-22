@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestEnvironment, init_logging};
+use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
@@ -40,17 +40,10 @@ async fn signed_request(
     }
 
     let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
-        access_key,
-        secret_key,
-        "",
-        "us-east-1",
-    );
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = reqwest::Client::new();
+    let client = local_http_client();
     let mut request_builder = client.request(reqwest_method, url);
     for (name, value) in signed.headers() {
         request_builder = request_builder.header(name, value);
@@ -238,10 +231,7 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
     let err = set_replication_target(&source_env, source_bucket, &target_env, target_bucket)
         .await
         .expect_err("unversioned target bucket should be rejected during remote target setup");
-    assert!(
-        err.to_string().contains("not versioned"),
-        "unexpected set remote target error: {err}"
-    );
+    assert!(err.to_string().contains("not versioned"), "unexpected set remote target error: {err}");
 
     Ok(())
 }

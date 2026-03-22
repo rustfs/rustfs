@@ -22,7 +22,7 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging};
+use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
@@ -285,6 +285,10 @@ pub async fn test_kms_key_management(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if skip_if_kms_admin_tool_unavailable("test_kms_key_management") {
+        return Ok(());
+    }
+
     info!("Testing KMS key management APIs");
 
     // Test CreateKey
@@ -419,7 +423,10 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = reqwest::get(&format!("{VAULT_URL}/v1/sys/health")).await
+                if let Ok(response) = local_http_client()
+                    .get(format!("{VAULT_URL}/v1/sys/health"))
+                    .send()
+                    .await
                     && response.status().is_success()
                 {
                     info!("Vault server is ready after {} seconds", i);
@@ -439,7 +446,7 @@ impl VaultTestEnvironment {
 
     /// Setup Vault transit secrets engine
     pub async fn setup_vault_transit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = reqwest::Client::new();
+        let client = local_http_client();
 
         info!("Enabling Vault transit secrets engine");
 
