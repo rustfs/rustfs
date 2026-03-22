@@ -1854,11 +1854,12 @@ impl ObjectOperations for SetDisks {
                     .await;
                 }
             };
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &part_opts).await;
-            if let Err(err) = gr {
-                return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
-            }
-            let gr = gr.unwrap();
+            let gr = match get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &part_opts).await {
+                Ok(reader) => reader,
+                Err(err) => {
+                    return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
+                }
+            };
             let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::new(
                 Box::new(WarpReader::new(reader)),
