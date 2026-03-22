@@ -2583,10 +2583,8 @@ impl DefaultObjectUsecase {
 
         // Check Object Lock retention before deletion
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
-        // 1. Integrate OptimizedFileCache (file_cache.rs) into the read_version() path
-        // 2. Or add a lightweight get_object_lock_info() that only fetches retention metadata
-        // 3. Or use combined get-and-delete in storage layer with retention check callback
-        // Note: The project has OptimizedFileCache with moka, but get_object_info doesn't use it yet
+        // 1. Add a lightweight get_object_lock_info() that only fetches retention metadata
+        // 2. Or use combined get-and-delete in storage layer with retention check callback
         let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
