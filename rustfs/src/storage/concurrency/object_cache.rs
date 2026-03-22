@@ -509,26 +509,45 @@ impl HotObjectCache {
 
     /// Clear all cached objects
     pub(crate) async fn clear(&self) {
+        // Clear both simple cache and response cache
         self.cache.invalidate_all();
+        self.response_cache.invalidate_all();
         // Sync to ensure all entries are removed
         self.cache.run_pending_tasks().await;
+        self.response_cache.run_pending_tasks().await;
     }
 
     /// Get cache statistics for monitoring
     pub(crate) async fn stats(&self) -> CacheStats {
-        // Ensure pending tasks are processed for accurate stats
+        // Ensure pending tasks are processed for accurate stats in both caches
         self.cache.run_pending_tasks().await;
+        self.response_cache.run_pending_tasks().await;
+
+        // Calculate average age for simple cache
         let mut total_ms: u128 = 0;
         let mut cnt: u64 = 0;
         self.cache.iter().for_each(|(_, v)| {
             total_ms += v.cached_at.elapsed().as_millis();
             cnt += 1;
         });
-        let avg_age_secs = if cnt == 0 {
+
+        // Calculate average age for response cache
+        let mut response_total_ms: u128 = 0;
+        let mut response_cnt: u64 = 0;
+        self.response_cache.iter().for_each(|(_, v)| {
+            response_total_ms += v.cached_at.elapsed().as_millis();
+            response_cnt += 1;
+        });
+
+        // Combine average age calculation
+        let total_entries = cnt + response_cnt;
+        let combined_total_ms = total_ms + response_total_ms;
+        let avg_age_secs = if total_entries == 0 {
             0.0
         } else {
-            (total_ms as f64 / cnt as f64) / 1000.0
+            (combined_total_ms as f64 / total_entries as f64) / 1000.0
         };
+
         let hit_count = self.hit_count.load(Ordering::Relaxed);
         let miss_count = self.miss_count.load(Ordering::Relaxed);
         let total_requests = hit_count + miss_count;
@@ -538,18 +557,28 @@ impl HotObjectCache {
             0.0
         };
 
-        let size = self.cache.weighted_size() as usize;
+        // Calculate total size from both caches
+        let simple_size = self.cache.weighted_size() as usize;
+        let response_size = self.response_cache.weighted_size() as usize;
+        let total_size = simple_size + response_size;
+
         let memory_usage_ratio = if self.max_capacity > 0 {
-            size as f64 / self.max_capacity as f64
+            total_size as f64 / self.max_capacity as f64
         } else {
             0.0
         };
 
-        let efficiency_score = (hit_rate * 50.0 + (1.0 - memory_usage_ratio) * 50.0) as u32;
+        let efficiency_score = if total_entries == 0 {
+            // Empty cache has no actual utility, efficiency score is 0
+            0
+        } else {
+            // Non-empty cache: hit rate contributes 50%, remaining capacity contributes 50%
+            (hit_rate * 50.0 + (1.0 - memory_usage_ratio) * 50.0) as u32
+        };
 
         CacheStats {
-            size,
-            entries: self.cache.entry_count() as usize,
+            size: total_size,
+            entries: total_entries as usize,
             max_size: self.max_capacity,
             max_object_size: self.max_object_size,
             hit_count,
@@ -558,7 +587,7 @@ impl HotObjectCache {
             hit_rate,
             eviction_count: 0, // Moka doesn't expose eviction count
             eviction_rate: 0.0,
-            memory_usage: size,
+            memory_usage: total_size,
             memory_usage_ratio,
             top_keys: vec![], // Would need additional tracking
             efficiency_score,
@@ -567,7 +596,8 @@ impl HotObjectCache {
 
     /// Check if a key exists in cache (lock-free)
     pub(crate) async fn contains(&self, key: &str) -> bool {
-        self.cache.contains_key(key)
+        // Check both simple cache and response cache
+        self.cache.contains_key(key) || self.response_cache.contains_key(key)
     }
 
     /// Get multiple objects from cache in parallel
@@ -824,6 +854,8 @@ impl HotObjectCache {
     /// Get current memory usage in bytes
     #[allow(dead_code)]
     pub(crate) async fn memory_usage(&self) -> usize {
+        // Sync pending tasks to ensure accurate weight statistics
+        self.cache.run_pending_tasks().await;
         self.cache.weighted_size() as usize
     }
 
@@ -1037,8 +1069,10 @@ mod cached_object_tests {
 #[cfg(test)]
 mod cache_health_tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_health_status() {
         let cache = HotObjectCache::new();
 
@@ -1059,6 +1093,7 @@ mod cache_health_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_memory_usage() {
         let cache = HotObjectCache::new();
 
@@ -1074,6 +1109,7 @@ mod cache_health_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_evict_percentage() {
         let cache = HotObjectCache::new();
 
@@ -1092,6 +1128,7 @@ mod cache_health_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_warm_from_hot_list() {
         let cache = HotObjectCache::new();
 
@@ -1118,8 +1155,10 @@ mod cache_health_tests {
 #[cfg(test)]
 mod cache_stats_tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_stats_hit_rate() {
         let cache = HotObjectCache::new();
 
@@ -1141,6 +1180,7 @@ mod cache_stats_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_stats_memory_usage_ratio() {
         let cache = HotObjectCache::new();
 
@@ -1156,6 +1196,7 @@ mod cache_stats_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_cache_stats_efficiency_score() {
         let cache = HotObjectCache::new();
 

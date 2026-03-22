@@ -597,6 +597,7 @@ mod integration_tests {
 
         // Get stats
         let stats = manager.cache_stats().await;
+
         assert!(stats.entries >= 5);
     }
 
@@ -689,8 +690,8 @@ mod integration_tests {
         let manager = ConcurrencyManager::new();
 
         // Test I/O strategy calculation
-        let low_wait = std::time::Duration::from_millis(5);
-        let high_wait = std::time::Duration::from_millis(100);
+        let low_wait = Duration::from_millis(5);
+        let high_wait = Duration::from_millis(100);
 
         let strategy_low = manager.calculate_io_strategy(low_wait, 128 * 1024);
         let strategy_high = manager.calculate_io_strategy(high_wait, 128 * 1024);
