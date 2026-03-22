@@ -37,14 +37,6 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
-fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
-    let start = src
-        .find(start_marker)
-        .unwrap_or_else(|| panic!("Expected marker `{}` in source", start_marker));
-    let after_start = &src[start..];
-    let end = after_start.find(end_marker).unwrap_or(after_start.len());
-    &after_start[..end]
-}
 
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
@@ -204,6 +196,17 @@ fn test_phase5_admin_info_and_rpc_read_file_contract() {
         read_file_block.contains(".read_file_stream(&query.volume, &query.path, query.offset, query.length)"),
         "rpc read_file_stream route must remain wired to disk.read_file_stream"
     );
+}
+
+fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = src
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("Expected marker `{}` in source", start_marker));
+    let after_start = &src[start..];
+    let end = after_start
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("Expected end marker `{}` in source", end_marker));
+    &after_start[..end]
 }
 
 #[test]

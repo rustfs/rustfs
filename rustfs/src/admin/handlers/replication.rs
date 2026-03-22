@@ -350,7 +350,7 @@ pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let _ = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
 
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
