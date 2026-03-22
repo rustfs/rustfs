@@ -178,7 +178,7 @@ time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros
 
 # Utilities and Tools
 anyhow = "1.0.102"
-arc-swap = "1.8.2"
+arc-swap = "1.9.0"
 astral-tokio-tar = "0.6.0"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
@@ -222,7 +222,7 @@ matchit = "0.9.1"
 md-5 = "0.11.0-rc.5"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
-moka = { version = "0.12.14", features = ["future"] }
+moka = { version = "0.12.15", features = ["future"] }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.12.0"
@@ -272,7 +272,7 @@ walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
-zip = "8.3.0"
+zip = "8.3.1"
 zstd = "0.13.3"
 
 # Observability and Metrics
