@@ -138,6 +138,29 @@ pub struct QueryStateMachine {
 }
 
 impl QueryStateMachine {
+    fn record_phase_timestamp(&self, phase: &str, event: &str) {
+        let elapsed = self.start.elapsed();
+        let phase = phase.to_string(); // Convert to owned String    
+        let event = event.to_string();
+        tokio::spawn(async move {
+            metrics::histogram!("s3select.phase.timestamp.seconds",     
+                "phase" => phase, "event" => event)
+            .record(elapsed.as_secs_f64());
+        });
+    }
+
+    pub fn time_phase(&self, phase: &str) -> impl Fn() {
+        let start_offset = self.start.elapsed();
+        let phase = phase.to_string(); // Convert to owned String    
+        move || {
+            let duration = self.start.elapsed() - start_offset;
+            let phase_clone = phase.clone(); // Clone for this closure    
+            tokio::spawn(async move {
+                metrics::histogram!("s3select.phase.duration.seconds", "phase" => phase_clone).record(duration.as_secs_f64());
+            });
+        }
+    }
+
     pub fn begin(query: Query, session: SessionCtx) -> Self {
         Self {
             session,
@@ -148,30 +171,30 @@ impl QueryStateMachine {
     }
 
     pub fn begin_analyze(&self) {
-        // TODO record time
+        self.record_phase_timestamp("analyze", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::ANALYZING));
     }
 
     pub fn end_analyze(&self) {
-        // TODO record time
+        self.record_phase_timestamp("analyze", "end");
     }
 
     pub fn begin_optimize(&self) {
-        // TODO record time
+        self.record_phase_timestamp("optimize", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::OPTIMIZING));
     }
 
     pub fn end_optimize(&self) {
-        // TODO
+        self.record_phase_timestamp("optimize", "end");
     }
 
     pub fn begin_schedule(&self) {
-        // TODO
+        self.record_phase_timestamp("schedule", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::SCHEDULING));
     }
 
     pub fn end_schedule(&self) {
-        // TODO
+        self.record_phase_timestamp("schedule", "end");
     }
 
     pub fn finish(&self) {
