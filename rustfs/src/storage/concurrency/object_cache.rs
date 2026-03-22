@@ -77,21 +77,25 @@ impl CachedObject {
     }
 
     /// Get the data reference
+    #[allow(dead_code)]
     pub fn data(&self) -> &Arc<Vec<u8>> {
         &self.data
     }
 
     /// Get the age of the cached object
+    #[allow(dead_code)]
     pub fn age(&self) -> Duration {
         self.cached_at.elapsed()
     }
 
     /// Increment access count and return new value
+    #[allow(dead_code)]
     pub fn increment_access(&self) -> u64 {
         self.access_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Get current access count
+    #[allow(dead_code)]
     pub fn access_count(&self) -> u64 {
         self.access_count.load(Ordering::Relaxed)
     }
@@ -187,6 +191,7 @@ impl Default for CachedGetObject {
     }
 }
 
+#[allow(dead_code)]
 impl CachedGetObject {
     /// Create a new CachedGetObject with the given body and content length
     pub fn new(body: bytes::Bytes, content_length: i64) -> Self {
@@ -234,8 +239,6 @@ impl CachedGetObject {
         self.version_id = Some(version_id);
         self
     }
-
-    /// Get the size in bytes for cache eviction calculations
 
     /// Builder method to set expires
     pub fn with_expires(mut self, expires: String) -> Self {
@@ -314,6 +317,7 @@ impl CachedGetObject {
     }
 
     /// Get the age of this cached entry
+    #[allow(dead_code)]
     pub fn age(&self) -> Option<Duration> {
         self.cached_at.map(|at| at.elapsed())
     }
@@ -790,6 +794,7 @@ impl HotObjectCache {
     }
 
     /// Get cache health status
+    #[allow(dead_code)]
     pub(crate) async fn health_status(&self) -> CacheHealthStatus {
         let stats = self.stats().await;
         let memory_usage = self.cache.weighted_size() as usize;
@@ -817,11 +822,13 @@ impl HotObjectCache {
     }
 
     /// Get current memory usage in bytes
+    #[allow(dead_code)]
     pub(crate) async fn memory_usage(&self) -> usize {
         self.cache.weighted_size() as usize
     }
 
     /// Evict a percentage of cached entries
+    #[allow(dead_code)]
     pub(crate) async fn evict_percentage(&self, percentage: f64) -> u64 {
         let stats = self.stats().await;
         let entries_to_evict = (stats.entries as f64 * percentage / 100.0).max(1.0) as u64;
@@ -835,6 +842,7 @@ impl HotObjectCache {
     }
 
     /// Warm cache from a list of hot keys
+    #[allow(dead_code)]
     pub(crate) async fn warm_from_hot_list(&self, hot_keys: Vec<(String, Vec<u8>)>) -> u64 {
         let mut warmed = 0u64;
 

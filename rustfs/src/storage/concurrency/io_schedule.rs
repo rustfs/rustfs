@@ -593,6 +593,7 @@ struct QueuedRequest<T> {
     /// Time when the request was enqueued.
     enqueue_time: Instant,
     /// Original priority assigned to the request.
+    #[allow(dead_code)]
     original_priority: IoPriority,
     /// Current priority (may be boosted for starvation prevention).
     current_priority: IoPriority,
@@ -893,6 +894,7 @@ pub struct IoPriorityMetrics {
     pub low_processed: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl IoPriorityMetrics {
     /// Create a new metrics instance.
     pub const fn new() -> Self {
@@ -911,6 +913,7 @@ impl IoPriorityMetrics {
     }
 
     /// Update queue depths from status.
+    #[allow(dead_code)]
     pub fn update_queue_depths(&self, status: &IoQueueStatus) {
         self.high_queue_depth
             .store(status.high_priority_waiting as u64, Ordering::Relaxed);
@@ -921,6 +924,7 @@ impl IoPriorityMetrics {
     }
 
     /// Record a starvation event.
+    #[allow(dead_code)]
     pub fn record_starvation(&self) {
         self.starvation_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -964,6 +968,7 @@ impl IoPriorityMetrics {
     }
 
     /// Get metrics summary for logging/debugging.
+    #[allow(dead_code)]
     pub fn summary(&self) -> String {
         format!(
             "high_queue={}, normal_queue={}, low_queue={}, starvation={}, high_proc={}, normal_proc={}, low_proc={}",
@@ -979,6 +984,7 @@ impl IoPriorityMetrics {
 }
 
 /// Global I/O priority metrics instance.
+#[allow(dead_code)]
 pub static IO_PRIORITY_METRICS: IoPriorityMetrics = IoPriorityMetrics::new();
 
 // ============================================
@@ -1059,9 +1065,11 @@ mod tests {
     #[test]
     #[serial]
     async fn test_io_priority_queue_starvation_prevention() {
-        let mut config = IoPriorityQueueConfig::default();
-        config.starvation_threshold_secs = 1; // 1 second for testing
-        config.starvation_prevention_interval_ms = 100;
+        let config = IoPriorityQueueConfig {
+            starvation_threshold_secs: 1,
+            starvation_prevention_interval_ms: 100,
+            ..Default::default()
+        };
 
         let queue = IoPriorityQueue::new(config);
 

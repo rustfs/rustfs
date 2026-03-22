@@ -546,8 +546,10 @@ impl Default for ConcurrencyManager {
 mod integration_tests {
     use super::*;
     use bytes::Bytes;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_priority_queue_integration() {
         let manager = ConcurrencyManager::new();
 
@@ -563,6 +565,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_cache_operations() {
         let manager = ConcurrencyManager::new();
 
@@ -582,6 +585,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_cache_stats() {
         let manager = ConcurrencyManager::new();
 
@@ -597,6 +601,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_io_queue_status() {
         let manager = ConcurrencyManager::new();
 
@@ -609,6 +614,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_disk_read_permit() {
         let manager = ConcurrencyManager::new();
 
@@ -625,6 +631,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_priority_scheduling() {
         let manager = ConcurrencyManager::new();
 
@@ -639,6 +646,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_cache_invalidation() {
         let manager = ConcurrencyManager::new();
 
@@ -657,6 +665,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_cache_clear() {
         let manager = ConcurrencyManager::new();
 
@@ -675,6 +684,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_io_strategy() {
         let manager = ConcurrencyManager::new();
 
@@ -690,6 +700,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_adaptive_buffer_size() {
         let manager = ConcurrencyManager::new();
 
