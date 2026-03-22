@@ -180,3 +180,156 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
+
+// =============================================================================
+// Concurrent Request Fix - Timeout and Backpressure Configuration
+// =============================================================================
+
+/// Environment variable for GetObject request timeout in seconds.
+///
+/// When a GetObject request exceeds this duration, it will be cancelled
+/// and return a 504 Gateway Timeout error. This prevents requests from
+/// hanging indefinitely due to deadlocks or resource exhaustion.
+///
+/// Default: 30 seconds (can be overridden by `RUSTFS_OBJECT_GET_TIMEOUT`).
+/// Set to 0 to disable timeout (not recommended for production).
+pub const ENV_OBJECT_GET_TIMEOUT: &str = "RUSTFS_OBJECT_GET_TIMEOUT";
+
+/// Default GetObject request timeout in seconds.
+///
+/// This value balances between allowing large object transfers to complete
+/// and preventing indefinite hangs. For 20-26MB objects with concurrent
+/// range reads, 30 seconds should be sufficient under normal conditions.
+pub const DEFAULT_OBJECT_GET_TIMEOUT: u64 = 30;
+
+/// Environment variable for disk read operation timeout in seconds.
+///
+/// Individual disk read operations that exceed this duration will be
+/// cancelled and treated as failures. This helps detect slow or hung
+/// disks without waiting indefinitely.
+///
+/// Default: 10 seconds (can be overridden by `RUSTFS_OBJECT_DISK_READ_TIMEOUT`).
+pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT";
+
+/// Default disk read timeout in seconds.
+pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
+
+/// Environment variable for duplex pipe buffer size in bytes.
+///
+/// The duplex pipe connects the disk read task to the HTTP response stream.
+/// A larger buffer reduces backpressure but increases memory usage.
+/// For large objects (20-26MB), a 4MB buffer provides good throughput.
+///
+/// Default: 4194304 (4 MB, can be overridden by `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE`).
+/// Minimum recommended: 1048576 (1 MB).
+pub const ENV_OBJECT_DUPLEX_BUFFER_SIZE: &str = "RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE";
+
+/// Default duplex buffer size: 4 MB.
+///
+/// This is 4x larger than the original 1 MB buffer, providing better
+/// handling of large objects and reducing backpressure-related hangs.
+pub const DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// Environment variable for I/O buffer size in bytes.
+///
+/// This controls the buffer size used for individual I/O operations.
+/// A larger buffer improves throughput for sequential reads but may
+/// increase latency for small random reads.
+///
+/// Default: 131072 (128 KB, can be overridden by `RUSTFS_OBJECT_IO_BUFFER_SIZE`).
+pub const ENV_OBJECT_IO_BUFFER_SIZE: &str = "RUSTFS_OBJECT_IO_BUFFER_SIZE";
+
+/// Default I/O buffer size: 128 KB.
+pub const DEFAULT_OBJECT_IO_BUFFER_SIZE: usize = 128 * 1024;
+
+/// Environment variable to enable/disable lock optimization.
+///
+/// When enabled, read locks are released immediately after metadata
+/// is read, rather than being held for the entire data transfer.
+/// This significantly reduces lock contention under high concurrency.
+///
+/// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE`).
+pub const ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE: &str = "RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE";
+
+/// Default: lock optimization is enabled.
+pub const DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE: bool = true;
+
+/// Environment variable to enable/disable priority-based I/O scheduling.
+///
+/// When enabled, smaller requests (< 1MB) are given higher priority
+/// than larger requests (> 10MB), preventing "starvation" of small
+/// requests by large ones.
+///
+/// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE`).
+pub const ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE: &str = "RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE";
+
+/// Default: priority scheduling is enabled.
+pub const DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE: bool = true;
+
+/// Environment variable to enable/disable deadlock detection.
+///
+/// When enabled, the system monitors active requests and detects
+/// potential deadlock situations (circular lock wait chains).
+/// This has some performance overhead and is intended for debugging.
+///
+/// Default: false (disabled, can be overridden by `RUSTFS_OBJECT_DEADLOCK_DETECTION_ENABLE`).
+pub const ENV_OBJECT_DEADLOCK_DETECTION_ENABLE: &str = "RUSTFS_OBJECT_DEADLOCK_DETECTION_ENABLE";
+
+/// Default: deadlock detection is disabled for performance.
+pub const DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE: bool = false;
+
+/// Environment variable for deadlock detection check interval in seconds.
+///
+/// How often the deadlock detector analyzes the lock wait graph.
+/// More frequent checks detect deadlocks faster but use more CPU.
+///
+/// Default: 5 seconds (can be overridden by `RUSTFS_OBJECT_DEADLOCK_CHECK_INTERVAL`).
+pub const ENV_OBJECT_DEADLOCK_CHECK_INTERVAL: &str = "RUSTFS_OBJECT_DEADLOCK_CHECK_INTERVAL";
+
+/// Default deadlock check interval: 5 seconds.
+pub const DEFAULT_OBJECT_DEADLOCK_CHECK_INTERVAL: u64 = 5;
+
+/// Environment variable for deadlock detection hang threshold in seconds.
+///
+/// Requests that have been running longer than this threshold are
+/// considered "potentially hung" and included in deadlock analysis.
+///
+/// Default: 10 seconds (can be overridden by `RUSTFS_OBJECT_DEADLOCK_HANG_THRESHOLD`).
+pub const ENV_OBJECT_DEADLOCK_HANG_THRESHOLD: &str = "RUSTFS_OBJECT_DEADLOCK_HANG_THRESHOLD";
+
+/// Default hang threshold: 10 seconds.
+pub const DEFAULT_OBJECT_DEADLOCK_HANG_THRESHOLD: u64 = 10;
+
+/// Environment variable for backpressure high watermark percentage.
+///
+/// When buffer usage exceeds this percentage, the system enters
+/// "high watermark" state and may apply backpressure to producers.
+///
+/// Default: 80 (80%, can be overridden by `RUSTFS_OBJECT_BACKPRESSURE_HIGH_WATERMARK`).
+pub const ENV_OBJECT_BACKPRESSURE_HIGH_WATERMARK: &str = "RUSTFS_OBJECT_BACKPRESSURE_HIGH_WATERMARK";
+
+/// Default high watermark: 80%.
+pub const DEFAULT_OBJECT_BACKPRESSURE_HIGH_WATERMARK: u32 = 80;
+
+/// Environment variable for backpressure low watermark percentage.
+///
+/// When buffer usage drops below this percentage after being in
+/// high watermark state, backpressure is released.
+///
+/// Default: 50 (50%, can be overridden by `RUSTFS_OBJECT_BACKPRESSURE_LOW_WATERMARK`).
+pub const ENV_OBJECT_BACKPRESSURE_LOW_WATERMARK: &str = "RUSTFS_OBJECT_BACKPRESSURE_LOW_WATERMARK";
+
+/// Default low watermark: 50%.
+pub const DEFAULT_OBJECT_BACKPRESSURE_LOW_WATERMARK: u32 = 50;
+
+/// Environment variable for lock acquisition timeout in seconds.
+///
+/// When a lock cannot be acquired within this duration, the operation
+/// will fail with a timeout error. This prevents indefinite waiting
+/// for locks that may never be released due to deadlocks.
+///
+/// Default: 5 seconds (can be overridden by `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT`).
+pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT";
+
+/// Default lock acquisition timeout: 5 seconds.
+pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;

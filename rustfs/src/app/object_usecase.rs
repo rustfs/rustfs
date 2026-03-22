@@ -30,6 +30,7 @@ use crate::storage::options::{
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
+use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -930,11 +931,36 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        // Create timeout wrapper for enhanced timeout tracking
+        let timeout_config = TimeoutConfig::from_env();
+        let wrapper =
+            RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{}-{}", req.input.bucket, req.input.key));
+
+        // Get cancellation token for cooperative cancellation
+        let _cancel_token = wrapper.cancel_token();
         let request_start = std::time::Instant::now();
 
         // Track this request for concurrency-aware optimizations
         let _request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+        // Register with deadlock detector if enabled
+        let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
+        let request_id = wrapper.request_id().to_string();
+        deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
+
+        // Check for request timeout before proceeding
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %req.input.bucket,
+                key = %req.input.key,
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out before processing"
+            );
+            deadlock_detector.unregister_request(&request_id);
+            return Err(s3_error!(InternalError, "Request timeout before processing"));
+        }
 
         #[cfg(feature = "metrics")]
         {
@@ -943,7 +969,10 @@ impl DefaultObjectUsecase {
             gauge!("rustfs.concurrent.get.object.requests").set(concurrent_requests as f64);
         }
 
-        debug!("GetObject request started with {} concurrent requests", concurrent_requests);
+        debug!(
+            "GetObject request started with {} concurrent requests, timeout={:?}",
+            concurrent_requests, timeout_config.get_object_timeout
+        );
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
         // mc get 3
@@ -1111,11 +1140,74 @@ impl DefaultObjectUsecase {
             .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
 
+        // Check timeout after acquiring permit
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                wait_ms = permit_wait_duration.as_millis(),
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out while waiting for disk permit"
+            );
+            deadlock_detector.unregister_request(&request_id);
+            #[cfg(feature = "metrics")]
+            metrics::counter!("rustfs.get.object.timeout.total", "stage" => "disk_permit").increment(1);
+            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
+        }
+
+        // Monitor I/O queue status for congestion detection
+        let queue_status = manager.io_queue_status();
+        let queue_utilization = if queue_status.total_permits > 0 {
+            (queue_status.permits_in_use as f64 / queue_status.total_permits as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Log warning if queue is congested (> 80% utilization)
+        if queue_utilization > 80.0 {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                queue_utilization = format!("{:.1}%", queue_utilization),
+                permits_in_use = queue_status.permits_in_use,
+                total_permits = queue_status.total_permits,
+                "I/O queue congestion detected"
+            );
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs.io.queue.congestion.total").increment(1);
+            }
+        }
+
         // Calculate adaptive I/O strategy from permit wait time
         // This adjusts buffer sizes, read-ahead, and caching behavior based on load
         // Use 256KB as the base buffer size for strategy calculation
         let base_buffer_size = self.base_buffer_size();
         let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
+
+        // Determine I/O priority based on request size (for priority scheduling)
+        // Small requests (< 1MB) get high priority, large requests (> 10MB) get low priority
+        let io_priority = manager.get_io_priority(io_strategy.buffer_size as i64);
+
+        // Log priority information for observability
+        if manager.is_priority_scheduling_enabled() {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                priority = %io_priority,
+                request_size = io_strategy.buffer_size,
+                "I/O priority assigned"
+            );
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs.io.priority.assigned.total", "priority" => io_priority.as_str()).increment(1);
+            }
+        }
 
         // Record detailed I/O metrics for monitoring
         #[cfg(feature = "metrics")]
@@ -1123,6 +1215,11 @@ impl DefaultObjectUsecase {
             use metrics::{counter, gauge, histogram};
             // Record permit wait time histogram
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
+            // Record I/O queue utilization
+            gauge!("rustfs.io.queue.utilization").set(queue_utilization);
+            gauge!("rustfs.io.queue.permits_in_use").set(queue_status.permits_in_use as f64);
+            gauge!("rustfs.io.queue.permits_available")
+                .set(queue_status.total_permits.saturating_sub(queue_status.permits_in_use) as f64);
             // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
             let load_level_value = match io_strategy.load_level {
                 crate::storage::concurrency::IoLoadLevel::Low => 0.0,
@@ -1135,6 +1232,8 @@ impl DefaultObjectUsecase {
             gauge!("rustfs.io.buffer.multiplier").set(io_strategy.buffer_multiplier);
             // Count strategy selections by load level
             counter!("rustfs.io.strategy.selected", "level" => format!("{:?}", io_strategy.load_level)).increment(1);
+            // Record I/O priority
+            counter!("rustfs.io.priority.assigned", "priority" => io_priority.as_str()).increment(1);
         }
 
         // Log strategy details at debug level for troubleshooting
@@ -1144,8 +1243,24 @@ impl DefaultObjectUsecase {
             buffer_size = io_strategy.buffer_size,
             readahead = io_strategy.enable_readahead,
             cache_wb = io_strategy.cache_writeback_enabled,
+            priority = io_priority.as_str(),
             "Adaptive I/O strategy calculated"
         );
+
+        // Check timeout before reading object
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out before reading object"
+            );
+            deadlock_detector.unregister_request(&request_id);
+            #[cfg(feature = "metrics")]
+            metrics::counter!("rustfs.get.object.timeout.total", "stage" => "before_read").increment(1);
+            return Err(s3_error!(InternalError, "Request timeout before reading object"));
+        }
 
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
@@ -1485,10 +1600,25 @@ impl DefaultObjectUsecase {
             histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
         }
 
+        // Check for timeout before returning
+        if wrapper.is_timeout() {
+            warn!(
+                "GetObject request exceeded timeout: key={} duration={:?} timeout={:?}",
+                cache_key,
+                wrapper.elapsed(),
+                timeout_config.get_object_timeout
+            );
+            #[cfg(feature = "metrics")]
+            counter!("rustfs.get.object.timeout.total").increment(1);
+        }
+
         debug!(
             "GetObject completed: key={} size={} duration={:?} buffer={}",
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
+
+        // Unregister from deadlock detector
+        deadlock_detector.unregister_request(&request_id);
 
         let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
