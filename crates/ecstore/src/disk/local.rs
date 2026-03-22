@@ -2612,16 +2612,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        // Try to use cached file content reading for better performance, with safe fallback
         let file_path = self.get_object_path(volume, path)?;
-        // let file_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
-
-        // First, try the cache
-        if let Ok(bytes) = get_global_file_cache().get_file_content(file_path.clone()).await {
-            return Ok(bytes);
-        }
-
-        // Fallback to direct read if cache fails
         let (data, _) = self.read_metadata_with_dmtime(&file_path).await?;
         Ok(data.into())
     }
