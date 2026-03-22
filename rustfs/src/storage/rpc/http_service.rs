@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::server::RPC_PREFIX;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
@@ -278,10 +278,20 @@ where
 {
     let mut body = body;
     let mut copied = 0_u64;
+    let mut pending = BytesMut::with_capacity(DEFAULT_READ_BUFFER_SIZE);
 
     while let Some(bytes) = body.try_next().await.map_err(io::Error::other)? {
         copied += bytes.len() as u64;
-        writer.write_all(&bytes).await?;
+        pending.extend_from_slice(&bytes);
+
+        if pending.len() >= DEFAULT_READ_BUFFER_SIZE {
+            writer.write_all(&pending).await?;
+            pending.clear();
+        }
+    }
+
+    if !pending.is_empty() {
+        writer.write_all(&pending).await?;
     }
 
     Ok(copied)
