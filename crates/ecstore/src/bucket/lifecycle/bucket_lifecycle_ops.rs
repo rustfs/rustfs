@@ -33,7 +33,9 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
+use crate::store_api::{
+    GetObjectReader, HTTPRangeSpec, ListOperations, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use bytes::BytesMut;
@@ -658,6 +660,29 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
             }
             _ => (),
         }
+    }
+}
+
+pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let mut marker = None;
+    let mut version_marker = None;
+
+    loop {
+        let page = api
+            .clone()
+            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .await?;
+
+        for object in &page.objects {
+            enqueue_transition_immediate(object, LcEventSrc::Scanner).await;
+        }
+
+        if !page.is_truncated {
+            return Ok(());
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
     }
 }
 

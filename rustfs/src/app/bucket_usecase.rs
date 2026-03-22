@@ -28,7 +28,7 @@ use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
-    lifecycle::bucket_lifecycle_ops::validate_transition_tier,
+    lifecycle::bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, validate_transition_tier},
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
         BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
@@ -124,6 +124,26 @@ fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'stati
     }
 
     Ok(())
+}
+
+fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
+    config.rules.iter().any(|rule| {
+        rule.transitions.as_ref().is_some_and(|transitions| {
+            transitions.iter().any(|transition| {
+                transition
+                    .storage_class
+                    .as_ref()
+                    .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+            })
+        }) || rule.noncurrent_version_transitions.as_ref().is_some_and(|transitions| {
+            transitions.iter().any(|transition| {
+                transition
+                    .storage_class
+                    .as_ref()
+                    .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+            })
+        })
+    })
 }
 
 #[derive(Clone, Default)]
@@ -1050,6 +1070,17 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        if lifecycle_has_transition_rules(&input_cfg)
+            && let Some(store) = new_object_layer_fn()
+        {
+            let bucket_name = bucket.clone();
+            tokio::spawn(async move {
+                if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
+                    warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
+                }
+            });
+        }
 
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
