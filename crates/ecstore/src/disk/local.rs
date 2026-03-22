@@ -667,6 +667,8 @@ impl LocalDisk {
             }
         }
 
+        get_global_file_cache().invalidate(delete_path).await;
+
         if let Some(dir_path) = delete_path.parent() {
             Box::pin(self.delete_file(base_path, &PathBuf::from(dir_path), false, false)).await?;
         }
@@ -2484,7 +2486,10 @@ impl DiskAPI for LocalDisk {
                 file_path.as_path(),
                 Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
             ]);
-            return rename_all(src_path, dst_path, file_path).await;
+            rename_all(&src_path, &dst_path, file_path).await?;
+            get_global_file_cache().invalidate(&src_path).await;
+            get_global_file_cache().invalidate(&dst_path).await;
+            return Ok(());
         }
 
         self.delete_file(&volume_dir, &xl_path, true, false).await
