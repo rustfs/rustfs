@@ -2551,7 +2551,8 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         let file_path = self.get_object_path(volume, path)?;
-        let (data, _) = self.read_metadata_with_dmtime(&file_path).await?;
+        let volume_dir = self.get_bucket_path(volume)?;
+        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data.into())
     }
 }
