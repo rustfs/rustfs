@@ -22,7 +22,9 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
+use crate::common::{
+    RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client,
+};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
@@ -423,10 +425,7 @@ impl VaultTestEnvironment {
             let port_check = TcpStream::connect(VAULT_ADDRESS).await.is_ok();
             if port_check {
                 // Additional check by making a health request
-                if let Ok(response) = local_http_client()
-                    .get(format!("{VAULT_URL}/v1/sys/health"))
-                    .send()
-                    .await
+                if let Ok(response) = local_http_client().get(format!("{VAULT_URL}/v1/sys/health")).send().await
                     && response.status().is_success()
                 {
                     info!("Vault server is ready after {} seconds", i);

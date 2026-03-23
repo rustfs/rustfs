@@ -27,7 +27,7 @@ use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use reqwest::Client as HttpClient;
 use std::ffi::OsStr;
 use std::fs as stdfs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Once;
 use std::time::Duration;
@@ -141,11 +141,11 @@ fn requested_rustfs_build_features() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn rustfs_binary_features_stamp_path(binary_path: &PathBuf) -> PathBuf {
+fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
     binary_path.with_extension("features")
 }
 
-fn binary_features_match(binary_path: &PathBuf, requested_features: Option<&str>) -> bool {
+fn binary_features_match(binary_path: &Path, requested_features: Option<&str>) -> bool {
     let stamp_path = rustfs_binary_features_stamp_path(binary_path);
     let recorded = stdfs::read_to_string(stamp_path).ok().map(|value| value.trim().to_string());
 
@@ -155,7 +155,7 @@ fn binary_features_match(binary_path: &PathBuf, requested_features: Option<&str>
     }
 }
 
-fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &PathBuf) -> bool {
+fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &Path) -> bool {
     if path.is_file() {
         return std::fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -689,10 +689,7 @@ impl RustFSTestClusterEnvironment {
     ///
     /// Verifies service availability by calling the S3 `list_buckets` API against the requested node,
     /// retries up to 120 times with a 1-second interval between attempts.
-    async fn wait_for_node_service_ready(
-        &self,
-        node_idx: usize,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_for_node_service_ready(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.create_s3_client(node_idx)?;
 
         for attempt in 0..120 {

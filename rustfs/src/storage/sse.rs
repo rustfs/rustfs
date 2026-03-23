@@ -162,6 +162,15 @@ async fn prepare_sse_configuration(
     ssekms_key_id: Option<SSEKMSKeyId>,
 ) -> Result<Option<SseConfiguration>, ApiError> {
     if let Some(server_side_encryption) = server_side_encryption.clone()
+        && server_side_encryption.as_str() == ServerSideEncryption::AES256
+    {
+        return Ok(Some(SseConfiguration {
+            effective_sse: server_side_encryption,
+            effective_kms_key_id: None,
+        }));
+    }
+
+    if let Some(server_side_encryption) = server_side_encryption.clone()
         && let Some(ssekms_key_id) = ssekms_key_id
     {
         return Ok(Some(SseConfiguration {
@@ -1057,11 +1066,17 @@ async fn apply_managed_encryption_material(
         }
     }
 
-    let kms_key_to_use = kms_key_candidate.clone().ok_or_else(|| {
-        ApiError::from(StorageError::other(
-            "No KMS key available for managed server-side encryption (required for SSE-KMS)",
-        ))
-    })?;
+    let kms_key_to_use = match (encryption_type, kms_key_candidate.clone()) {
+        (SSEType::SseS3, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseS3, None) => "default".to_string(),
+        (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseKms, None) => {
+            return Err(ApiError::from(StorageError::other(
+                "No KMS key available for managed server-side encryption (required for SSE-KMS)",
+            )));
+        }
+        _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
+    };
 
     let provider = get_sse_dek_provider().await?;
 
