@@ -26,11 +26,19 @@ updates:
       day: "monday"
       timezone: "Asia/Shanghai"
       time: "08:00"
+    assignees:
+      - "heihutu"
+    reviewers:
+      - "houseme"
+      - "overtrue"
+      - "majinghe"
     ignore:
       - dependency-name: "object_store"
         versions: [ "0.13.x" ]
       - dependency-name: "libunftp"
         versions: [ "0.23.x" ]
+      - dependency-name: "ratelimit"
+        versions: [ "1.x" ]
     groups:
       s3s:
         update-types:
