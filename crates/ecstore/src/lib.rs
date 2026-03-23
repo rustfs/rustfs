@@ -28,7 +28,6 @@ pub mod disks_layout;
 pub mod endpoints;
 pub mod erasure_coding;
 pub mod error;
-pub mod file_cache;
 pub mod global;
 pub mod metrics_realtime;
 pub mod notification_sys;

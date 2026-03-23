@@ -13,17 +13,23 @@
 // limitations under the License.
 
 pub mod access;
+pub mod backpressure;
 pub mod concurrency;
+pub mod deadlock_detector;
 pub mod ecfs;
 pub(crate) mod entity;
 pub(crate) mod helper;
+pub mod lock_optimizer;
 pub mod options;
 pub(crate) mod readers;
 pub mod rpc;
 pub(crate) mod s3_api;
 mod sse;
+pub mod timeout_wrapper;
 pub mod tonic_service;
 
+#[cfg(test)]
+mod concurrent_fix_test;
 #[cfg(test)]
 mod concurrent_get_object_test;
 mod ecfs_extend;

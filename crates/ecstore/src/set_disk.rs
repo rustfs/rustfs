@@ -121,6 +121,21 @@ use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
+
+/// Get the duplex buffer size from environment variable or use default.
+///
+/// This function reads `RUSTFS_DUPLEX_BUFFER_SIZE` environment variable
+/// to allow runtime configuration of the duplex pipe buffer size.
+/// A larger buffer (e.g., 4MB) helps prevent backpressure-related hangs
+/// when reading large objects (20-26MB) under high concurrency.
+///
+/// Default: 4MB (4 * 1024 * 1024 bytes)
+pub fn get_duplex_buffer_size() -> usize {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+    )
+}
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 
@@ -136,7 +151,72 @@ mod write;
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
 pub fn get_lock_acquire_timeout() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+    ))
+}
+
+/// Check if lock optimization is enabled.
+/// When enabled, read locks are released after metadata read instead of
+/// being held for the entire data transfer duration.
+pub fn is_lock_optimization_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+    )
+}
+
+/// Check if deadlock detection is enabled.
+/// When enabled, lock operations are recorded for deadlock analysis.
+pub fn is_deadlock_detection_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
+    )
+}
+
+/// Record a lock acquisition for deadlock detection.
+/// This records detailed lock information for deadlock analysis.
+/// Returns the lock_id for later release tracking.
+#[inline]
+fn record_lock_acquire(bucket: &str, object: &str, lock_type: &str) -> String {
+    let lock_id = format!("{}:{}", bucket, object);
+
+    if !is_deadlock_detection_enabled() {
+        return lock_id;
+    }
+
+    let request_id = format!("get-{}-{}", bucket, object);
+    let resource = format!("{}/{}", bucket, object);
+
+    // Log with structured fields for analysis
+    debug!(
+        request_id = %request_id,
+        lock_id = %lock_id,
+        lock_type = %lock_type,
+        resource = %resource,
+        "Lock acquired for deadlock tracking"
+    );
+
+    lock_id
+}
+
+/// Record a lock release for deadlock detection.
+#[inline]
+fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &str) {
+    if !is_deadlock_detection_enabled() {
+        return;
+    }
+
+    let request_id = format!("get-{}-{}", bucket, object);
+
+    debug!(
+        request_id = %request_id,
+        lock_id = %lock_id,
+        lock_type = %lock_type,
+        "Lock released for deadlock tracking"
+    );
 }
 
 fn build_tiered_decommission_file_info(
@@ -451,20 +531,44 @@ impl ObjectIO for SetDisks {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        // Check if lock optimization is enabled
+        // When enabled, read locks are released after metadata read
+        let lock_optimization_enabled = is_lock_optimization_enabled();
+
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
-            Some(
-                self.new_ns_lock(bucket, object)
-                    .await?
-                    .get_read_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire read lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "read", &e)
-                        ))
-                    })?,
-            )
+            let acquire_start = Instant::now();
+
+            // Record lock wait for deadlock detection
+            if is_deadlock_detection_enabled() {
+                debug!(
+                    lock_id = format!("{}:{}", bucket, object),
+                    lock_type = "read",
+                    resource = format!("{}/{}", bucket, object),
+                    "Waiting for read lock"
+                );
+            }
+
+            let guard = self
+                .new_ns_lock(bucket, object)
+                .await?
+                .get_read_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|e| {
+                    Error::other(format!(
+                        "Failed to acquire read lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "read", &e)
+                    ))
+                })?;
+
+            // Record lock acquisition for deadlock detection
+            let _lock_id = record_lock_acquire(bucket, object, "read");
+
+            // Record lock statistics
+            metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
+            metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+
+            Some(guard)
         } else {
             None
         };
@@ -512,7 +616,28 @@ impl ObjectIO for SetDisks {
             return Ok(gr);
         }
 
-        let (rd, wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+        // Lock optimization: release read lock after metadata read if enabled
+        // This reduces lock contention by not holding the lock during data transfer
+        let read_lock_guard = if lock_optimization_enabled {
+            // Record lock release for deadlock detection
+            if read_lock_guard.is_some() {
+                let lock_id = format!("{}:{}", bucket, object);
+                record_lock_release(bucket, object, &lock_id, "read");
+
+                // Record early lock release statistics
+                metrics::counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
+            }
+            // Explicitly drop the lock guard to release the lock early
+            drop(read_lock_guard);
+            debug!(bucket, object, "Lock optimization: released read lock after metadata read");
+            None
+        } else {
+            read_lock_guard
+        };
+
+        let duplex_buffer_size = get_duplex_buffer_size();
+        let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
+        debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
         let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
 
@@ -523,9 +648,10 @@ impl ObjectIO for SetDisks {
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
         // Move the read-lock guard into the task so it lives for the duration of the read
+        // Note: when lock optimization is enabled, read_lock_guard is None
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
-            let _guard = read_lock_guard; // keep guard alive until task ends
+            let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
@@ -751,7 +877,7 @@ impl ObjectIO for SetDisks {
             pfi.metadata = user_defined.clone();
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    pfi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
+                    pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
                 }
 
                 pfi.set_inline_data();
@@ -1093,7 +1219,7 @@ impl ObjectOperations for SetDisks {
         let mut unique_objects: HashSet<String> = HashSet::new();
         for dobj in &objects {
             if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(rustfs_lock::ObjectKey::new(bucket, dobj.object_name.clone()));
+                batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
             }
         }
 
@@ -2792,8 +2918,7 @@ impl MultipartOperations for SetDisks {
         // Build a lookup map for O(1) part resolution instead of O(n) find() in the loop
         // This optimizes from O(n^2) to O(n) when processing many parts
         use std::collections::HashMap;
-        let part_lookup: HashMap<usize, &rustfs_filemeta::ObjectPartInfo> =
-            curr_fi.parts.iter().map(|part| (part.number, part)).collect();
+        let part_lookup: HashMap<usize, &ObjectPartInfo> = curr_fi.parts.iter().map(|part| (part.number, part)).collect();
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let Some(ext_part) = part_lookup.get(&p.part_num) else {
@@ -3480,12 +3605,11 @@ async fn disks_with_all_parts(
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
-                let checksum_algo =
-                    if meta.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                    } else {
-                        checksum_info.algorithm
-                    };
+                let checksum_algo = if meta.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+                    HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
                 let data_len = data.len();
                 let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
