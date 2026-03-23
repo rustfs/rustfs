@@ -521,8 +521,8 @@ async fn run(config: config::Config) -> Result<()> {
         "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
     );
 
-    // Initialize background services independently so each feature flag is honored.
-    if enable_heal {
+    // Scanner depends on the heal channel/manager, so scanner implies heal.
+    if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
         init_heal_manager(heal_storage, None).await?;
     }
@@ -626,7 +626,7 @@ async fn handle_shutdown(
         shutdown_background_services();
     }
 
-    if enable_heal {
+    if enable_heal || enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Stopping AHM services..."
