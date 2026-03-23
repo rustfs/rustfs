@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod http_service;
 pub mod node_service;
 
+pub use http_service::InternodeRpcService;
 pub use node_service::{NodeService, make_server};

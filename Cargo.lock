@@ -7914,6 +7914,7 @@ name = "rustfs-rio"
 version = "0.0.5"
 dependencies = [
  "aes-gcm",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "crc-fast",
@@ -7921,10 +7922,12 @@ dependencies = [
  "futures",
  "hex-simd",
  "http 1.4.0",
+ "http-body-util",
  "md-5 0.11.0-rc.5",
  "pin-project-lite",
  "rand 0.10.0",
  "reqwest 0.13.2",
+ "rustfs-common",
  "rustfs-config",
  "rustfs-utils",
  "s3s",
