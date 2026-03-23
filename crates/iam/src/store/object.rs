@@ -25,7 +25,7 @@ use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOption
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
-        com::{delete_config, read_config, read_config_with_metadata, save_config},
+        com::{delete_config, read_config, read_config_no_lock, read_config_with_metadata, save_config},
     },
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
@@ -391,7 +391,7 @@ impl ObjectStore {
         // If it doesn't exist, the system bucket or metadata is not ready.
         let probe_path = format!("{}/format.json", *IAM_CONFIG_PREFIX);
 
-        match read_config(self.object_api.clone(), &probe_path).await {
+        match read_config_no_lock(self.object_api.clone(), &probe_path).await {
             Ok(_) => Ok(()),
             Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(Error::other(format!(
                 "Storage metadata not ready: probe object '{}' not found (expected IAM config to be initialized)",

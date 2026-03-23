@@ -24,6 +24,7 @@ use crate::server::{
     layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
+use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
@@ -592,6 +593,7 @@ fn process_connection(
         let http_service = SwiftService::new(true, None, s3_service);
         #[cfg(not(feature = "swift"))]
         let http_service = s3_service;
+        let http_service = InternodeRpcService::new(http_service);
 
         let service = hybrid(http_service, rpc_service);
 

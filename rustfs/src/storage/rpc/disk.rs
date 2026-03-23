@@ -13,6 +13,26 @@
 // limitations under the License.
 
 use super::*;
+use serde::de::DeserializeOwned;
+use std::io::Cursor;
+
+fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &str) -> std::result::Result<T, DiskError> {
+    if !binary.is_empty() {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
+        return T::deserialize(&mut deserializer)
+            .map_err(|err| DiskError::other(format!("decode {value_name} msgpack failed: {err}")));
+    }
+
+    serde_json::from_str(json).map_err(|err| DiskError::other(format!("decode {value_name} failed: {err}")))
+}
+
+fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    value
+        .serialize(&mut serializer)
+        .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
+    Ok(serializer.into_inner())
+}
 
 impl NodeService {
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
@@ -86,32 +106,44 @@ impl NodeService {
     ) -> Result<Response<ReadMultipleResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let read_multiple_req = match serde_json::from_str::<ReadMultipleReq>(&request.read_multiple_req) {
+            let read_multiple_req = match decode_msgpack_or_json::<ReadMultipleReq>(
+                &request.read_multiple_req_bin,
+                &request.read_multiple_req,
+                "ReadMultipleReq",
+            ) {
                 Ok(read_multiple_req) => read_multiple_req,
                 Err(err) => {
                     return Ok(Response::new(ReadMultipleResponse {
                         success: false,
                         read_multiple_resps: Vec::new(),
+                        read_multiple_resps_bin: Vec::new(),
                         error: Some(DiskError::other(format!("decode ReadMultipleReq failed: {err}")).into()),
                     }));
                 }
             };
             match disk.read_multiple(read_multiple_req).await {
                 Ok(read_multiple_resps) => {
-                    let read_multiple_resps = read_multiple_resps
+                    let read_multiple_resps: Vec<String> = read_multiple_resps
                         .into_iter()
                         .filter_map(|read_multiple_resp| serde_json::to_string(&read_multiple_resp).ok())
+                        .collect();
+                    let read_multiple_resps_bin = read_multiple_resps
+                        .iter()
+                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(json_str).ok())
+                        .filter_map(|resp| encode_msgpack(&resp, "ReadMultipleResp").ok())
                         .collect();
 
                     Ok(Response::new(ReadMultipleResponse {
                         success: true,
                         read_multiple_resps,
+                        read_multiple_resps_bin,
                         error: None,
                     }))
                 }
                 Err(err) => Ok(Response::new(ReadMultipleResponse {
                     success: false,
                     read_multiple_resps: Vec::new(),
+                    read_multiple_resps_bin: Vec::new(),
                     error: Some(err.into()),
                 })),
             }
@@ -119,6 +151,7 @@ impl NodeService {
             Ok(Response::new(ReadMultipleResponse {
                 success: false,
                 read_multiple_resps: Vec::new(),
+                read_multiple_resps_bin: Vec::new(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -239,21 +272,34 @@ impl NodeService {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_xl(&request.volume, &request.path, request.read_data).await {
-                Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
-                    Ok(raw_file_info) => Ok(Response::new(ReadXlResponse {
-                        success: true,
-                        raw_file_info,
-                        error: None,
-                    })),
-                    Err(err) => Ok(Response::new(ReadXlResponse {
-                        success: false,
-                        raw_file_info: String::new(),
-                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                    })),
-                },
+                Ok(raw_file_info) => {
+                    let raw_file_info_json = serde_json::to_string(&raw_file_info);
+                    let raw_file_info_bin = encode_msgpack(&raw_file_info, "RawFileInfo");
+                    match (raw_file_info_json, raw_file_info_bin) {
+                        (Ok(raw_file_info), Ok(raw_file_info_bin)) => Ok(Response::new(ReadXlResponse {
+                            success: true,
+                            raw_file_info,
+                            raw_file_info_bin,
+                            error: None,
+                        })),
+                        (Err(err), _) => Ok(Response::new(ReadXlResponse {
+                            success: false,
+                            raw_file_info: String::new(),
+                            raw_file_info_bin: Vec::new(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                        (_, Err(err)) => Ok(Response::new(ReadXlResponse {
+                            success: false,
+                            raw_file_info: String::new(),
+                            raw_file_info_bin: Vec::new(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                    }
+                }
                 Err(err) => Ok(Response::new(ReadXlResponse {
                     success: false,
                     raw_file_info: String::new(),
+                    raw_file_info_bin: Vec::new(),
                     error: Some(err.into()),
                 })),
             }
@@ -261,6 +307,7 @@ impl NodeService {
             Ok(Response::new(ReadXlResponse {
                 success: false,
                 raw_file_info: String::new(),
+                raw_file_info_bin: Vec::new(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -272,12 +319,13 @@ impl NodeService {
     ) -> Result<Response<ReadVersionResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let opts = match serde_json::from_str::<ReadOptions>(&request.opts) {
+            let opts = match decode_msgpack_or_json::<ReadOptions>(&request.opts_bin, &request.opts, "ReadOptions") {
                 Ok(options) => options,
                 Err(err) => {
                     return Ok(Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
+                        file_info_bin: Vec::new(),
                         error: Some(DiskError::other(format!("decode ReadOptions failed: {err}")).into()),
                     }));
                 }
@@ -286,21 +334,34 @@ impl NodeService {
                 .read_version("", &request.volume, &request.path, &request.version_id, &opts)
                 .await
             {
-                Ok(file_info) => match serde_json::to_string(&file_info) {
-                    Ok(file_info) => Ok(Response::new(ReadVersionResponse {
-                        success: true,
-                        file_info,
-                        error: None,
-                    })),
-                    Err(err) => Ok(Response::new(ReadVersionResponse {
-                        success: false,
-                        file_info: String::new(),
-                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                    })),
-                },
+                Ok(file_info) => {
+                    let file_info_json = serde_json::to_string(&file_info);
+                    let file_info_bin = encode_msgpack(&file_info, "FileInfo");
+                    match (file_info_json, file_info_bin) {
+                        (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
+                            success: true,
+                            file_info,
+                            file_info_bin,
+                            error: None,
+                        })),
+                        (Err(err), _) => Ok(Response::new(ReadVersionResponse {
+                            success: false,
+                            file_info: String::new(),
+                            file_info_bin: Vec::new(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                        (_, Err(err)) => Ok(Response::new(ReadVersionResponse {
+                            success: false,
+                            file_info: String::new(),
+                            file_info_bin: Vec::new(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                    }
+                }
                 Err(err) => Ok(Response::new(ReadVersionResponse {
                     success: false,
                     file_info: String::new(),
+                    file_info_bin: Vec::new(),
                     error: Some(err.into()),
                 })),
             }
@@ -308,6 +369,7 @@ impl NodeService {
             Ok(Response::new(ReadVersionResponse {
                 success: false,
                 file_info: String::new(),
+                file_info_bin: Vec::new(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -319,7 +381,7 @@ impl NodeService {
     ) -> Result<Response<WriteMetadataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(WriteMetadataResponse {
@@ -352,7 +414,7 @@ impl NodeService {
     ) -> Result<Response<UpdateMetadataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(UpdateMetadataResponse {
@@ -361,7 +423,8 @@ impl NodeService {
                     }));
                 }
             };
-            let opts = match serde_json::from_str::<UpdateMetadataOpts>(&request.opts) {
+            let opts = match decode_msgpack_or_json::<UpdateMetadataOpts>(&request.opts_bin, &request.opts, "UpdateMetadataOpts")
+            {
                 Ok(opts) => opts,
                 Err(err) => {
                     return Ok(Response::new(UpdateMetadataResponse {
@@ -908,5 +971,44 @@ impl NodeService {
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct SamplePayload {
+        name: String,
+        count: u32,
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_prefers_binary_payload() {
+        let payload = SamplePayload {
+            name: "rustfs".to_string(),
+            count: 3,
+        };
+
+        let binary = encode_msgpack(&payload, "SamplePayload").unwrap();
+        let decoded =
+            decode_msgpack_or_json::<SamplePayload>(&binary, r#"{"name":"ignored","count":1}"#, "SamplePayload").unwrap();
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_falls_back_to_json() {
+        let decoded = decode_msgpack_or_json::<SamplePayload>(&[], r#"{"name":"compat","count":7}"#, "SamplePayload").unwrap();
+
+        assert_eq!(
+            decoded,
+            SamplePayload {
+                name: "compat".to_string(),
+                count: 7,
+            }
+        );
     }
 }

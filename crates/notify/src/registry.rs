@@ -293,6 +293,12 @@ impl TargetRegistry {
                 }
             }
 
+            if &new_config == config {
+                info!("Notification target configuration unchanged, skip persisting server config");
+                info!(count = successful_targets.len(), "All target processing completed");
+                return Ok(successful_targets);
+            }
+
             let store = match rustfs_ecstore::global::new_object_layer_fn() {
                 Some(s) => s,
                 None => {

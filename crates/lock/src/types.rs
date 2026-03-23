@@ -225,6 +225,8 @@ pub struct LockRequest {
     pub priority: LockPriority,
     /// Deadlock detection
     pub deadlock_detection: bool,
+    /// Suppress warning logs for expected contention failures
+    pub suppress_contention_logs: bool,
 }
 
 impl LockRequest {
@@ -240,6 +242,7 @@ impl LockRequest {
             metadata: LockMetadata::default(),
             priority: LockPriority::default(),
             deadlock_detection: false,
+            suppress_contention_logs: false,
         }
     }
 
@@ -270,6 +273,12 @@ impl LockRequest {
     /// Set deadlock detection
     pub fn with_deadlock_detection(mut self, enabled: bool) -> Self {
         self.deadlock_detection = enabled;
+        self
+    }
+
+    /// Suppress warning logs for expected contention failures
+    pub fn with_suppress_contention_logs(mut self, enabled: bool) -> Self {
+        self.suppress_contention_logs = enabled;
         self
     }
 }
