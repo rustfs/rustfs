@@ -776,9 +776,9 @@ impl LifecycleCalculate for Transition {
             return Some(date.into());
         }
 
-        match self.days {
-            Some(days) => Some(expected_expiry_time(obj.mod_time.unwrap(), days)),
-            None => obj.mod_time,
+        match (self.days, obj.mod_time) {
+            (Some(days), Some(mod_time)) => Some(expected_expiry_time(mod_time, days)),
+            _ => None,
         }
     }
 }
@@ -1333,6 +1333,42 @@ mod tests {
         assert_eq!(event.action, IlmAction::TransitionAction);
         assert_eq!(event.rule_id, "transition-date");
         assert_eq!(event.storage_class, "WARM");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_transitions_without_schedule_are_ignored() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("transition-no-schedule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: None,
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            transition_status: "".to_string(),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time + Duration::days(1), 0).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
     }
 
     #[tokio::test]

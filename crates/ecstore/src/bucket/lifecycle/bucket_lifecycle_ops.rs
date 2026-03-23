@@ -463,17 +463,41 @@ impl TransitionState {
             src: src.clone(),
             event: event.clone(),
         };
-        select! {
-            //_ -> t.ctx.Done() => (),
-            _ = self.transition_tx.send(Some(task)) => (),
-            else => {
-                match src {
-                    LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload => {
-                        self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => ()
+        if let Err(err) = self.transition_tx.send(Some(task)).await {
+            warn!(
+                bucket = %oi.bucket,
+                object = %oi.name,
+                source = ?src,
+                error = ?err,
+                "failed to queue transition task"
+            );
+        }
+    }
+
+    pub fn try_queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
+        let task = TransitionTask {
+            obj_info: oi.clone(),
+            src: src.clone(),
+            event: event.clone(),
+        };
+        match self.transition_tx.try_send(Some(task)) {
+            Ok(()) => true,
+            Err(err) => {
+                if matches!(
+                    src,
+                    LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload
+                ) {
+                    self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
                 }
-            },
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    error = ?err,
+                    "failed to queue transition task without waiting"
+                );
+                false
+            }
         }
     }
 
@@ -647,23 +671,48 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
-pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
-    let lc = GLOBAL_LifecycleSys.get(&oi.bucket).await;
-    if !lc.is_none() {
-        let event = lc.expect("err").eval(&oi.to_lifecycle_opts()).await;
-        match event.action {
-            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                if oi.delete_marker || oi.is_dir {
-                    return;
-                }
-                GLOBAL_TransitionState.queue_transition_task(oi, &event, &src).await;
-            }
-            _ => (),
-        }
+async fn transition_event_for_object(lc: &BucketLifecycleConfiguration, oi: &ObjectInfo) -> Option<lifecycle::Event> {
+    if oi.delete_marker || oi.is_dir {
+        return None;
+    }
+
+    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    match event.action {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => Some(event),
+        _ => None,
     }
 }
 
+async fn enqueue_transition_with_config(lc: &BucketLifecycleConfiguration, oi: &ObjectInfo, src: &LcEventSrc) {
+    if let Some(event) = transition_event_for_object(lc, oi).await {
+        GLOBAL_TransitionState.queue_transition_task(oi, &event, src).await;
+    }
+}
+
+async fn try_enqueue_transition_with_config(lc: &BucketLifecycleConfiguration, oi: &ObjectInfo, src: &LcEventSrc) {
+    if let Some(event) = transition_event_for_object(lc, oi).await {
+        let _ = GLOBAL_TransitionState.try_queue_transition_task(oi, &event, src);
+    }
+}
+
+pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
+    let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
+        return;
+    };
+    enqueue_transition_with_config(&lc, oi, &src).await;
+}
+
+pub async fn try_enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
+    let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
+        return;
+    };
+    try_enqueue_transition_with_config(&lc, oi, &src).await;
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
+        return Ok(());
+    };
     let mut marker = None;
     let mut version_marker = None;
 
@@ -674,7 +723,7 @@ pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: 
             .await?;
 
         for object in &page.objects {
-            enqueue_transition_immediate(object, LcEventSrc::Scanner).await;
+            enqueue_transition_with_config(&lc, object, &LcEventSrc::Scanner).await;
         }
 
         if !page.is_truncated {
