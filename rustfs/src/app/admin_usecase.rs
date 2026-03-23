@@ -134,20 +134,20 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
             }
 
             // Only count file sizes, ignore directories
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_file() {
                     file_count += 1;
 
                     // When file count exceeds threshold, enable sampling
                     if file_count > MAX_FILES_THRESHOLD {
                         // Sampling: count 1 in every SAMPLE_RATE files
-                        if file_count % SAMPLE_RATE == 0 {
+                        if file_count.is_multiple_of(SAMPLE_RATE) {
                             sampled_size += metadata.len();
                             sampled_count += 1;
                         }
 
                         // Log progress every 100k files
-                        if file_count % 100_000 == 0 {
+                        if file_count.is_multiple_of(100_000) {
                             debug!(
                                 "Processed {} files, sampled {} files, size: {} bytes",
                                 file_count, sampled_count, sampled_size
@@ -158,7 +158,6 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
                         total_size += metadata.len();
                     }
                 }
-            }
         }
 
         // If sampling was enabled, return estimated value
@@ -180,7 +179,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         }
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    .map_err(std::io::Error::other)?
 }
 
 #[derive(Clone, Default)]
