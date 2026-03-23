@@ -27,7 +27,7 @@ use crate::bucket::utils::check_new_multipart_args;
 use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
-use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict};
 use crate::config::GLOBAL_STORAGE_CLASS;
 use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};

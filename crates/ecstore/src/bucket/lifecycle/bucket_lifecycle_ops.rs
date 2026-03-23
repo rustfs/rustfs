@@ -33,7 +33,9 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
+use crate::store_api::{
+    GetObjectReader, HTTPRangeSpec, ListOperations, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use bytes::BytesMut;
@@ -646,18 +648,48 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
 }
 
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
-    let lc = GLOBAL_LifecycleSys.get(&oi.bucket).await;
-    if !lc.is_none() {
-        let event = lc.expect("err").eval(&oi.to_lifecycle_opts()).await;
-        match event.action {
-            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                if oi.delete_marker || oi.is_dir {
-                    return;
-                }
-                GLOBAL_TransitionState.queue_transition_task(oi, &event, &src).await;
-            }
-            _ => (),
+    if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
+        enqueue_transition_with_lifecycle(oi, &lc, &src).await;
+    }
+}
+
+pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
+        return Ok(());
+    };
+    let mut marker = None;
+    let mut version_marker = None;
+    let src = LcEventSrc::Scanner;
+
+    loop {
+        let page = api
+            .clone()
+            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .await?;
+
+        for object in &page.objects {
+            enqueue_transition_with_lifecycle(object, &lc, &src).await;
         }
+
+        if !page.is_truncated {
+            return Ok(());
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+}
+
+async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) {
+    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    match event.action {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
+            if oi.delete_marker || oi.is_dir {
+                return;
+            }
+            GLOBAL_TransitionState.queue_transition_task(oi, &event, src).await;
+        }
+        _ => (),
     }
 }
 

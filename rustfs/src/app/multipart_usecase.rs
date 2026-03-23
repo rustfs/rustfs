@@ -30,6 +30,7 @@ use futures::StreamExt;
 use http::{HeaderMap, Uri};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
+    lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
@@ -59,6 +60,10 @@ use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 use urlencoding::encode;
+
+async fn maybe_enqueue_transition_immediate(obj_info: &rustfs_ecstore::store_api::ObjectInfo, src: LcEventSrc) {
+    enqueue_transition_immediate(obj_info, src).await;
+}
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
@@ -355,6 +360,8 @@ impl DefaultMultipartUsecase {
                 }
             }
         }
+
+        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
         // Invalidate cache for the completed multipart object
         let manager = get_concurrency_manager();

@@ -375,7 +375,7 @@ impl TransitionClient {
         //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
 
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
-        if resp.status() != StatusCode::OK {
+        if !resp.status().is_success() {
             //self.dump_http(&cloned_req, &resp)?;
             let mut body_vec = Vec::new();
             let mut body = resp.into_body();
