@@ -20,3 +20,6 @@ pub mod bucket_usecase;
 pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;
+
+#[cfg(test)]
+mod lifecycle_transition_api_test;

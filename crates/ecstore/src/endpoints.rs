@@ -791,14 +791,17 @@ mod test {
             panic!("No non-loop back IP address found for this host");
         }
         let non_loop_back_ip = non_loop_back_i_ps[0];
+        let remote_ip1 = "192.0.2.10";
+        let remote_ip2 = "192.0.2.11";
+        let remote_ip3 = "192.0.2.12";
 
         let case1_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let case1_endpoint2 = format!("http://{non_loop_back_ip}/d2");
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:10000/d2", non_loop_back_ip),
-            "http://example.org:10000/d3".to_string(),
-            "http://example.com:10000/d4".to_string(),
+            format!("http://{remote_ip1}:10000/d3"),
+            format!("http://{remote_ip2}:10000/d4"),
         ];
         let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
@@ -807,26 +810,26 @@ mod test {
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:9000/d2", non_loop_back_ip),
-            "http://example.org:10000/d3".to_string(),
-            "http://example.com:10000/d4".to_string(),
+            format!("http://{remote_ip1}:10000/d3"),
+            format!("http://{remote_ip2}:10000/d4"),
         ];
         let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
         let case3_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:80/d1", non_loop_back_ip),
-            "http://example.org:9000/d2".to_string(),
-            "http://example.com:80/d3".to_string(),
-            "http://example.net:80/d4".to_string(),
+            format!("http://{remote_ip1}:9000/d2"),
+            format!("http://{remote_ip2}:80/d3"),
+            format!("http://{remote_ip3}:80/d4"),
         ];
         let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:80/"));
 
         let case4_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:9000/d1", non_loop_back_ip),
-            "http://example.org:9000/d2".to_string(),
-            "http://example.com:9000/d3".to_string(),
-            "http://example.net:9000/d4".to_string(),
+            format!("http://{remote_ip1}:9000/d2"),
+            format!("http://{remote_ip2}:9000/d3"),
+            format!("http://{remote_ip3}:9000/d4"),
         ];
         let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:9000/"));
 
@@ -844,8 +847,8 @@ mod test {
 
         let case6_endpoint1 = format!("http://{non_loop_back_ip}:9003/d4");
         let args = vec![
-            "http://localhost:9000/d1".to_string(),
-            "http://localhost:9001/d2".to_string(),
+            "http://127.0.0.1:9000/d1".to_string(),
+            "http://127.0.0.1:9001/d2".to_string(),
             "http://127.0.0.1:9002/d3".to_string(),
             case6_endpoint1.clone(),
         ];
@@ -864,8 +867,8 @@ mod test {
             // Erasure Single Drive
             TestCase {
                 num: 2,
-                server_addr: "localhost:9000",
-                args: vec!["http://localhost/d1"],
+                server_addr: "127.0.0.1:9000",
+                args: vec!["http://127.0.0.1/d1"],
                 expected_err: Some(Error::other("use path style endpoint for single node setup")),
                 ..Default::default()
             },
@@ -885,7 +888,7 @@ mod test {
             },
             TestCase {
                 num: 4,
-                server_addr: "localhost:10000",
+                server_addr: "127.0.0.1:10000",
                 args: vec!["/d1"],
                 expected_endpoints: Some(Endpoints(vec![Endpoint {
                     url: must_file_path("/d1"),
@@ -899,12 +902,12 @@ mod test {
             },
             TestCase {
                 num: 5,
-                server_addr: "localhost:9000",
+                server_addr: "127.0.0.1:9000",
                 args: vec![
                     "https://127.0.0.1:9000/d1",
-                    "https://localhost:9001/d1",
-                    "https://example.com/d1",
-                    "https://example.com/d2",
+                    "https://127.0.0.1:9001/d1",
+                    "https://192.0.2.1/d1",
+                    "https://192.0.2.1/d2",
                 ],
                 expected_err: Some(Error::other("same path '/d1' can not be served by different port on same address")),
                 ..Default::default()
@@ -952,35 +955,35 @@ mod test {
                 num: 7,
                 server_addr: "0.0.0.0:9000",
                 args: vec![
-                    "http://localhost/d1",
-                    "http://localhost/d2",
-                    "http://localhost/d3",
-                    "http://localhost/d4",
+                    "http://127.0.0.1/d1",
+                    "http://127.0.0.1/d2",
+                    "http://127.0.0.1/d3",
+                    "http://127.0.0.1/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
-                        url: must_url("http://localhost:9000/d1"),
+                        url: must_url("http://127.0.0.1:9000/d1"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d2"),
+                        url: must_url("http://127.0.0.1:9000/d2"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d3"),
+                        url: must_url("http://127.0.0.1:9000/d3"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
                         disk_idx: 0,
                     },
                     Endpoint {
-                        url: must_url("http://localhost:9000/d4"),
+                        url: must_url("http://127.0.0.1:9000/d4"),
                         is_local: true,
                         pool_idx: 0,
                         set_idx: 0,
@@ -995,8 +998,8 @@ mod test {
                 num: 8,
                 server_addr: "127.0.0.1:10000",
                 args: vec![
-                    "http://localhost/d1",
-                    "http://localhost/d2",
+                    "http://[::1]/d1",
+                    "http://[::1]/d2",
                     "http://127.0.0.1/d3",
                     "http://127.0.0.1/d4",
                 ],
@@ -1034,8 +1037,8 @@ mod test {
                 args: vec![
                     case1_endpoint1.as_str(),
                     case1_endpoint2.as_str(),
-                    "http://example.org/d3",
-                    "http://example.com/d4",
+                    "http://192.0.2.10/d3",
+                    "http://192.0.2.11/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1076,8 +1079,8 @@ mod test {
                 args: vec![
                     case2_endpoint1.as_str(),
                     case2_endpoint2.as_str(),
-                    "http://example.org/d3",
-                    "http://example.com/d4",
+                    "http://192.0.2.10/d3",
+                    "http://192.0.2.11/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1117,9 +1120,9 @@ mod test {
                 server_addr: "0.0.0.0:80",
                 args: vec![
                     case3_endpoint1.as_str(),
-                    "http://example.org:9000/d2",
-                    "http://example.com/d3",
-                    "http://example.net/d4",
+                    "http://192.0.2.10:9000/d2",
+                    "http://192.0.2.11/d3",
+                    "http://192.0.2.12/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1159,9 +1162,9 @@ mod test {
                 server_addr: "0.0.0.0:9000",
                 args: vec![
                     case4_endpoint1.as_str(),
-                    "http://example.org/d2",
-                    "http://example.com/d3",
-                    "http://example.net/d4",
+                    "http://192.0.2.10/d2",
+                    "http://192.0.2.11/d3",
+                    "http://192.0.2.12/d4",
                 ],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1242,8 +1245,8 @@ mod test {
                 num: 16,
                 server_addr: "0.0.0.0:9003",
                 args: vec![
-                    "http://localhost:9000/d1",
-                    "http://localhost:9001/d2",
+                    "http://127.0.0.1:9000/d1",
+                    "http://127.0.0.1:9001/d2",
                     "http://127.0.0.1:9002/d3",
                     case6_endpoint1.as_str(),
                 ],
