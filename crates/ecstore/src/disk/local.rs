@@ -29,7 +29,6 @@ use crate::disk::{
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
 };
 use crate::erasure_coding::bitrot_verify;
-use crate::file_cache::{get_global_file_cache, prefetch_metadata_patterns, read_metadata_cached};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingLotRwLock;
@@ -492,56 +491,6 @@ impl LocalDisk {
         Ok(results.into_iter().map(|(_, path)| path).collect())
     }
 
-    // Optimized metadata reading with caching
-    async fn read_metadata_cached(&self, path: PathBuf) -> Result<Arc<FileMeta>> {
-        read_metadata_cached(path).await
-    }
-
-    // Smart prefetching for related files
-    async fn read_version_with_prefetch(
-        &self,
-        volume: &str,
-        path: &str,
-        version_id: &str,
-        opts: &ReadOptions,
-    ) -> Result<FileInfo> {
-        let file_path = self.get_object_path(volume, path)?;
-
-        // Async prefetch related files, don't block current read
-        if let Some(parent) = file_path.parent() {
-            prefetch_metadata_patterns(parent, &[STORAGE_FORMAT_FILE, "part.1", "part.2", "part.meta"]).await;
-        }
-
-        // Main read logic
-        let file_dir = self.get_bucket_path(volume)?;
-        let (data, _) = self.read_raw(volume, file_dir, file_path, opts.read_data).await?;
-
-        get_file_info(
-            &data,
-            volume,
-            path,
-            version_id,
-            FileInfoOpts {
-                data: opts.read_data,
-                include_free_versions: false,
-            },
-        )
-        .map_err(|_e| DiskError::Unexpected)
-    }
-
-    // Batch metadata reading for multiple objects
-    async fn read_metadata_batch(&self, requests: Vec<(String, String)>) -> Result<Vec<Option<Arc<FileMeta>>>> {
-        let paths: Vec<PathBuf> = requests
-            .iter()
-            .map(|(bucket, key)| self.get_object_path(bucket, &format!("{}/{}", key, STORAGE_FORMAT_FILE)))
-            .collect::<Result<Vec<_>>>()?;
-
-        let cache = get_global_file_cache();
-        let results = cache.get_metadata_batch(paths).await;
-
-        Ok(results.into_iter().map(|r| r.ok()).collect())
-    }
-
     // /// Write to the filesystem atomically.
     // /// This is done by first writing to a temporary location and then moving the file.
     // pub(crate) async fn prepare_file_write<'a>(&self, path: &'a PathBuf) -> Result<FileWriter<'a>> {
@@ -865,8 +814,6 @@ impl LocalDisk {
 
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
 
-        // Invalidate cache after successful write
-        get_global_file_cache().invalidate(&file_path).await;
         Ok(())
     }
 
@@ -893,7 +840,6 @@ impl LocalDisk {
         self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
             .await?;
 
-        get_global_file_cache().invalidate(&file_path).await;
         Ok(())
     }
     // write_all_internal do write file
@@ -2125,9 +2071,6 @@ impl DiskAPI for LocalDisk {
             return Err(err);
         }
 
-        get_global_file_cache().invalidate(&src_file_path).await;
-        get_global_file_cache().invalidate(&dst_file_path).await;
-
         if let Some(src_file_path_parent) = src_file_path.parent() {
             if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
                 let _ = remove_std(src_file_path_parent);
@@ -2484,7 +2427,7 @@ impl DiskAPI for LocalDisk {
                 file_path.as_path(),
                 Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
             ]);
-            return rename_all(src_path, dst_path, file_path).await;
+            return rename_all(&src_path, &dst_path, file_path).await;
         }
 
         self.delete_file(&volume_dir, &xl_path, true, false).await
@@ -2607,17 +2550,9 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        // Try to use cached file content reading for better performance, with safe fallback
         let file_path = self.get_object_path(volume, path)?;
-        // let file_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
-
-        // First, try the cache
-        if let Ok(bytes) = get_global_file_cache().get_file_content(file_path.clone()).await {
-            return Ok(bytes);
-        }
-
-        // Fallback to direct read if cache fails
-        let (data, _) = self.read_metadata_with_dmtime(&file_path).await?;
+        let volume_dir = self.get_bucket_path(volume)?;
+        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data.into())
     }
 }
