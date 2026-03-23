@@ -14,6 +14,7 @@
 
 //! Admin application use-case contracts.
 
+use crate::app::capacity_manager::{DataSource, get_capacity_manager};
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
@@ -66,7 +67,7 @@ const STAT_TIMEOUT_SECS: u64 = 5; // Statistics timeout
 const SAMPLE_RATE: usize = 100; // Sample rate (1 in every 100 files)
 
 /// Calculate actual used capacity of all data directories
-async fn calculate_data_dir_used_capacity(
+pub(crate) async fn calculate_data_dir_used_capacity(
     disks: &[rustfs_madmin::Disk],
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let mut total_used = 0u64;
@@ -315,39 +316,79 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        // Calculate actual data directory used capacity with performance protection
-        let start = Instant::now();
-        match calculate_data_dir_used_capacity(&storage_info.disks).await {
-            Ok(used_capacity) => {
-                info.total_used_capacity = used_capacity;
+        // Use hybrid strategy for capacity calculation
+        let capacity_manager = get_capacity_manager();
 
-                // Log calculation time
-                let elapsed = start.elapsed();
-                if elapsed > Duration::from_secs(1) {
-                    warn!("Capacity calculation took {:?}, which is slower than expected", elapsed);
+        // Check if we have a valid cache
+        if let Some(cached) = capacity_manager.get_capacity().await {
+            let cache_age = cached.last_update.elapsed();
+
+            // If cache is fresh (< 60 seconds), use it directly
+            if cache_age < Duration::from_secs(60) {
+                info.total_used_capacity = cached.total_used;
+                debug!(
+                    "Using cached capacity: {} bytes (age: {:?}, source: {:?})",
+                    cached.total_used, cache_age, cached.source
+                );
+            } else {
+                // Cache is stale, check if we need fast update
+                let needs_update = capacity_manager.needs_fast_update().await;
+
+                if needs_update {
+                    // Fast update needed (recent writes or high frequency)
+                    let start = Instant::now();
+                    match calculate_data_dir_used_capacity(&storage_info.disks).await {
+                        Ok(used_capacity) => {
+                            info.total_used_capacity = used_capacity;
+                            capacity_manager
+                                .update_capacity(used_capacity, DataSource::WriteTriggered)
+                                .await;
+
+                            let elapsed = start.elapsed();
+                            debug!("Fast capacity update completed in {:?}", elapsed);
+                        }
+                        Err(e) => {
+                            warn!("Fast capacity update failed: {:?}, using cached value", e);
+                            info.total_used_capacity = cached.total_used;
+                        }
+                    }
                 } else {
-                    debug!("Capacity calculation took {:?}", elapsed);
-                }
+                    // Use stale cache and trigger background update
+                    info.total_used_capacity = cached.total_used;
+                    debug!("Using stale cache, background update will be triggered");
 
-                // Log capacity comparison
-                let disk_used = info.total_capacity.saturating_sub(info.total_free_capacity);
-                info!(
-                    "Capacity statistics: data_dir_used={}, disk_used={}, difference={}",
-                    used_capacity,
-                    disk_used,
-                    i64::try_from(used_capacity).unwrap_or(i64::MAX) - i64::try_from(disk_used).unwrap_or(i64::MAX)
-                );
+                    // Trigger background update
+                    let disks = storage_info.disks.clone();
+                    let manager = capacity_manager.clone();
+                    tokio::spawn(async move {
+                        if let Ok(new_capacity) = calculate_data_dir_used_capacity(&disks).await {
+                            manager.update_capacity(new_capacity, DataSource::Scheduled).await;
+                            debug!("Background capacity update completed: {} bytes", new_capacity);
+                        }
+                    });
+                }
             }
-            Err(e) => {
-                warn!(
-                    "Failed to calculate data directory used capacity: {:?}, falling back to disk used capacity",
-                    e
-                );
-                // Fallback: use disk used capacity
-                info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+        } else {
+            // No cache, perform initial calculation
+            let start = Instant::now();
+            match calculate_data_dir_used_capacity(&storage_info.disks).await {
+                Ok(used_capacity) => {
+                    info.total_used_capacity = used_capacity;
+                    capacity_manager.update_capacity(used_capacity, DataSource::RealTime).await;
+
+                    let elapsed = start.elapsed();
+                    info!("Initial capacity calculation completed: {} bytes in {:?}", used_capacity, elapsed);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to calculate data directory used capacity: {:?}, falling back to disk used capacity",
+                        e
+                    );
+                    // Fallback: use disk used capacity
+                    info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+                }
             }
         }
-
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),
