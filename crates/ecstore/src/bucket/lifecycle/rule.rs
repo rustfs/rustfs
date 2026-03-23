@@ -69,7 +69,7 @@ pub trait TransitionOps {
 
 impl TransitionOps for Transition {
     fn validate(&self) -> Result<(), std::io::Error> {
-        if self.date.is_some() && self.days.expect("err!") > 0 {
+        if self.date.is_some() && self.days.is_some_and(|d| d > 0) {
             return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
         }
 

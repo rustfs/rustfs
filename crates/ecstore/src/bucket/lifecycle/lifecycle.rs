@@ -34,7 +34,7 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::bucket::lifecycle::rule::{Filter as _, TransitionOps};
+use crate::bucket::lifecycle::rule::TransitionOps;
 use crate::store_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
