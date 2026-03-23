@@ -25,32 +25,18 @@ memberlist:
   join_members:
     - tempo:7946
 
-# Distributor configuration - receives traces and writes directly to ingesters
 distributor:
-  ingester_write_path_enabled: true
-  kafka_write_path_enabled: false
   receivers:
     otlp:
       protocols:
         grpc:
-          endpoint: "tempo:4317"
+          endpoint: "0.0.0.0:4317"
         http:
-          endpoint: "tempo:4318"
-  ring:
-    kvstore:
-      store: memberlist
-
-# Ingester configuration - consumes from Kafka and stores traces
-ingester:
-  lifecycler:
-    ring:
-      kvstore:
-        store: memberlist
-      replication_factor: 1
-    tokens_file_path: /var/tempo/tokens.json
-  trace_idle_period: 10s
-  max_block_bytes: 1_000_000
-  max_block_duration: 5m
+          endpoint: "0.0.0.0:4318"
+  #log_received_spans:
+  #    enabled: true
+  #  log_discarded_spans:
+  #    enabled: true
 
 backend_scheduler:
   provider:
@@ -67,8 +53,7 @@ backend_worker:
       store: memberlist
 
 querier:
-  frontend_worker:
-    frontend_address: tempo:3200
+  query_live_store: true
 
 metrics_generator:
   registry:
@@ -90,9 +75,9 @@ storage:
   trace:
     backend: local
     wal:
-      path: /var/tempo/wal
+      path: /var/tempo/wal # where to store the wal locally
     local:
-      path: /var/tempo/blocks
+      path: /var/tempo/blocks # where to store the traces locally
 
 overrides:
   defaults:
@@ -101,24 +86,14 @@ overrides:
       generate_native_histograms: both
 
 ingest:
-  enabled: false
-  # Disabled because using direct ingester write path
-  # If you want Kafka path, enable this and set:
-  # kafka:
-  #   brokers: [redpanda:9092]
-  #   topic: tempo-ingest
-  #   encoding: protobuf
-  #   consumer_group: tempo-ingest-consumer
+  enabled: true
+  kafka:
+    address: redpanda:9092
+    topic: tempo-ingest
 
 block_builder:
   consume_cycle_duration: 30s
 
-compactor:
-  compaction:
-    block_retention: 168h  # 7 days
-  ring:
-    kvstore:
-      store: memberlist
-
 usage_report:
   reporting_enabled: false
+

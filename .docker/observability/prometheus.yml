@@ -50,6 +50,11 @@ scrape_configs:
     static_configs:
       - targets: [ 'localhost:9090' ]
 
+  - job_name: 'vulture'
+    static_configs:
+      - targets:
+          - 'vulture:8080'
+
 otlp:
   promote_resource_attributes:
     - service.instance.id

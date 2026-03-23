@@ -15,10 +15,11 @@
 services:
 
   # --- Tracing ---
-
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.10.3
     container_name: tempo
+    depends_on:
+      - redpanda
     command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:ro
@@ -37,6 +38,38 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+  redpanda:
+    image: redpandadata/redpanda:latest
+    ports:
+      - "9092:9092" # Kafka API for clients
+    command: >
+      redpanda start --overprovisioned
+      --mode=dev-container
+      --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    environment:
+      - CONFIG_FILEPATH=/etc/redpanda/redpanda-console-config.yaml
+    volumes:
+      - ./redpanda-console.yaml:/etc/redpanda/redpanda-console-config.yaml
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redpanda
+
+  vulture:
+    image: grafana/tempo-vulture:latest
+    restart: always
+    command:
+      [
+        "-prometheus-listen-address=:8080",
+        "-tempo-query-url=http://tempo:3200",
+        "-tempo-push-url=http://tempo:4317",
+      ]
+    depends_on:
+      - tempo
 
   jaeger:
     image: jaegertracing/jaeger:latest
