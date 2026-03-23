@@ -1822,19 +1822,21 @@ impl ObjectOperations for SetDisks {
         //}
 
         let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let rs: Option<HTTPRangeSpec> = None;
-        let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, opts).await;
-        if let Err(err) = gr {
-            return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
-        }
-        let gr = gr.unwrap();
 
         for part_info in &oi.parts {
-            let reader = BufReader::new(Cursor::new(vec![] /*gr.stream*/));
+            let mut popts = opts.clone();
+            popts.part_number = Some(part_info.number);
+            let rs: Option<HTTPRangeSpec> = None;
+            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &popts).await;
+            if let Err(err) = gr {
+                return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
+            }
+            let gr = gr.unwrap();
+            let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::new(
                 Box::new(WarpReader::new(reader)),
                 part_info.size as i64,
-                part_info.size as i64,
+                part_info.actual_size,
                 None,
                 None,
                 false,

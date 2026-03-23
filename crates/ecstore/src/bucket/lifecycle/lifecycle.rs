@@ -768,7 +768,7 @@ impl LifecycleCalculate for NoncurrentVersionTransition {
 #[async_trait::async_trait]
 impl LifecycleCalculate for Transition {
     fn next_due(&self, obj: &ObjectOpts) -> Option<OffsetDateTime> {
-        if !obj.is_latest || self.days.is_none() {
+        if !obj.is_latest {
             return None;
         }
 
@@ -1294,6 +1294,46 @@ mod tests {
         assert_eq!(event.action, IlmAction::TransitionAction);
         assert_eq!(event.rule_id, "transition-days");
         assert_eq!(event.storage_class, "COLDTIER44");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_transitions_latest_object_after_date_due() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let transition_time = base_time + Duration::days(1);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("transition-date".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: None,
+                    date: Some(transition_time.into()),
+                    storage_class: Some(TransitionStorageClass::from_static("COLDTIER44")),
+                }]),
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            transition_status: "".to_string(),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, transition_time + Duration::seconds(1), 0).await;
+
+        assert_eq!(event.action, IlmAction::TransitionAction);
+        assert_eq!(event.rule_id, "transition-date");
+        assert_eq!(event.storage_class, "COLDTIER44");
+        assert_eq!(event.due, Some(transition_time));
     }
 
     #[tokio::test]

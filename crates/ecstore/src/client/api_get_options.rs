@@ -76,8 +76,8 @@ impl GetObjectOptions {
         headers
     }
 
-    pub fn set(&self, key: &str, value: &str) {
-        //self.headers[http.CanonicalHeaderKey(key)] = value;
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.headers.insert(key.to_string(), value.to_string());
     }
 
     pub fn set_req_param(&mut self, key: &str, value: &str) {
@@ -144,5 +144,18 @@ impl GetObjectOptions {
         }
 
         url_values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GetObjectOptions;
+
+    #[test]
+    fn set_range_populates_range_header() {
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(10, 19).unwrap();
+
+        assert_eq!(opts.headers.get("Range").map(String::as_str), Some("bytes=10-19"));
     }
 }
