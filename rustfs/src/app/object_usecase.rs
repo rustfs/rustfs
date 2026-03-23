@@ -42,7 +42,8 @@ use metrics::{counter, histogram};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
-        bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts},
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{RestoreRequestOps, enqueue_transition_immediate, post_restore_opts},
         lifecycle::{self, Lifecycle, TransitionOptions},
     },
     metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
@@ -115,6 +116,10 @@ use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
+    enqueue_transition_immediate(obj_info, src).await;
+}
 
 /// Extract trailing-header checksum values, overriding the corresponding input fields.
 fn apply_trailing_checksums(
@@ -508,6 +513,8 @@ impl DefaultObjectUsecase {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
@@ -2307,6 +2314,8 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+
         // Update quota tracking after successful copy
         if has_bucket_metadata {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
@@ -3606,6 +3615,8 @@ impl DefaultObjectUsecase {
                     .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
                     .await
                     .map_err(ApiError::from)?;
+
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
                 let manager = get_concurrency_manager();
                 let fpath_clone = fpath.clone();
