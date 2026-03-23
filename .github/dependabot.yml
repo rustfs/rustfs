@@ -26,6 +26,12 @@ updates:
       day: "monday"
       timezone: "Asia/Shanghai"
       time: "08:00"
+    assignees:
+      - "heihutu"
+    reviewers:
+      - "houseme"
+      - "overtrue"
+      - "majinghe"
     ignore:
       - dependency-name: "object_store"
         versions: [ "0.13.x" ]
