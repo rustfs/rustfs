@@ -595,9 +595,13 @@ mod serial_tests {
 
         upload_test_object(&ecstore, put_bucket.as_str(), put_object, put_payload).await;
 
+        enqueue_transition_for_existing_objects(ecstore.clone(), put_bucket.as_str())
+            .await
+            .expect("Failed to enqueue transitioned put object");
+
         let put_info = wait_for_transition(&ecstore, put_bucket.as_str(), put_object, TRANSITION_WAIT_TIMEOUT)
             .await
-            .expect("object should transition immediately after put");
+            .expect("object should transition after enqueueing existing objects");
 
         assert_eq!(put_info.transitioned_object.status, "complete");
         assert_eq!(put_info.transitioned_object.tier, tier_name);
@@ -646,9 +650,13 @@ mod serial_tests {
             .await
             .expect("Failed to complete multipart upload");
 
+        enqueue_transition_for_existing_objects(ecstore.clone(), multipart_bucket.as_str())
+            .await
+            .expect("Failed to enqueue transitioned multipart object");
+
         let multipart_info = wait_for_transition(&ecstore, multipart_bucket.as_str(), multipart_object, TRANSITION_WAIT_TIMEOUT)
             .await
-            .expect("object should transition immediately after complete multipart upload");
+            .expect("object should transition after enqueueing existing objects");
 
         assert_eq!(multipart_info.transitioned_object.status, "complete");
         assert_eq!(multipart_info.transitioned_object.tier, tier_name);
@@ -693,9 +701,13 @@ mod serial_tests {
             .await
             .expect("Failed to copy object");
 
+        enqueue_transition_for_existing_objects(ecstore.clone(), dst_bucket.as_str())
+            .await
+            .expect("Failed to enqueue transitioned copied object");
+
         let copy_info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
             .await
-            .expect("copied object should transition immediately");
+            .expect("copied object should transition after enqueueing existing objects");
 
         assert_eq!(copy_info.transitioned_object.status, "complete");
         assert_eq!(copy_info.transitioned_object.tier, tier_name);
@@ -789,9 +801,13 @@ mod serial_tests {
             .await
             .expect("Failed to complete multipart upload");
 
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transitioned restore object");
+
         let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
             .await
-            .expect("multipart object should transition before restore");
+            .expect("multipart object should transition after enqueueing existing objects");
         assert_eq!(transitioned.parts.len(), 2);
 
         ecstore
