@@ -15,7 +15,6 @@
 use crate::admin::{
     handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user},
     router::{AdminOperation, S3Router},
-    rpc,
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
@@ -54,8 +53,6 @@ fn test_register_routes_cover_representative_admin_paths() {
     replication::register_replication_route(&mut router).expect("register replication route");
     profile_admin::register_profiling_route(&mut router).expect("register profile route");
     kms::register_kms_route(&mut router).expect("register kms route");
-    rpc::register_rpc_route(&mut router).expect("register rpc route");
-
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -117,8 +114,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
-    assert_route(&router, Method::GET, "/rustfs/rpc/read_file_stream");
-    assert_route(&router, Method::HEAD, "/rustfs/rpc/read_file_stream");
+
+    assert!(
+        !router.contains_route(Method::GET, "/rustfs/rpc/read_file_stream"),
+        "internode rpc routes should no longer be registered inside the admin router"
+    );
 }
 
 #[test]
@@ -160,9 +160,8 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
 }
 
 #[test]
-fn test_phase5_admin_info_and_rpc_read_file_contract() {
+fn test_phase5_admin_info_contract() {
     let system_src = include_str!("handlers/system.rs");
-    let rpc_src = include_str!("rpc.rs");
 
     let server_info_impl_marker = "impl Operation for ServerInfoHandler";
     let server_info_impl_start = system_src
@@ -175,24 +174,40 @@ fn test_phase5_admin_info_and_rpc_read_file_contract() {
             && server_info_impl_block.contains("execute_query_server_info(QueryServerInfoRequest { include_pools: true })"),
         "admin server info path must be served through DefaultAdminUsecase::execute_query_server_info"
     );
+}
 
-    let register_route_marker = "pub fn register_rpc_route";
-    let register_route_start = rpc_src
-        .find(register_route_marker)
-        .expect("Expected register_rpc_route in rpc.rs");
-    let register_route_block = &rpc_src[register_route_start..];
+fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = src
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("Expected marker `{}` in source", start_marker));
+    let after_start = &src[start..];
+    let end = after_start
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("Expected end marker `{}` in source", end_marker));
+    &after_start[..end]
+}
 
-    let read_file_marker = "pub struct ReadFile {}";
-    let read_file_start = rpc_src.find(read_file_marker).expect("Expected ReadFile operation in rpc.rs");
-    let read_file_block = &rpc_src[read_file_start..];
-
-    assert!(
-        register_route_block.contains("format!(\"{}{}\", RPC_PREFIX, \"/read_file_stream\")"),
-        "rpc read_file_stream route path must remain registered with RPC_PREFIX"
+#[test]
+fn test_replication_set_remote_target_compat_contract() {
+    let replication_src = include_str!("handlers/replication.rs");
+    let handler_block = extract_block_between_markers(
+        replication_src,
+        "impl Operation for SetRemoteTargetHandler",
+        "pub struct ListRemoteTargetHandler",
     );
 
     assert!(
-        read_file_block.contains(".read_file_stream(&query.volume, &query.path, query.offset, query.length)"),
-        "rpc read_file_stream route must remain wired to disk.read_file_stream"
+        handler_block.contains("read_compatible_admin_body("),
+        "set-remote-target must decode MinIO-compatible encrypted admin payloads"
+    );
+
+    assert!(
+        handler_block.contains("Body::from(arn_str)"),
+        "set-remote-target must keep ARN success responses as plain JSON string body"
+    );
+
+    assert!(
+        !handler_block.contains("encode_compatible_admin_payload("),
+        "set-remote-target should not re-encrypt ARN success responses"
     );
 }

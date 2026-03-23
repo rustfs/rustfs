@@ -71,6 +71,16 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     delay.max(Duration::from_secs(1))
 }
 
+fn initial_scanner_delay() -> Duration {
+    initial_scanner_delay_for(scanner_start_delay_secs())
+}
+
+fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
+    start_delay_secs
+        .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
+        .unwrap_or_else(|| Duration::from_secs(rand::random::<u64>() % 5))
+}
+
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
@@ -78,7 +88,7 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx.clone();
     let storeapi_clone = storeapi.clone();
     tokio::spawn(async move {
-        let sleep_time = Duration::from_secs(rand::random::<u64>() % 5);
+        let sleep_time = initial_scanner_delay();
         tokio::time::sleep(sleep_time).await;
 
         loop {
@@ -246,7 +256,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
-        Ok(ns_lock) => match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
                 debug!("run_data_scanner: acquired leader write lock");
                 guard
@@ -354,6 +364,14 @@ mod tests {
         let delay = randomized_cycle_delay_for(Duration::from_secs(120));
         assert!(delay > Duration::from_secs(30), "expected delay > 30s, got {delay:?}");
         // Jitter window should stay within configured bounds.
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_uses_configured_start_delay() {
+        let delay = initial_scanner_delay_for(Some(120));
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));
     }

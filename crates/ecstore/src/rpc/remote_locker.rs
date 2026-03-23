@@ -52,6 +52,7 @@ impl RemoteClient {
             metadata: LockMetadata::default(),
             priority: LockPriority::Normal,
             deadlock_detection: false,
+            suppress_contention_logs: false,
         }
     }
 

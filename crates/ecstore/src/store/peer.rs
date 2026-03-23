@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
     let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
@@ -22,6 +23,19 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
     } else {
         None
     }
+}
+
+pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
+    if let Some(disk) = find_local_disk(&disk_ref.to_string()).await {
+        return Some(disk);
+    }
+
+    let Ok(disk_id) = Uuid::parse_str(disk_ref) else {
+        return None;
+    };
+
+    let disk_path = GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned()?;
+    find_local_disk(&disk_path).await
 }
 
 pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {

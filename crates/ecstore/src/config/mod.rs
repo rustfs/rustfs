@@ -79,7 +79,7 @@ pub async fn try_migrate_server_config(api: Arc<ECStore>) {
     com::try_migrate_server_config(api).await
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KV {
     pub key: String,
     pub value: String,
@@ -87,7 +87,7 @@ pub struct KV {
     pub hidden_if_empty: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KVS(pub Vec<KV>);
 
 impl Default for KVS {
@@ -163,7 +163,7 @@ impl KVS {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config(pub HashMap<String, HashMap<String, KVS>>);
 
 impl Default for Config {
