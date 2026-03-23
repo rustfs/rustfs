@@ -18,6 +18,8 @@
 pub mod admin_usecase;
 pub mod bucket_usecase;
 pub mod capacity_manager;
+pub mod capacity_metrics;
+pub mod capacity_integration;
 pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;

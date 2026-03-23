@@ -14,6 +14,7 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
+use crate::app::admin_usecase::calculate_data_dir_used_capacity;
 use rustfs_config::{
     DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
     DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
@@ -25,8 +26,7 @@ use rustfs_utils::{get_env_u64, get_env_usize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
-
+use tracing::{debug, error, info};
 // ============================================================================
 // Configuration Functions
 // ============================================================================
@@ -296,8 +296,6 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
             let start = Instant::now();
 
             // Import the calculate function
-            use crate::app::admin_usecase::calculate_data_dir_used_capacity;
-
             match calculate_data_dir_used_capacity(&disks).await {
                 Ok(new_capacity) => {
                     let elapsed = start.elapsed();
