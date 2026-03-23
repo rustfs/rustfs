@@ -135,7 +135,12 @@ async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEvent
     if is_meta_bucketname(&object_info.bucket) {
         return Ok(object_info);
     }
-    enqueue_transition_immediate(&object_info, src).await;
+
+    let object_info_for_enqueue = object_info.clone();
+    tokio::spawn(async move {
+        enqueue_transition_immediate(&object_info_for_enqueue, src).await;
+    });
+
     Ok(object_info)
 }
 

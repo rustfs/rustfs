@@ -128,21 +128,22 @@ fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'stati
 
 fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.transitions.as_ref().is_some_and(|transitions| {
-            transitions.iter().any(|transition| {
-                transition
-                    .storage_class
-                    .as_ref()
-                    .is_some_and(|storage_class| !storage_class.as_str().is_empty())
-            })
-        }) || rule.noncurrent_version_transitions.as_ref().is_some_and(|transitions| {
-            transitions.iter().any(|transition| {
-                transition
-                    .storage_class
-                    .as_ref()
-                    .is_some_and(|storage_class| !storage_class.as_str().is_empty())
-            })
-        })
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && (rule.transitions.as_ref().is_some_and(|transitions| {
+                transitions.iter().any(|transition| {
+                    transition
+                        .storage_class
+                        .as_ref()
+                        .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+                })
+            }) || rule.noncurrent_version_transitions.as_ref().is_some_and(|transitions| {
+                transitions.iter().any(|transition| {
+                    transition
+                        .storage_class
+                        .as_ref()
+                        .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+                })
+            }))
     })
 }
 
@@ -1931,6 +1932,56 @@ mod tests {
         }];
 
         assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
+    }
+
+    #[test]
+    fn lifecycle_has_transition_rules_ignores_disabled_rules() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::DISABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("disabled-transition".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+            }],
+        };
+
+        assert!(!lifecycle_has_transition_rules(&config));
+    }
+
+    #[test]
+    fn lifecycle_has_transition_rules_accepts_enabled_noncurrent_transitions() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("enabled-noncurrent-transition".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        assert!(lifecycle_has_transition_rules(&config));
     }
 
     #[tokio::test]
