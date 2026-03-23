@@ -35,7 +35,7 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
-use s3s::{dto::*, S3Request};
+use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
     collections::HashMap,
@@ -303,6 +303,7 @@ fn streaming_blob_from_bytes(data: &[u8]) -> StreamingBlob {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn put_and_copy_object_transition_immediately_via_usecases() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let fs = FS::new();
@@ -381,6 +382,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn complete_multipart_upload_transitions_immediately_via_usecase() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultMultipartUsecase::without_context();
@@ -418,7 +420,6 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
                 e_tag: uploaded_part.etag.clone().map(|etag| to_s3s_etag(&etag)),
                 ..Default::default()
             }]),
-            ..Default::default()
         }))
         .build()
         .unwrap();

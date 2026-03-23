@@ -30,10 +30,7 @@ use futures::StreamExt;
 use http::{HeaderMap, Uri};
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::enqueue_transition_immediate,
-    },
+    lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
