@@ -256,7 +256,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
-        Ok(ns_lock) => match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
                 debug!("run_data_scanner: acquired leader write lock");
                 guard

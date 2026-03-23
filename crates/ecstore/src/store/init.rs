@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::global::is_first_cluster_node_local;
 
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
@@ -203,7 +204,7 @@ impl ECStore {
         let mut meta = PoolMeta::default();
         meta.load(self.pools[0].clone(), self.pools.clone()).await?;
         let update = meta.validate(self.pools.clone())?;
-        let should_persist_pool_meta = get_global_endpoints().first_local();
+        let should_persist_pool_meta = is_first_cluster_node_local().await;
 
         if !update {
             {

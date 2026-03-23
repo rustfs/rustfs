@@ -313,6 +313,12 @@ impl AuditRegistry {
                 }
             }
 
+            if &new_config == config {
+                info!("Audit target configuration unchanged, skip persisting server config");
+                info!(count = successful_targets.len(), "All target processing completed");
+                return Ok(successful_targets);
+            }
+
             let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
                 return Err(AuditError::StorageNotAvailable(
                     "Failed to save target configuration: server storage not initialized".to_string(),

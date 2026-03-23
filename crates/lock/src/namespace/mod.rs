@@ -58,6 +58,14 @@ impl NamespaceLockWrapper {
         self.lock.get_write_lock(self.resource.clone(), &self.owner, timeout).await
     }
 
+    /// Acquire write lock with expected contention logs suppressed
+    pub async fn get_write_lock_quiet(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        self.lock.get_write_lock_quiet(self.resource.clone(), &self.owner, timeout).await
+    }
+
     /// Acquire read lock (shared lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_read_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
@@ -234,6 +242,29 @@ impl NamespaceLock {
                 Err(crate::error::LockError::timeout(resource_str, timeout))
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Acquire write lock while suppressing expected contention warnings
+    pub async fn get_write_lock_quiet(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+    ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        let resource_str = format!("{}", resource);
+        match self {
+            Self::Distributed(lock) => match lock.lock_guard_quiet(resource, owner, timeout, ttl).await {
+                Ok(Some(guard)) => Ok(NamespaceLockGuard::Standard(guard)),
+                Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+                Err(e) => Err(e),
+            },
+            Self::Local(lock) => match lock.lock_guard(resource, owner, timeout, ttl).await {
+                Ok(Some(guard)) => Ok(NamespaceLockGuard::Fast(guard)),
+                Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
+                Err(e) => Err(e),
+            },
         }
     }
 
