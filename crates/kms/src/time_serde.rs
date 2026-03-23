@@ -38,7 +38,9 @@ pub(crate) mod option_zoned {
         D: Deserializer<'de>,
     {
         let value = Option::<String>::deserialize(deserializer)?;
-        value.map(|value| parse_zoned_compat(&value).map_err(serde::de::Error::custom)).transpose()
+        value
+            .map(|value| parse_zoned_compat(&value).map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 

@@ -20,8 +20,8 @@
 
 use super::common::{
     EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, create_sse_c_config, sse_customer_key_md5_base64,
-    test_all_multipart_encryption_types, test_kms_key_management, test_multipart_upload_with_config,
-    test_sse_c_encryption, test_sse_kms_encryption, test_sse_s3_encryption,
+    test_all_multipart_encryption_types, test_kms_key_management, test_multipart_upload_with_config, test_sse_c_encryption,
+    test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
 use serial_test::serial;

@@ -661,7 +661,9 @@ impl ObjectEncryptionService {
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
         } else if algorithm == "AES256" {
-            self.get_default_key_id().cloned().ok_or_else(|| KmsError::validation_error("Missing key ID"))?
+            self.get_default_key_id()
+                .cloned()
+                .ok_or_else(|| KmsError::validation_error("Missing key ID"))?
         } else {
             return Err(KmsError::validation_error("Missing key ID"));
         };

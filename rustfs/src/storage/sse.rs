@@ -194,17 +194,13 @@ async fn prepare_sse_configuration(
 
         debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
 
-        let effective_kms_key_id = resolve_effective_kms_key_id(
-            effective_sse.as_ref(),
-            ssekms_key_id,
-            || {
-                bucket_sse_config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            },
-        );
+        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
+            bucket_sse_config.rules.first().and_then(|rule| {
+                rule.apply_server_side_encryption_by_default
+                    .as_ref()
+                    .and_then(|sse| sse.kms_master_key_id.clone())
+            })
+        });
 
         Ok(Some(SseConfiguration {
             effective_sse: effective_sse.unwrap(),
@@ -596,9 +592,7 @@ fn is_multipart_object(etag: Option<&str>, parts: &[ObjectPartInfo]) -> bool {
         return true;
     }
 
-    etag
-        .map(|etag| etag.trim_matches('"').len() != 32)
-        .unwrap_or(false)
+    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
 }
 
 /// Type of encryption used
@@ -2252,10 +2246,7 @@ mod tests {
         let material = sse_encryption(request).await.expect("kms encryption should succeed");
         let metadata = material.expect("managed kms encryption should return material").metadata;
 
-        assert_eq!(
-            metadata.get("x-amz-server-side-encryption").map(String::as_str),
-            Some("aws:kms")
-        );
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
             metadata
                 .get("x-amz-server-side-encryption-aws-kms-key-id")
@@ -2284,10 +2275,7 @@ mod tests {
         let material = material.expect("managed sse-s3 encryption should return material");
 
         assert_eq!(material.kms_key_id, None);
-        assert_eq!(
-            material.metadata.get("x-amz-server-side-encryption").map(String::as_str),
-            Some("AES256")
-        );
+        assert_eq!(material.metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
         assert!(!material.metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
         assert_eq!(
             material.metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str),

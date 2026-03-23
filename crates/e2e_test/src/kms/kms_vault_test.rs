@@ -19,14 +19,13 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use md5::compute;
 use serial_test::serial;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 use super::common::{
-    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, start_kms,
-    test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
+    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
+    start_kms, test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
     test_sse_kms_encryption, test_sse_s3_encryption,
 };
 
@@ -140,8 +139,8 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
     let key2 = "98765432109876543210987654321098";
     let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
     let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
-    let key1_md5 = format!("{:x}", compute(key1));
-    let key2_md5 = format!("{:x}", compute(key2));
+    let key1_md5 = sse_customer_key_md5_base64(key1);
+    let key2_md5 = sse_customer_key_md5_base64(key2);
 
     let data1 = b"Vault data encrypted with key 1";
     let data2 = b"Vault data encrypted with key 2";
