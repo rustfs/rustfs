@@ -25,8 +25,11 @@ use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usa
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+use walkdir::WalkDir;
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 
@@ -55,6 +58,129 @@ pub struct DependencyReadiness {
 pub struct QueryPoolStatusRequest {
     pub pool: String,
     pub by_id: bool,
+}
+
+// Performance protection constants
+const MAX_FILES_THRESHOLD: usize = 1_000_000; // 1M files threshold
+const STAT_TIMEOUT_SECS: u64 = 5; // Statistics timeout
+const SAMPLE_RATE: usize = 100; // Sample rate (1 in every 100 files)
+
+/// Calculate actual used capacity of all data directories
+async fn calculate_data_dir_used_capacity(
+    disks: &[rustfs_madmin::Disk],
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut total_used = 0u64;
+    let mut has_failure = false;
+
+    for disk in disks {
+        let path = Path::new(&disk.drive_path);
+
+        // Check if path exists
+        if !path.exists() {
+            warn!("Data directory does not exist: {}", disk.drive_path);
+            has_failure = true;
+            continue;
+        }
+
+        // Asynchronously calculate directory size
+        match get_dir_size_async(path).await {
+            Ok(size) => {
+                debug!("Data directory {} size: {} bytes", disk.drive_path, size);
+                total_used += size;
+            }
+            Err(e) => {
+                warn!("Failed to get size for directory {}: {:?}", disk.drive_path, e);
+                has_failure = true;
+                // Continue with other directories
+            }
+        }
+    }
+
+    // Log warning if there were failures
+    if has_failure {
+        warn!("Some directories failed to calculate size, result may be incomplete");
+    }
+
+    Ok(total_used)
+}
+
+/// Asynchronously get directory size (using walkdir for efficient traversal, with performance protection)
+async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
+    let path = path.to_path_buf();
+
+    // Use tokio::task::spawn_blocking to avoid blocking the async runtime
+    tokio::task::spawn_blocking(move || {
+        let start_time = Instant::now();
+        let mut total_size = 0u64;
+        let mut file_count = 0usize;
+        let mut sampled_size = 0u64;
+        let mut sampled_count = 0usize;
+
+        // Use walkdir to traverse directory tree
+        let walker = WalkDir::new(&path)
+            .follow_links(false) // Don't follow symbolic links
+            .into_iter()
+            .filter_map(|e| e.ok());
+
+        for entry in walker {
+            // Check timeout
+            if start_time.elapsed() > Duration::from_secs(STAT_TIMEOUT_SECS) {
+                warn!("Directory size calculation timeout after {} files, using sampled estimate", file_count);
+                // Use sampling estimate: sampled_size * total_files / sampled_files
+                if sampled_count > 0 {
+                    return Ok(sampled_size * file_count as u64 / sampled_count as u64);
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Directory size calculation timeout"));
+            }
+
+            // Only count file sizes, ignore directories
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    file_count += 1;
+
+                    // When file count exceeds threshold, enable sampling
+                    if file_count > MAX_FILES_THRESHOLD {
+                        // Sampling: count 1 in every SAMPLE_RATE files
+                        if file_count % SAMPLE_RATE == 0 {
+                            sampled_size += metadata.len();
+                            sampled_count += 1;
+                        }
+
+                        // Log progress every 100k files
+                        if file_count % 100_000 == 0 {
+                            debug!(
+                                "Processed {} files, sampled {} files, size: {} bytes",
+                                file_count, sampled_count, sampled_size
+                            );
+                        }
+                    } else {
+                        // Below threshold, full statistics
+                        total_size += metadata.len();
+                    }
+                }
+            }
+        }
+
+        // If sampling was enabled, return estimated value
+        if file_count > MAX_FILES_THRESHOLD && sampled_count > 0 {
+            let estimated_size = sampled_size * file_count as u64 / sampled_count as u64;
+            info!(
+                "Large directory detected: {} files, estimated size: {} bytes (sampled {}/{} files)",
+                file_count, estimated_size, sampled_count, file_count
+            );
+            Ok(estimated_size)
+        } else {
+            debug!(
+                "Directory size calculation completed: {} files, {} bytes, took {:?}",
+                file_count,
+                total_size,
+                start_time.elapsed()
+            );
+            Ok(total_size)
+        }
+    })
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
 }
 
 #[derive(Clone, Default)]
@@ -182,7 +308,38 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+        // Calculate actual data directory used capacity with performance protection
+        let start = Instant::now();
+        match calculate_data_dir_used_capacity(&storage_info.disks).await {
+            Ok(used_capacity) => {
+                info.total_used_capacity = used_capacity;
+
+                // Log calculation time
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    warn!("Capacity calculation took {:?}, which is slower than expected", elapsed);
+                } else {
+                    debug!("Capacity calculation took {:?}", elapsed);
+                }
+
+                // Log capacity comparison
+                let disk_used = info.total_capacity.saturating_sub(info.total_free_capacity);
+                info!(
+                    "Capacity statistics: data_dir_used={}, disk_used={}, difference={}",
+                    used_capacity,
+                    disk_used,
+                    i64::try_from(used_capacity).unwrap_or(i64::MAX) - i64::try_from(disk_used).unwrap_or(i64::MAX)
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to calculate data directory used capacity: {:?}, falling back to disk used capacity",
+                    e
+                );
+                // Fallback: use disk used capacity
+                info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+            }
+        }
 
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
@@ -296,5 +453,79 @@ mod tests {
         let readiness = usecase.execute_collect_dependency_readiness();
         let _ = readiness.storage_ready;
         let _ = readiness.iam_ready;
+    }
+
+    // Tests for directory size calculation functions
+    #[tokio::test]
+    async fn test_get_dir_size_async_empty_directory() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_dir_size_async_single_file() {
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+
+        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
+        assert_eq!(size, 13);
+    }
+
+    #[tokio::test]
+    async fn test_get_dir_size_async_multiple_files() {
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create multiple files
+        for i in 0..10 {
+            let file_path = temp_dir.path().join(format!("file_{}.txt", i));
+            let mut file = File::create(&file_path).unwrap();
+            file.write_all(b"test").unwrap();
+        }
+
+        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
+        assert_eq!(size, 40); // 10 files * 4 bytes
+    }
+
+    #[tokio::test]
+    async fn test_get_dir_size_async_nested_directories() {
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create nested directories and files
+        let subdir = temp_dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let file1 = temp_dir.path().join("file1.txt");
+        let mut f1 = File::create(&file1).unwrap();
+        f1.write_all(b"content1").unwrap();
+
+        let file2 = subdir.join("file2.txt");
+        let mut f2 = File::create(&file2).unwrap();
+        f2.write_all(b"content2").unwrap();
+
+        let size = get_dir_size_async(temp_dir.path()).await.unwrap();
+        assert_eq!(size, 16); // "content1" (8) + "content2" (8)
+    }
+
+    #[tokio::test]
+    async fn test_get_dir_size_async_nonexistent_directory() {
+        let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
+        assert!(result.is_err());
     }
 }

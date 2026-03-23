@@ -7358,6 +7358,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "walkdir",
  "zip",
 ]
 

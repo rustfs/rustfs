@@ -98,6 +98,7 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 # Serialization and Data Formats
 bytes = { workspace = true }
 flatbuffers.workspace = true
+walkdir = "2.5"
 rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
