@@ -234,7 +234,7 @@ percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.0", features = ["serde"] }
-ratelimit = "1.0.0"
+ratelimit = "0.10.1"
 rayon = "1.11.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"

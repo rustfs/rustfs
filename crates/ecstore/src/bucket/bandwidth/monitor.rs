@@ -34,7 +34,9 @@ impl BucketThrottle {
     fn new(node_bandwidth_per_sec: i64) -> Result<Self, RatelimitError> {
         let node_bandwidth_per_sec = node_bandwidth_per_sec.max(1);
         let amount = node_bandwidth_per_sec as u64;
-        let limiter_inner = Ratelimiter::builder(amount).max_tokens(amount).build()?;
+        let limiter_inner = Ratelimiter::builder(amount, Duration::from_secs(1))
+            .max_tokens(amount)
+            .build()?;
         Ok(Self {
             limiter: Arc::new(Mutex::new(limiter_inner)),
             node_bandwidth_per_sec,
@@ -55,7 +57,7 @@ impl BucketThrottle {
             e.into_inner()
         });
         if n == 0 {
-            return (0, guard.rate() as f64, 0);
+            return (0, guard.rate(), 0);
         }
         let mut consumed = 0u64;
         if guard.try_wait().is_ok() {
@@ -65,12 +67,12 @@ impl BucketThrottle {
         let to_consume = n - consumed;
         let batch = to_consume.min(available);
         if batch > 0 {
-            guard.set_rate(available - batch);
+            let _ = guard.set_available(available - batch);
             consumed += batch;
         }
         let deficit = n.saturating_sub(consumed);
         let rate = guard.rate();
-        (deficit, rate as f64, consumed)
+        (deficit, rate, consumed)
     }
 }
 
