@@ -56,6 +56,8 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 mod bucket;
 #[path = "disk.rs"]
 mod disk;
+#[path = "event.rs"]
+mod event;
 #[path = "health.rs"]
 mod health;
 #[path = "lock.rs"]
@@ -427,6 +429,10 @@ impl Node for NodeService {
 
     async fn get_metrics(&self, request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
         self.handle_get_metrics(request).await
+    }
+
+    async fn get_live_events(&self, request: Request<GetLiveEventsRequest>) -> Result<Response<GetLiveEventsResponse>, Status> {
+        self.handle_get_live_events(request).await
     }
 
     async fn get_proc_info(&self, _request: Request<GetProcInfoRequest>) -> Result<Response<GetProcInfoResponse>, Status> {

@@ -78,12 +78,6 @@ pub mod notifier_global {
             return;
         }
 
-        // Skip event materialization when neither configured targets nor live listeners exist.
-        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await && !notification_sys.has_live_listeners() {
-            // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
-            return;
-        }
-
         // Create an event and send it
         let event = Arc::new(Event::new(args));
         notification_sys.send_event(event).await;

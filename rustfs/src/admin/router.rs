@@ -56,7 +56,8 @@ use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
 use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
-use rustfs_ecstore::rpc::verify_rpc_signature;
+use rustfs_ecstore::notification_sys::get_global_notification_sys;
+use rustfs_ecstore::rpc::{PeerRestClient, verify_rpc_signature};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{
     global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},
@@ -66,8 +67,8 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_signer::pre_sign_v4;
 use rustfs_s3_common::EventName;
+use rustfs_signer::pre_sign_v4;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -1014,10 +1015,7 @@ fn build_object_lambda_passthrough_response(
 ) -> S3Response<Body> {
     clear_object_lambda_variant_headers(&mut response_headers);
     for (name, value) in lambda_headers {
-        if !is_disallowed_object_lambda_response_header(name)
-            && name != "x-amz-request-route"
-            && name != "x-amz-request-token"
-        {
+        if !is_disallowed_object_lambda_response_header(name) && name != "x-amz-request-route" && name != "x-amz-request-token" {
             response_headers.insert(name.clone(), value.clone());
         }
     }
@@ -1095,6 +1093,14 @@ struct ListenNotificationStream {
     inner: ReceiverStream<Result<Bytes, StdError>>,
 }
 
+struct PeerLiveEventCursor {
+    client: PeerRestClient,
+    next_sequence: u64,
+}
+
+const LISTEN_NOTIFICATION_PEER_BATCH_LIMIT: u32 = 128;
+const LISTEN_NOTIFICATION_PEER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 impl Stream for ListenNotificationStream {
     type Item = Result<Bytes, StdError>;
 
@@ -1159,10 +1165,93 @@ fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<By
         .map_err(|e| s3_error!(InternalError, "failed to serialize notification event: {e}"))
 }
 
+fn list_remote_live_event_peers() -> Vec<PeerLiveEventCursor> {
+    get_global_notification_sys()
+        .map(|system| {
+            system
+                .peer_clients
+                .iter()
+                .flatten()
+                .cloned()
+                .map(|client| PeerLiveEventCursor {
+                    client,
+                    next_sequence: 0,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn deserialize_peer_live_events(payload: &[u8]) -> Result<Vec<NotificationEvent>, serde_json::Error> {
+    serde_json::from_slice(payload)
+}
+
+async fn fan_in_remote_live_events(
+    peers: &mut [PeerLiveEventCursor],
+    filter: &ListenNotificationFilter,
+    tx: &mpsc::Sender<Result<Bytes, StdError>>,
+) -> bool {
+    for peer in peers.iter_mut() {
+        loop {
+            let batch = match tokio::time::timeout(
+                Duration::from_secs(2),
+                peer.client
+                    .get_live_events(peer.next_sequence, LISTEN_NOTIFICATION_PEER_BATCH_LIMIT),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => batch,
+                Ok(Err(err)) => {
+                    warn!("failed to fetch live events from peer {}: {err}", peer.client.host);
+                    break;
+                }
+                Err(_) => {
+                    warn!("timed out fetching live events from peer {}", peer.client.host);
+                    break;
+                }
+            };
+
+            peer.next_sequence = batch.next_sequence.max(peer.next_sequence);
+
+            if !batch.events.is_empty() {
+                match deserialize_peer_live_events(&batch.events) {
+                    Ok(events) => {
+                        for event in events {
+                            if !event_matches_listen_notification(&event, filter) {
+                                continue;
+                            }
+                            match serialize_listen_notification_event(&event) {
+                                Ok(serialized) => {
+                                    if tx.send(Ok(serialized)).await.is_err() {
+                                        return false;
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("failed to serialize remote listen notification event: {err}");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("failed to decode live events from peer {}: {err}", peer.client.host);
+                    }
+                }
+            }
+
+            if !batch.truncated {
+                break;
+            }
+        }
+    }
+
+    true
+}
+
 fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Result<S3Response<Body>> {
     let (interval_duration, payload) = listen_notification_keepalive_plan(uri);
     let filter = parse_listen_notification_filter(uri, bucket)?;
     let mut live_events = notification_system().map(|system| system.subscribe_live_events());
+    let mut peer_live_events = list_remote_live_event_peers();
 
     let (tx, rx) = mpsc::channel(16);
     let stream: DynByteStream = Box::pin(ListenNotificationStream {
@@ -1171,8 +1260,10 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval_duration);
+        let mut peer_ticker = tokio::time::interval(LISTEN_NOTIFICATION_PEER_POLL_INTERVAL);
         // Skip the immediate first tick so behavior starts after interval duration.
         ticker.tick().await;
+        peer_ticker.tick().await;
         loop {
             if let Some(events_rx) = live_events.as_mut() {
                 tokio::select! {
@@ -1205,12 +1296,22 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
+                    _ = peer_ticker.tick(), if !peer_live_events.is_empty() => {
+                        if !fan_in_remote_live_events(&mut peer_live_events, &filter, &tx).await {
+                            break;
+                        }
+                    }
                 }
             } else {
                 tokio::select! {
                     _ = tx.closed() => break,
                     _ = ticker.tick() => {
                         if tx.send(Ok(payload.clone())).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = peer_ticker.tick(), if !peer_live_events.is_empty() => {
+                        if !fan_in_remote_live_events(&mut peer_live_events, &filter, &tx).await {
                             break;
                         }
                     }
@@ -1293,11 +1394,7 @@ fn apply_replication_metrics_bandwidth_report(
     bandwidth_report: HashMap<String, BandwidthDetails>,
 ) -> BucketStats {
     for (arn, details) in bandwidth_report {
-        let stat = bucket_stats
-            .replication_stats
-            .stats
-            .entry(arn)
-            .or_default();
+        let stat = bucket_stats.replication_stats.stats.entry(arn).or_default();
         stat.bandwidth_limit_bytes_per_sec = details.limit_bytes_per_sec;
         stat.current_bandwidth_bytes_per_sec = details.current_bandwidth_bytes_per_sec;
     }
@@ -1365,9 +1462,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
 }
 
 fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
-    let arn = query_value_exact(uri, "arn")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default();
+    let arn = query_value_exact(uri, "arn").filter(|v| !v.is_empty()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
     let reset_before = match query_value_exact(uri, "older-than").filter(|v| !v.is_empty()) {
@@ -1403,9 +1498,7 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
 
         let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|status| {
             status.status
-                == s3s::dto::ExistingObjectReplicationStatus::from_static(
-                    s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                )
+                == s3s::dto::ExistingObjectReplicationStatus::from_static(s3s::dto::ExistingObjectReplicationStatus::ENABLED)
         });
         if !existing_object_enabled {
             continue;
@@ -1429,10 +1522,7 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
     arns
 }
 
-fn resolve_replication_reset_target_arn(
-    config: &s3s::dto::ReplicationConfiguration,
-    requested_arn: &str,
-) -> S3Result<String> {
+fn resolve_replication_reset_target_arn(config: &s3s::dto::ReplicationConfiguration, requested_arn: &str) -> S3Result<String> {
     let resettable_arns = collect_resettable_replication_target_arns(config);
 
     if requested_arn.is_empty() {
@@ -1451,10 +1541,7 @@ fn resolve_replication_reset_target_arn(
 
     let (has_arn, existing_object_enabled) = config.has_existing_object_replication(requested_arn);
     if !has_arn {
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication reset arn is not configured for this bucket"
-        ));
+        return Err(s3_error!(InvalidRequest, "replication reset arn is not configured for this bucket"));
     }
     if !existing_object_enabled {
         return Err(s3_error!(
@@ -1562,9 +1649,7 @@ fn format_replication_check_client_error(err: &S3ClientError, context: Replicati
                 "s3:ReplicateDelete/s3:DeleteObject permissions missing for replication user".to_string()
             }
             ReplicationCheckFailureContext::BucketCheck => "target bucket check failed: access denied".to_string(),
-            ReplicationCheckFailureContext::VersioningCheck => {
-                "target bucket versioning check failed: access denied".to_string()
-            }
+            ReplicationCheckFailureContext::VersioningCheck => "target bucket versioning check failed: access denied".to_string(),
             ReplicationCheckFailureContext::ObjectLockCheck => "target object lock check failed: access denied".to_string(),
         };
     }
@@ -1591,13 +1676,10 @@ fn is_object_lock_not_enabled_error(err: &S3ClientError) -> bool {
     matches!(
         err.code.as_deref(),
         Some("ObjectLockConfigurationNotFoundError" | "ObjectLockConfigurationNotFound")
-    ) || err
-        .message
-        .as_deref()
-        .is_some_and(|message| {
-            message.contains("Object Lock configuration does not exist")
-                || message.contains("Object Lock is not enabled for this bucket")
-        })
+    ) || err.message.as_deref().is_some_and(|message| {
+        message.contains("Object Lock configuration does not exist")
+            || message.contains("Object Lock is not enabled for this bucket")
+    })
 }
 
 fn validate_replication_check_config_targets(
@@ -1689,10 +1771,7 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
         }
         Err(err) => {
             result.status = "FAILED".to_string();
-            result.error = Some(format_replication_check_client_error(
-                &err,
-                ReplicationCheckFailureContext::BucketCheck,
-            ));
+            result.error = Some(format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck));
             return result;
         }
     }
@@ -1958,11 +2037,10 @@ async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) 
         .send()
         .await
     {
-        Ok(res) => Ok(
-            res.object_lock_configuration()
-                .and_then(|cfg| cfg.object_lock_enabled())
-                .is_some_and(|state| state.as_str() == "Enabled"),
-        ),
+        Ok(res) => Ok(res
+            .object_lock_configuration()
+            .and_then(|cfg| cfg.object_lock_enabled())
+            .is_some_and(|state| state.as_str() == "Enabled")),
         Err(err) => {
             let err = S3ClientError::from(err);
             if is_object_lock_not_enabled_error(&err) {
@@ -2661,8 +2739,7 @@ mod tests {
             },
         );
 
-        let response =
-            build_replication_reset_status_response(status, Some("arn:z")).expect("status response should build");
+        let response = build_replication_reset_status_response(status, Some("arn:z")).expect("status response should build");
         let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
             .expect("body should read")
             .to_bytes();
@@ -2746,8 +2823,7 @@ mod tests {
             Some("denied".to_string()),
         );
 
-        let formatted =
-            format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+        let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
         assert_eq!(formatted, "target bucket check failed: access denied");
     }
 
@@ -2760,8 +2836,7 @@ mod tests {
             Some("bucket versioning is suspended".to_string()),
         );
 
-        let formatted =
-            format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+        let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
         assert_eq!(
             formatted,
             "target bucket versioning check failed: InvalidRequest: bucket versioning is suspended"
@@ -2777,22 +2852,13 @@ mod tests {
             Some("denied".to_string()),
         );
 
-        let replicate_object =
-            format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
-        assert_eq!(
-            replicate_object,
-            "s3:ReplicateObject permissions missing for replication user"
-        );
+        let replicate_object = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+        assert_eq!(replicate_object, "s3:ReplicateObject permissions missing for replication user");
 
-        let replicate_delete =
-            format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateDeleteMarker);
-        assert_eq!(
-            replicate_delete,
-            "s3:ReplicateDelete permissions missing for replication user"
-        );
+        let replicate_delete = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateDeleteMarker);
+        assert_eq!(replicate_delete, "s3:ReplicateDelete permissions missing for replication user");
 
-        let delete_object =
-            format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion);
+        let delete_object = format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion);
         assert_eq!(
             delete_object,
             "s3:ReplicateDelete/s3:DeleteObject permissions missing for replication user"
@@ -3316,8 +3382,8 @@ mod tests {
             )]),
         )]));
 
-        let err = resolve_object_lambda_webhook_config_from_server_config(&config, &arn)
-            .expect_err("invalid timeout should fail");
+        let err =
+            resolve_object_lambda_webhook_config_from_server_config(&config, &arn).expect_err("invalid timeout should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -3398,7 +3464,10 @@ mod tests {
 
         assert_eq!(response.status, Some(StatusCode::BAD_GATEWAY));
         assert_eq!(
-            response.headers.get(http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
         assert_eq!(
@@ -3413,10 +3482,7 @@ mod tests {
         assert!(response.headers.get(http::header::CONNECTION).is_none());
         assert!(response.headers.get("x-amz-request-route").is_none());
         assert!(response.headers.get("x-amz-request-token").is_none());
-        assert_eq!(
-            response.headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()),
-            Some("v1")
-        );
+        assert_eq!(response.headers.get("x-amz-version-id").and_then(|value| value.to_str().ok()), Some("v1"));
     }
 
     #[test]
@@ -3448,14 +3514,9 @@ mod tests {
         assert_eq!(source_url.path(), "/demo-bucket/object.txt");
         assert_eq!(query_pairs.get("versionId").map(|value| value.as_ref()), Some("v1"));
         assert!(!query_pairs.contains_key("lambdaArn"));
-        let expires = query_pairs
-            .get("X-Amz-Expires")
-            .and_then(|value| value.parse::<u64>().ok());
+        let expires = query_pairs.get("X-Amz-Expires").and_then(|value| value.parse::<u64>().ok());
         assert_eq!(expires, Some(3600));
-        assert_eq!(
-            query_pairs.get("X-Amz-Algorithm").map(|value| value.as_ref()),
-            Some("AWS4-HMAC-SHA256")
-        );
+        assert_eq!(query_pairs.get("X-Amz-Algorithm").map(|value| value.as_ref()), Some("AWS4-HMAC-SHA256"));
         assert!(query_pairs.contains_key("X-Amz-Signature"));
     }
 
