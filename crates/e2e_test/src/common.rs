@@ -26,6 +26,7 @@ use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use reqwest::Client as HttpClient;
 use std::ffi::OsStr;
+use std::fs as stdfs;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Once;
@@ -74,6 +75,11 @@ pub fn local_http_client() -> HttpClient {
 
 /// Resolve the RustFS binary relative to the workspace.
 pub fn rustfs_binary_path() -> PathBuf {
+    rustfs_binary_path_with_features(requested_rustfs_build_features().as_deref())
+}
+
+/// Resolve the RustFS binary relative to the workspace, optionally requesting build features.
+pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
@@ -84,8 +90,10 @@ pub fn rustfs_binary_path() -> PathBuf {
     binary_path.push(profile_dir);
     binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
 
+    let features_match = binary_features_match(&binary_path, requested_features);
     let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
-    if binary_path.is_file() && (!source_is_newer || running_inside_e2e_test_binary()) {
+    let can_reuse_inside_e2e = running_inside_e2e_test_binary() && requested_features.is_none() && features_match;
+    if binary_path.is_file() && features_match && (!source_is_newer || can_reuse_inside_e2e) {
         if source_is_newer {
             warn!(
                 "RustFS binary at {:?} appears older than workspace sources; reusing it inside cargo test to avoid nested builds",
@@ -97,7 +105,7 @@ pub fn rustfs_binary_path() -> PathBuf {
     }
 
     info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary();
+    build_rustfs_binary(requested_features);
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
@@ -124,6 +132,27 @@ fn workspace_sources_newer_than_binary(binary_path: &PathBuf) -> bool {
 
 fn running_inside_e2e_test_binary() -> bool {
     std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
+}
+
+fn requested_rustfs_build_features() -> Option<String> {
+    std::env::var("RUSTFS_BUILD_FEATURES")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn rustfs_binary_features_stamp_path(binary_path: &PathBuf) -> PathBuf {
+    binary_path.with_extension("features")
+}
+
+fn binary_features_match(binary_path: &PathBuf, requested_features: Option<&str>) -> bool {
+    let stamp_path = rustfs_binary_features_stamp_path(binary_path);
+    let recorded = stdfs::read_to_string(stamp_path).ok().map(|value| value.trim().to_string());
+
+    match requested_features {
+        Some(features) => recorded.as_deref() == Some(features),
+        None => recorded.as_deref().is_none_or(str::is_empty),
+    }
 }
 
 fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &PathBuf) -> bool {
@@ -155,7 +184,7 @@ fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &PathBuf) ->
 }
 
 /// Build the RustFS binary using cargo
-fn build_rustfs_binary() {
+fn build_rustfs_binary(requested_features: Option<&str>) {
     let workspace = workspace_root();
     info!("Building RustFS binary from workspace: {:?}", workspace);
 
@@ -170,11 +199,8 @@ fn build_rustfs_binary() {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
 
-    // Read features from environment variable for e2e tests
-    if let Ok(features) = std::env::var("RUSTFS_BUILD_FEATURES")
-        && !features.is_empty()
-    {
-        cmd.arg("--features").arg(&features);
+    if let Some(features) = requested_features {
+        cmd.arg("--features").arg(features);
         info!("Building with features: {}", features);
     }
 
@@ -192,6 +218,15 @@ fn build_rustfs_binary() {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!("Failed to build RustFS binary. Error: {stderr}");
+    }
+
+    let mut binary_path = workspace;
+    binary_path.push("target");
+    binary_path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+    if let Err(err) = stdfs::write(&stamp_path, requested_features.unwrap_or_default()) {
+        warn!("Failed to write RustFS feature stamp {:?}: {}", stamp_path, err);
     }
 
     info!("✅ RustFS binary built successfully");
@@ -628,7 +663,9 @@ impl RustFSTestClusterEnvironment {
             self.wait_for_node_ready(&node.address, i).await?;
         }
 
-        self.wait_for_service_ready().await?;
+        for node_idx in 0..self.nodes.len() {
+            self.wait_for_node_service_ready(node_idx).await?;
+        }
 
         Ok(())
     }
@@ -648,17 +685,20 @@ impl RustFSTestClusterEnvironment {
         Err(format!("Node {} failed to become ready", idx).into())
     }
 
-    /// Wait for the entire cluster's S3-compatible service to be ready (internal helper method).
+    /// Wait for a specific node's S3-compatible service to be ready (internal helper method).
     ///
-    /// Verifies service availability by calling the S3 `list_buckets` API, retries up to 120 times
-    /// with a 1-second interval between attempts. Fails if the API call remains unsuccessful after all retries.
-    async fn wait_for_service_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = self.create_s3_client(0)?;
+    /// Verifies service availability by calling the S3 `list_buckets` API against the requested node,
+    /// retries up to 120 times with a 1-second interval between attempts.
+    async fn wait_for_node_service_ready(
+        &self,
+        node_idx: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.create_s3_client(node_idx)?;
 
         for attempt in 0..120 {
             match client.list_buckets().send().await {
                 Ok(_) => {
-                    info!("Cluster service ready after {} attempts", attempt + 1);
+                    info!("Cluster node {} service ready after {} attempts", node_idx, attempt + 1);
                     return Ok(());
                 }
                 Err(_) => {
@@ -666,7 +706,8 @@ impl RustFSTestClusterEnvironment {
                 }
             }
         }
-        Err("Cluster service failed to become ready".into())
+
+        Err(format!("Cluster node {} service failed to become ready", node_idx).into())
     }
 
     /// Create an S3 client configured to communicate with a specific cluster node.

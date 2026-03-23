@@ -14,7 +14,7 @@
 
 //! Core WebDAV tests
 
-use crate::common::rustfs_binary_path;
+use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use base64::Engine;
@@ -47,7 +47,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 
     // Start server manually
     info!("Starting WebDAV server on {}", WEBDAV_ADDRESS);
-    let binary_path = rustfs_binary_path();
+    let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
     let mut server_process = Command::new(&binary_path)
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)

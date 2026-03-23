@@ -16,7 +16,7 @@
 //! Verifies that anonymous access works correctly with bucket policies
 //! when PublicAccessBlock configuration is missing or explicitly set.
 
-use crate::common::{RustFSTestEnvironment, init_logging};
+use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::types::PublicAccessBlockConfiguration;
 use serial_test::serial;
 use tracing::info;
@@ -67,7 +67,7 @@ async fn anonymous_get_object(
     key: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = format!("{}/{}/{}", env.url, bucket_name, key);
-    reqwest::Client::new().get(&url).send().await
+    local_http_client().get(&url).send().await
 }
 
 /// Issue #2036: Anonymous GetObject should succeed when bucket policy allows it

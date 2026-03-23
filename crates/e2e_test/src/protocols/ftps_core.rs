@@ -14,11 +14,13 @@
 
 //! Core FTPS tests
 
-use crate::common::rustfs_binary_path;
+use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use rcgen::generate_simple_self_signed;
-use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer, pki_types::pem::PemObject};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +32,46 @@ use tracing::info;
 // Fixed FTPS port for testing
 const FTPS_PORT: u16 = 9021;
 const FTPS_ADDRESS: &str = "127.0.0.1:9021";
+
+#[derive(Debug)]
+struct AcceptAnyServerCertVerifier;
+
+impl ServerCertVerifier for AcceptAnyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
 /// Test FTPS: put, ls, mkdir, rmdir, delete operations
 pub async fn test_ftps_core_operations() -> Result<()> {
@@ -58,7 +100,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
 
     // Start server manually
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
-    let binary_path = rustfs_binary_path();
+    let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
     let mut server_process = Command::new(&binary_path)
         .env("RUSTFS_FTPS_ENABLE", "true")
         .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
@@ -78,19 +120,9 @@ pub async fn test_ftps_core_operations() -> Result<()> {
             .install_default()
             .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
 
-        // Create a simple rustls config that accepts any certificate for testing
-        let mut root_store = RootCertStore::empty();
-        // Add the self-signed certificate to the trust store for e2e
-        // Note: In a real environment, you'd use proper root certificates
-        let cert_pem = default_cert.cert.pem();
-        let cert_der = CertificateDer::pem_reader_iter(&mut Cursor::new(cert_pem))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse cert: {}", e))?;
-
-        root_store.add_parsable_certificates(cert_der);
-
         let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
             .with_no_client_auth();
 
         // Wrap in suppaftp's RustlsConnector
