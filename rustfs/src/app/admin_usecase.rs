@@ -108,6 +108,13 @@ async fn calculate_data_dir_used_capacity(
 async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
     let path = path.to_path_buf();
 
+    // Check if path exists before traversing
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Directory not found: {:?}", path),
+        ));
+    }
     // Use tokio::task::spawn_blocking to avoid blocking the async runtime
     tokio::task::spawn_blocking(move || {
         let start_time = Instant::now();
@@ -135,29 +142,30 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
 
             // Only count file sizes, ignore directories
             if let Ok(metadata) = entry.metadata()
-                && metadata.is_file() {
-                    file_count += 1;
+                && metadata.is_file()
+            {
+                file_count += 1;
 
-                    // When file count exceeds threshold, enable sampling
-                    if file_count > MAX_FILES_THRESHOLD {
-                        // Sampling: count 1 in every SAMPLE_RATE files
-                        if file_count.is_multiple_of(SAMPLE_RATE) {
-                            sampled_size += metadata.len();
-                            sampled_count += 1;
-                        }
-
-                        // Log progress every 100k files
-                        if file_count.is_multiple_of(100_000) {
-                            debug!(
-                                "Processed {} files, sampled {} files, size: {} bytes",
-                                file_count, sampled_count, sampled_size
-                            );
-                        }
-                    } else {
-                        // Below threshold, full statistics
-                        total_size += metadata.len();
+                // When file count exceeds threshold, enable sampling
+                if file_count > MAX_FILES_THRESHOLD {
+                    // Sampling: count 1 in every SAMPLE_RATE files
+                    if file_count.is_multiple_of(SAMPLE_RATE) {
+                        sampled_size += metadata.len();
+                        sampled_count += 1;
                     }
+
+                    // Log progress every 100k files
+                    if file_count.is_multiple_of(100_000) {
+                        debug!(
+                            "Processed {} files, sampled {} files, size: {} bytes",
+                            file_count, sampled_count, sampled_size
+                        );
+                    }
+                } else {
+                    // Below threshold, full statistics
+                    total_size += metadata.len();
                 }
+            }
         }
 
         // If sampling was enabled, return estimated value
@@ -428,6 +436,7 @@ impl DefaultAdminUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {
@@ -523,6 +532,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_get_dir_size_async_nonexistent_directory() {
         let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
         assert!(result.is_err());
