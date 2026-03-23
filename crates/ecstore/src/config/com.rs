@@ -15,6 +15,7 @@
 use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
+use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::{DEFAULT_DELIMITER, RUSTFS_REGION};
@@ -41,6 +42,19 @@ static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
 #[instrument(skip(api))]
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
+    Ok(data)
+}
+
+pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+    let (data, _obj) = read_config_with_metadata(
+        api,
+        file,
+        &ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(data)
 }
 
@@ -287,7 +301,14 @@ fn is_object_not_found(err: &Error) -> bool {
 pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
     let config_file = get_config_file();
     match api
-        .get_object_info(RUSTFS_META_BUCKET, &config_file, &ObjectOptions::default())
+        .get_object_info(
+            RUSTFS_META_BUCKET,
+            &config_file,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(_) => {
@@ -360,7 +381,13 @@ pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
-    let cfg = new_and_save_server_config(api).await?;
+    let cfg = if is_first_cluster_node_local().await {
+        new_and_save_server_config(api.clone()).await?
+    } else {
+        let mut cfg = new_server_config();
+        lookup_configs(&mut cfg, api).await;
+        cfg
+    };
     warn!("Configuration initialization complete ({})", context);
     Ok(cfg)
 }
@@ -375,7 +402,7 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     let config_file = get_config_file();
 
     // Try to read the configuration file
-    match read_config(api.clone(), &config_file).await {
+    match read_config_no_lock(api.clone(), &config_file).await {
         Ok(data) => read_server_config(api, &data).await,
         Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration").await,
         Err(err) => handle_config_read_error(err, &config_file),
@@ -389,7 +416,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
         warn!("Received empty configuration data, try to reread from '{}'", config_file);
 
         // Try to read the configuration again
-        match read_config(api.clone(), &config_file).await {
+        match read_config_no_lock(api.clone(), &config_file).await {
             Ok(cfg_data) => {
                 // TODO: decrypt
                 let cfg = decode_server_config_blob(&cfg_data)?;

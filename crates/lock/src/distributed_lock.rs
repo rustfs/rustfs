@@ -230,7 +230,21 @@ impl DistributedLock {
         } else {
             // Check if it's a timeout or quorum failure
             if let Some(error_msg) = &resp.error {
-                warn!("acquire_lock_quorum error: {}", error_msg);
+                if request.suppress_contention_logs {
+                    tracing::debug!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        "acquire_lock_quorum contention: {}",
+                        error_msg
+                    );
+                } else {
+                    warn!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        "acquire_lock_quorum error: {}",
+                        error_msg
+                    );
+                }
                 if error_msg.contains("quorum") {
                     // This is a quorum failure - return appropriate error
                     // Extract achieved count from error message or use individual_locks.len()
@@ -263,6 +277,21 @@ impl DistributedLock {
         let req = LockRequest::new(resource, LockType::Exclusive, owner)
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
+        self.acquire_guard(&req).await
+    }
+
+    /// Convenience: acquire exclusive lock with expected contention logs suppressed
+    pub async fn lock_guard_quiet(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<DistributedLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Exclusive, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .with_suppress_contention_logs(true);
         self.acquire_guard(&req).await
     }
 
@@ -307,11 +336,24 @@ impl DistributedLock {
                             individual_locks.push((lock_info.id.clone(), self.clients[idx].clone()));
                         }
                     } else {
-                        tracing::warn!(
-                            "Failed to acquire lock on client from response: {}, error: {}",
-                            idx,
-                            resp.error.unwrap_or_else(|| "unknown error".to_string())
-                        );
+                        let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                        if request.suppress_contention_logs {
+                            tracing::debug!(
+                                resource = %request.resource,
+                                owner = %request.owner,
+                                "Failed to acquire lock on client from response: {}, error: {}",
+                                idx,
+                                error
+                            );
+                        } else {
+                            tracing::warn!(
+                                resource = %request.resource,
+                                owner = %request.owner,
+                                "Failed to acquire lock on client from response: {}, error: {}",
+                                idx,
+                                error
+                            );
+                        }
                     }
                 }
                 Err(e) => {

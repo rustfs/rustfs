@@ -530,14 +530,17 @@ async fn run(config: config::Config) -> Result<()> {
         "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
     );
 
-    // Initialize heal manager and scanner based on environment variables
+    // Scanner depends on the heal channel/manager, so scanner implies heal.
     if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-
         init_heal_manager(heal_storage, None).await?;
+    }
 
+    if enable_scanner {
         init_data_scanner(ctx.clone(), store.clone()).await;
-    } else {
+    }
+
+    if !enable_heal && !enable_scanner {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
 
@@ -623,20 +626,24 @@ async fn handle_shutdown(
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
-    // Stop background services based on what was enabled
-    if enable_scanner || enable_heal {
+    // Stop background services based on what was enabled.
+    if enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Stopping background services (data scanner and auto heal)..."
+            "Stopping background services (data scanner)..."
         );
         shutdown_background_services();
+    }
 
+    if enable_heal || enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Stopping AHM services..."
         );
         shutdown_ahm_services();
-    } else {
+    }
+
+    if !enable_scanner && !enable_heal {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Background services were disabled, skipping AHM shutdown"
