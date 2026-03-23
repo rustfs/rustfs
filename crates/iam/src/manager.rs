@@ -25,6 +25,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
+use rustfs_ecstore::global::is_first_cluster_node_local;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -300,6 +301,10 @@ where
         };
 
         if iam_fmt.version >= IAM_FORMAT_VERSION_1 {
+            return Ok(());
+        }
+
+        if !is_first_cluster_node_local().await {
             return Ok(());
         }
 

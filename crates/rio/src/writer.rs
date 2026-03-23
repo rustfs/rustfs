@@ -20,7 +20,7 @@ use crate::HttpWriter;
 
 pub enum Writer {
     Cursor(Cursor<Vec<u8>>),
-    Http(HttpWriter),
+    Http(Box<HttpWriter>),
     Other(Box<dyn AsyncWrite + Unpin + Send + Sync>),
 }
 
@@ -38,7 +38,7 @@ impl Writer {
     }
 
     pub fn from_http(w: HttpWriter) -> Self {
-        Writer::Http(w)
+        Writer::Http(Box::new(w))
     }
 
     pub fn into_cursor_inner(self) -> Option<Vec<u8>> {
@@ -56,14 +56,14 @@ impl Writer {
     }
     pub fn as_http(&mut self) -> Option<&mut HttpWriter> {
         match self {
-            Writer::Http(w) => Some(w),
+            Writer::Http(w) => Some(w.as_mut()),
             _ => None,
         }
     }
 
     pub fn into_http(self) -> Option<HttpWriter> {
         match self {
-            Writer::Http(w) => Some(w),
+            Writer::Http(w) => Some(*w),
             _ => None,
         }
     }
