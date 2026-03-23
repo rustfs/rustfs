@@ -203,6 +203,7 @@ impl ECStore {
         let mut meta = PoolMeta::default();
         meta.load(self.pools[0].clone(), self.pools.clone()).await?;
         let update = meta.validate(self.pools.clone())?;
+        let should_persist_pool_meta = get_global_endpoints().first_local();
 
         if !update {
             {
@@ -211,7 +212,9 @@ impl ECStore {
             }
         } else {
             let new_meta = PoolMeta::new(&self.pools, &meta);
-            new_meta.save(self.pools.clone()).await?;
+            if should_persist_pool_meta {
+                new_meta.save(self.pools.clone()).await?;
+            }
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 *pool_meta = new_meta;
