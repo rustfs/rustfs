@@ -18,6 +18,7 @@ use crate::disk::{
     WalkDirOptions,
     local::{LocalDisk, ScanGuard},
 };
+use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use std::{
@@ -410,7 +411,19 @@ impl LocalDiskWrapper {
     /// Set the disk ID
     pub async fn set_disk_id_internal(&self, id: Option<Uuid>) -> Result<()> {
         let mut disk_id = self.disk_id.write().await;
+        let previous = *disk_id;
         *disk_id = id;
+        drop(disk_id);
+
+        if self.disk.is_local() {
+            let mut disk_id_map = GLOBAL_LOCAL_DISK_ID_MAP.write().await;
+            if let Some(previous_id) = previous {
+                disk_id_map.remove(&previous_id);
+            }
+            if let Some(current_id) = id {
+                disk_id_map.insert(current_id, self.disk.endpoint().to_string());
+            }
+        }
         Ok(())
     }
 

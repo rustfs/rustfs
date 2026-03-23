@@ -49,3 +49,4 @@ result*
 rustfs-webdav.code-workspace
 
 .aiexclude
+*.bak
