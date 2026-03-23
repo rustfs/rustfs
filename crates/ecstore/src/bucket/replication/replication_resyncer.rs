@@ -2453,7 +2453,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let sopts = StatObjectOptions {
+        let mut sopts = StatObjectOptions {
             version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
             internal: AdvancedGetOptions {
                 replication_proxy_request: "false".to_string(),
@@ -2462,7 +2462,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS");
+        if let Err(err) = sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS") {
+            warn!("failed to set replication tagging directive header: {err}");
+        }
 
         match tgt_client
             .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))

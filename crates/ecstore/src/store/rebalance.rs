@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::bucket::utils::is_meta_bucketname;
 
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
