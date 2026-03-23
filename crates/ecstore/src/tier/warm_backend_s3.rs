@@ -34,7 +34,7 @@ use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
 use crate::tier::{
     tier_config::TierS3,
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 
@@ -128,18 +128,11 @@ impl WarmBackend for WarmBackendS3 {
     ) -> Result<String, std::io::Error> {
         let client = self.client.clone();
         let res = client
-            .put_object(
-                &self.bucket,
-                &self.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    send_content_md5: true,
-                    storage_class: self.storage_class.clone(),
-                    user_metadata: meta,
-                    ..Default::default()
-                },
-            )
+            .put_object(&self.bucket, &self.get_dest(object), r, length, &{
+                let mut opts = build_transition_put_options(self.storage_class.clone(), meta);
+                opts.send_content_md5 = true;
+                opts
+            })
             .await?;
         Ok(res.version_id)
     }

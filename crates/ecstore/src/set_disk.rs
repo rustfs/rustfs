@@ -82,6 +82,9 @@ use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, Wa
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
+use rustfs_utils::http::headers::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
+};
 use rustfs_utils::http::{
     SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
@@ -92,7 +95,7 @@ use rustfs_utils::{
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use rustfs_workers::workers::Workers;
-use s3s::header::X_AMZ_RESTORE;
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
@@ -1807,7 +1810,7 @@ impl ObjectOperations for SetDisks {
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
             stream: Box::new(pr),
-            object_info: oi,
+            object_info: oi.clone(),
         });
 
         let cloned_bucket = bucket.to_string();
@@ -1836,13 +1839,29 @@ impl ObjectOperations for SetDisks {
             };
         });
 
-        let rv = tgt_client
-            .put_with_meta(&dest_obj, reader, fi.size, {
-                let mut m = HashMap::<String, String>::new();
-                m.insert("name".to_string(), object.to_string());
-                m
-            })
-            .await;
+        let mut transition_meta = oi.user_defined.clone();
+        transition_meta.insert("name".to_string(), object.to_string());
+
+        if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
+            transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
+        }
+
+        for header in [
+            CONTENT_ENCODING,
+            CONTENT_LANGUAGE,
+            CONTENT_DISPOSITION,
+            CACHE_CONTROL,
+            EXPIRES,
+            X_AMZ_OBJECT_LOCK_MODE.as_str(),
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
+            X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
+        ] {
+            if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
+                transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
+            }
+        }
+
+        let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta).await;
         if let Err(err) = rv {
             return Err(StorageError::Io(err));
         }
