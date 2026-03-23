@@ -74,7 +74,6 @@ regex = { workspace = true }
 path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
-serde_bytes.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
@@ -117,6 +116,9 @@ faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client.workspace = true
 
+# Observability and Metrics
+metrics = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
@@ -134,3 +136,6 @@ harness = false
 [[bench]]
 name = "comparison_benchmark"
 harness = false
+
+[lib]
+doctest = false

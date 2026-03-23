@@ -82,6 +82,8 @@ mod scanner;
 mod stats_collector;
 mod system_cpu;
 mod system_drive;
+#[cfg(feature = "gpu")]
+mod system_gpu;
 mod system_memory;
 mod system_network;
 mod system_process;
@@ -104,8 +106,16 @@ pub use replication::{ReplicationStats, collect_replication_metrics};
 pub use request::{ApiRequestStats, collect_request_metrics};
 pub use resource::{ResourceStats, collect_resource_metrics};
 pub use scanner::{ScannerStats, collect_scanner_metrics};
-pub use system_cpu::{CpuStats, collect_cpu_metrics};
-pub use system_drive::{DriveCountStats, DriveDetailedStats, collect_drive_count_metrics, collect_drive_detailed_metrics};
-pub use system_memory::{MemoryStats, collect_memory_metrics};
-pub use system_network::{NetworkStats, collect_network_metrics};
-pub use system_process::{ProcessStats, collect_process_metrics};
+pub use system_cpu::{CpuStats, ProcessCpuStats, collect_cpu_metrics, collect_process_cpu_metrics};
+pub use system_drive::{
+    DriveCountStats, DriveDetailedStats, ProcessDiskStats, collect_drive_count_metrics, collect_drive_detailed_metrics,
+    collect_process_disk_metrics,
+};
+#[cfg(feature = "gpu")]
+pub use system_gpu::{GpuCollector, GpuError, GpuStats, collect_gpu_metrics};
+pub use system_memory::{MemoryStats, ProcessMemoryStats, collect_memory_metrics, collect_process_memory_metrics};
+pub use system_network::{NetworkStats, ProcessNetworkStats, collect_network_metrics, collect_process_network_metrics};
+pub use system_process::{
+    ProcessAttributeError, ProcessAttributes, ProcessStats, ProcessStatusType, collect_process_attributes,
+    collect_process_metrics,
+};

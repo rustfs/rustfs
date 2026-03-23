@@ -21,6 +21,7 @@ use rustfs_policy::policy::{Args, action::Action};
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::debug;
 
 #[derive(Clone)]
 struct AuthContext<'a> {
@@ -70,7 +71,7 @@ async fn check_admin_request_auth(
 ) -> S3Result<()> {
     let conditions = get_condition_values(ctx.headers, ctx.cred, None, None, ctx.remote_addr);
 
-    if !iam_store
+    let allowed = iam_store
         .is_allowed(&Args {
             account: &ctx.cred.access_key,
             groups: &ctx.cred.groups,
@@ -82,8 +83,17 @@ async fn check_admin_request_auth(
             bucket,
             object,
         })
-        .await
-    {
+        .await;
+
+    if !allowed {
+        debug!(
+            target = "rustfs::admin::auth",
+            ?action,
+            deny_only = ctx.deny_only,
+            is_owner = ctx.is_owner,
+            signer_access_key = %ctx.cred.access_key,
+            "IAM is_allowed returned false for admin request (enable DEBUG for rustfs::admin::auth)"
+        );
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 

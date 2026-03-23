@@ -25,9 +25,10 @@ use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
+use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
-    lifecycle::bucket_lifecycle_ops::validate_transition_tier,
+    lifecycle::bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, validate_transition_tier},
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
         BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
@@ -125,6 +126,27 @@ fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'stati
     Ok(())
 }
 
+fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
+    config.rules.iter().any(|rule| {
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && (rule.transitions.as_ref().is_some_and(|transitions| {
+                transitions.iter().any(|transition| {
+                    transition
+                        .storage_class
+                        .as_ref()
+                        .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+                })
+            }) || rule.noncurrent_version_transitions.as_ref().is_some_and(|transitions| {
+                transitions.iter().any(|transition| {
+                    transition
+                        .storage_class
+                        .as_ref()
+                        .is_some_and(|storage_class| !storage_class.as_str().is_empty())
+                })
+            }))
+    })
+}
+
 #[derive(Clone, Default)]
 pub struct DefaultBucketUsecase {
     context: Option<Arc<AppContext>>,
@@ -197,7 +219,7 @@ impl DefaultBucketUsecase {
         }
 
         let output = CreateBucketOutput::default();
-
+        counter!("rustfs_create_bucket_total").increment(1);
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         result
@@ -1050,6 +1072,17 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        if lifecycle_has_transition_rules(&input_cfg)
+            && let Some(store) = new_object_layer_fn()
+        {
+            let bucket_name = bucket.clone();
+            tokio::spawn(async move {
+                if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
+                    warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
+                }
+            });
+        }
+
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
@@ -1899,6 +1932,56 @@ mod tests {
         }];
 
         assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
+    }
+
+    #[test]
+    fn lifecycle_has_transition_rules_ignores_disabled_rules() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::DISABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("disabled-transition".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+            }],
+        };
+
+        assert!(!lifecycle_has_transition_rules(&config));
+    }
+
+    #[test]
+    fn lifecycle_has_transition_rules_accepts_enabled_noncurrent_transitions() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("enabled-noncurrent-transition".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        assert!(lifecycle_has_transition_rules(&config));
     }
 
     #[tokio::test]

@@ -33,11 +33,12 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+metrics-gpu = ["metrics", "rustfs-metrics/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
-full = ["metrics", "ftps", "swift", "webdav"]
+full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav"]
 
 [lints]
 workspace = true
@@ -105,6 +106,7 @@ serde_urlencoded = { workspace = true }
 # Cryptography and Security
 rustls = { workspace = true }
 subtle = { workspace = true }
+chrono = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 

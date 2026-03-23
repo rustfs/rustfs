@@ -452,6 +452,15 @@ async fn run(config: config::Config) -> Result<()> {
         Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
     }
 
+    // Initialize deadlock detector if enabled
+    let detector = crate::storage::deadlock_detector::get_deadlock_detector();
+    if detector.is_enabled() {
+        detector.start();
+        info!(target: "rustfs::main::run","Deadlock detector started successfully.");
+    } else {
+        info!(target: "rustfs::main::run","Deadlock detector disabled.");
+    }
+
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
