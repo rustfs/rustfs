@@ -82,8 +82,8 @@ use rustfs_s3select_api::{
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION,
-    SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, AMZ_WEBSITE_REDIRECT_LOCATION,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, SUFFIX_ACTUAL_SIZE,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
         AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -1506,13 +1506,39 @@ impl DefaultObjectUsecase {
                 response_content_length as usize,
             )))
         } else if encryption_applied {
-            // For encrypted objects (SSE-C or managed SSE), avoid bytes_stream length limiting
-            // because DecryptReader may need to consume the full encrypted stream.
-            info!(
-                "Encrypted object: Using unlimited stream for decryption with buffer size {}",
-                optimal_buffer_size
-            );
-            Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+            let should_buffer_encrypted_object = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && rs.is_none();
+
+            if should_buffer_encrypted_object {
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    error!("Failed to read decrypted object into memory: {}", e);
+                    return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
+                }
+
+                if buf.len() != response_content_length as usize {
+                    warn!(
+                        "Encrypted object size mismatch during read: expected={} actual={}",
+                        response_content_length,
+                        buf.len()
+                    );
+                }
+
+                let mem_reader = InMemoryAsyncReader::new(buf);
+                Some(StreamingBlob::wrap(bytes_stream(
+                    ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+                    response_content_length as usize,
+                )))
+            } else {
+                info!(
+                    "Encrypted object: Using unlimited stream for decryption with buffer size {}",
+                    optimal_buffer_size
+                );
+                Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
+            }
         } else {
             let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
 
