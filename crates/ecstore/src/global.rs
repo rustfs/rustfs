@@ -22,7 +22,6 @@ use crate::{
     tier::tier::TierConfigMgr,
 };
 use lazy_static::lazy_static;
-use rustfs_common::get_global_local_node_name;
 use rustfs_lock::client::LockClient;
 use std::{
     collections::HashMap,
@@ -156,12 +155,7 @@ pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
 }
 
 pub async fn is_first_cluster_node_local() -> bool {
-    let local_node_name = get_global_local_node_name().await;
-    get_global_endpoints()
-        .get_nodes()
-        .first()
-        .and_then(|node| node.url.host_str())
-        .is_some_and(|host| host == local_node_name)
+    get_global_endpoints().first_local()
 }
 
 pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
