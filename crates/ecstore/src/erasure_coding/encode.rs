@@ -112,11 +112,66 @@ impl<'a> MultiWriter<'a> {
         )))
     }
 
-    pub async fn _shutdown(&mut self) -> std::io::Result<()> {
-        for writer in self.writers.iter_mut().flatten() {
-            writer.shutdown().await?;
+    async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
+        match writer_opt {
+            Some(writer) => match writer.shutdown().await {
+                Ok(()) => {
+                    *err = None;
+                }
+                Err(e) => {
+                    *err = Some(Error::from(e));
+                    *writer_opt = None;
+                }
+            },
+            None => {
+                *err = Some(Error::DiskNotFound);
+            }
         }
-        Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        {
+            let mut futures = FuturesUnordered::new();
+            for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
+                if err.is_some() {
+                    continue;
+                }
+                futures.push(Self::shutdown_writer(writer_opt, err));
+            }
+            while let Some(()) = futures.next().await {}
+        }
+
+        let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
+        if nil_count >= self.write_quorum {
+            return Ok(());
+        }
+
+        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
+            error!(
+                "reduce_write_quorum_errs during shutdown: {:?}, offline-disks={}/{}, errs={:?}",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len(),
+                self.errs
+            );
+            return Err(std::io::Error::other(format!(
+                "Failed to shutdown writers: {} (offline-disks={}/{})",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len()
+            )));
+        }
+
+        Err(std::io::Error::other(format!(
+            "Failed to shutdown writers: (offline-disks={}/{}): {}",
+            count_errs(&self.errs, &Error::DiskNotFound),
+            self.writers.len(),
+            self.errs
+                .iter()
+                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 }
 
@@ -176,7 +231,69 @@ impl Erasure {
         }
 
         let (reader, total) = task.await??;
-        // writers.shutdown().await?;
+        writers.shutdown().await?;
         Ok((reader, total))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+    use rustfs_utils::HashAlgorithm;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Clone, Default)]
+    struct DeferredCommitWriter {
+        buffered: Vec<u8>,
+        committed: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl DeferredCommitWriter {
+        fn new(committed: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self {
+                buffered: Vec::new(),
+                committed,
+            }
+        }
+    }
+
+    impl AsyncWrite for DeferredCommitWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let buffered = std::mem::take(&mut self.buffered);
+            let mut committed = self.committed.lock().unwrap();
+            committed.extend_from_slice(&buffered);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_shutdowns_writers_after_small_shards() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed.clone());
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(b"small payload".to_vec()));
+        let (_reader, written) = erasure.encode(reader, &mut writers, 1).await.unwrap();
+
+        assert_eq!(written, b"small payload".len());
+        assert!(!committed.lock().unwrap().is_empty());
     }
 }

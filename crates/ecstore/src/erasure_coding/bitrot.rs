@@ -15,6 +15,7 @@
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
+use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
 use uuid::Uuid;
@@ -155,12 +156,10 @@ where
                 error!("bitrot writer write hash error: hash is empty");
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
             }
-            self.inner.write_all(hash.as_ref()).await?;
+            write_all_vectored(&mut self.inner, hash.as_ref(), buf).await?;
+        } else {
+            self.inner.write_all(buf).await?;
         }
-
-        self.inner.write_all(buf).await?;
-
-        self.inner.flush().await?;
 
         let n = buf.len();
 
@@ -168,8 +167,36 @@ where
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.flush().await?;
         self.inner.shutdown().await
     }
+}
+
+async fn write_all_vectored<W>(writer: &mut W, hash: &[u8], data: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut hash_offset = 0;
+    let mut data_offset = 0;
+
+    while hash_offset < hash.len() || data_offset < data.len() {
+        let slices = [IoSlice::new(&hash[hash_offset..]), IoSlice::new(&data[data_offset..])];
+        let written = writer.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write hash and data"));
+        }
+
+        let hash_remaining = hash.len() - hash_offset;
+        if written < hash_remaining {
+            hash_offset += written;
+            continue;
+        }
+
+        hash_offset = hash.len();
+        data_offset += written - hash_remaining;
+    }
+
+    Ok(())
 }
 
 pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorithm) -> usize {
@@ -292,6 +319,33 @@ impl AsyncWrite for CustomWriter {
             }
         }
     }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::InlineBuffer(data) => {
+                let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+                for buf in bufs {
+                    data.extend_from_slice(buf);
+                }
+                std::task::Poll::Ready(Ok(total))
+            }
+            Self::Other(writer) => {
+                let pinned_writer = std::pin::Pin::new(writer.as_mut());
+                pinned_writer.poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::InlineBuffer(_) => true,
+            Self::Other(writer) => writer.is_write_vectored(),
+        }
+    }
 }
 
 /// Wrapper around BitrotWriter that uses our custom writer
@@ -361,7 +415,74 @@ mod tests {
     use super::BitrotReader;
     use super::BitrotWriter;
     use rustfs_utils::HashAlgorithm;
-    use std::io::Cursor;
+    use std::io::{Cursor, IoSlice};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct VectoredCountingWriter {
+        vectored_writes: Arc<AtomicUsize>,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for VectoredCountingWriter {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("poll_write should not be used")))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes.fetch_add(1, Ordering::SeqCst);
+            let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+            for buf in bufs {
+                self.writes.extend_from_slice(buf);
+            }
+            Poll::Ready(Ok(total))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        flushes: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.writes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn test_bitrot_read_write_ok() {
@@ -470,5 +591,42 @@ mod tests {
         }
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_writer_flushes_once_on_shutdown() {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let writer = CountingWriter {
+            flushes: flushes.clone(),
+            shutdowns: shutdowns.clone(),
+            writes: Vec::new(),
+        };
+        let mut bitrot_writer = BitrotWriter::new(writer, 8, HashAlgorithm::None);
+
+        bitrot_writer.write(b"12345678").await.unwrap();
+        bitrot_writer.write(b"abc").await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+
+        bitrot_writer.shutdown().await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_writer_uses_vectored_write_for_hash_and_data() {
+        let vectored_writes = Arc::new(AtomicUsize::new(0));
+        let writer = VectoredCountingWriter {
+            vectored_writes: vectored_writes.clone(),
+            writes: Vec::new(),
+        };
+        let mut bitrot_writer = BitrotWriter::new(writer, 8, HashAlgorithm::HighwayHash256);
+
+        bitrot_writer.write(b"payload").await.unwrap();
+
+        assert!(vectored_writes.load(Ordering::SeqCst) > 0);
     }
 }

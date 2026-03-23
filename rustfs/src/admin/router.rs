@@ -14,9 +14,7 @@
 
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
-};
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -24,7 +22,6 @@ use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
-use rustfs_ecstore::rpc::verify_rpc_signature;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
@@ -33,7 +30,6 @@ use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
 use tower::Service;
-use tracing::error;
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -140,7 +136,7 @@ where
             return true;
         }
 
-        is_admin_path(path) || path.starts_with(RPC_PREFIX) || is_console_path(path)
+        is_admin_path(path) || is_console_path(path)
     }
 
     // check_access before call
@@ -165,18 +161,6 @@ where
 
         // Allow unauthenticated access to OIDC endpoints (user not yet authenticated)
         if is_oidc_path(path) {
-            return Ok(());
-        }
-
-        // Check RPC signature verification
-        if req.uri.path().starts_with(RPC_PREFIX) {
-            // Skip signature verification for HEAD requests (health checks)
-            if req.method != Method::HEAD {
-                verify_rpc_signature(&req.uri.to_string(), &req.method, &req.headers).map_err(|e| {
-                    error!("RPC signature verification failed: {}", e);
-                    s3_error!(AccessDenied, "{}", e)
-                })?;
-            }
             return Ok(());
         }
 
