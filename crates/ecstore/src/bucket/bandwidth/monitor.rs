@@ -65,7 +65,7 @@ impl BucketThrottle {
         let to_consume = n - consumed;
         let batch = to_consume.min(available);
         if batch > 0 {
-            let _ = guard.set_rate(available - batch);
+            guard.set_rate(available - batch);
             consumed += batch;
         }
         let deficit = n.saturating_sub(consumed);
