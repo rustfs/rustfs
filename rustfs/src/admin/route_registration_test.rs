@@ -175,3 +175,39 @@ fn test_phase5_admin_info_contract() {
         "admin server info path must be served through DefaultAdminUsecase::execute_query_server_info"
     );
 }
+
+fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = src
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("Expected marker `{}` in source", start_marker));
+    let after_start = &src[start..];
+    let end = after_start
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("Expected end marker `{}` in source", end_marker));
+    &after_start[..end]
+}
+
+#[test]
+fn test_replication_set_remote_target_compat_contract() {
+    let replication_src = include_str!("handlers/replication.rs");
+    let handler_block = extract_block_between_markers(
+        replication_src,
+        "impl Operation for SetRemoteTargetHandler",
+        "pub struct ListRemoteTargetHandler",
+    );
+
+    assert!(
+        handler_block.contains("read_compatible_admin_body("),
+        "set-remote-target must decode MinIO-compatible encrypted admin payloads"
+    );
+
+    assert!(
+        handler_block.contains("Body::from(arn_str)"),
+        "set-remote-target must keep ARN success responses as plain JSON string body"
+    );
+
+    assert!(
+        !handler_block.contains("encode_compatible_admin_payload("),
+        "set-remote-target should not re-encrypt ARN success responses"
+    );
+}
