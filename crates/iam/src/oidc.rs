@@ -25,6 +25,8 @@ use openidconnect::{
     PkceCodeVerifier, RedirectUrl, Scope,
 };
 use rustfs_config::oidc::*;
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -120,6 +122,26 @@ pub struct OidcProviderConfig {
     pub username_claim: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcProviderConfigSource {
+    Env,
+    Persisted,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcedOidcProviderConfig {
+    pub config: OidcProviderConfig,
+    pub source: OidcProviderConfigSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OidcProviderValidationResult {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: Option<String>,
+}
+
 /// Summary info about a provider, returned to the console.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcProviderSummary {
@@ -170,11 +192,12 @@ impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
         let http_client = ReqwestHttpClient(reqwest::Client::new());
-        let parsed_configs = Self::parse_env_configs();
+        let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
 
-        for config in parsed_configs {
+        for sourced_config in parsed_configs {
+            let config = sourced_config.config;
             if !config.enabled {
                 info!("OIDC provider '{}' is disabled, skipping", config.id);
                 continue;
@@ -620,6 +643,33 @@ impl OidcSys {
         configs
     }
 
+    fn parse_persisted_configs(cfg: &ServerConfig) -> Vec<OidcProviderConfig> {
+        let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+            return Vec::new();
+        };
+
+        let mut configs = Vec::new();
+        let mut provider_ids: Vec<String> = subsystem.keys().cloned().collect();
+        provider_ids.sort();
+
+        for raw_id in provider_ids {
+            let Some(kvs) = subsystem.get(&raw_id) else {
+                continue;
+            };
+
+            let id = if raw_id == DEFAULT_DELIMITER {
+                "default"
+            } else {
+                raw_id.as_str()
+            };
+            if let Some(config) = Self::parse_single_persisted_provider(kvs, id) {
+                configs.push(config);
+            }
+        }
+
+        configs
+    }
+
     /// Parse a single provider's config from env vars with the given suffix.
     fn parse_single_provider(env_suffix: &str, id: &str) -> Option<OidcProviderConfig> {
         let get_env = |base: &str| -> String { std::env::var(format!("{base}{env_suffix}")).unwrap_or_default() };
@@ -716,6 +766,68 @@ impl OidcSys {
         })
     }
 
+    fn parse_single_persisted_provider(kvs: &KVS, id: &str) -> Option<OidcProviderConfig> {
+        let config_url = kvs.get(OIDC_CONFIG_URL);
+        if config_url.is_empty() {
+            return None;
+        }
+
+        let enabled = kvs
+            .lookup(ENABLE_KEY)
+            .unwrap_or_else(|| EnableState::Off.to_string())
+            .parse::<EnableState>()
+            .map(|s| s.is_enabled())
+            .unwrap_or(false);
+
+        let scopes_str = kvs.get(OIDC_SCOPES);
+        let scopes = if scopes_str.is_empty() {
+            OIDC_DEFAULT_SCOPES.split(',').map(String::from).collect()
+        } else {
+            scopes_str.split(',').map(|s| s.trim().to_string()).collect()
+        };
+
+        let redirect_uri_dynamic = kvs
+            .lookup(OIDC_REDIRECT_URI_DYNAMIC)
+            .unwrap_or_else(|| EnableState::On.to_string())
+            .parse::<EnableState>()
+            .map(|s| s.is_enabled())
+            .unwrap_or(true);
+
+        let claim_name = kvs
+            .lookup(OIDC_CLAIM_NAME)
+            .unwrap_or_else(|| OIDC_DEFAULT_CLAIM_NAME.to_string());
+        let groups_claim = kvs
+            .lookup(OIDC_GROUPS_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_GROUPS_CLAIM.to_string());
+        let email_claim = kvs
+            .lookup(OIDC_EMAIL_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_EMAIL_CLAIM.to_string());
+        let username_claim = kvs
+            .lookup(OIDC_USERNAME_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_USERNAME_CLAIM.to_string());
+        let display_name = kvs.lookup(OIDC_DISPLAY_NAME).unwrap_or_else(|| id.to_string());
+        let redirect_uri = kvs.lookup(OIDC_REDIRECT_URI).filter(|v| !v.is_empty());
+        let client_secret = kvs.lookup(OIDC_CLIENT_SECRET).filter(|v| !v.is_empty());
+
+        Some(OidcProviderConfig {
+            id: id.to_string(),
+            enabled,
+            config_url,
+            client_id: kvs.get(OIDC_CLIENT_ID),
+            client_secret,
+            scopes,
+            redirect_uri,
+            redirect_uri_dynamic,
+            claim_name,
+            claim_prefix: kvs.get(OIDC_CLAIM_PREFIX),
+            role_policy: kvs.get(OIDC_ROLE_POLICY),
+            display_name,
+            groups_claim,
+            email_claim,
+            username_claim,
+        })
+    }
+
     /// Perform OIDC discovery for a provider.
     /// `discover_async` fetches the discovery document and JWKS in one step.
     async fn discover_provider(config: &OidcProviderConfig, http_client: &ReqwestHttpClient) -> Result<ProviderState, String> {
@@ -734,6 +846,64 @@ impl OidcSys {
             discovered_at: Instant::now(),
         })
     }
+}
+
+pub fn load_oidc_provider_configs_from_env() -> Vec<OidcProviderConfig> {
+    OidcSys::parse_env_configs()
+}
+
+pub fn load_oidc_provider_configs_from_server_config(cfg: &ServerConfig) -> Vec<OidcProviderConfig> {
+    OidcSys::parse_persisted_configs(cfg)
+}
+
+pub fn merge_oidc_provider_configs(
+    env_configs: Vec<OidcProviderConfig>,
+    persisted_configs: Vec<OidcProviderConfig>,
+) -> Vec<SourcedOidcProviderConfig> {
+    let mut effective = HashMap::new();
+
+    for config in persisted_configs {
+        effective.insert(
+            config.id.clone(),
+            SourcedOidcProviderConfig {
+                config,
+                source: OidcProviderConfigSource::Persisted,
+            },
+        );
+    }
+
+    for config in env_configs {
+        effective.insert(
+            config.id.clone(),
+            SourcedOidcProviderConfig {
+                config,
+                source: OidcProviderConfigSource::Env,
+            },
+        );
+    }
+
+    let mut configs: Vec<SourcedOidcProviderConfig> = effective.into_values().collect();
+    configs.sort_by(|lhs, rhs| lhs.config.id.cmp(&rhs.config.id));
+    configs
+}
+
+pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>) -> Vec<SourcedOidcProviderConfig> {
+    let env_configs = load_oidc_provider_configs_from_env();
+    let persisted_configs = server_config
+        .map(load_oidc_provider_configs_from_server_config)
+        .unwrap_or_default();
+    merge_oidc_provider_configs(env_configs, persisted_configs)
+}
+
+pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
+    let http_client = ReqwestHttpClient(reqwest::Client::new());
+    let state = OidcSys::discover_provider(config, &http_client).await?;
+
+    Ok(OidcProviderValidationResult {
+        issuer: state.metadata.issuer().to_string(),
+        authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+        token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
+    })
 }
 
 // --- Helper functions ---
@@ -1017,6 +1187,59 @@ mod tests {
     fn test_parse_single_provider_no_config_url() {
         let config = OidcSys::parse_single_provider("_TEST_EMPTY", "test_empty");
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_parse_persisted_provider_config() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::Off.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "default");
+        assert_eq!(parsed[0].client_id, "console");
+        assert!(parsed[0].enabled);
+    }
+
+    #[test]
+    fn test_merge_oidc_provider_configs_prefers_env() {
+        let mut persisted = test_config("default");
+        persisted.display_name = "Persisted".to_string();
+
+        let mut env = test_config("default");
+        env.display_name = "Environment".to_string();
+
+        let merged = merge_oidc_provider_configs(vec![env], vec![persisted]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].config.display_name, "Environment");
+        assert_eq!(merged[0].source, OidcProviderConfigSource::Env);
     }
 
     #[test]
