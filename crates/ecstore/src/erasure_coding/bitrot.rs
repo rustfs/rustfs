@@ -430,11 +430,7 @@ mod tests {
     }
 
     impl AsyncWrite for VectoredCountingWriter {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Err(std::io::Error::other("poll_write should not be used")))
         }
 
@@ -472,11 +468,7 @@ mod tests {
     }
 
     impl AsyncWrite for CountingWriter {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
             self.writes.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }

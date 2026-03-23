@@ -327,8 +327,8 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_stream::iter;
     use tokio_stream::StreamExt;
+    use tokio_stream::iter;
 
     #[test]
     fn internode_rpc_path_matches_rpc_prefix() {

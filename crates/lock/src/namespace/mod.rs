@@ -63,7 +63,9 @@ impl NamespaceLockWrapper {
         &self,
         timeout: Duration,
     ) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
-        self.lock.get_write_lock_quiet(self.resource.clone(), &self.owner, timeout).await
+        self.lock
+            .get_write_lock_quiet(self.resource.clone(), &self.owner, timeout)
+            .await
     }
 
     /// Acquire read lock (shared lock) with timeout
