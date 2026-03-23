@@ -116,6 +116,9 @@ faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client.workspace = true
 
+# Observability and Metrics
+metrics = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
