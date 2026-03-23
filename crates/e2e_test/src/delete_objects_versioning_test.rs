@@ -16,15 +16,13 @@
 //! "In a versioned Bucket, DeleteMarkers are not appearing straight after
 //! a delete_objects is called."
 //!
-//! Root cause: `delete_versions_internal` wrote new xl.meta to disk via
-//! `write_all_private` without invalidating the `GlobalFileCache`. Subsequent
-//! calls to `read_metadata` returned the stale cached xl.meta (without the
-//! delete marker), making `list_object_versions` show the old version as
-//! `IsLatest=true` rather than the new delete marker.
+//! Root cause: metadata updates could become temporarily invisible to
+//! `list_object_versions`, so the old version was still reported as
+//! `IsLatest=true` instead of the newly-created delete marker.
 //!
-//! Fix: `write_all_private` now calls `get_global_file_cache().invalidate()`
-//! after every successful write, and `rename_data` also invalidates the cache
-//! for the destination path after the atomic rename.
+//! Fix: metadata write, delete, and rename paths now make the updated
+//! `xl.meta` immediately visible, and the old file-cache shortcut has been
+//! removed from the read path.
 
 #[cfg(test)]
 mod tests {
