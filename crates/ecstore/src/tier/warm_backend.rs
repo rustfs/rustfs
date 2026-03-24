@@ -44,7 +44,10 @@ use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
+use s3s::header::{
+    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
+    X_AMZ_STORAGE_CLASS,
+};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
@@ -81,10 +84,9 @@ fn parse_http_timestamp(value: &str) -> Option<OffsetDateTime> {
         .ok()
 }
 
-pub fn build_transition_put_options(storage_class: String, metadata: HashMap<String, String>) -> PutObjectOptions {
+pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap<String, String>) -> PutObjectOptions {
     let mut opts = PutObjectOptions {
         storage_class,
-        user_metadata: metadata.clone(),
         legalhold: ObjectLockLegalHoldStatus::from_static(""),
         internal: AdvancedPutOptions {
             replication_status: ReplicationStatus::from_static(""),
@@ -132,6 +134,23 @@ pub fn build_transition_put_options(storage_class: String, metadata: HashMap<Str
         opts.legalhold = ObjectLockLegalHoldStatus::from(legalhold.to_ascii_uppercase());
     }
 
+    for key in [
+        CONTENT_TYPE,
+        CONTENT_ENCODING,
+        CONTENT_LANGUAGE,
+        CONTENT_DISPOSITION,
+        CACHE_CONTROL,
+        EXPIRES,
+        X_AMZ_OBJECT_LOCK_MODE.as_str(),
+        X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
+        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
+        X_AMZ_REPLICATION_STATUS.as_str(),
+        X_AMZ_STORAGE_CLASS.as_str(),
+    ] {
+        metadata.remove(key);
+    }
+
+    opts.user_metadata = metadata;
     opts
 }
 
@@ -314,5 +333,21 @@ mod tests {
         assert_eq!(opts.mode.as_str(), ObjectLockRetentionMode::GOVERNANCE);
         assert_eq!(opts.legalhold.as_str(), ObjectLockLegalHoldStatus::ON);
         assert_ne!(opts.retain_until_date, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn build_transition_put_options_filters_promoted_headers_from_user_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("name".to_string(), "object".to_string());
+        metadata.insert(CONTENT_TYPE.to_string(), "text/plain".to_string());
+        metadata.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
+        metadata.insert(X_AMZ_REPLICATION_STATUS.to_string(), "PENDING".to_string());
+
+        let opts = build_transition_put_options("COLD".to_string(), metadata);
+
+        assert_eq!(opts.user_metadata.get("name"), Some(&"object".to_string()));
+        assert!(!opts.user_metadata.contains_key(CONTENT_TYPE));
+        assert!(!opts.user_metadata.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()));
+        assert!(!opts.user_metadata.contains_key(X_AMZ_REPLICATION_STATUS.as_str()));
     }
 }

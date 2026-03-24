@@ -418,10 +418,10 @@ impl WarmBackend for MockWarmBackend {
         object: &str,
         r: ReaderImpl,
         _length: i64,
-        _meta: HashMap<String, String>,
+        meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
-        let opts = build_transition_put_options(String::new(), _meta);
+        let opts = build_transition_put_options(String::new(), meta);
         let mut metadata = opts.user_metadata.clone();
         if !opts.content_type.is_empty() {
             metadata.insert("content-type".to_string(), opts.content_type.clone());

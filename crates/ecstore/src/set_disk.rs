@@ -1806,11 +1806,32 @@ impl ObjectOperations for SetDisks {
         let dest_obj = dest_obj.unwrap();
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let mut transition_meta = oi.user_defined.clone();
+        transition_meta.insert("name".to_string(), object.to_string());
+
+        if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
+            transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
+        }
+
+        for header in [
+            CONTENT_ENCODING,
+            CONTENT_LANGUAGE,
+            CONTENT_DISPOSITION,
+            CACHE_CONTROL,
+            EXPIRES,
+            X_AMZ_OBJECT_LOCK_MODE.as_str(),
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
+            X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
+        ] {
+            if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
+                transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
+            }
+        }
 
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
             stream: Box::new(pr),
-            object_info: oi.clone(),
+            object_info: oi,
         });
 
         let cloned_bucket = bucket.to_string();
@@ -1838,28 +1859,6 @@ impl ObjectOperations for SetDisks {
                 error!("get_object_with_fileinfo err {:?}", e);
             };
         });
-
-        let mut transition_meta = oi.user_defined.clone();
-        transition_meta.insert("name".to_string(), object.to_string());
-
-        if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
-            transition_meta.insert(CONTENT_TYPE.to_ascii_lowercase(), content_type.clone());
-        }
-
-        for header in [
-            CONTENT_ENCODING,
-            CONTENT_LANGUAGE,
-            CONTENT_DISPOSITION,
-            CACHE_CONTROL,
-            EXPIRES,
-            X_AMZ_OBJECT_LOCK_MODE.as_str(),
-            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
-            X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
-        ] {
-            if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
-                transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
-            }
-        }
 
         let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta).await;
         if let Err(err) = rv {
