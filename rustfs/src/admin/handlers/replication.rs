@@ -21,7 +21,7 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
@@ -49,6 +49,22 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     }
 
     params
+}
+
+fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
+    match err {
+        BucketTargetError::BucketRemoteTargetNotFound { .. }
+        | BucketTargetError::BucketRemoteArnTypeInvalid { .. }
+        | BucketTargetError::BucketRemoteAlreadyExists { .. }
+        | BucketTargetError::BucketRemoteArnInvalid { .. }
+        | BucketTargetError::RemoteTargetConnectionErr { .. }
+        | BucketTargetError::BucketReplicationSourceNotVersioned { .. }
+        | BucketTargetError::BucketRemoteTargetNotVersioned { .. }
+        | BucketTargetError::BucketRemoteRemoveDisallowed { .. } => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, err.to_string())
+        }
+        BucketTargetError::Io(io_err) => S3Error::with_message(S3ErrorCode::InternalError, io_err.to_string()),
+    }
 }
 
 pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -256,7 +272,7 @@ impl Operation for SetRemoteTargetHandler {
         bucket_target_sys
             .set_target(bucket, &remote_target, update)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+            .map_err(map_bucket_target_error)?;
 
         let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
             error!("Failed to list bucket targets: {}", e);
@@ -368,10 +384,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let sys = BucketTargetSys::get();
 
-        sys.remove_target(bucket, arn_str).await.map_err(|e| {
-            error!("Failed to remove target: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to remove target".to_string())
-        })?;
+        sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
         let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
             error!("Failed to list bucket targets: {}", e);

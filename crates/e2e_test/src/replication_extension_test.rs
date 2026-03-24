@@ -164,6 +164,20 @@ async fn run_replication_check(
     signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
+async fn remove_replication_target(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    arn: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let url = format!(
+        "{}/rustfs/admin/v3/remove-remote-target?bucket={}&arn={}",
+        env.url,
+        urlencoding::encode(bucket),
+        urlencoding::encode(arn)
+    );
+    signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
 async fn build_replication_pair(
     enable_target_versioning: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String), Box<dyn Error + Send + Sync>> {
@@ -209,6 +223,130 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 
 #[tokio::test]
 #[serial]
+async fn test_replication_check_rejects_target_without_object_lock()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-check-lock-src";
+    let target_bucket = "replication-check-lock-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("object lock"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-check-unversioned-src";
+    let target_bucket = "replication-check-unversioned-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let err = set_replication_target(&source_env, source_bucket, &target_env, target_bucket)
+        .await
+        .expect_err("unversioned source bucket should be rejected during remote target setup");
+    let err = err.to_string();
+
+    assert!(err.contains("400 Bad Request"), "unexpected set remote target error: {err}");
+    assert!(err.contains("InvalidRequest"), "unexpected set remote target error: {err}");
+    assert!(err.to_ascii_lowercase().contains("not versioned"), "unexpected set remote target error: {err}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "replication-check-same-target";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&env, bucket).await?;
+
+    let body = serde_json::json!({
+        "endpoint": env.address,
+        "credentials": {
+            "accessKey": env.access_key,
+            "secretKey": env.secret_key
+        },
+        "targetbucket": bucket,
+        "secure": false,
+        "type": "replication"
+    });
+    let url = format!(
+        "{}/rustfs/admin/v3/set-remote-target?bucket={}",
+        env.url,
+        urlencoding::encode(bucket)
+    );
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("IncorrectEndpoint"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -232,6 +370,85 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
         .await
         .expect_err("unversioned target bucket should be rejected during remote target setup");
     assert!(err.to_string().contains("not versioned"), "unexpected set remote target error: {err}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let bucket = "replication-remove-missing-target";
+    let target_bucket = "replication-remove-missing-target-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&source_env, bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let arn = set_replication_target(&source_env, bucket, &target_env, target_bucket).await?;
+
+    let first_remove = remove_replication_target(&source_env, bucket, &arn).await?;
+    assert_eq!(first_remove.status(), StatusCode::NO_CONTENT);
+
+    let response = remove_replication_target(&source_env, bucket, &arn).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("not found"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_remove_remote_target_rejects_target_used_by_replication() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (source_env, _target_env, source_bucket) = build_replication_pair(true).await?;
+    let targets_url = format!(
+        "{}/rustfs/admin/v3/list-remote-targets?bucket={}",
+        source_env.url,
+        urlencoding::encode(&source_bucket)
+    );
+    let targets_response = signed_request(
+        http::Method::GET,
+        &targets_url,
+        &source_env.access_key,
+        &source_env.secret_key,
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(targets_response.status(), StatusCode::OK);
+    let targets: Vec<serde_json::Value> = targets_response.json().await?;
+    let arn = targets
+        .first()
+        .and_then(|target| target.get("arn"))
+        .and_then(|arn| arn.as_str())
+        .ok_or("replication target arn missing")?
+        .to_string();
+
+    let response = remove_replication_target(&source_env, &source_bucket, &arn).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("removal disallowed"), "unexpected response: {body}");
 
     Ok(())
 }
