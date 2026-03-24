@@ -160,6 +160,11 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),
