@@ -49,7 +49,6 @@ use crate::{
     StorageAPI,
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
-    global::{get_global_endpoints, is_first_cluster_node_local},
     store::ECStore,
     store_api::{ObjectIO as _, ObjectOptions, PutObjReader},
 };
@@ -1006,7 +1005,7 @@ impl TierConfigMgr {
     #[tracing::instrument(level = "debug", name = "tier_save", skip(self))]
     pub async fn save(&self) -> std::result::Result<(), std::io::Error> {
         let Some(api) = new_object_layer_fn() else {
-            return Err(std::io::Error::other("errServerNotInitialized"));
+            return Err(tier_config_not_initialized_error("save tiering config"));
         };
         //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;
 
@@ -1119,15 +1118,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 }
                 Err(legacy_err) if is_err_config_not_found(&legacy_err) => {
                     warn!("config not found, start to init");
-                    if is_first_cluster_node_local().await {
-                        new_and_save_tiering_config(api).await.map_err(io::Error::other)
-                    } else {
-                        Ok(TierConfigMgr {
-                            driver_cache: HashMap::new(),
-                            tiers: HashMap::new(),
-                            last_refreshed_at: OffsetDateTime::now_utc(),
-                        })
-                    }
+                    new_and_save_tiering_config(api).await.map_err(io::Error::other)
                 }
                 Err(legacy_err) => Err(io::Error::other(legacy_err)),
             }
@@ -1175,14 +1166,7 @@ async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, dat
 pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
     let target_path = tier_config_path(TIER_CONFIG_FILE);
     if api
-        .get_object_info(
-            RUSTFS_META_BUCKET,
-            &target_path,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
+        .get_object_info(RUSTFS_META_BUCKET, &target_path, &ObjectOptions::default())
         .await
         .is_ok()
     {
@@ -1229,6 +1213,10 @@ pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
 
 pub fn is_err_config_not_found(err: &StorageError) -> bool {
     matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::BucketNotFound(_)) || err == &StorageError::ConfigNotFound
+}
+
+fn tier_config_not_initialized_error(operation: &str) -> std::io::Error {
+    std::io::Error::other(format!("failed to {operation}: object layer not initialized"))
 }
 
 #[cfg(test)]
@@ -1334,5 +1322,14 @@ mod tests {
                 .map(|s3| s3.bucket.as_str()),
             Some("bucket-a")
         );
+    }
+
+    #[test]
+    fn test_tier_config_not_initialized_error_formats_operation_context() {
+        let err = tier_config_not_initialized_error("save tiering config");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to save tiering config"), "{rendered}");
+        assert!(rendered.contains("object layer not initialized"), "{rendered}");
     }
 }

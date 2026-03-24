@@ -850,7 +850,7 @@ impl Node for NodeService {
             warn!("start rebalance");
             let store = store.clone();
             spawn(async move {
-                store.start_rebalance().await;
+                let _ = store.start_rebalance().await;
             });
         }
 

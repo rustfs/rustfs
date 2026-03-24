@@ -79,7 +79,13 @@ impl Index {
         if n > MAX_INDEX_ENTRIES {
             panic!("n > MAX_INDEX_ENTRIES");
         }
-        self.info = Vec::with_capacity(n);
+        self.info = vec![
+            IndexInfo {
+                compressed_offset: 0,
+                uncompressed_offset: 0,
+            };
+            n
+        ];
     }
 
     pub fn add(&mut self, compressed_offset: i64, uncompressed_offset: i64) -> io::Result<()> {
@@ -217,9 +223,8 @@ impl Index {
         self.reduce();
         let init_size = b.len();
 
-        // Add skippable header
-        b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]); // ChunkTypeIndex
-        b.extend_from_slice(&[0, 0, 0]); // Placeholder for chunk length
+        // Add skippable header (1-byte marker + 24-bit length placeholder)
+        b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]); // length is written back into bytes 1..=3
 
         // Add header
         b.extend_from_slice(S2_INDEX_HEADER);
@@ -295,7 +300,7 @@ impl Index {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
         }
 
-        if b[0] != 0x50 || b[1] != 0x2A || b[2] != 0x4D || b[3] != 0x18 {
+        if b[0] != 0x50 {
             return Err(io::Error::other("invalid chunk type"));
         }
 
@@ -684,6 +689,48 @@ mod tests {
         assert!(json_str.contains("\"compressed\": 100"));
         assert!(json_str.contains("\"uncompressed\": 1000"));
         assert!(json_str.contains("\"est_block_uncompressed\": 0"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_into_vec_round_trip_via_load() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+
+        let encoded = source.clone().into_vec();
+
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_ref())?;
+
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+        assert_eq!(decoded.info[0].compressed_offset, source.info[0].compressed_offset);
+        assert_eq!(decoded.info[0].uncompressed_offset, source.info[0].uncompressed_offset);
+        assert_eq!(decoded.info[1].uncompressed_offset, source.info[1].uncompressed_offset);
+        assert!(decoded.info[1].compressed_offset > decoded.info[0].compressed_offset);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_load_rejects_invalid_chunk_type_marker() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+        let mut encoded = source.into_vec().to_vec();
+
+        encoded[0] = 0x51;
+
+        let mut decoded = Index::new();
+        let err = decoded
+            .load(encoded.as_slice())
+            .expect_err("invalid marker should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "invalid chunk type");
 
         Ok(())
     }
