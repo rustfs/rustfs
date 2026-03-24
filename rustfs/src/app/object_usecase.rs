@@ -137,6 +137,28 @@ impl Drop for DeadlockRequestGuard {
     }
 }
 
+#[cfg(test)]
+mod deadlock_request_guard_tests {
+    use super::DeadlockRequestGuard;
+    use crate::storage::deadlock_detector::DeadlockDetector;
+    use std::sync::Arc;
+
+    #[test]
+    fn deadlock_request_guard_unregisters_on_drop() {
+        let detector = Arc::new(DeadlockDetector::new(true));
+        let request_id = "test-request-id".to_string();
+
+        detector.register_request(&request_id);
+        assert_eq!(detector.tracked_count(), 1);
+
+        {
+            let _guard = DeadlockRequestGuard::new(Arc::clone(&detector), request_id.clone());
+            // `_guard` is dropped at the end of this scope, which should unregister the request.
+        }
+
+        assert_eq!(detector.tracked_count(), 0);
+    }
+}
 async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
     enqueue_transition_immediate(obj_info, src).await;
 }
