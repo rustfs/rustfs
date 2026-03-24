@@ -22,11 +22,11 @@ use s3s::Body;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::error::Error;
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
-use time::OffsetDateTime;
 
 #[derive(Debug)]
 struct CapturedWebhookRequest {
@@ -400,7 +400,6 @@ async fn read_listen_notification_event(
     }
 }
 
-
 #[tokio::test]
 #[serial]
 async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -732,7 +731,10 @@ async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), 
 
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert!(body.contains("NotImplemented"), "unexpected error body: {body}");
-    assert!(body.to_ascii_lowercase().contains("target type is not supported"), "unexpected error body: {body}");
+    assert!(
+        body.to_ascii_lowercase().contains("target type is not supported"),
+        "unexpected error body: {body}"
+    );
 
     Ok(())
 }
@@ -766,7 +768,10 @@ async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected error body: {body}");
-    assert!(body.to_ascii_lowercase().contains("target is not configured"), "unexpected error body: {body}");
+    assert!(
+        body.to_ascii_lowercase().contains("target is not configured"),
+        "unexpected error body: {body}"
+    );
 
     Ok(())
 }
@@ -852,15 +857,18 @@ async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Resul
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidArgument"), "unexpected error body: {body}");
-    assert!(body.to_ascii_lowercase().contains("invalid endpoint url"), "unexpected error body: {body}");
+    assert!(
+        body.to_ascii_lowercase().contains("invalid endpoint url"),
+        "unexpected error body: {body}"
+    );
 
     Ok(())
 }
 
 #[tokio::test]
 #[serial]
-async fn test_configure_object_lambda_notify_webhook_rejects_response_header_timeout_key(
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_configure_object_lambda_notify_webhook_rejects_response_header_timeout_key()
+-> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -882,7 +890,10 @@ async fn test_configure_object_lambda_notify_webhook_rejects_response_header_tim
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidArgument"), "unexpected error body: {body}");
-    assert!(body.to_ascii_lowercase().contains("response_header_timeout"), "unexpected error body: {body}");
+    assert!(
+        body.to_ascii_lowercase().contains("response_header_timeout"),
+        "unexpected error body: {body}"
+    );
     assert!(body.to_ascii_lowercase().contains("not allowed"), "unexpected error body: {body}");
 
     Ok(())

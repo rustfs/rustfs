@@ -284,8 +284,7 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 
 #[tokio::test]
 #[serial]
-async fn test_replication_check_rejects_target_without_object_lock()
--> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_replication_check_rejects_target_without_object_lock() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
@@ -354,7 +353,10 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
 
     assert!(err.contains("400 Bad Request"), "unexpected set remote target error: {err}");
     assert!(err.contains("InvalidRequest"), "unexpected set remote target error: {err}");
-    assert!(err.to_ascii_lowercase().contains("not versioned"), "unexpected set remote target error: {err}");
+    assert!(
+        err.to_ascii_lowercase().contains("not versioned"),
+        "unexpected set remote target error: {err}"
+    );
 
     Ok(())
 }
@@ -400,10 +402,7 @@ async fn test_replication_check_rejects_missing_replication_config() -> Result<(
     let body = response.text().await?;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(
-        body.contains("ReplicationConfigurationNotFoundError"),
-        "unexpected response: {body}"
-    );
+    assert!(body.contains("ReplicationConfigurationNotFoundError"), "unexpected response: {body}");
 
     Ok(())
 }
@@ -449,11 +448,7 @@ async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Resu
         "secure": false,
         "type": "replication"
     });
-    let url = format!(
-        "{}/rustfs/admin/v3/set-remote-target?bucket={}",
-        env.url,
-        urlencoding::encode(bucket)
-    );
+    let url = format!("{}/rustfs/admin/v3/set-remote-target?bucket={}", env.url, urlencoding::encode(bucket));
     let response = signed_request(
         http::Method::PUT,
         &url,

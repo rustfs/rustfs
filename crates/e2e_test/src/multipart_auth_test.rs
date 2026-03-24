@@ -90,12 +90,7 @@ fn build_pax_record(key: &str, value: &str) -> Vec<u8> {
     }
 }
 
-async fn make_tar_with_pax_entry(
-    path: &str,
-    data: &[u8],
-    mtime: Option<u64>,
-    pax: &HashMap<&str, String>,
-) -> Vec<u8> {
+async fn make_tar_with_pax_entry(path: &str, data: &[u8], mtime: Option<u64>, pax: &HashMap<&str, String>) -> Vec<u8> {
     let buf = Cursor::new(Vec::new());
     let mut builder = tokio_tar::Builder::new(buf);
 
@@ -1011,8 +1006,7 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_uses_bucket_default_sse_kms()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1059,7 +1053,9 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms()
         .text("policy", policy)
         .part(
             "file",
-            reqwest::multipart::Part::bytes(expected_body.clone()).file_name("upload.txt").mime_str("text/plain")?,
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
         );
 
     let post_resp = local_http_client()
@@ -1082,8 +1078,7 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1290,8 +1285,8 @@ async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_co
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_storage_class_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_storage_class_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1347,8 +1342,8 @@ async fn test_anonymous_post_object_rejects_storage_class_policy_mismatch()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_invalid_storage_class_value()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_invalid_storage_class_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1522,22 +1517,10 @@ async fn test_anonymous_post_object_rejects_checksum_auxiliary_fields_missing_fr
     let admin_client = env.create_s3_client();
 
     for (bucket, field_name, field_value) in [
-        (
-            "anon-post-checksum-crc32-missing",
-            "x-amz-checksum-crc32",
-            "AAAAAA==",
-        ),
-        (
-            "anon-post-checksum-crc32c-missing",
-            "x-amz-checksum-crc32c",
-            "AAAAAA==",
-        ),
+        ("anon-post-checksum-crc32-missing", "x-amz-checksum-crc32", "AAAAAA=="),
+        ("anon-post-checksum-crc32c-missing", "x-amz-checksum-crc32c", "AAAAAA=="),
         ("anon-post-checksum-sha1-missing", "x-amz-checksum-sha1", "ZmFrZXNoYTE="),
-        (
-            "anon-post-checksum-sha256-missing",
-            "x-amz-checksum-sha256",
-            "ZmFrZXNoYTI1Ng==",
-        ),
+        ("anon-post-checksum-sha256-missing", "x-amz-checksum-sha256", "ZmFrZXNoYTI1Ng=="),
         ("anon-post-checksum-mode-missing", "x-amz-checksum-mode", "ENABLED"),
     ] {
         let object_key = format!("uploads/{field_name}.txt");
@@ -1665,8 +1648,8 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1696,10 +1679,7 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch()
         .text("policy", policy)
         .text("x-amz-server-side-encryption-customer-algorithm", "AES256")
         .text("x-amz-server-side-encryption-customer-key", request_key_b64)
-        .text(
-            "x-amz-server-side-encryption-customer-key-md5",
-            sse_customer_key_md5_base64(request_key),
-        )
+        .text("x-amz-server-side-encryption-customer-key-md5", sse_customer_key_md5_base64(request_key))
         .part(
             "file",
             reqwest::multipart::Part::bytes(b"sse-c-policy-mismatch".to_vec())
@@ -1727,8 +1707,7 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_duplicate_key_form_values()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_duplicate_key_form_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -4553,8 +4532,7 @@ async fn test_anonymous_post_object_rejects_sigv4_credential_policy_mismatch()
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -4662,8 +4640,7 @@ async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Re
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_multiple_bucket_values()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_rejects_multiple_bucket_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5017,8 +4994,7 @@ async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5064,8 +5040,7 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect()
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_preserves_storage_class()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5108,8 +5083,7 @@ async fn test_signed_put_object_extract_preserves_storage_class()
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_rejects_invalid_storage_class()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5145,8 +5119,7 @@ async fn test_signed_put_object_extract_rejects_invalid_storage_class()
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_uses_bucket_default_sse_s3()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5209,8 +5182,7 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3()
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5331,8 +5303,8 @@ async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn 
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_preserves_object_lock_legal_hold()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_preserves_object_lock_legal_hold() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5386,8 +5358,8 @@ async fn test_signed_put_object_extract_preserves_object_lock_legal_hold()
 
 #[tokio::test]
 #[serial]
-async fn test_signed_put_object_extract_preserves_object_lock_retention()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5509,10 +5481,7 @@ async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Bo
         .await?;
 
     let head = client.head_object().bucket(bucket).key(extracted_key).send().await?;
-    assert_eq!(
-        head.last_modified().expect("last_modified should exist").secs(),
-        modified_at_secs as i64
-    );
+    assert_eq!(head.last_modified().expect("last_modified should exist").secs(), modified_at_secs as i64);
 
     Ok(())
 }
