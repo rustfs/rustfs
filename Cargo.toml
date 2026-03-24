@@ -245,7 +245,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "d9556e3c0036bd3f2b330966009cbaa5aebf19a3", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "b296762bc9e7fa608f1bc44f5cd625d606e0dd31", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"
@@ -323,6 +323,3 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
-
-[patch."https://github.com/rustfs/s3s"]
-s3s = { path = "third_party/s3s" }
