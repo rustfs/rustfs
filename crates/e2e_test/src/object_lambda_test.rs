@@ -235,26 +235,33 @@ async fn configure_webhook_target(
     endpoint: &str,
     auth_token: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    configure_webhook_target_with_key_values(
+        env,
+        target_name,
+        vec![
+            ("endpoint", endpoint.to_string()),
+            ("auth_token", auth_token.to_string()),
+            ("queue_dir", format!("{}/notify-queue", env.temp_dir)),
+        ],
+    )
+    .await
+}
+
+async fn configure_webhook_target_with_key_values(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+    key_values: Vec<(&str, String)>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let queue_dir = format!("{}/notify-queue", env.temp_dir);
     tokio::fs::create_dir_all(&queue_dir).await?;
-    let payload = serde_json::json!({
-        "key_values": [
-            { "key": "endpoint", "value": endpoint },
-            { "key": "auth_token", "value": auth_token },
-            { "key": "queue_dir", "value": queue_dir }
-        ]
-    });
-    let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{}", env.url, target_name);
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
-        &env.access_key,
-        &env.secret_key,
-        Some(payload.to_string().into_bytes()),
-        Some("application/json"),
-    )
-    .await?;
-
+    let mut key_values = key_values
+        .into_iter()
+        .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+        .collect::<Vec<_>>();
+    if !key_values.iter().any(|entry| entry["key"].as_str() == Some("queue_dir")) {
+        key_values.push(serde_json::json!({ "key": "queue_dir", "value": queue_dir }));
+    }
+    let response = send_configure_webhook_target_request(env, target_name, key_values).await?;
     if response.status() != StatusCode::OK {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -262,6 +269,24 @@ async fn configure_webhook_target(
     }
 
     Ok(())
+}
+
+async fn send_configure_webhook_target_request(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+    key_values: Vec<serde_json::Value>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let payload = serde_json::json!({ "key_values": key_values });
+    let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{}", env.url, target_name);
+    signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(payload.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await
 }
 
 async fn list_notification_targets(env: &RustFSTestEnvironment) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
@@ -674,6 +699,191 @@ async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_he
     assert!(body.contains("authorization headers"), "unexpected error body: {body}");
 
     webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-unsupported-target";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:mqtt";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("NotImplemented"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("target type is not supported"), "unexpected error body: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-missing-target";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("target is not configured"), "unexpected error body: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-disabled-target";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    configure_webhook_target_with_key_values(
+        &env,
+        "transformer",
+        vec![
+            ("endpoint", "http://127.0.0.1:9/transform".to_string()),
+            ("auth_token", "secret-token".to_string()),
+            ("enable", "off".to_string()),
+        ],
+    )
+    .await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("target is disabled"), "unexpected error body: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-invalid-endpoint";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("input.txt")
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    let response = send_configure_webhook_target_request(
+        &env,
+        "transformer",
+        vec![
+            serde_json::json!({ "key": "endpoint", "value": "://invalid-endpoint" }),
+            serde_json::json!({ "key": "auth_token", "value": "secret-token" }),
+            serde_json::json!({ "key": "queue_dir", "value": format!("{}/notify-queue", env.temp_dir) }),
+        ],
+    )
+    .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidArgument"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("invalid endpoint url"), "unexpected error body: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_configure_object_lambda_notify_webhook_rejects_response_header_timeout_key(
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let response = send_configure_webhook_target_request(
+        &env,
+        "transformer",
+        vec![
+            serde_json::json!({ "key": "endpoint", "value": "http://127.0.0.1:9/transform" }),
+            serde_json::json!({ "key": "auth_token", "value": "secret-token" }),
+            serde_json::json!({ "key": "response_header_timeout", "value": "not-a-duration" }),
+            serde_json::json!({ "key": "queue_dir", "value": format!("{}/notify-queue", env.temp_dir) }),
+        ],
+    )
+    .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidArgument"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("response_header_timeout"), "unexpected error body: {body}");
+    assert!(body.to_ascii_lowercase().contains("not allowed"), "unexpected error body: {body}");
 
     Ok(())
 }
