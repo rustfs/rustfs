@@ -374,8 +374,6 @@ impl DefaultMultipartUsecase {
         let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
         let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_mpu_version.clone()
-        } else if BucketVersioningSys::prefix_suspended(&bucket, &key).await {
-            Some("null".to_string())
         } else {
             None
         };

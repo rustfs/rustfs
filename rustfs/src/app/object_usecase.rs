@@ -843,8 +843,6 @@ impl DefaultObjectUsecase {
 
         let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_version
-        } else if BucketVersioningSys::prefix_suspended(&bucket, &key).await {
-            Some("null".to_string())
         } else {
             None
         };
@@ -2664,8 +2662,13 @@ impl DefaultObjectUsecase {
             rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
         }
 
-        let dest_version = oi.version_id.map(|v| v.to_string());
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), dest_version.clone());
+        let raw_dest_version = oi.version_id.map(|v| v.to_string());
+        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_dest_version.clone());
+        let dest_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_dest_version
+        } else {
+            None
+        };
 
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
