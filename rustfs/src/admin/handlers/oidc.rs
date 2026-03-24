@@ -16,7 +16,7 @@ use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -27,8 +27,8 @@ use rustfs_config::oidc::{
     OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::Config as ServerConfig;
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
+use rustfs_ecstore::config::{Config as ServerConfig, get_global_server_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -38,9 +38,9 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use url::Url;
 
-const OIDC_PUBLIC_PROVIDERS_PATH: &str = "/rustfs/admin/v3/oidc/providers";
-const OIDC_AUTHORIZE_PREFIX: &str = "/rustfs/admin/v3/oidc/authorize/";
-const OIDC_CALLBACK_PREFIX: &str = "/rustfs/admin/v3/oidc/callback/";
+const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
+const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
+const OIDC_CALLBACK_SUFFIX: &str = "/v3/oidc/callback/";
 
 /// Validate that a provider ID contains only safe characters (alphanumeric, underscore, hyphen).
 fn is_valid_provider_id(id: &str) -> bool {
@@ -100,7 +100,13 @@ pub fn register_oidc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
 
 /// Returns true if the given path is an OIDC endpoint (requires unauthenticated access).
 pub fn is_oidc_path(path: &str) -> bool {
-    path == OIDC_PUBLIC_PROVIDERS_PATH || path.starts_with(OIDC_AUTHORIZE_PREFIX) || path.starts_with(OIDC_CALLBACK_PREFIX)
+    let public_prefixes = [ADMIN_PREFIX, MINIO_ADMIN_PREFIX];
+
+    public_prefixes.iter().any(|prefix| {
+        path == format!("{prefix}{OIDC_PUBLIC_PROVIDERS_SUFFIX}")
+            || path.starts_with(&format!("{prefix}{OIDC_AUTHORIZE_SUFFIX}"))
+            || path.starts_with(&format!("{prefix}{OIDC_CALLBACK_SUFFIX}"))
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +262,7 @@ impl Operation for GetOidcConfigHandler {
         authorize_oidc_config_request(&req, AdminAction::ServerInfoAdminAction).await?;
 
         let config = load_server_config_from_store().await?;
+        let restart_required = oidc_restart_required(&config);
         let providers = rustfs_iam::oidc::load_effective_oidc_provider_configs(Some(&config))
             .into_iter()
             .map(|provider| OidcConfigView {
@@ -283,7 +290,7 @@ impl Operation for GetOidcConfigHandler {
             StatusCode::OK,
             &OidcConfigListResponse {
                 providers,
-                restart_required: false,
+                restart_required,
             },
         )
     }
@@ -677,6 +684,16 @@ fn provider_instance_key(provider_id: &str) -> String {
     }
 }
 
+fn oidc_restart_required(config: &ServerConfig) -> bool {
+    let active_config = get_global_server_config();
+    oidc_restart_required_from_active_config(config, active_config.as_ref())
+}
+
+fn oidc_restart_required_from_active_config(config: &ServerConfig, active_config: Option<&ServerConfig>) -> bool {
+    rustfs_iam::oidc::load_effective_oidc_provider_configs(Some(config))
+        != rustfs_iam::oidc::load_effective_oidc_provider_configs(active_config)
+}
+
 fn default_oidc_kvs() -> s3s::S3Result<rustfs_ecstore::config::KVS> {
     ServerConfig::new()
         .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
@@ -975,9 +992,13 @@ mod tests {
         assert!(is_oidc_path("/rustfs/admin/v3/oidc/providers"));
         assert!(is_oidc_path("/rustfs/admin/v3/oidc/authorize/okta"));
         assert!(is_oidc_path("/rustfs/admin/v3/oidc/callback/okta"));
+        assert!(is_oidc_path("/minio/admin/v3/oidc/providers"));
+        assert!(is_oidc_path("/minio/admin/v3/oidc/authorize/okta"));
+        assert!(is_oidc_path("/minio/admin/v3/oidc/callback/okta"));
         assert!(!is_oidc_path("/rustfs/admin/v3/oidc/config"));
         assert!(!is_oidc_path("/rustfs/admin/v3/oidc/config/default"));
         assert!(!is_oidc_path("/rustfs/admin/v3/oidc/validate"));
+        assert!(!is_oidc_path("/minio/admin/v3/oidc/config"));
         assert!(!is_oidc_path("/rustfs/admin/v3/users"));
         assert!(!is_oidc_path("/health"));
     }
@@ -1105,5 +1126,33 @@ mod tests {
             build_provider_config_from_upsert("default", req, Some("existing-secret".to_string())).expect("config should build");
 
         assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
+    }
+
+    #[test]
+    fn test_oidc_restart_required_detects_persisted_changes() {
+        let active_config = ServerConfig::new();
+        let mut persisted_config = ServerConfig::new();
+        let provider_config = rustfs_iam::oidc::OidcProviderConfig {
+            id: "default".to_string(),
+            enabled: true,
+            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            client_id: "console".to_string(),
+            client_secret: Some("secret".to_string()),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            redirect_uri: None,
+            redirect_uri_dynamic: true,
+            claim_name: OIDC_DEFAULT_CLAIM_NAME.to_string(),
+            claim_prefix: String::new(),
+            role_policy: String::new(),
+            display_name: "default".to_string(),
+            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
+            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+        };
+
+        upsert_persisted_provider_config(&mut persisted_config, &provider_config);
+
+        assert!(oidc_restart_required_from_active_config(&persisted_config, Some(&active_config)));
+        assert!(!oidc_restart_required_from_active_config(&persisted_config, Some(&persisted_config)));
     }
 }

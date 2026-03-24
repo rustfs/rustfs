@@ -103,7 +103,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 // ---- Public types (unchanged API) ----
 
 /// Parsed configuration for a single OIDC provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
@@ -129,7 +129,7 @@ pub enum OidcProviderConfigSource {
     Persisted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcedOidcProviderConfig {
     pub config: OidcProviderConfig,
     pub source: OidcProviderConfigSource,
