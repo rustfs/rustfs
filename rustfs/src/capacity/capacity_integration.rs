@@ -14,7 +14,7 @@
 
 //! Capacity management integration for application startup
 
-use crate::capacity::capacity_manager::{get_capacity_manager, start_background_task, DataSource};
+use crate::capacity::capacity_manager::{DataSource, get_capacity_manager, start_background_task};
 use crate::capacity::capacity_metrics::{get_capacity_metrics, start_metrics_logging};
 use rustfs_ecstore::disk::DiskAPI;
 use std::time::Duration;
@@ -85,7 +85,7 @@ pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capacity::capacity_manager::{get_capacity_manager, DataSource};
+    use crate::capacity::capacity_manager::{DataSource, get_capacity_manager};
 
     #[tokio::test]
     async fn test_get_capacity_with_metrics() {

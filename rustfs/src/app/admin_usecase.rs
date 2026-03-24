@@ -15,7 +15,9 @@
 //! Admin application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
-use crate::capacity::capacity_manager::{DataSource, get_capacity_manager, get_max_files_threshold, get_sample_rate, get_stat_timeout};
+use crate::capacity::capacity_manager::{
+    DataSource, get_capacity_manager, get_max_files_threshold, get_sample_rate, get_stat_timeout,
+};
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;

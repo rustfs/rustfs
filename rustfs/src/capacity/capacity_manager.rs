@@ -275,6 +275,7 @@ impl HybridCapacityManager {
     }
 
     /// Get write frequency (writes/minute)
+    #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = self.write_record.read().await;
         record.write_window.len()

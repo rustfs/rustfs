@@ -18,7 +18,7 @@
 mod tests {
     use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager};
     use crate::capacity::capacity_metrics::{
-        get_capacity_metrics, record_global_cache_hit, record_global_cache_miss, record_global_write_operation, CapacityMetrics,
+        CapacityMetrics, get_capacity_metrics, record_global_cache_hit, record_global_cache_miss, record_global_write_operation,
     };
     use serial_test::serial;
     use std::time::Duration;
