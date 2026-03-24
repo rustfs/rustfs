@@ -97,6 +97,31 @@ async fn set_replication_target(
     Ok(arn)
 }
 
+async fn send_set_replication_target_request(
+    source_env: &RustFSTestEnvironment,
+    source_bucket: &str,
+    update: bool,
+    body: serde_json::Value,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let mut url = format!(
+        "{}/rustfs/admin/v3/set-remote-target?bucket={}",
+        source_env.url,
+        urlencoding::encode(source_bucket)
+    );
+    if update {
+        url.push_str("&update=true");
+    }
+    signed_request(
+        http::Method::PUT,
+        &url,
+        &source_env.access_key,
+        &source_env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await
+}
+
 async fn put_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -370,6 +395,107 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
         .await
         .expect_err("unversioned target bucket should be rejected during remote target setup");
     assert!(err.to_string().contains("not versioned"), "unexpected set remote target error: {err}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-update-needs-arn-src";
+    let target_bucket = "replication-update-needs-arn-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let response = send_set_replication_target_request(
+        &source_env,
+        source_bucket,
+        true,
+        serde_json::json!({
+            "endpoint": target_env.address,
+            "credentials": {
+                "accessKey": target_env.access_key,
+                "secretKey": target_env.secret_key
+            },
+            "targetbucket": target_bucket,
+            "secure": false,
+            "type": "replication"
+        }),
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("arn is empty"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-update-missing-target-src";
+    let target_bucket = "replication-update-missing-target-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let response = send_set_replication_target_request(
+        &source_env,
+        source_bucket,
+        true,
+        serde_json::json!({
+            "endpoint": target_env.address,
+            "credentials": {
+                "accessKey": target_env.access_key,
+                "secretKey": target_env.secret_key
+            },
+            "targetbucket": target_bucket,
+            "secure": false,
+            "type": "replication",
+            "arn": "arn:aws:s3:us-east-1:123456789012:replication::missing-target"
+        }),
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("target not found"), "unexpected response: {body}");
 
     Ok(())
 }

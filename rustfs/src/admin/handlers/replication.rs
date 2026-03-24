@@ -242,7 +242,7 @@ impl Operation for SetRemoteTargetHandler {
         }
 
         if remote_target.arn.is_empty() {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "ARN is empty".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
         }
 
         if update {
@@ -250,7 +250,7 @@ impl Operation for SetRemoteTargetHandler {
                 .get_remote_bucket_target_by_arn(bucket, &remote_target.arn)
                 .await
             else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Target not found".to_string()));
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Target not found".to_string()));
             };
 
             target.credentials = remote_target.credentials;
