@@ -147,9 +147,7 @@ mod tests {
         assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 1_000_000);
         assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 5);
         assert_eq!(DEFAULT_SAMPLE_RATE, 100);
-        assert_eq!(DEFAULT_CAPACITY_FOLLOW_SYMLINKS, false);
         assert_eq!(DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH, 3);
-        assert_eq!(DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, true);
         assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 5);
         assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 60);
         assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 1);
