@@ -158,18 +158,9 @@ impl PostPolicy {
         // which are allowed outside policy conditions for browser POST uploads.
         matches!(
             name,
-            "x-amz-signature"
-                | "signature"
-                | "awsaccesskeyid"
-                | "file"
-                | "submit"
-                | "policy"
-                | "x-amz-server-side-encryption-aws-kms-key-id"
-                | "x-amz-server-side-encryption-context"
-                | "x-amz-server-side-encryption-customer-algorithm"
-                | "x-amz-server-side-encryption-customer-key"
-                | "x-amz-server-side-encryption-customer-key-md5"
-        ) || name.starts_with("x-ignore-")
+            "x-amz-signature" | "signature" | "awsaccesskeyid" | "file" | "submit" | "policy"
+        ) || name.starts_with("x-amz-server-side-encryption-")
+            || name.starts_with("x-ignore-")
     }
 
     /// Returns true if the policy contains at least one `Eq` or `StartsWith` condition for the field.
@@ -964,7 +955,9 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-key", "ZmFrZS1rZXk="),
                 ("x-amz-server-side-encryption-customer-key-md5", "ZmFrZS1tZDU="),
                 ("x-amz-server-side-encryption-aws-kms-key-id", "test-key"),
+                ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
                 ("x-amz-server-side-encryption-context", "e30="),
+                ("x-amz-server-side-encryption-custom-flag", "custom"),
             ],
             None,
         );
