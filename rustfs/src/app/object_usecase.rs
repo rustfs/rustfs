@@ -117,6 +117,26 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+struct DeadlockRequestGuard {
+    deadlock_detector: Arc<crate::storage::deadlock_detector::DeadlockDetector>,
+    request_id: String,
+}
+
+impl DeadlockRequestGuard {
+    fn new(deadlock_detector: Arc<crate::storage::deadlock_detector::DeadlockDetector>, request_id: String) -> Self {
+        Self {
+            deadlock_detector,
+            request_id,
+        }
+    }
+}
+
+impl Drop for DeadlockRequestGuard {
+    fn drop(&mut self) {
+        self.deadlock_detector.unregister_request(&self.request_id);
+    }
+}
+
 async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
     enqueue_transition_immediate(obj_info, src).await;
 }
@@ -955,6 +975,7 @@ impl DefaultObjectUsecase {
         let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
         let request_id = wrapper.request_id().to_string();
         deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
+        let _deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector.clone(), request_id.clone());
 
         // Check for request timeout before proceeding
         if wrapper.is_timeout() {
@@ -965,7 +986,6 @@ impl DefaultObjectUsecase {
                 elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out before processing"
             );
-            deadlock_detector.unregister_request(&request_id);
             return Err(s3_error!(InternalError, "Request timeout before processing"));
         }
 
@@ -1157,7 +1177,6 @@ impl DefaultObjectUsecase {
                 elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out while waiting for disk permit"
             );
-            deadlock_detector.unregister_request(&request_id);
             #[cfg(feature = "metrics")]
             metrics::counter!("rustfs.get.object.timeout.total", "stage" => "disk_permit").increment(1);
             return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
@@ -1263,7 +1282,6 @@ impl DefaultObjectUsecase {
                 elapsed_ms = wrapper.elapsed().as_millis(),
                 "GetObject request timed out before reading object"
             );
-            deadlock_detector.unregister_request(&request_id);
             #[cfg(feature = "metrics")]
             metrics::counter!("rustfs.get.object.timeout.total", "stage" => "before_read").increment(1);
             return Err(s3_error!(InternalError, "Request timeout before reading object"));
@@ -1623,9 +1641,6 @@ impl DefaultObjectUsecase {
             "GetObject completed: key={} size={} duration={:?} buffer={}",
             cache_key, response_content_length, total_duration, optimal_buffer_size
         );
-
-        // Unregister from deadlock detector
-        deadlock_detector.unregister_request(&request_id);
 
         let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
         let result = Ok(response);
