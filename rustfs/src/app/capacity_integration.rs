@@ -14,16 +14,16 @@
 
 //! Capacity management integration for application startup
 
+use crate::app::capacity_manager::{get_capacity_manager, start_background_task};
+use crate::app::capacity_metrics::{get_capacity_metrics, start_metrics_logging};
 use std::time::Duration;
-use tracing::{info, error, warn};
-use crate::app::capacity_manager::{start_background_task, get_capacity_manager};
-use crate::app::capacity_metrics::{start_metrics_logging, get_capacity_metrics};
+use tracing::{error, info, warn};
 
 /// Initialize capacity management system
 /// This should be called during application startup after local disks are initialized
 pub async fn init_capacity_management() {
     info!("Initializing capacity management system...");
-    
+
     // Get all local disks
     let disks = match rustfs_ecstore::store::all_local_disk().await {
         Ok(d) => d,
@@ -32,16 +32,17 @@ pub async fn init_capacity_management() {
             return;
         }
     };
-    
+
     if disks.is_empty() {
         warn!("No local disks found, capacity management will not run");
         return;
     }
-    
+
     info!("Found {} local disk(s)", disks.len());
-    
+
     // Convert DiskStore to Disk (for compatibility with capacity_manager)
-    let disk_refs: Vec<rustfs_madmin::Disk> = disks.iter()
+    let disk_refs: Vec<rustfs_madmin::Disk> = disks
+        .iter()
         .map(|ds| rustfs_madmin::Disk {
             id: ds.id.clone(),
             endpoint: ds.endpoint.clone(),
@@ -52,18 +53,19 @@ pub async fn init_capacity_management() {
             is_local: ds.is_local,
             total_capacity: ds.total_capacity,
             free_capacity: ds.free_capacity,
+            ..Default::default()
         })
         .collect();
-    
+
     // Start background update task
     info!("Starting background capacity update task...");
     start_background_task(disk_refs).await;
-    
+
     // Start metrics logging (log every 10 minutes)
     let metrics_interval = Duration::from_secs(600);
     info!("Starting metrics logging task (interval: {:?})...", metrics_interval);
     start_metrics_logging(metrics_interval).await;
-    
+
     info!("Capacity management system initialized successfully");
 }
 
@@ -71,21 +73,21 @@ pub async fn init_capacity_management() {
 pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
     let manager = get_capacity_manager();
     let metrics = get_capacity_metrics();
-    
+
     // Check cache
     if let Some(cached) = manager.get_capacity().await {
         metrics.record_cache_hit();
-        
+
         let source = match cached.source {
             crate::app::capacity_manager::DataSource::RealTime => "real-time",
             crate::app::capacity_manager::DataSource::Scheduled => "scheduled",
             crate::app::capacity_manager::DataSource::WriteTriggered => "write-triggered",
             crate::app::capacity_manager::DataSource::Fallback => "fallback",
         };
-        
+
         return Some((cached.total_used, source.to_string()));
     }
-    
+
     metrics.record_cache_miss();
     None
 }
@@ -97,11 +99,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_capacity_with_metrics() {
         let manager = get_capacity_manager();
-        manager.update_capacity(1000, crate::app::capacity_manager::DataSource::RealTime).await;
-        
+        manager
+            .update_capacity(1000, crate::app::capacity_manager::DataSource::RealTime)
+            .await;
+
         let result = get_capacity_with_metrics().await;
         assert!(result.is_some());
-        
+
         let (capacity, source) = result.unwrap();
         assert_eq!(capacity, 1000);
         assert_eq!(source, "real-time");

@@ -14,6 +14,7 @@
 
 //! Object application use-case contracts.
 
+use crate::app::capacity_manager::get_capacity_manager;
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
@@ -580,6 +581,11 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        // Record write operation for capacity management
+        tokio::spawn(async move {
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+        });
         result
     }
 
@@ -2653,6 +2659,11 @@ impl DefaultObjectUsecase {
         let _ = helper.complete(&result);
         result
     }
+        // Record write operation for capacity management (batch delete)
+        tokio::spawn(async move {
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+        });
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
@@ -2828,6 +2839,11 @@ impl DefaultObjectUsecase {
             .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
+        // Record write operation for capacity management
+        tokio::spawn(async move {
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+        });
         let _ = helper.complete(&result);
         result
     }

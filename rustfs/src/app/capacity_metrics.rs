@@ -17,6 +17,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use metrics::{counter, gauge, histogram};
 use tracing::{info, warn};
 
 /// Capacity metrics for monitoring
@@ -47,26 +48,36 @@ impl CapacityMetrics {
     /// Record cache hit
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.cache.hits").increment(1);
     }
 
     /// Record cache miss
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.cache.misses").increment(1);
     }
 
     /// Record scheduled update
     pub fn record_scheduled_update(&self) {
         self.scheduled_updates.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.update.scheduled").increment(1);
     }
 
     /// Record write triggered update
     pub fn record_write_triggered_update(&self) {
         self.write_triggered_updates.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.update.write_triggered").increment(1);
     }
 
     /// Record update failure
     pub fn record_update_failure(&self) {
         self.update_failures.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.update.failures").increment(1);
+    }
+
+    /// Record write operation
+    pub fn record_write_operation(&self) {
+        counter!("rustfs.capacity.write.operations").increment(1);
     }
 
     /// Record update duration
@@ -74,6 +85,8 @@ impl CapacityMetrics {
         let duration_us = duration.as_micros() as u64;
         self.total_update_duration_us.fetch_add(duration_us, Ordering::Relaxed);
         self.update_count.fetch_add(1, Ordering::Relaxed);
+        
+        histogram!("rustfs.capacity.update.duration_us", duration_us as f64);
     }
 
     /// Get cache hit rate
@@ -115,6 +128,15 @@ impl CapacityMetrics {
     /// Log metrics summary
     pub fn log_summary(&self) {
         let summary = self.get_summary();
+        
+        // Update gauges for current values
+        gauge!("rustfs.capacity.cache.hit_rate", summary.cache_hit_rate);
+        gauge!("rustfs.capacity.cache.hits_total", summary.cache_hits as f64);
+        gauge!("rustfs.capacity.cache.misses_total", summary.cache_misses as f64);
+        gauge!("rustfs.capacity.update.scheduled_total", summary.scheduled_updates as f64);
+        gauge!("rustfs.capacity.update.write_triggered_total", summary.write_triggered_updates as f64);
+        gauge!("rustfs.capacity.update.failures_total", summary.update_failures as f64);
+        
         info!(
             "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}",
             summary.cache_hit_rate * 100.0,
@@ -162,6 +184,24 @@ pub async fn start_metrics_logging(interval: Duration) {
             metrics.log_summary();
         }
     });
+}
+
+/// Record a write operation globally
+pub fn record_global_write_operation() {
+    let metrics = get_capacity_metrics();
+    metrics.record_write_operation();
+}
+
+/// Record cache hit globally
+pub fn record_global_cache_hit() {
+    let metrics = get_capacity_metrics();
+    metrics.record_cache_hit();
+}
+
+/// Record cache miss globally
+pub fn record_global_cache_miss() {
+    let metrics = get_capacity_metrics();
+    metrics.record_cache_miss();
 }
 
 #[cfg(test)]
@@ -215,5 +255,14 @@ mod tests {
         assert_eq!(summary.cache_hits, 1);
         assert_eq!(summary.scheduled_updates, 1);
         assert_eq!(summary.avg_update_duration, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_record_write_operation() {
+        let metrics = CapacityMetrics::new();
+        metrics.record_write_operation();
+        metrics.record_write_operation();
+        // This test just ensures the method doesn't panic
+        assert_eq!(metrics.write_triggered_updates.load(Ordering::Relaxed), 0);
     }
 }

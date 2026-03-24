@@ -17,6 +17,7 @@
 use crate::app::admin_usecase::calculate_data_dir_used_capacity;
 use rustfs_config::{
     DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
+use metrics::{counter, gauge};
     DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
     ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE,
     ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
@@ -196,6 +197,14 @@ impl HybridCapacityManager {
         });
 
         debug!("Capacity updated: {} bytes, source: {:?}", capacity, source);
+        // Update metrics
+        gauge!("rustfs.capacity.current", capacity as f64);
+        match source {
+            DataSource::RealTime => counter!("rustfs.capacity.update.realtime").increment(1),
+            DataSource::Scheduled => counter!("rustfs.capacity.update.scheduled").increment(1),
+            DataSource::WriteTriggered => counter!("rustfs.capacity.update.write_triggered").increment(1),
+            DataSource::Fallback => counter!("rustfs.capacity.update.fallback").increment(1),
+        }
     }
 
     /// Record write operation
@@ -213,6 +222,8 @@ impl HybridCapacityManager {
 
         debug!(
             "Write operation recorded: total writes = {}, recent writes = {}",
+        counter!("rustfs.capacity.write.operations").increment(1);
+        gauge!("rustfs.capacity.write.frequency", record.write_window.len() as f64);
             record.write_count,
             record.write_window.len()
         );
