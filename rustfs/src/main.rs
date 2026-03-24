@@ -16,6 +16,7 @@ mod admin;
 mod app;
 mod auth;
 mod auth_keystone;
+mod capacity;
 mod config;
 mod error;
 mod init;
@@ -40,11 +41,11 @@ use crate::init::{init_ftp_system, init_ftps_system};
 #[cfg(feature = "webdav")]
 use crate::init::init_webdav_system;
 
+use crate::capacity::capacity_integration::init_capacity_management;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use app::capacity_integration::init_capacity_management;
 use license::{current_license, init_license, license_status};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;

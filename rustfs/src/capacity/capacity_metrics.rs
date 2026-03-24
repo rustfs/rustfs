@@ -14,10 +14,10 @@
 
 //! Capacity Metrics for monitoring
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use metrics::{counter, gauge, histogram};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Capacity metrics for monitoring
@@ -85,7 +85,7 @@ impl CapacityMetrics {
         let duration_us = duration.as_micros() as u64;
         self.total_update_duration_us.fetch_add(duration_us, Ordering::Relaxed);
         self.update_count.fetch_add(1, Ordering::Relaxed);
-        
+
         histogram!("rustfs.capacity.update.duration_us", duration_us as f64);
     }
 
@@ -94,11 +94,7 @@ impl CapacityMetrics {
         let hits = self.cache_hits.load(Ordering::Relaxed);
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
+        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
     }
 
     /// Get average update duration
@@ -128,7 +124,7 @@ impl CapacityMetrics {
     /// Log metrics summary
     pub fn log_summary(&self) {
         let summary = self.get_summary();
-        
+
         // Update gauges for current values
         gauge!("rustfs.capacity.cache.hit_rate", summary.cache_hit_rate);
         gauge!("rustfs.capacity.cache.hits_total", summary.cache_hits as f64);
@@ -136,7 +132,7 @@ impl CapacityMetrics {
         gauge!("rustfs.capacity.update.scheduled_total", summary.scheduled_updates as f64);
         gauge!("rustfs.capacity.update.write_triggered_total", summary.write_triggered_updates as f64);
         gauge!("rustfs.capacity.update.failures_total", summary.update_failures as f64);
-        
+
         info!(
             "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}",
             summary.cache_hit_rate * 100.0,
@@ -167,18 +163,16 @@ static CAPACITY_METRICS: std::sync::OnceLock<Arc<CapacityMetrics>> = std::sync::
 
 /// Get global metrics
 pub fn get_capacity_metrics() -> Arc<CapacityMetrics> {
-    CAPACITY_METRICS
-        .get_or_init(|| Arc::new(CapacityMetrics::new()))
-        .clone()
+    CAPACITY_METRICS.get_or_init(|| Arc::new(CapacityMetrics::new())).clone()
 }
 
 /// Start metrics logging task
 pub async fn start_metrics_logging(interval: Duration) {
     let metrics = get_capacity_metrics();
-    
+
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
-        
+
         loop {
             timer.tick().await;
             metrics.log_summary();
@@ -229,7 +223,7 @@ mod tests {
         metrics.record_cache_hit();
         metrics.record_cache_hit();
         metrics.record_cache_miss();
-        
+
         let rate = metrics.get_cache_hit_rate();
         assert!((rate - 0.6666666666666666).abs() < 0.0001);
     }
@@ -239,7 +233,7 @@ mod tests {
         let metrics = CapacityMetrics::new();
         metrics.record_update_duration(Duration::from_millis(100));
         metrics.record_update_duration(Duration::from_millis(200));
-        
+
         let avg = metrics.get_avg_update_duration();
         assert_eq!(avg, Duration::from_millis(150));
     }
@@ -250,7 +244,7 @@ mod tests {
         metrics.record_cache_hit();
         metrics.record_scheduled_update();
         metrics.record_update_duration(Duration::from_millis(100));
-        
+
         let summary = metrics.get_summary();
         assert_eq!(summary.cache_hits, 1);
         assert_eq!(summary.scheduled_updates, 1);

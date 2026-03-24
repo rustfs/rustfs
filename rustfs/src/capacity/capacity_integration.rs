@@ -14,8 +14,8 @@
 
 //! Capacity management integration for application startup
 
-use crate::app::capacity_manager::{get_capacity_manager, start_background_task};
-use crate::app::capacity_metrics::{get_capacity_metrics, start_metrics_logging};
+use crate::capacity::capacity_manager::{get_capacity_manager, start_background_task};
+use crate::capacity::capacity_metrics::{get_capacity_metrics, start_metrics_logging};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -79,10 +79,10 @@ pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
         metrics.record_cache_hit();
 
         let source = match cached.source {
-            crate::app::capacity_manager::DataSource::RealTime => "real-time",
-            crate::app::capacity_manager::DataSource::Scheduled => "scheduled",
-            crate::app::capacity_manager::DataSource::WriteTriggered => "write-triggered",
-            crate::app::capacity_manager::DataSource::Fallback => "fallback",
+            crate::capacity::capacity_manager::DataSource::RealTime => "real-time",
+            crate::capacity::capacity_manager::DataSource::Scheduled => "scheduled",
+            crate::capacity::capacity_manager::DataSource::WriteTriggered => "write-triggered",
+            crate::capacity::capacity_manager::DataSource::Fallback => "fallback",
         };
 
         return Some((cached.total_used, source.to_string()));
@@ -95,13 +95,12 @@ pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::capacity_manager::{DataSource, get_capacity_manager};
 
     #[tokio::test]
     async fn test_get_capacity_with_metrics() {
         let manager = get_capacity_manager();
-        manager
-            .update_capacity(1000, crate::app::capacity_manager::DataSource::RealTime)
-            .await;
+        manager.update_capacity(1000, DataSource::RealTime).await;
 
         let result = get_capacity_with_metrics().await;
         assert!(result.is_some());
