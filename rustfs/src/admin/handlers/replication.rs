@@ -212,7 +212,7 @@ impl Operation for SetRemoteTargetHandler {
         })?;
 
         let Ok(target_url) = remote_target.url() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Invalid target url".to_string()));
+            return Err(s3_error!(InvalidRequest, "invalid target url"));
         };
 
         let same_target = rustfs_utils::net::is_local_host(
@@ -310,20 +310,17 @@ impl Operation for ListRemoteTargetHandler {
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 error!("bucket parameter is empty");
-                return Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Bucket parameter is required".to_string()),
-                )));
+                return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
-            if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
-                error!("Error fetching bucket info: {:?}", err);
-                return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
-            }
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
             let sys = BucketTargetSys::get();
             let targets = sys.list_targets(bucket, "").await;
@@ -363,24 +360,27 @@ impl Operation for RemoveRemoteTargetHandler {
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
         let Some(bucket) = queries.get("bucket") else {
-            return Ok(S3Response::new((
-                StatusCode::BAD_REQUEST,
-                Body::from("Bucket parameter is required".to_string()),
-            )));
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        }
 
         let Some(arn_str) = queries.get("arn") else {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("ARN is required".to_string()))));
+            return Err(s3_error!(InvalidRequest, "arn is required"));
+        };
+        if arn_str.is_empty() {
+            return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
-        if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
-            error!("Error fetching bucket info: {:?}", err);
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
-        }
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
 
         let sys = BucketTargetSys::get();
 

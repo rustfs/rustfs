@@ -203,6 +203,42 @@ async fn remove_replication_target(
     signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
+async fn remove_replication_target_request(
+    env: &RustFSTestEnvironment,
+    bucket: Option<&str>,
+    arn: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let mut url = format!("{}/rustfs/admin/v3/remove-remote-target", env.url);
+    let mut separator = '?';
+
+    if let Some(bucket) = bucket {
+        url.push(separator);
+        separator = '&';
+        url.push_str("bucket=");
+        url.push_str(&urlencoding::encode(bucket));
+    }
+
+    if let Some(arn) = arn {
+        url.push(separator);
+        url.push_str("arn=");
+        url.push_str(&urlencoding::encode(arn));
+    }
+
+    signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
+async fn list_replication_targets_request(
+    env: &RustFSTestEnvironment,
+    bucket: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let mut url = format!("{}/rustfs/admin/v3/list-remote-targets", env.url);
+    if let Some(bucket) = bucket {
+        url.push_str("?bucket=");
+        url.push_str(&urlencoding::encode(bucket));
+    }
+    signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
 async fn build_replication_pair(
     enable_target_versioning: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String), Box<dyn Error + Send + Sync>> {
@@ -502,6 +538,83 @@ async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Bo
 
 #[tokio::test]
 #[serial]
+async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "replication-invalid-target-url-src";
+    let source_client = source_env.create_s3_client();
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+
+    let response = send_set_replication_target_request(
+        &source_env,
+        bucket,
+        false,
+        serde_json::json!({
+            "endpoint": "://invalid-target-url",
+            "credentials": {
+                "accessKey": "replication",
+                "secretKey": "replication"
+            },
+            "targetbucket": "target-bucket",
+            "secure": false,
+            "type": "replication"
+        }),
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("invalid target url"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let response = list_replication_targets_request(&env, Some("")).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("bucket is required"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let response = list_replication_targets_request(&env, Some("missing-replication-target-bucket")).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("NoSuchBucket"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -535,6 +648,53 @@ async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dy
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
     assert!(body.to_ascii_lowercase().contains("not found"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "replication-remove-missing-arn";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&env, bucket).await?;
+
+    let response = remove_replication_target_request(&env, Some(bucket), None).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("arn is required"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let response = remove_replication_target_request(
+        &env,
+        Some("missing-replication-remove-bucket"),
+        Some("arn:aws:s3:us-east-1:123456789012:replication::missing"),
+    )
+    .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("NoSuchBucket"), "unexpected response: {body}");
 
     Ok(())
 }
