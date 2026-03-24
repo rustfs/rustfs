@@ -62,10 +62,6 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- with include "chart.imagePullSecrets" . }}
-      imagePullSecrets:
-        {{- . | nindent 8 }}
-      {{- end }}
       initContainers:
         - name: init-step
           image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
