@@ -214,6 +214,54 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
 
+/// Environment variable for minimum GetObject timeout in seconds.
+///
+/// When dynamic timeout calculation is enabled, this is the minimum timeout
+/// that will be used regardless of object size. This prevents excessively
+/// short timeouts for very small objects.
+///
+/// Default: 5 seconds (can be overridden by `RUSTFS_OBJECT_MIN_TIMEOUT`).
+pub const ENV_OBJECT_MIN_TIMEOUT: &str = "RUSTFS_OBJECT_MIN_TIMEOUT";
+
+/// Default minimum GetObject timeout: 5 seconds.
+pub const DEFAULT_OBJECT_MIN_TIMEOUT: u64 = 5;
+
+/// Environment variable for maximum GetObject timeout in seconds.
+///
+/// When dynamic timeout calculation is enabled, this is the maximum timeout
+/// that will be used regardless of object size. This prevents excessively
+/// long timeouts for very large objects.
+///
+/// Default: 300 seconds (5 minutes, can be overridden by `RUSTFS_OBJECT_MAX_TIMEOUT`).
+pub const ENV_OBJECT_MAX_TIMEOUT: &str = "RUSTFS_OBJECT_MAX_TIMEOUT";
+
+/// Default maximum GetObject timeout: 300 seconds (5 minutes).
+pub const DEFAULT_OBJECT_MAX_TIMEOUT: u64 = 300;
+
+/// Environment variable for default bytes per second for timeout estimation.
+///
+/// This value is used to estimate timeout duration based on object size when
+/// dynamic timeout calculation is enabled. The timeout is calculated as:
+/// (object_size / bytes_per_second) * buffer_factor
+///
+/// Default: 1048576 (1 MB/s, can be overridden by `RUSTFS_OBJECT_BYTES_PER_SECOND`).
+pub const ENV_OBJECT_BYTES_PER_SECOND: &str = "RUSTFS_OBJECT_BYTES_PER_SECOND";
+
+/// Default bytes per second for timeout estimation: 1 MB/s.
+pub const DEFAULT_OBJECT_BYTES_PER_SECOND: u64 = 1024 * 1024;
+
+/// Environment variable to enable dynamic timeout calculation.
+///
+/// When enabled, timeout is calculated based on object size and transfer speed
+/// rather than using a fixed timeout value. This provides better timeout
+/// handling for objects of varying sizes.
+///
+/// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_DYNAMIC_TIMEOUT_ENABLE`).
+pub const ENV_OBJECT_DYNAMIC_TIMEOUT_ENABLE: &str = "RUSTFS_OBJECT_DYNAMIC_TIMEOUT_ENABLE";
+
+/// Default: dynamic timeout calculation is enabled.
+pub const DEFAULT_OBJECT_DYNAMIC_TIMEOUT_ENABLE: bool = true;
+
 /// Environment variable for duplex pipe buffer size in bytes.
 ///
 /// The duplex pipe connects the disk read task to the HTTP response stream.

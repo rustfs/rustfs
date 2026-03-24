@@ -16,6 +16,7 @@ mod admin;
 mod app;
 mod auth;
 mod auth_keystone;
+mod capacity;
 mod config;
 mod error;
 mod init;
@@ -40,6 +41,7 @@ use crate::init::{init_ftp_system, init_ftps_system};
 #[cfg(feature = "webdav")]
 use crate::init::init_webdav_system;
 
+use crate::capacity::capacity_integration::init_capacity_management;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -296,6 +298,7 @@ async fn run(config: config::Config) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
     // Initialize the lock clients
+
     init_lock_clients(endpoint_pools.clone());
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -330,7 +333,8 @@ async fn run(config: config::Config) -> Result<()> {
             );
         }
     }
-
+    // Initialize capacity management system
+    init_capacity_management().await;
     let state_manager = ServiceStateManager::new();
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);

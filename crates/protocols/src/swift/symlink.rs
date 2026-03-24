@@ -59,10 +59,33 @@
 //! ```
 
 use super::{SwiftError, SwiftResult};
-use tracing::debug;
+use std::collections::HashSet;
+use tracing::{debug, warn};
 
 /// Maximum symlink follow depth to prevent infinite loops
 const MAX_SYMLINK_DEPTH: u8 = 5;
+
+/// Symlink path used for loop detection
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymlinkPath {
+    pub account: String,
+    pub container: String,
+    pub object: String,
+}
+
+impl SymlinkPath {
+    pub fn new(account: &str, container: &str, object: &str) -> Self {
+        Self {
+            account: account.to_string(),
+            container: container.to_string(),
+            object: object.to_string(),
+        }
+    }
+
+    pub fn from_strs(account: &str, container: &str, object: &str) -> Self {
+        Self::new(account, container, object)
+    }
+}
 
 /// Parsed symlink target
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +187,43 @@ pub fn validate_symlink_depth(depth: u8) -> SwiftResult<()> {
             depth
         )));
     }
+    Ok(())
+}
+
+/// Check if a symlink path has been visited before (circular reference detection)
+pub fn check_circular_reference(visited: &HashSet<SymlinkPath>, account: &str, container: &str, object: &str) -> SwiftResult<()> {
+    let path = SymlinkPath::new(account, container, object);
+
+    if visited.contains(&path) {
+        warn!(
+            account = %account,
+            container = %container,
+            object = %object,
+            "Circular symlink reference detected"
+        );
+        return Err(SwiftError::Conflict(format!(
+            "Circular symlink reference detected: {}/{}/{}",
+            account, container, object
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate symlink depth and check for circular references
+pub fn validate_symlink_access(
+    visited: &HashSet<SymlinkPath>,
+    depth: u8,
+    account: &str,
+    container: &str,
+    object: &str,
+) -> SwiftResult<()> {
+    // Check depth limit first
+    validate_symlink_depth(depth)?;
+
+    // Check for circular references
+    check_circular_reference(visited, account, container, object)?;
+
     Ok(())
 }
 
@@ -309,5 +369,95 @@ mod tests {
     fn test_validate_symlink_depth_exceeded() {
         assert!(validate_symlink_depth(5).is_err());
         assert!(validate_symlink_depth(10).is_err());
+    }
+
+    #[test]
+    fn test_symlink_path_creation() {
+        let path = SymlinkPath::new("account1", "container1", "object1");
+        assert_eq!(path.account, "account1");
+        assert_eq!(path.container, "container1");
+        assert_eq!(path.object, "object1");
+    }
+
+    #[test]
+    fn test_symlink_path_equality() {
+        let path1 = SymlinkPath::new("account1", "container1", "object1");
+        let path2 = SymlinkPath::new("account1", "container1", "object1");
+        let path3 = SymlinkPath::new("account2", "container1", "object1");
+
+        assert_eq!(path1, path2);
+        assert_ne!(path1, path3);
+    }
+
+    #[test]
+    fn test_check_circular_reference_not_visited() {
+        let visited = HashSet::new();
+        assert!(check_circular_reference(&visited, "acc", "cont", "obj").is_ok());
+    }
+
+    #[test]
+    fn test_check_circular_reference_visited() {
+        let mut visited = HashSet::new();
+        visited.insert(SymlinkPath::new("acc", "cont", "obj"));
+
+        let result = check_circular_reference(&visited, "acc", "cont", "obj");
+        assert!(result.is_err());
+
+        if let Err(SwiftError::Conflict(msg)) = result {
+            assert!(msg.contains("Circular symlink reference detected"));
+            assert!(msg.contains("acc/cont/obj"));
+        } else {
+            panic!("Expected Conflict error");
+        }
+    }
+
+    #[test]
+    fn test_check_circular_reference_different_path() {
+        let mut visited = HashSet::new();
+        visited.insert(SymlinkPath::new("acc1", "cont1", "obj1"));
+
+        // Different path should not trigger circular reference error
+        assert!(check_circular_reference(&visited, "acc2", "cont2", "obj2").is_ok());
+    }
+
+    #[test]
+    fn test_validate_symlink_access_success() {
+        let visited = HashSet::new();
+        assert!(validate_symlink_access(&visited, 0, "acc", "cont", "obj").is_ok());
+        assert!(validate_symlink_access(&visited, 4, "acc", "cont", "obj").is_ok());
+    }
+
+    #[test]
+    fn test_validate_symlink_access_depth_exceeded() {
+        let visited = HashSet::new();
+        assert!(validate_symlink_access(&visited, 5, "acc", "cont", "obj").is_err());
+        assert!(validate_symlink_access(&visited, 10, "acc", "cont", "obj").is_err());
+    }
+
+    #[test]
+    fn test_validate_symlink_access_circular_reference() {
+        let mut visited = HashSet::new();
+        visited.insert(SymlinkPath::new("acc", "cont", "obj"));
+
+        let result = validate_symlink_access(&visited, 0, "acc", "cont", "obj");
+        assert!(result.is_err());
+
+        if let Err(SwiftError::Conflict(msg)) = result {
+            assert!(msg.contains("Circular symlink reference detected"));
+        } else {
+            panic!("Expected Conflict error");
+        }
+    }
+
+    #[test]
+    fn test_validate_symlink_access_both_checks() {
+        let mut visited = HashSet::new();
+        visited.insert(SymlinkPath::new("acc", "cont", "obj"));
+
+        // Should fail due to circular reference even though depth is OK
+        assert!(validate_symlink_access(&visited, 0, "acc", "cont", "obj").is_err());
+
+        // Should fail due to depth even though no circular reference
+        assert!(validate_symlink_access(&visited, 6, "acc2", "cont2", "obj2").is_err());
     }
 }
