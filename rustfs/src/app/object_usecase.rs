@@ -37,8 +37,8 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
-use metrics::{counter, histogram};
 use md5::Context as Md5Context;
+use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
@@ -351,6 +351,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_put_request_metadata(
     metadata: &mut HashMap<String, String>,
     headers: &HeaderMap,
@@ -3731,11 +3732,13 @@ impl DefaultObjectUsecase {
         let mut effective_sse = original_sse.or_else(|| {
             bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
                 config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| match sse.sse_algorithm.as_str() {
-                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                    })
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .map(|sse| match sse.sse_algorithm.as_str() {
+                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        })
                 })
             })
         });
@@ -3823,9 +3826,9 @@ impl DefaultObjectUsecase {
         let decoder = CompressionFormat::from_extension(&ext)
             .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
             .map_err(|e| {
-            error!("get_decoder err {:?}", e);
-            s3_error!(InvalidArgument, "get_decoder err")
-        })?;
+                error!("get_decoder err {:?}", e);
+                s3_error!(InvalidArgument, "get_decoder err")
+            })?;
 
         let mut ar = Archive::new(decoder);
         let mut entries = ar.entries().map_err(|e| {
@@ -3991,10 +3994,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
 
-            let obj_info = match store
-                .put_object(&bucket, &fpath, &mut reader, &opts)
-                .await
-            {
+            let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,
                 Err(e) => {
                     if extract_options.ignore_errors {
