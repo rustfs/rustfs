@@ -1329,7 +1329,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
     Ok(resp)
 }
 
-async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
+async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
     let Some(store) = new_object_layer_fn() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
     };
@@ -1339,6 +1339,10 @@ async fn ensure_replication_bucket_ready(bucket: &str) -> S3Result<()> {
         .await
         .map_err(ApiError::from)?;
 
+    Ok(())
+}
+
+async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
         Err(rustfs_ecstore::error::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
@@ -1982,7 +1986,7 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
     if !BucketVersioningSys::enabled(bucket).await {
         return Err(s3_error!(
             InvalidRequest,
-            "replication check requires source bucket versioning to be enabled"
+            "replication validation requires bucket versioning to be enabled"
         ));
     }
 
@@ -2101,10 +2105,11 @@ async fn handle_replication_extension_request(
     ext_req: &ReplicationExtRequest,
 ) -> S3Result<S3Response<Body>> {
     authorize_replication_extension_request(req, ext_req).await?;
-    ensure_replication_bucket_ready(&ext_req.bucket).await?;
+    ensure_replication_bucket_exists(&ext_req.bucket).await?;
 
     match ext_req.route {
         ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
+            ensure_replication_config_exists(&ext_req.bucket).await?;
             build_replication_metrics_response(&ext_req.bucket, ext_req.route).await
         }
         ReplicationExtRoute::Check => {
@@ -2117,14 +2122,17 @@ async fn handle_replication_extension_request(
                     "replication validation requires bucket versioning to be enabled"
                 ));
             }
+            ensure_replication_config_exists(&ext_req.bucket).await?;
             run_replication_check(&ext_req.bucket).await
         }
         ReplicationExtRoute::ResetStatus => {
+            ensure_replication_config_exists(&ext_req.bucket).await?;
             let status_req = parse_reset_status_target(&req.uri);
             let status = load_replication_resync_status(&ext_req.bucket).await?;
             build_replication_reset_status_response(status, status_req.arn.as_deref())
         }
         ReplicationExtRoute::ResetStart => {
+            ensure_replication_config_exists(&ext_req.bucket).await?;
             let target = parse_reset_start_target(&req.uri)?;
             let target = start_replication_resync(&ext_req.bucket, &target).await?;
             build_replication_reset_response(vec![target])

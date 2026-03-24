@@ -361,6 +361,73 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
 
 #[tokio::test]
 #[serial]
+async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "replication-check-source-unversioned";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let response = run_replication_check(&env, bucket).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
+    assert!(body.to_ascii_lowercase().contains("versioning"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replication_check_rejects_missing_replication_config() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "replication-check-missing-config";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&env, bucket).await?;
+
+    let response = run_replication_check(&env, bucket).await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("ReplicationConfigurationNotFoundError"),
+        "unexpected response: {body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let response = run_replication_check(&env, "replication-check-no-such-bucket").await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("NoSuchBucket"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
