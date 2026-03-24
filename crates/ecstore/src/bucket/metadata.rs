@@ -442,9 +442,7 @@ impl BucketMetadata {
                 "LoggingConfigXML" | "LoggingConfigXml" => self.logging_config_xml = read_msgp_bin(rd)?,
                 "WebsiteConfigXML" | "WebsiteConfigXml" => self.website_config_xml = read_msgp_bin(rd)?,
                 "AccelerateConfigXML" | "AccelerateConfigXml" => self.accelerate_config_xml = read_msgp_bin(rd)?,
-                "RequestPaymentConfigXML" | "RequestPaymentConfigXml" => {
-                    self.request_payment_config_xml = read_msgp_bin(rd)?
-                }
+                "RequestPaymentConfigXML" | "RequestPaymentConfigXml" => self.request_payment_config_xml = read_msgp_bin(rd)?,
                 "PublicAccessBlockConfigXML" | "PublicAccessBlockConfigXml" => {
                     self.public_access_block_config_xml = read_msgp_bin(rd)?
                 }

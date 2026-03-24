@@ -18,9 +18,7 @@ use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
-use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX,
-};
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use crate::storage::access::{ReqInfo, authorize_request};
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
@@ -57,7 +55,7 @@ use rustfs_ecstore::config::com::read_config_without_migrate;
 use rustfs_ecstore::config::{Config, get_global_server_config};
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
-use rustfs_ecstore::rpc::{PeerRestClient, verify_rpc_signature};
+use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{
     global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region},

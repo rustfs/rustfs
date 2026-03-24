@@ -7740,6 +7740,7 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "clap",
  "mime_guess",
  "rmcp",
