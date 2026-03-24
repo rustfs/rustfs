@@ -16,8 +16,13 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection};
-use std::{error::Error, time::Duration};
+use rustfs_common::{
+    GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection, internode_metrics::global_internode_metrics,
+};
+use std::{
+    error::Error,
+    time::{Duration, Instant},
+};
 use tonic::{
     Request, Status,
     service::interceptor::InterceptedService,
@@ -65,6 +70,7 @@ const RUSTFS_HTTPS_PREFIX: &str = "https://";
 /// - Overall RPC timeout of 30s (reduced from 60s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
+    let dial_started_at = Instant::now();
 
     let mut connector = Endpoint::from_shared(addr.to_string())?
         // Fast connection timeout for dead peer detection
@@ -119,7 +125,16 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     }
 
-    let channel = connector.connect().await?;
+    let channel = match connector.connect().await {
+        Ok(channel) => {
+            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), true);
+            channel
+        }
+        Err(err) => {
+            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), false);
+            return Err(err.into());
+        }
+    };
 
     // Cache the new connection
     {

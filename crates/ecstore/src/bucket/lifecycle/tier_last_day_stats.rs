@@ -51,6 +51,10 @@ impl LastDayTierStats {
         self.bins[now_idx] = self.bins[now_idx].add(&ts);
     }
 
+    pub fn total(&self) -> TierStats {
+        self.bins.iter().fold(TierStats::default(), |acc, bin| acc.add(bin))
+    }
+
     fn forward_to(&mut self, t: &mut OffsetDateTime) {
         if t.unix_timestamp() == 0 {
             *t = OffsetDateTime::now_utc();
@@ -99,4 +103,30 @@ impl LastDayTierStats {
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+
+    #[test]
+    fn total_sums_all_recorded_stats() {
+        let mut stats = LastDayTierStats::default();
+        stats.add_stats(TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        stats.add_stats(TierStats {
+            total_size: 20,
+            num_versions: 2,
+            num_objects: 0,
+        });
+
+        assert_eq!(
+            stats.total(),
+            TierStats {
+                total_size: 30,
+                num_versions: 3,
+                num_objects: 1,
+            }
+        );
+    }
+}

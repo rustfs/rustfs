@@ -43,11 +43,7 @@ impl FileMeta {
         let vid = version_id.unwrap_or_default();
 
         if self.data.entries().unwrap_or_default() > 0
-            && self
-                .data
-                .find(super::data_key_for_version(version_id).as_str())
-                .unwrap_or_default()
-                .is_some()
+            && self.find_inline_data_for_version(version_id).unwrap_or_default().is_some()
         {
             return 0;
         }

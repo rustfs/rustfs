@@ -36,7 +36,8 @@ rustfs-utils = { workspace = true, features = ["full"] }
 s3s.workspace = true
 base64-simd.workspace = true
 
-[dev-dependencies]
-
 [lints]
 workspace = true
+
+[lib]
+doctest = false

@@ -151,8 +151,30 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 }
 
 async fn async_main() -> Result<()> {
-    // Parse the obtained parameters
-    let config = config::Config::parse()?;
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let command_result = match config::Opt::parse_command(args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Command parse failed, error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Handle info command
+    if let config::CommandResult::Info(opts) = command_result {
+        config::execute_info(&opts);
+        return Ok(());
+    }
+
+    // Get config for server command
+    let config = match command_result {
+        config::CommandResult::Server(cfg) => cfg,
+        config::CommandResult::Info(_) => unreachable!(),
+    };
+
+    // Initialize the global config snapshot for info command
+    config::init_config_snapshot(&config);
 
     // Initialize the configuration
     init_license(config.license.clone());
@@ -211,7 +233,7 @@ async fn async_main() -> Result<()> {
     }
 
     // Run parameters
-    match run(config).await {
+    match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("Server encountered an error and is shutting down: {}", e);
@@ -430,6 +452,15 @@ async fn run(config: config::Config) -> Result<()> {
         Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
     }
 
+    // Initialize deadlock detector if enabled
+    let detector = crate::storage::deadlock_detector::get_deadlock_detector();
+    if detector.is_enabled() {
+        detector.start();
+        info!(target: "rustfs::main::run","Deadlock detector started successfully.");
+    } else {
+        info!(target: "rustfs::main::run","Deadlock detector disabled.");
+    }
+
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -499,14 +530,17 @@ async fn run(config: config::Config) -> Result<()> {
         "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
     );
 
-    // Initialize heal manager and scanner based on environment variables
+    // Scanner depends on the heal channel/manager, so scanner implies heal.
     if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-
         init_heal_manager(heal_storage, None).await?;
+    }
 
+    if enable_scanner {
         init_data_scanner(ctx.clone(), store.clone()).await;
-    } else {
+    }
+
+    if !enable_heal && !enable_scanner {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
 
@@ -592,20 +626,24 @@ async fn handle_shutdown(
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
-    // Stop background services based on what was enabled
-    if enable_scanner || enable_heal {
+    // Stop background services based on what was enabled.
+    if enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Stopping background services (data scanner and auto heal)..."
+            "Stopping background services (data scanner)..."
         );
         shutdown_background_services();
+    }
 
+    if enable_heal || enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Stopping AHM services..."
         );
         shutdown_ahm_services();
-    } else {
+    }
+
+    if !enable_scanner && !enable_heal {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Background services were disabled, skipping AHM shutdown"

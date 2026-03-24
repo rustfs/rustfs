@@ -331,6 +331,8 @@ message UpdateMetadataRequest {
   string path = 3;
   string file_info = 4;
   string opts = 5;
+  bytes file_info_bin = 6;
+  bytes opts_bin = 7;
 }
 
 message UpdateMetadataResponse {
@@ -343,6 +345,7 @@ message WriteMetadataRequest {
   string volume = 2;
   string path = 3;
   string file_info = 4;
+  bytes file_info_bin = 5;
 }
 
 message WriteMetadataResponse {
@@ -356,12 +359,14 @@ message ReadVersionRequest {
   string path = 3;
   string version_id = 4;
   string opts = 5;
+  bytes opts_bin = 6;
 }
 
 message ReadVersionResponse {
   bool success = 1;
   string file_info = 2;
   optional Error error = 3;
+  bytes file_info_bin = 4;
 }
 
 message ReadXLRequest {
@@ -375,6 +380,7 @@ message ReadXLResponse {
   bool success = 1;
   string raw_file_info = 2;
   optional Error error = 3;
+  bytes raw_file_info_bin = 4;
 }
 
 message DeleteVersionRequest {
@@ -408,12 +414,14 @@ message DeleteVersionsResponse {
 message ReadMultipleRequest {
   string disk = 1;
   string read_multiple_req = 2;
+  bytes read_multiple_req_bin = 3;
 }
 
 message ReadMultipleResponse {
   bool success = 1;
   repeated string read_multiple_resps = 2;
   optional Error error = 3;
+  repeated bytes read_multiple_resps_bin = 4;
 }
 
 message DeleteVolumeRequest {

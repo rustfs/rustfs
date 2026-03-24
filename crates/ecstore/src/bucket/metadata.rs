@@ -33,7 +33,7 @@ use serde::Serializer;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 use tracing::error;
 
 fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
@@ -43,19 +43,177 @@ fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
     Ok(String::from_utf8(buf)?)
 }
 
+fn read_msgp_bool<R: Read>(rd: &mut R) -> Result<bool> {
+    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    match marker {
+        rmp::Marker::True => Ok(true),
+        rmp::Marker::False => Ok(false),
+        rmp::Marker::FixPos(v) => Ok(v != 0),
+        rmp::Marker::U8 => Ok(read_u8(rd)? != 0),
+        rmp::Marker::U16 => Ok(read_u16_raw(rd)? != 0),
+        rmp::Marker::U32 => Ok(read_u32_raw(rd)? != 0),
+        rmp::Marker::U64 => Ok(read_u64_raw(rd)? != 0),
+        rmp::Marker::I8 => Ok(read_i8_raw(rd)? != 0),
+        rmp::Marker::I16 => Ok(read_i16_raw(rd)? != 0),
+        rmp::Marker::I32 => Ok(read_i32_raw(rd)? != 0),
+        rmp::Marker::I64 => Ok(read_i64_raw(rd)? != 0),
+        rmp::Marker::FixNeg(v) => Ok(v != 0),
+        _ => Err(Error::other(format!("expected bool or int-like bool, got marker: {marker:?}"))),
+    }
+}
+
 fn read_msgp_time_value<R: Read>(rd: &mut R) -> Result<OffsetDateTime> {
     let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
     match marker {
         rmp::Marker::Null => Ok(OffsetDateTime::UNIX_EPOCH),
         rmp::Marker::Ext8 => read_msgp_ext8_time(rd),
+        rmp::Marker::FixArray(len) => read_msgp_legacy_compact_time(rd, u32::from(len)),
+        rmp::Marker::Array16 => {
+            let len = read_u16_raw(rd)?;
+            read_msgp_legacy_compact_time(rd, u32::from(len))
+        }
+        rmp::Marker::Array32 => {
+            let len = read_u32_raw(rd)?;
+            read_msgp_legacy_compact_time(rd, len)
+        }
+        rmp::Marker::Bin8 => {
+            let len = usize::from(read_u8(rd)?);
+            read_msgp_time_value_from_embedded_bin(rd, len)
+        }
+        rmp::Marker::Bin16 => {
+            let len = usize::from(read_u16_raw(rd)?);
+            read_msgp_time_value_from_embedded_bin(rd, len)
+        }
+        rmp::Marker::Bin32 => {
+            let len = read_u32_raw(rd)? as usize;
+            read_msgp_time_value_from_embedded_bin(rd, len)
+        }
         _ => Err(Error::other(format!("expected time ext or nil, got marker: {marker:?}"))),
     }
 }
 
-fn read_msgp_bin<R: Read>(rd: &mut R) -> Result<Vec<u8>> {
-    let len = rmp::decode::read_bin_len(rd)? as usize;
+fn read_u8<R: Read>(rd: &mut R) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    rd.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn read_u16_raw<R: Read>(rd: &mut R) -> Result<u16> {
+    let mut buf = [0u8; 2];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_u16(&buf))
+}
+
+fn read_u32_raw<R: Read>(rd: &mut R) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_u32(&buf))
+}
+
+fn read_u64_raw<R: Read>(rd: &mut R) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_u64(&buf))
+}
+
+fn read_i8_raw<R: Read>(rd: &mut R) -> Result<i8> {
+    Ok(read_u8(rd)? as i8)
+}
+
+fn read_i16_raw<R: Read>(rd: &mut R) -> Result<i16> {
+    let mut buf = [0u8; 2];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_i16(&buf))
+}
+
+fn read_i32_raw<R: Read>(rd: &mut R) -> Result<i32> {
+    let mut buf = [0u8; 4];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_i32(&buf))
+}
+
+fn read_i64_raw<R: Read>(rd: &mut R) -> Result<i64> {
+    let mut buf = [0u8; 8];
+    rd.read_exact(&mut buf)?;
+    Ok(BigEndian::read_i64(&buf))
+}
+
+fn read_msgp_time_value_from_embedded_bin<R: Read>(rd: &mut R, len: usize) -> Result<OffsetDateTime> {
     let mut buf = vec![0u8; len];
     rd.read_exact(&mut buf)?;
+    let mut cur = std::io::Cursor::new(buf);
+    read_msgp_time_value(&mut cur)
+}
+
+fn read_msgp_legacy_compact_time<R: Read>(rd: &mut R, len: u32) -> Result<OffsetDateTime> {
+    if len != 9 {
+        return Err(Error::other(format!("invalid legacy compact time len: {len}")));
+    }
+
+    let year: i32 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let ordinal: u16 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let hour: u8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let minute: u8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let second: u8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let nanosecond: u32 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let offset_hour: i8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let offset_minute: i8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let offset_second: i8 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+
+    let date =
+        Date::from_ordinal_date(year, ordinal).map_err(|e| Error::other(format!("invalid legacy compact time date: {e}")))?;
+    let time = CivilTime::from_hms_nano(hour, minute, second, nanosecond)
+        .map_err(|e| Error::other(format!("invalid legacy compact time time: {e}")))?;
+    let offset = UtcOffset::from_hms(offset_hour, offset_minute, offset_second)
+        .map_err(|e| Error::other(format!("invalid legacy compact time offset: {e}")))?;
+
+    Ok(PrimitiveDateTime::new(date, time)
+        .assume_offset(offset)
+        .to_offset(UtcOffset::UTC))
+}
+
+fn read_msgp_bin<R: Read>(rd: &mut R) -> Result<Vec<u8>> {
+    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    match marker {
+        rmp::Marker::Null => Ok(Vec::new()),
+        rmp::Marker::Bin8 => {
+            let len = usize::from(read_u8(rd)?);
+            read_exact_bytes(rd, len)
+        }
+        rmp::Marker::Bin16 => {
+            let len = usize::from(read_u16_raw(rd)?);
+            read_exact_bytes(rd, len)
+        }
+        rmp::Marker::Bin32 => {
+            let len = read_u32_raw(rd)? as usize;
+            read_exact_bytes(rd, len)
+        }
+        rmp::Marker::FixArray(len) => read_msgp_legacy_byte_array(rd, u32::from(len)),
+        rmp::Marker::Array16 => {
+            let len = read_u16_raw(rd)?;
+            read_msgp_legacy_byte_array(rd, u32::from(len))
+        }
+        rmp::Marker::Array32 => {
+            let len = read_u32_raw(rd)?;
+            read_msgp_legacy_byte_array(rd, len)
+        }
+        _ => Err(Error::other(format!("expected bin or byte array, got marker: {marker:?}"))),
+    }
+}
+
+fn read_exact_bytes<R: Read>(rd: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_msgp_legacy_byte_array<R: Read>(rd: &mut R, len: u32) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        let value: i64 = rmp::decode::read_int(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+        let byte = u8::try_from(value).map_err(|_| Error::other(format!("byte value out of range: {value}")))?;
+        buf.push(byte);
+    }
     Ok(buf)
 }
 
@@ -255,18 +413,20 @@ impl BucketMetadata {
             match key.as_str() {
                 "Name" => self.name = read_msgp_str(rd)?,
                 "Created" => self.created = read_msgp_time_value(rd)?,
-                "LockEnabled" => self.lock_enabled = rmp::decode::read_bool(rd)?,
-                "PolicyConfigJSON" => self.policy_config_json = read_msgp_bin(rd)?,
-                "NotificationConfigXML" => self.notification_config_xml = read_msgp_bin(rd)?,
-                "LifecycleConfigXML" => self.lifecycle_config_xml = read_msgp_bin(rd)?,
-                "ObjectLockConfigXML" => self.object_lock_config_xml = read_msgp_bin(rd)?,
-                "VersioningConfigXML" => self.versioning_config_xml = read_msgp_bin(rd)?,
-                "EncryptionConfigXML" => self.encryption_config_xml = read_msgp_bin(rd)?,
-                "TaggingConfigXML" => self.tagging_config_xml = read_msgp_bin(rd)?,
-                "QuotaConfigJSON" => self.quota_config_json = read_msgp_bin(rd)?,
-                "ReplicationConfigXML" => self.replication_config_xml = read_msgp_bin(rd)?,
-                "BucketTargetsConfigJSON" => self.bucket_targets_config_json = read_msgp_bin(rd)?,
-                "BucketTargetsConfigMetaJSON" => self.bucket_targets_config_meta_json = read_msgp_bin(rd)?,
+                "LockEnabled" => self.lock_enabled = read_msgp_bool(rd)?,
+                "PolicyConfigJSON" | "PolicyConfigJson" => self.policy_config_json = read_msgp_bin(rd)?,
+                "NotificationConfigXML" | "NotificationConfigXml" => self.notification_config_xml = read_msgp_bin(rd)?,
+                "LifecycleConfigXML" | "LifecycleConfigXml" => self.lifecycle_config_xml = read_msgp_bin(rd)?,
+                "ObjectLockConfigXML" | "ObjectLockConfigXml" => self.object_lock_config_xml = read_msgp_bin(rd)?,
+                "VersioningConfigXML" | "VersioningConfigXml" => self.versioning_config_xml = read_msgp_bin(rd)?,
+                "EncryptionConfigXML" | "EncryptionConfigXml" => self.encryption_config_xml = read_msgp_bin(rd)?,
+                "TaggingConfigXML" | "TaggingConfigXml" => self.tagging_config_xml = read_msgp_bin(rd)?,
+                "QuotaConfigJSON" | "QuotaConfigJson" => self.quota_config_json = read_msgp_bin(rd)?,
+                "ReplicationConfigXML" | "ReplicationConfigXml" => self.replication_config_xml = read_msgp_bin(rd)?,
+                "BucketTargetsConfigJSON" | "BucketTargetsConfigJson" => self.bucket_targets_config_json = read_msgp_bin(rd)?,
+                "BucketTargetsConfigMetaJSON" | "BucketTargetsConfigMetaJson" => {
+                    self.bucket_targets_config_meta_json = read_msgp_bin(rd)?
+                }
                 "PolicyConfigUpdatedAt" => self.policy_config_updated_at = read_msgp_time_value(rd)?,
                 "ObjectLockConfigUpdatedAt" => self.object_lock_config_updated_at = read_msgp_time_value(rd)?,
                 "EncryptionConfigUpdatedAt" => self.encryption_config_updated_at = read_msgp_time_value(rd)?,
@@ -278,13 +438,17 @@ impl BucketMetadata {
                 "NotificationConfigUpdatedAt" => self.notification_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketTargetsConfigUpdatedAt" => self.bucket_targets_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketTargetsConfigMetaUpdatedAt" => self.bucket_targets_config_meta_updated_at = read_msgp_time_value(rd)?,
-                "CorsConfigXML" => self.cors_config_xml = read_msgp_bin(rd)?,
-                "LoggingConfigXML" => self.logging_config_xml = read_msgp_bin(rd)?,
-                "WebsiteConfigXML" => self.website_config_xml = read_msgp_bin(rd)?,
-                "AccelerateConfigXML" => self.accelerate_config_xml = read_msgp_bin(rd)?,
-                "RequestPaymentConfigXML" => self.request_payment_config_xml = read_msgp_bin(rd)?,
-                "PublicAccessBlockConfigXML" => self.public_access_block_config_xml = read_msgp_bin(rd)?,
-                "BucketAclConfigJSON" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
+                "CorsConfigXML" | "CorsConfigXml" => self.cors_config_xml = read_msgp_bin(rd)?,
+                "LoggingConfigXML" | "LoggingConfigXml" => self.logging_config_xml = read_msgp_bin(rd)?,
+                "WebsiteConfigXML" | "WebsiteConfigXml" => self.website_config_xml = read_msgp_bin(rd)?,
+                "AccelerateConfigXML" | "AccelerateConfigXml" => self.accelerate_config_xml = read_msgp_bin(rd)?,
+                "RequestPaymentConfigXML" | "RequestPaymentConfigXml" => {
+                    self.request_payment_config_xml = read_msgp_bin(rd)?
+                }
+                "PublicAccessBlockConfigXML" | "PublicAccessBlockConfigXml" => {
+                    self.public_access_block_config_xml = read_msgp_bin(rd)?
+                }
+                "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,

@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, GLOBAL_STORAGE_CLASS, storageclass};
+use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
+use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
-use rustfs_config::{DEFAULT_DELIMITER, RUSTFS_REGION};
+use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
+use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -41,6 +43,19 @@ static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
 #[instrument(skip(api))]
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
+    Ok(data)
+}
+
+pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+    let (data, _obj) = read_config_with_metadata(
+        api,
+        file,
+        &ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(data)
 }
 
@@ -167,6 +182,85 @@ fn parse_inline_block_value(value: &Value) -> Option<String> {
     }
 }
 
+fn parse_oidc_scalar_value(key: &str, value: &Value) -> Option<String> {
+    match value {
+        Value::String(v) => Some(v.trim().to_string()),
+        Value::Bool(v) if key == ENABLE_KEY || key == OIDC_REDIRECT_URI_DYNAMIC => Some(if *v {
+            EnableState::On.to_string()
+        } else {
+            EnableState::Off.to_string()
+        }),
+        Value::Bool(v) => Some(v.to_string()),
+        Value::Number(v) => Some(v.to_string()),
+        Value::Array(values) if key == rustfs_config::oidc::OIDC_SCOPES => {
+            let scopes = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(scopes)
+        }
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn decode_oidc_provider_object(provider: &Map<String, Value>) -> KVS {
+    let mut kvs = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+
+    for (key, value) in provider {
+        if !IDENTITY_OPENID_KEYS.contains(&key.as_str()) || key == COMMENT_KEY {
+            continue;
+        }
+
+        if let Some(parsed) = parse_oidc_scalar_value(key, value) {
+            kvs.insert(key.clone(), parsed);
+        }
+    }
+
+    kvs
+}
+
+fn apply_external_oidc_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
+    let oidc_root = root.get("openid").or_else(|| root.get(IDENTITY_OPENID_SUB_SYS));
+    let Some(Value::Object(oidc_obj)) = oidc_root else {
+        return false;
+    };
+
+    if oidc_obj.is_empty() {
+        return false;
+    }
+
+    let subsystem = cfg.0.entry(IDENTITY_OPENID_SUB_SYS.to_string()).or_default();
+    let mut applied = false;
+
+    for (raw_instance, provider) in oidc_obj {
+        let instance_key = if raw_instance == "default" {
+            DEFAULT_DELIMITER.to_string()
+        } else {
+            raw_instance.to_string()
+        };
+
+        match provider {
+            Value::Object(provider_obj) => {
+                subsystem.insert(instance_key, decode_oidc_provider_object(provider_obj));
+                applied = true;
+            }
+            Value::Array(_) => {
+                if let Ok(kvs) = serde_json::from_value::<KVS>(provider.clone()) {
+                    subsystem.insert(instance_key, kvs);
+                    applied = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    applied
+}
+
 fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
     let sc = root.get("storageclass").or_else(|| root.get("storage_class"));
     let Some(Value::Object(sc_obj)) = sc else {
@@ -210,8 +304,9 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
 
     let mut cfg = Config::new();
     let has_storage = apply_external_storage_class_map(&mut cfg, &root);
+    let has_oidc = apply_external_oidc_map(&mut cfg, &root);
     let has_header = root.contains_key("version") || root.contains_key("region") || root.contains_key("credential");
-    if !has_storage && !has_header {
+    if !has_storage && !has_oidc && !has_header {
         return Err(Error::other("unrecognized external server config shape"));
     }
     Ok(cfg)
@@ -241,6 +336,119 @@ fn build_storageclass_object(cfg: &Config) -> Map<String, Value> {
     sc_obj
 }
 
+fn build_oidc_provider_object(kvs: &KVS) -> Map<String, Value> {
+    let mut provider = Map::new();
+
+    for kv in &kvs.0 {
+        if kv.key == COMMENT_KEY || (kv.hidden_if_empty && kv.value.trim().is_empty()) {
+            continue;
+        }
+
+        if kv.value.trim().is_empty() {
+            continue;
+        }
+
+        if kv.key == ENABLE_KEY || kv.key == OIDC_REDIRECT_URI_DYNAMIC {
+            let enabled = kv
+                .value
+                .parse::<EnableState>()
+                .map(|state| state.is_enabled())
+                .unwrap_or(false);
+            provider.insert(kv.key.clone(), Value::Bool(enabled));
+            continue;
+        }
+
+        if kv.key == rustfs_config::oidc::OIDC_SCOPES {
+            let scopes = kv
+                .value
+                .split(',')
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(|scope| Value::String(scope.to_string()))
+                .collect::<Vec<_>>();
+            provider.insert(kv.key.clone(), Value::Array(scopes));
+            continue;
+        }
+
+        provider.insert(kv.key.clone(), Value::String(kv.value.clone()));
+    }
+
+    provider
+}
+
+fn build_oidc_object(cfg: &Config) -> Map<String, Value> {
+    let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+        return Map::new();
+    };
+
+    let mut providers = subsystem.iter().collect::<Vec<_>>();
+    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+    let mut oidc_obj = Map::new();
+    for (instance_key, kvs) in providers {
+        if kvs
+            .lookup(rustfs_config::oidc::OIDC_CONFIG_URL)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
+
+        let provider = build_oidc_provider_object(kvs);
+        if provider.is_empty() {
+            continue;
+        }
+
+        let external_key = if instance_key == DEFAULT_DELIMITER {
+            "default".to_string()
+        } else {
+            instance_key.clone()
+        };
+        oidc_obj.insert(external_key, Value::Object(provider));
+    }
+
+    oidc_obj
+}
+
+fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
+    let Some(subsystem) = cfg.0.get(IDENTITY_OPENID_SUB_SYS) else {
+        return Map::new();
+    };
+
+    let mut providers = subsystem.iter().collect::<Vec<_>>();
+    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+    let mut oidc_obj = Map::new();
+    for (instance_key, kvs) in providers {
+        let mut normalized = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+        normalized.extend(kvs.clone());
+
+        if normalized
+            .lookup(rustfs_config::oidc::OIDC_CONFIG_URL)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
+
+        let provider = build_oidc_provider_object(&normalized);
+        if provider.is_empty() {
+            continue;
+        }
+
+        let external_key = if instance_key == DEFAULT_DELIMITER {
+            "default".to_string()
+        } else {
+            instance_key.clone()
+        };
+        oidc_obj.insert(external_key, Value::Object(provider));
+    }
+
+    oidc_obj
+}
+
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut root = seed.and_then(parse_object_seed).unwrap_or_default();
 
@@ -261,6 +469,15 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
     root.insert("storageclass".to_string(), Value::Object(sc_obj));
     root.remove("storage_class");
 
+    let oidc_obj = build_oidc_object(cfg);
+    if oidc_obj.is_empty() {
+        root.remove("openid");
+        root.remove(IDENTITY_OPENID_SUB_SYS);
+    } else {
+        root.insert("openid".to_string(), Value::Object(oidc_obj));
+        root.remove(IDENTITY_OPENID_SUB_SYS);
+    }
+
     Ok(serde_json::to_vec(&Value::Object(root))?)
 }
 
@@ -278,6 +495,7 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
     build_storageclass_object(lhs) == build_storageclass_object(rhs)
+        && build_semantic_oidc_object(lhs) == build_semantic_oidc_object(rhs)
 }
 
 fn is_object_not_found(err: &Error) -> bool {
@@ -287,7 +505,14 @@ fn is_object_not_found(err: &Error) -> bool {
 pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
     let config_file = get_config_file();
     match api
-        .get_object_info(RUSTFS_META_BUCKET, &config_file, &ObjectOptions::default())
+        .get_object_info(
+            RUSTFS_META_BUCKET,
+            &config_file,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(_) => {
@@ -360,7 +585,13 @@ pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
-    let cfg = new_and_save_server_config(api).await?;
+    let cfg = if is_first_cluster_node_local().await {
+        new_and_save_server_config(api.clone()).await?
+    } else {
+        let mut cfg = new_server_config();
+        lookup_configs(&mut cfg, api).await;
+        cfg
+    };
     warn!("Configuration initialization complete ({})", context);
     Ok(cfg)
 }
@@ -375,7 +606,7 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     let config_file = get_config_file();
 
     // Try to read the configuration file
-    match read_config(api.clone(), &config_file).await {
+    match read_config_no_lock(api.clone(), &config_file).await {
         Ok(data) => read_server_config(api, &data).await,
         Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration").await,
         Err(err) => handle_config_read_error(err, &config_file),
@@ -389,7 +620,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
         warn!("Received empty configuration data, try to reread from '{}'", config_file);
 
         // Try to read the configuration again
-        match read_config(api.clone(), &config_file).await {
+        match read_config_no_lock(api.clone(), &config_file).await {
             Ok(cfg_data) => {
                 // TODO: decrypt
                 let cfg = decode_server_config_blob(&cfg_data)?;
@@ -481,7 +712,9 @@ mod tests {
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
         storage_class_kvs_mut,
     };
-    use crate::config::Config;
+    use crate::config::{Config, oidc};
+    use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
     use serde_json::Value;
 
     #[test]
@@ -524,6 +757,54 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_server_config_reads_openid_providers() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "openid":{
+            "default":{
+              "enable":true,
+              "config_url":"https://example.com/.well-known/openid-configuration",
+              "client_id":"console",
+              "client_secret":"secret-value",
+              "scopes":["openid","profile","email"],
+              "redirect_uri_dynamic":true,
+              "display_name":"Default Provider"
+            },
+            "smoke":{
+              "enable":false,
+              "config_url":"https://issuer.example.com/.well-known/openid-configuration",
+              "client_id":"smoke-client",
+              "scopes":["openid"],
+              "redirect_uri_dynamic":false
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+
+        let default_kvs = cfg
+            .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("default oidc provider should exist");
+        assert_eq!(
+            default_kvs.get(rustfs_config::oidc::OIDC_CONFIG_URL),
+            "https://example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "console");
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_SCOPES), "openid,profile,email");
+        assert_eq!(default_kvs.get(ENABLE_KEY), EnableState::On.to_string());
+
+        let smoke_kvs = cfg
+            .get_value(IDENTITY_OPENID_SUB_SYS, "smoke")
+            .expect("named oidc provider should exist");
+        assert_eq!(smoke_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "smoke-client");
+        assert_eq!(
+            smoke_kvs.get(rustfs_config::oidc::OIDC_REDIRECT_URI_DYNAMIC),
+            EnableState::Off.to_string()
+        );
+    }
+
+    #[test]
     fn test_encode_server_config_writes_external_object_shape() {
         let mut cfg = Config::new();
         let kvs = storage_class_kvs_mut(&mut cfg);
@@ -535,6 +816,48 @@ mod tests {
         assert!(v.get("version").is_some(), "external object should have version");
         assert!(v.get("storageclass").is_some(), "external object should have storageclass");
         assert!(v.get("storage_class").is_none(), "should not write rustfs map shape");
+    }
+
+    #[test]
+    fn test_encode_server_config_writes_openid_object_shape() {
+        let mut cfg = Config::new();
+        let mut oidc_section = std::collections::HashMap::new();
+        let mut default_provider = oidc::DEFAULT_IDENTITY_OPENID_KVS.clone();
+        default_provider.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        default_provider.insert(
+            rustfs_config::oidc::OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        default_provider.insert(rustfs_config::oidc::OIDC_CLIENT_ID.to_string(), "console".to_string());
+        default_provider.insert(rustfs_config::oidc::OIDC_SCOPES.to_string(), "openid,profile,email".to_string());
+        oidc_section.insert(DEFAULT_DELIMITER.to_string(), default_provider);
+        cfg.0.insert(IDENTITY_OPENID_SUB_SYS.to_string(), oidc_section);
+
+        let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+        let v: Value = serde_json::from_slice(&out).expect("output should be json");
+        let openid = v
+            .get("openid")
+            .and_then(Value::as_object)
+            .expect("output should include openid object");
+        let default_provider = openid
+            .get("default")
+            .and_then(Value::as_object)
+            .expect("default provider should be encoded");
+
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_CLIENT_ID)
+                .and_then(Value::as_str),
+            Some("console")
+        );
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_SCOPES)
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["openid", "profile", "email"])
+        );
+        assert_eq!(default_provider.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
     }
 
     #[test]
@@ -550,6 +873,41 @@ mod tests {
     fn test_configs_semantically_equal_for_equivalent_shapes() {
         let external = br#"{"version":"33","storageclass":{"standard":"EC:2","rrs":"EC:1","optimize":"availability"}}"#;
         let legacy = br#"{"storage_class":{"_":[{"key":"standard","value":"EC:2"},{"key":"rrs","value":"EC:1"},{"key":"optimize","value":"availability"}]}}"#;
+        let lhs = decode_server_config_blob(external).expect("decode external");
+        let rhs = decode_server_config_blob(legacy).expect("decode legacy");
+        assert!(configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[test]
+    fn test_configs_semantically_equal_accounts_for_openid() {
+        let external = br#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1","optimize":"availability"},
+          "openid":{
+            "default":{
+              "enable":true,
+              "config_url":"https://example.com/.well-known/openid-configuration",
+              "client_id":"console",
+              "scopes":["openid","profile","email"],
+              "redirect_uri_dynamic":true
+            }
+          }
+        }"#;
+        let legacy = br#"{
+          "storage_class":{"_":[
+            {"key":"standard","value":"EC:2"},
+            {"key":"rrs","value":"EC:1"},
+            {"key":"optimize","value":"availability"}
+          ]},
+          "identity_openid":{"_":[
+            {"key":"enable","value":"on"},
+            {"key":"config_url","value":"https://example.com/.well-known/openid-configuration"},
+            {"key":"client_id","value":"console"},
+            {"key":"scopes","value":"openid,profile,email"},
+            {"key":"redirect_uri_dynamic","value":"on"}
+          ]}
+        }"#;
+
         let lhs = decode_server_config_blob(external).expect("decode external");
         let rhs = decode_server_config_blob(legacy).expect("decode legacy");
         assert!(configs_semantically_equal(&lhs, &rhs));

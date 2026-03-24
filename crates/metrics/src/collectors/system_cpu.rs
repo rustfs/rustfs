@@ -16,16 +16,18 @@
 
 //! System CPU metrics collector.
 //!
-//! Collects CPU-related metrics including load average, idle time,
-//! I/O wait, and CPU usage percentages.
+//! Collects CPU metrics including load average, CPU time distribution,
+//! and process-level CPU usage.
 //!
-//! This collector reuses the metric descriptors defined in `metrics_type::system_cpu`
-//! to avoid duplication of metric names, types, and help text.
+//! This module provides both system-level and process-level CPU metrics,
+//! with process-level metrics migrated from `rustfs-obs::system`.
 
 use crate::format::PrometheusMetric;
 use crate::metrics_type::system_cpu::*;
+use crate::metrics_type::system_process::{PROCESS_CPU_USAGE_MD, PROCESS_CPU_UTILIZATION_MD};
+use std::borrow::Cow;
 
-/// CPU statistics for a node.
+/// System CPU statistics.
 #[derive(Debug, Clone, Default)]
 pub struct CpuStats {
     /// Average CPU idle time (percentage, 0-100)
@@ -46,6 +48,17 @@ pub struct CpuStats {
     pub user: f64,
 }
 
+/// Process CPU statistics.
+///
+/// Contains CPU usage metrics for a specific process.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessCpuStats {
+    /// CPU usage percentage (0-100)
+    pub usage: f64,
+    /// CPU utilization percentage (considering multiple cores, can exceed 100)
+    pub utilization: f64,
+}
+
 /// Collects CPU metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::system_cpu` module.
@@ -63,6 +76,29 @@ pub fn collect_cpu_metrics(stats: &CpuStats) -> Vec<PrometheusMetric> {
     ]
 }
 
+/// Collects process CPU metrics from the given stats.
+///
+/// Uses the metric descriptors from `metrics_type::system_process` module.
+/// Returns a vector of Prometheus metrics for process CPU statistics.
+///
+/// # Arguments
+///
+/// * `stats` - Process CPU statistics
+/// * `labels` - Optional additional labels (e.g., process attributes)
+pub fn collect_process_cpu_metrics(
+    stats: &ProcessCpuStats,
+    labels: Option<&[(&'static str, Cow<'static, str>)]>,
+) -> Vec<PrometheusMetric> {
+    let mut usage_metric = PrometheusMetric::from_descriptor(&PROCESS_CPU_USAGE_MD, stats.usage);
+    let mut utilization_metric = PrometheusMetric::from_descriptor(&PROCESS_CPU_UTILIZATION_MD, stats.utilization);
+
+    if let Some(l) = labels {
+        usage_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+        utilization_metric.labels.extend(l.iter().map(|(k, v)| (*k, v.clone())));
+    }
+
+    vec![usage_metric, utilization_metric]
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +135,50 @@ mod tests {
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_collect_process_cpu_metrics() {
+        let stats = ProcessCpuStats {
+            usage: 45.5,
+            utilization: 182.0, // 4 cores at ~45% each
+        };
+
+        let metrics = collect_process_cpu_metrics(&stats, None);
+        report_metrics(&metrics);
+
+        assert_eq!(metrics.len(), 2);
+
+        // Verify usage metric
+        let usage_metric = metrics.iter().find(|m| m.name.contains("cpu_usage"));
+        assert!(usage_metric.is_some());
+        assert_eq!(usage_metric.map(|m| m.value), Some(45.5));
+
+        // Verify utilization metric
+        let util_metric = metrics.iter().find(|m| m.name.contains("cpu_utilization"));
+        assert!(util_metric.is_some());
+        assert_eq!(util_metric.map(|m| m.value), Some(182.0));
+    }
+
+    #[test]
+    fn test_collect_process_cpu_metrics_with_labels() {
+        let stats = ProcessCpuStats {
+            usage: 25.0,
+            utilization: 100.0,
+        };
+
+        let labels = vec![
+            ("process_pid", Cow::Borrowed("12345")),
+            ("process_executable_name", Cow::Borrowed("rustfs")),
+        ];
+
+        let metrics = collect_process_cpu_metrics(&stats, Some(&labels));
+        assert_eq!(metrics.len(), 2);
+
+        // All metrics should have the labels
+        for metric in &metrics {
+            assert_eq!(metric.labels.len(), 2);
         }
     }
 }

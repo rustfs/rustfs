@@ -29,7 +29,7 @@ use crate::client::{
 };
 use crate::tier::{
     tier_config::TierMinIO,
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
 use tracing::warn;
@@ -106,19 +106,12 @@ impl WarmBackend for WarmBackendMinIO {
         let part_size = optimal_part_size(length)?;
         let client = self.0.client.clone();
         let res = client
-            .put_object(
-                &self.0.bucket,
-                &self.0.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    storage_class: self.0.storage_class.clone(),
-                    part_size: part_size as u64,
-                    disable_content_sha256: true,
-                    user_metadata: meta,
-                    ..Default::default()
-                },
-            )
+            .put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &{
+                let mut opts = build_transition_put_options(self.0.storage_class.clone(), meta);
+                opts.part_size = part_size as u64;
+                opts.disable_content_sha256 = true;
+                opts
+            })
             .await?;
         //self.ToObjectError(err, object)
         Ok(res.version_id)

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, SystemObserver, telemetry::init_telemetry};
+use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
@@ -116,17 +116,8 @@ pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError
 /// ```
 pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, GlobalError> {
     let otel_guard = init_telemetry(config)?;
-    tokio::spawn(async move {
-        let obs_result = SystemObserver::init_process_observer().await;
-        match obs_result {
-            Ok(_) => {
-                info!(target: "rustfs::obs::system::metrics", "Process observer initialized successfully");
-            }
-            Err(e) => {
-                error!(target: "rustfs::obs::system::metrics", "Failed to initialize process observer: {}", e);
-            }
-        }
-    });
+    // Note: System monitoring has been migrated to rustfs-metrics
+    // Use rustfs_metrics::init_metrics_collectors() for system metrics
     Ok(otel_guard)
 }
 

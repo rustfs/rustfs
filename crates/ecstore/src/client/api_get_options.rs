@@ -64,20 +64,32 @@ impl GetObjectOptions {
     pub fn header(&self) -> HeaderMap {
         let mut headers: HeaderMap = HeaderMap::with_capacity(self.headers.len());
         for (k, v) in &self.headers {
-            if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
-                headers.insert(header_name, v.parse().expect("err"));
-            } else {
-                warn!("Invalid header name: {}", k);
+            match (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+                (Ok(header_name), Ok(header_value)) => {
+                    headers.insert(header_name, header_value);
+                }
+                (Err(_), _) => {
+                    warn!("Invalid header name: {}", k);
+                }
+                (_, Err(_)) => {
+                    warn!("Invalid header value for {}: {:?}", k, v);
+                }
             }
         }
         if self.checksum {
-            headers.insert("x-amz-checksum-mode", "ENABLED".parse().expect("err"));
+            headers.insert(HeaderName::from_static("x-amz-checksum-mode"), HeaderValue::from_static("ENABLED"));
         }
         headers
     }
 
-    pub fn set(&mut self, key: &str, value: &str) {
-        self.headers.insert(key.to_string(), value.to_string());
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), std::io::Error> {
+        let header_name = HeaderName::from_bytes(key.as_bytes())
+            .map_err(|err| std::io::Error::other(err_invalid_argument(&format!("Invalid header name {key}: {err}"))))?;
+        HeaderValue::from_str(value)
+            .map_err(|err| std::io::Error::other(err_invalid_argument(&format!("Invalid header value for {key}: {err}"))))?;
+
+        self.headers.insert(header_name.as_str().to_string(), value.to_string());
+        Ok(())
     }
 
     pub fn set_req_param(&mut self, key: &str, value: &str) {
@@ -89,12 +101,12 @@ impl GetObjectOptions {
     }
 
     pub fn set_match_etag(&mut self, etag: &str) -> Result<(), std::io::Error> {
-        self.set("If-Match", &format!("\"{etag}\""));
+        self.set("If-Match", &format!("\"{etag}\""))?;
         Ok(())
     }
 
     pub fn set_match_etag_except(&mut self, etag: &str) -> Result<(), std::io::Error> {
-        self.set("If-None-Match", &format!("\"{etag}\""));
+        self.set("If-None-Match", &format!("\"{etag}\""))?;
         Ok(())
     }
 
@@ -102,7 +114,7 @@ impl GetObjectOptions {
         if mod_time.unix_timestamp() == 0 {
             return Err(std::io::Error::other(err_invalid_argument("Modified since cannot be empty.")));
         }
-        self.set("If-Unmodified-Since", &mod_time.to_string());
+        self.set("If-Unmodified-Since", &mod_time.to_string())?;
         Ok(())
     }
 
@@ -110,17 +122,17 @@ impl GetObjectOptions {
         if mod_time.unix_timestamp() == 0 {
             return Err(std::io::Error::other(err_invalid_argument("Modified since cannot be empty.")));
         }
-        self.set("If-Modified-Since", &mod_time.to_string());
+        self.set("If-Modified-Since", &mod_time.to_string())?;
         Ok(())
     }
 
     pub fn set_range(&mut self, start: i64, end: i64) -> Result<(), std::io::Error> {
         if start == 0 && end < 0 {
-            self.set("Range", &format!("bytes={}", end));
+            self.set("Range", &format!("bytes={}", end))?;
         } else if 0 < start && end == 0 {
-            self.set("Range", &format!("bytes={}-", start));
+            self.set("Range", &format!("bytes={}-", start))?;
         } else if 0 <= start && start <= end {
-            self.set("Range", &format!("bytes={}-{}", start, end));
+            self.set("Range", &format!("bytes={}-{}", start, end))?;
         } else {
             return Err(std::io::Error::other(err_invalid_argument(&format!(
                 "Invalid range specified: start={} end={}",
@@ -154,8 +166,32 @@ mod tests {
     #[test]
     fn set_range_populates_range_header() {
         let mut opts = GetObjectOptions::default();
-        opts.set_range(10, 19).unwrap();
+        opts.set_range(5, 9).expect("valid range should succeed");
 
-        assert_eq!(opts.headers.get("Range").map(String::as_str), Some("bytes=10-19"));
+        let headers = opts.header();
+        let range = headers.get("range").expect("range header should be present");
+        assert_eq!(range.to_str().expect("range header must be valid ascii"), "bytes=5-9");
+    }
+
+    #[test]
+    fn set_rejects_invalid_header_value() {
+        let mut opts = GetObjectOptions::default();
+
+        let err = opts
+            .set("Range", "bytes=5-\n9")
+            .expect_err("invalid header value should fail");
+
+        assert!(err.to_string().contains("Invalid header value"));
+        assert!(opts.headers.is_empty(), "invalid headers must not be stored");
+    }
+
+    #[test]
+    fn header_skips_invalid_prepopulated_header_value() {
+        let mut opts = GetObjectOptions::default();
+        opts.headers.insert("Range".to_string(), "bytes=5-\n9".to_string());
+
+        let headers = opts.header();
+
+        assert!(headers.get("range").is_none(), "invalid stored header values should be ignored");
     }
 }

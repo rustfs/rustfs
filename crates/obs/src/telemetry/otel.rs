@@ -41,17 +41,17 @@ use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::OtelGuard;
-// Import helper functions from local.rs (sibling module)
-use crate::TelemetryError;
 use crate::telemetry::local::spawn_cleanup_task;
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
+// Import helper functions from local.rs (sibling module)
+use crate::TelemetryError;
 use metrics::counter;
-use opentelemetry::{global, trace::TracerProvider};
+use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
@@ -326,7 +326,8 @@ pub(super) fn init_observability_http(
 ///
 /// Returns `None` when the endpoint is empty or trace export is disabled.
 /// When enabled, the provider is also registered as the global tracer provider
-/// and installs the W3C trace-context propagator.
+/// and installs a composite propagator supporting both W3C TraceContext
+/// (traceparent header) and W3C Baggage (baggage header) propagation.
 fn build_tracer_provider(
     trace_ep: &str,
     config: &OtelConfig,
@@ -358,7 +359,14 @@ fn build_tracer_provider(
 
     let provider = builder.build();
     global::set_tracer_provider(provider.clone());
-    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    // Configure composite propagator to support multiple trace context formats:
+    // - W3C TraceContext (traceparent header) - standard format for distributed tracing
+    // - W3C Baggage (baggage header) - for propagating user-defined key-value pairs
+    let propagator =
+        TextMapCompositePropagator::new(vec![Box::new(TraceContextPropagator::new()), Box::new(BaggagePropagator::new())]);
+    global::set_text_map_propagator(propagator);
+
     Ok(Some(provider))
 }
 

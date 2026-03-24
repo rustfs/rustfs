@@ -25,8 +25,12 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use rustfs_common::data_usage::TierStats;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
 use rustfs_ecstore::{
+    bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
+    client::admin_handler_utils::AdminError,
     config::storageclass,
     tier::{
         tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
@@ -45,6 +49,7 @@ use s3s::{
     s3_error,
 };
 use serde_urlencoded::from_bytes;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
 
@@ -484,9 +489,10 @@ impl Operation for VerifyTier {
         )
         .await?;
 
+        let tier_name = require_tier_name(&query)?;
         let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-        tier_config_mgr.verify(&query.tier.unwrap()).await;
+        tier_config_mgr.verify(tier_name).await.map_err(map_tier_verify_error)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -526,9 +532,12 @@ impl Operation for GetTierInfo {
             }
         };
 
-        let tier_config_mgr_handle = resolve_tier_config_handle();
-        let tier_config_mgr = tier_config_mgr_handle.read().await;
-        let info = tier_config_mgr.get(&query.tier.unwrap());
+        let tier_name = if query.tier.is_some() {
+            Some(require_tier_name(&query)?)
+        } else {
+            None
+        };
+        let info = filter_tier_stats(GLOBAL_TransitionState.get_daily_all_tier_stats(), tier_name);
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
@@ -538,6 +547,51 @@ impl Operation for GetTierInfo {
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
+}
+
+fn optional_tier_name(query: &AddTierQuery) -> Option<&str> {
+    query.tier.as_deref().map(str::trim).filter(|tier| !tier.is_empty())
+}
+
+fn require_tier_name(query: &AddTierQuery) -> S3Result<&str> {
+    optional_tier_name(query).ok_or_else(|| s3_error!(InvalidArgument, "tier is required"))
+}
+
+fn filter_tier_stats(daily_stats: DailyAllTierStats, tier_name: Option<&str>) -> HashMap<String, TierStats> {
+    daily_stats
+        .into_iter()
+        .filter_map(|(name, stats)| {
+            if tier_name.is_some_and(|requested| !name.eq_ignore_ascii_case(requested)) {
+                return None;
+            }
+
+            Some((name, stats.total()))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn map_tier_verify_error(err: std::io::Error) -> S3Error {
+    if let Some(admin_err) = err.get_ref().and_then(|inner| inner.downcast_ref::<AdminError>()) {
+        return match admin_err.code.as_str() {
+            code if code == ERR_TIER_NOT_FOUND.code => {
+                S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!")
+            }
+            code if code == ERR_TIER_CONNECT_ERR.code => S3Error::with_message(
+                S3ErrorCode::Custom("TierVerificationFailed".into()),
+                format!("tier verification failed. {}", admin_err.message),
+            ),
+            _ => S3Error::with_message(
+                S3ErrorCode::Custom("TierVerificationFailed".into()),
+                format!("tier verification failed. {}", admin_err.message),
+            ),
+        };
+    }
+
+    S3Error::with_message(
+        S3ErrorCode::Custom("TierVerificationFailed".into()),
+        format!("tier verification failed. {err}"),
+    )
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -612,5 +666,113 @@ impl Operation for ClearTier {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+
+    #[test]
+    fn require_tier_name_rejects_missing_value() {
+        let err = require_tier_name(&AddTierQuery::default()).expect_err("missing tier should return an error");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn require_tier_name_rejects_empty_value() {
+        let err = require_tier_name(&AddTierQuery {
+            tier: Some("   ".to_string()),
+            ..Default::default()
+        })
+        .expect_err("empty tier should return an error");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn filter_tier_stats_returns_all_tiers_without_filter() {
+        let stats = filter_tier_stats(sample_daily_stats(), None);
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(
+            stats.get("WARM"),
+            Some(&TierStats {
+                total_size: 15,
+                num_versions: 3,
+                num_objects: 1,
+            })
+        );
+        assert_eq!(
+            stats.get("ARCHIVE"),
+            Some(&TierStats {
+                total_size: 9,
+                num_versions: 1,
+                num_objects: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn filter_tier_stats_applies_case_insensitive_filter() {
+        let stats = filter_tier_stats(sample_daily_stats(), Some("warm"));
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            stats.get("WARM"),
+            Some(&TierStats {
+                total_size: 15,
+                num_versions: 3,
+                num_objects: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn map_tier_verify_error_preserves_not_found() {
+        let err = std::io::Error::other(ERR_TIER_NOT_FOUND.clone());
+        let mapped = map_tier_verify_error(err);
+
+        assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierNotFound".into()));
+        assert_eq!(mapped.message(), Some("tier not found!"));
+    }
+
+    #[test]
+    fn map_tier_verify_error_wraps_other_failures() {
+        let err = std::io::Error::other("backend unavailable");
+        let mapped = map_tier_verify_error(err);
+
+        assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierVerificationFailed".into()));
+        assert_eq!(mapped.message(), Some("tier verification failed. backend unavailable"));
+    }
+
+    fn sample_daily_stats() -> DailyAllTierStats {
+        let mut warm = LastDayTierStats::default();
+        warm.add_stats(TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        warm.add_stats(TierStats {
+            total_size: 5,
+            num_versions: 2,
+            num_objects: 0,
+        });
+
+        let mut archive = LastDayTierStats::default();
+        archive.add_stats(TierStats {
+            total_size: 9,
+            num_versions: 1,
+            num_objects: 1,
+        });
+
+        let mut stats = DailyAllTierStats::new();
+        stats.insert("WARM".to_string(), warm);
+        stats.insert("ARCHIVE".to_string(), archive);
+        stats
     }
 }

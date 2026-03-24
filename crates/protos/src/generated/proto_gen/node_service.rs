@@ -467,6 +467,10 @@ pub struct UpdateMetadataRequest {
     pub file_info: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub file_info_bin: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub opts_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpdateMetadataResponse {
@@ -486,6 +490,8 @@ pub struct WriteMetadataRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub file_info: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub file_info_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteMetadataResponse {
@@ -506,6 +512,8 @@ pub struct ReadVersionRequest {
     pub version_id: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub opts_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadVersionResponse {
@@ -515,6 +523,8 @@ pub struct ReadVersionResponse {
     pub file_info: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub file_info_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadXlRequest {
@@ -535,6 +545,8 @@ pub struct ReadXlResponse {
     pub raw_file_info: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub raw_file_info_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVersionRequest {
@@ -586,6 +598,8 @@ pub struct ReadMultipleRequest {
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub read_multiple_req: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub read_multiple_req_bin: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadMultipleResponse {
@@ -595,6 +609,8 @@ pub struct ReadMultipleResponse {
     pub read_multiple_resps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub read_multiple_resps_bin: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVolumeRequest {

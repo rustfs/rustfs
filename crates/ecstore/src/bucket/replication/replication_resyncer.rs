@@ -2466,7 +2466,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS");
+        if let Err(err) = sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS") {
+            warn!("failed to set replication tagging directive header: {err}");
+        }
 
         match tgt_client
             .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))

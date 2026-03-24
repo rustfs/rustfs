@@ -2313,7 +2313,7 @@ where
             return true;
         }
 
-        is_admin_path(path) || path.starts_with(RPC_PREFIX) || is_console_path(path)
+        is_admin_path(path) || is_console_path(path)
     }
 
     // check_access before call
@@ -2347,18 +2347,6 @@ where
 
         // Allow unauthenticated access to OIDC endpoints (user not yet authenticated)
         if is_oidc_path(path) {
-            return Ok(());
-        }
-
-        // Check RPC signature verification
-        if req.uri.path().starts_with(RPC_PREFIX) {
-            // Skip signature verification for HEAD requests (health checks)
-            if req.method != Method::HEAD {
-                verify_rpc_signature(&req.uri.to_string(), &req.method, &req.headers).map_err(|e| {
-                    error!("RPC signature verification failed: {}", e);
-                    s3_error!(AccessDenied, "{}", e)
-                })?;
-            }
             return Ok(());
         }
 

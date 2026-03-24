@@ -40,7 +40,6 @@ swift = [
     "dep:sha2",
     "dep:uuid",
     "dep:futures",
-    "dep:http-body",
     "dep:http-body-util",
     "dep:tokio-util",
     "dep:serde",
@@ -99,7 +98,6 @@ percent-encoding = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

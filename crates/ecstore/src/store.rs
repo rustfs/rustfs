@@ -159,8 +159,8 @@ mod rebalance;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk, get_disk_infos, get_disk_via_endpoint, has_space_for, init_local_disks,
-    init_lock_clients,
+    all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
+    has_space_for, init_local_disks, init_lock_clients,
 };
 
 #[derive(Debug)]
