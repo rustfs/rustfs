@@ -29,6 +29,7 @@ use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
+use url::Url;
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
@@ -40,6 +41,9 @@ pub(crate) struct ReqInfo {
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct PostObjectRequestMarker;
 
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
     req.extensions
@@ -359,6 +363,35 @@ fn put_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
 }
 
+fn post_object_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
+fn complete_multipart_upload_authorize_action() -> Action {
+    Action::S3Action(S3Action::PutObjectAction)
+}
+
+fn list_parts_authorize_action() -> Action {
+    Action::S3Action(S3Action::ListMultipartUploadPartsAction)
+}
+
+fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()> {
+    if let Some(status) = input.success_action_status
+        && !matches!(status, 200 | 201 | 204)
+    {
+        return Err(s3_error!(MalformedPOSTRequest, "success_action_status must be one of 200, 201, or 204"));
+    }
+
+    if let Some(redirect) = input.success_action_redirect.as_deref().map(str::trim)
+        && !redirect.is_empty()
+        && Url::parse(redirect).is_err()
+    {
+        return Err(s3_error!(MalformedPOSTRequest, "success_action_redirect must be a valid absolute URL"));
+    }
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl S3Access for FS {
     // /// Checks whether the current request has accesses to the resources.
@@ -437,15 +470,23 @@ impl S3Access for FS {
     /// Checks whether the AbortMultipartUpload request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn abort_multipart_upload(&self, _req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
-        Ok(())
+    async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await
     }
 
     /// Checks whether the CompleteMultipartUpload request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn complete_multipart_upload(&self, _req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
-        Ok(())
+    async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, complete_multipart_upload_authorize_action()).await
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
@@ -617,8 +658,11 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_website(&self, _req: &mut S3Request<DeleteBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_website(&self, req: &mut S3Request<DeleteBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the DeleteObject request has accesses to the resources.
@@ -708,9 +752,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_bucket_accelerate_configuration(
         &self,
-        _req: &mut S3Request<GetBucketAccelerateConfigurationInput>,
+        req: &mut S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketAcl request has accesses to the resources.
@@ -866,8 +913,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketRequestPayment request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_request_payment(&self, _req: &mut S3Request<GetBucketRequestPaymentInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_request_payment(&self, req: &mut S3Request<GetBucketRequestPaymentInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketTagging request has accesses to the resources.
@@ -893,8 +943,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_website(&self, _req: &mut S3Request<GetBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_website(&self, req: &mut S3Request<GetBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetObject request has accesses to the resources.
@@ -1142,8 +1195,25 @@ impl S3Access for FS {
     /// Checks whether the ListParts request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn list_parts(&self, _req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
-        Ok(())
+    async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, list_parts_authorize_action()).await
+    }
+
+    /// Checks whether the PostObject request has accesses to the resources.
+    async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
+        validate_post_object_success_controls(&req.input)?;
+
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+        req.extensions.insert(PostObjectRequestMarker);
+
+        authorize_request(req, post_object_authorize_action()).await
     }
 
     /// Checks whether the PutBucketAccelerateConfiguration request has accesses to the resources.
@@ -1151,9 +1221,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_bucket_accelerate_configuration(
         &self,
-        _req: &mut S3Request<PutBucketAccelerateConfigurationInput>,
+        req: &mut S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketAcl request has accesses to the resources.
@@ -1286,8 +1359,11 @@ impl S3Access for FS {
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_request_payment(&self, _req: &mut S3Request<PutBucketRequestPaymentInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_request_payment(&self, req: &mut S3Request<PutBucketRequestPaymentInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketTagging request has accesses to the resources.
@@ -1313,8 +1389,11 @@ impl S3Access for FS {
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_website(&self, _req: &mut S3Request<PutBucketWebsiteInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_website(&self, req: &mut S3Request<PutBucketWebsiteInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutObject request has accesses to the resources.
@@ -1444,8 +1523,35 @@ impl S3Access for FS {
     /// Checks whether the UploadPartCopy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn upload_part_copy(&self, _req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
-        Ok(())
+    async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        {
+            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
+                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Bucket { bucket, key, version_id } => {
+                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
+                }
+            };
+
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
+            req_info.bucket = Some(src_bucket.clone());
+            req_info.object = Some(src_key.clone());
+            req_info.version_id = version_id.clone();
+
+            let tag_conds = self
+                .fetch_tag_conditions(&src_bucket, &src_key, version_id.as_deref(), "upload_part_copy_src")
+                .await?;
+            req.extensions.insert(tag_conds);
+
+            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        }
+
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = None;
+
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.
@@ -1459,6 +1565,7 @@ impl S3Access for FS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{HeaderMap, Method, Uri};
     use std::collections::HashMap;
 
     #[test]
@@ -1469,6 +1576,74 @@ mod tests {
     #[test]
     fn put_bucket_policy_uses_put_bucket_policy_action() {
         assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
+    }
+
+    #[test]
+    fn post_object_uses_put_object_action() {
+        assert_eq!(post_object_authorize_action(), Action::S3Action(S3Action::PutObjectAction));
+    }
+
+    #[test]
+    fn complete_multipart_upload_uses_put_object_action() {
+        assert_eq!(complete_multipart_upload_authorize_action(), Action::S3Action(S3Action::PutObjectAction));
+    }
+
+    #[test]
+    fn list_parts_uses_list_multipart_upload_parts_action() {
+        assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_accepts_supported_status_codes() {
+        for status in [200, 201, 204] {
+            let input = PostObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("test-key".to_string())
+                .success_action_status(Some(status))
+                .build()
+                .expect("post object input should build");
+            assert!(
+                validate_post_object_success_controls(&input).is_ok(),
+                "status {status} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_rejects_invalid_status_code() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_status(Some(202))
+            .build()
+            .expect("post object input should build");
+
+        let err = validate_post_object_success_controls(&input).expect_err("status 202 should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::MalformedPOSTRequest);
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_accepts_empty_redirect() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_redirect(Some("".to_string()))
+            .build()
+            .expect("post object input should build");
+        assert!(validate_post_object_success_controls(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_post_object_success_controls_rejects_invalid_redirect() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .success_action_redirect(Some("://invalid-url".to_string()))
+            .build()
+            .expect("post object input should build");
+
+        let err = validate_post_object_success_controls(&input).expect_err("invalid redirect should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::MalformedPOSTRequest);
     }
 
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
@@ -1514,5 +1689,35 @@ mod tests {
             false,
             &Action::S3Action(S3Action::DeleteBucketPolicyAction)
         ));
+    }
+
+    #[tokio::test]
+    async fn post_object_marks_request_extensions() {
+        let input = PostObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("post object input should build");
+
+        let mut req = S3Request {
+            input,
+            method: Method::POST,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.extensions.insert(ReqInfo::default());
+
+        let fs = FS::new();
+        let _ = fs.post_object(&mut req).await;
+
+        assert!(
+            req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            "post object request should carry the marker for downstream handling"
+        );
     }
 }

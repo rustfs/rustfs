@@ -21,7 +21,7 @@
 //! - Concurrent encryption operations
 //! - Security validation tests
 
-use super::common::LocalKMSTestEnvironment;
+use super::common::{LocalKMSTestEnvironment, sse_customer_key_md5_base64};
 use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::Engine;
@@ -72,7 +72,7 @@ async fn test_kms_zero_byte_file_encryption() -> Result<(), Box<dyn std::error::
     info!("📤 Testing SSE-C with zero-byte file");
     let test_key = "01234567890123456789012345678901";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", compute(test_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let object_key_c = "zero-byte-sse-c";
 
     let _put_response_c = s3_client
@@ -166,7 +166,7 @@ async fn test_kms_single_byte_file_encryption() -> Result<(), Box<dyn std::error
     info!("📤 Testing SSE-C with single-byte file");
     let test_key = "01234567890123456789012345678901";
     let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let test_key_md5 = format!("{:x}", compute(test_key));
+    let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let object_key_c = "single-byte-sse-c";
 
     s3_client
@@ -334,7 +334,7 @@ async fn test_kms_invalid_key_scenarios() -> Result<(), Box<dyn std::error::Erro
     info!("🔍 Testing access to SSE-C object without key");
 
     // First upload a valid SSE-C object
-    let valid_key_md5 = format!("{:x}", compute(valid_key));
+    let valid_key_md5 = sse_customer_key_md5_base64(valid_key);
     s3_client
         .put_object()
         .bucket(TEST_BUCKET)
@@ -421,7 +421,7 @@ async fn test_kms_concurrent_encryption() -> Result<(), Box<dyn std::error::Erro
                     // SSE-C
                     let key = format!("testkey{i:026}"); // 32-byte key
                     let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key);
-                    let key_md5 = format!("{:x}", compute(&key));
+                    let key_md5 = sse_customer_key_md5_base64(&key);
 
                     client
                         .put_object()
@@ -493,8 +493,8 @@ async fn test_kms_key_validation_security() -> Result<(), Box<dyn std::error::Er
 
     let key1_b64 = base64::engine::general_purpose::STANDARD.encode(key1);
     let key2_b64 = base64::engine::general_purpose::STANDARD.encode(key2);
-    let key1_md5 = format!("{:x}", compute(key1));
-    let key2_md5 = format!("{:x}", compute(key2));
+    let key1_md5 = sse_customer_key_md5_base64(key1);
+    let key2_md5 = sse_customer_key_md5_base64(key2);
 
     // Upload same data with different keys
     s3_client
