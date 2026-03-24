@@ -26,7 +26,7 @@ use rustfs_ecstore::{
     },
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
-        warm_backend::{WarmBackend, WarmBackendGetOpts},
+        warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     },
 };
 use rustfs_scanner::scanner::init_data_scanner;
@@ -375,13 +375,22 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
 }
 
 #[derive(Clone, Default)]
+struct MockStoredObject {
+    bytes: Vec<u8>,
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Clone, Default)]
 struct MockWarmBackend {
-    objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    objects: Arc<Mutex<HashMap<String, MockStoredObject>>>,
 }
 
 impl MockWarmBackend {
-    async fn put_bytes(&self, object: &str, bytes: Vec<u8>) -> String {
-        self.objects.lock().await.insert(object.to_string(), bytes);
+    async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
+        self.objects
+            .lock()
+            .await
+            .insert(object.to_string(), MockStoredObject { bytes, metadata });
         Uuid::new_v4().to_string()
     }
 
@@ -401,7 +410,7 @@ impl MockWarmBackend {
 impl WarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes).await)
+        Ok(self.put_bytes(object, bytes, HashMap::new()).await)
     }
 
     async fn put_with_meta(
@@ -409,17 +418,38 @@ impl WarmBackend for MockWarmBackend {
         object: &str,
         r: ReaderImpl,
         _length: i64,
-        _meta: HashMap<String, String>,
+        meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes).await)
+        let opts = build_transition_put_options(String::new(), meta);
+        let mut metadata = opts.user_metadata.clone();
+        if !opts.content_type.is_empty() {
+            metadata.insert("content-type".to_string(), opts.content_type.clone());
+        }
+        if !opts.content_encoding.is_empty() {
+            metadata.insert("content-encoding".to_string(), opts.content_encoding.clone());
+        }
+        if !opts.cache_control.is_empty() {
+            metadata.insert("cache-control".to_string(), opts.cache_control.clone());
+        }
+        if !opts.internal.replication_status.as_str().is_empty() {
+            metadata.insert(
+                "x-amz-replication-status".to_string(),
+                opts.internal.replication_status.as_str().to_string(),
+            );
+        }
+        if !opts.legalhold.as_str().is_empty() {
+            metadata.insert("x-amz-object-lock-legal-hold".to_string(), opts.legalhold.as_str().to_string());
+        }
+        Ok(self.put_bytes(object, bytes, metadata).await)
     }
 
     async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         let objects = self.objects.lock().await;
-        let Some(bytes) = objects.get(object) else {
+        let Some(stored) = objects.get(object) else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock object not found"));
         };
+        let bytes = &stored.bytes;
 
         let start = opts.start_offset.max(0) as usize;
         let end = if opts.length > 0 {
@@ -593,7 +623,21 @@ mod serial_tests {
             .await
             .expect("Failed to set lifecycle configuration");
 
-        upload_test_object(&ecstore, put_bucket.as_str(), put_object, put_payload).await;
+        let mut reader = PutObjReader::from_vec(put_payload.to_vec());
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "text/plain".to_string());
+        ecstore
+            .put_object(
+                put_bucket.as_str(),
+                put_object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to upload transition metadata test object");
 
         enqueue_transition_for_existing_objects(ecstore.clone(), put_bucket.as_str())
             .await
@@ -606,6 +650,21 @@ mod serial_tests {
         assert_eq!(put_info.transitioned_object.status, "complete");
         assert_eq!(put_info.transitioned_object.tier, tier_name);
         assert!(backend.objects.lock().await.contains_key(&put_info.transitioned_object.name));
+        {
+            let stored = backend.objects.lock().await;
+            let transitioned = stored
+                .get(&put_info.transitioned_object.name)
+                .expect("transitioned object should be present in mock backend");
+            assert_eq!(transitioned.metadata.get("content-type"), Some(&"text/plain".to_string()));
+            assert!(
+                !transitioned.metadata.contains_key("x-amz-replication-status"),
+                "transitioned objects must not inherit replication status defaults"
+            );
+            assert!(
+                !transitioned.metadata.contains_key("x-amz-object-lock-legal-hold"),
+                "transitioned objects must not invent object lock headers"
+            );
+        }
 
         let multipart_bucket = format!("test-immediate-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let multipart_object = "test/multipart.txt";
