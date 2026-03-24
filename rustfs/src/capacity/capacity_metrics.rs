@@ -15,8 +15,8 @@
 //! Capacity Metrics for monitoring
 
 use metrics::{counter, gauge, histogram};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -86,7 +86,7 @@ impl CapacityMetrics {
         self.total_update_duration_us.fetch_add(duration_us, Ordering::Relaxed);
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
-        histogram!("rustfs.capacity.update.duration_us", duration_us as f64);
+        histogram!("rustfs.capacity.update.duration_us").record(duration_us as f64);
     }
 
     /// Get cache hit rate
@@ -126,12 +126,12 @@ impl CapacityMetrics {
         let summary = self.get_summary();
 
         // Update gauges for current values
-        gauge!("rustfs.capacity.cache.hit_rate", summary.cache_hit_rate);
-        gauge!("rustfs.capacity.cache.hits_total", summary.cache_hits as f64);
-        gauge!("rustfs.capacity.cache.misses_total", summary.cache_misses as f64);
-        gauge!("rustfs.capacity.update.scheduled_total", summary.scheduled_updates as f64);
-        gauge!("rustfs.capacity.update.write_triggered_total", summary.write_triggered_updates as f64);
-        gauge!("rustfs.capacity.update.failures_total", summary.update_failures as f64);
+        gauge!("rustfs.capacity.cache.hit_rate").set(summary.cache_hit_rate);
+        gauge!("rustfs.capacity.cache.hits_total").set(summary.cache_hits as f64);
+        gauge!("rustfs.capacity.cache.misses_total").set(summary.cache_misses as f64);
+        gauge!("rustfs.capacity.update.scheduled_total").set(summary.scheduled_updates as f64);
+        gauge!("rustfs.capacity.update.write_triggered_total").set(summary.write_triggered_updates as f64);
+        gauge!("rustfs.capacity.update.failures_total").set(summary.update_failures as f64);
 
         info!(
             "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}",
