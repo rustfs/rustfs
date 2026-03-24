@@ -335,6 +335,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_get_scheduled_update_interval() {
         let interval = get_scheduled_update_interval();
         assert_eq!(interval, Duration::from_secs(300));

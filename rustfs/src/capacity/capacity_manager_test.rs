@@ -17,10 +17,12 @@
 #[cfg(test)]
 mod tests {
     use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager, HybridStrategyConfig, get_capacity_manager};
+    use serial_test::serial;
     use std::time::Duration;
     use tokio::time::sleep;
 
     #[tokio::test]
+    #[serial]
     async fn test_capacity_manager_initialization() {
         let manager = get_capacity_manager();
         assert!(manager.get_capacity().await.is_none());
@@ -156,6 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_concurrent_access() {
         let manager = get_capacity_manager();
 
@@ -185,6 +188,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_performance_overhead() {
         let manager = get_capacity_manager();
 

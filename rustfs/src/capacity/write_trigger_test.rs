@@ -20,9 +20,11 @@ mod tests {
     use crate::capacity::capacity_metrics::{
         get_capacity_metrics, record_global_cache_hit, record_global_cache_miss, record_global_write_operation,
     };
+    use serial_test::serial;
     use std::time::Duration;
 
     #[tokio::test]
+    #[serial]
     async fn test_write_trigger_integration() {
         let manager = HybridCapacityManager::from_env();
         let metrics = get_capacity_metrics();
@@ -42,6 +44,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_write_trigger_with_capacity_update() {
         let manager = HybridCapacityManager::from_env();
         let metrics = get_capacity_metrics();
@@ -64,6 +67,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_metrics_recording() {
         let metrics = get_capacity_metrics();
 
@@ -138,6 +142,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_global_metrics_functions() {
         // Test global functions don't panic
         record_global_write_operation();
