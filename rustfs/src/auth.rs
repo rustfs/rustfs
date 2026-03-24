@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tracing::{debug, warn};
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -128,7 +129,7 @@ impl S3Auth for IAMAuth {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
         if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
-            tracing::debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
+            debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             return Ok(SecretKey::from(String::new()));
         }
@@ -140,7 +141,7 @@ impl S3Auth for IAMAuth {
         // Check if this is a Keystone access key (from mixed auth scenario)
         // Keystone credentials use token authentication, not signature verification
         if access_key.starts_with("keystone:") {
-            tracing::debug!(
+            debug!(
                 "IAMAuth: Keystone access key detected ({}), returning empty secret for token-based auth",
                 access_key
             );
@@ -168,14 +169,14 @@ impl S3Auth for IAMAuth {
                     return Ok(SecretKey::from(id.credentials.secret_key.clone()));
                 }
                 Ok((None, _)) => {
-                    tracing::warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                    warn!("get_secret_key failed: no such user, access_key: {access_key}");
                 }
                 Err(e) => {
-                    tracing::warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
                 }
             }
         } else {
-            tracing::warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
+            warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
         }
 
         Err(s3_error!(
@@ -195,8 +196,14 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
     // Try to get Keystone credentials from task-local storage first
+    // Add debug logging for UI authentication tracking
+    debug!(
+        "check_key_valid: starting validation - access_key={}, session_token_len={}",
+        access_key,
+        session_token.len()
+    );
     if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
-        tracing::debug!("check_key_valid: Keystone credentials found in task-local storage");
+        debug!("check_key_valid: Keystone credentials found in task-local storage");
 
         if !auth_keystone::is_keystone_enabled() {
             return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
@@ -228,10 +235,9 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             })
             .unwrap_or(false);
 
-        tracing::debug!(
+        debug!(
             "check_key_valid: Keystone user {} has owner permissions: {}",
-            credentials.parent_user,
-            is_owner
+            credentials.parent_user, is_owner
         );
 
         return Ok((credentials, is_owner));
@@ -239,7 +245,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
     // Legacy check for explicit "keystone:" prefix (for backwards compatibility)
     if access_key.starts_with("keystone:") {
-        tracing::warn!(
+        warn!(
             "check_key_valid: Keystone access key detected but no credentials in task-local storage. \
              This indicates middleware was bypassed or not configured."
         );
@@ -274,14 +280,17 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
 
         if !ok {
-            let Some(u) = u else {
+            let Some(ref u) = u else {
+                warn!("check_key_valid: user not found for access_key={}", access_key);
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
+                warn!("check_key_valid: account disabled for access_key={}", access_key);
                 return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
             }
 
+            warn!("check_key_valid: validation failed for access_key={}", access_key);
             return Err(s3_error!(InvalidRequest, "check key failed"));
         }
 
@@ -386,9 +395,19 @@ pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credenti
 }
 
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
-    hds.get("x-amz-security-token")
+    let token = hds
+        .get("x-amz-security-token")
         .map(|v| v.to_str().unwrap_or_default())
-        .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"))
+        .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"));
+
+    // Add debug logging to track session token extraction
+    if token.is_some() {
+        debug!("get_session_token: session token found in request (header or query param)");
+    } else {
+        debug!("get_session_token: no session token found in request headers or query params");
+    }
+
+    token
 }
 
 /// Get condition values for policy evaluation

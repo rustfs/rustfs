@@ -21,7 +21,8 @@
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator,
-    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition, TransitionStorageClass,
+    LifecycleRuleFilter, NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
+    TransitionStorageClass,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -350,12 +351,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     continue;
                 }
             }
-            /*if !rule.filter.test_tags(obj.user_tags) {
-                continue;
-            }*/
-            //if !obj.delete_marker && !rule.filter.BySize(obj.size) {
-            if !obj.delete_marker && false {
-                continue;
+            if let Some(filter) = rule.filter.as_ref() {
+                if !<LifecycleRuleFilter as crate::bucket::lifecycle::rule::Filter>::test_tags(filter, &obj.user_tags) {
+                    continue;
+                }
+                if !obj.delete_marker
+                    && !<LifecycleRuleFilter as crate::bucket::lifecycle::rule::Filter>::by_size(filter, obj.size as i64)
+                {
+                    continue;
+                }
             }
             rules.push(rule.clone());
         }
@@ -1564,6 +1568,122 @@ mod tests {
             ..Default::default()
         };
         let not_matched = lc.filter_rules(&non_match_obj).await.unwrap();
+        assert_eq!(not_matched.len(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn filter_rules_respects_filter_tag() {
+        let filter = LifecycleRuleFilter {
+            tag: Some(s3s::dto::Tag {
+                key: Some("env".to_string()),
+                value: Some("prod".to_string()),
+            }),
+            ..Default::default()
+        };
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: Some(filter),
+                id: Some("rule-tag".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+                del_marker_expiration: None,
+            }],
+        };
+
+        let matched = lc
+            .filter_rules(&ObjectOpts {
+                name: "obj".to_string(),
+                user_tags: "env=prod&team=storage".to_string(),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+                is_latest: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+
+        let not_matched = lc
+            .filter_rules(&ObjectOpts {
+                name: "obj".to_string(),
+                user_tags: "env=dev&team=storage".to_string(),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+                is_latest: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(not_matched.len(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn filter_rules_respects_filter_and_tags() {
+        let mut filter = LifecycleRuleFilter::default();
+        filter.and = Some(LifecycleRuleAndOperator {
+            tags: Some(vec![
+                s3s::dto::Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                },
+                s3s::dto::Tag {
+                    key: Some("team".to_string()),
+                    value: Some("storage".to_string()),
+                },
+            ]),
+            ..Default::default()
+        });
+
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: Some(filter),
+                id: Some("rule-and-tags".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+                del_marker_expiration: None,
+            }],
+        };
+
+        let matched = lc
+            .filter_rules(&ObjectOpts {
+                name: "obj".to_string(),
+                user_tags: "env=prod&team=storage".to_string(),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+                is_latest: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+
+        let not_matched = lc
+            .filter_rules(&ObjectOpts {
+                name: "obj".to_string(),
+                user_tags: "env=prod&team=platform".to_string(),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+                is_latest: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(not_matched.len(), 0);
     }
 
