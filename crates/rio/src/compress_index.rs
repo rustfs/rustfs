@@ -18,6 +18,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
 const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
+const LEGACY_INDEX_HEADER_PADDING: &[u8] = &[0, 0, 0];
 const MAX_INDEX_ENTRIES: usize = 1 << 16;
 const MIN_INDEX_DIST: i64 = 1 << 20;
 // const MIN_INDEX_DIST: i64 = 0;
@@ -309,6 +310,10 @@ impl Index {
 
         if b.len() < chunk_len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
+        }
+
+        if b.starts_with(LEGACY_INDEX_HEADER_PADDING) {
+            b = &b[LEGACY_INDEX_HEADER_PADDING.len()..];
         }
 
         if !b.starts_with(S2_INDEX_HEADER) {
@@ -731,6 +736,32 @@ mod tests {
             .expect_err("invalid marker should be rejected");
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "invalid chunk type");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_load_accepts_legacy_zero_padded_header() -> io::Result<()> {
+        let mut source = Index::new();
+        source.add(100, 1_000)?;
+        source.add(300, 1_000 + MIN_INDEX_DIST)?;
+
+        let mut encoded = source.clone().into_vec().to_vec();
+        let chunk_len = (encoded[1] as usize) | ((encoded[2] as usize) << 8) | ((encoded[3] as usize) << 16);
+        let legacy_chunk_len = chunk_len + LEGACY_INDEX_HEADER_PADDING.len();
+
+        encoded[1] = legacy_chunk_len as u8;
+        encoded[2] = (legacy_chunk_len >> 8) as u8;
+        encoded[3] = (legacy_chunk_len >> 16) as u8;
+        encoded.splice(4..4, LEGACY_INDEX_HEADER_PADDING.iter().copied());
+
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_slice())?;
+
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
 
         Ok(())
     }

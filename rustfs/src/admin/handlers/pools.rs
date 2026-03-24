@@ -47,7 +47,10 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
     }
 
     if rebalance_running {
-        return Err(s3_error!(InvalidRequest, "RebalanceAlreadyRunning"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            "Decommission cannot be started, rebalance is already in progress".to_string(),
+        ));
     }
 
     Ok(())
@@ -448,8 +451,8 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_rejects_rebalance_running() {
         let err = validate_start_decommission_guards(false, true).expect_err("rebalance running should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("RebalanceAlreadyRunning"));
+        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(err.message(), Some("Decommission cannot be started, rebalance is already in progress"));
     }
 
     #[test]
