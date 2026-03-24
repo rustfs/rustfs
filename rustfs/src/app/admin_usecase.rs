@@ -15,7 +15,7 @@
 //! Admin application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
-use crate::capacity::capacity_manager::{DataSource, get_capacity_manager};
+use crate::capacity::capacity_manager::{DataSource, get_capacity_manager, get_max_files_threshold, get_sample_rate, get_stat_timeout};
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
@@ -61,11 +61,6 @@ pub struct QueryPoolStatusRequest {
     pub by_id: bool,
 }
 
-// Performance protection constants
-const MAX_FILES_THRESHOLD: usize = 1_000_000; // 1M files threshold
-const STAT_TIMEOUT_SECS: u64 = 5; // Statistics timeout
-const SAMPLE_RATE: usize = 100; // Sample rate (1 in every 100 files)
-
 /// Calculate actual used capacity of all data directories
 pub(crate) async fn calculate_data_dir_used_capacity(
     disks: &[rustfs_madmin::Disk],
@@ -109,6 +104,11 @@ pub(crate) async fn calculate_data_dir_used_capacity(
 async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
     let path = path.to_path_buf();
 
+    // Get configuration values
+    let max_files_threshold = get_max_files_threshold();
+    let stat_timeout = get_stat_timeout();
+    let sample_rate = get_sample_rate();
+
     // Check if path exists before traversing
     if !path.exists() {
         return Err(std::io::Error::new(
@@ -132,7 +132,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
 
         for entry in walker {
             // Check timeout
-            if start_time.elapsed() > Duration::from_secs(STAT_TIMEOUT_SECS) {
+            if start_time.elapsed() > stat_timeout {
                 warn!("Directory size calculation timeout after {} files, using sampled estimate", file_count);
                 // Use sampling estimate: sampled_size * total_files / sampled_files
                 if sampled_count > 0 {
@@ -148,9 +148,9 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
                 file_count += 1;
 
                 // When file count exceeds threshold, enable sampling
-                if file_count > MAX_FILES_THRESHOLD {
-                    // Sampling: count 1 in every SAMPLE_RATE files
-                    if file_count.is_multiple_of(SAMPLE_RATE) {
+                if file_count > max_files_threshold {
+                    // Sampling: count 1 in every sample_rate files
+                    if file_count.is_multiple_of(sample_rate) {
                         sampled_size += metadata.len();
                         sampled_count += 1;
                     }
@@ -170,7 +170,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         }
 
         // If sampling was enabled, return estimated value
-        if file_count > MAX_FILES_THRESHOLD && sampled_count > 0 {
+        if file_count > max_files_threshold && sampled_count > 0 {
             let estimated_size = sampled_size * file_count as u64 / sampled_count as u64;
             info!(
                 "Large directory detected: {} files, estimated size: {} bytes (sampled {}/{} files)",

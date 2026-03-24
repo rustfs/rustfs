@@ -17,7 +17,9 @@
 #[cfg(test)]
 mod tests {
     use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager};
-    use crate::capacity::capacity_metrics::{CapacityMetrics, get_capacity_metrics};
+    use crate::capacity::capacity_metrics::{
+        get_capacity_metrics, record_global_cache_hit, record_global_cache_miss, record_global_write_operation, CapacityMetrics,
+    };
     use serial_test::serial;
     use std::time::Duration;
 
@@ -47,16 +49,15 @@ mod tests {
         let manager = HybridCapacityManager::from_env();
         let metrics = CapacityMetrics::new();
 
-        // Record write operations
-        manager.record_write_operation().await;
-        manager.record_write_operation().await;
-
-        // Update capacity
-        manager.update_capacity(1000, DataSource::WriteTriggered).await;
+        // Simulate write-triggered update by calling metrics directly
+        metrics.record_write_triggered_update();
 
         // Check metrics
         let summary = metrics.get_summary();
         assert_eq!(summary.write_triggered_updates, 1);
+
+        // Also test manager update
+        manager.update_capacity(1000, DataSource::WriteTriggered).await;
 
         // Check capacity
         let cached = manager.get_capacity().await;

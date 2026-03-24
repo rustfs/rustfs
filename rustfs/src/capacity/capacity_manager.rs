@@ -53,19 +53,16 @@ pub fn get_fast_update_threshold() -> Duration {
 }
 
 /// Get max files threshold from environment or default
-#[allow(dead_code)]
 pub fn get_max_files_threshold() -> usize {
     get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD)
 }
 
 /// Get stat timeout from environment or default
-#[allow(dead_code)]
 pub fn get_stat_timeout() -> Duration {
     Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS))
 }
 
 /// Get sample rate from environment or default
-#[allow(dead_code)]
 pub fn get_sample_rate() -> usize {
     get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
 }

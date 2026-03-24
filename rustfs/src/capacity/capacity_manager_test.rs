@@ -16,8 +16,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager, HybridStrategyConfig, get_capacity_manager};
+    use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager, HybridStrategyConfig};
     use serial_test::serial;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
 
