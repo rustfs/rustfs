@@ -88,3 +88,19 @@ mod checksum_upload_test;
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
+
+// S3 dummy-compat bucket API tests
+#[cfg(test)]
+mod bucket_logging_test;
+
+// Multipart control API auth regression tests
+#[cfg(test)]
+mod multipart_auth_test;
+
+// Object lambda end-to-end regression tests
+#[cfg(test)]
+mod object_lambda_test;
+
+// Replication extension end-to-end regression tests
+#[cfg(test)]
+mod replication_extension_test;

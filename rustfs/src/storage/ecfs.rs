@@ -16,8 +16,13 @@ use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use rustfs_ecstore::{
-    bucket::tagging::decode_tags_to_map,
-    error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+    bucket::{
+        metadata::{BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG},
+        metadata_sys,
+        tagging::decode_tags_to_map,
+        utils::serialize,
+    },
+    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
 };
@@ -265,6 +270,26 @@ impl S3 for FS {
         usecase.execute_delete_bucket_tagging(req).await
     }
 
+    async fn delete_bucket_website(
+        &self,
+        req: S3Request<DeleteBucketWebsiteInput>,
+    ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        metadata_sys::delete(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn delete_public_access_block(
         &self,
@@ -301,6 +326,29 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_acl(req).await
+    }
+
+    async fn get_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<GetBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        match metadata_sys::get_accelerate_config(&req.input.bucket).await {
+            Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
+                status: accelerate.status,
+                ..Default::default()
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default())),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -370,6 +418,30 @@ impl S3 for FS {
         usecase.execute_get_bucket_replication(req).await
     }
 
+    async fn get_bucket_request_payment(
+        &self,
+        req: S3Request<GetBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        match metadata_sys::get_request_payment_config(&req.input.bucket).await {
+            Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
+                payer: Some(payment.payer),
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
+                payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
+            })),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         record_s3_op(S3Operation::GetBucketTagging, &req.input.bucket);
@@ -395,6 +467,28 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketVersioning, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_versioning(req).await
+    }
+
+    async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        match metadata_sys::get_website_config(&req.input.bucket).await {
+            Ok((website, _)) => Ok(S3Response::new(GetBucketWebsiteOutput {
+                error_document: website.error_document,
+                index_document: website.index_document,
+                redirect_all_requests_to: website.redirect_all_requests_to,
+                routing_rules: website.routing_rules,
+            })),
+            Err(StorageError::ConfigNotFound) => Err(s3_error!(NoSuchWebsiteConfiguration)),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     /// Get bucket notification
@@ -528,6 +622,27 @@ impl S3 for FS {
         usecase.execute_put_bucket_acl(req).await
     }
 
+    async fn put_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<PutBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        let accelerate_config = serialize(&req.input.accelerate_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let usecase = DefaultBucketUsecase::from_global();
@@ -543,7 +658,14 @@ impl S3 for FS {
             .get_bucket_info(&req.input.bucket, &BucketOptions::default())
             .await
             .map_err(crate::error::ApiError::from)?;
-        Err(s3_error!(NotImplemented, "GetBucketLogging is not implemented yet"))
+
+        match metadata_sys::get_logging_config(&req.input.bucket).await {
+            Ok((logging, _)) => Ok(S3Response::new(GetBucketLoggingOutput {
+                logging_enabled: logging.logging_enabled,
+            })),
+            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketLoggingOutput::default())),
+            Err(err) => Err(crate::error::ApiError::from(err).into()),
+        }
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
@@ -555,7 +677,14 @@ impl S3 for FS {
             .get_bucket_info(&req.input.bucket, &BucketOptions::default())
             .await
             .map_err(crate::error::ApiError::from)?;
-        Err(s3_error!(NotImplemented, "PutBucketLogging is not implemented yet"))
+
+        let logging_config = serialize(&req.input.bucket_logging_status)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
 
     async fn put_bucket_encryption(
@@ -596,6 +725,27 @@ impl S3 for FS {
         usecase.execute_put_bucket_replication(req).await
     }
 
+    async fn put_bucket_request_payment(
+        &self,
+        req: S3Request<PutBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        let payment_config = serialize(&req.input.request_payment_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
+    }
+
     #[instrument(level = "debug", skip(self))]
     async fn put_public_access_block(
         &self,
@@ -618,6 +768,24 @@ impl S3 for FS {
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_put_bucket_versioning(req).await
+    }
+
+    async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        let website_config = serialize(&req.input.website_configuration)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        metadata_sys::update(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self, req))]

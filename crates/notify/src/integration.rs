@@ -25,11 +25,61 @@ use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
 use rustfs_targets::target::EntityTarget;
 use rustfs_targets::{StoreError, Target};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
+
+const MAX_RECENT_LIVE_EVENTS: usize = 1024;
+
+#[derive(Clone)]
+pub struct LiveEventBatch {
+    pub events: Vec<Arc<Event>>,
+    pub next_sequence: u64,
+    pub truncated: bool,
+}
+
+#[derive(Default)]
+struct LiveEventHistory {
+    next_sequence: u64,
+    events: VecDeque<(u64, Arc<Event>)>,
+}
+
+impl LiveEventHistory {
+    fn record(&mut self, event: Arc<Event>) {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.events.push_back((self.next_sequence, event));
+        while self.events.len() > MAX_RECENT_LIVE_EVENTS {
+            self.events.pop_front();
+        }
+    }
+
+    fn snapshot_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
+        let mut events = Vec::new();
+        let mut next_sequence = after_sequence;
+        let mut truncated = false;
+
+        for (sequence, event) in self.events.iter() {
+            if *sequence <= after_sequence {
+                continue;
+            }
+            if events.len() >= limit {
+                truncated = true;
+                break;
+            }
+            next_sequence = *sequence;
+            events.push(event.clone());
+        }
+
+        LiveEventBatch {
+            events,
+            next_sequence,
+            truncated,
+        }
+    }
+}
 
 /// Notify the system of monitoring indicators
 pub struct NotificationMetrics {
@@ -108,6 +158,10 @@ pub struct NotificationSystem {
     metrics: Arc<NotificationMetrics>,
     /// Subscriber view
     subscriber_view: NotificationSystemSubscriberView,
+    /// Live event fan-out for in-process streaming consumers.
+    live_event_sender: broadcast::Sender<Arc<Event>>,
+    /// Recent live event history for peer fan-in consumers.
+    live_event_history: Arc<RwLock<LiveEventHistory>>,
 }
 
 impl NotificationSystem {
@@ -115,6 +169,7 @@ impl NotificationSystem {
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
+        let (live_event_sender, _) = broadcast::channel(1024);
         NotificationSystem {
             subscriber_view: NotificationSystemSubscriberView::new(),
             notifier: Arc::new(EventNotifier::new()),
@@ -123,6 +178,8 @@ impl NotificationSystem {
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
             concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics: Arc::new(NotificationMetrics::new()),
+            live_event_sender,
+            live_event_history: Arc::new(RwLock::new(LiveEventHistory::default())),
         }
     }
 
@@ -214,6 +271,21 @@ impl NotificationSystem {
             return false;
         }
         self.notifier.has_subscriber(bucket, event).await
+    }
+
+    /// Returns true when at least one in-process consumer is subscribed to live events.
+    pub fn has_live_listeners(&self) -> bool {
+        self.live_event_sender.receiver_count() > 0
+    }
+
+    /// Subscribes to the in-process live event stream.
+    pub fn subscribe_live_events(&self) -> broadcast::Receiver<Arc<Event>> {
+        self.live_event_sender.subscribe()
+    }
+
+    pub async fn recent_live_events_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
+        let history = self.live_event_history.read().await;
+        history.snapshot_since(after_sequence, limit.max(1))
     }
 
     async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
@@ -500,6 +572,8 @@ impl NotificationSystem {
 
     /// Sends an event
     pub async fn send_event(&self, event: Arc<Event>) {
+        self.live_event_history.write().await.record(event.clone());
+        let _ = self.live_event_sender.send(event.clone());
         self.notifier.send(event).await;
     }
 
@@ -557,4 +631,38 @@ pub async fn load_config_from_file(path: &str, system: &NotificationSystem) -> R
     let config = Config::unmarshal(config_data.as_slice())
         .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {e}")))?;
     system.reload_config(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_s3_common::EventName;
+
+    #[test]
+    fn live_event_history_snapshots_from_sequence() {
+        let mut history = LiveEventHistory::default();
+        history.record(Arc::new(Event::new_test_event("bucket", "one", EventName::ObjectCreatedPut)));
+        history.record(Arc::new(Event::new_test_event("bucket", "two", EventName::ObjectCreatedPut)));
+
+        let batch = history.snapshot_since(1, 16);
+
+        assert_eq!(batch.next_sequence, 2);
+        assert!(!batch.truncated);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].s3.object.key, "two");
+    }
+
+    #[test]
+    fn live_event_history_marks_truncation() {
+        let mut history = LiveEventHistory::default();
+        history.record(Arc::new(Event::new_test_event("bucket", "one", EventName::ObjectCreatedPut)));
+        history.record(Arc::new(Event::new_test_event("bucket", "two", EventName::ObjectCreatedPut)));
+
+        let batch = history.snapshot_since(0, 1);
+
+        assert_eq!(batch.next_sequence, 1);
+        assert!(batch.truncated);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].s3.object.key, "one");
+    }
 }

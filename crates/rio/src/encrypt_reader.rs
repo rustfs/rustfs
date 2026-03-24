@@ -290,17 +290,19 @@ where
                     Poll::Ready(Ok(())) => {
                         let n = temp_buf.filled().len();
                         if n == 0 {
-                            *this.finished = true;
-                            return Poll::Ready(Ok(()));
+                            if *this.header_read == 0 {
+                                *this.finished = true;
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Ready(Err(Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF while reading encrypted block header",
+                            )));
                         }
                         this.header_buf[*this.header_read..*this.header_read + n].copy_from_slice(&temp_buf.filled()[..n]);
                         *this.header_read += n;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                }
-
-                if *this.header_read < 8 {
-                    return Poll::Pending;
                 }
             }
 
@@ -374,7 +376,10 @@ where
                     Poll::Ready(Ok(())) => {
                         let n = temp_buf.filled().len();
                         if n == 0 {
-                            break;
+                            return Poll::Ready(Err(Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF while reading encrypted block payload",
+                            )));
                         }
                         *this.ciphertext_read += n;
                     }
@@ -483,12 +488,50 @@ fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-    use crate::WarpReader;
+    use crate::{HardLimitReader, WarpReader};
 
     use super::*;
+    use futures::StreamExt;
     use rand::{Rng, RngExt};
-    use tokio::io::{AsyncReadExt, BufReader};
+    use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+    use tokio_util::io::ReaderStream;
+
+    struct ChunkedCursor {
+        inner: Cursor<Vec<u8>>,
+        max_chunk: usize,
+    }
+
+    impl ChunkedCursor {
+        fn new(data: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                inner: Cursor::new(data),
+                max_chunk,
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedCursor {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.max_chunk == 0 || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let remaining = self.inner.get_ref().len() as u64 - self.inner.position();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let to_read = remaining.min(self.max_chunk as u64).min(buf.remaining() as u64) as usize;
+            let start = self.inner.position() as usize;
+            let end = start + to_read;
+            buf.put_slice(&self.inner.get_ref()[start..end]);
+            self.inner.set_position(end as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn test_encrypt_decrypt_reader_aes256gcm() {
@@ -567,6 +610,86 @@ mod tests {
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 
         assert_eq!(&decrypted, &data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_large_with_small_chunks() {
+        let size = 1024 * 1024;
+        let mut data = vec![0u8; size];
+        rand::rng().fill(&mut data[..]);
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let reader = Cursor::new(data.clone());
+        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+
+        let reader = ChunkedCursor::new(encrypted, 3);
+        let mut decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_large_through_reader_stream() {
+        let size = 1024 * 1024;
+        let mut data = vec![0u8; size];
+        rand::rng().fill(&mut data[..]);
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let reader = Cursor::new(data.clone());
+        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+
+        let reader = ChunkedCursor::new(encrypted, 8192);
+        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut stream = ReaderStream::with_capacity(Box::new(decrypt_reader), 262_144);
+
+        let mut decrypted = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.unwrap();
+            decrypted.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_large_through_hard_limit_reader_stream() {
+        let size = 1024 * 1024;
+        let mut data = vec![0u8; size];
+        rand::rng().fill(&mut data[..]);
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let reader = Cursor::new(data.clone());
+        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+
+        let reader = ChunkedCursor::new(encrypted, 8192);
+        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let limit_reader = HardLimitReader::new(Box::new(decrypt_reader), size as i64);
+        let mut stream = ReaderStream::with_capacity(Box::new(limit_reader), 262_144);
+
+        let mut decrypted = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.unwrap();
+            decrypted.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(decrypted, data);
     }
 
     #[tokio::test]

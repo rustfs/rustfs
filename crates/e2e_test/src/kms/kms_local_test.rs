@@ -19,7 +19,10 @@
 //! - S3 object upload/download with SSE-S3, SSE-KMS, SSE-C encryption
 //! - Complete encryption/decryption lifecycle
 
-use super::common::{LocalKMSTestEnvironment, get_kms_status, test_kms_key_management, test_sse_c_encryption};
+use super::common::{
+    LocalKMSTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
+    test_kms_key_management, test_sse_c_encryption,
+};
 use crate::common::{TEST_BUCKET, init_logging};
 use serial_test::serial;
 use tracing::{error, info};
@@ -28,6 +31,9 @@ use tracing::{error, info};
 #[serial]
 async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
+    if skip_if_kms_admin_tool_unavailable("test_local_kms_end_to_end") {
+        return Ok(());
+    }
     info!("Starting Local KMS End-to-End Test");
 
     // Create LocalKMS test environment
@@ -140,8 +146,8 @@ async fn test_local_kms_key_isolation() {
     let key2 = "98765432109876543210987654321098";
     let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
     let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    let key1_md5 = sse_customer_key_md5_base64(key1);
+    let key2_md5 = sse_customer_key_md5_base64(key2);
 
     let data1 = b"Data encrypted with key 1";
     let data2 = b"Data encrypted with key 2";
@@ -562,7 +568,7 @@ async fn test_multipart_upload_with_sse_c(
     // SSE-C encryption key
     let encryption_key = "01234567890123456789012345678901";
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, encryption_key);
-    let key_md5 = format!("{:x}", md5::compute(encryption_key));
+    let key_md5 = sse_customer_key_md5_base64(encryption_key);
 
     // Generate test data
     let test_data: Vec<u8> = (0..total_size).map(|i| ((i * 3) % 256) as u8).collect();

@@ -3081,14 +3081,19 @@ name = "e2e_test"
 version = "0.0.5"
 dependencies = [
  "anyhow",
+ "astral-tokio-tar",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "flatbuffers",
+ "flate2",
  "futures",
+ "http 1.4.0",
  "md5",
  "rand 0.10.0",
  "rcgen",
@@ -3100,18 +3105,24 @@ dependencies = [
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
+ "rustfs-signer",
  "rustls",
+ "s3s",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.11.0-rc.5",
  "suppaftp",
+ "time",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
+ "walkdir",
+ "zstd",
 ]
 
 [[package]]
@@ -7325,6 +7336,7 @@ dependencies = [
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
+ "rustfs-signer",
  "rustfs-targets",
  "rustfs-trusted-proxies",
  "rustfs-utils",
@@ -7728,6 +7740,7 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "clap",
  "mime_guess",
  "rmcp",
@@ -8329,7 +8342,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=d9556e3c0036bd3f2b330966009cbaa5aebf19a3#d9556e3c0036bd3f2b330966009cbaa5aebf19a3"
+source = "git+https://github.com/rustfs/s3s?rev=b296762bc9e7fa608f1bc44f5cd625d606e0dd31#b296762bc9e7fa608f1bc44f5cd625d606e0dd31"
 dependencies = [
  "arc-swap",
  "arrayvec",

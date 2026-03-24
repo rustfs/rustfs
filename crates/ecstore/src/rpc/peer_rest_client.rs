@@ -29,9 +29,9 @@ use rustfs_madmin::{
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketMetadataRequest, DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest,
-    GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
-    GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-    LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+    GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+    GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest, LoadBucketMetadataRequest,
+    LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
     LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
     ReloadSiteReplicationConfigRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StopRebalanceRequest,
     node_service_client::NodeServiceClient,
@@ -47,6 +47,13 @@ use tracing::warn;
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
+
+#[derive(Clone, Debug)]
+pub struct PeerLiveEventsBatch {
+    pub events: Vec<u8>,
+    pub next_sequence: u64,
+    pub truncated: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerRestClient {
@@ -331,6 +338,25 @@ impl PeerRestClient {
         let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
 
         Ok(realtime_metrics)
+    }
+
+    pub async fn get_live_events(&self, after_sequence: u64, limit: u32) -> Result<PeerLiveEventsBatch> {
+        let mut client = self.get_client().await?;
+        let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
+
+        let response = client.get_live_events(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(Error::other(""));
+        }
+
+        Ok(PeerLiveEventsBatch {
+            events: response.events.to_vec(),
+            next_sequence: response.next_sequence,
+            truncated: response.truncated,
+        })
     }
 
     pub async fn get_proc_info(&self) -> Result<ProcInfo> {

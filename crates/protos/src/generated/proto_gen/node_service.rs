@@ -796,6 +796,26 @@ pub struct GetMetricsResponse {
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetLiveEventsRequest {
+    #[prost(uint64, tag = "1")]
+    pub after_sequence: u64,
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetLiveEventsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub events: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub next_sequence: u64,
+    #[prost(bool, tag = "4")]
+    pub truncated: bool,
+    #[prost(string, optional, tag = "5")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetProcInfoRequest {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetProcInfoResponse {
@@ -1921,6 +1941,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "GetMetrics"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_live_events(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetLiveEventsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetLiveEventsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetLiveEvents");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetLiveEvents"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_proc_info(
             &mut self,
             request: impl tonic::IntoRequest<super::GetProcInfoRequest>,
@@ -2521,6 +2556,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::GetMetricsRequest>,
         ) -> std::result::Result<tonic::Response<super::GetMetricsResponse>, tonic::Status>;
+        async fn get_live_events(
+            &self,
+            request: tonic::Request<super::GetLiveEventsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetLiveEventsResponse>, tonic::Status>;
         async fn get_proc_info(
             &self,
             request: tonic::Request<super::GetProcInfoRequest>,
@@ -4088,6 +4127,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetMetricsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetLiveEvents" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetLiveEventsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetLiveEventsRequest> for GetLiveEventsSvc<T> {
+                        type Response = super::GetLiveEventsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetLiveEventsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_live_events(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetLiveEventsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

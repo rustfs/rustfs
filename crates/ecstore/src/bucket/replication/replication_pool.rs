@@ -21,7 +21,7 @@ use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, REPLICATION_DIR, RESYNC_FILE_NAME, ReplicationConfig,
-    ReplicationResyncer, decode_resync_file, get_heal_replicate_object_info,
+    ReplicationResyncer, TargetReplicationResyncStatus, decode_resync_file, get_heal_replicate_object_info, save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
@@ -763,6 +763,63 @@ impl<S: StorageAPI> ReplicationPool<S> {
         Ok(())
     }
 
+    pub async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        if let Some(status) = self.resyncer.status_map.read().await.get(bucket).cloned() {
+            return Ok(status);
+        }
+
+        let status = load_bucket_resync_metadata(bucket, self.storage.clone()).await?;
+        self.resyncer
+            .status_map
+            .write()
+            .await
+            .insert(bucket.to_string(), status.clone());
+        Ok(status)
+    }
+
+    pub async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {
+        let now = OffsetDateTime::now_utc();
+        let bucket_status = {
+            let mut status_map = self.resyncer.status_map.write().await;
+            let bucket_status = status_map.entry(opts.bucket.clone()).or_insert_with(|| {
+                let mut status = BucketReplicationResyncStatus::new();
+                status.id = 0;
+                status
+            });
+
+            bucket_status.last_update = Some(now);
+            bucket_status.targets_map.insert(
+                opts.arn.clone(),
+                TargetReplicationResyncStatus {
+                    start_time: Some(now),
+                    last_update: Some(now),
+                    resync_id: opts.resync_id.clone(),
+                    resync_before_date: opts.resync_before,
+                    resync_status: ResyncStatusType::ResyncPending,
+                    failed_size: 0,
+                    failed_count: 0,
+                    replicated_size: 0,
+                    replicated_count: 0,
+                    bucket: opts.bucket.clone(),
+                    object: String::new(),
+                    error: None,
+                },
+            );
+
+            bucket_status.clone()
+        };
+
+        save_resync_status(&opts.bucket, &bucket_status, self.storage.clone()).await?;
+
+        let resyncer = self.resyncer.clone();
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            resyncer.resync_bucket(CancellationToken::new(), storage, false, opts).await;
+        });
+
+        Ok(())
+    }
+
     /// Start the resync routine that runs in a loop
     async fn start_resync_routine(self: Arc<Self>, buckets: Vec<String>, cancellation_token: CancellationToken) {
         // Run the replication resync in a loop
@@ -891,6 +948,8 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
+    async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
+    async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError>;
     async fn init_resync(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
@@ -911,6 +970,14 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize) {
         self.resize(priority, max_workers, max_l_workers).await;
+    }
+
+    async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        self.get_bucket_resync_status(bucket).await
+    }
+
+    async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {
+        self.start_bucket_resync(opts).await
     }
 
     async fn init_resync(

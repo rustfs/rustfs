@@ -13,10 +13,52 @@
 //  limitations under the License.
 
 use crate::app::context::resolve_server_config;
+use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
+use rustfs_notify::EventArgs as NotifyEventArgs;
+use rustfs_s3_common::EventName;
+use tokio::spawn;
 use tracing::{error, info, instrument, warn};
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
+    let version_id = args.object.version_id.map(|v| v.to_string()).unwrap_or_default();
+    let (host, port) = match args.host.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (args.host, 0),
+        },
+        None => (args.host, 0),
+    };
+    let req_params = args.req_params.into_iter().collect();
+    let resp_elements = args.resp_elements.into_iter().collect();
+
+    NotifyEventArgs {
+        event_name: EventName::from(args.event_name.as_str()),
+        bucket_name: args.bucket_name,
+        object: args.object,
+        req_params,
+        resp_elements,
+        version_id,
+        host,
+        port,
+        user_agent: args.user_agent,
+    }
+}
+
+fn install_ecstore_event_dispatch_hook() {
+    let installed = register_event_dispatch_hook(|args| {
+        let notify_args = convert_ecstore_event_args(args);
+        spawn(async move {
+            rustfs_notify::notifier_global::notify(notify_args).await;
+        });
+    });
+
+    if !installed {
+        warn!("ECStore event dispatch hook was already registered");
+    }
 }
 
 /// Shuts down the event notifier system gracefully
@@ -67,6 +109,7 @@ pub(crate) async fn init_event_notifier() {
     if let Err(e) = rustfs_notify::initialize(server_config).await {
         error!("Failed to initialize event notifier system: {}", e);
     } else {
+        install_ecstore_event_dispatch_hook();
         info!(
             target: "rustfs::main::init_event_notifier",
             "Event notifier system initialized successfully."

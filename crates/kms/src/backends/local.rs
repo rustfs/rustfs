@@ -57,7 +57,9 @@ struct StoredMasterKey {
     status: KeyStatus,
     description: Option<String>,
     metadata: HashMap<String, String>,
+    #[serde(with = "crate::time_serde::zoned")]
     created_at: Zoned,
+    #[serde(with = "crate::time_serde::option_zoned")]
     rotated_at: Option<Zoned>,
     created_by: Option<String>,
     /// Encrypted key material (32 bytes encoded in base64 for AES-256)
@@ -840,6 +842,7 @@ impl KmsBackend for LocalKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     async fn create_test_client() -> (LocalKmsClient, TempDir) {
@@ -942,5 +945,40 @@ mod tests {
 
         // Note: Direct decryption of encrypt() results is not implemented in this simple version
         // In a real implementation, encrypt() would create a different envelope format
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_accepts_legacy_rfc3339_timestamp() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: None,
+            file_permissions: Some(0o600),
+        };
+        let client = LocalKmsClient::new(config).await.expect("Failed to create client");
+
+        let stored_key = serde_json::json!({
+            "key_id": "legacy-key",
+            "version": 1u32,
+            "algorithm": "AES_256",
+            "usage": "EncryptDecrypt",
+            "status": "Active",
+            "description": serde_json::Value::Null,
+            "metadata": HashMap::<String, String>::new(),
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "rotated_at": serde_json::Value::Null,
+            "created_by": "legacy-test",
+            "encrypted_key_material": BASE64.encode([7u8; 32]),
+            "nonce": Vec::<u8>::new()
+        });
+
+        let key_path = client.master_key_path("legacy-key");
+        fs::write(&key_path, serde_json::to_vec_pretty(&stored_key).expect("serialize test key"))
+            .await
+            .expect("write legacy key");
+
+        let key_info = client.load_master_key("legacy-key").await.expect("legacy key should load");
+        assert_eq!(key_info.key_id, "legacy-key");
+        assert_eq!(key_info.created_at.time_zone().iana_name(), Some("UTC"));
     }
 }
