@@ -34,6 +34,7 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
+    versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
@@ -315,10 +316,13 @@ impl DefaultMultipartUsecase {
             server_side_encryption
         );
 
-        let ssekms_key_id = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .cloned();
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => multipart_info
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .cloned(),
+            _ => None,
+        };
 
         info!(
             "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
@@ -367,7 +371,12 @@ impl DefaultMultipartUsecase {
         let manager = get_concurrency_manager();
         let mpu_bucket = bucket.clone();
         let mpu_key = key.clone();
-        let mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
+        let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
+            raw_mpu_version.clone()
+        } else {
+            None
+        };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
         tokio::spawn(async move {
@@ -494,6 +503,14 @@ impl DefaultMultipartUsecase {
             ssekms_key_id,
             ..
         } = req.input.clone();
+
+        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let ssekms_key_id = ssekms_key_id.or_else(|| {
+            req.headers
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned)
+        });
 
         // Validate storage class if provided
         if let Some(ref storage_class) = storage_class
@@ -708,10 +725,13 @@ impl DefaultMultipartUsecase {
                         .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
                 })
                 .transpose()?;
-            let key_id = fi
-                .user_defined
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .map(|s| s.to_string());
+            let key_id = match sse.as_ref() {
+                Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => fi
+                    .user_defined
+                    .get("x-amz-server-side-encryption-aws-kms-key-id")
+                    .map(|s| s.to_string()),
+                _ => None,
+            };
             (sse, key_id)
         };
         let part_key = fi.user_defined.get("x-rustfs-encryption-key").cloned();
@@ -1045,6 +1065,7 @@ impl DefaultMultipartUsecase {
             sse_customer_key_md5: copy_source_sse_customer_key_md5.as_ref(),
             part_number: None,
             parts: &src_info.parts,
+            etag: src_info.etag.as_deref(),
         };
 
         if let Some(material) = sse_decryption(src_decryption_request).await? {
@@ -1073,10 +1094,13 @@ impl DefaultMultipartUsecase {
                     .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
             })
             .transpose()?;
-        let ssekms_key_id = mp_info
-            .user_defined
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .map(|s| s.to_string());
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => mp_info
+                .user_defined
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(|s| s.to_string()),
+            _ => None,
+        };
         let part_key = mp_info.user_defined.get("x-rustfs-encryption-key").cloned();
         let part_nonce = mp_info.user_defined.get("x-rustfs-encryption-iv").cloned();
         let encryption_request = EncryptionRequest {

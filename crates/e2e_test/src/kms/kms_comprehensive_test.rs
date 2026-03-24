@@ -19,9 +19,9 @@
 //! complex workflows.
 
 use super::common::{
-    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, create_sse_c_config, test_all_multipart_encryption_types,
-    test_kms_key_management, test_multipart_upload_with_config, test_sse_c_encryption, test_sse_kms_encryption,
-    test_sse_s3_encryption,
+    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, create_sse_c_config, sse_customer_key_md5_base64,
+    test_all_multipart_encryption_types, test_kms_key_management, test_multipart_upload_with_config, test_sse_c_encryption,
+    test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
 use serial_test::serial;
@@ -149,8 +149,8 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     // Test different SSE-C keys to ensure isolation
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_md5 = format!("{:x}", md5::compute(key1));
-    let key2_md5 = format!("{:x}", md5::compute(key2));
+    let key1_md5 = sse_customer_key_md5_base64(key1);
+    let key2_md5 = sse_customer_key_md5_base64(key2);
 
     let config1 = MultipartTestConfig::new(
         "isolation-test-key1",
@@ -183,7 +183,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
     let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
-    let wrong_key_md5 = format!("{:x}", md5::compute(wrong_key));
+    let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
 
     // Try to read file encrypted with key1 using wrong key
     let wrong_read_result = s3_client

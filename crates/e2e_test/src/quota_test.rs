@@ -17,6 +17,15 @@ use aws_sdk_s3::Client;
 use serial_test::serial;
 use tracing::{debug, info};
 
+fn skip_without_awscurl() -> bool {
+    if crate::common::awscurl_available() {
+        return false;
+    }
+
+    info!("Skipping quota test because awscurl is not available");
+    true
+}
+
 /// Test environment setup for quota tests
 pub struct QuotaTestEnv {
     pub env: RustFSTestEnvironment,
@@ -233,6 +242,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_basic_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         // Create test bucket
@@ -269,6 +281,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_update_and_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -302,6 +317,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_delete_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -336,6 +354,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_usage_tracking() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -372,6 +393,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_statistics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -403,6 +427,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_check_api() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -441,6 +468,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_multiple_buckets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         // Create two buckets in the same environment
@@ -479,6 +509,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_error_handling() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -512,6 +545,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_http_endpoints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -575,6 +611,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_normal_user_permissions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
         env.create_bucket().await?;
 
@@ -628,6 +667,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_copy_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -671,6 +713,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_batch_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
@@ -727,6 +772,9 @@ mod integration_tests {
     #[serial]
     async fn test_quota_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;

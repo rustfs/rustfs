@@ -65,6 +65,7 @@ mod error;
 pub mod manager;
 pub mod service;
 pub mod service_manager;
+mod time_serde;
 pub mod types;
 
 // Re-export public API

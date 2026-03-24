@@ -1337,6 +1337,7 @@ mod tests {
         assert_eq!(event.action, IlmAction::TransitionAction);
         assert_eq!(event.rule_id, "transition-date");
         assert_eq!(event.storage_class, "WARM");
+        assert_eq!(event.due, Some(transition_date));
     }
 
     #[tokio::test]

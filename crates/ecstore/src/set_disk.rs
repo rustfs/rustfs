@@ -701,6 +701,11 @@ impl ObjectIO for SetDisks {
         }
 
         let mut user_defined = opts.user_defined.clone();
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for (key, value) in eval_metadata {
+                user_defined.insert(key.clone(), value.clone());
+            }
+        }
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {

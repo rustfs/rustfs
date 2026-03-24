@@ -629,6 +629,8 @@ mod tests {
         let config = Config {
             access_key_id: Some("test_key".to_string()),
             secret_access_key: Some("test_secret".to_string()),
+            endpoint_url: Some("http://127.0.0.1:9000".to_string()),
+            force_path_style: true,
             ..Config::default()
         };
 
