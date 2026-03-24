@@ -59,6 +59,7 @@ pub async fn init_capacity_management() {
 }
 
 /// Get capacity statistics with metrics
+#[allow(dead_code)]
 pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
     let manager = get_capacity_manager();
     let metrics = get_capacity_metrics();

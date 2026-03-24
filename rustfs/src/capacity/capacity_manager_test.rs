@@ -24,7 +24,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_capacity_manager_initialization() {
-        let manager = get_capacity_manager();
+        let manager = HybridCapacityManager::from_env();
         assert!(manager.get_capacity().await.is_none());
     }
 
@@ -121,7 +121,7 @@ mod tests {
         ];
 
         for source in sources {
-            manager.update_capacity(1000, source.clone()).await;
+            manager.update_capacity(1000, source).await;
             let cached = manager.get_capacity().await.unwrap();
             assert_eq!(cached.source, source);
         }
@@ -160,7 +160,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_concurrent_access() {
-        let manager = get_capacity_manager();
+        let manager = Arc::new(HybridCapacityManager::from_env());
 
         // Simulate concurrent updates
         let mut handles = vec![];
@@ -190,7 +190,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_performance_overhead() {
-        let manager = get_capacity_manager();
+        let manager = Arc::new(HybridCapacityManager::from_env());
 
         // Measure time for 1000 operations
         let start = std::time::Instant::now();

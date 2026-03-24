@@ -17,9 +17,7 @@
 #[cfg(test)]
 mod tests {
     use crate::capacity::capacity_manager::{DataSource, HybridCapacityManager};
-    use crate::capacity::capacity_metrics::{
-        get_capacity_metrics, record_global_cache_hit, record_global_cache_miss, record_global_write_operation,
-    };
+    use crate::capacity::capacity_metrics::{CapacityMetrics, get_capacity_metrics};
     use serial_test::serial;
     use std::time::Duration;
 
@@ -27,7 +25,7 @@ mod tests {
     #[serial]
     async fn test_write_trigger_integration() {
         let manager = HybridCapacityManager::from_env();
-        let metrics = get_capacity_metrics();
+        let metrics = CapacityMetrics::new();
 
         // Record write operations
         manager.record_write_operation().await;
@@ -47,7 +45,7 @@ mod tests {
     #[serial]
     async fn test_write_trigger_with_capacity_update() {
         let manager = HybridCapacityManager::from_env();
-        let metrics = get_capacity_metrics();
+        let metrics = CapacityMetrics::new();
 
         // Record write operations
         manager.record_write_operation().await;
@@ -69,7 +67,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_metrics_recording() {
-        let metrics = get_capacity_metrics();
+        let metrics = CapacityMetrics::new();
 
         // Record various operations
         metrics.record_cache_hit();
@@ -138,18 +136,21 @@ mod tests {
         // (depending on configuration, this may or may not trigger)
         let needs_update = manager.needs_fast_update().await;
         // Just ensure it doesn't panic
-        assert!(needs_update == true || needs_update == false);
+        #[allow(clippy::overly_complex_bool_expr)]
+        let _ = needs_update || !needs_update;
     }
 
     #[test]
     #[serial]
     fn test_global_metrics_functions() {
         // Test global functions don't panic
+        let before = get_capacity_metrics().cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+
         record_global_write_operation();
         record_global_cache_hit();
         record_global_cache_miss();
 
         let metrics = get_capacity_metrics();
-        assert!(metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed) > before);
     }
 }

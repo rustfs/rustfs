@@ -53,16 +53,19 @@ pub fn get_fast_update_threshold() -> Duration {
 }
 
 /// Get max files threshold from environment or default
+#[allow(dead_code)]
 pub fn get_max_files_threshold() -> usize {
     get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD)
 }
 
 /// Get stat timeout from environment or default
+#[allow(dead_code)]
 pub fn get_stat_timeout() -> Duration {
     Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS))
 }
 
 /// Get sample rate from environment or default
+#[allow(dead_code)]
 pub fn get_sample_rate() -> usize {
     get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
 }
@@ -73,6 +76,7 @@ pub fn get_sample_rate() -> usize {
 
 /// Cached capacity data
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CachedCapacity {
     /// Total used capacity in bytes
     pub total_used: u64,
@@ -87,6 +91,7 @@ pub struct CachedCapacity {
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
+#[allow(dead_code)]
 pub enum DataSource {
     /// Real-time statistics
     RealTime,
@@ -111,6 +116,7 @@ pub struct WriteRecord {
 
 /// Hybrid strategy configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HybridStrategyConfig {
     /// Scheduled update interval
     pub scheduled_update_interval: Duration,
@@ -265,6 +271,7 @@ impl HybridCapacityManager {
     }
 
     /// Get cache age
+    #[allow(dead_code)]
     pub async fn get_cache_age(&self) -> Option<Duration> {
         let cache = self.cache.read().await;
         cache.as_ref().map(|c| c.last_update.elapsed())
@@ -342,42 +349,49 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_get_write_trigger_delay() {
         let delay = get_write_trigger_delay();
         assert_eq!(delay, Duration::from_secs(10));
     }
 
     #[test]
+    #[serial]
     fn test_get_write_frequency_threshold() {
         let threshold = get_write_frequency_threshold();
         assert_eq!(threshold, 10);
     }
 
     #[test]
+    #[serial]
     fn test_get_fast_update_threshold() {
         let threshold = get_fast_update_threshold();
         assert_eq!(threshold, Duration::from_secs(60));
     }
 
     #[test]
+    #[serial]
     fn test_get_max_files_threshold() {
         let threshold = get_max_files_threshold();
         assert_eq!(threshold, 1_000_000);
     }
 
     #[test]
+    #[serial]
     fn test_get_stat_timeout() {
         let timeout = get_stat_timeout();
         assert_eq!(timeout, Duration::from_secs(5));
     }
 
     #[test]
+    #[serial]
     fn test_get_sample_rate() {
         let rate = get_sample_rate();
         assert_eq!(rate, 100);
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_scheduled_interval() {
         temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
             let interval = get_scheduled_update_interval();
@@ -386,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_write_trigger_delay() {
         temp_env::with_var(ENV_CAPACITY_WRITE_TRIGGER_DELAY, Some("20"), || {
             let delay = get_write_trigger_delay();
@@ -394,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_write_frequency_threshold() {
         temp_env::with_var(ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, Some("20"), || {
             let threshold = get_write_frequency_threshold();
@@ -402,6 +418,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_fast_update_threshold() {
         temp_env::with_var(ENV_CAPACITY_FAST_UPDATE_THRESHOLD, Some("120"), || {
             let threshold = get_fast_update_threshold();
@@ -410,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_max_files_threshold() {
         temp_env::with_var(ENV_CAPACITY_MAX_FILES_THRESHOLD, Some("2000000"), || {
             let threshold = get_max_files_threshold();
@@ -418,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_stat_timeout() {
         temp_env::with_var(ENV_CAPACITY_STAT_TIMEOUT, Some("10"), || {
             let timeout = get_stat_timeout();
@@ -426,6 +445,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_var_override_sample_rate() {
         temp_env::with_var(ENV_CAPACITY_SAMPLE_RATE, Some("200"), || {
             let rate = get_sample_rate();
@@ -434,6 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_capacity_manager_creation() {
         let config = HybridStrategyConfig::default();
         let manager = HybridCapacityManager::new(config);
@@ -442,6 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_update_capacity() {
         let manager = HybridCapacityManager::from_env();
 
@@ -453,6 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_record_write_operation() {
         let manager = HybridCapacityManager::from_env();
 
@@ -463,6 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_needs_fast_update() {
         let manager = HybridCapacityManager::from_env();
 
@@ -491,6 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_config_from_env_with_override() {
         temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
             let config = HybridStrategyConfig::from_env();

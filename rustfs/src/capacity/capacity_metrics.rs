@@ -18,7 +18,7 @@ use metrics::{counter, gauge, histogram};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Capacity metrics for monitoring
 #[derive(Debug, Default)]
@@ -58,29 +58,34 @@ impl CapacityMetrics {
     }
 
     /// Record scheduled update
+    #[allow(dead_code)]
     pub fn record_scheduled_update(&self) {
         self.scheduled_updates.fetch_add(1, Ordering::Relaxed);
         counter!("rustfs.capacity.update.scheduled").increment(1);
     }
 
     /// Record write triggered update
+    #[allow(dead_code)]
     pub fn record_write_triggered_update(&self) {
         self.write_triggered_updates.fetch_add(1, Ordering::Relaxed);
         counter!("rustfs.capacity.update.write_triggered").increment(1);
     }
 
     /// Record update failure
+    #[allow(dead_code)]
     pub fn record_update_failure(&self) {
         self.update_failures.fetch_add(1, Ordering::Relaxed);
         counter!("rustfs.capacity.update.failures").increment(1);
     }
 
     /// Record write operation
+    #[allow(dead_code)]
     pub fn record_write_operation(&self) {
         counter!("rustfs.capacity.write.operations").increment(1);
     }
 
     /// Record update duration
+    #[allow(dead_code)]
     pub fn record_update_duration(&self, duration: Duration) {
         let duration_us = duration.as_micros() as u64;
         self.total_update_duration_us.fetch_add(duration_us, Ordering::Relaxed);
@@ -181,18 +186,21 @@ pub async fn start_metrics_logging(interval: Duration) {
 }
 
 /// Record a write operation globally
+#[allow(dead_code)]
 pub fn record_global_write_operation() {
     let metrics = get_capacity_metrics();
     metrics.record_write_operation();
 }
 
 /// Record cache hit globally
+#[allow(dead_code)]
 pub fn record_global_cache_hit() {
     let metrics = get_capacity_metrics();
     metrics.record_cache_hit();
 }
 
 /// Record cache miss globally
+#[allow(dead_code)]
 pub fn record_global_cache_miss() {
     let metrics = get_capacity_metrics();
     metrics.record_cache_miss();
