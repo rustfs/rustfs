@@ -38,6 +38,8 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
+use md5::Context as Md5Context;
+use pin_project_lite::pin_project;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -106,8 +108,9 @@ use std::convert::Infallible;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -115,6 +118,54 @@ use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+pin_project! {
+    struct ExtractArchiveEtagReader<R> {
+        #[pin]
+        inner: R,
+        md5: Md5Context,
+        finished: bool,
+        etag: Arc<Mutex<Option<String>>>,
+    }
+}
+
+impl<R> ExtractArchiveEtagReader<R> {
+    fn new(inner: R, etag: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            inner,
+            md5: Md5Context::new(),
+            finished: false,
+            etag,
+        }
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.project();
+        let before = buf.filled().len();
+        match this.inner.poll_read(cx, buf) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(())) => {
+                let filled = &buf.filled()[before..];
+                if !filled.is_empty() {
+                    this.md5.consume(filled);
+                } else if !*this.finished {
+                    *this.finished = true;
+                    if let Ok(mut etag) = this.etag.lock() {
+                        *etag = Some(format!("{:x}", this.md5.clone().finalize()));
+                    }
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+        }
+    }
+}
 
 /// Extract trailing-header checksum values, overriding the corresponding input fields.
 fn apply_trailing_checksums(
@@ -261,6 +312,43 @@ fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -
     }
 
     key
+}
+
+fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
+    s3_error!(InvalidArgument, "Failed to process archive entry: {}", err)
+}
+
+async fn apply_extract_entry_pax_extensions<R>(
+    entry: &mut tokio_tar::Entry<Archive<R>>,
+    metadata: &mut HashMap<String, String>,
+    opts: &mut ObjectOptions,
+) -> S3Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    let Some(extensions) = entry.pax_extensions().await.map_err(map_extract_archive_error)? else {
+        return Ok(());
+    };
+
+    for ext in extensions {
+        let ext = ext.map_err(map_extract_archive_error)?;
+        let key = ext.key().map_err(map_extract_archive_error)?;
+        let value = ext.value().map_err(map_extract_archive_error)?;
+
+        if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
+            let meta_key = meta_key.strip_prefix("x-amz-meta-").unwrap_or(meta_key);
+            if !meta_key.is_empty() {
+                metadata.insert(meta_key.to_string(), value.to_string());
+            }
+            continue;
+        }
+
+        if key == "minio.versionId" && !value.is_empty() {
+            opts.version_id = Some(value.to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_put_request_metadata(
@@ -3592,6 +3680,14 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
+        let auth_method = req.method.clone();
+        let auth_uri = req.uri.clone();
+        let auth_headers = req.headers.clone();
+        let auth_extensions = req.extensions.clone();
+        let auth_credentials = req.credentials.clone();
+        let auth_region = req.region.clone();
+        let auth_service = req.service.clone();
+        let auth_trailing_headers = req.trailing_headers.clone();
         if is_sse_kms_requested(&req.input, &req.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
@@ -3717,13 +3813,16 @@ impl DefaultObjectUsecase {
 
         let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
-        let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut archive_reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
-        if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+        if let Err(err) = archive_reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
             return Err(ApiError::from(err).into());
         }
 
-        let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {
+        let archive_etag = Arc::new(Mutex::new(None));
+        let decoder = CompressionFormat::from_extension(&ext)
+            .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
+            .map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
         })?;
@@ -3755,7 +3854,7 @@ impl DefaultObjectUsecase {
         let user_agent = get_request_user_agent(&req.headers);
 
         while let Some(entry) = entries.next().await {
-            let f = match entry {
+            let mut f = match entry {
                 Ok(f) => f,
                 Err(e) => {
                     if extract_options.ignore_errors {
@@ -3781,21 +3880,31 @@ impl DefaultObjectUsecase {
             let is_dir = f.header().entry_type().is_dir();
             let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
 
-            let mut size = f.header().size().unwrap_or_default() as i64;
-
-            debug!("Extracting file: {}, size: {} bytes", fpath, size);
-
-            let mut reader: Box<dyn Reader> = if is_dir {
-                if extract_options.ignore_dirs {
-                    debug!("Skipping directory entry during archive extract: {}", fpath);
-                    continue;
-                }
-                size = 0;
-                Box::new(WarpReader::new(std::io::Cursor::new(Vec::new())))
-            } else {
-                Box::new(WarpReader::new(f))
+            let mut auth_req = S3Request {
+                input: PutObjectInput::default(),
+                method: auth_method.clone(),
+                uri: auth_uri.clone(),
+                headers: auth_headers.clone(),
+                extensions: auth_extensions.clone(),
+                credentials: auth_credentials.clone(),
+                region: auth_region.clone(),
+                service: auth_service.clone(),
+                trailing_headers: auth_trailing_headers.clone(),
             };
+            {
+                let req_info = req_info_mut(&mut auth_req)?;
+                req_info.bucket = Some(bucket.clone());
+                req_info.object = Some(fpath.clone());
+                req_info.version_id = None;
+            }
+            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
+            let mut size = f.header().size().unwrap_or_default() as i64;
+            let archive_entry_mod_time = f
+                .header()
+                .mtime()
+                .ok()
+                .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
             let mut metadata = HashMap::new();
             apply_put_request_metadata(
                 &mut metadata,
@@ -3811,6 +3920,26 @@ impl DefaultObjectUsecase {
                 tagging.clone(),
                 storage_class.clone(),
             )?;
+            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
+                .await
+                .map_err(ApiError::from)?;
+            apply_extract_entry_pax_extensions(&mut f, &mut metadata, &mut opts).await?;
+            if archive_entry_mod_time.is_some() {
+                opts.mod_time = archive_entry_mod_time;
+            }
+
+            debug!("Extracting file: {}, size: {} bytes", fpath, size);
+
+            let mut reader: Box<dyn Reader> = if is_dir {
+                if extract_options.ignore_dirs {
+                    debug!("Skipping directory entry during archive extract: {}", fpath);
+                    continue;
+                }
+                size = 0;
+                Box::new(WarpReader::new(std::io::Cursor::new(Vec::new())))
+            } else {
+                Box::new(WarpReader::new(f))
+            };
 
             let actual_size = size;
 
@@ -3825,9 +3954,6 @@ impl DefaultObjectUsecase {
             }
 
             let mut hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
-                .await
-                .map_err(ApiError::from)?;
             apply_put_request_object_lock_opts(
                 &bucket,
                 object_lock_legal_hold_status.clone(),
@@ -3929,7 +4055,22 @@ impl DefaultObjectUsecase {
             checksums.crc32, checksums.crc32c, checksums.sha1, checksums.sha256, checksums.crc64nvme,
         );
 
+        drop(entries);
+        let mut decoder = match ar.into_inner() {
+            Ok(decoder) => decoder,
+            Err(_) => return Err(s3_error!(InvalidArgument, "Failed to finalize archive reader")),
+        };
+        tokio::io::copy(&mut decoder, &mut tokio::io::sink())
+            .await
+            .map_err(map_extract_archive_error)?;
+        let archive_etag = archive_etag
+            .lock()
+            .ok()
+            .and_then(|etag| etag.clone())
+            .map(|etag| to_s3s_etag(&etag));
+
         let output = PutObjectOutput {
+            e_tag: archive_etag,
             checksum_crc32: checksums.crc32,
             checksum_crc32c: checksums.crc32c,
             checksum_sha1: checksums.sha1,

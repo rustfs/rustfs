@@ -26,9 +26,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{Compression, write::GzEncoder};
 use http::HeaderValue;
 use serial_test::serial;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
     let expiration = (Utc::now() + ChronoDuration::hours(1))
@@ -72,6 +74,59 @@ async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
             .await
             .expect("file entry should be appended");
     }
+
+    builder.into_inner().await.expect("tar builder should finalize").into_inner()
+}
+
+fn build_pax_record(key: &str, value: &str) -> Vec<u8> {
+    let payload = format!("{key}={value}\n");
+    let mut len = payload.len() + 3;
+    loop {
+        let record = format!("{len} {payload}");
+        if record.len() == len {
+            return record.into_bytes();
+        }
+        len = record.len();
+    }
+}
+
+async fn make_tar_with_pax_entry(
+    path: &str,
+    data: &[u8],
+    mtime: Option<u64>,
+    pax: &HashMap<&str, String>,
+) -> Vec<u8> {
+    let buf = Cursor::new(Vec::new());
+    let mut builder = tokio_tar::Builder::new(buf);
+
+    if !pax.is_empty() {
+        let mut pax_payload = Vec::new();
+        for (key, value) in pax {
+            pax_payload.extend(build_pax_record(key, value));
+        }
+
+        let mut pax_header = tokio_tar::Header::new_gnu();
+        pax_header.set_entry_type(tokio_tar::EntryType::XHeader);
+        pax_header.set_size(pax_payload.len() as u64);
+        pax_header.set_mode(0o644);
+        pax_header.set_cksum();
+        builder
+            .append_data(&mut pax_header, "PaxHeaders.X/entry", Cursor::new(pax_payload))
+            .await
+            .expect("pax header entry should be appended");
+    }
+
+    let mut header = tokio_tar::Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    if let Some(mtime) = mtime {
+        header.set_mtime(mtime);
+    }
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new(data))
+        .await
+        .expect("file entry should be appended");
 
     builder.into_inner().await.expect("tar builder should finalize").into_inner()
 }
@@ -5385,6 +5440,133 @@ async fn test_signed_put_object_extract_preserves_object_lock_retention()
             .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
         retain_until_expected
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-etag";
+    let archive_key = "bundle.tar";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let archive = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+    let expected_etag = format!("\"{:x}\"", md5::compute(&archive));
+
+    let response = client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    assert_eq!(response.e_tag(), Some(expected_etag.as_str()));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-mtime";
+    let archive_key = "bundle.tar";
+    let extracted_key = "mtime/file.txt";
+    let modified_at_secs = 1_704_000_123_u64;
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let archive = make_tar_with_pax_entry(extracted_key, b"mtime-body", Some(modified_at_secs), &HashMap::new()).await;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let head = client.head_object().bucket(bucket).key(extracted_key).send().await?;
+    assert_eq!(
+        head.last_modified().expect("last_modified should exist").secs(),
+        modified_at_secs as i64
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-pax";
+    let archive_key = "bundle.tar";
+    let extracted_key = "pax/alpha.txt";
+    let expected_version_id = Uuid::new_v4().to_string();
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let mut pax = HashMap::new();
+    pax.insert("minio.metadata.project", "alpha-demo".to_string());
+    pax.insert("minio.metadata.x-amz-meta-owner", "ops".to_string());
+    pax.insert("minio.versionId", expected_version_id.clone());
+    let archive = make_tar_with_pax_entry(extracted_key, b"pax-body", None, &pax).await;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let head = client.head_object().bucket(bucket).key(extracted_key).send().await?;
+    let metadata = head.metadata().expect("head_object should expose metadata");
+    assert_eq!(metadata.get("project").map(String::as_str), Some("alpha-demo"));
+    assert_eq!(metadata.get("owner").map(String::as_str), Some("ops"));
+    assert_eq!(head.version_id(), Some(expected_version_id.as_str()));
 
     Ok(())
 }
