@@ -975,7 +975,7 @@ impl DefaultObjectUsecase {
         let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
         let request_id = wrapper.request_id().to_string();
         deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
-        let _deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector.clone(), request_id.clone());
+        let _deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector.clone(), request_id);
 
         // Check for request timeout before proceeding
         if wrapper.is_timeout() {
