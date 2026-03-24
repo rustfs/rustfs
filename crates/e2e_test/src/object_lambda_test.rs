@@ -17,7 +17,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
+use rustfs_signer::{pre_sign_v4, sign_v4};
 use s3s::Body;
 use serial_test::serial;
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
+use time::OffsetDateTime;
 
 #[derive(Debug)]
 struct CapturedWebhookRequest {
@@ -169,6 +170,30 @@ async fn spawn_object_lambda_webhook_server_with_response(
     });
 
     Ok((webhook_url, request_rx, handle))
+}
+
+async fn presigned_get_request(
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let signed = pre_sign_v4(
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .header(HOST, authority)
+            .body(Body::empty())?,
+        access_key,
+        secret_key,
+        "",
+        "us-east-1",
+        600,
+        OffsetDateTime::now_utc(),
+    );
+
+    Ok(local_http_client().get(signed.uri().to_string()).send().await?)
 }
 
 async fn signed_request(
@@ -348,6 +373,88 @@ async fn read_listen_notification_event(
             }
         }
     }
+}
+
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-presigned";
+    let key = "input.txt";
+    let object_body = b"hello presigned object lambda";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(object_body))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
+    let response = presigned_get_request(&lambda_url, &env.access_key, &env.secret_key).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await?, "transformed through object lambda");
+
+    let captured = timeout(Duration::from_secs(10), request_rx).await??;
+    assert_eq!(captured.payload["configuration"]["accessPointArn"].as_str(), Some(lambda_arn));
+
+    webhook_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "object-lambda-e2e-named-target";
+    let key = "input.txt";
+    let lambda_arn = "arn:rustfs:s3-object-lambda:us-east-1:transformer:webhook-preview";
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello object lambda"))
+        .send()
+        .await?;
+
+    configure_webhook_target(&env, "transformer", &webhook_url, "secret-token").await?;
+    wait_for_target_visibility(&env, "transformer").await?;
+
+    let lambda_url = format!("{}/{}/{}?lambdaArn={}", env.url, bucket, key, urlencoding::encode(lambda_arn));
+    let response = signed_request(http::Method::GET, &lambda_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await?, "transformed through object lambda");
+
+    let captured = timeout(Duration::from_secs(10), request_rx).await??;
+    assert_eq!(captured.payload["configuration"]["accessPointArn"].as_str(), Some(lambda_arn));
+
+    webhook_handle.await??;
+
+    Ok(())
 }
 
 #[tokio::test]
