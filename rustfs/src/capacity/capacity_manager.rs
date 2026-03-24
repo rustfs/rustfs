@@ -220,10 +220,10 @@ impl HybridCapacityManager {
             .retain(|&t| now.duration_since(t) < Duration::from_secs(60));
         record.write_window.push(now);
 
+        counter!("rustfs.capacity.write.operations").increment(1);
+        gauge!("rustfs.capacity.write.frequency").set(record.write_window.len() as f64);
         debug!(
             "Write operation recorded: total writes = {}, recent writes = {}",
-        counter!("rustfs.capacity.write.operations").increment(1);
-        gauge!("rustfs.capacity.write.frequency", record.write_window.len() as f64);
             record.write_count,
             record.write_window.len()
         );

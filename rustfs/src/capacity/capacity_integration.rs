@@ -16,8 +16,9 @@
 
 use crate::capacity::capacity_manager::{get_capacity_manager, start_background_task, DataSource};
 use crate::capacity::capacity_metrics::{get_capacity_metrics, start_metrics_logging};
+use rustfs_ecstore::disk::DiskAPI;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Initialize capacity management system
 /// This should be called during application startup after local disks are initialized
@@ -25,13 +26,7 @@ pub async fn init_capacity_management() {
     info!("Initializing capacity management system...");
 
     // Get all local disks
-    let disks = match rustfs_ecstore::store::all_local_disk().await {
-        Ok(d) => d,
-        Err(e) => {
-            error!("Failed to get local disks: {:?}", e);
-            return;
-        }
-    };
+    let disks = rustfs_ecstore::store::all_local_disk().await;
 
     if disks.is_empty() {
         warn!("No local disks found, capacity management will not run");
@@ -44,15 +39,9 @@ pub async fn init_capacity_management() {
     let disk_refs: Vec<rustfs_madmin::Disk> = disks
         .iter()
         .map(|ds| rustfs_madmin::Disk {
-            id: ds.id.clone(),
-            endpoint: ds.endpoint.clone(),
-            set_id: ds.set_id,
-            pool_idx: ds.pool_idx,
-            set_idx: ds.set_idx,
-            root: ds.root.clone(),
-            is_local: ds.is_local,
-            total_capacity: ds.total_capacity,
-            free_capacity: ds.free_capacity,
+            endpoint: ds.endpoint().to_string(),
+            drive_path: ds.to_string(),
+            root_disk: true,
             ..Default::default()
         })
         .collect();
