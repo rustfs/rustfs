@@ -120,9 +120,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
 
     // Ensure sample_rate is never zero to avoid panics in is_multiple_of
     let effective_sample_rate = if sample_rate == 0 {
-        warn!(
-            "Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic."
-        );
+        warn!("Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic.");
         1
     } else {
         sample_rate
@@ -153,10 +151,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
-                    warn!(
-                        "Failed to traverse directory entry under {:?}: {}",
-                        path, err
-                    );
+                    warn!("Failed to traverse directory entry under {:?}: {}", path, err);
                     return Err(std::io::Error::other(err.to_string()));
                 }
             };

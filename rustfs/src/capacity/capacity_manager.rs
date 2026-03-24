@@ -24,8 +24,8 @@ use rustfs_config::{
     ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_utils::{get_env_u64, get_env_usize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -325,9 +325,7 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
 
     // Prevent panic in tokio::time::interval when misconfigured to 0
     if interval.is_zero() {
-        warn!(
-            "RUSTFS_CAPACITY_SCHEDULED_INTERVAL is configured as 0; clamping to 1s to avoid panic"
-        );
+        warn!("RUSTFS_CAPACITY_SCHEDULED_INTERVAL is configured as 0; clamping to 1s to avoid panic");
         interval = Duration::from_secs(1);
     }
 
