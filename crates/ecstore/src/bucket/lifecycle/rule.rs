@@ -27,6 +27,10 @@ pub trait Filter {
 
 impl Filter for LifecycleRuleFilter {
     fn test_tags(&self, user_tags: &str) -> bool {
+        if !requires_tag_matching(self) {
+            return true;
+        }
+
         let user_tags = decode_tags_to_map(user_tags);
 
         self.tag.as_ref().is_none_or(|tag| tag_matches(tag, &user_tags))
@@ -40,6 +44,15 @@ impl Filter for LifecycleRuleFilter {
             && self.object_size_less_than.is_none_or(|max| sz < max)
             && self.and.as_ref().is_none_or(|and| and_size_matches(and, sz))
     }
+}
+
+fn requires_tag_matching(filter: &LifecycleRuleFilter) -> bool {
+    filter.tag.is_some()
+        || filter
+            .and
+            .as_ref()
+            .and_then(|and| and.tags.as_ref())
+            .is_some_and(|tags| !tags.is_empty())
 }
 
 fn tag_matches(tag: &Tag, user_tags: &std::collections::HashMap<String, String>) -> bool {
@@ -133,5 +146,16 @@ mod test {
         assert!(!filter.by_size(5));
         assert!(filter.by_size(6));
         assert!(!filter.by_size(10));
+    }
+
+    #[test]
+    fn lifecycle_rule_filter_without_tag_constraints_accepts_any_tags() {
+        let filter = LifecycleRuleFilter {
+            object_size_greater_than: Some(5),
+            ..Default::default()
+        };
+
+        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
+        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, ""));
     }
 }
