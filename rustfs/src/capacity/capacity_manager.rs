@@ -24,10 +24,11 @@ use rustfs_config::{
     ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_utils::{get_env_u64, get_env_usize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 // ============================================================================
 // Configuration Functions
 // ============================================================================
@@ -161,6 +162,8 @@ pub struct HybridCapacityManager {
     write_record: Arc<RwLock<WriteRecord>>,
     /// Configuration
     config: HybridStrategyConfig,
+    /// Background update in progress flag
+    update_in_progress: Arc<AtomicBool>,
 }
 
 impl HybridCapacityManager {
@@ -174,6 +177,7 @@ impl HybridCapacityManager {
                 write_window: Vec::new(),
             })),
             config,
+            update_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -217,11 +221,16 @@ impl HybridCapacityManager {
         record.write_count += 1;
 
         // Maintain write time window (keep last 1 minute)
+        // Cap the window size to prevent unbounded memory growth at high write rates
+        const MAX_WRITE_WINDOW_SIZE: usize = 10000;
         let now = Instant::now();
         record
             .write_window
             .retain(|&t| now.duration_since(t) < Duration::from_secs(60));
-        record.write_window.push(now);
+        // Only push if under the cap to prevent unbounded growth
+        if record.write_window.len() < MAX_WRITE_WINDOW_SIZE {
+            record.write_window.push(now);
+        }
 
         counter!("rustfs.capacity.write.operations").increment(1);
         gauge!("rustfs.capacity.write.frequency").set(record.write_window.len() as f64);
@@ -285,6 +294,18 @@ impl HybridCapacityManager {
     pub fn get_config(&self) -> &HybridStrategyConfig {
         &self.config
     }
+
+    /// Try to start a background update, returns true if update was started (false if already in progress)
+    pub fn try_start_background_update(&self) -> bool {
+        self.update_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Mark background update as complete
+    pub fn complete_background_update(&self) {
+        self.update_in_progress.store(false, Ordering::Release);
+    }
 }
 
 /// Global capacity manager instance
@@ -300,7 +321,15 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 /// Start background update task
 pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
     let manager = get_capacity_manager();
-    let interval = manager.get_config().scheduled_update_interval;
+    let mut interval = manager.get_config().scheduled_update_interval;
+
+    // Prevent panic in tokio::time::interval when misconfigured to 0
+    if interval.is_zero() {
+        warn!(
+            "RUSTFS_CAPACITY_SCHEDULED_INTERVAL is configured as 0; clamping to 1s to avoid panic"
+        );
+        interval = Duration::from_secs(1);
+    }
 
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);

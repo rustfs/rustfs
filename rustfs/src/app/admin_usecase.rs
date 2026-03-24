@@ -30,7 +30,7 @@ use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
@@ -69,6 +69,7 @@ pub(crate) async fn calculate_data_dir_used_capacity(
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let mut total_used = 0u64;
     let mut has_failure = false;
+    let mut has_success = false;
 
     for disk in disks {
         let path = Path::new(&disk.drive_path);
@@ -85,6 +86,7 @@ pub(crate) async fn calculate_data_dir_used_capacity(
             Ok(size) => {
                 debug!("Data directory {} size: {} bytes", disk.drive_path, size);
                 total_used += size;
+                has_success = true;
             }
             Err(e) => {
                 warn!("Failed to get size for directory {}: {:?}", disk.drive_path, e);
@@ -94,7 +96,12 @@ pub(crate) async fn calculate_data_dir_used_capacity(
         }
     }
 
-    // Log warning if there were failures
+    // If all directories failed, return error to trigger fallback
+    if !has_success {
+        return Err("All directories failed to calculate size".into());
+    }
+
+    // Log warning if there were some failures
     if has_failure {
         warn!("Some directories failed to calculate size, result may be incomplete");
     }
@@ -110,6 +117,16 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
     let max_files_threshold = get_max_files_threshold();
     let stat_timeout = get_stat_timeout();
     let sample_rate = get_sample_rate();
+
+    // Ensure sample_rate is never zero to avoid panics in is_multiple_of
+    let effective_sample_rate = if sample_rate == 0 {
+        warn!(
+            "Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic."
+        );
+        1
+    } else {
+        sample_rate
+    };
 
     // Check if path exists before traversing
     if !path.exists() {
@@ -129,10 +146,20 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         // Use walkdir to traverse directory tree
         let walker = WalkDir::new(&path)
             .follow_links(false) // Don't follow symbolic links
-            .into_iter()
-            .filter_map(|e| e.ok());
+            .into_iter();
 
-        for entry in walker {
+        for entry_result in walker {
+            // Propagate traversal errors instead of silently dropping them
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(
+                        "Failed to traverse directory entry under {:?}: {}",
+                        path, err
+                    );
+                    return Err(std::io::Error::other(err.to_string()));
+                }
+            };
             // Check timeout
             if start_time.elapsed() > stat_timeout {
                 warn!("Directory size calculation timeout after {} files, using sampled estimate", file_count);
@@ -151,8 +178,8 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
 
                 // When file count exceeds threshold, enable sampling
                 if file_count > max_files_threshold {
-                    // Sampling: count 1 in every sample_rate files
-                    if file_count.is_multiple_of(sample_rate) {
+                    // Sampling: count 1 in every effective_sample_rate files
+                    if file_count.is_multiple_of(effective_sample_rate) {
                         sampled_size += metadata.len();
                         sampled_count += 1;
                     }
@@ -324,9 +351,10 @@ impl DefaultAdminUsecase {
         // Check if we have a valid cache
         if let Some(cached) = capacity_manager.get_capacity().await {
             let cache_age = cached.last_update.elapsed();
+            let fast_update_threshold = capacity_manager.get_config().fast_update_threshold;
 
-            // If cache is fresh (< 60 seconds), use it directly
-            if cache_age < Duration::from_secs(60) {
+            // If cache is fresh (< fast_update_threshold), use it directly
+            if cache_age < fast_update_threshold {
                 info.total_used_capacity = cached.total_used;
                 debug!(
                     "Using cached capacity: {} bytes (age: {:?}, source: {:?})",
@@ -355,19 +383,24 @@ impl DefaultAdminUsecase {
                         }
                     }
                 } else {
-                    // Use stale cache and trigger background update
+                    // Use stale cache and trigger background update (if not already in progress)
                     info.total_used_capacity = cached.total_used;
-                    debug!("Using stale cache, background update will be triggered");
+                    debug!("Using stale cache, background update will be triggered if not already in progress");
 
-                    // Trigger background update
-                    let disks = storage_info.disks.clone();
-                    let manager = capacity_manager.clone();
-                    tokio::spawn(async move {
-                        if let Ok(new_capacity) = calculate_data_dir_used_capacity(&disks).await {
-                            manager.update_capacity(new_capacity, DataSource::Scheduled).await;
-                            debug!("Background capacity update completed: {} bytes", new_capacity);
-                        }
-                    });
+                    // Trigger background update only if not already in progress (prevent thundering herd)
+                    if capacity_manager.try_start_background_update() {
+                        let disks = storage_info.disks.clone();
+                        let manager = capacity_manager.clone();
+                        tokio::spawn(async move {
+                            if let Ok(new_capacity) = calculate_data_dir_used_capacity(&disks).await {
+                                manager.update_capacity(new_capacity, DataSource::Scheduled).await;
+                                debug!("Background capacity update completed: {} bytes", new_capacity);
+                            }
+                            manager.complete_background_update();
+                        });
+                    } else {
+                        debug!("Background update already in progress, skipping spawn");
+                    }
                 }
             }
         } else {
