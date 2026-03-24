@@ -96,6 +96,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::io::AsyncRead;
 use tracing::{debug, error};
 
+const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+
 use crate::error::ApiError;
 use crate::storage::readers::InMemoryAsyncReader;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -160,6 +162,15 @@ async fn prepare_sse_configuration(
     ssekms_key_id: Option<SSEKMSKeyId>,
 ) -> Result<Option<SseConfiguration>, ApiError> {
     if let Some(server_side_encryption) = server_side_encryption.clone()
+        && server_side_encryption.as_str() == ServerSideEncryption::AES256
+    {
+        return Ok(Some(SseConfiguration {
+            effective_sse: server_side_encryption,
+            effective_kms_key_id: None,
+        }));
+    }
+
+    if let Some(server_side_encryption) = server_side_encryption.clone()
         && let Some(ssekms_key_id) = ssekms_key_id
     {
         return Ok(Some(SseConfiguration {
@@ -192,7 +203,7 @@ async fn prepare_sse_configuration(
 
         debug!("effective_sse={:?} (original={:?})", effective_sse, server_side_encryption);
 
-        let effective_kms_key_id = ssekms_key_id.or_else(|| {
+        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
@@ -224,6 +235,21 @@ async fn prepare_sse_configuration(
     } else {
         Ok(None)
     }
+}
+
+fn resolve_effective_kms_key_id<F>(
+    effective_sse: Option<&ServerSideEncryption>,
+    requested_kms_key_id: Option<SSEKMSKeyId>,
+    bucket_default_kms_key_id: F,
+) -> Option<SSEKMSKeyId>
+where
+    F: FnOnce() -> Option<SSEKMSKeyId>,
+{
+    if effective_sse.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+        return requested_kms_key_id;
+    }
+
+    requested_kms_key_id.or_else(bucket_default_kms_key_id)
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +550,8 @@ pub struct DecryptionRequest<'a> {
     pub part_number: Option<usize>,
     /// Parts information for multipart objects
     pub parts: &'a [ObjectPartInfo],
+    /// Object-level ETag, used to distinguish multipart objects from single-part objects.
+    pub etag: Option<&'a str>,
 }
 
 /// Unified encryption material returned by `apply_encryption()`
@@ -566,6 +594,14 @@ pub struct DecryptionMaterial {
     pub is_multipart: bool,
     /// Part information for multipart objects
     pub parts: Vec<ObjectPartInfo>,
+}
+
+fn is_multipart_object(etag: Option<&str>, parts: &[ObjectPartInfo]) -> bool {
+    if parts.len() > 1 {
+        return true;
+    }
+
+    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
 }
 
 /// Type of encryption used
@@ -815,7 +851,7 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
-    let is_multipart = request.parts.len() > 1;
+    let is_multipart = is_multipart_object(request.etag, request.parts);
 
     // Check for SSE-C encryption
     if request
@@ -1021,7 +1057,7 @@ async fn apply_managed_encryption_material(
         context = context.with_size(content_size as u64);
     }
 
-    // Determine KMS key ID to use
+    // Determine KMS key ID to use for internal key wrapping.
     let mut kms_key_candidate = kms_key_id.clone().map(|s| s.to_string());
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
@@ -1030,11 +1066,17 @@ async fn apply_managed_encryption_material(
         }
     }
 
-    let kms_key_to_use = kms_key_candidate.clone().ok_or_else(|| {
-        ApiError::from(StorageError::other(
-            "No KMS key available for managed server-side encryption (required for SSE-KMS)",
-        ))
-    })?;
+    let kms_key_to_use = match (encryption_type, kms_key_candidate.clone()) {
+        (SSEType::SseS3, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseS3, None) => "default".to_string(),
+        (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
+        (SSEType::SseKms, None) => {
+            return Err(ApiError::from(StorageError::other(
+                "No KMS key available for managed server-side encryption (required for SSE-KMS)",
+            )));
+        }
+        _ => unreachable!("managed SSE branch only supports SSE-S3 or SSE-KMS"),
+    };
 
     let provider = get_sse_dek_provider().await?;
 
@@ -1074,7 +1116,7 @@ async fn apply_managed_encryption_material(
         (data_key, encrypted_data_key)
     };
 
-    let algorithm = DEFAULT_SSE_ALGORITHM.to_string();
+    let algorithm = server_side_encryption.as_str().to_string();
 
     let encryption_metadata = EncryptionMetadata {
         algorithm: algorithm.clone(),
@@ -1103,12 +1145,14 @@ async fn apply_managed_encryption_material(
         metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
         metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
         metadata.insert("x-amz-server-side-encryption".to_string(), server_side_encryption.as_str().to_string());
-
-        // if kms_key is changed, we need to update the metadata
-        if kms_key_id.is_none() {
-            metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
-        }
     }
+
+    if matches!(encryption_type, SSEType::SseKms) {
+        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
+    } else {
+        metadata.remove("x-amz-server-side-encryption-aws-kms-key-id");
+    }
+    metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), kms_key_to_use.clone());
 
     metadata.insert(
         "x-rustfs-encryption-original-size".to_string(),
@@ -1118,7 +1162,7 @@ async fn apply_managed_encryption_material(
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
-        kms_key_id: Some(kms_key_to_use),
+        kms_key_id: matches!(encryption_type, SSEType::SseKms).then_some(kms_key_to_use),
         algorithm,
 
         key_bytes: data_key.plaintext_key,
@@ -1182,7 +1226,8 @@ async fn apply_managed_decryption_material(
 
     // Extract KMS key ID from metadata (optional, used for provider context)
     let kms_key_id = metadata
-        .get("x-amz-server-side-encryption-aws-kms-key-id")
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
@@ -2180,6 +2225,80 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_effective_kms_key_id_ignores_bucket_default_for_explicit_sse_s3() {
+        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+
+        let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
+
+        assert_eq!(kms_key_id, None);
+    }
+
+    #[test]
+    fn test_resolve_effective_kms_key_id_uses_bucket_default_for_sse_kms() {
+        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);
+
+        let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
+
+        assert_eq!(kms_key_id.as_deref(), Some("bucket-default"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
+        let request = EncryptionRequest {
+            bucket: "test-bucket",
+            key: "test-key",
+            server_side_encryption: Some("aws:kms".to_string().into()),
+            ssekms_key_id: Some("test-key".to_string()),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let material = sse_encryption(request).await.expect("kms encryption should succeed");
+        let metadata = material.expect("managed kms encryption should return material").metadata;
+
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
+        assert_eq!(
+            metadata
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .map(String::as_str),
+            Some("test-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_encryption_omits_kms_header_for_sse_s3_objects() {
+        let request = EncryptionRequest {
+            bucket: "test-bucket",
+            key: "test-key",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 1024,
+            part_number: None,
+            part_key: None,
+            part_nonce: None,
+        };
+
+        let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
+        let material = material.expect("managed sse-s3 encryption should return material");
+
+        assert_eq!(material.kms_key_id, None);
+        assert_eq!(material.metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+        assert!(!material.metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+        assert_eq!(
+            material.metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str),
+            Some("default")
+        );
+    }
+
+    #[test]
     fn test_strip_managed_encryption_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
@@ -2191,6 +2310,32 @@ mod tests {
         assert!(!metadata.contains_key("x-amz-server-side-encryption"));
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(metadata.contains_key("content-type"));
+    }
+
+    #[test]
+    fn test_is_multipart_object_treats_single_part_multipart_etag_as_multipart() {
+        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef-1".to_string())]);
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 128,
+            actual_size: 64,
+            ..Default::default()
+        }];
+
+        assert!(is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
+    }
+
+    #[test]
+    fn test_is_multipart_object_keeps_regular_single_part_object_as_non_multipart() {
+        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef".to_string())]);
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 128,
+            actual_size: 64,
+            ..Default::default()
+        }];
+
+        assert!(!is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
     }
 
     #[test]

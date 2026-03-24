@@ -78,12 +78,6 @@ pub mod notifier_global {
             return;
         }
 
-        // Check if any subscribers are interested in the event
-        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
-            // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
-            return;
-        }
-
         // Create an event and send it
         let event = Arc::new(Event::new(args));
         notification_sys.send_event(event).await;

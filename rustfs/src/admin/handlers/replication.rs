@@ -23,7 +23,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
@@ -51,6 +51,22 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     }
 
     params
+}
+
+fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
+    match err {
+        BucketTargetError::BucketRemoteTargetNotFound { .. }
+        | BucketTargetError::BucketRemoteArnTypeInvalid { .. }
+        | BucketTargetError::BucketRemoteAlreadyExists { .. }
+        | BucketTargetError::BucketRemoteArnInvalid { .. }
+        | BucketTargetError::RemoteTargetConnectionErr { .. }
+        | BucketTargetError::BucketReplicationSourceNotVersioned { .. }
+        | BucketTargetError::BucketRemoteTargetNotVersioned { .. }
+        | BucketTargetError::BucketRemoteRemoveDisallowed { .. } => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, err.to_string())
+        }
+        BucketTargetError::Io(io_err) => S3Error::with_message(S3ErrorCode::InternalError, io_err.to_string()),
+    }
 }
 
 pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -200,7 +216,7 @@ impl Operation for SetRemoteTargetHandler {
         })?;
 
         let Ok(target_url) = remote_target.url() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Invalid target url".to_string()));
+            return Err(s3_error!(InvalidRequest, "invalid target url"));
         };
 
         let same_target = rustfs_utils::net::is_local_host(
@@ -232,7 +248,7 @@ impl Operation for SetRemoteTargetHandler {
         }
 
         if remote_target.arn.is_empty() {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "ARN is empty".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
         }
 
         if update {
@@ -240,7 +256,7 @@ impl Operation for SetRemoteTargetHandler {
                 .get_remote_bucket_target_by_arn(bucket, &remote_target.arn)
                 .await
             else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Target not found".to_string()));
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Target not found".to_string()));
             };
 
             target.credentials = remote_target.credentials;
@@ -262,7 +278,7 @@ impl Operation for SetRemoteTargetHandler {
         bucket_target_sys
             .set_target(bucket, &remote_target, update)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+            .map_err(map_bucket_target_error)?;
 
         let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
             error!("Failed to list bucket targets: {}", e);
@@ -302,20 +318,17 @@ impl Operation for ListRemoteTargetHandler {
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
                 error!("bucket parameter is empty");
-                return Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Bucket parameter is required".to_string()),
-                )));
+                return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
             let Some(store) = new_object_layer_fn() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
-            if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
-                error!("Error fetching bucket info: {:?}", err);
-                return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
-            }
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
             let sys = BucketTargetSys::get();
             let targets = sys.list_targets(bucket, "").await;
@@ -355,31 +368,31 @@ impl Operation for RemoveRemoteTargetHandler {
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
         let Some(bucket) = queries.get("bucket") else {
-            return Ok(S3Response::new((
-                StatusCode::BAD_REQUEST,
-                Body::from("Bucket parameter is required".to_string()),
-            )));
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        }
 
         let Some(arn_str) = queries.get("arn") else {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("ARN is required".to_string()))));
+            return Err(s3_error!(InvalidRequest, "arn is required"));
+        };
+        if arn_str.is_empty() {
+            return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
-        if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
-            error!("Error fetching bucket info: {:?}", err);
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
-        }
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
 
         let sys = BucketTargetSys::get();
 
-        sys.remove_target(bucket, arn_str).await.map_err(|e| {
-            error!("Failed to remove target: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to remove target".to_string())
-        })?;
+        sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
         let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
             error!("Failed to list bucket targets: {}", e);

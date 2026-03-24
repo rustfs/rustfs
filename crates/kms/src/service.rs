@@ -49,6 +49,8 @@ pub struct ObjectEncryptionService {
     kms_manager: KmsManager,
 }
 
+const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+
 /// Result of object encryption
 #[derive(Debug, Clone)]
 pub struct EncryptionResult {
@@ -604,11 +606,12 @@ impl ObjectEncryptionService {
             headers.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
         } else if metadata.algorithm == "AES256" {
             headers.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
-            // For SSE-S3, we still need to store the key ID for internal use
-            headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
         } else {
             headers.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
             headers.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), metadata.key_id.clone());
+        }
+        if metadata.key_id != "sse-c" {
+            headers.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), metadata.key_id.clone());
         }
 
         // Internal headers for decryption
@@ -653,8 +656,14 @@ impl ObjectEncryptionService {
 
         let key_id = if algorithm == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
             "sse-c".to_string()
+        } else if let Some(key_id) = headers.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER) {
+            key_id.clone()
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
+        } else if algorithm == "AES256" {
+            self.get_default_key_id()
+                .cloned()
+                .ok_or_else(|| KmsError::validation_error("Missing key ID"))?
         } else {
             return Err(KmsError::validation_error("Missing key ID"));
         };
@@ -821,6 +830,8 @@ mod tests {
         let headers = service.metadata_to_headers(&metadata);
         assert!(headers.contains_key("x-amz-server-side-encryption"));
         assert!(headers.contains_key("x-rustfs-encryption-iv"));
+        assert!(headers.contains_key(INTERNAL_ENCRYPTION_KEY_ID_HEADER));
+        assert!(!headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
 
         // Convert back to metadata
         let parsed_metadata = service.headers_to_metadata(&headers).expect("Failed to parse headers");
