@@ -263,6 +263,95 @@ fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -
     key
 }
 
+fn apply_put_request_metadata(
+    metadata: &mut HashMap<String, String>,
+    headers: &HeaderMap,
+    object_name: &str,
+    cache_control: Option<CacheControl>,
+    content_disposition: Option<ContentDisposition>,
+    content_encoding: Option<ContentEncoding>,
+    content_language: Option<ContentLanguage>,
+    content_type: Option<ContentType>,
+    expires: Option<Timestamp>,
+    website_redirect_location: Option<WebsiteRedirectLocation>,
+    tagging: Option<TaggingHeader>,
+    storage_class: Option<StorageClass>,
+) -> S3Result<()> {
+    if let Some(cache_control) = cache_control {
+        metadata.insert("cache-control".to_string(), cache_control.to_string());
+    }
+    if let Some(content_disposition) = content_disposition {
+        metadata.insert("content-disposition".to_string(), content_disposition.to_string());
+    }
+    if let Some(content_encoding) = content_encoding
+        && let Some(normalized_content_encoding) = normalize_content_encoding_for_storage(&content_encoding)
+    {
+        metadata.insert("content-encoding".to_string(), normalized_content_encoding);
+    }
+    if let Some(content_language) = content_language {
+        metadata.insert("content-language".to_string(), content_language.to_string());
+    }
+    if let Some(content_type) = content_type {
+        metadata.insert("content-type".to_string(), content_type.to_string());
+    }
+    if let Some(expires) = expires {
+        let mut formatted = Vec::new();
+        expires
+            .format(TimestampFormat::HttpDate, &mut formatted)
+            .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+        metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
+    }
+    if let Some(website_redirect_location) = website_redirect_location {
+        metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location.to_string());
+    }
+    if let Some(tags) = tagging {
+        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
+    }
+    if let Some(storage_class) = storage_class {
+        metadata.insert(AMZ_STORAGE_CLASS.to_string(), storage_class.as_str().to_string());
+    }
+
+    extract_metadata_from_mime_with_object_name(headers, metadata, true, Some(object_name));
+    Ok(())
+}
+
+async fn apply_put_request_object_lock_opts(
+    bucket: &str,
+    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
+    object_lock_mode: Option<ObjectLockMode>,
+    object_lock_retain_until_date: Option<Timestamp>,
+    opts: &mut ObjectOptions,
+) -> S3Result<()> {
+    if object_lock_legal_hold_status.is_none() && object_lock_mode.is_none() && object_lock_retain_until_date.is_none() {
+        return Ok(());
+    }
+
+    validate_bucket_object_lock_enabled(bucket).await?;
+
+    let retention = match (object_lock_mode, object_lock_retain_until_date) {
+        (Some(mode), retain_until_date) => Some(ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
+            retain_until_date,
+        }),
+        (None, Some(retain_until_date)) => Some(ObjectLockRetention {
+            mode: None,
+            retain_until_date: Some(retain_until_date),
+        }),
+        (None, None) => None,
+    };
+
+    let mut eval_metadata = parse_object_lock_retention(retention)?;
+    eval_metadata.extend(parse_object_lock_legal_hold(
+        object_lock_legal_hold_status.map(|status| ObjectLockLegalHold { status: Some(status) }),
+    )?);
+
+    if !eval_metadata.is_empty() {
+        opts.eval_metadata = Some(eval_metadata);
+    }
+
+    Ok(())
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
     let prefix = snowball_meta_value_by_suffix(headers, AMZ_SNOWBALL_PREFIX_INTERNAL, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .and_then(|value| normalize_snowball_prefix(&value));
@@ -421,6 +510,7 @@ impl DefaultObjectUsecase {
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
+            storage_class,
             website_redirect_location,
             ..
         } = input;
@@ -517,68 +607,32 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        if let Some(cache_control) = cache_control {
-            metadata.insert("cache-control".to_string(), cache_control.to_string());
-        }
-        if let Some(content_disposition) = content_disposition {
-            metadata.insert("content-disposition".to_string(), content_disposition.to_string());
-        }
-        if let Some(content_encoding) = content_encoding
-            && let Some(normalized_content_encoding) = normalize_content_encoding_for_storage(&content_encoding)
-        {
-            metadata.insert("content-encoding".to_string(), normalized_content_encoding);
-        }
-        if let Some(content_language) = content_language {
-            metadata.insert("content-language".to_string(), content_language.to_string());
-        }
-        if let Some(content_type) = content_type {
-            metadata.insert("content-type".to_string(), content_type.to_string());
-        }
-        if let Some(expires) = expires {
-            let mut formatted = Vec::new();
-            expires
-                .format(TimestampFormat::HttpDate, &mut formatted)
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
-            metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
-        }
-        if let Some(website_redirect_location) = website_redirect_location {
-            metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location.to_string());
-        }
-
-        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
-
-        if let Some(tags) = tagging {
-            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
-        }
+        apply_put_request_metadata(
+            &mut metadata,
+            &req.headers,
+            &key,
+            cache_control,
+            content_disposition,
+            content_encoding,
+            content_language,
+            content_type,
+            expires,
+            website_redirect_location,
+            tagging,
+            storage_class.clone(),
+        )?;
 
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
             .map_err(ApiError::from)?;
-
-        if object_lock_legal_hold_status.is_some() || object_lock_mode.is_some() || object_lock_retain_until_date.is_some() {
-            validate_bucket_object_lock_enabled(&bucket).await?;
-
-            let retention = match (object_lock_mode, object_lock_retain_until_date) {
-                (Some(mode), retain_until_date) => Some(ObjectLockRetention {
-                    mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
-                    retain_until_date,
-                }),
-                (None, Some(retain_until_date)) => Some(ObjectLockRetention {
-                    mode: None,
-                    retain_until_date: Some(retain_until_date),
-                }),
-                (None, None) => None,
-            };
-
-            let mut eval_metadata = parse_object_lock_retention(retention)?;
-            eval_metadata.extend(parse_object_lock_legal_hold(
-                object_lock_legal_hold_status.map(|status| ObjectLockLegalHold { status: Some(status) }),
-            )?);
-
-            if !eval_metadata.is_empty() {
-                opts.eval_metadata = Some(eval_metadata);
-            }
-        }
+        apply_put_request_object_lock_opts(
+            &bucket,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
+            &mut opts,
+        )
+        .await?;
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
@@ -3548,12 +3602,70 @@ impl DefaultObjectUsecase {
             bucket,
             key,
             version_id,
+            cache_control,
+            content_disposition,
+            content_encoding,
             content_length,
+            content_language,
+            content_type,
             content_md5,
+            expires,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            ssekms_key_id,
+            storage_class,
+            tagging,
+            website_redirect_location,
             ..
         } = input;
 
         let event_version_id = version_id;
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
+        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+        let sse_customer_key = sse_customer_key.or(h_key);
+        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+
+        let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let mut effective_sse = original_sse.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| match sse.sse_algorithm.as_str() {
+                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                    })
+                })
+            })
+        });
+        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
+            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
+                config.rules.first().and_then(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .and_then(|sse| sse.kms_master_key_id.clone())
+                })
+            })
+        });
+        if effective_sse
+            .as_ref()
+            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+        {
+            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+        }
+        validate_sse_headers_for_write(
+            effective_sse.as_ref(),
+            effective_kms_key_id.as_ref(),
+            sse_customer_algorithm.as_ref(),
+            sse_customer_key.as_ref(),
+            sse_customer_key_md5.as_ref(),
+            true,
+        )?;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let size = match content_length {
@@ -3685,6 +3797,20 @@ impl DefaultObjectUsecase {
             };
 
             let mut metadata = HashMap::new();
+            apply_put_request_metadata(
+                &mut metadata,
+                &req.headers,
+                &fpath,
+                cache_control.clone(),
+                content_disposition.clone(),
+                content_encoding.clone(),
+                content_language.clone(),
+                content_type.clone(),
+                expires.clone(),
+                website_redirect_location.clone(),
+                tagging.clone(),
+                storage_class.clone(),
+            )?;
 
             let actual_size = size;
 
@@ -3698,11 +3824,49 @@ impl DefaultObjectUsecase {
                 size = HashReader::SIZE_PRESERVE_LAYER;
             }
 
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+            let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
+                .await
+                .map_err(ApiError::from)?;
+            apply_put_request_object_lock_opts(
+                &bucket,
+                object_lock_legal_hold_status.clone(),
+                object_lock_mode.clone(),
+                object_lock_retain_until_date.clone(),
+                &mut opts,
+            )
+            .await?;
+            if let Some(material) = sse_encryption(EncryptionRequest {
+                bucket: &bucket,
+                key: &fpath,
+                server_side_encryption: effective_sse.clone(),
+                ssekms_key_id: effective_kms_key_id.clone(),
+                sse_customer_algorithm: sse_customer_algorithm.clone(),
+                sse_customer_key: sse_customer_key.clone(),
+                sse_customer_key_md5: sse_customer_key_md5.clone(),
+                content_size: actual_size,
+                part_number: None,
+                part_key: None,
+                part_nonce: None,
+            })
+            .await?
+            {
+                effective_sse = Some(material.server_side_encryption.clone());
+                effective_kms_key_id = material.kms_key_id.clone();
+
+                let encrypted_reader = material.wrap_reader(hrd);
+                hrd = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                    .map_err(ApiError::from)?;
+
+                let encryption_metadata = material.metadata;
+                metadata.extend(encryption_metadata.clone());
+                opts.user_defined.extend(encryption_metadata);
+            }
+            opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
 
             let obj_info = match store
-                .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
+                .put_object(&bucket, &fpath, &mut reader, &opts)
                 .await
             {
                 Ok(info) => info,

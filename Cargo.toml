@@ -323,3 +323,6 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
+
+[patch."https://github.com/rustfs/s3s"]
+s3s = { path = "third_party/s3s" }

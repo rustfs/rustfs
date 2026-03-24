@@ -18,9 +18,13 @@ use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use async_compression::tokio::write::{BzEncoder, XzEncoder};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+};
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{Compression, write::GzEncoder};
+use http::HeaderValue;
 use serial_test::serial;
 use std::io::Cursor;
 use std::io::Write;
@@ -36,6 +40,10 @@ fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
     });
 
     base64::engine::general_purpose::STANDARD.encode(policy.to_string())
+}
+
+fn sse_customer_key_md5_base64(key: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(md5::compute(key).0)
 }
 
 async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
@@ -466,6 +474,872 @@ async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std:
     assert!(
         response_body.contains("<Code>NotImplemented</Code>"),
         "response should contain NotImplemented code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_kms_with_key_id_outside_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-kms-keyid";
+    let object_key = "post-sse-kms-keyid-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .text("x-amz-server-side-encryption-aws-kms-key-id", "test-key")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-kms-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "SSE-KMS key id should not fail policy validation before runtime rejection"
+    );
+    assert!(
+        response_body.contains("<Code>NotImplemented</Code>"),
+        "response should contain NotImplemented code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_kms_with_context_outside_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-kms-context";
+    let object_key = "post-sse-kms-context-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .text("x-amz-server-side-encryption-context", "e30=")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-kms-context-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "SSE-KMS context should not fail policy validation before runtime rejection"
+    );
+    assert!(
+        response_body.contains("<Code>NotImplemented</Code>"),
+        "response should contain NotImplemented code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_kms_key_id_policy_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-kms-keyid-mismatch";
+    let object_key = "post-sse-kms-keyid-mismatch-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+        serde_json::json!({ "x-amz-server-side-encryption-aws-kms-key-id": "expected-key" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .text("x-amz-server-side-encryption-aws-kms-key-id", "other-key")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-kms-keyid-mismatch-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    let response_body_lower = response_body.to_ascii_lowercase();
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+    assert!(
+        response_body_lower.contains("aws-kms-key-id"),
+        "response should mention the conflicting kms key id field, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_kms_context_policy_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-kms-context-mismatch";
+    let object_key = "post-sse-kms-context-mismatch-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+        serde_json::json!({ "x-amz-server-side-encryption-context": "e30=" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .text("x-amz-server-side-encryption-context", "eyJrIjoiYiJ9")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-kms-context-mismatch-body".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    let response_body_lower = response_body.to_ascii_lowercase();
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+    assert!(
+        response_body_lower.contains("server-side-encryption-context"),
+        "response should mention the conflicting kms context field, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-s3";
+    let object_key = "post-sse-s3-object.txt";
+    let expected_body = b"post-sse-s3-body".to_vec();
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "AES256" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "AES256")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+    assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
+
+    let head = admin_client.head_object().bucket(bucket).key(object_key).send().await?;
+    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("AES256"));
+
+    let uploaded = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = uploaded.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-default-sse-s3";
+    let object_key = "post-default-sse-s3-object.txt";
+    let expected_body = b"post-default-sse-s3-body".to_vec();
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let encryption_config = ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(
+                    ServerSideEncryptionByDefault::builder()
+                        .sse_algorithm(ServerSideEncryption::Aes256)
+                        .build()
+                        .expect("default encryption rule should build"),
+                )
+                .build(),
+        )
+        .build()
+        .expect("bucket encryption config should build");
+
+    admin_client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(encryption_config)
+        .send()
+        .await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(post_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let head = admin_client.head_object().bucket(bucket).key(object_key).send().await?;
+    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("AES256"));
+
+    let uploaded = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = uploaded.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-s3-reject";
+    let object_key = "post-sse-s3-reject-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption": "AES256" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "aws:kms")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-s3-mismatch".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_s3_missing_from_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-s3-missing";
+    let object_key = "post-sse-s3-missing-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption", "AES256")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-sse-s3-missing".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        response_body.contains("<Code>AccessDenied</Code>"),
+        "response should contain AccessDenied code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-storage-class";
+    let object_key = "post-storage-class-object.txt";
+    let expected_body = b"post-storage-class-body".to_vec();
+    let storage_class = "STANDARD_IA";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-storage-class": storage_class }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-storage-class", storage_class)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(post_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let head = admin_client.head_object().bucket(bucket).key(object_key).send().await?;
+    assert_eq!(head.storage_class().map(|value| value.as_str()), Some(storage_class));
+
+    let uploaded = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = uploaded.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-storage-class-missing";
+    let object_key = "post-storage-class-missing-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-storage-class", "STANDARD_IA")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-storage-class-missing".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(
+        response_body.contains("<Code>AccessDenied</Code>"),
+        "response should contain AccessDenied code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_storage_class_policy_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-storage-class-mismatch";
+    let object_key = "post-storage-class-mismatch-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-storage-class": "STANDARD_IA" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-storage-class", "ONEZONE_IA")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-storage-class-mismatch".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    let response_body_lower = response_body.to_ascii_lowercase();
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+    assert!(
+        response_body_lower.contains("storage-class"),
+        "response should mention storage class mismatch, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_invalid_storage_class_value()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-storage-class-invalid";
+    let object_key = "post-storage-class-invalid-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-storage-class": "INVALID" }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy)
+        .text("x-amz-storage-class", "INVALID")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"post-storage-class-invalid".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidStorageClass</Code>"),
+        "response should contain InvalidStorageClass code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-c-ignore";
+    let object_key = "sse-c-object.txt";
+    let expected_body = b"anonymous-post-sse-c".to_vec();
+    let customer_key = "01234567890123456789012345678901";
+    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key)
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .text("x-amz-server-side-encryption-customer-key", customer_key_b64.clone())
+        .text("x-amz-server-side-encryption-customer-key-md5", customer_key_md5.clone())
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(expected_body.clone())
+                .file_name("sse-c.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    assert_eq!(
+        post_resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "SSE-C form fields should be accepted outside policy conditions"
+    );
+
+    let head_resp = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key(object_key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(customer_key_b64)
+        .sse_customer_key_md5(customer_key_md5.clone())
+        .send()
+        .await?;
+    assert_eq!(head_resp.sse_customer_algorithm(), Some("AES256"));
+
+    let get_resp = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key(object_key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(base64::engine::general_purpose::STANDARD.encode(customer_key))
+        .sse_customer_key_md5(customer_key_md5)
+        .send()
+        .await?;
+    let actual_body = get_resp.body.collect().await?.into_bytes().to_vec();
+    assert_eq!(actual_body, expected_body);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-sse-c-mismatch";
+    let object_key = "sse-c-mismatch-object.txt";
+    let policy_key = "01234567890123456789012345678901";
+    let request_key = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    let policy_key_b64 = base64::engine::general_purpose::STANDARD.encode(policy_key);
+    let request_key_b64 = base64::engine::general_purpose::STANDARD.encode(request_key);
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!({ "x-amz-server-side-encryption-customer-algorithm": "AES256" }),
+        serde_json::json!({ "x-amz-server-side-encryption-customer-key": policy_key_b64 }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key)
+        .text("policy", policy)
+        .text("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .text("x-amz-server-side-encryption-customer-key", request_key_b64)
+        .text(
+            "x-amz-server-side-encryption-customer-key-md5",
+            sse_customer_key_md5_base64(request_key),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"sse-c-policy-mismatch".to_vec())
+                .file_name("sse-c.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_post_object_rejects_duplicate_key_form_values()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-post-duplicate-key";
+    let object_key = "duplicate-key-object.txt";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(vec![
+        serde_json::json!({ "bucket": bucket }),
+        serde_json::json!({ "key": object_key }),
+        serde_json::json!(["content-length-range", 0, 1024]),
+    ]);
+
+    let post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("key", "other-object.txt")
+        .text("policy", policy)
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"duplicate-key".to_vec())
+                .file_name("upload.txt")
+                .mime_str("text/plain")?,
+        );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
+        "response should contain InvalidPolicyDocument code, got: {response_body}"
     );
 
     Ok(())
@@ -3319,6 +4193,500 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
         }
         other_err => panic!("Expected ServiceError with missing-object code, got: {other_err:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_objects()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-request-metadata";
+    let archive_key = "metadata.tar";
+    let extracted_prefix = "imports/metadata";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .cache_control("max-age=60")
+        .tagging("project=archive&env=test")
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let head = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+    assert_eq!(head.cache_control(), Some("max-age=60"));
+
+    let tagging = admin_client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+
+    let mut tags = tagging
+        .tag_set()
+        .iter()
+        .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+        .collect::<Vec<_>>();
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec![
+            ("env".to_string(), "test".to_string()),
+            ("project".to_string(), "archive".to_string())
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-sse-s3-redirect";
+    let archive_key = "encrypted-metadata.tar";
+    let extracted_prefix = "imports/encrypted";
+    let redirect_location = "/docs/extracted.html";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+        .website_redirect_location(redirect_location)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let head = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+
+    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("AES256"));
+    assert_eq!(head.website_redirect_location(), Some(redirect_location));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_storage_class()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-storage-class";
+    let archive_key = "storage-class.tar";
+    let extracted_prefix = "imports/storage-class";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let head = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+
+    assert_eq!(head.storage_class().map(|value| value.as_str()), Some("STANDARD_IA"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_rejects_invalid_storage_class()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-storage-class-invalid";
+    let archive_key = "storage-class-invalid.tar";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    let result = admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
+            req.headers_mut()
+                .insert("x-amz-storage-class", HeaderValue::from_static("INVALID"));
+        })
+        .send()
+        .await;
+
+    assert_s3_error_code(result, "InvalidStorageClass");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_uses_bucket_default_sse_s3()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-default-sse-s3";
+    let archive_key = "default-encryption.tar";
+    let extracted_prefix = "imports/default-encryption";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let encryption_config = ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(
+                    ServerSideEncryptionByDefault::builder()
+                        .sse_algorithm(ServerSideEncryption::Aes256)
+                        .build()
+                        .expect("default encryption rule should build"),
+                )
+                .build(),
+        )
+        .build()
+        .expect("bucket encryption config should build");
+
+    admin_client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(encryption_config)
+        .send()
+        .await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let head = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+
+    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("AES256"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-default-sse-kms";
+    let archive_key = "default-encryption-kms.tar";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let encryption_config = ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(
+                    ServerSideEncryptionByDefault::builder()
+                        .sse_algorithm(ServerSideEncryption::AwsKms)
+                        .kms_master_key_id("test-key")
+                        .build()
+                        .expect("default encryption rule should build"),
+                )
+                .build(),
+        )
+        .build()
+        .expect("bucket encryption config should build");
+
+    admin_client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(encryption_config)
+        .send()
+        .await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    let result = admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
+        })
+        .send()
+        .await;
+
+    assert_s3_error_code(result, "NotImplemented");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "extract-sse-c";
+    let archive_key = "bundle.tar";
+    let extracted_key = "nested/file.txt";
+    let expected_body = b"extract-sse-c-body".to_vec();
+    let customer_key = "01234567890123456789012345678901";
+    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
+
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let archive = make_tar(&[(extracted_key, expected_body.as_slice())], &[]).await;
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(archive))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(customer_key_b64.clone())
+        .sse_customer_key_md5(customer_key_md5.clone())
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
+            req.headers_mut()
+                .insert("x-amz-meta-rustfs-snowball-prefix", HeaderValue::from_static("extract-root"));
+        })
+        .send()
+        .await?;
+
+    let extracted = client
+        .head_object()
+        .bucket(bucket)
+        .key("extract-root/nested/file.txt")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(customer_key_b64.clone())
+        .sse_customer_key_md5(customer_key_md5.clone())
+        .send()
+        .await?;
+    assert_eq!(extracted.sse_customer_algorithm(), Some("AES256"));
+
+    let fetched = client
+        .get_object()
+        .bucket(bucket)
+        .key("extract-root/nested/file.txt")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(customer_key_b64)
+        .sse_customer_key_md5(customer_key_md5)
+        .send()
+        .await?;
+    let actual_body = fetched.body.collect().await?.into_bytes().to_vec();
+    assert_eq!(actual_body, expected_body);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_object_lock_legal_hold()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-object-lock-hold";
+    let archive_key = "legal-hold.tar";
+    let extracted_prefix = "imports/legal-hold";
+
+    let admin_client = env.create_s3_client();
+    admin_client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .object_lock_legal_hold_status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::On)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let legal_hold = admin_client
+        .get_object_legal_hold()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+
+    assert_eq!(
+        legal_hold
+            .legal_hold()
+            .and_then(|value| value.status())
+            .map(|value| value.as_str()),
+        Some("ON")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_extract_preserves_object_lock_retention()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-object-lock-retention";
+    let archive_key = "retention.tar";
+    let extracted_prefix = "imports/retention";
+    let retain_until = aws_sdk_s3::primitives::DateTime::from_secs(2_143_623_680);
+    let retain_until_expected = retain_until.fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?;
+
+    let admin_client = env.create_s3_client();
+    admin_client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+
+    let tar_bytes = make_tar(&[("alpha.txt", b"alpha-body")], &[]).await;
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
+        .object_lock_retain_until_date(retain_until)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-acme-snowball-prefix", extracted_prefix);
+        })
+        .send()
+        .await?;
+
+    let retention = admin_client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(format!("{extracted_prefix}/alpha.txt"))
+        .send()
+        .await?;
+    let retention = retention.retention().expect("retention should be present");
+
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert_eq!(
+        retention
+            .retain_until_date()
+            .expect("retain_until_date should be present")
+            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
+        retain_until_expected
+    );
 
     Ok(())
 }
