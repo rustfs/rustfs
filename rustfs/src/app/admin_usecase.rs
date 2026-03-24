@@ -16,8 +16,10 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::capacity_manager::{
-    DataSource, get_capacity_manager, get_max_files_threshold, get_sample_rate, get_stat_timeout,
+    DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
+    get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout, get_stat_timeout,
 };
+use crate::capacity::capacity_metrics::get_capacity_metrics;
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
@@ -28,9 +30,10 @@ use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usa
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
@@ -109,14 +112,228 @@ pub(crate) async fn calculate_data_dir_used_capacity(
     Ok(total_used)
 }
 
-/// Asynchronously get directory size (using walkdir for efficient traversal, with performance protection)
+// ============================================================================
+// Symlink Tracker for Circular Reference Detection
+// ============================================================================
+
+/// Tracker for symlink resolution with circular reference detection
+struct SymlinkTracker {
+    /// Set of visited symlink paths to detect circular references
+    visited: HashSet<PathBuf>,
+    /// Count of symlinks encountered
+    symlink_count: usize,
+    /// Total size of symlink targets
+    symlink_size: u64,
+    /// Maximum symlink depth to follow
+    max_depth: u8,
+}
+
+impl SymlinkTracker {
+    /// Create a new symlink tracker
+    fn new(max_depth: u8) -> Self {
+        Self {
+            visited: HashSet::new(),
+            symlink_count: 0,
+            symlink_size: 0,
+            max_depth,
+        }
+    }
+
+    /// Check if we should follow a symlink at the given depth
+    fn should_follow(&self, path: &Path, depth: u8) -> bool {
+        if depth >= self.max_depth {
+            debug!("Symlink depth limit reached: {} >= {}, not following {:?}", depth, self.max_depth, path);
+            return false;
+        }
+
+        if self.visited.contains(path) {
+            warn!("Circular symlink reference detected: {:?}, skipping", path);
+            return false;
+        }
+
+        true
+    }
+
+    /// Record a visited symlink path and update metrics
+    fn record_symlink(&mut self, path: PathBuf, size: u64) {
+        self.visited.insert(path);
+        self.symlink_count += 1;
+        self.symlink_size += size;
+
+        // Record to metrics
+        if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
+            metrics.record_symlink(size);
+        }
+    }
+
+    /// Get symlink statistics
+    fn get_stats(&self) -> (usize, u64) {
+        (self.symlink_count, self.symlink_size)
+    }
+}
+
+// ============================================================================
+// Progress Monitor for Timeout and Stall Detection
+// ============================================================================
+
+/// Monitor for directory traversal progress with timeout and stall detection
+struct ProgressMonitor {
+    /// Start time of the operation
+    start_time: Instant,
+    /// Last check time for stall detection
+    last_check: Instant,
+    /// Number of files processed at last checkpoint
+    last_checkpoint_files: usize,
+    /// Base timeout for this operation
+    timeout: Duration,
+    /// Minimum allowed timeout
+    min_timeout: Duration,
+    /// Maximum allowed timeout
+    max_timeout: Duration,
+    /// Stall detection timeout
+    stall_timeout: Duration,
+    /// Enable dynamic timeout calculation
+    enable_dynamic_timeout: bool,
+    /// Track if dynamic timeout was used
+    used_dynamic_timeout: bool,
+}
+
+impl ProgressMonitor {
+    /// Create a new progress monitor
+    fn new(
+        base_timeout: Duration,
+        min_timeout: Duration,
+        max_timeout: Duration,
+        stall_timeout: Duration,
+        enable_dynamic: bool,
+    ) -> Self {
+        Self {
+            start_time: Instant::now(),
+            last_check: Instant::now(),
+            last_checkpoint_files: 0,
+            timeout: base_timeout,
+            min_timeout,
+            max_timeout,
+            stall_timeout,
+            enable_dynamic_timeout: enable_dynamic,
+            used_dynamic_timeout: false,
+        }
+    }
+
+    /// Calculate dynamic timeout based on directory characteristics
+    fn calculate_dynamic_timeout(&mut self, file_count: usize, avg_file_size: u64) -> Duration {
+        if !self.enable_dynamic_timeout {
+            return self.timeout;
+        }
+
+        // Mark that we're using dynamic timeout
+        self.used_dynamic_timeout = true;
+
+        // Calculate multipliers based on directory characteristics
+        let file_factor = (file_count as f64).sqrt() * 0.01; // File count influence
+        let size_factor = if avg_file_size > 0 {
+            (avg_file_size as f64).log(10.0) * 0.05 // File size influence
+        } else {
+            0.0
+        };
+
+        let multiplier = 1.0 + file_factor + size_factor;
+        let adjusted_timeout = self.timeout.mul_f64(multiplier.min(5.0)); // Max 5x multiplier
+
+        // Clamp to min/max bounds
+        let clamped_timeout = adjusted_timeout.max(self.min_timeout).min(self.max_timeout);
+
+        debug!(
+            "Dynamic timeout calculation: files={}, avg_size={}, multiplier={:.2}, base_timeout={:?}, adjusted_timeout={:?}, clamped_timeout={:?}",
+            file_count, avg_file_size, multiplier, self.timeout, adjusted_timeout, clamped_timeout
+        );
+
+        clamped_timeout
+    }
+
+    /// Update and check for timeout or stall
+    fn update_and_check_timeout(&mut self, files_processed: usize, avg_file_size: u64) -> Result<(), std::io::Error> {
+        let elapsed = self.start_time.elapsed();
+
+        // Calculate dynamic timeout based on current state
+        let dynamic_timeout = if self.enable_dynamic_timeout {
+            self.calculate_dynamic_timeout(files_processed, avg_file_size)
+        } else {
+            self.timeout
+        };
+
+        // Check for hard timeout
+        if elapsed >= dynamic_timeout {
+            warn!(
+                "Directory size calculation timeout after {} files, elapsed: {:?}, timeout: {:?}",
+                files_processed, elapsed, dynamic_timeout
+            );
+
+            // Record timeout to metrics
+            if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics))
+                && self.used_dynamic_timeout
+            {
+                metrics.record_dynamic_timeout();
+            }
+
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Timeout after {} files", files_processed),
+            ));
+        }
+
+        // Check for stall (no progress)
+        let now = Instant::now();
+        if now.duration_since(self.last_check) >= self.stall_timeout {
+            let files_per_checkpoint = files_processed.saturating_sub(self.last_checkpoint_files);
+
+            if files_per_checkpoint == 0 && files_processed > 0 {
+                // No progress for stall_timeout duration
+                warn!(
+                    "No progress detected for {:?}, possible stall at {} files",
+                    self.stall_timeout, files_processed
+                );
+
+                // Record stall to metrics
+                if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
+                    metrics.record_stall_detected();
+                }
+
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Stall detected at {} files", files_processed),
+                ));
+            }
+
+            self.last_check = now;
+            self.last_checkpoint_files = files_processed;
+        }
+
+        Ok(())
+    }
+
+    /// Record timeout fallback to sampling
+    fn record_timeout_fallback(&self) {
+        if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
+            metrics.record_timeout_fallback();
+        }
+    }
+}
+
+/// Asynchronously get directory size with enhanced symlink handling and dynamic timeout
 async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
     let path = path.to_path_buf();
 
     // Get configuration values
     let max_files_threshold = get_max_files_threshold();
-    let stat_timeout = get_stat_timeout();
+    let base_timeout = get_stat_timeout();
+    let min_timeout = get_min_timeout();
+    let max_timeout = get_max_timeout();
+    let stall_timeout = get_stall_timeout();
     let sample_rate = get_sample_rate();
+    let enable_dynamic_timeout = get_enable_dynamic_timeout();
+    let follow_symlinks = get_follow_symlinks();
+    let max_symlink_depth = get_max_symlink_depth();
 
     // Ensure sample_rate is never zero to avoid panics in is_multiple_of
     let effective_sample_rate = if sample_rate == 0 {
@@ -133,6 +350,7 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
             format!("Directory not found: {:?}", path),
         ));
     }
+
     // Use tokio::task::spawn_blocking to avoid blocking the async runtime
     tokio::task::spawn_blocking(move || {
         let start_time = Instant::now();
@@ -141,10 +359,22 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         let mut sampled_size = 0u64;
         let mut sampled_count = 0usize;
 
-        // Use walkdir to traverse directory tree
-        let walker = WalkDir::new(&path)
-            .follow_links(false) // Don't follow symbolic links
-            .into_iter();
+        // Initialize symlink tracker and progress monitor
+        let mut symlink_tracker = if follow_symlinks {
+            Some(SymlinkTracker::new(max_symlink_depth))
+        } else {
+            None
+        };
+
+        let mut progress_monitor =
+            ProgressMonitor::new(base_timeout, min_timeout, max_timeout, stall_timeout, enable_dynamic_timeout);
+
+        // Build WalkDir with appropriate settings
+        let mut walker_builder = WalkDir::new(&path);
+        if !follow_symlinks {
+            walker_builder = walker_builder.follow_links(false);
+        }
+        let walker = walker_builder.into_iter();
 
         for entry_result in walker {
             // Propagate traversal errors instead of silently dropping them
@@ -155,41 +385,75 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
                     return Err(std::io::Error::other(err.to_string()));
                 }
             };
-            // Check timeout
-            if start_time.elapsed() > stat_timeout {
-                warn!("Directory size calculation timeout after {} files, using sampled estimate", file_count);
-                // Use sampling estimate: sampled_size * total_files / sampled_files
-                if sampled_count > 0 {
-                    return Ok(sampled_size * file_count as u64 / sampled_count as u64);
+
+            // Get file metadata
+            let metadata = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    warn!("Failed to get metadata for {:?}: {}", entry.path(), err);
+                    continue;
                 }
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Directory size calculation timeout"));
+            };
+
+            // Handle symlinks if enabled
+            if metadata.is_symlink() {
+                if let Some(ref mut tracker) = symlink_tracker
+                    && let Ok(target) = std::fs::read_link(entry.path())
+                    && tracker.should_follow(&target, 0)
+                {
+                    tracker.record_symlink(target, metadata.len());
+                    // Don't count symlink size itself, only target
+                    continue;
+                }
+                // If not following symlinks, skip
+                continue;
             }
 
             // Only count file sizes, ignore directories
-            if let Ok(metadata) = entry.metadata()
-                && metadata.is_file()
-            {
-                file_count += 1;
+            if !metadata.is_file() {
+                continue;
+            }
 
-                // When file count exceeds threshold, enable sampling
-                if file_count > max_files_threshold {
-                    // Sampling: count 1 in every effective_sample_rate files
-                    if file_count.is_multiple_of(effective_sample_rate) {
-                        sampled_size += metadata.len();
-                        sampled_count += 1;
-                    }
+            file_count += 1;
 
-                    // Log progress every 100k files
-                    if file_count.is_multiple_of(100_000) {
-                        debug!(
-                            "Processed {} files, sampled {} files, size: {} bytes",
-                            file_count, sampled_count, sampled_size
-                        );
-                    }
-                } else {
-                    // Below threshold, full statistics
-                    total_size += metadata.len();
+            // Update progress and check for timeout/stall
+            let avg_size = if file_count > 0 { total_size / file_count as u64 } else { 0 };
+            if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
+                // Timeout or stall detected
+                if sampled_count > 0 {
+                    info!("Timeout/stall at {} files, using sampled estimate", file_count);
+                    progress_monitor.record_timeout_fallback();
+                    return Ok(sampled_size * file_count as u64 / sampled_count as u64);
                 }
+                return Err(e);
+            }
+
+            // When file count exceeds threshold, enable sampling
+            if file_count > max_files_threshold {
+                // Sampling: count 1 in every effective_sample_rate files
+                if file_count.is_multiple_of(effective_sample_rate) {
+                    sampled_size += metadata.len();
+                    sampled_count += 1;
+                }
+
+                // Log progress every 100k files
+                if file_count.is_multiple_of(100_000) {
+                    debug!(
+                        "Processed {} files, sampled {} files, size: {} bytes",
+                        file_count, sampled_count, sampled_size
+                    );
+                }
+            } else {
+                // Below threshold, full statistics
+                total_size += metadata.len();
+            }
+        }
+
+        // Report symlink statistics if tracking was enabled
+        if let Some(tracker) = symlink_tracker {
+            let (count, size) = tracker.get_stats();
+            if count > 0 {
+                info!("Symlink tracking: {} symlinks processed, total target size: {} bytes", count, size);
             }
         }
 

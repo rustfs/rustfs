@@ -39,6 +39,24 @@ pub const ENV_CAPACITY_STAT_TIMEOUT: &str = "RUSTFS_CAPACITY_STAT_TIMEOUT";
 /// Environment variable for sample rate
 pub const ENV_CAPACITY_SAMPLE_RATE: &str = "RUSTFS_CAPACITY_SAMPLE_RATE";
 
+/// Environment variable for following symbolic links during capacity calculation
+pub const ENV_CAPACITY_FOLLOW_SYMLINKS: &str = "RUSTFS_CAPACITY_FOLLOW_SYMLINKS";
+
+/// Environment variable for maximum symlink follow depth
+pub const ENV_CAPACITY_MAX_SYMLINK_DEPTH: &str = "RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH";
+
+/// Environment variable for enabling dynamic timeout calculation
+pub const ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT: &str = "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT";
+
+/// Environment variable for minimum capacity calculation timeout
+pub const ENV_CAPACITY_MIN_TIMEOUT: &str = "RUSTFS_CAPACITY_MIN_TIMEOUT";
+
+/// Environment variable for maximum capacity calculation timeout
+pub const ENV_CAPACITY_MAX_TIMEOUT: &str = "RUSTFS_CAPACITY_MAX_TIMEOUT";
+
+/// Environment variable for progress stall detection timeout
+pub const ENV_CAPACITY_STALL_TIMEOUT: &str = "RUSTFS_CAPACITY_STALL_TIMEOUT";
+
 // ============================================================================
 // Default Values
 // ============================================================================
@@ -71,6 +89,30 @@ pub const DEFAULT_STAT_TIMEOUT_SECS: u64 = 5;
 /// Default: 100
 pub const DEFAULT_SAMPLE_RATE: usize = 100;
 
+/// Follow symbolic links during capacity calculation
+/// Default: false (disabled for safety)
+pub const DEFAULT_CAPACITY_FOLLOW_SYMLINKS: bool = false;
+
+/// Maximum symlink follow depth
+/// Default: 3 levels
+pub const DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH: u8 = 3;
+
+/// Enable dynamic timeout calculation based on directory characteristics
+/// Default: true (enabled)
+pub const DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT: bool = true;
+
+/// Minimum capacity calculation timeout in seconds
+/// Default: 5 seconds
+pub const DEFAULT_CAPACITY_MIN_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum capacity calculation timeout in seconds
+/// Default: 60 seconds
+pub const DEFAULT_CAPACITY_MAX_TIMEOUT_SECS: u64 = 60;
+
+/// Progress stall detection timeout in seconds
+/// Default: 1 second (no progress for 1 second = stall)
+pub const DEFAULT_CAPACITY_STALL_TIMEOUT_SECS: u64 = 1;
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -88,6 +130,12 @@ mod tests {
         assert_eq!(ENV_CAPACITY_MAX_FILES_THRESHOLD, "RUSTFS_CAPACITY_MAX_FILES_THRESHOLD");
         assert_eq!(ENV_CAPACITY_STAT_TIMEOUT, "RUSTFS_CAPACITY_STAT_TIMEOUT");
         assert_eq!(ENV_CAPACITY_SAMPLE_RATE, "RUSTFS_CAPACITY_SAMPLE_RATE");
+        assert_eq!(ENV_CAPACITY_FOLLOW_SYMLINKS, "RUSTFS_CAPACITY_FOLLOW_SYMLINKS");
+        assert_eq!(ENV_CAPACITY_MAX_SYMLINK_DEPTH, "RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH");
+        assert_eq!(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT");
+        assert_eq!(ENV_CAPACITY_MIN_TIMEOUT, "RUSTFS_CAPACITY_MIN_TIMEOUT");
+        assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");
+        assert_eq!(ENV_CAPACITY_STALL_TIMEOUT, "RUSTFS_CAPACITY_STALL_TIMEOUT");
     }
 
     #[test]
@@ -99,5 +147,11 @@ mod tests {
         assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 1_000_000);
         assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 5);
         assert_eq!(DEFAULT_SAMPLE_RATE, 100);
+        assert!(!DEFAULT_CAPACITY_FOLLOW_SYMLINKS);
+        assert_eq!(DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH, 3);
+        assert!(DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT);
+        assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 5);
+        assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 60);
+        assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 1);
     }
 }

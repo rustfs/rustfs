@@ -17,13 +17,16 @@
 use crate::app::admin_usecase::calculate_data_dir_used_capacity;
 use metrics::{counter, gauge};
 use rustfs_config::{
+    DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
+    DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
     DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
     DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
-    ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE,
-    ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
-    ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS,
+    ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_SYMLINK_DEPTH, ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_MIN_TIMEOUT,
+    ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
+    ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
-use rustfs_utils::{get_env_u64, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -66,6 +69,36 @@ pub fn get_stat_timeout() -> Duration {
 /// Get sample rate from environment or default
 pub fn get_sample_rate() -> usize {
     get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
+}
+
+/// Get follow symlinks flag from environment or default
+pub fn get_follow_symlinks() -> bool {
+    get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS)
+}
+
+/// Get max symlink depth from environment or default
+pub fn get_max_symlink_depth() -> u8 {
+    get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8
+}
+
+/// Get enable dynamic timeout flag from environment or default
+pub fn get_enable_dynamic_timeout() -> bool {
+    get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT)
+}
+
+/// Get min timeout from environment or default
+pub fn get_min_timeout() -> Duration {
+    Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS))
+}
+
+/// Get max timeout from environment or default
+pub fn get_max_timeout() -> Duration {
+    Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS))
+}
+
+/// Get stall timeout from environment or default
+pub fn get_stall_timeout() -> Duration {
+    Duration::from_secs(get_env_u64(ENV_CAPACITY_STALL_TIMEOUT, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS))
 }
 
 // ============================================================================

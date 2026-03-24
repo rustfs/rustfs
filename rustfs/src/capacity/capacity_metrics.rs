@@ -37,6 +37,16 @@ pub struct CapacityMetrics {
     pub total_update_duration_us: AtomicU64,
     /// Update count for average calculation
     pub update_count: AtomicU64,
+    /// Symlink count encountered during capacity calculation
+    pub symlink_count: AtomicU64,
+    /// Total size of symlink targets
+    pub symlink_size: AtomicU64,
+    /// Dynamic timeout usage count
+    pub dynamic_timeout_count: AtomicU64,
+    /// Timeout fallback to sampling count
+    pub timeout_fallback_count: AtomicU64,
+    /// Stall detection count
+    pub stall_detected_count: AtomicU64,
 }
 
 impl CapacityMetrics {
@@ -84,6 +94,48 @@ impl CapacityMetrics {
         counter!("rustfs.capacity.write.operations").increment(1);
     }
 
+    /// Record symlink encountered
+    pub fn record_symlink(&self, size: u64) {
+        self.symlink_count.fetch_add(1, Ordering::Relaxed);
+        self.symlink_size.fetch_add(size, Ordering::Relaxed);
+        counter!("rustfs.capacity.symlinks.encountered").increment(1);
+        gauge!("rustfs.capacity.symlinks.total_size").set(size as f64);
+    }
+
+    /// Record dynamic timeout usage
+    pub fn record_dynamic_timeout(&self) {
+        self.dynamic_timeout_count.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.timeout.dynamic").increment(1);
+    }
+
+    /// Record timeout fallback to sampling
+    pub fn record_timeout_fallback(&self) {
+        self.timeout_fallback_count.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.timeout.fallback").increment(1);
+    }
+
+    /// Record stall detection
+    pub fn record_stall_detected(&self) {
+        self.stall_detected_count.fetch_add(1, Ordering::Relaxed);
+        counter!("rustfs.capacity.timeout.stall").increment(1);
+    }
+
+    /// Get symlink statistics
+    #[allow(dead_code)]
+    pub fn get_symlink_stats(&self) -> (u64, u64) {
+        (self.symlink_count.load(Ordering::Relaxed), self.symlink_size.load(Ordering::Relaxed))
+    }
+
+    /// Get timeout statistics
+    #[allow(dead_code)]
+    pub fn get_timeout_stats(&self) -> (u64, u64, u64) {
+        (
+            self.dynamic_timeout_count.load(Ordering::Relaxed),
+            self.timeout_fallback_count.load(Ordering::Relaxed),
+            self.stall_detected_count.load(Ordering::Relaxed),
+        )
+    }
+
     /// Record update duration
     #[allow(dead_code)]
     pub fn record_update_duration(&self, duration: Duration) {
@@ -123,6 +175,11 @@ impl CapacityMetrics {
             write_triggered_updates: self.write_triggered_updates.load(Ordering::Relaxed),
             update_failures: self.update_failures.load(Ordering::Relaxed),
             avg_update_duration: self.get_avg_update_duration(),
+            symlink_count: self.symlink_count.load(Ordering::Relaxed),
+            symlink_size: self.symlink_size.load(Ordering::Relaxed),
+            dynamic_timeout_count: self.dynamic_timeout_count.load(Ordering::Relaxed),
+            timeout_fallback_count: self.timeout_fallback_count.load(Ordering::Relaxed),
+            stall_detected_count: self.stall_detected_count.load(Ordering::Relaxed),
         }
     }
 
@@ -137,16 +194,26 @@ impl CapacityMetrics {
         gauge!("rustfs.capacity.update.scheduled_total").set(summary.scheduled_updates as f64);
         gauge!("rustfs.capacity.update.write_triggered_total").set(summary.write_triggered_updates as f64);
         gauge!("rustfs.capacity.update.failures_total").set(summary.update_failures as f64);
+        gauge!("rustfs.capacity.symlinks.count").set(summary.symlink_count as f64);
+        gauge!("rustfs.capacity.symlinks.size").set(summary.symlink_size as f64);
+        gauge!("rustfs.capacity.timeout.dynamic_total").set(summary.dynamic_timeout_count as f64);
+        gauge!("rustfs.capacity.timeout.fallback_total").set(summary.timeout_fallback_count as f64);
+        gauge!("rustfs.capacity.timeout.stall_total").set(summary.stall_detected_count as f64);
 
         info!(
-            "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}",
+            "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}, symlinks={}, symlink_size={}, dynamic_timeouts={}, timeout_fallbacks={}, stalls={}",
             summary.cache_hit_rate * 100.0,
             summary.cache_hits,
             summary.cache_misses,
             summary.scheduled_updates,
             summary.write_triggered_updates,
             summary.update_failures,
-            summary.avg_update_duration
+            summary.avg_update_duration,
+            summary.symlink_count,
+            summary.symlink_size,
+            summary.dynamic_timeout_count,
+            summary.timeout_fallback_count,
+            summary.stall_detected_count
         );
     }
 }
@@ -161,6 +228,11 @@ pub struct MetricsSummary {
     pub write_triggered_updates: u64,
     pub update_failures: u64,
     pub avg_update_duration: Duration,
+    pub symlink_count: u64,
+    pub symlink_size: u64,
+    pub dynamic_timeout_count: u64,
+    pub timeout_fallback_count: u64,
+    pub stall_detected_count: u64,
 }
 
 /// Global metrics instance
@@ -257,6 +329,8 @@ mod tests {
         assert_eq!(summary.cache_hits, 1);
         assert_eq!(summary.scheduled_updates, 1);
         assert_eq!(summary.avg_update_duration, Duration::from_millis(100));
+        assert_eq!(summary.symlink_count, 0);
+        assert_eq!(summary.dynamic_timeout_count, 0);
     }
 
     #[test]
@@ -266,5 +340,40 @@ mod tests {
         metrics.record_write_operation();
         // This test just ensures the method doesn't panic
         assert_eq!(metrics.write_triggered_updates.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_record_symlink() {
+        let metrics = CapacityMetrics::new();
+        metrics.record_symlink(1024);
+        metrics.record_symlink(2048);
+
+        let (count, size) = metrics.get_symlink_stats();
+        assert_eq!(count, 2);
+        assert_eq!(size, 3072);
+    }
+
+    #[test]
+    fn test_record_dynamic_timeout() {
+        let metrics = CapacityMetrics::new();
+        metrics.record_dynamic_timeout();
+        metrics.record_dynamic_timeout();
+
+        let (dynamic, fallback, stalls) = metrics.get_timeout_stats();
+        assert_eq!(dynamic, 2);
+        assert_eq!(fallback, 0);
+        assert_eq!(stalls, 0);
+    }
+
+    #[test]
+    fn test_record_timeout_fallback() {
+        let metrics = CapacityMetrics::new();
+        metrics.record_timeout_fallback();
+        metrics.record_stall_detected();
+
+        let (dynamic, fallback, stalls) = metrics.get_timeout_stats();
+        assert_eq!(dynamic, 0);
+        assert_eq!(fallback, 1);
+        assert_eq!(stalls, 1);
     }
 }

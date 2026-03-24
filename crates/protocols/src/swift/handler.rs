@@ -1013,7 +1013,7 @@ async fn handle_authenticated_request(
 type SymlinkResolutionFuture<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<(String, String, String, Option<String>), SwiftError>> + Send + 'a>>;
 
-/// Resolve symlink chain recursively
+/// Resolve symlink chain recursively with circular reference detection
 ///
 /// Returns (final_account, final_container, final_object, symlink_target_header)
 /// where symlink_target_header is Some(target) if the original object was a symlink
@@ -1023,12 +1023,17 @@ fn resolve_symlink_chain<'a>(
     object: &'a str,
     credentials: &'a Option<Credentials>,
     depth: u8,
+    visited: std::collections::HashSet<crate::swift::symlink::SymlinkPath>,
 ) -> SymlinkResolutionFuture<'a> {
     Box::pin(async move {
         use super::symlink;
 
-        // Validate depth to prevent infinite loops
-        symlink::validate_symlink_depth(depth)?;
+        // Validate both depth and circular references
+        symlink::validate_symlink_access(&visited, depth, account, container, object)?;
+
+        // Add current path to visited set
+        let mut new_visited = visited;
+        new_visited.insert(symlink::SymlinkPath::new(account, container, object));
 
         // Get object metadata
         let info = if let Some(creds) = credentials {
@@ -1041,14 +1046,14 @@ fn resolve_symlink_chain<'a>(
         // Check if this object is a symlink
         if let Some(target) = symlink::get_symlink_target(&info.user_defined)? {
             let target_container = target.resolve_container(container);
-            let target_object = &target.object;
+            let target_object = target.object.clone();
 
             // Store the original target for the response header
             let target_header = target.to_header_value(container);
 
             // Recursively resolve the target (it might also be a symlink)
             let (final_account, final_container, final_object, _) =
-                resolve_symlink_chain(account, target_container, target_object, credentials, depth + 1).await?;
+                resolve_symlink_chain(account, target_container, &target_object, credentials, depth + 1, new_visited).await?;
 
             // Return the final target, but keep the first-level symlink target for the header
             Ok((final_account, final_container, final_object, Some(target_header)))
@@ -1057,6 +1062,18 @@ fn resolve_symlink_chain<'a>(
             Ok((account.to_string(), container.to_string(), object.to_string(), None))
         }
     })
+}
+
+/// Helper function to start symlink resolution with an empty visited set
+fn resolve_symlink_chain_wrapper<'a>(
+    account: &'a str,
+    container: &'a str,
+    object: &'a str,
+    credentials: &'a Option<Credentials>,
+) -> SymlinkResolutionFuture<'a> {
+    Box::pin(
+        async move { resolve_symlink_chain(account, container, object, credentials, 0, std::collections::HashSet::new()).await },
+    )
 }
 
 /// Helper function for object GET operations (used by both authenticated and TempURL requests)
@@ -1072,7 +1089,7 @@ async fn handle_object_get(
 
     // Resolve symlinks first (with loop detection)
     let (final_account, final_container, final_object, symlink_target) =
-        resolve_symlink_chain(account, container, object, credentials, 0).await?;
+        resolve_symlink_chain_wrapper(account, container, object, credentials).await?;
 
     // Check if object is SLO (via metadata)
     if slo::is_slo_object(&final_account, &final_container, &final_object, credentials).await? {
@@ -1213,7 +1230,7 @@ async fn handle_object_head(
 ) -> Result<Response<Body>, SwiftError> {
     // Resolve symlinks first (with loop detection)
     let (final_account, final_container, final_object, symlink_target) =
-        resolve_symlink_chain(account, container, object, credentials, 0).await?;
+        resolve_symlink_chain_wrapper(account, container, object, credentials).await?;
 
     let info = if let Some(creds) = credentials {
         object::head_object(&final_account, &final_container, &final_object, creds).await?
@@ -1437,8 +1454,7 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    use super::parse_range_header;
     #[test]
     fn test_parse_range_header_start_end() {
         // bytes=100-199
