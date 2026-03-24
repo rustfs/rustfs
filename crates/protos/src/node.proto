@@ -773,6 +773,19 @@ message LoadTransitionTierConfigResponse {
   optional string error_info = 2;
 }
 
+message GetLiveEventsRequest {
+  uint64 after_sequence = 1;
+  uint32 limit = 2;
+}
+
+message GetLiveEventsResponse {
+  bool success = 1;
+  bytes events = 2;
+  uint64 next_sequence = 3;
+  bool truncated = 4;
+  optional string error_info = 5;
+}
+
 /* -------------------------------------------------------------------- */
 
 service NodeService {
@@ -865,4 +878,5 @@ service NodeService {
   rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {};
   rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {};
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
+  rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
 }

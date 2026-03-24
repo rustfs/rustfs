@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config as S3Config};
+use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -132,6 +133,14 @@ impl S3Client {
             .credentials_provider(credentials)
             .region(Region::new(config.region.clone()))
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+
+        if config
+            .endpoint_url
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.starts_with("http://"))
+        {
+            config_builder = config_builder.http_client(SmithyHttpClientBuilder::new().build_http());
+        }
 
         // Set force path style if custom endpoint or explicitly requested
         let should_force_path_style = config.endpoint_url.is_some() || config.force_path_style;

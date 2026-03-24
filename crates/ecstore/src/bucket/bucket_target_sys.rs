@@ -1134,11 +1134,20 @@ pub struct S3ClientError {
 }
 impl S3ClientError {
     pub fn new(value: impl Into<String>) -> Self {
+        Self::with_metadata(value, None, None, None)
+    }
+
+    pub fn with_metadata(
+        error: impl Into<String>,
+        status_code: Option<StatusCode>,
+        code: Option<String>,
+        message: Option<String>,
+    ) -> Self {
         S3ClientError {
-            error: value.into(),
-            status_code: None,
-            code: None,
-            message: None,
+            error: error.into(),
+            status_code,
+            code,
+            message,
         }
     }
 
@@ -1154,16 +1163,16 @@ impl S3ClientError {
 
 impl<T: aws_sdk_s3::error::ProvideErrorMetadata> From<T> for S3ClientError {
     fn from(value: T) -> Self {
-        S3ClientError {
-            error: format!(
-                "{}: {}",
-                value.code().map(String::from).unwrap_or("unknown code".into()),
-                value.message().map(String::from).unwrap_or("missing reason".into()),
-            ),
-            status_code: None,
-            code: None,
-            message: None,
-        }
+        let code = value.code().map(String::from);
+        let message = value.message().map(String::from);
+        let error = match (code.as_deref(), message.as_deref()) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (Some(code), None) => code.to_string(),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "unknown remote error".to_string(),
+        };
+
+        S3ClientError::with_metadata(error, None, code, message)
     }
 }
 
@@ -1207,10 +1216,15 @@ impl TargetClient {
                             other
                         );
                         let message = other.meta().meta();
-                        Err(S3ClientError::new(format!(
-                            "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
-                            message
-                        )))
+                        Err(S3ClientError::with_metadata(
+                            format!(
+                                "failed to check bucket exists for bucket:{bucket} please check the bucket name and credentials, error:{:?}",
+                                message
+                            ),
+                            None,
+                            message.code().map(ToOwned::to_owned),
+                            message.message().map(ToOwned::to_owned),
+                        ))
                     }
                 },
                 SdkError::DispatchFailure(e) => Err(S3ClientError::new(format!(

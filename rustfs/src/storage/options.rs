@@ -334,7 +334,7 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
 /// request-side transfer encoding for SigV4 streaming and must not be stored or returned.
 /// If the only value is "aws-chunked", returns None (do not persist). Otherwise returns
 /// the value with "aws-chunked" stripped, or None if nothing remains.
-fn normalize_content_encoding_for_storage(value: &str) -> Option<String> {
+pub(crate) fn normalize_content_encoding_for_storage(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;

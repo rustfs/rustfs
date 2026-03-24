@@ -40,6 +40,7 @@ pub struct DataKeyEnvelope {
     pub encrypted_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub encryption_context: HashMap<String, String>,
+    #[serde(with = "crate::time_serde::zoned")]
     pub created_at: Zoned,
 }
 
@@ -308,6 +309,23 @@ mod tests {
         }"#;
 
         let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize current format");
+        assert_eq!(deserialized.key_id, "test-key-id");
+        assert_eq!(deserialized.master_key_id, "master-key-id");
+    }
+
+    #[tokio::test]
+    async fn test_data_key_envelope_accepts_legacy_rfc3339_timestamp() {
+        let envelope_json = r#"{
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {"bucket": "test-bucket"},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+
+        let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize legacy format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
     }
