@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::admin::{
-    handlers::{bucket_meta, heal, health, kms, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user},
+    handlers::{
+        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user,
+    },
     router::{AdminOperation, S3Router},
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
@@ -53,6 +55,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     replication::register_replication_route(&mut router).expect("register replication route");
     profile_admin::register_profiling_route(&mut router).expect("register profile route");
     kms::register_kms_route(&mut router).expect("register kms route");
+    oidc::register_oidc_route(&mut router).expect("register oidc route");
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -114,6 +117,13 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/providers"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/oidc/config/default"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/oidc/config/default"));
+    assert_route(&router, Method::POST, &admin_path("/v3/oidc/validate"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/authorize/default"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/callback/default"));
 
     assert!(
         !router.contains_route(Method::GET, "/rustfs/rpc/read_file_stream"),
@@ -132,6 +142,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
     pools::register_pool_route(&mut router).expect("register pool route");
     rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
     quota::register_quota_route(&mut router).expect("register quota route");
+    oidc::register_oidc_route(&mut router).expect("register oidc route");
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),
@@ -149,6 +160,11 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),
