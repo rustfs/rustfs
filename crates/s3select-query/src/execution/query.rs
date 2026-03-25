@@ -24,25 +24,6 @@ use rustfs_s3select_api::query::scheduler::SchedulerRef;
 use rustfs_s3select_api::{QueryError, QueryResult};
 use tracing::debug;
 
-pub struct PhaseTimer {  
-    phase_name: String,  
-    start_time: Instant,  
-    state_machine: QueryStateMachineRef,  
-}  
-  
-impl PhaseTimer {  
-    pub fn new(phase_name: &str, state_machine: QueryStateMachineRef) -> Self {  
-        Self {  
-            phase_name: phase_name.to_string(),  
-            start_time: Instant::now(),  
-            state_machine,  
-        }  
-    }  
-}
-
-
-
-
 pub struct SqlQueryExecution {
     query_state_machine: QueryStateMachineRef,
     plan: QueryPlan,
