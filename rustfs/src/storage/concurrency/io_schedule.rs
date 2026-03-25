@@ -159,7 +159,6 @@ impl std::fmt::Display for IoPriority {
 
 /// I/O scheduler configuration.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct IoSchedulerConfig {
     /// Maximum concurrent disk reads.
     pub max_concurrent_reads: usize,
@@ -248,7 +247,6 @@ impl Default for IoSchedulerConfig {
     }
 }
 
-#[allow(dead_code)]
 impl IoSchedulerConfig {
     /// Load configuration from environment.
     pub fn from_env() -> Self {
@@ -360,7 +358,6 @@ impl IoSchedulerConfig {
 
 /// I/O queue status for monitoring.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct IoQueueStatus {
     /// Total permits available.
     pub total_permits: usize,
@@ -535,7 +532,6 @@ pub struct IoStrategy {
     pub permit_wait_duration: Duration,
 }
 
-#[allow(dead_code)]
 impl IoStrategy {
     /// Create a new IoStrategy from disk permit wait time and base buffer size.
     ///
@@ -1016,7 +1012,6 @@ pub(crate) struct IoLoadMetrics {
     observation_count: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl IoLoadMetrics {
     pub(crate) fn new(max_samples: usize) -> Self {
         Self {
@@ -1221,7 +1216,6 @@ struct QueuedRequest<T> {
     /// Time when the request was enqueued.
     enqueue_time: Instant,
     /// Original priority assigned to the request.
-    #[allow(dead_code)]
     original_priority: IoPriority,
     /// Current priority (may be boosted for starvation prevention).
     current_priority: IoPriority,
@@ -1314,7 +1308,6 @@ impl Default for IoPriorityQueueConfig {
     }
 }
 
-#[allow(dead_code)]
 impl IoPriorityQueueConfig {
     /// Load configuration from environment.
     pub fn from_env() -> Self {
@@ -1343,7 +1336,6 @@ impl IoPriorityQueueConfig {
     }
 }
 
-#[allow(dead_code)]
 impl<T> IoPriorityQueue<T> {
     /// Create a new priority queue with the given configuration.
     pub fn new(config: IoPriorityQueueConfig) -> Self {
@@ -1498,7 +1490,6 @@ impl<T> IoPriorityQueue<T> {
 ///
 /// These metrics are exposed for Prometheus scraping and provide
 /// visibility into the priority queue behavior.
-#[allow(dead_code)]
 pub struct IoPriorityMetrics {
     /// High priority queue depth.
     pub high_queue_depth: AtomicU64,
@@ -1522,7 +1513,6 @@ pub struct IoPriorityMetrics {
     pub low_processed: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl IoPriorityMetrics {
     /// Create a new metrics instance.
     pub const fn new() -> Self {
@@ -1541,7 +1531,6 @@ impl IoPriorityMetrics {
     }
 
     /// Update queue depths from status.
-    #[allow(dead_code)]
     pub fn update_queue_depths(&self, status: &IoQueueStatus) {
         self.high_queue_depth
             .store(status.high_priority_waiting as u64, Ordering::Relaxed);
@@ -1552,7 +1541,6 @@ impl IoPriorityMetrics {
     }
 
     /// Record a starvation event.
-    #[allow(dead_code)]
     pub fn record_starvation(&self) {
         self.starvation_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -1596,7 +1584,6 @@ impl IoPriorityMetrics {
     }
 
     /// Get metrics summary for logging/debugging.
-    #[allow(dead_code)]
     pub fn summary(&self) -> String {
         format!(
             "high_queue={}, normal_queue={}, low_queue={}, starvation={}, high_proc={}, normal_proc={}, low_proc={}",
@@ -1612,7 +1599,6 @@ impl IoPriorityMetrics {
 }
 
 /// Global I/O priority metrics instance.
-#[allow(dead_code)]
 pub static IO_PRIORITY_METRICS: IoPriorityMetrics = IoPriorityMetrics::new();
 
 // ============================================
