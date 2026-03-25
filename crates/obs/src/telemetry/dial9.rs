@@ -97,8 +97,8 @@ impl Dial9Config {
             file_prefix: get_env_str(ENV_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX),
             max_file_size: get_env_u64(ENV_RUNTIME_DIAL9_MAX_FILE_SIZE, DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE),
             rotation_count: get_env_usize(ENV_RUNTIME_DIAL9_ROTATION_COUNT, DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT),
-            s3_bucket: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET),
-            s3_prefix: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX),
+            s3_bucket: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET).filter(|s| !s.is_empty()),
+            s3_prefix: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX).filter(|s| !s.is_empty()),
             sampling_rate: get_env_f64(ENV_RUNTIME_DIAL9_SAMPLING_RATE, DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE).clamp(0.0, 1.0),
         }
     }
@@ -234,14 +234,18 @@ pub fn build_traced_runtime(
 
     let config = Dial9Config::from_env();
 
+    // Ensure the output directory exists before creating the writer
+    std::fs::create_dir_all(&config.output_dir)
+        .map_err(|e| TelemetryError::Io(format!("Failed to create dial9 output directory '{}': {}", config.output_dir, e)))?;
+
     // Create rotating writer (synchronous for runtime building)
     let base_path = config.base_path();
     let writer = RotatingWriter::new(base_path, config.max_file_size, config.max_file_size * config.rotation_count as u64)
         .map_err(|e| TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e)))?;
 
     // Build traced runtime
-    // Note: sampling_rate is logged but not directly used in builder
-    // The dial9 library may use sampling internally or it may be a future feature
+    // Note: sampling_rate and S3 upload settings are reserved for future use
+    // once the dial9 library provides support for those configuration options.
     dial9_tokio_telemetry::telemetry::TracedRuntime::builder()
         .with_task_tracking(true)
         .build(builder, writer)

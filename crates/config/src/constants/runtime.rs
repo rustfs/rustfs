@@ -57,8 +57,7 @@ pub const DEFAULT_RUNTIME_DIAL9_FILE_PREFIX: &str = "rustfs-tokio";
 pub const DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
 pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
-pub const DEFAULT_RUNTIME_DIAL9_S3_BUCKET: &str = ""; // S3 bucket name (empty = no upload)
-pub const DEFAULT_RUNTIME_DIAL9_S3_PREFIX: &str = ""; // S3 key prefix (empty = no prefix)
+// Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
 /// Threshold for small object seek support in megabytes.
 ///

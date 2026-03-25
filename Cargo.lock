@@ -8043,6 +8043,7 @@ version = "0.0.5"
 dependencies = [
  "metrics",
  "nvml-wrapper",
+ "rustfs-config",
  "rustfs-ecstore",
  "rustfs-utils",
  "sysinfo",

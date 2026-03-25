@@ -87,9 +87,9 @@ fn compute_default_max_blocking_threads() -> usize {
 /// Panics if environment variable values are invalid
 /// # Examples
 /// ```no_run
-/// use rustfs_server::tokio_runtime_builder;
-/// let builder = tokio_runtime_builder();
-/// let runtime = builder.build().unwrap();
+/// // tokio_runtime_builder is pub(crate) - call it from within the rustfs binary:
+/// // let builder = tokio_runtime_builder();
+/// // let runtime = builder.build().unwrap();
 /// ```
 pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -186,9 +186,8 @@ fn print_tokio_thread_enable() -> bool {
 /// # Examples
 ///
 /// ```no_run
-/// use rustfs::server::runtime::build_tokio_runtime;
-///
-/// let runtime = build_tokio_runtime().expect("Failed to build runtime");
+/// // build_tokio_runtime is pub(crate) - call it from within the rustfs binary:
+/// // let runtime = build_tokio_runtime().expect("Failed to build runtime");
 /// // runtime.block_on(async { /* ... */ })
 /// ```
 pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {

@@ -1,0 +1,4 @@
+[build]
+# Enable Tokio unstable features required by dial9-tokio-telemetry for runtime tracing.
+# See: https://docs.rs/tokio/latest/tokio/#unstable-features
+rustflags = ["--cfg", "tokio_unstable"]

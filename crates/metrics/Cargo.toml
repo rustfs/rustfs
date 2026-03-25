@@ -31,6 +31,7 @@ gpu = ["dep:nvml-wrapper"]
 full = ["gpu"]
 
 [dependencies]
+rustfs-config = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true }
 metrics = { workspace = true }

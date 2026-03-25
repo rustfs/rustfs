@@ -203,11 +203,11 @@ async fn async_main() -> Result<()> {
 
     // Check dial9 Tokio runtime telemetry status
     // Note: The actual telemetry session is created in build_tokio_runtime()
-    // which stores the guard globally for the program duration.
+    // which stores the TelemetryGuard globally for the program duration.
     if rustfs_obs::dial9::is_enabled() {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is enabled via environment variables.");
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
     } else {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is disabled.");
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
     }
 
     info!("license status: {}", license_status());

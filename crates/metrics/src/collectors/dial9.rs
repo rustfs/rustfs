@@ -21,11 +21,8 @@
 
 use crate::MetricType;
 use crate::format::PrometheusMetric;
+use rustfs_config::{DEFAULT_RUNTIME_DIAL9_ENABLED, ENV_RUNTIME_DIAL9_ENABLED};
 use rustfs_utils::get_env_bool;
-
-// Dial9 environment variable and default values
-const ENV_RUNTIME_DIAL9_ENABLED: &str = "RUSTFS_RUNTIME_DIAL9_ENABLED";
-const DEFAULT_RUNTIME_DIAL9_ENABLED: bool = false;
 
 /// Dial9 telemetry system statistics.
 #[derive(Debug, Clone, Default)]
@@ -63,19 +60,6 @@ pub struct Dial9Stats {
 /// # Returns
 ///
 /// A vector of Prometheus metrics for dial9 telemetry statistics.
-///
-/// # Examples
-///
-/// ```no_run
-/// use rustfs_metrics::collectors::dial9::{collect_dial9_metrics, Dial9Stats};
-///
-/// let stats = Dial9Stats {
-///     events_total: 10000,
-///     bytes_written: 1024000,
-///     ..Default::default()
-/// };
-/// let metrics = collect_dial9_metrics(&stats);
-/// ```
 pub fn collect_dial9_metrics(stats: &Dial9Stats) -> Vec<PrometheusMetric> {
     let enabled = is_dial9_enabled();
     let enabled_value = if enabled { 1.0 } else { 0.0 };

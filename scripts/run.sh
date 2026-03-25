@@ -98,10 +98,10 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # Features:
 # - CPU overhead < 5% (with sampling rate 1.0)
 # - Automatic file rotation (configurable size and count)
-# - Optional S3 upload for long-term storage
 # - Graceful degradation if initialization fails
 #
 # Note: Disabled by default. Enable only when needed for runtime diagnostics.
+# Note: Requires build flag --cfg tokio_unstable (set in .cargo/config.toml).
 
 # Enable dial9 telemetry (default: false)
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
@@ -122,10 +122,8 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # Lower values reduce CPU overhead. Recommended: 0.1-0.5 for production.
 #export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
 
-# Optional S3 bucket for uploading trace files (default: not set)
+# S3 upload settings (not yet implemented; reserved for future use):
 #export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
-
-# Optional S3 prefix for uploaded files (default: not set)
 #export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
 
 # --- Scenario 1: Development / Debugging ---
@@ -138,8 +136,6 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # Reduced sampling rate to minimize overhead
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=0.1
-#export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=rustfs-telemetry
-#export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
 
 # --- Scenario 3: Performance Investigation ---
 # Short-term tracing with high detail, manual cleanup
