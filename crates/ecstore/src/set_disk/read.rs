@@ -662,8 +662,8 @@ impl SetDisks {
                 };
 
             // Read zero-copy configuration from environment variable
-            // Default: disabled (false) for safety
-            let use_zero_copy = rustfs_utils::get_env_bool("RUSTFS_OBJECT_ZERO_COPY_ENABLE", false);
+            // Default: enabled (true) for performance
+            let use_zero_copy = rustfs_utils::get_env_bool("RUSTFS_OBJECT_ZERO_COPY_ENABLE", true);
 
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
