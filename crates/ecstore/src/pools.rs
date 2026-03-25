@@ -1327,7 +1327,11 @@ impl ECStore {
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
-            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            {
+                warn!("{err}");
+            }
         }
 
         Ok(())
@@ -1700,7 +1704,7 @@ impl ECStore {
                     entry.name.as_str(),
                 )
             {
-                return Err(err);
+                warn!("{err}");
             }
         }
 
@@ -1937,7 +1941,11 @@ impl ECStore {
 
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("decommission_failed for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+                if let Err(err) =
+                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+                {
+                    warn!("{err}");
+                }
             }
         }
 
@@ -1962,7 +1970,11 @@ impl ECStore {
             drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+                if let Err(err) =
+                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+                {
+                    warn!("{err}");
+                }
             }
         }
 
@@ -2102,7 +2114,11 @@ impl ECStore {
         pool_meta.save(self.pools.clone()).await?;
 
         if let Some(notification_sys) = get_global_notification_sys() {
-            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, "start_decommission")?;
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, "start_decommission")
+            {
+                warn!("{err}");
+            }
         }
 
         Ok(())

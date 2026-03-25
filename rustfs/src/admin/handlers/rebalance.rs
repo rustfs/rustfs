@@ -267,6 +267,10 @@ fn rebalance_admin_no_pools_error(operation: &str) -> S3Error {
     )
 }
 
+fn warn_rebalance_propagation_failure(operation: &str, err: impl std::fmt::Display) {
+    warn!("rebalance {operation} propagation failed after local state update: {err}");
+}
+
 fn resolve_rebalance_status_meta_load_error(pool_idx: usize, err: StorageError) -> S3Error {
     if err == StorageError::ConfigNotFound {
         return s3_error!(NoSuchResource, "Pool rebalance is not started");
@@ -332,10 +336,9 @@ impl Operation for RebalanceStart {
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("RebalanceStart Loading rebalance meta start");
-            notification_sys
-                .load_rebalance_meta(true)
-                .await
-                .map_err(|e| rebalance_admin_internal_error("propagate rebalance metadata", e))?;
+            if let Err(err) = notification_sys.load_rebalance_meta(true).await {
+                warn_rebalance_propagation_failure("start", err);
+            }
             warn!("RebalanceStart Loading rebalance meta done");
         }
 
@@ -474,10 +477,9 @@ impl Operation for RebalanceStop {
         warn!("handle RebalanceStop save_rebalance_stats done ");
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("handle RebalanceStop notification_sys load_rebalance_meta");
-            notification_sys
-                .load_rebalance_meta(false)
-                .await
-                .map_err(|e| rebalance_admin_internal_error("refresh rebalance metadata", e))?;
+            if let Err(err) = notification_sys.load_rebalance_meta(false).await {
+                warn_rebalance_propagation_failure("stop", err);
+            }
             warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
 

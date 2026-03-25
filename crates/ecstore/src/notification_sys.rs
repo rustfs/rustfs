@@ -478,20 +478,22 @@ impl NotificationSys {
             Ok(_) => {
                 if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
                     error!("notification stop_rebalance local save err {:?}", err);
-                    failures.push(notification_local_operation_failure(
+                    return Err(Error::other(notification_local_operation_failure(
                         "stop_rebalance",
                         "save_rebalance_stats(stopped_at)",
                         &err,
-                    ));
+                    )));
                 }
             }
             Err(err) => {
                 error!("notification stop_rebalance local stop err {:?}", err);
-                failures.push(notification_local_operation_failure("stop_rebalance", "stop", &err));
+                return Err(Error::other(notification_local_operation_failure("stop_rebalance", "stop", &err)));
             }
         }
 
-        aggregate_notification_failures("stop_rebalance", failures)?;
+        if let Err(err) = aggregate_notification_failures("stop_rebalance", failures) {
+            warn!("{err}");
+        }
         warn!("notification stop_rebalance stop_rebalance done");
         Ok(())
     }
