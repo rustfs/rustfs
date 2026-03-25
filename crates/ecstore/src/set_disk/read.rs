@@ -14,6 +14,21 @@
 
 use super::*;
 
+/// Environment variable for controlling zero-copy reads
+const ENV_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
+
+/// Default value for zero-copy enable (disabled by default for safety)
+const DEFAULT_ZERO_COPY_ENABLE: bool = false;
+
+/// Read zero-copy configuration from environment variable.
+/// Returns the configured value, or the default if not set.
+fn is_zero_copy_enabled() -> bool {
+    std::env::var(ENV_ZERO_COPY_ENABLE)
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(DEFAULT_ZERO_COPY_ENABLE)
+}
+
 impl SetDisks {
     pub(super) async fn read_parts(
         disks: &[Option<DiskStore>],
@@ -661,6 +676,9 @@ impl SetDisks {
                     checksum_info.algorithm
                 };
 
+            // Read zero-copy configuration
+            let use_zero_copy = is_zero_copy_enabled();
+
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -674,7 +692,7 @@ impl SetDisks {
                     erasure.shard_size(),
                     checksum_algo.clone(),
                     skip_verify_bitrot,
-                    false, // use_zero_copy: can be enabled via config later
+                    use_zero_copy,
                 )
                 .await
                 {

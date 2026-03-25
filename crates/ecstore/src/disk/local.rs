@@ -1831,6 +1831,9 @@ impl DiskAPI for LocalDisk {
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        use std::time::Instant;
+
+        let start = Instant::now();
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -1889,12 +1892,22 @@ impl DiskAPI for LocalDisk {
             .await
             .map_err(DiskError::from)??;
 
+            // Log successful zero-copy read metrics
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            debug!(
+                size = length,
+                duration_ms = duration_ms,
+                "zero_copy_read_success"
+            );
+
             return Ok(bytes);
         }
 
         // Non-Unix fallback: efficient read into Bytes
         #[cfg(not(unix))]
         {
+            debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
             let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
 
             if offset > 0 {

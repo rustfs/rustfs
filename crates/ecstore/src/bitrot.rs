@@ -18,6 +18,7 @@ use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;
 use tokio::io::AsyncRead;
+use tracing::debug;
 
 /// Create a BitrotReader from either inline data or disk file stream
 ///
@@ -64,6 +65,13 @@ pub async fn create_bitrot_reader(
             // Try zero-copy read first (uses mmap on Unix)
             match disk.read_file_zero_copy(bucket, path, offset, length - offset).await {
                 Ok(bytes) => {
+                    // Log successful zero-copy read
+                    debug!(
+                        size = bytes.len(),
+                        path = %path,
+                        "zero_copy_read_success"
+                    );
+
                     // Wrap Bytes in Cursor for AsyncRead
                     // The Bytes is reference-counted, so this is zero-copy
                     let rd = Cursor::new(bytes);
@@ -76,6 +84,13 @@ pub async fn create_bitrot_reader(
                     Ok(Some(reader))
                 }
                 Err(e) => {
+                    // Log zero-copy fallback
+                    debug!(
+                        reason = %format!("{:?}", e),
+                        path = %path,
+                        "zero_copy_fallback"
+                    );
+
                     // Fall back to regular stream read on error
                     match disk.read_file_stream(bucket, path, offset, length - offset).await {
                         Ok(rd) => {
