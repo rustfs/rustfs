@@ -269,6 +269,84 @@ impl ConcurrencyManager {
         IoStrategy::from_wait_duration(permit_wait_duration, base_buffer_size)
     }
 
+    /// Calculate I/O strategy with enhanced multi-factor context.
+    ///
+    /// This method integrates storage media, access patterns, bandwidth observations,
+    /// and concurrent request count to provide a more sophisticated I/O strategy.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_size` - Size of the file/object being read (-1 if unknown)
+    /// * `base_buffer_size` - Base buffer size from workload configuration
+    /// * `permit_wait_duration` - Time spent waiting for disk read permit
+    /// * `is_sequential_hint` - Whether the access pattern is known to be sequential
+    ///
+    /// # Returns
+    ///
+    /// An `IoStrategy` with optimized parameters based on all available factors.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let strategy = manager.calculate_io_strategy_with_context(
+    ///     file_size,
+    ///     256 * 1024,
+    ///     permit_wait_duration,
+    ///     false,
+    /// );
+    /// let optimal_buffer = strategy.buffer_size;
+    /// let enable_readahead = strategy.enable_readahead;
+    /// ```
+    pub fn calculate_io_strategy_with_context(
+        &self,
+        file_size: i64,
+        base_buffer_size: usize,
+        permit_wait_duration: Duration,
+        is_sequential_hint: bool,
+    ) -> IoStrategy {
+        use super::io_schedule::IoSchedulingContext;
+
+        // Record the observation for future smoothing
+        self.record_permit_wait(permit_wait_duration);
+
+        // Get current access pattern
+        let access_pattern = if let Ok(detector) = self.pattern_detector.lock() {
+            detector.current_pattern()
+        } else {
+            super::io_profile::AccessPattern::Unknown
+        };
+
+        // Get current bandwidth snapshot
+        let observed_bandwidth_bps = if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            let snapshot = monitor.snapshot();
+            if snapshot.tier == super::bandwidth_monitor::BandwidthTier::Unknown {
+                None
+            } else {
+                Some(snapshot.bytes_per_second)
+            }
+        } else {
+            None
+        };
+
+        // Get concurrent request count
+        let concurrent_requests = super::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Build scheduling context
+        let context = IoSchedulingContext {
+            file_size,
+            base_buffer_size,
+            permit_wait_duration,
+            is_sequential_hint,
+            access_pattern,
+            storage_media: self.storage_media,
+            observed_bandwidth_bps,
+            concurrent_requests,
+        };
+
+        // Calculate strategy using multi-factor approach
+        IoStrategy::from_context_with_config(&context, &self.scheduler_config)
+    }
+
     /// Get the smoothed I/O load level based on recent observations.
     ///
     /// This uses the rolling window of permit wait times to provide a more

@@ -662,6 +662,302 @@ impl IoStrategy {
         }
     }
 
+    /// Create a new IoStrategy from enhanced scheduling context and configuration.
+    ///
+    /// This is the comprehensive multi-factor strategy calculation that integrates:
+    /// - Base buffer size from workload configuration
+    /// - Permit wait time and load level
+    /// - Concurrent request count
+    /// - Storage media profile (NVMe/SSD/HDD)
+    /// - Access pattern (sequential/random/mixed)
+    /// - Observed bandwidth
+    ///
+    /// # Arguments
+    ///
+    /// * `context` - Scheduling context with all runtime factors
+    /// * `config` - Scheduler configuration with thresholds and caps
+    ///
+    /// # Returns
+    ///
+    /// An IoStrategy with optimized parameters based on all factors.
+    pub fn from_context_with_config(context: &IoSchedulingContext, config: &IoSchedulerConfig) -> Self {
+        // Stage 1: Start with base buffer size
+        let mut buffer_size = context.base_buffer_size;
+        let mut buffer_multiplier = 1.0;
+
+        // Stage 2: Apply load level reduction based on permit wait
+        let load_level = IoLoadLevel::from_wait_duration_with_thresholds(
+            context.permit_wait_duration,
+            config.load_low_threshold_ms,
+            config.load_high_threshold_ms,
+        );
+
+        let load_multiplier = match load_level {
+            IoLoadLevel::Low => 1.0,
+            IoLoadLevel::Medium => 0.75,
+            IoLoadLevel::High => 0.5,
+            IoLoadLevel::Critical => 0.4,
+        };
+        buffer_multiplier *= load_multiplier;
+
+        // Stage 3: Apply concurrency-based reduction
+        let concurrency_multiplier = if context.concurrent_requests >= config.high_concurrency_threshold {
+            0.5
+        } else if context.concurrent_requests >= config.medium_concurrency_threshold {
+            0.75
+        } else {
+            1.0
+        };
+        buffer_multiplier *= concurrency_multiplier;
+
+        // Stage 4: Get storage profile for buffer cap and preferences
+        let storage_profile = StorageProfile::for_media(
+            context.storage_media,
+            config.nvme_buffer_cap,
+            config.ssd_buffer_cap,
+            config.hdd_buffer_cap,
+        );
+
+        // Stage 5: Apply access pattern adjustments
+        let pattern_multiplier = match context.access_pattern {
+            AccessPattern::Sequential => storage_profile.sequential_boost_multiplier,
+            AccessPattern::Random => storage_profile.random_penalty_multiplier,
+            AccessPattern::Mixed => 1.0,
+            AccessPattern::Unknown => 1.0,
+        };
+        buffer_multiplier *= pattern_multiplier;
+
+        // Stage 6: Apply bandwidth-based reduction
+        let (bandwidth_tier, bandwidth_multiplier, bandwidth_limited) = match context.observed_bandwidth_bps {
+            Some(bps) if bps < config.bandwidth_low_threshold_bps => {
+                // Low bandwidth: reduce buffer size
+                (BandwidthTier::Low, 0.6, true)
+            }
+            Some(bps) if bps < config.bandwidth_high_threshold_bps => {
+                // Medium bandwidth: no change
+                (BandwidthTier::Medium, 1.0, false)
+            }
+            Some(_) => {
+                // High bandwidth: can use larger buffers
+                (BandwidthTier::High, 1.1, false)
+            }
+            None => {
+                // Unknown bandwidth: conservative
+                (BandwidthTier::Unknown, 0.9, false)
+            }
+        };
+        buffer_multiplier *= bandwidth_multiplier;
+
+        // Calculate final buffer size with all multipliers applied
+        buffer_size = ((context.base_buffer_size as f64) * buffer_multiplier) as usize;
+
+        // Apply storage media cap
+        let buffer_cap = storage_profile.buffer_cap;
+        let buffer_cap_applied = buffer_size > buffer_cap;
+        buffer_size = buffer_size.min(buffer_cap);
+
+        // Apply final clamp (safety bounds)
+        let clamp_min = 32 * KI_B;
+        let clamp_max = MI_B;
+        let clamp_min_applied = buffer_size < clamp_min;
+        let clamp_max_applied = buffer_size > clamp_max;
+        buffer_size = buffer_size.clamp(clamp_min, clamp_max);
+
+        // Determine readahead preference
+        let mut readahead_reason;
+        let enable_readahead;
+        let readahead_disabled_by_pattern;
+        let readahead_disabled_by_concurrency;
+        let readahead_disabled_by_load;
+        let readahead_disabled_by_bandwidth;
+
+        // Start with storage profile preference
+        let mut should_enable_readahead = storage_profile.prefers_readahead;
+        readahead_reason = if storage_profile.prefers_readahead { "media-pref" } else { "media-no-pref" };
+
+        // Apply access pattern override
+        readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
+        if readahead_disabled_by_pattern {
+            should_enable_readahead = false;
+            readahead_reason = "random-pattern";
+        }
+
+        // Apply concurrency override
+        readahead_disabled_by_concurrency = context.concurrent_requests >= config.random_readahead_disable_concurrency;
+        if readahead_disabled_by_concurrency && matches!(context.access_pattern, AccessPattern::Random) {
+            should_enable_readahead = false;
+            readahead_reason = "high-concurrency-random";
+        }
+
+        // Apply load override
+        readahead_disabled_by_load = matches!(load_level, IoLoadLevel::High | IoLoadLevel::Critical);
+        if readahead_disabled_by_load {
+            should_enable_readahead = false;
+            readahead_reason = "high-load";
+        }
+
+        // Apply bandwidth override
+        readahead_disabled_by_bandwidth = bandwidth_limited;
+        if readahead_disabled_by_bandwidth {
+            should_enable_readahead = false;
+            readahead_reason = "low-bandwidth";
+        }
+
+        enable_readahead = should_enable_readahead;
+
+        // Determine cache writeback
+        let cache_writeback_enabled = match load_level {
+            IoLoadLevel::Critical => false,
+            _ => !bandwidth_limited,
+        };
+
+        let cache_writeback_disabled_by_load = matches!(load_level, IoLoadLevel::Critical);
+        let cache_writeback_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
+
+        // Calculate priority based on request size
+        let priority = if context.file_size > 0 {
+            IoPriority::from_size_with_thresholds(
+                context.file_size,
+                config.high_priority_size_threshold,
+                config.low_priority_size_threshold,
+            )
+        } else {
+            IoPriority::Normal
+        };
+
+        Self {
+            // Enhanced fields
+            storage_media: context.storage_media,
+            access_pattern: context.access_pattern,
+            observed_bandwidth_bps: context.observed_bandwidth_bps,
+            concurrent_requests: context.concurrent_requests,
+            bandwidth_tier,
+            request_size: context.file_size,
+            base_buffer_size: context.base_buffer_size,
+            buffer_cap,
+            sequential_detected: matches!(context.access_pattern, AccessPattern::Sequential),
+            bandwidth_limited,
+            readahead_reason,
+            low_bandwidth_threshold_bps: config.bandwidth_low_threshold_bps,
+            high_bandwidth_threshold_bps: config.bandwidth_high_threshold_bps,
+            random_readahead_disable_concurrency: config.random_readahead_disable_concurrency,
+            low_priority_size_threshold: config.low_priority_size_threshold,
+            high_priority_size_threshold: config.high_priority_size_threshold,
+            priority_enabled: config.enable_priority,
+            priority,
+            queue_capacity_hint: match priority {
+                IoPriority::High => config.queue_high_capacity,
+                IoPriority::Normal => config.queue_normal_capacity,
+                IoPriority::Low => config.queue_low_capacity,
+            },
+            load_sample_window: config.load_sample_window,
+            load_high_threshold_ms: config.load_high_threshold_ms,
+            load_low_threshold_ms: config.load_low_threshold_ms,
+            starvation_prevention_interval_ms: config.starvation_prevention_interval_ms,
+            starvation_threshold_secs: config.starvation_threshold_secs,
+            max_concurrent_reads: config.max_concurrent_reads,
+            priority_queue_high_capacity: config.queue_high_capacity,
+            priority_queue_normal_capacity: config.queue_normal_capacity,
+            priority_queue_low_capacity: config.queue_low_capacity,
+            storage_profile,
+            bandwidth_snapshot: context.observed_bandwidth_bps.map(|bps| BandwidthSnapshot {
+                bytes_per_second: bps,
+                tier: bandwidth_tier,
+            }),
+            scheduling_context: context.clone(),
+            high_concurrency_threshold: config.high_concurrency_threshold,
+            medium_concurrency_threshold: config.medium_concurrency_threshold,
+            permit_wait_ms: context.permit_wait_duration.as_millis() as u64,
+            strategy_version: "2.0-multi-factor",
+            is_large_request: context.file_size > config.low_priority_size_threshold as i64,
+            is_small_request: context.file_size > 0 && context.file_size < config.high_priority_size_threshold as i64,
+            storage_detection_enabled: config.storage_detection_enabled,
+            storage_media_override_applied: !config.storage_media_override.is_empty(),
+            pattern_history_size: config.pattern_history_size,
+            sequential_step_tolerance_bytes: config.sequential_step_tolerance_bytes,
+            bandwidth_ema_beta: config.bandwidth_ema_beta,
+            nvme_buffer_cap: config.nvme_buffer_cap,
+            ssd_buffer_cap: config.ssd_buffer_cap,
+            hdd_buffer_cap: config.hdd_buffer_cap,
+            is_range_request: context.file_size > 0 && !context.is_sequential_hint,
+            target_read_size: context.file_size,
+            source_request_size: context.file_size,
+            strategy_reason: "multi-factor",
+            used_compatibility_path: false,
+            queue_depth_hint: context.concurrent_requests,
+            should_throttle_random_io: matches!(context.access_pattern, AccessPattern::Random),
+            should_expand_for_sequential: matches!(context.access_pattern, AccessPattern::Sequential),
+            should_reduce_for_concurrency: concurrency_multiplier < 1.0,
+            should_reduce_for_bandwidth: bandwidth_limited,
+            should_disable_cache_writeback: !cache_writeback_enabled,
+            should_disable_readahead: !enable_readahead,
+            should_use_buffered_io: true,
+            effective_multiplier_stage_concurrency: concurrency_multiplier,
+            effective_multiplier_stage_pattern: pattern_multiplier,
+            effective_multiplier_stage_bandwidth: bandwidth_multiplier,
+            final_multiplier: buffer_multiplier,
+            strategy_source: "from_context_with_config",
+            notes: "Multi-factor strategy with media, pattern, and bandwidth awareness",
+            profile_prefers_readahead: storage_profile.prefers_readahead,
+            fallback_to_unknown_media: matches!(context.storage_media, StorageMedia::Unknown),
+            request_class: if context.file_size > 0 {
+                if context.file_size < config.high_priority_size_threshold as i64 { "small" }
+                else if context.file_size < config.low_priority_size_threshold as i64 { "medium" }
+                else { "large" }
+            } else { "unknown" },
+            io_path_kind: if context.is_sequential_hint { "sequential" } else { "random" },
+            queue_mode: match priority {
+                IoPriority::High => "high-priority",
+                IoPriority::Normal => "normal-priority",
+                IoPriority::Low => "low-priority",
+            },
+            load_level_label: load_level.as_str(),
+            pattern_label: context.access_pattern.as_str(),
+            media_label: match context.storage_media {
+                StorageMedia::Nvme => "nvme",
+                StorageMedia::Ssd => "ssd",
+                StorageMedia::Hdd => "hdd",
+                StorageMedia::Unknown => "unknown",
+            },
+            bandwidth_label: match bandwidth_tier {
+                BandwidthTier::Low => "low",
+                BandwidthTier::Medium => "medium",
+                BandwidthTier::High => "high",
+                BandwidthTier::Unknown => "unknown",
+            },
+            sequential_hint_applied: context.is_sequential_hint,
+            observed_bandwidth_available: context.observed_bandwidth_bps.is_some(),
+            read_size_known: context.file_size > 0,
+            random_penalty_applied: matches!(context.access_pattern, AccessPattern::Random),
+            sequential_boost_applied: matches!(context.access_pattern, AccessPattern::Sequential),
+            buffer_cap_applied,
+            clamp_min_applied,
+            clamp_max_applied,
+            readahead_disabled_by_concurrency,
+            readahead_disabled_by_pattern,
+            readahead_disabled_by_load,
+            readahead_disabled_by_bandwidth,
+            cache_writeback_disabled_by_load,
+            cache_writeback_disabled_by_pattern,
+            cache_writeback_disabled_by_request_size: false,
+            storage_profile_buffer_cap_source: match context.storage_media {
+                StorageMedia::Nvme => "nvme-cap",
+                StorageMedia::Ssd => "ssd-cap",
+                StorageMedia::Hdd => "hdd-cap",
+                StorageMedia::Unknown => "unknown-cap",
+            },
+            final_buffer_floor: clamp_min,
+            // Compatibility fields
+            buffer_size,
+            buffer_multiplier,
+            enable_readahead,
+            cache_writeback_enabled,
+            use_buffered_io: true,
+            load_level,
+            permit_wait_duration: context.permit_wait_duration,
+        }
+    }
+
     /// Get a human-readable description of the current I/O strategy.
     pub fn description(&self) -> String {
         format!(

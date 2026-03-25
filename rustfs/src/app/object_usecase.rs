@@ -1606,7 +1606,6 @@ impl DefaultObjectUsecase {
 
         // Note: I/O priority will be calculated later after we have the actual request size
         // For now, we use Normal priority as a default until we know the real request size
-        let initial_priority = crate::storage::concurrency::IoPriority::Normal;
 
         // Log strategy details at debug level for troubleshooting
         debug!(
