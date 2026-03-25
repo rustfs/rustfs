@@ -132,6 +132,7 @@ impl SetDisks {
         Ok(ret)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(level = "debug", skip(disks))]
     pub(super) async fn read_all_fileinfo(
         disks: &[Option<DiskStore>],
@@ -141,13 +142,14 @@ impl SetDisks {
         version_id: &str,
         read_data: bool,
         healing: bool,
+        incl_free_versions: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>)> {
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
         let opts = Arc::new(ReadOptions {
+            incl_free_versions,
             read_data,
             healing,
-            ..Default::default()
         });
         let org_bucket = Arc::new(org_bucket.to_string());
         let bucket = Arc::new(bucket.to_string());
@@ -475,7 +477,8 @@ impl SetDisks {
         let vid = opts.version_id.clone().unwrap_or_default();
 
         // TODO: optimize concurrency and break once enough slots are available
-        let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await?;
+        let (parts_metadata, errs) =
+            Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions).await?;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -542,6 +545,9 @@ impl SetDisks {
         }
 
         if fi.deleted {
+            if opts.incl_free_versions && fi.tier_free_version() && opts.version_id.is_some() {
+                return (oi, write_quorum, None);
+            }
             return if opts.version_id.is_none() || opts.delete_marker {
                 (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
             } else {

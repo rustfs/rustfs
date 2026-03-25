@@ -142,6 +142,42 @@ impl Drop for DeadlockRequestGuard {
     }
 }
 
+async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
+    let Some(existing) = existing else {
+        return;
+    };
+
+    let je = if opts.delete_prefix {
+        rustfs_ecstore::bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+    } else {
+        let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
+        rustfs_ecstore::bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+            version_id,
+            opts.versioned,
+            opts.version_suspended,
+            &existing.transitioned_object,
+        )
+    };
+    let Some(je) = je else {
+        return;
+    };
+
+    let mut expiry_state = rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
+        .write()
+        .await;
+    if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
+        warn!(
+            bucket,
+            object,
+            remote_object = %existing.transitioned_object.name,
+            remote_version_id = %existing.transitioned_object.version_id,
+            tier = %existing.transitioned_object.tier,
+            error = ?err,
+            "failed to enqueue transitioned object cleanup"
+        );
+    }
+}
+
 pin_project! {
     struct ExtractArchiveEtagReader<R> {
         #[pin]
@@ -2820,6 +2856,7 @@ impl DefaultObjectUsecase {
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_idx = Vec::new();
         let mut object_sizes = Vec::new();
+        let mut existing_object_infos = Vec::new();
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -2919,6 +2956,7 @@ impl DefaultObjectUsecase {
 
             object_to_delete_idx.push(idx);
             object_to_delete.push(object);
+            existing_object_infos.push(gerr.is_none().then_some(goi));
         }
 
         let (mut dobjs, errs) = store
@@ -2970,6 +3008,18 @@ impl DefaultObjectUsecase {
                     dobjs[i].replication_state = Some(object_to_delete[i].replication_state());
                 }
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
+                enqueue_transitioned_delete_cleanup(
+                    &bucket,
+                    &object_to_delete[i].object_name,
+                    &ObjectOptions {
+                        version_id: object_to_delete[i].version_id.map(|v| v.to_string()),
+                        versioned: version_cfg.prefix_enabled(object_to_delete[i].object_name.as_str()),
+                        version_suspended: version_cfg.suspended(),
+                        ..Default::default()
+                    },
+                    existing_object_infos[i].as_ref(),
+                )
+                .await;
                 let size = object_sizes[i];
                 if size > 0 {
                     rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
@@ -3147,7 +3197,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        match store.get_object_info(&bucket, &key, &get_opts).await {
+        let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
             Ok(obj_info) => {
                 // Check for bypass governance retention header (permission already verified in access.rs)
                 let bypass_governance = has_bypass_governance_header(&req.headers);
@@ -3155,17 +3205,19 @@ impl DefaultObjectUsecase {
                 if let Some(block_reason) = check_object_lock_for_deletion(&bucket, &obj_info, bypass_governance).await {
                     return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
                 }
+                Some(obj_info)
             }
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let obj_info = {
-            match store.delete_object(&bucket, &key, opts).await {
+            match store.delete_object(&bucket, &key, opts.clone()).await {
                 Ok(obj) => obj,
                 Err(err) => {
                     if is_err_bucket_not_found(&err) {
@@ -3182,6 +3234,8 @@ impl DefaultObjectUsecase {
                 }
             }
         };
+
+        enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
