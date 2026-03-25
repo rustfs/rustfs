@@ -20,9 +20,9 @@
 use crate::TelemetryError;
 // Import and re-export TelemetryGuard for use in other crates (like rustfs)
 // Use as Dial9TelemetryGuard internally to avoid naming conflicts
+use dial9_tokio_telemetry::telemetry::RotatingWriter;
 pub use dial9_tokio_telemetry::telemetry::TelemetryGuard;
 use dial9_tokio_telemetry::telemetry::TelemetryGuard as Dial9TelemetryGuard;
-use dial9_tokio_telemetry::telemetry::RotatingWriter;
 // Use rustfs_config which re-exports runtime constants
 use rustfs_config::{
     DEFAULT_RUNTIME_DIAL9_ENABLED, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE,
