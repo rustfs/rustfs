@@ -70,7 +70,7 @@ jobs:
       - name: Build RustFS
         run: |
           echo "Building the default package..."
-          RUSTFLAGS="--cfg tokio_unstable" nix build .#default --print-build-logs
+          nix build .#default --print-build-logs
 
       - name: Test Binary
         run: |
