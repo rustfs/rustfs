@@ -15,6 +15,7 @@
 //! Object application use-case contracts.
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
+use crate::capacity::capacity_manager::get_capacity_manager;
 use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
@@ -938,6 +939,9 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
+        let manager = get_capacity_manager();
+        manager.record_write_operation().await;
         result
     }
 
@@ -3037,6 +3041,9 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
+        let manager = get_capacity_manager();
+        manager.record_write_operation().await;
         result
     }
 
@@ -3214,6 +3221,9 @@ impl DefaultObjectUsecase {
             .version_id(version_id.map(|v| v.to_string()).unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
+        // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
+        let manager = get_capacity_manager();
+        manager.record_write_operation().await;
         let _ = helper.complete(&result);
         result
     }

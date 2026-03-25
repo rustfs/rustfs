@@ -12,21 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod app;
-pub(crate) mod body_limits;
-pub(crate) mod capacity;
-pub(crate) mod compress;
-pub(crate) mod console;
-pub(crate) mod env;
-pub(crate) mod heal;
-pub(crate) mod object;
-pub(crate) mod oidc;
-pub(crate) mod profiler;
-pub(crate) mod protocols;
-pub(crate) mod proxy;
-pub(crate) mod quota;
-pub(crate) mod runtime;
-pub(crate) mod scanner;
-pub(crate) mod targets;
-pub(crate) mod tls;
-pub(crate) mod workload;
+pub mod capacity_integration;
+pub mod capacity_manager;
+#[cfg(test)]
+mod capacity_manager_test;
+pub mod capacity_metrics;
+#[cfg(test)]
+mod write_trigger_test;
