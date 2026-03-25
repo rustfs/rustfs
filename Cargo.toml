@@ -48,6 +48,7 @@ members = [
     "crates/trusted-proxies", # Trusted proxies management
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
+    "crates/zero-copy-metrics", # Zero-copy metrics collection for performance analysis
     "crates/zip", # ZIP file handling and compression
 ]
 resolver = "3"

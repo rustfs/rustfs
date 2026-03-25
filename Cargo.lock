@@ -8164,6 +8164,7 @@ name = "rustfs-zero-copy-metrics"
 version = "0.0.5"
 dependencies = [
  "metrics",
+ "rustfs-config",
 ]
 
 [[package]]
