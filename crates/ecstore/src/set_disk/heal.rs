@@ -14,21 +14,6 @@
 
 use super::*;
 
-/// Environment variable for controlling zero-copy reads
-const ENV_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
-
-/// Default value for zero-copy enable (disabled by default for safety)
-const DEFAULT_ZERO_COPY_ENABLE: bool = false;
-
-/// Read zero-copy configuration from environment variable.
-/// Returns the configured value, or the default if not set.
-fn is_zero_copy_enabled() -> bool {
-    std::env::var(ENV_ZERO_COPY_ENABLE)
-        .ok()
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(DEFAULT_ZERO_COPY_ENABLE)
-}
-
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(super) async fn heal_object(
@@ -372,8 +357,9 @@ impl SetDisks {
                                     checksum_info.algorithm
                                 };
 
-                                // Read zero-copy configuration
-                                let use_zero_copy = is_zero_copy_enabled();
+                                // Read zero-copy configuration from environment variable
+                                // Default: disabled (false) for safety
+                                let use_zero_copy = rustfs_utils::get_env_bool("RUSTFS_OBJECT_ZERO_COPY_ENABLE", false);
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());
