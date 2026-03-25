@@ -1713,11 +1713,10 @@ impl DefaultObjectUsecase {
         };
 
         // Record access pattern for future detection
-        if let Some(range_spec) = &rs {
-            if range_spec.start >= 0 {
+        if let Some(range_spec) = &rs
+            && range_spec.start >= 0 {
                 manager.record_access(range_spec.start as u64, response_content_length as u64);
             }
-        }
 
         // Calculate multi-factor I/O strategy
         let io_strategy = manager.calculate_io_strategy_with_context(

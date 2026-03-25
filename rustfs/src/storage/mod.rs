@@ -39,6 +39,8 @@ mod ecfs_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
 mod sse_test;
+#[cfg(test)]
+mod multi_factor_scheduler_integration_test;
 
 pub(crate) use ecfs_extend::*;
 pub(crate) use sse::{

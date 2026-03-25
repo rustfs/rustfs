@@ -71,6 +71,16 @@ impl IoLoadLevel {
             IoLoadLevel::Critical => "critical",
         }
     }
+
+    /// Get the load level as a numeric index (0=Low, 1=Medium, 2=High, 3=Critical).
+    pub fn level_index(&self) -> u8 {
+        match self {
+            IoLoadLevel::Low => 0,
+            IoLoadLevel::Medium => 1,
+            IoLoadLevel::High => 2,
+            IoLoadLevel::Critical => 3,
+        }
+    }
 }
 
 // ============================================
@@ -123,6 +133,21 @@ impl IoPriority {
             IoPriority::Normal => "normal",
             IoPriority::Low => "low",
         }
+    }
+
+    /// Check if this is high priority.
+    pub fn is_high(&self) -> bool {
+        matches!(self, IoPriority::High)
+    }
+
+    /// Check if this is normal priority.
+    pub fn is_normal(&self) -> bool {
+        matches!(self, IoPriority::Normal)
+    }
+
+    /// Check if this is low priority.
+    pub fn is_low(&self) -> bool {
+        matches!(self, IoPriority::Low)
     }
 }
 
@@ -765,45 +790,45 @@ impl IoStrategy {
 
         // Determine readahead preference
         let mut readahead_reason;
-        let enable_readahead;
-        let readahead_disabled_by_pattern;
-        let readahead_disabled_by_concurrency;
-        let readahead_disabled_by_load;
-        let readahead_disabled_by_bandwidth;
+        
+        
+        
+        
+        
 
         // Start with storage profile preference
         let mut should_enable_readahead = storage_profile.prefers_readahead;
         readahead_reason = if storage_profile.prefers_readahead { "media-pref" } else { "media-no-pref" };
 
         // Apply access pattern override
-        readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
+        let readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
         if readahead_disabled_by_pattern {
             should_enable_readahead = false;
             readahead_reason = "random-pattern";
         }
 
         // Apply concurrency override
-        readahead_disabled_by_concurrency = context.concurrent_requests >= config.random_readahead_disable_concurrency;
+        let readahead_disabled_by_concurrency = context.concurrent_requests >= config.random_readahead_disable_concurrency;
         if readahead_disabled_by_concurrency && matches!(context.access_pattern, AccessPattern::Random) {
             should_enable_readahead = false;
             readahead_reason = "high-concurrency-random";
         }
 
         // Apply load override
-        readahead_disabled_by_load = matches!(load_level, IoLoadLevel::High | IoLoadLevel::Critical);
+        let readahead_disabled_by_load = matches!(load_level, IoLoadLevel::High | IoLoadLevel::Critical);
         if readahead_disabled_by_load {
             should_enable_readahead = false;
             readahead_reason = "high-load";
         }
 
         // Apply bandwidth override
-        readahead_disabled_by_bandwidth = bandwidth_limited;
+        let readahead_disabled_by_bandwidth = bandwidth_limited;
         if readahead_disabled_by_bandwidth {
             should_enable_readahead = false;
             readahead_reason = "low-bandwidth";
         }
 
-        enable_readahead = should_enable_readahead;
+        let enable_readahead = should_enable_readahead;
 
         // Determine cache writeback
         let cache_writeback_enabled = match load_level {
@@ -1758,5 +1783,384 @@ mod tests {
 
         assert_eq!(metrics.high_processed.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.normal_processed.load(Ordering::Relaxed), 1);
+    }
+
+    // ============================================
+    // Multi-Factor Strategy Tests
+    // ============================================
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_nvme_sequential_low_load() {
+        // NVMe + Sequential + Low load = maximum buffer size
+        let context = IoSchedulingContext {
+            file_size: 100 * 1024 * 1024, // 100MB
+            base_buffer_size: 256 * 1024,   // 256KB
+            permit_wait_duration: Duration::from_millis(5), // Low load
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Nvme,
+            observed_bandwidth_bps: Some(600 * 1024 * 1024), // 600MB/s (High, > 512MB/s threshold)
+            concurrent_requests: 2, // Low concurrency
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Should get large buffer due to NVMe + Sequential + High bandwidth
+        assert!(strategy.buffer_size > 256 * 1024, "NVMe sequential should get larger buffer");
+        assert!(strategy.enable_readahead, "Sequential reads should enable readahead");
+        assert_eq!(strategy.load_level, IoLoadLevel::Low);
+        assert_eq!(strategy.storage_media, StorageMedia::Nvme);
+        assert_eq!(strategy.access_pattern, AccessPattern::Sequential);
+        assert_eq!(strategy.bandwidth_tier, BandwidthTier::High);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_hdd_random_high_load() {
+        // HDD + Random + High load = conservative buffer size
+        let context = IoSchedulingContext {
+            file_size: 100 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(100), // High load
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Random,
+            storage_media: StorageMedia::Hdd,
+            observed_bandwidth_bps: Some(10 * 1024 * 1024), // 10MB/s (Low)
+            concurrent_requests: 16, // High concurrency
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Should get small buffer due to HDD + Random + High load + Low bandwidth
+        assert!(strategy.buffer_size < 256 * 1024, "HDD random high load should get smaller buffer");
+        assert!(!strategy.enable_readahead, "Random reads should disable readahead");
+        assert_eq!(strategy.load_level, IoLoadLevel::High);
+        assert_eq!(strategy.storage_media, StorageMedia::Hdd);
+        assert_eq!(strategy.access_pattern, AccessPattern::Random);
+        assert!(strategy.bandwidth_limited, "Low bandwidth should be marked");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_ssd_mixed_medium_load() {
+        // SSD + Mixed + Medium load = moderate buffer
+        let context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(30), // Medium load
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Mixed,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024), // 100MB/s (Medium)
+            concurrent_requests: 6, // Medium concurrency
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Should get moderate buffer
+        assert!(strategy.buffer_size >= 128 * 1024 && strategy.buffer_size <= 256 * 1024,
+                "SSD mixed medium load should get moderate buffer");
+        assert_eq!(strategy.load_level, IoLoadLevel::Medium);
+        assert_eq!(strategy.storage_media, StorageMedia::Ssd);
+        assert_eq!(strategy.access_pattern, AccessPattern::Mixed);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_critical_load_disables_features() {
+        // Any media + Critical load = minimal features
+        let context = IoSchedulingContext {
+            file_size: 10 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(300), // Critical load
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Nvme,
+            observed_bandwidth_bps: Some(200 * 1024 * 1024),
+            concurrent_requests: 1,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Critical load should disable readahead and cache writeback
+        assert_eq!(strategy.load_level, IoLoadLevel::Critical);
+        assert!(!strategy.enable_readahead, "Critical load should disable readahead");
+        assert!(!strategy.cache_writeback_enabled, "Critical load should disable cache writeback");
+        // Buffer: 256KB * 0.4 (critical) * 1.35 (sequential) ≈ 138KB
+        assert!(strategy.buffer_size < 200 * 1024, "Critical load should reduce buffer");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_buffer_cap_enforcement() {
+        // Test that storage media caps are enforced
+        let context = IoSchedulingContext {
+            file_size: 1000 * 1024 * 1024, // 1GB
+            base_buffer_size: 16 * 1024 * 1024, // 16MB (very large)
+            permit_wait_duration: Duration::from_millis(1), // Low load
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Nvme,
+            observed_bandwidth_bps: Some(1000 * 1024 * 1024), // Very high
+            concurrent_requests: 1,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Should be capped at NVMe buffer cap and 1MB max
+        assert!(strategy.buffer_size <= MI_B, "Should be capped at 1MB max");
+        assert!(strategy.buffer_cap_applied, "Buffer cap should be applied");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_bandwidth_low_reduces_buffer() {
+        // Low bandwidth should reduce buffer
+        let context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024,
+            base_buffer_size: 512 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(5 * 1024 * 1024), // 5MB/s (Low)
+            concurrent_requests: 2,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        assert_eq!(strategy.bandwidth_tier, BandwidthTier::Low);
+        assert!(strategy.bandwidth_limited, "Low bandwidth should be flagged");
+        assert!(!strategy.enable_readahead, "Low bandwidth should disable readahead");
+        assert!(strategy.buffer_size < context.base_buffer_size, "Low bandwidth should reduce buffer");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_high_concurrency_reduction() {
+        // High concurrency should reduce buffer
+        let context = IoSchedulingContext {
+            file_size: 100 * 1024 * 1024,
+            base_buffer_size: 512 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Nvme,
+            observed_bandwidth_bps: Some(200 * 1024 * 1024),
+            concurrent_requests: 20, // High concurrency (> 16)
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        assert!(strategy.concurrent_requests >= config.high_concurrency_threshold);
+        assert!(strategy.should_reduce_for_concurrency, "Should mark concurrency reduction");
+        assert!(strategy.buffer_size < context.base_buffer_size, "High concurrency should reduce buffer");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_sequential_boost() {
+        // Sequential reads should get boost
+        let sequential_context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024),
+            concurrent_requests: 2,
+        };
+
+        let random_context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Random,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024),
+            concurrent_requests: 2,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let sequential_strategy = IoStrategy::from_context_with_config(&sequential_context, &config);
+        let random_strategy = IoStrategy::from_context_with_config(&random_context, &config);
+
+        assert!(sequential_strategy.buffer_size > random_strategy.buffer_size,
+                "Sequential should get larger buffer than random");
+        assert!(sequential_strategy.sequential_boost_applied, "Should mark sequential boost");
+        assert!(random_strategy.random_penalty_applied, "Should mark random penalty");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_unknown_media_conservative() {
+        // Unknown media should be conservative
+        let context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024,
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Sequential,
+            storage_media: StorageMedia::Unknown,
+            observed_bandwidth_bps: None,
+            concurrent_requests: 2,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        assert_eq!(strategy.storage_media, StorageMedia::Unknown);
+        assert_eq!(strategy.bandwidth_tier, BandwidthTier::Unknown);
+        assert!(strategy.buffer_size <= context.base_buffer_size,
+                "Unknown media should not exceed base buffer");
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_priority_classification() {
+        // Test priority classification based on file size
+        let small_context = IoSchedulingContext {
+            file_size: 500 * 1024, // 500KB (High priority)
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Unknown,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024),
+            concurrent_requests: 2,
+        };
+
+        let medium_context = IoSchedulingContext {
+            file_size: 5 * 1024 * 1024, // 5MB (Normal priority)
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Unknown,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024),
+            concurrent_requests: 2,
+        };
+
+        let large_context = IoSchedulingContext {
+            file_size: 50 * 1024 * 1024, // 50MB (Low priority)
+            base_buffer_size: 256 * 1024,
+            permit_wait_duration: Duration::from_millis(10),
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Unknown,
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(100 * 1024 * 1024),
+            concurrent_requests: 2,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let small_strategy = IoStrategy::from_context_with_config(&small_context, &config);
+        let medium_strategy = IoStrategy::from_context_with_config(&medium_context, &config);
+        let large_strategy = IoStrategy::from_context_with_config(&large_context, &config);
+
+        assert_eq!(small_strategy.priority, IoPriority::High);
+        assert_eq!(medium_strategy.priority, IoPriority::Normal);
+        assert_eq!(large_strategy.priority, IoPriority::Low);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_readahead_decision_matrix() {
+        // Test readahead enable/disable logic
+        let configs = vec![
+            // (media, pattern, load, bandwidth, concurrency, expected_readahead, reason)
+            (StorageMedia::Nvme, AccessPattern::Sequential, IoLoadLevel::Low, BandwidthTier::High, 1, true, "all-favorable"),
+            (StorageMedia::Hdd, AccessPattern::Random, IoLoadLevel::Low, BandwidthTier::Medium, 1, false, "random-pattern"),
+            (StorageMedia::Ssd, AccessPattern::Sequential, IoLoadLevel::High, BandwidthTier::Medium, 1, false, "high-load"),
+            (StorageMedia::Nvme, AccessPattern::Sequential, IoLoadLevel::Low, BandwidthTier::Low, 1, false, "low-bandwidth"),
+            (StorageMedia::Ssd, AccessPattern::Random, IoLoadLevel::Low, BandwidthTier::High, 20, false, "high-concurrency-random"),
+        ];
+
+        for (media, pattern, load, bandwidth, concurrency, expected, reason) in configs {
+            let context = IoSchedulingContext {
+                file_size: 10 * 1024 * 1024,
+                base_buffer_size: 256 * 1024,
+                permit_wait_duration: match load {
+                    IoLoadLevel::Low => Duration::from_millis(5),
+                    IoLoadLevel::Medium => Duration::from_millis(30),
+                    IoLoadLevel::High => Duration::from_millis(100),
+                    IoLoadLevel::Critical => Duration::from_millis(300),
+                },
+                is_sequential_hint: matches!(pattern, AccessPattern::Sequential),
+                access_pattern: pattern,
+                storage_media: media,
+                observed_bandwidth_bps: match bandwidth {
+                    BandwidthTier::Low => Some(5 * 1024 * 1024),
+                    BandwidthTier::Medium => Some(100 * 1024 * 1024),
+                    BandwidthTier::High => Some(500 * 1024 * 1024),
+                    BandwidthTier::Unknown => None,
+                },
+                concurrent_requests: concurrency,
+            };
+
+            let config = IoSchedulerConfig::default();
+            let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+            assert_eq!(strategy.enable_readahead, expected,
+                "Readahead mismatch for case: {}, expected={}, got={}",
+                reason, expected, strategy.enable_readahead);
+        }
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_buffer_multiplier_stages() {
+        // Test that all multiplier stages are applied
+        let context = IoSchedulingContext {
+            file_size: 100 * 1024 * 1024,
+            base_buffer_size: 1024 * 1024, // 1MB base
+            permit_wait_duration: Duration::from_millis(100), // High load (0.5x)
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Random, // Penalty (0.8x)
+            storage_media: StorageMedia::Ssd,
+            observed_bandwidth_bps: Some(5 * 1024 * 1024), // Low bandwidth (0.6x)
+            concurrent_requests: 12, // High concurrency (0.75x)
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        // Expected multiplier: 1.0 * 0.5 (load) * 0.5 (concurrency, 12>=8) * 0.8 (random) * 0.6 (bandwidth)
+        // = 0.12x
+        let expected_min = (1024_f64 * 1024_f64) * 0.10_f64; // ~100KB
+        let expected_max = (1024_f64 * 1024_f64) * 0.15_f64; // ~150KB
+
+        assert!(strategy.buffer_size >= expected_min as usize &&
+                strategy.buffer_size <= expected_max as usize,
+                "Buffer size {} should be in range [{}, {}] based on combined multipliers",
+                strategy.buffer_size, expected_min, expected_max);
+
+        assert!(strategy.should_reduce_for_concurrency);
+        assert!(strategy.should_reduce_for_bandwidth);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_multi_factor_strategy_compatibility_path() {
+        // Test that compatibility path (from_wait_duration) still works
+        let wait_duration = Duration::from_millis(50);
+        let base_buffer = 256 * 1024;
+
+        let compat_strategy = IoStrategy::from_wait_duration(wait_duration, base_buffer);
+
+        // 50ms is >= high_threshold (50ms), so it's High load
+        assert_eq!(compat_strategy.load_level, IoLoadLevel::High);
+        assert!(compat_strategy.buffer_size > 0);
+        assert_eq!(compat_strategy.storage_media, StorageMedia::Unknown);
+        assert_eq!(compat_strategy.access_pattern, AccessPattern::Unknown);
     }
 }

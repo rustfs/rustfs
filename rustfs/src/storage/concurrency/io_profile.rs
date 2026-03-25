@@ -62,6 +62,26 @@ impl AccessPattern {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Check if this is a sequential access pattern.
+    pub fn is_sequential(&self) -> bool {
+        matches!(self, Self::Sequential)
+    }
+
+    /// Check if this is a random access pattern.
+    pub fn is_random(&self) -> bool {
+        matches!(self, Self::Random)
+    }
+
+    /// Check if this is a mixed access pattern.
+    pub fn is_mixed(&self) -> bool {
+        matches!(self, Self::Mixed)
+    }
+
+    /// Check if this pattern is unknown.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

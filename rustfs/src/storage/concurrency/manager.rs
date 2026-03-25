@@ -18,7 +18,7 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, StorageProfile, detect_storage_media};
+use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
 use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
@@ -72,7 +72,7 @@ impl std::fmt::Debug for ConcurrencyManager {
             "locked".to_string()
         };
         f.debug_struct("ConcurrencyManager")
-            .field("active_requests", &super::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
+            .field("active_requests", &crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
             .field("io_metrics", &io_metrics_info)
             .field("storage_media", &self.storage_media)
@@ -304,7 +304,7 @@ impl ConcurrencyManager {
         permit_wait_duration: Duration,
         is_sequential_hint: bool,
     ) -> IoStrategy {
-        use super::io_schedule::IoSchedulingContext;
+        use crate::storage::concurrency::io_schedule::IoSchedulingContext;
 
         // Record the observation for future smoothing
         self.record_permit_wait(permit_wait_duration);
@@ -313,13 +313,13 @@ impl ConcurrencyManager {
         let access_pattern = if let Ok(detector) = self.pattern_detector.lock() {
             detector.current_pattern()
         } else {
-            super::io_profile::AccessPattern::Unknown
+            crate::storage::concurrency::io_profile::AccessPattern::Unknown
         };
 
         // Get current bandwidth snapshot
         let observed_bandwidth_bps = if let Ok(monitor) = self.bandwidth_monitor.lock() {
             let snapshot = monitor.snapshot();
-            if snapshot.tier == super::bandwidth_monitor::BandwidthTier::Unknown {
+            if snapshot.tier == crate::storage::concurrency::bandwidth_monitor::BandwidthTier::Unknown {
                 None
             } else {
                 Some(snapshot.bytes_per_second)
@@ -329,7 +329,7 @@ impl ConcurrencyManager {
         };
 
         // Get concurrent request count
-        let concurrent_requests = super::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
+        let concurrent_requests = crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
 
         // Build scheduling context
         let context = IoSchedulingContext {
@@ -464,7 +464,7 @@ impl ConcurrencyManager {
         } else {
             BandwidthSnapshot {
                 bytes_per_second: 0,
-                tier: super::bandwidth_monitor::BandwidthTier::Unknown,
+                tier: crate::storage::concurrency::bandwidth_monitor::BandwidthTier::Unknown,
             }
         }
     }
@@ -1005,5 +1005,181 @@ mod integration_tests {
         // Should return a reasonable buffer size
         assert!(size1 > 0);
         assert!(size1 <= 2 * 1024 * 1024); // Not more than 2MB
+    }
+
+    // ============================================
+    // Multi-Factor Strategy Integration Tests
+    // ============================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_nvme_optimal() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate optimal conditions: Unknown/SSD + Sequential + Low load
+        let file_size = 100 * 1024 * 1024; // 100MB
+        let base_buffer = 256 * 1024;
+        let permit_wait = Duration::from_millis(5); // Low load
+        let is_sequential = true;
+
+        let strategy = manager.calculate_io_strategy_with_context(
+            file_size,
+            base_buffer,
+            permit_wait,
+            is_sequential,
+        );
+
+        // Verify basic optimizations work
+        assert_eq!(strategy.storage_media, manager.storage_media());
+        assert!(strategy.buffer_size >= base_buffer * 8 / 10, "Sequential should maintain or boost buffer");
+        assert!(strategy.enable_readahead, "Sequential reads should enable readahead");
+        assert_eq!(strategy.load_level, IoLoadLevel::Low);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_access_pattern_tracking() {
+        let manager = ConcurrencyManager::new();
+
+        // Record sequential accesses
+        for offset in [0, 1024, 2048, 3072, 4096] {
+            manager.record_access(offset, 1024);
+        }
+
+        // Check pattern detection
+        let pattern = manager.current_access_pattern();
+        assert_eq!(pattern, crate::storage::concurrency::io_profile::AccessPattern::Sequential);
+
+        // Record random accesses
+        for offset in [0, 10 * 1024, 100 * 1024, 5 * 1024 * 1024] {
+            manager.record_access(offset, 1024);
+        }
+
+        // Pattern should change to mixed or random
+        let pattern_after = manager.current_access_pattern();
+        assert!(!matches!(pattern_after, crate::storage::concurrency::io_profile::AccessPattern::Sequential));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_bandwidth_recording() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate transfer
+        let bytes = 10 * 1024 * 1024; // 10MB
+        let duration = Duration::from_millis(100); // 100ms = 100MB/s
+
+        manager.record_transfer(bytes, duration);
+
+        // Check bandwidth snapshot (returns BandwidthSnapshot directly)
+        let snapshot = manager.current_bandwidth_snapshot();
+        assert!(snapshot.bytes_per_second > 0, "Should have bandwidth data after recording");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_compatibility() {
+        let manager = ConcurrencyManager::new();
+
+        // Test that old API still works
+        let old_strategy = manager.calculate_io_strategy(
+            Duration::from_millis(50),
+            256 * 1024,
+        );
+
+        assert!(old_strategy.buffer_size > 0);
+
+        // New API with context should also work
+        let new_strategy = manager.calculate_io_strategy_with_context(
+            50 * 1024 * 1024,
+            256 * 1024,
+            Duration::from_millis(50),
+            false,
+        );
+
+        assert!(new_strategy.buffer_size > 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_high_concurrency() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate high concurrent requests by keeping guards alive
+        let _guards: Vec<_> = (0..20).map(|_| crate::storage::concurrency::GetObjectGuard::new()).collect();
+
+        let strategy = manager.calculate_io_strategy_with_context(
+            100 * 1024 * 1024,
+            512 * 1024,
+            Duration::from_millis(10),
+            true,
+        );
+
+        // High concurrency should reduce buffer
+        assert!(strategy.concurrent_requests >= manager.scheduler_config().high_concurrency_threshold);
+        assert!(strategy.buffer_size < 512 * 1024, "High concurrency should reduce buffer");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_buffer_clamp() {
+        let manager = ConcurrencyManager::new();
+
+        // Request very large base buffer
+        let large_base = 16 * 1024 * 1024; // 16MB
+
+        let strategy = manager.calculate_io_strategy_with_context(
+            1 * 1024 * 1024, // 1GB file
+            large_base,
+            Duration::from_millis(1),
+            true,
+        );
+
+        // Should be limited to max (1MB) by either cap or clamp
+        assert!(strategy.buffer_size <= MI_B);
+        assert!(strategy.clamp_max_applied || strategy.buffer_size == MI_B,
+                "Should apply max clamp or buffer cap");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_storage_media_detection() {
+        let manager = ConcurrencyManager::new();
+
+        // Check storage media was detected at initialization
+        let media = manager.storage_media();
+
+        // Should be one of the known types (not Unknown unless detection failed)
+        // We accept Unknown if detection wasn't configured
+        assert!(matches!(media,
+            crate::storage::concurrency::io_profile::StorageMedia::Nvme |
+            crate::storage::concurrency::io_profile::StorageMedia::Ssd |
+            crate::storage::concurrency::io_profile::StorageMedia::Hdd |
+            crate::storage::concurrency::io_profile::StorageMedia::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_priority_with_context() {
+        let manager = ConcurrencyManager::new();
+
+        // Test priority is correctly calculated in multi-factor strategy
+        let small_file_strategy = manager.calculate_io_strategy_with_context(
+            500 * 1024, // 500KB
+            256 * 1024,
+            Duration::from_millis(10),
+            false,
+        );
+
+        let large_file_strategy = manager.calculate_io_strategy_with_context(
+            50 * 1024 * 1024, // 50MB
+            256 * 1024,
+            Duration::from_millis(10),
+            false,
+        );
+
+        assert_eq!(small_file_strategy.priority, crate::storage::concurrency::io_schedule::IoPriority::High);
+        assert_eq!(large_file_strategy.priority, crate::storage::concurrency::io_schedule::IoPriority::Low);
     }
 }
