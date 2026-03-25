@@ -187,7 +187,6 @@ impl ZeroCopyObjectReader {
     ) -> Result<Self, ZeroCopyReadError> {
         // Get the file path from the tokio file
         // This is a workaround - in production you'd want to cache the path
-        use tokio::io::AsyncReadExt;
 
         // Read a small portion to get the file's metadata
         let _ = file.try_clone().await?;

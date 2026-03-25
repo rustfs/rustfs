@@ -129,6 +129,7 @@ async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &s
             shard_size,
             checksum_algo.clone(),
             false,
+            false, // use_zero_copy
         )
         .await
         {
@@ -187,7 +188,7 @@ async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &s
 
     let read_length = shard_size;
     let mut reader =
-        match create_bitrot_reader(None, Some(&disk), bucket, &path, 0, read_length, shard_size, checksum_algo.clone(), false)
+        match create_bitrot_reader(None, Some(&disk), bucket, &path, 0, read_length, shard_size, checksum_algo.clone(), false, false) // use_zero_copy
             .await
         {
             Ok(Some(r)) => r,

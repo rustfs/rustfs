@@ -480,7 +480,7 @@ impl TieredObjectCache {
                 let hot_keys = self.access_tracker.get_hot_keys(limit).await;
                 let mut warmed = 0;
 
-                for (key, _hit_count) in hot_keys {
+                for (_key, _hit_count) in hot_keys {
                     // Note: In a real implementation, we would load the object
                     // from storage and cache it. Here we just track the operation.
                     warmed += 1;

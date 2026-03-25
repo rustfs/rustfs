@@ -18,13 +18,56 @@
 //! to reduce memory allocations and improve I/O performance.
 
 use bytes::BytesMut;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// A buffer managed by the BytesPool.
+///
+/// When dropped, the semaphore permit is automatically released,
+/// allowing another buffer to be acquired.
+pub struct PooledBuffer<'a> {
+    /// The underlying buffer
+    buffer: BytesMut,
+    /// The semaphore permit (must be dropped last)
+    _permit: SemaphorePermit<'a>,
+}
+
+/// Owned semaphore permit.
+///
+/// This type holds a semaphore permit and releases it when dropped.
+struct SemaphorePermit<'a>(tokio::sync::SemaphorePermit<'a>);
+
+impl Deref for PooledBuffer<'_> {
+    type Target = BytesMut;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl DerefMut for PooledBuffer<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl AsRef<[u8]> for PooledBuffer<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for PooledBuffer<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut()
+    }
+}
+
 /// Bytes object pool for buffer management.
 ///
-/// The pool maintains a set of pre-allocated buffers that can be reused
-/// across I/O operations, reducing allocation overhead.
+/// The pool maintains a semaphore that limits concurrent buffer allocations,
+/// preventing memory exhaustion from too many simultaneous allocations.
 ///
 /// # Example
 ///
@@ -55,7 +98,7 @@ impl BytesPool {
     ///
     /// # Arguments
     ///
-    /// * `max_buffers` - Maximum number of buffers to maintain
+    /// * `max_buffers` - Maximum number of concurrent buffers
     /// * `default_buffer_size` - Default size for each buffer
     ///
     /// # Example
@@ -71,7 +114,7 @@ impl BytesPool {
         }
     }
 
-    /// Acquire a BytesMut buffer from the pool.
+    /// Acquire a PooledBuffer from the pool.
     ///
     /// If the pool has available capacity, returns a new buffer.
     /// Otherwise, blocks until capacity is available.
@@ -82,19 +125,24 @@ impl BytesPool {
     ///
     /// # Returns
     ///
-    /// A BytesMut buffer with at least the requested capacity.
+    /// A PooledBuffer that releases the permit when dropped.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let buffer = pool.acquire_buffer(8192).await;
     /// ```
-    pub async fn acquire_buffer(&self, size: usize) -> BytesMut {
+    pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer<'_> {
         // Acquire a permit from the semaphore
-        let _permit = self.semaphore.acquire().await;
+        let permit = self.semaphore.acquire().await.unwrap();
 
         // Create a new buffer with requested capacity
-        BytesMut::with_capacity(size.max(self.default_buffer_size))
+        let buffer = BytesMut::with_capacity(size.max(self.default_buffer_size));
+
+        PooledBuffer {
+            buffer,
+            _permit: SemaphorePermit(permit),
+        }
     }
 
     /// Try to acquire a buffer without blocking.
@@ -107,10 +155,14 @@ impl BytesPool {
     ///
     /// * `Some(buffer)` - If a buffer was available
     /// * `None` - If the pool is at capacity
-    pub fn try_acquire_buffer(&self, size: usize) -> Option<BytesMut> {
+    pub fn try_acquire_buffer(&self, size: usize) -> Option<PooledBuffer<'_>> {
         // Try to acquire a permit without blocking
-        if let Ok(_permit) = self.semaphore.try_acquire() {
-            Some(BytesMut::with_capacity(size.max(self.default_buffer_size)))
+        if let Ok(permit) = self.semaphore.try_acquire() {
+            let buffer = BytesMut::with_capacity(size.max(self.default_buffer_size));
+            Some(PooledBuffer {
+                buffer,
+                _permit: SemaphorePermit(permit),
+            })
         } else {
             None
         }
@@ -152,6 +204,7 @@ mod tests {
 
         let buffer = pool.acquire_buffer(2048).await;
         assert!(buffer.capacity() >= 2048);
+        assert_eq!(pool.available_buffers(), 9);
     }
 
     #[tokio::test]
@@ -161,6 +214,7 @@ mod tests {
         // First acquisition should succeed
         let buffer1 = pool.try_acquire_buffer(512);
         assert!(buffer1.is_some());
+        assert_eq!(pool.available_buffers(), 0);
 
         // Second acquisition should fail (pool at capacity)
         let buffer2 = pool.try_acquire_buffer(512);
@@ -168,6 +222,7 @@ mod tests {
 
         // After dropping first, second should succeed
         drop(buffer1);
+        assert_eq!(pool.available_buffers(), 1);
         let buffer3 = pool.try_acquire_buffer(512);
         assert!(buffer3.is_some());
     }
@@ -180,5 +235,8 @@ mod tests {
 
         let _buffer = pool.acquire_buffer(512).await;
         assert_eq!(pool.available_buffers(), 4);
+
+        drop(_buffer);
+        assert_eq!(pool.available_buffers(), 5);
     }
 }

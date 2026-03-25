@@ -1381,6 +1381,16 @@ impl DefaultObjectUsecase {
                 histogram!("rustfs.get.object.cache.size.bytes").record(cached.body.len() as f64);
             }
 
+            // Record zero-copy metrics for cache hits
+            // Cache hits use zero-copy because cached.body is Arc<Bytes>, clone() only increments reference count
+            #[cfg(feature = "metrics")]
+            {
+                use crate::storage::zero_copy::metrics::{record_memory_copy_saved, record_zero_copy_read};
+                record_zero_copy_read(cached.body.len(), cache_serve_duration.as_secs_f64() * 1000.0);
+                // Memory saved: would have copied cached.body.len() bytes without zero-copy
+                record_memory_copy_saved(cached.body.len());
+            }
+
             // Build response from cached data with full metadata
             // ZERO-COPY: cached.body is Arc<Bytes>, clone() only increments reference count
             // No data is copied - the underlying Bytes buffer is shared via reference counting
@@ -1631,12 +1641,26 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InternalError, "Request timeout before reading object"));
         }
 
+        // Record read start time for zero-copy metrics
+        let read_start = std::time::Instant::now();
+
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
             .await
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+
+        // Record zero-copy read metrics for non-cache reads
+        #[cfg(feature = "metrics")]
+        {
+            use crate::storage::zero_copy::metrics::{record_memory_copy_saved, record_zero_copy_read};
+            let read_duration = read_start.elapsed();
+            // Estimate memory saved: assuming zero-copy avoids at least 2 copies (read + response)
+            let estimated_saved = (info.size * 2) as usize;
+            record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
+            record_memory_copy_saved(estimated_saved);
+        }
 
         check_preconditions(&req.headers, &info)?;
 
