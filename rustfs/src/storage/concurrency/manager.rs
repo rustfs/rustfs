@@ -1129,7 +1129,7 @@ mod integration_tests {
         let large_base = 16 * 1024 * 1024; // 16MB
 
         let strategy = manager.calculate_io_strategy_with_context(
-            1 * 1024 * 1024, // 1GB file
+            1024 * 1024, // 1GB file
             large_base,
             Duration::from_millis(1),
             true,

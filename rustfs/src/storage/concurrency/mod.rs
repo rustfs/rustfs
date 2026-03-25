@@ -16,6 +16,7 @@
 
 // Sub-modules
 pub mod bandwidth_monitor;
+pub mod global_metrics;
 pub mod io_profile;
 pub mod io_schedule;
 pub mod manager;
@@ -50,6 +51,9 @@ pub use object_cache::{CacheHealthStatus, CacheStats, CachedGetObject};
 
 // Concurrency manager
 pub use manager::ConcurrencyManager;
+
+// Global metrics
+pub use global_metrics::get_global_metrics;
 
 // ============================================
 // Helper Functions

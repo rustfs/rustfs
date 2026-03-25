@@ -1,0 +1,438 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Core performance metrics for RustFS monitoring.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Re-export metrics crate macros when feature is enabled
+#[cfg(feature = "metrics")]
+pub use metrics::{counter, gauge};
+
+/// Performance metrics structure for RustFS.
+///
+/// This structure contains atomic counters for various performance metrics
+/// that can be safely updated from multiple threads.
+#[derive(Debug)]
+pub struct PerformanceMetrics {
+    // ===== Cache Metrics =====
+    /// Total cache hits
+    pub cache_hits: AtomicU64,
+    /// Total cache misses
+    pub cache_misses: AtomicU64,
+    /// L1 cache hits
+    pub l1_cache_hits: AtomicU64,
+    /// L2 cache hits
+    pub l2_cache_hits: AtomicU64,
+
+    // ===== I/O Metrics =====
+    /// Total bytes read
+    pub total_bytes_read: AtomicU64,
+    /// Total bytes written
+    pub total_bytes_written: AtomicU64,
+    /// Disk read count
+    pub disk_read_count: AtomicU64,
+    /// Disk write count
+    pub disk_write_count: AtomicU64,
+    /// Average I/O latency in microseconds
+    pub avg_io_latency_us: AtomicU64,
+    /// P95 I/O latency in microseconds
+    pub p95_io_latency_us: AtomicU64,
+    /// P99 I/O latency in microseconds
+    pub p99_io_latency_us: AtomicU64,
+
+    // ===== Concurrency Metrics =====
+    /// Current concurrent requests
+    pub current_concurrent_requests: AtomicU64,
+    /// Peak concurrent requests
+    pub peak_concurrent_requests: AtomicU64,
+    /// Average wait time in milliseconds
+    pub avg_wait_time_ms: AtomicU64,
+
+    // ===== Throughput Metrics =====
+    /// Current read throughput in MB/s
+    pub current_read_throughput_mbps: AtomicU64,
+    /// Current write throughput in MB/s
+    pub current_write_throughput_mbps: AtomicU64,
+    /// Peak read throughput in MB/s
+    pub peak_read_throughput_mbps: AtomicU64,
+    /// Peak write throughput in MB/s
+    pub peak_write_throughput_mbps: AtomicU64,
+
+    // ===== Error Metrics =====
+    /// Total errors
+    pub total_errors: AtomicU64,
+    /// Timeout errors
+    pub timeout_errors: AtomicU64,
+    /// Disk errors
+    pub disk_errors: AtomicU64,
+
+    // ===== Queue Metrics =====
+    /// High priority queue depth
+    pub high_priority_queue_depth: AtomicU64,
+    /// Normal priority queue depth
+    pub normal_priority_queue_depth: AtomicU64,
+    /// Low priority queue depth
+    pub low_priority_queue_depth: AtomicU64,
+}
+
+impl PerformanceMetrics {
+    /// Create a new PerformanceMetrics instance with all values initialized to zero.
+    pub fn new() -> Self {
+        Self {
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            l1_cache_hits: AtomicU64::new(0),
+            l2_cache_hits: AtomicU64::new(0),
+            total_bytes_read: AtomicU64::new(0),
+            total_bytes_written: AtomicU64::new(0),
+            disk_read_count: AtomicU64::new(0),
+            disk_write_count: AtomicU64::new(0),
+            avg_io_latency_us: AtomicU64::new(0),
+            p95_io_latency_us: AtomicU64::new(0),
+            p99_io_latency_us: AtomicU64::new(0),
+            current_concurrent_requests: AtomicU64::new(0),
+            peak_concurrent_requests: AtomicU64::new(0),
+            avg_wait_time_ms: AtomicU64::new(0),
+            current_read_throughput_mbps: AtomicU64::new(0),
+            current_write_throughput_mbps: AtomicU64::new(0),
+            peak_read_throughput_mbps: AtomicU64::new(0),
+            peak_write_throughput_mbps: AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+            timeout_errors: AtomicU64::new(0),
+            disk_errors: AtomicU64::new(0),
+            high_priority_queue_depth: AtomicU64::new(0),
+            normal_priority_queue_depth: AtomicU64::new(0),
+            low_priority_queue_depth: AtomicU64::new(0),
+        }
+    }
+
+    /// Calculate the cache hit rate.
+    ///
+    /// Returns the ratio of cache hits to total cache accesses (0.0 to 1.0).
+    /// Returns 0.0 if there have been no cache accesses.
+    pub fn cache_hit_rate(&self) -> f64 {
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let misses = self.cache_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    /// Get the L1 cache hit rate.
+    ///
+    /// Returns the ratio of L1 hits to total cache hits.
+    pub fn l1_hit_rate(&self) -> f64 {
+        let l1_hits = self.l1_cache_hits.load(Ordering::Relaxed);
+        let total_hits = self.cache_hits.load(Ordering::Relaxed);
+
+        if total_hits == 0 {
+            0.0
+        } else {
+            l1_hits as f64 / total_hits as f64
+        }
+    }
+
+    /// Get a summary of the current metrics state.
+    ///
+    /// This returns a compact summary structure suitable for
+    /// monitoring dashboards and logging.
+    pub fn summary(&self) -> MetricsSummary {
+        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
+        let total_hits = cache_hits;
+
+        MetricsSummary {
+            cache_hit_rate: self.cache_hit_rate(),
+            l1_hit_rate: if total_hits > 0 {
+                self.l1_cache_hits.load(Ordering::Relaxed) as f64 / total_hits as f64
+            } else {
+                0.0
+            },
+            avg_io_latency_ms: self.avg_io_latency_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            current_throughput_mbps: self.current_read_throughput_mbps.load(Ordering::Relaxed) as f64,
+            concurrent_requests: self.current_concurrent_requests.load(Ordering::Relaxed),
+            total_errors: self.total_errors.load(Ordering::Relaxed),
+            total_bytes_read: self.total_bytes_read.load(Ordering::Relaxed),
+            total_bytes_written: self.total_bytes_written.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record a cache hit.
+    #[inline]
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_cache_hits_total").increment(1);
+        }
+    }
+
+    /// Record a cache miss.
+    #[inline]
+    pub fn record_cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_cache_misses_total").increment(1);
+        }
+    }
+
+    /// Record an L1 cache hit.
+    #[inline]
+    pub fn record_l1_hit(&self) {
+        self.l1_cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.record_cache_hit();
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_cache_l1_hits_total").increment(1);
+        }
+    }
+
+    /// Record an L2 cache hit.
+    #[inline]
+    pub fn record_l2_hit(&self) {
+        self.l2_cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.record_cache_hit();
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_cache_l2_hits_total").increment(1);
+        }
+    }
+
+    /// Record bytes read.
+    #[inline]
+    pub fn record_bytes_read(&self, bytes: u64) {
+        self.total_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_io_bytes_read_total").increment(bytes);
+        }
+    }
+
+    /// Record bytes written.
+    #[inline]
+    pub fn record_bytes_written(&self, bytes: u64) {
+        self.total_bytes_written.fetch_add(bytes, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_io_bytes_written_total").increment(bytes);
+        }
+    }
+
+    /// Record a disk read operation.
+    #[inline]
+    pub fn record_disk_read(&self) {
+        self.disk_read_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_io_disk_reads_total").increment(1);
+        }
+    }
+
+    /// Record a disk write operation.
+    #[inline]
+    pub fn record_disk_write(&self) {
+        self.disk_write_count.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_io_disk_writes_total").increment(1);
+        }
+    }
+
+    /// Update concurrent request count and track peak.
+    #[inline]
+    pub fn update_concurrent_requests(&self, count: u64) {
+        self.current_concurrent_requests.store(count, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            gauge!("rustfs_concurrent_requests").set(count as f64);
+        }
+
+        // Update peak
+        let mut peak = self.peak_concurrent_requests.load(Ordering::Relaxed);
+        loop {
+            if count <= peak {
+                break;
+            }
+            match self.peak_concurrent_requests.compare_exchange_weak(peak, count, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(new_peak) => peak = new_peak,
+            }
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            let peak = self.peak_concurrent_requests.load(Ordering::Relaxed);
+            gauge!("rustfs_concurrent_requests_peak").set(peak as f64);
+        }
+    }
+
+    /// Record an error.
+    #[inline]
+    pub fn record_error(&self) {
+        self.total_errors.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_errors_total").increment(1);
+        }
+    }
+
+    /// Record a timeout error.
+    #[inline]
+    pub fn record_timeout(&self) {
+        self.timeout_errors.fetch_add(1, Ordering::Relaxed);
+        self.record_error();
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_errors_timeout_total").increment(1);
+        }
+    }
+
+    /// Record a disk error.
+    #[inline]
+    pub fn record_disk_error(&self) {
+        self.disk_errors.fetch_add(1, Ordering::Relaxed);
+        self.record_error();
+
+        #[cfg(feature = "metrics")]
+        {
+            counter!("rustfs_errors_disk_total").increment(1);
+        }
+    }
+}
+
+impl Default for PerformanceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A compact summary of current performance metrics.
+///
+/// This structure is designed to be cheap to clone and suitable
+/// for passing to monitoring systems or logging.
+#[derive(Debug, Clone)]
+pub struct MetricsSummary {
+    /// Cache hit rate (0.0 to 1.0)
+    pub cache_hit_rate: f64,
+    /// L1 cache hit rate (0.0 to 1.0)
+    pub l1_hit_rate: f64,
+    /// Average I/O latency in milliseconds
+    pub avg_io_latency_ms: f64,
+    /// Current read throughput in MB/s
+    pub current_throughput_mbps: f64,
+    /// Current number of concurrent requests
+    pub concurrent_requests: u64,
+    /// Total errors encountered
+    pub total_errors: u64,
+    /// Total bytes read
+    pub total_bytes_read: u64,
+    /// Total bytes written
+    pub total_bytes_written: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_creation() {
+        let metrics = PerformanceMetrics::new();
+        assert_eq!(metrics.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.cache_misses.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_cache_hit_rate() {
+        let metrics = PerformanceMetrics::new();
+
+        // No accesses yet
+        assert_eq!(metrics.cache_hit_rate(), 0.0);
+
+        // Record some hits and misses
+        for _ in 0..5 {
+            metrics.record_cache_hit();
+        }
+        for _ in 0..3 {
+            metrics.record_cache_miss();
+        }
+
+        assert_eq!(metrics.cache_hit_rate(), 5.0 / 8.0);
+    }
+
+    #[test]
+    fn test_l1_hit_rate() {
+        let metrics = PerformanceMetrics::new();
+
+        metrics.record_l1_hit(); // Records both L1 and total
+        metrics.record_l2_hit(); // Records L2 and total
+        metrics.record_cache_hit(); // Direct total hit (L2 or backend)
+
+        assert_eq!(metrics.cache_hits.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.l1_cache_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.l1_hit_rate(), 1.0 / 3.0);
+    }
+
+    #[test]
+    fn test_concurrent_tracking() {
+        let metrics = PerformanceMetrics::new();
+
+        metrics.update_concurrent_requests(5);
+        assert_eq!(metrics.current_concurrent_requests.load(Ordering::Relaxed), 5);
+        assert_eq!(metrics.peak_concurrent_requests.load(Ordering::Relaxed), 5);
+
+        metrics.update_concurrent_requests(3);
+        assert_eq!(metrics.current_concurrent_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.peak_concurrent_requests.load(Ordering::Relaxed), 5); // Peak stays at 5
+    }
+
+    #[test]
+    fn test_error_recording() {
+        let metrics = PerformanceMetrics::new();
+
+        metrics.record_timeout();
+        assert_eq!(metrics.total_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.timeout_errors.load(Ordering::Relaxed), 1);
+
+        metrics.record_disk_error();
+        assert_eq!(metrics.total_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.disk_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_io_recording() {
+        let metrics = PerformanceMetrics::new();
+
+        metrics.record_bytes_read(1024 * 1024); // 1MB
+        metrics.record_disk_read();
+
+        assert_eq!(metrics.total_bytes_read.load(Ordering::Relaxed), 1024 * 1024);
+        assert_eq!(metrics.disk_read_count.load(Ordering::Relaxed), 1);
+    }
+}

@@ -160,6 +160,7 @@ pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = true;
 /// When enabled, uses two-level caching:
 /// - L1: Hot small objects (<1MB) with short TTL
 /// - L2: Standard objects (<10MB) with longer TTL
+///
 /// When enabled, provides L1 (hot small objects) and L2 (standard objects) caching.
 /// When disabled, uses single-level cache for backward compatibility.
 pub const ENV_OBJECT_TIERED_CACHE_ENABLE: &str = "RUSTFS_OBJECT_TIERED_CACHE_ENABLE";

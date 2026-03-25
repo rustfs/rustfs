@@ -21,6 +21,7 @@ mod config;
 mod error;
 mod init;
 mod license;
+mod monitoring;
 mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav"))]
 mod protocols;
