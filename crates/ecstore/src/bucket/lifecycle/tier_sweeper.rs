@@ -120,9 +120,9 @@ impl ObjSweeper {
 #[derive(Debug, Clone)]
 #[allow(unused_assignments)]
 pub struct Jentry {
-    obj_name: String,
-    version_id: String,
-    tier_name: String,
+    pub(crate) obj_name: String,
+    pub(crate) version_id: String,
+    pub(crate) tier_name: String,
 }
 
 impl ExpiryOp for Jentry {
@@ -145,6 +145,38 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
         Err(e) => return Err(std::io::Error::other(e)),
     };
     w.remove(obj_name, rv_id).await
+}
+
+pub fn transitioned_delete_journal_entry(
+    version_id: Option<Uuid>,
+    versioned: bool,
+    suspended: bool,
+    transitioned: &TransitionedObject,
+) -> Option<Jentry> {
+    let sweeper = ObjSweeper {
+        version_id,
+        versioned,
+        suspended,
+        transition_status: transitioned.status.clone(),
+        transition_tier: transitioned.tier.clone(),
+        transition_version_id: transitioned.version_id.clone(),
+        remote_object: transitioned.name.clone(),
+        ..Default::default()
+    };
+
+    sweeper.should_remove_remote_object()
+}
+
+pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject) -> Option<Jentry> {
+    if transitioned.status != lifecycle::TRANSITION_COMPLETE {
+        return None;
+    }
+
+    Some(Jentry {
+        obj_name: transitioned.name.clone(),
+        version_id: transitioned.version_id.clone(),
+        tier_name: transitioned.tier.clone(),
+    })
 }
 
 #[cfg(test)]
