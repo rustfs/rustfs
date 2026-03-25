@@ -47,6 +47,7 @@ pub struct ObjectOptions {
 
     pub versioned: bool,
     pub version_suspended: bool,
+    pub incl_free_versions: bool,
 
     pub skip_decommissioned: bool,
     pub skip_rebalancing: bool,

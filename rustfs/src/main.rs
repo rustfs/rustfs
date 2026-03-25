@@ -16,6 +16,7 @@ mod admin;
 mod app;
 mod auth;
 mod auth_keystone;
+mod capacity;
 mod config;
 mod error;
 mod init;
@@ -40,6 +41,7 @@ use crate::init::{init_ftp_system, init_ftps_system};
 #[cfg(feature = "webdav")]
 use crate::init::init_webdav_system;
 
+use crate::capacity::capacity_integration::init_capacity_management;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -105,9 +107,8 @@ fn main() {
         eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
     }
 
-    let runtime = server::tokio_runtime_builder()
-        .build()
-        .expect("Failed to build Tokio runtime");
+    // Build Tokio runtime with optional dial9 telemetry support
+    let runtime = server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
         // Use eprintln as tracing may not be initialized at this point
@@ -198,6 +199,15 @@ async fn async_main() -> Result<()> {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
+    }
+
+    // Check dial9 Tokio runtime telemetry status
+    // Note: The actual telemetry session is created in build_tokio_runtime()
+    // which stores the TelemetryGuard globally for the program duration.
+    if rustfs_obs::dial9::is_enabled() {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
+    } else {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
     }
 
     info!("license status: {}", license_status());
@@ -296,6 +306,7 @@ async fn run(config: config::Config) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
     // Initialize the lock clients
+
     init_lock_clients(endpoint_pools.clone());
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -330,7 +341,8 @@ async fn run(config: config::Config) -> Result<()> {
             );
         }
     }
-
+    // Initialize capacity management system
+    init_capacity_management().await;
     let state_manager = ServiceStateManager::new();
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
