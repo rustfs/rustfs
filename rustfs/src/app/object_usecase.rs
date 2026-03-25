@@ -1604,53 +1604,9 @@ impl DefaultObjectUsecase {
         let base_buffer_size = self.base_buffer_size();
         let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
 
-        // Determine I/O priority based on request size (for priority scheduling)
-        // Small requests (< 1MB) get high priority, large requests (> 10MB) get low priority
-        let io_priority = manager.get_io_priority(io_strategy.buffer_size as i64);
-
-        // Log priority information for observability
-        if manager.is_priority_scheduling_enabled() {
-            debug!(
-                bucket = %bucket,
-                key = %key,
-                priority = %io_priority,
-                request_size = io_strategy.buffer_size,
-                "I/O priority assigned"
-            );
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::counter;
-                counter!("rustfs.io.priority.assigned.total", "priority" => io_priority.as_str()).increment(1);
-            }
-        }
-
-        // Record detailed I/O metrics for monitoring
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::{counter, gauge, histogram};
-            // Record permit wait time histogram
-            histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
-            // Record I/O queue utilization
-            gauge!("rustfs.io.queue.utilization").set(queue_utilization);
-            gauge!("rustfs.io.queue.permits_in_use").set(queue_status.permits_in_use as f64);
-            gauge!("rustfs.io.queue.permits_available")
-                .set(queue_status.total_permits.saturating_sub(queue_status.permits_in_use) as f64);
-            // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
-            let load_level_value = match io_strategy.load_level {
-                crate::storage::concurrency::IoLoadLevel::Low => 0.0,
-                crate::storage::concurrency::IoLoadLevel::Medium => 1.0,
-                crate::storage::concurrency::IoLoadLevel::High => 2.0,
-                crate::storage::concurrency::IoLoadLevel::Critical => 3.0,
-            };
-            gauge!("rustfs.io.load.level").set(load_level_value);
-            // Record buffer multiplier as gauge
-            gauge!("rustfs.io.buffer.multiplier").set(io_strategy.buffer_multiplier);
-            // Count strategy selections by load level
-            counter!("rustfs.io.strategy.selected", "level" => format!("{:?}", io_strategy.load_level)).increment(1);
-            // Record I/O priority
-            counter!("rustfs.io.priority.assigned", "priority" => io_priority.as_str()).increment(1);
-        }
+        // Note: I/O priority will be calculated later after we have the actual request size
+        // For now, we use Normal priority as a default until we know the real request size
+        let initial_priority = crate::storage::concurrency::IoPriority::Normal;
 
         // Log strategy details at debug level for troubleshooting
         debug!(
@@ -1659,8 +1615,7 @@ impl DefaultObjectUsecase {
             buffer_size = io_strategy.buffer_size,
             readahead = io_strategy.enable_readahead,
             cache_wb = io_strategy.cache_writeback_enabled,
-            priority = io_priority.as_str(),
-            "Adaptive I/O strategy calculated"
+            "Adaptive I/O strategy calculated (priority TBD after size detection)"
         );
 
         // Check timeout before reading object
@@ -1787,6 +1742,60 @@ impl DefaultObjectUsecase {
                 }
                 None => (None, None, None, None, false),
             };
+
+        // Now we have the actual request size, calculate I/O priority correctly
+        // Small requests (< 1MB) get high priority, large requests (> 10MB) get low priority
+        let io_priority = manager.get_io_priority(response_content_length);
+
+        // Log priority information for observability
+        if manager.is_priority_scheduling_enabled() {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                priority = %io_priority,
+                request_size = response_content_length,
+                "I/O priority assigned (based on actual request size)"
+            );
+
+            #[cfg(feature = "metrics")]
+            {
+                use metrics::counter;
+                counter!("rustfs.io.priority.assigned.total", "priority" => io_priority.as_str()).increment(1);
+            }
+        }
+
+        // Record detailed I/O metrics for monitoring (now that we have actual sizes)
+        #[cfg(feature = "metrics")]
+        {
+            use metrics::{counter, gauge, histogram};
+            // Record permit wait time histogram
+            histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
+            // Record I/O queue utilization
+            gauge!("rustfs.io.queue.utilization").set(queue_utilization);
+            gauge!("rustfs.io.queue.permits_in_use").set(queue_status.permits_in_use as f64);
+            gauge!("rustfs.io.queue.permits_available")
+                .set(queue_status.total_permits.saturating_sub(queue_status.permits_in_use) as f64);
+            // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
+            let load_level_value = match io_strategy.load_level {
+                crate::storage::concurrency::IoLoadLevel::Low => 0.0,
+                crate::storage::concurrency::IoLoadLevel::Medium => 1.0,
+                crate::storage::concurrency::IoLoadLevel::High => 2.0,
+                crate::storage::concurrency::IoLoadLevel::Critical => 3.0,
+            };
+            gauge!("rustfs.io.load.level").set(load_level_value);
+            // Record buffer multiplier as gauge
+            gauge!("rustfs.io.buffer.multiplier").set(io_strategy.buffer_multiplier);
+            // Count strategy selections by load level
+            counter!("rustfs.io.strategy.selected", "level" => format!("{:?}", io_strategy.load_level)).increment(1);
+            // Record I/O priority (with actual request size)
+            counter!("rustfs.io.priority.assigned", "priority" => io_priority.as_str()).increment(1);
+        }
+
+        debug!(
+            actual_request_size = response_content_length,
+            priority = %io_priority.as_str(),
+            "I/O priority finalized with actual request size"
+        );
 
         // Calculate concurrency-aware buffer size for optimal performance
         // This adapts based on the number of concurrent GetObject requests

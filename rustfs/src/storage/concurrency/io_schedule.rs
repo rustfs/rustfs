@@ -14,7 +14,7 @@
 
 //! I/O scheduling types for adaptive buffer sizing and load management.
 
-use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot, BandwidthTier};
+use super::bandwidth_monitor::{BandwidthSnapshot, BandwidthTier};
 use super::io_profile::{AccessPattern, StorageMedia, StorageProfile};
 use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -37,22 +37,38 @@ pub enum IoLoadLevel {
 
 impl IoLoadLevel {
     /// Determine load level from disk permit wait duration.
-    ///
-    /// Thresholds are based on typical NVMe SSD characteristics:
-    /// - Low: < 10ms (normal operation)
-    /// - Medium: 10-50ms (moderate contention)
-    /// - High: 50-200ms (significant contention)
-    /// - Critical: > 200ms (severe congestion)
     pub fn from_wait_duration(wait: Duration) -> Self {
-        let wait_ms = wait.as_millis();
-        if wait_ms < 10 {
+        Self::from_wait_duration_with_thresholds(
+            wait,
+            rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
+        )
+    }
+
+    pub fn from_wait_duration_with_thresholds(wait: Duration, low_threshold_ms: u64, high_threshold_ms: u64) -> Self {
+        let wait_ms = wait.as_millis() as u64;
+        let low_threshold_ms = low_threshold_ms.max(1);
+        let high_threshold_ms = high_threshold_ms.max(low_threshold_ms + 1);
+        let critical_threshold_ms = high_threshold_ms.saturating_mul(4);
+
+        if wait_ms < low_threshold_ms {
             IoLoadLevel::Low
-        } else if wait_ms < 50 {
+        } else if wait_ms < high_threshold_ms {
             IoLoadLevel::Medium
-        } else if wait_ms < 200 {
+        } else if wait_ms < critical_threshold_ms {
             IoLoadLevel::High
         } else {
             IoLoadLevel::Critical
+        }
+    }
+
+    /// Get the load level as a string for metrics labels.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IoLoadLevel::Low => "low",
+            IoLoadLevel::Medium => "medium",
+            IoLoadLevel::High => "high",
+            IoLoadLevel::Critical => "critical",
         }
     }
 }
@@ -144,6 +160,34 @@ pub struct IoSchedulerConfig {
     pub load_low_threshold_ms: u64,
     /// Whether priority scheduling is enabled.
     pub enable_priority: bool,
+
+    // Enhanced scheduling configuration fields
+    /// Storage media detection enabled.
+    pub storage_detection_enabled: bool,
+    /// Storage media override string.
+    pub storage_media_override: String,
+    /// Pattern detection history size.
+    pub pattern_history_size: usize,
+    /// Sequential step tolerance in bytes.
+    pub sequential_step_tolerance_bytes: u64,
+    /// Bandwidth EMA beta (smoothing factor).
+    pub bandwidth_ema_beta: f64,
+    /// Bandwidth low threshold in bytes per second.
+    pub bandwidth_low_threshold_bps: u64,
+    /// Bandwidth high threshold in bytes per second.
+    pub bandwidth_high_threshold_bps: u64,
+    /// NVMe buffer capacity in bytes.
+    pub nvme_buffer_cap: usize,
+    /// SSD buffer capacity in bytes.
+    pub ssd_buffer_cap: usize,
+    /// HDD buffer capacity in bytes.
+    pub hdd_buffer_cap: usize,
+    /// Concurrency threshold to disable random readahead.
+    pub random_readahead_disable_concurrency: usize,
+    /// High concurrency threshold.
+    pub high_concurrency_threshold: usize,
+    /// Medium concurrency threshold.
+    pub medium_concurrency_threshold: usize,
 }
 
 impl Default for IoSchedulerConfig {
@@ -161,6 +205,20 @@ impl Default for IoSchedulerConfig {
             load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
             load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
             load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            // Enhanced config defaults
+            storage_detection_enabled: rustfs_config::DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE,
+            storage_media_override: rustfs_config::DEFAULT_OBJECT_IO_STORAGE_MEDIA_OVERRIDE.to_string(),
+            pattern_history_size: rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
+            sequential_step_tolerance_bytes: rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
+            bandwidth_ema_beta: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
+            bandwidth_low_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
+            bandwidth_high_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
+            nvme_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
+            ssd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
+            hdd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
+            random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
+            high_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            medium_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
         }
     }
 }
@@ -217,6 +275,59 @@ impl IoSchedulerConfig {
             load_low_threshold_ms: rustfs_utils::get_env_u64(
                 rustfs_config::ENV_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
                 rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            ),
+            // Enhanced config from environment
+            storage_detection_enabled: rustfs_utils::get_env_bool(
+                rustfs_config::ENV_OBJECT_IO_STORAGE_DETECTION_ENABLE,
+                rustfs_config::DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE,
+            ),
+            storage_media_override: rustfs_utils::get_env_str(
+                rustfs_config::ENV_OBJECT_IO_STORAGE_MEDIA_OVERRIDE,
+                rustfs_config::DEFAULT_OBJECT_IO_STORAGE_MEDIA_OVERRIDE,
+            ),
+            pattern_history_size: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_IO_PATTERN_HISTORY_SIZE,
+                rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
+            ),
+            sequential_step_tolerance_bytes: rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
+                rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
+            ),
+            bandwidth_ema_beta: rustfs_utils::get_env_f64(
+                rustfs_config::ENV_OBJECT_IO_BANDWIDTH_EMA_BETA,
+                rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
+            ),
+            bandwidth_low_threshold_bps: rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
+                rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
+            ),
+            bandwidth_high_threshold_bps: rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
+                rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
+            ),
+            nvme_buffer_cap: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_IO_NVME_BUFFER_CAP,
+                rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
+            ),
+            ssd_buffer_cap: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_IO_SSD_BUFFER_CAP,
+                rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
+            ),
+            hdd_buffer_cap: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_IO_HDD_BUFFER_CAP,
+                rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
+            ),
+            random_readahead_disable_concurrency: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
+                rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
+            ),
+            high_concurrency_threshold: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+                rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            ),
+            medium_concurrency_threshold: rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+                rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
             ),
         }
     }
@@ -381,42 +492,20 @@ pub struct IoStrategy {
     pub cache_writeback_disabled_by_request_size: bool,
     pub storage_profile_buffer_cap_source: &'static str,
     pub final_buffer_floor: usize,
-}
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct IoStrategy {
+    // ---- Compatibility fields (used by manager and tests) ----
     /// Recommended buffer size for I/O operations (in bytes).
-    ///
-    /// Under high load, this is reduced to improve fairness and reduce memory pressure.
-    /// Under low load, this is maximized for throughput.
     pub buffer_size: usize,
-
     /// Buffer size multiplier (0.4 - 1.0) applied to base buffer size.
-    ///
-    /// - 1.0: Low load - use full buffer
-    /// - 0.75: Medium load - slightly reduced
-    /// - 0.5: High load - significantly reduced
-    /// - 0.4: Critical load - minimal buffer
     pub buffer_multiplier: f64,
-
     /// Whether to enable aggressive read-ahead for sequential reads.
-    ///
-    /// Disabled under high load to reduce I/O amplification.
     pub enable_readahead: bool,
-
     /// Whether to enable cache writeback for this request.
-    ///
-    /// May be disabled under extreme load to reduce memory pressure.
     pub cache_writeback_enabled: bool,
-
     /// Whether to use tokio BufReader for improved async I/O.
-    ///
-    /// Always enabled for better async performance.
     pub use_buffered_io: bool,
-
     /// The detected I/O load level.
     pub load_level: IoLoadLevel,
-
     /// The raw permit wait duration that was used to calculate this strategy.
     pub permit_wait_duration: Duration,
 }
@@ -462,12 +551,112 @@ impl IoStrategy {
             IoLoadLevel::Critical => false, // Disable under extreme load
         };
 
+        // Build minimal scheduling context for compatibility path
+        let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
+
         Self {
+            // Enhanced fields with default/unknown values
+            storage_media: StorageMedia::Unknown,
+            access_pattern: AccessPattern::Unknown,
+            observed_bandwidth_bps: None,
+            concurrent_requests: ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
+            bandwidth_tier: BandwidthTier::Unknown,
+            request_size: -1,
+            base_buffer_size,
+            buffer_cap: buffer_size,
+            sequential_detected: false,
+            bandwidth_limited: false,
+            readahead_reason: if enable_readahead { "load-based" } else { "high-load" },
+            low_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
+            high_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
+            random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
+            low_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
+            high_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
+            priority_enabled: rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
+            priority: IoPriority::Normal,
+            queue_capacity_hint: 0,
+            load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
+            load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
+            load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            starvation_prevention_interval_ms: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL,
+            starvation_threshold_secs: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
+            max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+            priority_queue_high_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY,
+            priority_queue_normal_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY,
+            priority_queue_low_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY,
+            storage_profile: StorageProfile::for_media(
+                StorageMedia::Unknown,
+                rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
+                rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
+                rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
+            ),
+            bandwidth_snapshot: None,
+            scheduling_context,
+            high_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            medium_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+            permit_wait_ms: permit_wait_duration.as_millis() as u64,
+            strategy_version: "1.0-compat",
+            is_large_request: false,
+            is_small_request: false,
+            storage_detection_enabled: rustfs_config::DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE,
+            storage_media_override_applied: false,
+            pattern_history_size: rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
+            sequential_step_tolerance_bytes: rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
+            bandwidth_ema_beta: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
+            nvme_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
+            ssd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
+            hdd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
+            is_range_request: false,
+            target_read_size: -1,
+            source_request_size: -1,
+            strategy_reason: "compatibility-path",
+            used_compatibility_path: true,
+            queue_depth_hint: 0,
+            should_throttle_random_io: false,
+            should_expand_for_sequential: false,
+            should_reduce_for_concurrency: false,
+            should_reduce_for_bandwidth: false,
+            should_disable_cache_writeback: !cache_writeback_enabled,
+            should_disable_readahead: !enable_readahead,
+            should_use_buffered_io: true,
+            effective_multiplier_stage_concurrency: buffer_multiplier,
+            effective_multiplier_stage_pattern: 1.0,
+            effective_multiplier_stage_bandwidth: 1.0,
+            final_multiplier: buffer_multiplier,
+            strategy_source: "from_wait_duration",
+            notes: "legacy compatibility mode",
+            profile_prefers_readahead: false,
+            fallback_to_unknown_media: true,
+            request_class: "unknown",
+            io_path_kind: "compat",
+            queue_mode: "standard",
+            load_level_label: load_level.as_str(),
+            pattern_label: "unknown",
+            media_label: "unknown",
+            bandwidth_label: "unknown",
+            sequential_hint_applied: false,
+            observed_bandwidth_available: false,
+            read_size_known: false,
+            random_penalty_applied: false,
+            sequential_boost_applied: false,
+            buffer_cap_applied: false,
+            clamp_min_applied: buffer_size <= 32 * KI_B,
+            clamp_max_applied: buffer_size >= MI_B,
+            readahead_disabled_by_concurrency: false,
+            readahead_disabled_by_pattern: false,
+            readahead_disabled_by_load: !enable_readahead,
+            readahead_disabled_by_bandwidth: false,
+            cache_writeback_disabled_by_load: !cache_writeback_enabled,
+            cache_writeback_disabled_by_pattern: false,
+            cache_writeback_disabled_by_request_size: false,
+            storage_profile_buffer_cap_source: "compat",
+            final_buffer_floor: 32 * KI_B,
+            // Compatibility fields (primary interface)
             buffer_size,
             buffer_multiplier,
             enable_readahead,
             cache_writeback_enabled,
-            use_buffered_io: true, // Always enabled
+            use_buffered_io: true,
             load_level,
             permit_wait_duration,
         }
@@ -1245,7 +1434,7 @@ mod tests {
 
         assert!(config.enable_priority);
         assert_eq!(config.high_priority_size_threshold, 1024 * 1024); // 1MB
-        assert_eq!(config.low_priority_size_threshold, 100 * 1024 * 1024); // 100MB
+        assert_eq!(config.low_priority_size_threshold, 10 * 1024 * 1024); // 10MB
         assert_eq!(config.queue_high_capacity, 32);
         assert_eq!(config.queue_normal_capacity, 64);
         assert_eq!(config.queue_low_capacity, 16);

@@ -469,11 +469,11 @@ pub const DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD: usize = 1024 * 1024;
 /// Requests larger than this threshold are classified as low priority.
 /// Low priority requests are processed last to avoid blocking small requests.
 ///
-/// Default: 104857600 (100 MB, can be overridden by `RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD`).
+/// Default: 10485760 (10 MB, can be overridden by `RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD`).
 pub const ENV_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: &str = "RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD";
 
-/// Default low priority size threshold: 100 MB.
-pub const DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: usize = 100 * 1024 * 1024;
+/// Default low priority size threshold: 10 MB.
+pub const DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: usize = 10 * 1024 * 1024;
 
 /// Environment variable for high priority queue capacity.
 ///

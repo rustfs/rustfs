@@ -15,11 +15,13 @@
 //! Concurrency manager for coordinating concurrent GetObject requests.
 
 use super::io_schedule::{
-    IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
+    IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
+use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, StorageProfile, detect_storage_media};
 use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
+use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
 use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::bytes_pool::BytesPool;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -45,6 +47,15 @@ pub struct ConcurrencyManager {
     priority_queue: Arc<IoPriorityQueue<()>>,
     /// Bytes pool for buffer allocation and reuse
     bytes_pool: Arc<BytesPool>,
+    // Enhanced scheduler state
+    /// I/O scheduler configuration (cached at initialization)
+    scheduler_config: IoSchedulerConfig,
+    /// Detected storage media type
+    storage_media: StorageMedia,
+    /// I/O pattern detector for sequential/random access tracking
+    pattern_detector: Arc<Mutex<IoPatternDetector>>,
+    /// Bandwidth monitor for adaptive I/O sizing
+    bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -55,10 +66,17 @@ impl std::fmt::Debug for ConcurrencyManager {
         } else {
             "locked".to_string()
         };
+        let bandwidth_info = if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            format!("{:?}", monitor.snapshot())
+        } else {
+            "locked".to_string()
+        };
         f.debug_struct("ConcurrencyManager")
             .field("active_requests", &super::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
             .field("io_metrics", &io_metrics_info)
+            .field("storage_media", &self.storage_media)
+            .field("bandwidth", &bandwidth_info)
             .field("bytes_pool", &self.bytes_pool)
             .finish()
     }
@@ -72,16 +90,16 @@ impl ConcurrencyManager {
     /// - `RUSTFS_OBJECT_TIERED_CACHE_ENABLE`: Enable tiered L1+L2 caching (default: true)
     /// - `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`: Maximum concurrent disk reads (default: 64)
     pub fn new() -> Self {
+        // Load scheduler configuration once at initialization
+        let scheduler_config = IoSchedulerConfig::from_env();
+
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
 
         let tiered_cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE);
 
-        let max_disk_reads = rustfs_utils::get_env_usize(
-            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
-            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-        );
+        let max_disk_reads = scheduler_config.max_concurrent_reads;
 
         // Bytes pool configuration
         let buffer_pool_size = rustfs_utils::get_env_usize(
@@ -93,6 +111,12 @@ impl ConcurrencyManager {
             256 * 1024, // default: 256KB
         );
 
+        // Detect storage media
+        let storage_media = detect_storage_media(
+            scheduler_config.storage_detection_enabled,
+            &scheduler_config.storage_media_override,
+        );
+
         // Create tiered cache configuration
         let cache = if tiered_cache_enabled {
             Arc::new(TieredObjectCache::new())
@@ -102,13 +126,39 @@ impl ConcurrencyManager {
             Arc::new(TieredObjectCache::new())
         };
 
+        // Initialize I/O pattern detector
+        let pattern_detector = Arc::new(Mutex::new(IoPatternDetector::new(
+            scheduler_config.pattern_history_size,
+            scheduler_config.sequential_step_tolerance_bytes,
+        )));
+
+        // Initialize bandwidth monitor
+        let bandwidth_monitor = Arc::new(Mutex::new(BandwidthMonitor::new(
+            scheduler_config.bandwidth_ema_beta,
+            scheduler_config.bandwidth_low_threshold_bps,
+            scheduler_config.bandwidth_high_threshold_bps,
+        )));
+
+        // Build priority queue config
+        let queue_config = IoPriorityQueueConfig {
+            queue_high_capacity: scheduler_config.queue_high_capacity,
+            queue_normal_capacity: scheduler_config.queue_normal_capacity,
+            queue_low_capacity: scheduler_config.queue_low_capacity,
+            starvation_prevention_interval_ms: scheduler_config.starvation_prevention_interval_ms,
+            starvation_threshold_secs: scheduler_config.starvation_threshold_secs,
+        };
+
         Self {
             cache,
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
-            io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
-            priority_queue: Arc::new(IoPriorityQueue::new(IoPriorityQueueConfig::default())),
+            io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
+            priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
             bytes_pool: Arc::new(BytesPool::new(buffer_pool_size, default_buffer_size)),
+            scheduler_config,
+            storage_media,
+            pattern_detector,
+            bandwidth_monitor,
         }
     }
 
@@ -282,6 +332,75 @@ impl ConcurrencyManager {
         buffer_size.clamp(32 * KI_B, MI_B)
     }
 
+    // ============================================
+    // Enhanced I/O Scheduling Methods
+    // ============================================
+
+    /// Record an I/O access for pattern detection.
+    ///
+    /// This updates the pattern detector with the offset and size of an access,
+    /// allowing it to distinguish between sequential and random access patterns.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - File offset being accessed
+    /// * `len` - Length of the access
+    pub fn record_access(&self, offset: u64, len: u64) {
+        if let Ok(mut detector) = self.pattern_detector.lock() {
+            detector.record(offset, len);
+        }
+    }
+
+    /// Get the current access pattern.
+    ///
+    /// Returns the detected access pattern (Sequential, Random, Mixed, or Unknown).
+    pub fn current_access_pattern(&self) -> AccessPattern {
+        if let Ok(detector) = self.pattern_detector.lock() {
+            detector.current_pattern()
+        } else {
+            AccessPattern::Unknown
+        }
+    }
+
+    /// Record a data transfer for bandwidth monitoring.
+    ///
+    /// This updates the bandwidth monitor with the bytes transferred and duration,
+    /// allowing it to maintain an EMA (Exponential Moving Average) of the observed bandwidth.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes transferred
+    /// * `duration` - Duration of the transfer
+    pub fn record_transfer(&self, bytes: u64, duration: Duration) {
+        if let Ok(mut monitor) = self.bandwidth_monitor.lock() {
+            monitor.record_transfer(bytes, duration);
+        }
+    }
+
+    /// Get the current bandwidth snapshot.
+    ///
+    /// Returns a snapshot of the current bandwidth including bytes per second and tier.
+    pub fn current_bandwidth_snapshot(&self) -> BandwidthSnapshot {
+        if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            monitor.snapshot()
+        } else {
+            BandwidthSnapshot {
+                bytes_per_second: 0,
+                tier: super::bandwidth_monitor::BandwidthTier::Unknown,
+            }
+        }
+    }
+
+    /// Get the detected storage media type.
+    pub fn storage_media(&self) -> StorageMedia {
+        self.storage_media
+    }
+
+    /// Get the scheduler configuration.
+    pub fn scheduler_config(&self) -> &IoSchedulerConfig {
+        &self.scheduler_config
+    }
+
     /// Get cache statistics
     pub async fn cache_stats(&self) -> CacheStats {
         self.cache.stats_as_hot_cache().await
@@ -290,6 +409,13 @@ impl ConcurrencyManager {
     /// Clear all cached objects
     pub async fn clear_cache(&self) {
         self.cache.clear().await;
+    }
+
+    /// Reset cache hit/miss metrics counters.
+    ///
+    /// This is useful for testing to get a clean slate for hit rate calculations.
+    pub fn reset_cache_metrics(&self) {
+        self.cache.reset_metrics();
     }
 
     /// Check if a key is cached
@@ -323,10 +449,15 @@ impl ConcurrencyManager {
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
-        use super::object_cache::WarmupPattern;
-        // Convert objects to warmup pattern
-        let keys: Vec<String> = objects.into_iter().map(|(k, _v)| k).collect();
-        let _ = self.cache.warm(WarmupPattern::SpecificKeys(keys)).await;
+        if !self.cache_enabled {
+            debug!("Cache is disabled, skipping warmup");
+            return;
+        }
+
+        // Cache each object
+        for (key, data) in objects {
+            self.cache_object(key, data).await;
+        }
     }
 
     /// Warm up cache with a specific pattern.
@@ -543,26 +674,25 @@ impl ConcurrencyManager {
             // Unknown size, use normal priority
             IoPriority::Normal
         } else {
-            IoPriority::from_size(request_size)
+            // Use cached scheduler config thresholds
+            IoPriority::from_size_with_thresholds(
+                request_size,
+                self.scheduler_config.high_priority_size_threshold,
+                self.scheduler_config.low_priority_size_threshold,
+            )
         }
     }
 
     /// Check if priority scheduling is enabled.
     pub fn is_priority_scheduling_enabled(&self) -> bool {
-        rustfs_utils::get_env_bool(
-            rustfs_config::ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE,
-            rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
-        )
+        self.scheduler_config.enable_priority
     }
 
     /// Get current I/O queue status for monitoring.
     ///
     /// Returns information about permit usage and waiting requests.
     pub fn io_queue_status(&self) -> IoQueueStatus {
-        let total_permits = rustfs_utils::get_env_usize(
-            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
-            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-        );
+        let total_permits = self.scheduler_config.max_concurrent_reads;
         let permits_in_use = total_permits.saturating_sub(self.disk_read_semaphore.available_permits());
 
         IoQueueStatus {

@@ -472,6 +472,15 @@ impl TieredObjectCache {
         self.l2_cache.run_pending_tasks().await;
     }
 
+    /// Reset hit/miss metrics counters.
+    ///
+    /// This is useful for testing to get a clean slate for hit rate calculations.
+    pub fn reset_metrics(&self) {
+        self.l1_hits.store(0, Ordering::Relaxed);
+        self.l2_hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+    }
+
     /// Get the access tracker reference.
     pub fn access_tracker(&self) -> &Arc<AccessTracker> {
         &self.access_tracker
@@ -648,9 +657,20 @@ impl TieredObjectCache {
     }
 
     /// Invalidate a versioned object.
-    pub async fn invalidate_versioned(&self, _bucket: &str, key: &str, _version_id: Option<&str>) {
-        // For now, just invalidate the key. Version-aware invalidation can be added later.
-        self.invalidate(key).await;
+    ///
+    /// When version_id is Some, invalidates both "{bucket}/{key}?versionId={version_id}"
+    /// and "{bucket}/{key}" (the latest key).
+    /// When version_id is None, only invalidates "{bucket}/{key}".
+    pub async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
+        // Invalidate the base key (latest)
+        let base_key = format!("{}/{}", bucket, key);
+        self.invalidate(&base_key).await;
+
+        // If version_id is provided, also invalidate the versioned key
+        if let Some(vid) = version_id {
+            let versioned_key = format!("{}/{}?versionId={}", bucket, key, vid);
+            self.invalidate(&versioned_key).await;
+        }
     }
 
     /// Get the overall hit rate.
