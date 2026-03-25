@@ -3186,6 +3186,7 @@ dependencies = [
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-protos",
+ "rustfs-rio",
  "rustfs-signer",
  "rustls",
  "s3s",
