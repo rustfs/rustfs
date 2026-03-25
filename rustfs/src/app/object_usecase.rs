@@ -112,6 +112,7 @@ use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
@@ -1431,6 +1432,11 @@ impl DefaultObjectUsecase {
             // ZERO-COPY: cached.body is Arc<Bytes>, clone() only increments reference count
             // No data is copied - the underlying Bytes buffer is shared via reference counting
             let body_data = cached.body.clone();
+
+            // Record bandwidth for cache hits - cache access is very fast (microseconds)
+            // We use a minimal duration (1 microsecond) to indicate high-speed cache access
+            manager.record_transfer(cached.content_length as u64, Duration::from_micros(1));
+
             let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
 
             // Parse last_modified from RFC3339 string if available
@@ -1717,6 +1723,14 @@ impl DefaultObjectUsecase {
             && range_spec.start >= 0 {
                 manager.record_access(range_spec.start as u64, response_content_length as u64);
             }
+
+        // Record transfer for bandwidth monitoring
+        // Note: For non-cached data, permit_wait_duration represents queue time, not I/O time.
+        // We use it as an upper bound for bandwidth estimation. A more accurate approach
+        // would track actual I/O duration in the storage layer.
+        if response_content_length > 0 {
+            manager.record_transfer(response_content_length as u64, permit_wait_duration);
+        }
 
         // Calculate multi-factor I/O strategy
         let io_strategy = manager.calculate_io_strategy_with_context(
