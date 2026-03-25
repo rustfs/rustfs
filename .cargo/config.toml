@@ -1,0 +1,26 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RustFS Cargo configuration
+
+# Enable tokio_unstable cfg for dial9-tokio-telemetry support
+# This allows dial9 to hook into Tokio's internal runtime events
+[build]
+# Enable Tokio unstable features required by dial9-tokio-telemetry for runtime tracing.
+# See: https://docs.rs/tokio/latest/tokio/#unstable-features
+rustflags = ["--cfg", "tokio_unstable"]
+
+# Enable frame pointers for CPU profiling (Linux only, optional but recommended)
+# Uncomment the following line for better CPU profiling data
+# rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]

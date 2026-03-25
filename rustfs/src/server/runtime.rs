@@ -12,8 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use sysinfo::{RefreshKind, System};
+
+// Import TelemetryGuard from rustfs_obs re-export
+use rustfs_obs::dial9::TelemetryGuard;
+
+// Global storage for TelemetryGuard to keep it alive for the program duration
+static DIAL9_TELEMETRY_GUARD: OnceLock<TelemetryGuard> = OnceLock::new();
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
@@ -80,9 +87,9 @@ fn compute_default_max_blocking_threads() -> usize {
 /// Panics if environment variable values are invalid
 /// # Examples
 /// ```no_run
-/// use rustfs_server::tokio_runtime_builder;
-/// let builder = tokio_runtime_builder();
-/// let runtime = builder.build().unwrap();
+/// // tokio_runtime_builder is pub(crate) - call it from within the rustfs binary:
+/// // let builder = tokio_runtime_builder();
+/// // let runtime = builder.build().unwrap();
 /// ```
 pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -157,4 +164,79 @@ pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
 /// This can be useful for debugging purposes
 fn print_tokio_thread_enable() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_THREAD_PRINT_ENABLED, rustfs_config::DEFAULT_THREAD_PRINT_ENABLED)
+}
+
+/// Build Tokio runtime with optional dial9 telemetry support.
+///
+/// If dial9 is enabled via environment variables, creates a TracedRuntime
+/// and stores the TelemetryGuard globally to keep it alive for the
+/// duration of the program.
+///
+/// # Returns
+///
+/// * `Ok(runtime)` - Successfully created runtime
+/// * `Err(e)` - Failed to create runtime
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The Tokio runtime builder fails
+/// - Dial9 is enabled but fails to initialize (falls back to standard runtime)
+///
+/// # Examples
+///
+/// ```no_run
+/// // build_tokio_runtime is pub(crate) - call it from within the rustfs binary:
+/// // let runtime = build_tokio_runtime().expect("Failed to build runtime");
+/// // runtime.block_on(async { /* ... */ })
+/// ```
+pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
+    let mut builder = tokio_runtime_builder();
+
+    // Check if dial9 is enabled
+    if rustfs_obs::dial9::is_enabled() {
+        tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
+
+        return match rustfs_obs::dial9::build_traced_runtime(builder) {
+            Ok((runtime, guard)) => {
+                // Store guard in global static to keep it alive for the program duration
+                let _ = DIAL9_TELEMETRY_GUARD.set(guard);
+                tracing::info!("TracedRuntime created successfully, guard stored globally");
+                Ok(runtime)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build TracedRuntime: {}", e);
+                tracing::warn!("Falling back to standard Tokio runtime");
+                // Rebuild the builder for standard runtime
+                let mut builder = tokio_runtime_builder();
+                builder.build().map_err(BuildError::Runtime)
+            }
+        };
+    }
+
+    // Standard runtime
+    builder.build().map_err(BuildError::Runtime)
+}
+
+/// Error type for runtime building failures.
+#[derive(Debug)]
+pub enum BuildError {
+    /// Tokio runtime creation failed
+    Runtime(std::io::Error),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::Runtime(e) => write!(f, "Failed to build Tokio runtime: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BuildError::Runtime(e) => Some(e),
+        }
+    }
 }

@@ -27,6 +27,16 @@ pub const ENV_RNG_SEED: &str = "RUSTFS_RUNTIME_RNG_SEED";
 /// Event polling interval
 pub const ENV_EVENT_INTERVAL: &str = "RUSTFS_RUNTIME_EVENT_INTERVAL";
 
+// Dial9 Tokio Telemetry Configuration
+pub const ENV_RUNTIME_DIAL9_ENABLED: &str = "RUSTFS_RUNTIME_DIAL9_ENABLED";
+pub const ENV_RUNTIME_DIAL9_OUTPUT_DIR: &str = "RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR";
+pub const ENV_RUNTIME_DIAL9_FILE_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_FILE_PREFIX";
+pub const ENV_RUNTIME_DIAL9_MAX_FILE_SIZE: &str = "RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE";
+pub const ENV_RUNTIME_DIAL9_ROTATION_COUNT: &str = "RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT";
+pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
+pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
+pub const ENV_RUNTIME_DIAL9_SAMPLING_RATE: &str = "RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE";
+
 // Default values for Tokio runtime
 pub const DEFAULT_WORKER_THREADS: usize = 16;
 pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 1024;
@@ -39,6 +49,15 @@ pub const DEFAULT_MAX_IO_EVENTS_PER_TICK: usize = 1024;
 /// Event polling default (Tokio default 61)
 pub const DEFAULT_EVENT_INTERVAL: u32 = 61;
 pub const DEFAULT_RNG_SEED: Option<u64> = None; // None means random
+
+// Dial9 Tokio Telemetry Default values
+pub const DEFAULT_RUNTIME_DIAL9_ENABLED: bool = false; // Disabled by default
+pub const DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR: &str = "/var/log/rustfs/telemetry";
+pub const DEFAULT_RUNTIME_DIAL9_FILE_PREFIX: &str = "rustfs-tokio";
+pub const DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
+pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
+pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
+// Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
 /// Threshold for small object seek support in megabytes.
 ///
