@@ -185,13 +185,13 @@ impl Default for TieredCacheConfig {
             l1_max_objects: rustfs_config::DEFAULT_OBJECT_L1_CACHE_MAX_OBJECTS,
             l1_ttl_secs: rustfs_config::DEFAULT_OBJECT_L1_CACHE_TTL_SECS,
             l1_tti_secs: rustfs_config::DEFAULT_OBJECT_L1_CACHE_TTI_SECS,
-            l1_max_object_size: rustfs_config::DEFAULT_OBJECT_L1_MAX_OBJECT_SIZE_MB as usize * MI_B,
+            l1_max_object_size: rustfs_config::DEFAULT_OBJECT_L1_MAX_OBJECT_SIZE_MB * MI_B,
 
             l2_max_size: rustfs_config::DEFAULT_OBJECT_L2_CACHE_MAX_SIZE_MB as usize * MI_B,
             l2_max_objects: rustfs_config::DEFAULT_OBJECT_L2_CACHE_MAX_OBJECTS,
             l2_ttl_secs: rustfs_config::DEFAULT_OBJECT_L2_CACHE_TTL_SECS,
             l2_tti_secs: rustfs_config::DEFAULT_OBJECT_L2_CACHE_TTI_SECS,
-            l2_max_object_size: rustfs_config::DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB as usize * MI_B,
+            l2_max_object_size: rustfs_config::DEFAULT_OBJECT_CACHE_MAX_OBJECT_SIZE_MB * MI_B,
 
             adaptive_ttl_enabled: rustfs_config::DEFAULT_OBJECT_ADAPTIVE_TTL_ENABLE,
             hot_hit_threshold: rustfs_config::DEFAULT_OBJECT_HOT_HIT_THRESHOLD,
@@ -517,6 +517,245 @@ impl TieredObjectCache {
             .into_iter()
             .map(|(key, _)| key)
             .collect()
+    }
+
+    // ============================================
+    // API Compatibility Methods (for migration from HotObjectCache)
+    // ============================================
+
+    /// Check if a key exists in either cache level.
+    pub async fn contains(&self, key: &str) -> bool {
+        self.l1_cache.contains_key(key) || self.l2_cache.contains_key(key)
+    }
+
+    /// Get multiple objects from cache.
+    pub async fn get_batch(&self, keys: &[String]) -> Vec<(String, Option<Arc<CachedGetObject>>)> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = self.get(key).await;
+            results.push((key.clone(), value));
+        }
+        results
+    }
+
+    /// Remove a key from both cache levels.
+    pub async fn remove(&self, key: &str) -> Option<Arc<CachedGetObject>> {
+        // Try L1 first
+        if let Some(entry) = self.l1_cache.remove(key).await {
+            self.l2_cache.invalidate(key).await;
+            self.access_tracker.remove(key).await;
+            return Some(Arc::clone(&entry.data));
+        }
+        // Try L2
+        if let Some(entry) = self.l2_cache.remove(key).await {
+            self.access_tracker.remove(key).await;
+            return Some(Arc::clone(&entry.data));
+        }
+        None
+    }
+
+    /// Get hot keys with their hit counts.
+    pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, usize)> {
+        let keys = self.access_tracker.get_hot_keys(limit).await;
+        keys.into_iter().map(|(k, v)| (k, v as usize)).collect()
+    }
+
+    /// Warm the cache with a pattern.
+    pub async fn warm(&self, pattern: WarmupPattern) -> usize {
+        self.warm_with_pattern(pattern).await
+    }
+
+    /// Get a response object (wrapper for compatibility).
+    pub async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
+        self.get(key).await
+    }
+
+    /// Put a response object (wrapper for compatibility).
+    pub async fn put_response(&self, key: String, response: CachedGetObject) {
+        self.put(key, response).await
+    }
+
+    /// Invalidate a versioned object.
+    pub async fn invalidate_versioned(&self, _bucket: &str, key: &str, _version_id: Option<&str>) {
+        // For now, just invalidate the key. Version-aware invalidation can be added later.
+        self.invalidate(key).await;
+    }
+
+    /// Get the overall hit rate.
+    pub fn hit_rate(&self) -> f64 {
+        let l1_hits = self.l1_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let l2_hits = self.l2_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let total_hits = l1_hits + l2_hits;
+        let total_requests = total_hits + misses;
+
+        if total_requests > 0 {
+            total_hits as f64 / total_requests as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the maximum object size that can be cached.
+    pub fn max_object_size(&self) -> usize {
+        self.config.l2_max_object_size
+    }
+
+    /// Get combined cache stats (for API compatibility with HotObjectCache).
+    ///
+    /// Combines L1 and L2 stats into a single-level format for backward compatibility.
+    pub async fn stats_as_hot_cache(&self) -> CacheStats {
+        let tiered_stats = self.stats().await;
+
+        let total_size = tiered_stats.l1_size + tiered_stats.l2_size;
+        let total_entries = tiered_stats.l1_entries + tiered_stats.l2_entries;
+        let total_hits = tiered_stats.l1_hits + tiered_stats.l2_hits;
+        let total_max_size = tiered_stats.l1_max_size + tiered_stats.l2_max_size;
+        let max_object_size = self.config.l2_max_object_size;
+        let misses = tiered_stats.misses;
+
+        // Calculate efficiency score (0-100)
+        let total_requests = total_hits + misses;
+        let efficiency_score = if total_requests > 0 {
+            (tiered_stats.hit_rate * 100.0) as u32
+        } else {
+            0
+        };
+
+        CacheStats {
+            size: total_size,
+            entries: total_entries,
+            max_size: total_max_size,
+            max_object_size,
+            hit_count: total_hits,
+            miss_count: misses,
+            avg_age_secs: 0.0, // Not tracked in tiered cache
+            hit_rate: tiered_stats.hit_rate,
+            eviction_count: 0,   // Not tracked in tiered cache
+            eviction_rate: 0.0,
+            memory_usage: total_size,
+            memory_usage_ratio: if total_max_size > 0 { total_size as f64 / total_max_size as f64 } else { 0.0 },
+            top_keys: Vec::new(),  // Would need to fetch from access tracker
+            efficiency_score,
+        }
+    }
+
+    // ============================================
+    // Byte-level caching methods (for compatibility with HotObjectCache API)
+    // ============================================
+
+    /// Get raw bytes from cache (API compatibility method).
+    ///
+    /// Returns the cached data bytes if available as Arc<Vec<u8>>.
+    pub async fn get_bytes(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.get(key).await.map(|cached| Arc::new(cached.body.to_vec()))
+    }
+
+    /// Put raw bytes into cache (API compatibility method).
+    ///
+    /// Stores the byte data with minimal metadata in the appropriate cache level.
+    pub async fn put_bytes(&self, key: String, data: Arc<Vec<u8>>) {
+        // Create a CachedGetObject with minimal required fields
+        let cached_obj = CachedGetObject {
+            body: bytes::Bytes::copy_from_slice(data.as_slice()),
+            content_length: data.len() as i64,
+            ..Default::default()
+        };
+
+        // Store using the existing put method
+        self.put(key, cached_obj).await;
+    }
+
+    /// Invalidate a versioned object (byte-level API).
+    pub async fn invalidate_bytes_versioned(&self, _bucket: &str, key: &str, _version_id: Option<&str>) {
+        // Just use the existing invalidate method
+        self.invalidate(key).await;
+    }
+
+    /// Get multiple objects as bytes (API compatibility).
+    pub async fn get_batch_bytes(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
+        let results = self.get_batch(keys).await;
+        results.into_iter().map(|(_key, value)| {
+            value.map(|cached| Arc::new(cached.body.to_vec()))
+        }).collect()
+    }
+
+    /// Get byte cache statistics (API compatibility).
+    pub async fn stats_bytes(&self) -> ByteCacheStats {
+        let cache_stats = self.stats().await;
+
+        // Calculate efficiency score (0-100)
+        let total_hits = cache_stats.l1_hits + cache_stats.l2_hits;
+        let total_requests = total_hits + cache_stats.misses;
+        let efficiency_score = if total_requests > 0 {
+            (cache_stats.hit_rate * 100.0) as u32
+        } else {
+            0
+        };
+
+        ByteCacheStats {
+            size: cache_stats.l1_size + cache_stats.l2_size,
+            entries: cache_stats.l1_entries + cache_stats.l2_entries,
+            max_size: cache_stats.l1_max_size + cache_stats.l2_max_size,
+            max_object_size: self.config.l2_max_object_size,
+            hit_count: cache_stats.l1_hits + cache_stats.l2_hits,
+            miss_count: cache_stats.misses,
+            avg_age_secs: 0.0,
+            hit_rate: cache_stats.hit_rate,
+            eviction_count: 0,
+            eviction_rate: 0.0,
+            memory_usage: cache_stats.l1_size + cache_stats.l2_size,
+            memory_usage_ratio: {
+                let total_max = cache_stats.l1_max_size + cache_stats.l2_max_size;
+                if total_max > 0 {
+                    (cache_stats.l1_size + cache_stats.l2_size) as f64 / total_max as f64
+                } else {
+                    0.0
+                }
+            },
+            top_keys: Vec::new(),
+            efficiency_score,
+        }
+    }
+}
+
+/// Byte cache statistics (for compatibility with HotObjectCache).
+#[derive(Debug, Clone)]
+pub struct ByteCacheStats {
+    pub size: usize,
+    pub entries: usize,
+    pub max_size: usize,
+    pub max_object_size: usize,
+    pub hit_count: u64,
+    pub miss_count: u64,
+    pub avg_age_secs: f64,
+    pub hit_rate: f64,
+    pub eviction_count: u64,
+    pub eviction_rate: f64,
+    pub memory_usage: usize,
+    pub memory_usage_ratio: f64,
+    pub top_keys: Vec<(String, u64)>,
+    pub efficiency_score: u32,
+}
+
+impl From<ByteCacheStats> for CacheStats {
+    fn from(stats: ByteCacheStats) -> Self {
+        CacheStats {
+            size: stats.size,
+            entries: stats.entries,
+            max_size: stats.max_size,
+            max_object_size: stats.max_object_size,
+            hit_count: stats.hit_count,
+            miss_count: stats.miss_count,
+            avg_age_secs: stats.avg_age_secs,
+            hit_rate: stats.hit_rate,
+            eviction_count: stats.eviction_count,
+            eviction_rate: stats.eviction_rate,
+            memory_usage: stats.memory_usage,
+            memory_usage_ratio: stats.memory_usage_ratio,
+            top_keys: stats.top_keys,
+            efficiency_score: stats.efficiency_score,
+        }
     }
 }
 

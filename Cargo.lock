@@ -8125,7 +8125,6 @@ dependencies = [
  "local-ip-address",
  "lz4",
  "md-5 0.11.0-rc.5",
- "metrics",
  "netif",
  "rand 0.10.0",
  "regex",
@@ -8164,7 +8163,6 @@ name = "rustfs-zero-copy-metrics"
 version = "0.0.5"
 dependencies = [
  "metrics",
- "rustfs-config",
 ]
 
 [[package]]

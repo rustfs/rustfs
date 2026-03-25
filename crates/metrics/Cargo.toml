@@ -26,14 +26,12 @@ categories.workspace = true
 authors.workspace = true
 
 [features]
-default = ["metrics", "ecstore"]
+default = []
 gpu = ["dep:nvml-wrapper"]
-metrics = []
-ecstore = ["dep:rustfs-ecstore"]
-full = ["gpu", "metrics", "ecstore"]
+full = ["gpu"]
 
 [dependencies]
-rustfs-ecstore = { workspace = true, optional = true }
+rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true }
 metrics = { workspace = true }
 sysinfo = { workspace = true }

@@ -146,7 +146,7 @@ impl ZeroCopyObjectReader {
 
             // Convert to Bytes
             Ok(Self {
-                data: Bytes::copy_from_slice(&*mmap),
+                data: Bytes::copy_from_slice(&mmap),
                 pos: 0,
             })
         })
@@ -299,9 +299,9 @@ mod tests {
     #[tokio::test]
     async fn test_from_bytes() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from(data.clone());
+        let mut reader = ZeroCopyObjectReader::from_bytes(data.clone());
 
-        let mut buf = vec![0u8; 11];
+        let mut buf = [0u8; 11];
         let n = reader.read(&mut buf[..]).await.unwrap();
 
         assert_eq!(n, 11);
@@ -311,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn test_remaining_bytes() {
         let data = Bytes::from("hello world");
-        let reader = ZeroCopyObjectReader::from(data);
+        let reader = ZeroCopyObjectReader::from_bytes(data);
 
         let remaining = reader.remaining_bytes();
         assert_eq!(remaining.len(), 11);
@@ -321,11 +321,11 @@ mod tests {
     #[tokio::test]
     async fn test_position() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from(data);
+        let mut reader = ZeroCopyObjectReader::from_bytes(data);
 
         assert_eq!(reader.position(), 0);
 
-        let mut buf = vec![0u8; 5];
+        let mut buf = [0u8; 5];
         reader.read(&mut buf[..]).await.unwrap();
 
         assert_eq!(reader.position(), 5);
@@ -334,11 +334,11 @@ mod tests {
     #[tokio::test]
     async fn test_is_empty() {
         let data = Bytes::from("");
-        let reader = ZeroCopyObjectReader::from(data);
+        let reader = ZeroCopyObjectReader::from_bytes(data);
         assert!(reader.is_empty());
 
         let data = Bytes::from("hello");
-        let reader = ZeroCopyObjectReader::from(data);
+        let reader = ZeroCopyObjectReader::from_bytes(data);
         assert!(!reader.is_empty());
     }
 }

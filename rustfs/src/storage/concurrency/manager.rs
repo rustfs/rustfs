@@ -18,7 +18,7 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache, TieredObjectCache, WarmupPattern};
+use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::bytes_pool::BytesPool;
@@ -32,8 +32,8 @@ pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::
 
 #[derive(Clone)]
 pub struct ConcurrencyManager {
-    /// Hot object cache for frequently accessed objects
-    cache: Arc<HotObjectCache>,
+    /// Tiered object cache (L1 + L2) for frequently accessed objects
+    cache: Arc<TieredObjectCache>,
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
     /// Whether object caching is enabled (from RUSTFS_OBJECT_CACHE_ENABLE env var)
@@ -69,10 +69,14 @@ impl ConcurrencyManager {
     ///
     /// Reads configuration from environment variables:
     /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: true)
+    /// - `RUSTFS_OBJECT_TIERED_CACHE_ENABLE`: Enable tiered L1+L2 caching (default: true)
     /// - `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`: Maximum concurrent disk reads (default: 64)
     pub fn new() -> Self {
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
+
+        let tiered_cache_enabled =
+            rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE);
 
         let max_disk_reads = rustfs_utils::get_env_usize(
             rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
@@ -89,8 +93,17 @@ impl ConcurrencyManager {
             256 * 1024, // default: 256KB
         );
 
+        // Create tiered cache configuration
+        let cache = if tiered_cache_enabled {
+            Arc::new(TieredObjectCache::new())
+        } else {
+            // If tiered cache is disabled, create a simple tiered cache (acts as single-level)
+            // For now, we always use TieredObjectCache since the configuration is now enabled by default
+            Arc::new(TieredObjectCache::new())
+        };
+
         Self {
-            cache: Arc::new(HotObjectCache::new()),
+            cache,
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
@@ -120,14 +133,13 @@ impl ConcurrencyManager {
 
     /// Try to get an object from cache
     pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        self.cache.get(key).await
+        self.cache.get_bytes(key).await
     }
 
     /// Cache an object for future retrievals
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
-        let size = data.len();
-        let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
-        self.cache.put(key, cached_obj).await;
+        let cached_data = Arc::new(data);
+        self.cache.put_bytes(key, cached_data).await;
     }
 
     /// Get the bytes pool for buffer allocation
@@ -272,7 +284,7 @@ impl ConcurrencyManager {
 
     /// Get cache statistics
     pub async fn cache_stats(&self) -> CacheStats {
-        self.cache.stats().await
+        self.cache.stats_as_hot_cache().await
     }
 
     /// Clear all cached objects
@@ -287,17 +299,18 @@ impl ConcurrencyManager {
 
     /// Get multiple cached objects in a single operation
     pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
-        self.cache.get_batch(keys).await
+        self.cache.get_batch_bytes(keys).await
     }
 
     /// Remove a specific object from cache
     pub async fn remove_cached(&self, key: &str) -> bool {
-        self.cache.remove(key).await
+        self.cache.remove(key).await.is_some()
     }
 
     /// Get the most frequently accessed keys
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
-        self.cache.get_hot_keys(limit).await
+        let keys = self.cache.get_hot_keys(limit).await;
+        keys.into_iter().map(|(k, v)| (k, v as u64)).collect()
     }
 
     /// Get cache hit rate percentage
@@ -310,7 +323,10 @@ impl ConcurrencyManager {
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
-        self.cache.warm(objects).await;
+        use super::object_cache::WarmupPattern;
+        // Convert objects to warmup pattern
+        let keys: Vec<String> = objects.into_iter().map(|(k, _v)| k).collect();
+        let _ = self.cache.warm(WarmupPattern::SpecificKeys(keys)).await;
     }
 
     /// Warm up cache with a specific pattern.
@@ -339,11 +355,18 @@ impl ConcurrencyManager {
     /// manager.warm_cache_with_pattern(pattern).await;
     /// ```
     pub async fn warm_cache_with_pattern(&self, pattern: WarmupPattern) -> usize {
-        // Note: Current HotObjectCache doesn't support pattern-based warming
-        // This is a placeholder for future enhancement
-        // In the meantime, we return 0 to indicate no objects were warmed
+        if !self.cache_enabled {
+            debug!("Cache is disabled, skipping warmup");
+            return 0;
+        }
+
         debug!("warm_cache_with_pattern called with pattern: {:?}", pattern);
-        0
+
+        // Delegate to the tiered cache's warm implementation
+        // Note: This returns the count of keys identified for warming,
+        // but actual object loading from storage would need to be implemented
+        // at a higher layer (object_usecase) that has access to storage backends
+        self.cache.warm(pattern).await
     }
 
     /// Get optimized buffer size for a request

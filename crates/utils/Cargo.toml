@@ -42,7 +42,6 @@ libc = { workspace = true, optional = true }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
@@ -92,8 +91,7 @@ crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake2", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
 os = ["dep:rustix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
-metrics = ["dep:metrics"]  # metrics recording features
 sys = ["dep:sysinfo"]  # system information features
 http = ["dep:convert_case", "dep:http", "dep:regex"]
 obj = ["http"] # object storage features
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify", "http", "obj", "metrics"]  # all features
+full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys", "notify", "http", "obj"]  # all features

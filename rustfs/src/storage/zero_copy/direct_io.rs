@@ -27,8 +27,7 @@
 //! Direct I/O is only supported on Linux. On other platforms, attempting to
 //! create a DirectIoReader will return an error.
 
-use bytes::Bytes;
-use std::io::{self, Cursor, Read};
+use std::io::{self};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};

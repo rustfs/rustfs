@@ -1848,7 +1848,7 @@ impl DiskAPI for LocalDisk {
         let file_path_clone = file_path.clone();
         let meta = tokio::task::spawn_blocking(move || {
             std::fs::metadata(&file_path_clone)
-                .map_err(|e| DiskError::from(e))
+                .map_err(DiskError::from)
         })
         .await
         .map_err(DiskError::from)??;
@@ -1860,7 +1860,7 @@ impl DiskAPI for LocalDisk {
                 length,
                 meta.len()
             );
-            return Err(DiskError::FileCorrupt.into());
+            return Err(DiskError::FileCorrupt);
         }
 
         // Unix: use mmap for zero-copy
@@ -1887,7 +1887,7 @@ impl DiskAPI for LocalDisk {
                 .map_err(DiskError::other)?;
 
                 // Convert mmap to Bytes (zero-copy via Vec::into_raw_parts)
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&*mmap))
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
             })
             .await
             .map_err(DiskError::from)??;

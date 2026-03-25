@@ -38,13 +38,10 @@
 
 pub mod reader;
 
-pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
 
 // Re-export from rustfs-zero-copy-metrics crate for unified metrics handling
-pub use rustfs_zero_copy_metrics::{record_memory_copy_saved, record_zero_copy_fallback, record_zero_copy_read};
+pub use rustfs_zero_copy_metrics::{record_memory_copy_saved, record_zero_copy_read};
 
 #[cfg(feature = "direct-io")]
 pub mod direct_io;
 
-#[cfg(feature = "direct-io")]
-pub use direct_io::DirectIoReader;
