@@ -137,7 +137,7 @@ impl Output {
 
 impl Stream for Output {
     type Item = Result<RecordBatch, QueryError>;
-
+    
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this {
@@ -178,6 +178,9 @@ impl QueryStateMachine {
         });
     }
 
+    pub fn time_phase(&self, phase_name: &str) -> PhaseTimer {  
+    PhaseTimer::new(phase_name)  
+    }
     pub fn time_phase(&self, phase: &str) -> impl Fn() {
         let start_offset = self.start.elapsed();
         let phase = phase.to_string(); // Convert to owned String    
