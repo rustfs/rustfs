@@ -2113,12 +2113,11 @@ impl ECStore {
 
         pool_meta.save(self.pools.clone()).await?;
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            if let Err(err) =
+        if let Some(notification_sys) = get_global_notification_sys()
+            && let Err(err) =
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, "start_decommission")
-            {
-                warn!("{err}");
-            }
+        {
+            warn!("{err}");
         }
 
         Ok(())

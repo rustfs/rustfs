@@ -35,7 +35,7 @@ use rustfs_ecstore::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
-    Body, S3Error, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -213,72 +213,6 @@ fn build_rebalance_pool_statuses(
         .collect()
 }
 
-fn validate_start_rebalance_guards(single_pool: bool, decommission_running: bool, rebalance_running: bool) -> S3Result<()> {
-    if single_pool {
-        return Err(s3_error!(NotImplemented));
-    }
-
-    if decommission_running {
-        return Err(s3_error!(
-            InvalidRequest,
-            "Rebalance cannot be started, decommission is already in progress"
-        ));
-    }
-
-    if rebalance_running {
-        return Err(s3_error!(OperationAborted, "Rebalance already in progress"));
-    }
-
-    Ok(())
-}
-
-fn validate_stop_rebalance_guards(rebalance_started: bool) -> S3Result<()> {
-    if !rebalance_started {
-        return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
-    }
-
-    Ok(())
-}
-
-fn validate_rebalance_status_pool_guard(pool_count: usize) -> S3Result<()> {
-    if pool_count == 0 {
-        return Err(rebalance_admin_no_pools_error("load rebalance status"));
-    }
-
-    Ok(())
-}
-
-fn rebalance_admin_internal_error(operation: &str, err: impl std::fmt::Display) -> S3Error {
-    s3_error!(InternalError, "Failed to {}: {}", operation, err)
-}
-
-fn rebalance_admin_not_initialized_error(operation: &str) -> S3Error {
-    rebalance_admin_internal_error(operation, "object layer not initialized")
-}
-
-fn rebalance_admin_missing_credentials_error(operation: &str) -> S3Error {
-    S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to {operation}: missing credentials"))
-}
-
-fn rebalance_admin_no_pools_error(operation: &str) -> S3Error {
-    S3Error::with_message(
-        s3s::S3ErrorCode::InternalError,
-        format!("Failed to {operation}: no storage pools available"),
-    )
-}
-
-fn warn_rebalance_propagation_failure(operation: &str, err: impl std::fmt::Display) {
-    warn!("rebalance {operation} propagation failed after local state update: {err}");
-}
-
-fn resolve_rebalance_status_meta_load_error(pool_idx: usize, err: StorageError) -> S3Error {
-    if err == StorageError::ConfigNotFound {
-        return s3_error!(NoSuchResource, "Pool rebalance is not started");
-    }
-
-    rebalance_admin_internal_error(&format!("load rebalance metadata from pool {}", pool_idx), err)
-}
-
 pub struct RebalanceStart {}
 
 #[async_trait::async_trait]
@@ -288,7 +222,7 @@ impl Operation for RebalanceStart {
         warn!("handle RebalanceStart");
 
         let Some(input_cred) = req.credentials else {
-            return Err(rebalance_admin_missing_credentials_error("start rebalance"));
+            return Err(s3_error!(InvalidRequest, "Failed to start rebalance: missing credentials"));
         };
 
         let (cred, owner) =
@@ -305,46 +239,55 @@ impl Operation for RebalanceStart {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(rebalance_admin_not_initialized_error("start rebalance"));
+            return Err(s3_error!(InternalError, "Failed to start rebalance: object layer not initialized"));
         };
 
-        validate_start_rebalance_guards(
-            store.pools.len() == 1,
-            store.is_decommission_running().await,
-            store.is_rebalance_conflicting_with_decommission().await,
-        )?;
+        if store.pools.len() == 1 {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        if store.is_decommission_running().await {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Rebalance cannot be started, decommission is already in progress"
+            ));
+        }
+
+        if store.is_rebalance_conflicting_with_decommission().await {
+            return Err(s3_error!(OperationAborted, "Rebalance already in progress"));
+        }
 
         let bucket_infos = store
             .list_bucket(&BucketOptions::default())
             .await
-            .map_err(|e| rebalance_admin_internal_error("list buckets for rebalance", e))?;
+            .map_err(|e| s3_error!(InternalError, "Failed to list buckets for rebalance: {}", e))?;
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
         let id = match store.init_rebalance_meta(buckets).await {
             Ok(id) => id,
             Err(e) => {
-                return Err(rebalance_admin_internal_error("initialize rebalance metadata", e));
+                return Err(s3_error!(InternalError, "Failed to initialize rebalance metadata: {}", e));
             }
         };
 
         store
             .start_rebalance()
             .await
-            .map_err(|e| rebalance_admin_internal_error("start rebalance", e))?;
+            .map_err(|e| s3_error!(InternalError, "Failed to start rebalance: {}", e))?;
 
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("RebalanceStart Loading rebalance meta start");
             if let Err(err) = notification_sys.load_rebalance_meta(true).await {
-                warn_rebalance_propagation_failure("start", err);
+                warn!("rebalance start propagation failed after local state update: {err}");
             }
             warn!("RebalanceStart Loading rebalance meta done");
         }
 
         let resp = RebalanceResp { id };
-        let data =
-            serde_json::to_string(&resp).map_err(|e| rebalance_admin_internal_error("serialize rebalance start response", e))?;
+        let data = serde_json::to_string(&resp)
+            .map_err(|e| s3_error!(InternalError, "Failed to serialize rebalance start response: {}", e))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -363,7 +306,7 @@ impl Operation for RebalanceStatus {
         warn!("handle RebalanceStatus");
 
         let Some(input_cred) = req.credentials else {
-            return Err(rebalance_admin_missing_credentials_error("load rebalance status"));
+            return Err(s3_error!(InvalidRequest, "Failed to load rebalance status: missing credentials"));
         };
 
         let (cred, owner) =
@@ -380,20 +323,26 @@ impl Operation for RebalanceStatus {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(rebalance_admin_not_initialized_error("load rebalance status"));
+            return Err(s3_error!(InternalError, "Failed to load rebalance status: object layer not initialized"));
         };
 
-        validate_rebalance_status_pool_guard(store.pools.len())?;
+        if store.pools.is_empty() {
+            return Err(s3_error!(InternalError, "Failed to load rebalance status: no storage pools available"));
+        }
 
         let first_pool = store
             .pools
             .first()
             .cloned()
-            .ok_or_else(|| rebalance_admin_no_pools_error("load rebalance status"))?;
+            .ok_or_else(|| s3_error!(InternalError, "Failed to load rebalance status: no storage pools available"))?;
 
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(first_pool).await {
-            return Err(resolve_rebalance_status_meta_load_error(0, err));
+            if err == StorageError::ConfigNotFound {
+                return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
+            }
+
+            return Err(s3_error!(InternalError, "Failed to load rebalance metadata from pool 0: {}", err));
         }
 
         // Compute disk usage percentage
@@ -417,7 +366,7 @@ impl Operation for RebalanceStatus {
         };
 
         let data = serde_json::to_string(&admin_status)
-            .map_err(|e| rebalance_admin_internal_error("serialize rebalance status response", e))?;
+            .map_err(|e| s3_error!(InternalError, "Failed to serialize rebalance status response: {}", e))?;
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -435,7 +384,7 @@ impl Operation for RebalanceStop {
         warn!("handle RebalanceStop");
 
         let Some(input_cred) = req.credentials else {
-            return Err(rebalance_admin_missing_credentials_error("stop rebalance"));
+            return Err(s3_error!(InvalidRequest, "Failed to stop rebalance: missing credentials"));
         };
 
         let (cred, owner) =
@@ -452,33 +401,35 @@ impl Operation for RebalanceStop {
         .await?;
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(rebalance_admin_not_initialized_error("stop rebalance"));
+            return Err(s3_error!(InternalError, "Failed to stop rebalance: object layer not initialized"));
         };
 
-        validate_stop_rebalance_guards(store.is_rebalance_conflicting_with_decommission().await)?;
+        if !store.is_rebalance_conflicting_with_decommission().await {
+            return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
+        }
 
         if let Some(notification_sys) = get_global_notification_sys() {
             notification_sys
                 .stop_rebalance()
                 .await
-                .map_err(|e| rebalance_admin_internal_error("stop rebalance via notification system", e))?;
+                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance via notification system: {}", e))?;
         } else {
             store
                 .stop_rebalance()
                 .await
-                .map_err(|e| rebalance_admin_internal_error("stop rebalance", e))?;
+                .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
 
             store
                 .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
                 .await
-                .map_err(|e| rebalance_admin_internal_error("persist rebalance stop metadata", e))?;
+                .map_err(|e| s3_error!(InternalError, "Failed to persist rebalance stop metadata: {}", e))?;
         }
 
         warn!("handle RebalanceStop save_rebalance_stats done ");
         if let Some(notification_sys) = get_global_notification_sys() {
             warn!("handle RebalanceStop notification_sys load_rebalance_meta");
             if let Err(err) = notification_sys.load_rebalance_meta(false).await {
-                warn_rebalance_propagation_failure("stop", err);
+                warn!("rebalance stop propagation failed after local state update: {err}");
             }
             warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
@@ -527,16 +478,10 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses,
-        rebalance_admin_internal_error, rebalance_admin_missing_credentials_error, rebalance_admin_no_pools_error,
-        rebalance_admin_not_initialized_error, rebalance_pool_used, rebalance_remaining_buckets, rebalance_used_pct,
-        resolve_rebalance_status_meta_load_error, validate_rebalance_status_pool_guard, validate_start_rebalance_guards,
-        validate_stop_rebalance_guards,
+        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, build_rebalance_pool_statuses, rebalance_pool_used,
+        rebalance_remaining_buckets, rebalance_used_pct,
     };
-    use rustfs_ecstore::{
-        error::StorageError,
-        rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats},
-    };
+    use rustfs_ecstore::rebalance::{DiskStat, RebalStatus, RebalanceInfo, RebalanceStats};
     use time::OffsetDateTime;
 
     #[test]
@@ -834,138 +779,6 @@ mod rebalance_handler_tests {
         );
 
         assert!(statuses.is_empty());
-    }
-
-    #[test]
-    fn test_validate_start_rebalance_guards_rejects_single_pool() {
-        let err = validate_start_rebalance_guards(true, false, false).expect_err("single pool should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::NotImplemented);
-        assert_eq!(err.message(), None);
-    }
-
-    #[test]
-    fn test_validate_start_rebalance_guards_rejects_decommission_running() {
-        let err =
-            validate_start_rebalance_guards(false, true, false).expect_err("decommission running should block rebalance start");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("Rebalance cannot be started, decommission is already in progress"));
-    }
-
-    #[test]
-    fn test_validate_start_rebalance_guards_prefers_decommission_over_running_rebalance() {
-        let err = validate_start_rebalance_guards(false, true, true)
-            .expect_err("decommission should be rejected before another rebalance when both are running");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("Rebalance cannot be started, decommission is already in progress"));
-    }
-
-    #[test]
-    fn test_validate_start_rebalance_guards_rejects_rebalance_running() {
-        let err = validate_start_rebalance_guards(false, false, true).expect_err("running rebalance should block second start");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
-        assert_eq!(err.message(), Some("Rebalance already in progress"));
-    }
-
-    #[test]
-    fn test_validate_start_rebalance_guards_allows_when_idle() {
-        assert!(validate_start_rebalance_guards(false, false, false).is_ok());
-    }
-
-    #[test]
-    fn test_validate_stop_rebalance_guards_rejects_when_not_started() {
-        let err = validate_stop_rebalance_guards(false).expect_err("non-started rebalance should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchResource);
-        assert_eq!(err.message(), Some("Pool rebalance is not started"));
-    }
-
-    #[test]
-    fn test_validate_stop_rebalance_guards_allows_when_started() {
-        assert!(validate_stop_rebalance_guards(true).is_ok());
-    }
-
-    #[test]
-    fn test_validate_rebalance_status_pool_guard_rejects_empty() {
-        let err = validate_rebalance_status_pool_guard(0).expect_err("empty pool list should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to load rebalance status: no storage pools available"));
-    }
-
-    #[test]
-    fn test_validate_rebalance_status_pool_guard_allows_non_empty() {
-        assert!(validate_rebalance_status_pool_guard(1).is_ok());
-    }
-
-    #[test]
-    fn test_rebalance_admin_internal_error_formats_operation_context() {
-        let err = rebalance_admin_internal_error("persist rebalance stop metadata", "disk offline");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to persist rebalance stop metadata: disk offline"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_not_initialized_error_formats_start_context() {
-        let err = rebalance_admin_not_initialized_error("start rebalance");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to start rebalance: object layer not initialized"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_not_initialized_error_formats_status_context() {
-        let err = rebalance_admin_not_initialized_error("load rebalance status");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to load rebalance status: object layer not initialized"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_not_initialized_error_formats_stop_context() {
-        let err = rebalance_admin_not_initialized_error("stop rebalance");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to stop rebalance: object layer not initialized"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_missing_credentials_error_formats_start_context() {
-        let err = rebalance_admin_missing_credentials_error("start rebalance");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("Failed to start rebalance: missing credentials"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_missing_credentials_error_formats_status_context() {
-        let err = rebalance_admin_missing_credentials_error("load rebalance status");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("Failed to load rebalance status: missing credentials"));
-    }
-
-    #[test]
-    fn test_rebalance_admin_no_pools_error_formats_status_context() {
-        let err = rebalance_admin_no_pools_error("load rebalance status");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("Failed to load rebalance status: no storage pools available"));
-    }
-
-    #[test]
-    fn test_resolve_rebalance_status_meta_load_error_maps_config_not_found() {
-        let err = resolve_rebalance_status_meta_load_error(0, StorageError::ConfigNotFound);
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchResource);
-        assert_eq!(err.message(), Some("Pool rebalance is not started"));
-    }
-
-    #[test]
-    fn test_resolve_rebalance_status_meta_load_error_wraps_pool_context() {
-        let err = resolve_rebalance_status_meta_load_error(2, StorageError::DiskNotFound);
-        let message = err.message().expect("message should be present");
-
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
-        assert!(message.starts_with("Failed to load rebalance metadata from pool 2:"));
     }
 
     #[test]

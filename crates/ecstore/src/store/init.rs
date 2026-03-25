@@ -16,70 +16,17 @@ use super::*;
 use crate::error::is_err_decommission_running;
 use crate::global::is_first_cluster_node_local;
 
-fn missing_deployment_id_error() -> Error {
-    Error::other("store init failed: deployment id is not initialized")
-}
-
-fn no_storage_pools_available_error() -> Error {
-    Error::other("store init failed: no storage pools available")
-}
-
-fn store_init_load_formats_exhausted_error(retries: usize, err: &Error) -> Error {
-    Error::other(format!("store init failed to load formats after {retries} retries: {err}"))
-}
-
-fn store_init_deployment_id_mismatch_error() -> Error {
-    Error::other("store init failed: deployment IDs do not match across pools")
-}
-
-fn store_init_retry_budget_exhausted_error() -> Error {
-    Error::other("store init failed: init retry budget exhausted")
-}
-
-fn store_init_resume_pool_not_found_error(cmd_line: &str) -> Error {
-    Error::other(format!(
-        "store init failed to resolve resumable decommission pool `{cmd_line}` from current endpoints"
-    ))
-}
-
-fn store_init_resume_pool_index_not_found_error(idx: usize) -> Error {
-    Error::other(format!(
-        "store init failed to resolve decommission resume pool index {idx} from current endpoints"
-    ))
-}
-
-fn store_init_resume_pool_without_endpoints_error(idx: usize) -> Error {
-    Error::other(format!(
-        "store init failed to resolve decommission resume pool index {idx}: no endpoints available"
-    ))
-}
-
-fn format_store_init_decommission_resume_error(pool_indices: &[usize], err: &Error) -> String {
-    format!("store init failed to resume decommission for pools {:?}: {}", pool_indices, err)
-}
-
-fn format_store_init_decommission_resume_spawn_error(pool_indices: &[usize], err: &Error) -> String {
-    format!("store init failed to resume decommission workers for pools {:?}: {}", pool_indices, err)
-}
-
-fn require_deployment_id(deployment_id: Option<Uuid>) -> Result<Uuid> {
-    deployment_id.ok_or_else(missing_deployment_id_error)
-}
-
-fn clone_first_store_pool<T: Clone>(pools: &[T]) -> Result<T> {
-    pools.first().cloned().ok_or_else(no_storage_pools_available_error)
-}
-
 fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
-    let pool = endpoints
-        .as_ref()
-        .get(idx)
-        .ok_or_else(|| store_init_resume_pool_index_not_found_error(idx))?;
-    let endpoint = pool
-        .endpoints
-        .as_ref()
-        .first()
-        .ok_or_else(|| store_init_resume_pool_without_endpoints_error(idx))?;
+    let pool = endpoints.as_ref().get(idx).ok_or_else(|| {
+        Error::other(format!(
+            "store init failed to resolve decommission resume pool index {idx} from current endpoints"
+        ))
+    })?;
+    let endpoint = pool.endpoints.as_ref().first().ok_or_else(|| {
+        Error::other(format!(
+            "store init failed to resolve decommission resume pool index {idx}: no endpoints available"
+        ))
+    })?;
 
     Ok(endpoint.is_local)
 }
@@ -116,7 +63,10 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                     .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
                     .await
                 {
-                    error!("{}", format_store_init_decommission_resume_spawn_error(&pool_indices, &spawn_err));
+                    error!(
+                        "store init failed to resume decommission workers for pools {:?}: {}",
+                        pool_indices, spawn_err
+                    );
                 }
                 return;
             }
@@ -134,7 +84,7 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                 }
             }
             Err(err) => {
-                error!("{}", format_store_init_decommission_resume_error(&pool_indices, &err));
+                error!("store init failed to resume decommission for pools {:?}: {}", pool_indices, err);
                 return;
             }
         }
@@ -212,7 +162,9 @@ impl ECStore {
                     {
                         Ok(fm) => break Ok(fm),
                         // Wrap the final error if we are giving up
-                        Err(e) if times >= 10 => break Err(store_init_load_formats_exhausted_error(times, &e)),
+                        Err(e) if times >= 10 => {
+                            break Err(Error::other(format!("store init failed to load formats after {times} retries: {e}")));
+                        }
                         // Retrying so just drop the error
                         Err(_) => {}
                     }
@@ -242,7 +194,7 @@ impl ECStore {
             }
 
             if deployment_id != Some(fm.id) {
-                return Err(store_init_deployment_id_mismatch_error());
+                return Err(Error::other("store init failed: deployment IDs do not match across pools"));
             }
 
             if deployment_id.is_some_and(|id| id.is_nil()) {
@@ -276,7 +228,7 @@ impl ECStore {
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
-            id: require_deployment_id(deployment_id)?,
+            id: deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?,
             disk_map,
             pools,
             peer_sys,
@@ -301,7 +253,7 @@ impl ECStore {
                 sleep(Duration::from_secs(wait_sec)).await;
 
                 if exit_count > 10 {
-                    return Err(store_init_retry_budget_exhausted_error());
+                    return Err(Error::other("store init failed: init retry budget exhausted"));
                 }
 
                 exit_count += 1;
@@ -328,7 +280,14 @@ impl ECStore {
 
         let mut meta = PoolMeta::default();
         resolve_store_init_stage_result(
-            meta.load(clone_first_store_pool(&self.pools)?, self.pools.clone()).await,
+            meta.load(
+                self.pools
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| Error::other("store init failed: no storage pools available"))?,
+                self.pools.clone(),
+            )
+            .await,
             "load_pool_meta",
         )?;
         let update = meta.validate(self.pools.clone())?;
@@ -360,7 +319,10 @@ impl ECStore {
             if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
                 pool_indices.push(idx);
             } else {
-                return Err(store_init_resume_pool_not_found_error(&p.cmd_line));
+                return Err(Error::other(format!(
+                    "store init failed to resolve resumable decommission pool `{}` from current endpoints",
+                    p.cmd_line
+                )));
             }
         }
 
@@ -403,10 +365,8 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, clone_first_store_pool, require_deployment_id,
-        resolve_store_init_stage_result, should_resume_local_decommission, should_retry_local_decommission_resume,
-        store_init_deployment_id_mismatch_error, store_init_load_formats_exhausted_error, store_init_resume_pool_not_found_error,
-        store_init_retry_budget_exhausted_error, wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, resolve_store_init_stage_result, should_resume_local_decommission,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
@@ -415,35 +375,6 @@ mod tests {
     };
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
-
-    #[test]
-    fn test_require_deployment_id_returns_uuid() {
-        let id = Uuid::new_v4();
-        let resolved = require_deployment_id(Some(id)).expect("deployment id should pass through");
-        assert_eq!(resolved, id);
-    }
-
-    #[test]
-    fn test_require_deployment_id_rejects_missing_id() {
-        let err = require_deployment_id(None).expect_err("missing deployment id should error");
-        assert!(
-            err.to_string()
-                .contains("store init failed: deployment id is not initialized")
-        );
-    }
-
-    #[test]
-    fn test_clone_first_store_pool_returns_first_pool() {
-        let first = clone_first_store_pool(&[1_u8, 2, 3]).expect("first pool should be returned");
-        assert_eq!(first, 1);
-    }
-
-    #[test]
-    fn test_clone_first_store_pool_rejects_empty_pools() {
-        let err = clone_first_store_pool::<u8>(&[]).expect_err("empty pool list should error");
-        assert!(err.to_string().contains("store init failed: no storage pools available"));
-    }
 
     #[test]
     fn test_should_resume_local_decommission_respects_local_flag() {
@@ -518,62 +449,6 @@ mod tests {
         let err_message = err.to_string();
         assert!(err_message.contains("store init failed during start_rebalance"));
         assert!(err_message.contains(&StorageError::SlowDown.to_string()));
-    }
-
-    #[test]
-    fn test_format_store_init_decommission_resume_error_includes_pool_context() {
-        let message = super::format_store_init_decommission_resume_error(&[1, 3], &StorageError::SlowDown);
-
-        assert!(message.contains("resume decommission for pools [1, 3]"));
-        assert!(message.contains(&StorageError::SlowDown.to_string()));
-    }
-
-    #[test]
-    fn test_format_store_init_decommission_resume_spawn_error_includes_pool_context() {
-        let message = super::format_store_init_decommission_resume_spawn_error(&[2], &StorageError::SlowDown);
-
-        assert!(message.contains("resume decommission workers for pools [2]"));
-        assert!(message.contains(&StorageError::SlowDown.to_string()));
-    }
-
-    #[test]
-    fn test_store_init_load_formats_exhausted_error_includes_retry_count_and_source() {
-        let err = store_init_load_formats_exhausted_error(10, &StorageError::SlowDown);
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("store init failed to load formats after 10 retries"), "{rendered}");
-        assert!(rendered.contains(&StorageError::SlowDown.to_string()), "{rendered}");
-    }
-
-    #[test]
-    fn test_store_init_deployment_id_mismatch_error_formats_context() {
-        let err = store_init_deployment_id_mismatch_error();
-        let rendered = err.to_string();
-
-        assert!(
-            rendered.contains("store init failed: deployment IDs do not match across pools"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn test_store_init_retry_budget_exhausted_error_formats_context() {
-        let err = store_init_retry_budget_exhausted_error();
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("store init failed: init retry budget exhausted"), "{rendered}");
-    }
-
-    #[test]
-    fn test_store_init_resume_pool_not_found_error_formats_cmdline_context() {
-        let err = store_init_resume_pool_not_found_error("pool-a");
-        let rendered = err.to_string();
-
-        assert!(
-            rendered.contains("store init failed to resolve resumable decommission pool `pool-a`"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("current endpoints"), "{rendered}");
     }
 
     #[tokio::test]

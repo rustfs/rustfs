@@ -22,6 +22,7 @@ use rustfs_common::internode_metrics::global_internode_metrics;
 use rustfs_utils::get_env_opt_str;
 use std::io::IoSlice;
 use std::io::{self, Error};
+use std::net::IpAddr;
 use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -91,25 +92,48 @@ fn load_optional_mtls_identity_from_tls_path() -> Option<Identity> {
     }
 }
 
-fn get_http_client() -> Client {
-    // Reuse the HTTP connection pool in the global `reqwest::Client` instance
-    // TODO: interact with load balancing?
-    static CLIENT: LazyLock<Client> = LazyLock::new(|| {
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .tcp_keepalive(std::time::Duration::from_secs(10))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
-            .http2_keep_alive_while_idle(true);
+fn build_http_client(disable_proxy: bool) -> Client {
+    let mut builder = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .tcp_keepalive(std::time::Duration::from_secs(10))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(5))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
+        .http2_keep_alive_while_idle(true);
 
-        // HTTPS root trust + optional mTLS identity from RUSTFS_TLS_PATH
-        builder = load_ca_roots_from_tls_path(builder);
-        if let Some(id) = load_optional_mtls_identity_from_tls_path() {
-            builder = builder.identity(id);
-        }
+    if disable_proxy {
+        builder = builder.no_proxy();
+    }
 
-        builder.build().expect("Failed to create global HTTP client")
-    });
+    builder = load_ca_roots_from_tls_path(builder);
+    if let Some(id) = load_optional_mtls_identity_from_tls_path() {
+        builder = builder.identity(id);
+    }
+
+    builder.build().expect("Failed to create global HTTP client")
+}
+
+fn should_bypass_proxy_for_url(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+fn get_http_client(url: &str) -> Client {
+    // Reuse HTTP connection pools while keeping loopback traffic away from
+    // system proxies so local RPC/tests do not leak to proxy listeners.
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| build_http_client(false));
+    static LOCAL_CLIENT: LazyLock<Client> = LazyLock::new(|| build_http_client(true));
+
+    if should_bypass_proxy_for_url(url) {
+        return LOCAL_CLIENT.clone();
+    }
+
     CLIENT.clone()
 }
 
@@ -138,7 +162,7 @@ impl HttpReader {
         _read_buf_size: usize,
     ) -> io::Result<Self> {
         let track_internode_metrics = is_internode_rpc_url(&url);
-        let client = get_http_client();
+        let client = get_http_client(&url);
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
@@ -302,7 +326,7 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = get_http_client();
+            let client = get_http_client(&url_clone);
             let request = client
                 .request(method_clone, url_clone.clone())
                 .headers(headers_clone.clone())
@@ -663,5 +687,15 @@ mod tests {
         assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"hello world".to_vec()]);
 
         handle.abort();
+    }
+
+    #[test]
+    fn loopback_urls_bypass_proxy_selection() {
+        assert!(should_bypass_proxy_for_url("http://127.0.0.1:9000/stream"));
+        assert!(should_bypass_proxy_for_url("http://localhost:9000/stream"));
+        assert!(should_bypass_proxy_for_url("http://[::1]:9000/stream"));
+        assert!(!should_bypass_proxy_for_url("http://192.168.1.10:9000/stream"));
+        assert!(!should_bypass_proxy_for_url("http://example.com/stream"));
+        assert!(!should_bypass_proxy_for_url("not-a-url"));
     }
 }

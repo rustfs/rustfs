@@ -70,32 +70,6 @@ pub struct NotificationPeerErr {
     pub err: Option<Error>,
 }
 
-fn collect_unreachable_peer_failures<T>(clients: &[Option<T>], operation: &str) -> Vec<String> {
-    clients
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, client)| {
-            if client.is_none() {
-                Some(format!("peer[{idx}] {operation} failed: peer is not reachable"))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn resolve_notification_peer_result<T>(operation: &str, peer: &str, result: Result<T>) -> Option<String> {
-    result.err().map(|err| format!("peer {peer} {operation} failed: {err}"))
-}
-
-fn notification_not_initialized_error(operation: &str) -> Error {
-    Error::other(format!("{operation}: object layer not initialized"))
-}
-
-fn notification_local_operation_failure(operation: &str, stage: &str, err: impl std::fmt::Display) -> String {
-    format!("local {operation} {stage} failed: {err}")
-}
-
 impl NotificationSys {
     pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
         if self.all_peer_clients.is_empty() {
@@ -404,15 +378,20 @@ impl NotificationSys {
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "reload_pool_meta");
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
-            futures.push(client.reload_pool_meta());
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                let host = client.grid_host.clone();
+                futures.push(async move { client.reload_pool_meta().await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] reload_pool_meta failed: peer is not reachable"));
+            }
         }
 
-        let results = join_all(futures).await;
-        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
-            if let Some(failure) = resolve_notification_peer_result("reload_pool_meta", client.grid_host.as_str(), result) {
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} reload_pool_meta failed: {err}");
                 error!("notification reload_pool_meta err {}", failure);
                 failures.push(failure);
             }
@@ -424,19 +403,24 @@ impl NotificationSys {
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
         let operation = format!("load_rebalance_meta(start={start})");
-        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, operation.as_str());
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for (i, client) in self.peer_clients.iter().flatten().enumerate() {
-            warn!(
-                "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
-                start, i, client.host
-            );
-            futures.push(client.load_rebalance_meta(start));
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                warn!(
+                    "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
+                    start, idx, client.host
+                );
+                let host = client.grid_host.clone();
+                futures.push(async move { client.load_rebalance_meta(start).await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
+            }
         }
 
-        let results = join_all(futures).await;
-        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
-            if let Some(failure) = resolve_notification_peer_result(operation.as_str(), client.grid_host.as_str(), result) {
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} {operation} failed: {err}");
                 error!("notification load_rebalance_meta err {}", failure);
                 failures.push(failure);
             } else {
@@ -451,23 +435,28 @@ impl NotificationSys {
         warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
-            return Err(notification_not_initialized_error("stop_rebalance"));
+            return Err(Error::other("stop_rebalance: object layer not initialized"));
         };
 
         // warn!("notification stop_rebalance load_rebalance_meta");
         // self.load_rebalance_meta(false).await;
         // warn!("notification stop_rebalance load_rebalance_meta done");
 
-        let mut failures = collect_unreachable_peer_failures(&self.peer_clients, "stop_rebalance");
+        let mut failures = Vec::new();
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
-            futures.push(client.stop_rebalance());
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                let host = client.grid_host.clone();
+                futures.push(async move { client.stop_rebalance().await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] stop_rebalance failed: peer is not reachable"));
+            }
         }
 
-        let results = join_all(futures).await;
-        for (client, result) in self.peer_clients.iter().flatten().zip(results) {
-            if let Some(failure) = resolve_notification_peer_result("stop_rebalance", client.grid_host.as_str(), result) {
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} stop_rebalance failed: {err}");
                 error!("notification stop_rebalance err {}", failure);
                 failures.push(failure);
             }
@@ -478,16 +467,14 @@ impl NotificationSys {
             Ok(_) => {
                 if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
                     error!("notification stop_rebalance local save err {:?}", err);
-                    return Err(Error::other(notification_local_operation_failure(
-                        "stop_rebalance",
-                        "save_rebalance_stats(stopped_at)",
-                        &err,
+                    return Err(Error::other(format!(
+                        "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
                     )));
                 }
             }
             Err(err) => {
                 error!("notification stop_rebalance local stop err {:?}", err);
-                return Err(Error::other(notification_local_operation_failure("stop_rebalance", "stop", &err)));
+                return Err(Error::other(format!("local stop_rebalance stop failed: {err}")));
             }
         }
 
@@ -900,65 +887,6 @@ mod tests {
     #[test]
     fn aggregate_notification_failures_returns_ok_when_empty() {
         assert!(aggregate_notification_failures("stop_rebalance", Vec::new()).is_ok());
-    }
-
-    #[test]
-    fn collect_unreachable_peer_failures_ignores_reachable_slots() {
-        let failures = collect_unreachable_peer_failures(&[Some(()), Some(())], "stop_rebalance");
-        assert!(failures.is_empty());
-    }
-
-    #[test]
-    fn collect_unreachable_peer_failures_reports_missing_peers_with_operation_context() {
-        let failures = collect_unreachable_peer_failures(&[Some(()), None, None], "load_rebalance_meta");
-
-        assert_eq!(failures.len(), 2);
-        assert!(failures[0].contains("peer[1] load_rebalance_meta failed"));
-        assert!(failures[1].contains("peer[2] load_rebalance_meta failed"));
-        assert!(failures.iter().all(|failure| failure.contains("peer is not reachable")));
-    }
-
-    #[test]
-    fn resolve_notification_peer_result_returns_none_on_success() {
-        assert!(resolve_notification_peer_result("stop_rebalance", "peer-a", Ok(())).is_none());
-    }
-
-    #[test]
-    fn resolve_notification_peer_result_wraps_peer_and_operation_context() {
-        let failure = resolve_notification_peer_result(
-            "load_rebalance_meta(start=true)",
-            "peer-a:9000",
-            Err::<(), _>(Error::other("boom")),
-        )
-        .expect("error result should produce failure message");
-
-        assert!(failure.contains("peer peer-a:9000 load_rebalance_meta(start=true) failed"));
-        assert!(failure.contains("boom"));
-    }
-
-    #[test]
-    fn notification_not_initialized_error_wraps_operation_context() {
-        let err = notification_not_initialized_error("stop_rebalance");
-        let message = err.to_string();
-
-        assert!(message.contains("stop_rebalance: object layer not initialized"));
-    }
-
-    #[test]
-    fn notification_local_operation_failure_wraps_stop_stage_context() {
-        let message = notification_local_operation_failure("stop_rebalance", "stop", Error::other("boom"));
-
-        assert!(message.contains("local stop_rebalance stop failed:"));
-        assert!(message.contains("boom"));
-    }
-
-    #[test]
-    fn notification_local_operation_failure_wraps_save_stage_context() {
-        let message =
-            notification_local_operation_failure("stop_rebalance", "save_rebalance_stats(stopped_at)", Error::other("boom"));
-
-        assert!(message.contains("local stop_rebalance save_rebalance_stats(stopped_at) failed:"));
-        assert!(message.contains("boom"));
     }
 
     #[test]
