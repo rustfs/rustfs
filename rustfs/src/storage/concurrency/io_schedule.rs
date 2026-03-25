@@ -1601,6 +1601,38 @@ impl IoPriorityMetrics {
 /// Global I/O priority metrics instance.
 pub static IO_PRIORITY_METRICS: IoPriorityMetrics = IoPriorityMetrics::new();
 
+/// Get optimized buffer size for I/O operations.
+///
+/// This function provides adaptive buffer sizing based on:
+/// - File size (small files get smaller buffers)
+/// - Concurrent request count (high concurrency gets smaller buffers)
+/// - Base buffer size from configuration
+///
+/// # Arguments
+///
+/// * `file_size` - Size of the file being read/written (-1 for unknown)
+///
+/// # Returns
+///
+/// Optimal buffer size in bytes
+///
+/// # Example
+///
+/// ```ignore
+/// let buffer_size = get_buffer_size_opt_in(1024 * 1024); // 1MB file
+/// assert!(buffer_size >= 64 * 1024); // At least 64KB
+/// ```
+pub fn get_buffer_size_opt_in(file_size: i64) -> usize {
+    // Get base buffer size from configuration
+    let base_buffer_size = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE,
+        rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
+    );
+
+    // Apply concurrency-aware adjustments
+    get_concurrency_aware_buffer_size(file_size, base_buffer_size)
+}
+
 // ============================================
 // Unit Tests
 // ============================================
