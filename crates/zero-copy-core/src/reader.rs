@@ -144,7 +144,7 @@ impl ZeroCopyObjectReader {
             }
                 .map_err(|e| ZeroCopyReadError::Mmap(e.to_string()))?;
 
-            // Convert to Bytes
+            // Convert to Bytes (this is a copy, but only done once)
             Ok(Self {
                 data: Bytes::copy_from_slice(&mmap),
                 pos: 0,
@@ -185,27 +185,10 @@ impl ZeroCopyObjectReader {
         offset: u64,
         size: usize,
     ) -> Result<Self, ZeroCopyReadError> {
-        // Get the file path from the tokio file
-        // This is a workaround - in production you'd want to cache the path
-
-        // Read a small portion to get the file's metadata
-        let _ = file.try_clone().await?;
-
-        // For now, fall back to regular I/O if we don't have the path
-        // TODO: Improve this implementation
-        Self::from_file_read(file, offset, size).await
-    }
-
-    /// Create a zero-copy reader from a file (async read fallback).
-    ///
-    /// This is a fallback when mmap is not available.
-    async fn from_file_read(
-        file: &tokio::fs::File,
-        offset: u64,
-        size: usize,
-    ) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
+        // For mmap, we need the file path - fall back to regular read if not available
+        // This is a simplified implementation
         let mut cloned = file.try_clone().await?;
         cloned.seek(SeekFrom::Start(offset)).await?;
 
@@ -227,7 +210,18 @@ impl ZeroCopyObjectReader {
         offset: u64,
         size: usize,
     ) -> Result<Self, ZeroCopyReadError> {
-        Self::from_file_read(file, offset, size).await
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+        let mut cloned = file.try_clone().await?;
+        cloned.seek(SeekFrom::Start(offset)).await?;
+
+        let mut buffer = vec![0u8; size];
+        cloned.read_exact(&mut buffer).await?;
+
+        Ok(Self {
+            data: Bytes::from(buffer),
+            pos: 0,
+        })
     }
 
     /// Get the remaining data as Bytes (zero-copy).

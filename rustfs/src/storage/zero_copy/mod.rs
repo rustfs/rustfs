@@ -14,8 +14,8 @@
 
 //! Zero-copy data path module for optimized I/O operations.
 //!
-//! This module provides zero-copy readers and writers that minimize memory
-//! allocations and data copying during I/O operations.
+//! This module re-exports zero-copy readers and writers from rustfs-zero-copy-core,
+//! minimizing memory allocations and data copying during I/O operations.
 //!
 //! # Features
 //!
@@ -36,12 +36,13 @@
 //! let reader = ZeroCopyObjectReader::from_bytes(bytes_data);
 //! ```
 
-pub mod reader;
+// Re-export from rustfs-zero-copy-core for unified zero-copy types
+pub use rustfs_zero_copy_core::{ZeroCopyObjectReader, ZeroCopyReadError};
 
+#[cfg(target_os = "linux")]
+pub use rustfs_zero_copy_core::{DirectIoReader, DirectIoError};
 
 // Re-export from rustfs-zero-copy-metrics crate for unified metrics handling
 pub use rustfs_zero_copy_metrics::{record_memory_copy_saved, record_zero_copy_read};
 
-#[cfg(feature = "direct-io")]
-pub mod direct_io;
 

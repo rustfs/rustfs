@@ -86,7 +86,7 @@ impl From<io::Error> for DirectIoError {
 /// # Example
 ///
 /// ```ignore
-/// use rustfs::storage::zero_copy::DirectIoReader;
+/// use rustfs_zero_copy_core::DirectIoReader;
 ///
 /// // Linux only
 /// #[cfg(target_os = "linux")]
@@ -215,12 +215,8 @@ impl AsyncRead for DirectIoReader {
             }
         }
 
-        let n_read = buf.filled().len() - filled;
-        if n_read == 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Ready(Ok(()))
-        }
+        let _n_read = buf.filled().len() - filled;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -284,8 +280,6 @@ mod tests {
     fn test_alignment_check() {
         #[cfg(target_os = "linux")]
         {
-            use std::io::Cursor;
-
             // Valid alignment
             let file = std::fs::File::open("/dev/zero").unwrap();
             assert!(

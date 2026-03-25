@@ -7627,6 +7627,7 @@ dependencies = [
  "rustfs-targets",
  "rustfs-trusted-proxies",
  "rustfs-utils",
+ "rustfs-zero-copy-core",
  "rustfs-zero-copy-metrics",
  "rustfs-zip",
  "rustls",
@@ -7832,6 +7833,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
+ "rustfs-zero-copy-core",
  "rustfs-zero-copy-metrics",
  "rustls",
  "s3s",
@@ -8442,6 +8444,16 @@ version = "0.0.5"
 dependencies = [
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-zero-copy-core"
+version = "0.0.5"
+dependencies = [
+ "bytes",
+ "memmap2 0.9.10",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
