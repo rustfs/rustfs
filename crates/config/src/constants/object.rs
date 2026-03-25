@@ -41,6 +41,60 @@ pub const ENV_OBJECT_CACHE_CAPACITY_MB: &str = "RUSTFS_OBJECT_CACHE_CAPACITY_MB"
 /// - Note: Setting this too low may reduce cache effectiveness; setting it too high may lead to inefficient memory usage.
 pub const ENV_OBJECT_CACHE_MAX_OBJECT_SIZE_MB: &str = "RUSTFS_OBJECT_CACHE_MAX_OBJECT_SIZE_MB";
 
+// =============================================================================
+// L1/L2 Tiered Cache Configuration
+// =============================================================================
+
+/// Environment variable for L1 cache maximum size in megabytes.
+///
+/// L1 cache is for hot small objects (<1MB). Higher values improve hit rate for small objects.
+pub const ENV_OBJECT_L1_CACHE_MAX_SIZE_MB: &str = "RUSTFS_OBJECT_L1_CACHE_MAX_SIZE_MB";
+
+/// Environment variable for L1 cache maximum number of objects.
+pub const ENV_OBJECT_L1_CACHE_MAX_OBJECTS: &str = "RUSTFS_OBJECT_L1_CACHE_MAX_OBJECTS";
+
+/// Environment variable for L1 cache TTL (time-to-live) in seconds.
+pub const ENV_OBJECT_L1_CACHE_TTL_SECS: &str = "RUSTFS_OBJECT_L1_CACHE_TTL_SECS";
+
+/// Environment variable for L1 cache TTI (time-to-idle) in seconds.
+pub const ENV_OBJECT_L1_CACHE_TTI_SECS: &str = "RUSTFS_OBJECT_L1_CACHE_TTI_SECS";
+
+/// Environment variable for L1 cache maximum object size in megabytes.
+pub const ENV_OBJECT_L1_MAX_OBJECT_SIZE_MB: &str = "RUSTFS_OBJECT_L1_MAX_OBJECT_SIZE_MB";
+
+/// Environment variable for L2 cache maximum size in megabytes.
+///
+/// L2 cache is for standard objects (<10MB).
+pub const ENV_OBJECT_L2_CACHE_MAX_SIZE_MB: &str = "RUSTFS_OBJECT_L2_CACHE_MAX_SIZE_MB";
+
+/// Environment variable for L2 cache maximum number of objects.
+pub const ENV_OBJECT_L2_CACHE_MAX_OBJECTS: &str = "RUSTFS_OBJECT_L2_CACHE_MAX_OBJECTS";
+
+/// Environment variable for L2 cache TTL (time-to-live) in seconds.
+pub const ENV_OBJECT_L2_CACHE_TTL_SECS: &str = "RUSTFS_OBJECT_L2_CACHE_TTL_SECS";
+
+/// Environment variable for L2 cache TTI (time-to-idle) in seconds.
+pub const ENV_OBJECT_L2_CACHE_TTI_SECS: &str = "RUSTFS_OBJECT_L2_CACHE_TTI_SECS";
+
+// =============================================================================
+// Adaptive TTL Configuration
+// =============================================================================
+
+/// Environment variable to enable adaptive TTL.
+///
+/// When enabled, hot objects (with high hit counts) get extended TTL.
+pub const ENV_OBJECT_ADAPTIVE_TTL_ENABLE: &str = "RUSTFS_OBJECT_ADAPTIVE_TTL_ENABLE";
+
+/// Environment variable for hot object hit threshold.
+///
+/// Objects with hit count >= this threshold are considered "hot" and get extended TTL.
+pub const ENV_OBJECT_HOT_HIT_THRESHOLD: &str = "RUSTFS_OBJECT_HOT_HIT_THRESHOLD";
+
+/// Environment variable for TTL extension factor.
+///
+/// Hot objects TTL is extended by this factor (e.g., 2.0 = 2x longer).
+pub const ENV_OBJECT_TTL_EXTENSION_FACTOR: &str = "RUSTFS_OBJECT_TTL_EXTENSION_FACTOR";
+
 /// Environment variable name for object cache TTL (time-to-live) in seconds.
 ///
 /// - Purpose: Specify the maximum lifetime of a cached entry from the moment it is written.
@@ -94,11 +148,12 @@ pub const ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: &str = "RUSTFS_OBJECT_MEDIUM_
 /// - Note: This setting may interact with OS-level I/O scheduling and should be tuned based on hardware capabilities.
 pub const ENV_OBJECT_MAX_CONCURRENT_DISK_READS: &str = "RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS";
 
-/// Default: object caching is disabled.
+/// Default: object caching is enabled.
 ///
-/// - Semantics: Safe default to avoid unexpected memory usage or cache consistency concerns when not explicitly enabled.
-/// - Default is set to false (disabled).
-pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = false;
+/// - Semantics: Caching is now enabled by default for improved performance. Hot objects are kept in memory
+///   to reduce backend requests. Set RUSTFS_OBJECT_CACHE_ENABLE=false to disable if needed.
+/// - Default is set to true (enabled).
+pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = true;
 
 /// Default object cache capacity in MB.
 ///
@@ -490,3 +545,63 @@ pub const ENV_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: &str = "RUSTFS_OBJECT_IO_LOAD_LOW
 
 /// Default low load threshold: 10 ms.
 pub const DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: u64 = 10;
+
+// =============================================================================
+// L1/L2 Tiered Cache Default Values
+// =============================================================================
+
+/// Default L1 cache maximum size: 50 MB.
+///
+/// L1 cache is for hot small objects (<1MB). Smaller values reduce memory usage.
+pub const DEFAULT_OBJECT_L1_CACHE_MAX_SIZE_MB: u64 = 50;
+
+/// Default L1 cache maximum number of objects: 1000.
+pub const DEFAULT_OBJECT_L1_CACHE_MAX_OBJECTS: usize = 1000;
+
+/// Default L1 cache TTL: 60 seconds (1 minute).
+///
+/// Shorter TTL for L1 cache ensures only very hot objects stay in L1.
+pub const DEFAULT_OBJECT_L1_CACHE_TTL_SECS: u64 = 60;
+
+/// Default L1 cache TTI: 30 seconds.
+///
+/// Shorter TTI means L1 evicts idle objects quickly.
+pub const DEFAULT_OBJECT_L1_CACHE_TTI_SECS: u64 = 30;
+
+/// Default L1 maximum object size: 1 MB.
+///
+/// Only objects smaller than 1MB are cached in L1.
+pub const DEFAULT_OBJECT_L1_MAX_OBJECT_SIZE_MB: usize = 1;
+
+/// Default L2 cache maximum size: 200 MB.
+///
+/// L2 cache is for standard objects (<10MB).
+pub const DEFAULT_OBJECT_L2_CACHE_MAX_SIZE_MB: u64 = 200;
+
+/// Default L2 cache maximum number of objects: 500.
+pub const DEFAULT_OBJECT_L2_CACHE_MAX_OBJECTS: usize = 500;
+
+/// Default L2 cache TTL: 300 seconds (5 minutes).
+pub const DEFAULT_OBJECT_L2_CACHE_TTL_SECS: u64 = 300;
+
+/// Default L2 cache TTI: 120 seconds (2 minutes).
+pub const DEFAULT_OBJECT_L2_CACHE_TTI_SECS: u64 = 120;
+
+// =============================================================================
+// Adaptive TTL Default Values
+// =============================================================================
+
+/// Default: adaptive TTL is enabled.
+///
+/// When enabled, hot objects get extended TTL based on access patterns.
+pub const DEFAULT_OBJECT_ADAPTIVE_TTL_ENABLE: bool = true;
+
+/// Default hot object hit threshold: 3.
+///
+/// Objects with hit count >= 3 are considered "hot" and get extended TTL.
+pub const DEFAULT_OBJECT_HOT_HIT_THRESHOLD: usize = 3;
+
+/// Default TTL extension factor: 2.0.
+///
+/// Hot objects TTL is extended by 2x (e.g., 5 min TTL becomes 10 min).
+pub const DEFAULT_OBJECT_TTL_EXTENSION_FACTOR: f64 = 2.0;

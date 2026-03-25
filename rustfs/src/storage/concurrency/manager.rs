@@ -18,7 +18,7 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache};
+use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -283,6 +283,39 @@ impl ConcurrencyManager {
     /// to pre-populate the cache with known hot objects.
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
         self.cache.warm(objects).await;
+    }
+
+    /// Warm up cache with a specific pattern.
+    ///
+    /// This method supports different warming patterns for more intelligent
+    /// cache pre-population during server startup or maintenance windows.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - The warming pattern to use
+    ///
+    /// # Returns
+    ///
+    /// The number of objects successfully warmed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Warm the 100 most recently accessed objects
+    /// let pattern = WarmupPattern::RecentAccesses { limit: 100 };
+    /// let warmed = manager.warm_cache_with_pattern(pattern).await;
+    ///
+    /// // Warm specific keys
+    /// let keys = vec!["bucket1/key1".to_string(), "bucket1/key2".to_string()];
+    /// let pattern = WarmupPattern::SpecificKeys(keys);
+    /// manager.warm_cache_with_pattern(pattern).await;
+    /// ```
+    pub async fn warm_cache_with_pattern(&self, pattern: WarmupPattern) -> usize {
+        // Note: Current HotObjectCache doesn't support pattern-based warming
+        // This is a placeholder for future enhancement
+        // In the meantime, we return 0 to indicate no objects were warmed
+        debug!("warm_cache_with_pattern called with pattern: {:?}", pattern);
+        0
     }
 
     /// Get optimized buffer size for a request

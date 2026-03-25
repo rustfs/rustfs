@@ -153,6 +153,9 @@ libsystemd.workspace = true
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
 
+# Data structures
+hashbrown = { workspace = true }
+
 # Only enable pprof-based profiling on non-Windows targets.
 [target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
 starshard = { workspace = true }
