@@ -18,7 +18,7 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache, WarmupPattern};
+use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
 use rustfs_ecstore::bytes_pool::BytesPool;
