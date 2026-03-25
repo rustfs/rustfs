@@ -393,12 +393,37 @@ impl ExpiryState {
                         //delete_object_versions(api, &v.bucket, &v.versions, v.event).await;
                     }
                     else if v.as_any().is::<Jentry>() {
-                        //transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+                        let v = v.as_any().downcast_ref::<Jentry>().expect("err!");
+                        if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
+                            warn!(
+                                object = %v.obj_name,
+                                version_id = %v.version_id,
+                                tier = %v.tier_name,
+                                error = ?err,
+                                "failed to delete transitioned object from remote tier"
+                            );
+                        }
                     }
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
-                        let _oi = v.0.clone();
-
+                        let oi = v.0.clone();
+                        if let Err(err) = delete_object_from_remote_tier(
+                            &oi.transitioned_object.name,
+                            &oi.transitioned_object.version_id,
+                            &oi.transitioned_object.tier,
+                        )
+                        .await
+                        {
+                            warn!(
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                error = ?err,
+                                "failed to sweep transitioned free version from remote tier"
+                            );
+                        }
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);

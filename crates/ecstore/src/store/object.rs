@@ -286,7 +286,9 @@ impl ECStore {
         }
 
         if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
-            return self.delete_object_from_all_pools(bucket, object, &opts, errs).await;
+            let mut obj = self.delete_object_from_all_pools(bucket, object, &opts, errs).await?;
+            obj.name = decode_dir_object(object);
+            return Ok(obj);
         }
 
         for pool in self.pools.iter() {

@@ -1565,8 +1565,6 @@ impl ObjectOperations for SetDisks {
             return Ok(oi);
         }
 
-        let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-
         // Create a single object deletion request
         let mut dfi = FileInfo {
             name: object.to_string(),
