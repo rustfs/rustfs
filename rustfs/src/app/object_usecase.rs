@@ -227,6 +227,61 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     }
 }
 
+/// Determine if zero-copy write should be used for this PutObject operation.
+///
+/// Zero-copy is beneficial for large objects without encryption or compression.
+///
+/// # Arguments
+///
+/// * `size` - Object size in bytes
+/// * `headers` - HTTP headers (to check for encryption/compression)
+///
+/// # Returns
+///
+/// `true` if zero-copy should be used, `false` otherwise
+fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
+    // Only use zero-copy for large objects (> 1MB)
+    const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
+
+    if size < ZERO_COPY_MIN_SIZE {
+        return false;
+    }
+
+    // Don't use zero-copy if encryption is requested
+    if headers.get("x-amz-server-side-encryption").is_some()
+        || headers.get("x-amz-server-side-encryption-customer-algorithm").is_some()
+        || headers.get("x-amz-server-side-encryption-aws-kms-key-id").is_some()
+    {
+        return false;
+    }
+
+    // Don't use zero-copy if compression is likely (compressible content types)
+    // The compression check happens later in the flow
+    if let Some(content_type) = headers.get("content-type") {
+        if let Ok(ct) = content_type.to_str() {
+            // Skip zero-copy for easily compressible content types
+            // since compression will be applied
+            let compressible_types = [
+                "text/plain",
+                "text/html",
+                "text/css",
+                "text/javascript",
+                "application/javascript",
+                "application/json",
+                "application/xml",
+                "text/xml",
+            ];
+            for ct_type in compressible_types {
+                if ct.contains(ct_type) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
@@ -733,6 +788,22 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
+
+        // Detect zero-copy opportunity before encryption/compression decisions
+        // Zero-copy is beneficial for large unencrypted, uncompressed objects
+        let enable_zero_copy = should_use_zero_copy(size, &req.headers);
+
+        #[cfg(feature = "metrics")]
+        if enable_zero_copy {
+            // Record zero-copy write attempt
+            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
+            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            debug!(
+                "Zero-copy write enabled for {} byte object (bucket={}, key={})",
+                size, bucket, key
+            );
+        }
+
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
