@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Metrics collector for RustFS performance monitoring.
+//! Metrics collector for I/O operation tracking and latency analysis.
 
 use super::metrics::PerformanceMetrics;
 use std::sync::atomic::Ordering;
@@ -20,15 +20,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Metrics collector for tracking I/O operations and performance.
+/// Metrics collector for tracking I/O operations and computing latency percentiles.
 ///
-/// This collector maintains samples of I/O latencies and computes
-/// percentile values (P95, P99) for monitoring dashboards.
+/// Maintains a sliding window of I/O latency samples and updates P95/P99 metrics
+/// for monitoring dashboards.
 pub struct MetricsCollector {
-    /// The underlying metrics
+    /// The underlying metrics (shared reference)
     metrics: Arc<PerformanceMetrics>,
     /// I/O latency samples for percentile calculation
-    io_latency_samples: Arc<RwLock<Vec<Duration>>>,
+    io_latency_samples: RwLock<Vec<Duration>>,
     /// Maximum number of latency samples to keep
     max_latency_samples: usize,
 }
@@ -43,22 +43,20 @@ impl MetricsCollector {
     pub fn new(metrics: Arc<PerformanceMetrics>, max_latency_samples: usize) -> Self {
         Self {
             metrics,
-            io_latency_samples: Arc::new(RwLock::new(Vec::new())),
+            io_latency_samples: RwLock::new(Vec::new()),
             max_latency_samples,
         }
     }
 
-    /// Create a new metrics collector with default settings.
-    ///
-    /// Uses a maximum of 1000 latency samples.
+    /// Create a new metrics collector with default settings (1000 max samples).
     pub fn with_default_max_samples(metrics: Arc<PerformanceMetrics>) -> Self {
         Self::new(metrics, 1000)
     }
 
-    /// Record an I/O operation.
+    /// Record an I/O operation with its duration.
     ///
-    /// This updates the metrics counters and records the latency for
-    /// percentile calculation.
+    /// Updates byte counters, operation counters, and records latency for
+    /// P95/P99 calculation.
     ///
     /// # Arguments
     ///
@@ -90,6 +88,7 @@ impl MetricsCollector {
         }
 
         // Update latency percentiles
+        drop(samples); // Release write lock before calling update
         self.update_latency_percentiles().await;
     }
 
@@ -102,6 +101,7 @@ impl MetricsCollector {
 
         // Sort samples to calculate percentiles
         let mut sorted: Vec<_> = samples.iter().map(|d| d.as_micros()).collect();
+        drop(samples); // Release read lock before sort
         sorted.sort();
 
         let len = sorted.len();
@@ -129,19 +129,10 @@ impl MetricsCollector {
         self.io_latency_samples.read().await.len()
     }
 
-    /// Get a reference to the underlying metrics.
-    pub fn metrics(&self) -> &Arc<PerformanceMetrics> {
-        &self.metrics
+    /// Get the maximum number of samples this collector will retain.
+    pub fn max_samples(&self) -> usize {
+        self.max_latency_samples
     }
-}
-
-/// I/O operation type for metrics collection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoOpType {
-    /// Read operation
-    Read,
-    /// Write operation
-    Write,
 }
 
 #[cfg(test)]
@@ -152,14 +143,72 @@ mod tests {
     fn test_collector_creation() {
         let metrics = Arc::new(PerformanceMetrics::new());
         let collector = MetricsCollector::with_default_max_samples(metrics);
-        // Test synchronous creation
-        assert_eq!(collector.max_latency_samples, 1000);
+        assert_eq!(collector.max_samples(), 1000);
     }
 
-    #[test]
-    fn test_latency_samples_limit() {
+    #[tokio::test]
+    async fn test_record_io_basic() {
         let metrics = Arc::new(PerformanceMetrics::new());
-        let collector = MetricsCollector::new(metrics, 10);
-        assert_eq!(collector.max_latency_samples, 10);
+        let collector = MetricsCollector::new(metrics.clone(), 10);
+
+        collector.record_io_operation(1024, Duration::from_millis(10), true).await;
+
+        assert_eq!(metrics.total_bytes_read.load(Ordering::Relaxed), 1024);
+        assert_eq!(metrics.disk_read_count.load(Ordering::Relaxed), 1);
+        assert_eq!(collector.sample_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_latency_percentiles() {
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let collector = MetricsCollector::new(metrics.clone(), 10);
+
+        // Record some latencies
+        collector.record_io_operation(0, Duration::from_micros(100), true).await;
+        collector.record_io_operation(0, Duration::from_micros(200), true).await;
+        collector.record_io_operation(0, Duration::from_micros(300), true).await;
+        collector.record_io_operation(0, Duration::from_micros(400), true).await;
+        collector.record_io_operation(0, Duration::from_micros(500), true).await;
+
+        // Check average
+        let avg = metrics.avg_io_latency_us.load(Ordering::Relaxed);
+        assert_eq!(avg, 300); // (100+200+300+400+500) / 5
+
+        // Check percentiles
+        let p95 = metrics.p95_io_latency_us.load(Ordering::Relaxed);
+        let p99 = metrics.p99_io_latency_us.load(Ordering::Relaxed);
+
+        // P95 should be close to 500 (5th element)
+        // P99 should be 500 (same as max)
+        assert!(p95 >= 400); // Allow some tolerance
+        assert_eq!(p99, 500);
+    }
+
+    #[tokio::test]
+    async fn test_sample_limit() {
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let collector = MetricsCollector::new(metrics.clone(), 5); // Max 5 samples
+
+        // Record more than the limit
+        for _ in 0..10 {
+            collector.record_io_operation(0, Duration::from_millis(1), true).await;
+        }
+
+        // Should only keep 5 samples
+        assert_eq!(collector.sample_count().await, 5);
+    }
+
+    #[tokio::test]
+    async fn test_read_write_distinction() {
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let collector = MetricsCollector::new(metrics.clone(), 10);
+
+        collector.record_io_operation(1024, Duration::from_millis(10), true).await;
+        collector.record_io_operation(2048, Duration::from_millis(5), false).await;
+
+        assert_eq!(metrics.total_bytes_read.load(Ordering::Relaxed), 1024);
+        assert_eq!(metrics.total_bytes_written.load(Ordering::Relaxed), 2048);
+        assert_eq!(metrics.disk_read_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.disk_write_count.load(Ordering::Relaxed), 1);
     }
 }

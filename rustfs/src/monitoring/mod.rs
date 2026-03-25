@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Performance monitoring and auto-tuning module.
+//! Performance monitoring module for RustFS.
 //!
-//! This module provides real-time performance metrics collection, analysis,
-//! and automatic parameter tuning for the RustFS object storage system.
+//! Provides real-time performance metrics collection with automatic
+//! Prometheus-compatible reporting via the `metrics` crate.
 
-pub mod metrics;
 pub mod collector;
+pub mod metrics;
 
 // Re-exports
 pub use metrics::PerformanceMetrics;

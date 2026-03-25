@@ -13,6 +13,9 @@
 // limitations under the License.
 
 //! Core performance metrics for RustFS monitoring.
+//!
+//! This module provides atomic counters for performance metrics that integrate
+//! with the `metrics` crate for Prometheus-compatible reporting.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,18 +25,27 @@ pub use metrics::{counter, gauge};
 
 /// Performance metrics structure for RustFS.
 ///
-/// This structure contains atomic counters for various performance metrics
-/// that can be safely updated from multiple threads.
+/// Thread-safe atomic counters for recording performance metrics.
+/// All `record_*` methods automatically report to the metrics crate when
+/// the `metrics` feature is enabled.
+///
+/// # Example
+///
+/// ```rust
+/// let metrics = PerformanceMetrics::new();
+/// metrics.record_cache_hit();
+/// metrics.record_bytes_read(1024);
+/// ```
 #[derive(Debug)]
 pub struct PerformanceMetrics {
     // ===== Cache Metrics =====
-    /// Total cache hits
+    /// Total cache hits (all levels)
     pub cache_hits: AtomicU64,
     /// Total cache misses
     pub cache_misses: AtomicU64,
-    /// L1 cache hits
+    /// L1 cache hits (hot objects)
     pub l1_cache_hits: AtomicU64,
-    /// L2 cache hits
+    /// L2 cache hits (standard objects)
     pub l2_cache_hits: AtomicU64,
 
     // ===== I/O Metrics =====
@@ -41,9 +53,9 @@ pub struct PerformanceMetrics {
     pub total_bytes_read: AtomicU64,
     /// Total bytes written
     pub total_bytes_written: AtomicU64,
-    /// Disk read count
+    /// Disk read operation count
     pub disk_read_count: AtomicU64,
-    /// Disk write count
+    /// Disk write operation count
     pub disk_write_count: AtomicU64,
     /// Average I/O latency in microseconds
     pub avg_io_latency_us: AtomicU64,
@@ -57,18 +69,6 @@ pub struct PerformanceMetrics {
     pub current_concurrent_requests: AtomicU64,
     /// Peak concurrent requests
     pub peak_concurrent_requests: AtomicU64,
-    /// Average wait time in milliseconds
-    pub avg_wait_time_ms: AtomicU64,
-
-    // ===== Throughput Metrics =====
-    /// Current read throughput in MB/s
-    pub current_read_throughput_mbps: AtomicU64,
-    /// Current write throughput in MB/s
-    pub current_write_throughput_mbps: AtomicU64,
-    /// Peak read throughput in MB/s
-    pub peak_read_throughput_mbps: AtomicU64,
-    /// Peak write throughput in MB/s
-    pub peak_write_throughput_mbps: AtomicU64,
 
     // ===== Error Metrics =====
     /// Total errors
@@ -77,14 +77,6 @@ pub struct PerformanceMetrics {
     pub timeout_errors: AtomicU64,
     /// Disk errors
     pub disk_errors: AtomicU64,
-
-    // ===== Queue Metrics =====
-    /// High priority queue depth
-    pub high_priority_queue_depth: AtomicU64,
-    /// Normal priority queue depth
-    pub normal_priority_queue_depth: AtomicU64,
-    /// Low priority queue depth
-    pub low_priority_queue_depth: AtomicU64,
 }
 
 impl PerformanceMetrics {
@@ -104,23 +96,14 @@ impl PerformanceMetrics {
             p99_io_latency_us: AtomicU64::new(0),
             current_concurrent_requests: AtomicU64::new(0),
             peak_concurrent_requests: AtomicU64::new(0),
-            avg_wait_time_ms: AtomicU64::new(0),
-            current_read_throughput_mbps: AtomicU64::new(0),
-            current_write_throughput_mbps: AtomicU64::new(0),
-            peak_read_throughput_mbps: AtomicU64::new(0),
-            peak_write_throughput_mbps: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
             timeout_errors: AtomicU64::new(0),
             disk_errors: AtomicU64::new(0),
-            high_priority_queue_depth: AtomicU64::new(0),
-            normal_priority_queue_depth: AtomicU64::new(0),
-            low_priority_queue_depth: AtomicU64::new(0),
         }
     }
 
-    /// Calculate the cache hit rate.
+    /// Calculate the cache hit rate (0.0 to 1.0).
     ///
-    /// Returns the ratio of cache hits to total cache accesses (0.0 to 1.0).
     /// Returns 0.0 if there have been no cache accesses.
     pub fn cache_hit_rate(&self) -> f64 {
         let hits = self.cache_hits.load(Ordering::Relaxed);
@@ -134,7 +117,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Get the L1 cache hit rate.
+    /// Get the L1 cache hit rate (0.0 to 1.0).
     ///
     /// Returns the ratio of L1 hits to total cache hits.
     pub fn l1_hit_rate(&self) -> f64 {
@@ -148,29 +131,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Get a summary of the current metrics state.
-    ///
-    /// This returns a compact summary structure suitable for
-    /// monitoring dashboards and logging.
-    pub fn summary(&self) -> MetricsSummary {
-        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
-        let total_hits = cache_hits;
-
-        MetricsSummary {
-            cache_hit_rate: self.cache_hit_rate(),
-            l1_hit_rate: if total_hits > 0 {
-                self.l1_cache_hits.load(Ordering::Relaxed) as f64 / total_hits as f64
-            } else {
-                0.0
-            },
-            avg_io_latency_ms: self.avg_io_latency_us.load(Ordering::Relaxed) as f64 / 1000.0,
-            current_throughput_mbps: self.current_read_throughput_mbps.load(Ordering::Relaxed) as f64,
-            concurrent_requests: self.current_concurrent_requests.load(Ordering::Relaxed),
-            total_errors: self.total_errors.load(Ordering::Relaxed),
-            total_bytes_read: self.total_bytes_read.load(Ordering::Relaxed),
-            total_bytes_written: self.total_bytes_written.load(Ordering::Relaxed),
-        }
-    }
+    // ===== Cache Recording Methods =====
 
     /// Record a cache hit.
     #[inline]
@@ -194,7 +155,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Record an L1 cache hit.
+    /// Record an L1 cache hit (includes recording total cache hit).
     #[inline]
     pub fn record_l1_hit(&self) {
         self.l1_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -206,7 +167,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Record an L2 cache hit.
+    /// Record an L2 cache hit (includes recording total cache hit).
     #[inline]
     pub fn record_l2_hit(&self) {
         self.l2_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -217,6 +178,8 @@ impl PerformanceMetrics {
             counter!("rustfs_cache_l2_hits_total").increment(1);
         }
     }
+
+    // ===== I/O Recording Methods =====
 
     /// Record bytes read.
     #[inline]
@@ -262,6 +225,8 @@ impl PerformanceMetrics {
         }
     }
 
+    // ===== Concurrency Recording Methods =====
+
     /// Update concurrent request count and track peak.
     #[inline]
     pub fn update_concurrent_requests(&self, count: u64) {
@@ -272,7 +237,7 @@ impl PerformanceMetrics {
             gauge!("rustfs_concurrent_requests").set(count as f64);
         }
 
-        // Update peak
+        // Update peak using lock-free CAS loop
         let mut peak = self.peak_concurrent_requests.load(Ordering::Relaxed);
         loop {
             if count <= peak {
@@ -291,7 +256,9 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Record an error.
+    // ===== Error Recording Methods =====
+
+    /// Record a generic error.
     #[inline]
     pub fn record_error(&self) {
         self.total_errors.fetch_add(1, Ordering::Relaxed);
@@ -302,7 +269,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Record a timeout error.
+    /// Record a timeout error (includes recording total error).
     #[inline]
     pub fn record_timeout(&self) {
         self.timeout_errors.fetch_add(1, Ordering::Relaxed);
@@ -314,7 +281,7 @@ impl PerformanceMetrics {
         }
     }
 
-    /// Record a disk error.
+    /// Record a disk error (includes recording total error).
     #[inline]
     pub fn record_disk_error(&self) {
         self.disk_errors.fetch_add(1, Ordering::Relaxed);
@@ -331,30 +298,6 @@ impl Default for PerformanceMetrics {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A compact summary of current performance metrics.
-///
-/// This structure is designed to be cheap to clone and suitable
-/// for passing to monitoring systems or logging.
-#[derive(Debug, Clone)]
-pub struct MetricsSummary {
-    /// Cache hit rate (0.0 to 1.0)
-    pub cache_hit_rate: f64,
-    /// L1 cache hit rate (0.0 to 1.0)
-    pub l1_hit_rate: f64,
-    /// Average I/O latency in milliseconds
-    pub avg_io_latency_ms: f64,
-    /// Current read throughput in MB/s
-    pub current_throughput_mbps: f64,
-    /// Current number of concurrent requests
-    pub concurrent_requests: u64,
-    /// Total errors encountered
-    pub total_errors: u64,
-    /// Total bytes read
-    pub total_bytes_read: u64,
-    /// Total bytes written
-    pub total_bytes_written: u64,
 }
 
 #[cfg(test)]
@@ -392,7 +335,7 @@ mod tests {
 
         metrics.record_l1_hit(); // Records both L1 and total
         metrics.record_l2_hit(); // Records L2 and total
-        metrics.record_cache_hit(); // Direct total hit (L2 or backend)
+        metrics.record_cache_hit(); // Direct total hit
 
         assert_eq!(metrics.cache_hits.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.l1_cache_hits.load(Ordering::Relaxed), 1);

@@ -53,7 +53,6 @@ pub use object_cache::{CacheHealthStatus, CacheStats, CachedGetObject};
 pub use manager::ConcurrencyManager;
 
 // Global metrics
-pub use global_metrics::get_global_metrics;
 
 // ============================================
 // Helper Functions
