@@ -15,6 +15,8 @@
 //! Concurrency optimization module for high-performance object retrieval.
 
 // Sub-modules
+pub mod bandwidth_monitor;
+pub mod io_profile;
 pub mod io_schedule;
 pub mod manager;
 pub mod object_cache;

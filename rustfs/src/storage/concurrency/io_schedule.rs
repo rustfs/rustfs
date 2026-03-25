@@ -14,6 +14,8 @@
 
 //! I/O scheduling types for adaptive buffer sizing and load management.
 
+use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot, BandwidthTier};
+use super::io_profile::{AccessPattern, StorageMedia, StorageProfile};
 use rustfs_config::{KI_B, MI_B};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -78,25 +80,20 @@ pub enum IoPriority {
 }
 
 impl IoPriority {
-    /// Determine priority from request size.
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - Request size in bytes
-    ///
-    /// # Returns
-    ///
-    /// Priority level based on size thresholds:
-    /// - High: < 1MB
-    /// - Normal: 1MB - 10MB
-    /// - Low: > 10MB
+    /// Determine priority from request size using scheduler config thresholds.
     pub fn from_size(size: i64) -> Self {
-        const HIGH_THRESHOLD: i64 = MI_B as i64; // 1MB
-        const LOW_THRESHOLD: i64 = 10 * MI_B as i64; // 10MB
+        Self::from_size_with_thresholds(size, IoSchedulerConfig::default().high_priority_size_threshold, IoSchedulerConfig::default().low_priority_size_threshold)
+    }
 
-        if size < HIGH_THRESHOLD {
+    pub fn from_size_with_thresholds(size: i64, high_priority_size_threshold: usize, low_priority_size_threshold: usize) -> Self {
+        if size < 0 {
+            return IoPriority::Normal;
+        }
+
+        let size = size as usize;
+        if size < high_priority_size_threshold {
             IoPriority::High
-        } else if size > LOW_THRESHOLD {
+        } else if size > low_priority_size_threshold {
             IoPriority::Low
         } else {
             IoPriority::Normal
@@ -249,6 +246,33 @@ pub struct IoQueueStatus {
     pub starvation_events: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoSchedulingContext {
+    pub file_size: i64,
+    pub base_buffer_size: usize,
+    pub permit_wait_duration: Duration,
+    pub is_sequential_hint: bool,
+    pub access_pattern: AccessPattern,
+    pub storage_media: StorageMedia,
+    pub observed_bandwidth_bps: Option<u64>,
+    pub concurrent_requests: usize,
+}
+
+impl IoSchedulingContext {
+    pub fn from_wait_duration(permit_wait_duration: Duration, base_buffer_size: usize) -> Self {
+        Self {
+            file_size: -1,
+            base_buffer_size,
+            permit_wait_duration,
+            is_sequential_hint: false,
+            access_pattern: AccessPattern::Unknown,
+            storage_media: StorageMedia::Unknown,
+            observed_bandwidth_bps: None,
+            concurrent_requests: ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Adaptive I/O strategy calculated from current system load.
 ///
 /// This structure provides optimized I/O parameters based on the observed
@@ -265,6 +289,100 @@ pub struct IoQueueStatus {
 /// let enable_readahead = strategy.enable_readahead;
 /// let enable_cache_writeback = strategy.cache_writeback_enabled;
 /// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoStrategy {
+    pub storage_media: StorageMedia,
+    pub access_pattern: AccessPattern,
+    pub observed_bandwidth_bps: Option<u64>,
+    pub concurrent_requests: usize,
+    pub bandwidth_tier: BandwidthTier,
+    pub request_size: i64,
+    pub base_buffer_size: usize,
+    pub buffer_cap: usize,
+    pub sequential_detected: bool,
+    pub bandwidth_limited: bool,
+    pub readahead_reason: &'static str,
+    pub low_bandwidth_threshold_bps: u64,
+    pub high_bandwidth_threshold_bps: u64,
+    pub random_readahead_disable_concurrency: usize,
+    pub low_priority_size_threshold: usize,
+    pub high_priority_size_threshold: usize,
+    pub priority_enabled: bool,
+    pub priority: IoPriority,
+    pub queue_capacity_hint: usize,
+    pub load_sample_window: usize,
+    pub load_high_threshold_ms: u64,
+    pub load_low_threshold_ms: u64,
+    pub starvation_prevention_interval_ms: u64,
+    pub starvation_threshold_secs: u64,
+    pub max_concurrent_reads: usize,
+    pub priority_queue_high_capacity: usize,
+    pub priority_queue_normal_capacity: usize,
+    pub priority_queue_low_capacity: usize,
+    pub storage_profile: StorageProfile,
+    pub bandwidth_snapshot: Option<BandwidthSnapshot>,
+    pub scheduling_context: IoSchedulingContext,
+    pub high_concurrency_threshold: usize,
+    pub medium_concurrency_threshold: usize,
+    pub permit_wait_ms: u64,
+    pub strategy_version: &'static str,
+    pub is_large_request: bool,
+    pub is_small_request: bool,
+    pub storage_detection_enabled: bool,
+    pub storage_media_override_applied: bool,
+    pub pattern_history_size: usize,
+    pub sequential_step_tolerance_bytes: u64,
+    pub bandwidth_ema_beta: f64,
+    pub nvme_buffer_cap: usize,
+    pub ssd_buffer_cap: usize,
+    pub hdd_buffer_cap: usize,
+    pub is_range_request: bool,
+    pub target_read_size: i64,
+    pub source_request_size: i64,
+    pub strategy_reason: &'static str,
+    pub used_compatibility_path: bool,
+    pub queue_depth_hint: usize,
+    pub should_throttle_random_io: bool,
+    pub should_expand_for_sequential: bool,
+    pub should_reduce_for_concurrency: bool,
+    pub should_reduce_for_bandwidth: bool,
+    pub should_disable_cache_writeback: bool,
+    pub should_disable_readahead: bool,
+    pub should_use_buffered_io: bool,
+    pub effective_multiplier_stage_concurrency: f64,
+    pub effective_multiplier_stage_pattern: f64,
+    pub effective_multiplier_stage_bandwidth: f64,
+    pub final_multiplier: f64,
+    pub strategy_source: &'static str,
+    pub notes: &'static str,
+    pub profile_prefers_readahead: bool,
+    pub fallback_to_unknown_media: bool,
+    pub request_class: &'static str,
+    pub io_path_kind: &'static str,
+    pub queue_mode: &'static str,
+    pub load_level_label: &'static str,
+    pub pattern_label: &'static str,
+    pub media_label: &'static str,
+    pub bandwidth_label: &'static str,
+    pub sequential_hint_applied: bool,
+    pub observed_bandwidth_available: bool,
+    pub read_size_known: bool,
+    pub random_penalty_applied: bool,
+    pub sequential_boost_applied: bool,
+    pub buffer_cap_applied: bool,
+    pub clamp_min_applied: bool,
+    pub clamp_max_applied: bool,
+    pub readahead_disabled_by_concurrency: bool,
+    pub readahead_disabled_by_pattern: bool,
+    pub readahead_disabled_by_load: bool,
+    pub readahead_disabled_by_bandwidth: bool,
+    pub cache_writeback_disabled_by_load: bool,
+    pub cache_writeback_disabled_by_pattern: bool,
+    pub cache_writeback_disabled_by_request_size: bool,
+    pub storage_profile_buffer_cap_source: &'static str,
+    pub final_buffer_floor: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IoStrategy {
     /// Recommended buffer size for I/O operations (in bytes).
