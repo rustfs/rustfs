@@ -1671,17 +1671,7 @@ impl ObjectOperations for SetDisks {
 
         let (metas, errs) = {
             if let Some(version_id) = &opts.version_id {
-                Self::read_all_fileinfo(
-                    &disks,
-                    "",
-                    bucket,
-                    object,
-                    version_id.to_string().as_str(),
-                    false,
-                    false,
-                    false,
-                )
-                .await?
+                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false, false).await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }

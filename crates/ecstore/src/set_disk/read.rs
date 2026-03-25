@@ -131,6 +131,7 @@ impl SetDisks {
         Ok(ret)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(level = "debug", skip(disks))]
     pub(super) async fn read_all_fileinfo(
         disks: &[Option<DiskStore>],
@@ -148,7 +149,6 @@ impl SetDisks {
             incl_free_versions,
             read_data,
             healing,
-            ..Default::default()
         });
         let org_bucket = Arc::new(org_bucket.to_string());
         let bucket = Arc::new(bucket.to_string());
@@ -477,8 +477,7 @@ impl SetDisks {
 
         // TODO: optimize concurrency and break once enough slots are available
         let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions)
-                .await?;
+            Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions).await?;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 

@@ -501,10 +501,7 @@ async fn scan_object_metadata(disk_path: &PathBuf, bucket: &str, object: &str) {
     )
     .await
     .expect("failed to open local disk");
-    let metadata_path = disk_path
-        .join(bucket)
-        .join(object)
-        .join(STORAGE_FORMAT_FILE);
+    let metadata_path = disk_path.join(bucket).join(object).join(STORAGE_FORMAT_FILE);
     let relative_path = metadata_path.to_string_lossy().to_string();
     let (_, scanner_path) = path2_bucket_object_with_base_path(disk_path.to_string_lossy().as_ref(), relative_path.as_str());
     let file_type = fs::metadata(&metadata_path)
