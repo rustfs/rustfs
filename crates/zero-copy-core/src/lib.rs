@@ -24,12 +24,13 @@
 //! - Memory-mapped file reading (mmap) on Unix platforms
 //! - Bytes-based zero-copy wrapping
 //! - AsyncRead trait implementations
+//! - Tiered BytesPool for buffer management
 //! - Optional Direct I/O support (Linux only)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use rustfs_zero_copy_core::ZeroCopyObjectReader;
+//! use rustfs_zero_copy_core::{ZeroCopyObjectReader, BytesPool};
 //! use bytes::Bytes;
 //!
 //! // Create from existing bytes (zero-copy)
@@ -39,11 +40,17 @@
 //! // Create from file using mmap (Unix only)
 //! #[cfg(unix)]
 //! let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
+//!
+//! // Use BytesPool
+//! let pool = BytesPool::new_tiered();
+//! let mut buffer = pool.acquire_buffer(8192).await;
 //! ```
 
 pub mod direct_io;
+pub mod pool;
 pub mod reader;
 
+pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
 pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
 #[cfg(target_os = "linux")]
 pub use direct_io::{DirectIoReader, DirectIoError};

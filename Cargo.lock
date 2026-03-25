@@ -8452,6 +8452,7 @@ version = "0.0.5"
 dependencies = [
  "bytes",
  "memmap2 0.9.10",
+ "rustfs-zero-copy-metrics",
  "tempfile",
  "tokio",
 ]

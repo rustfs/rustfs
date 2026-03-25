@@ -29,8 +29,9 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt"] }
+tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
 memmap2 = { workspace = true }
+rustfs-zero-copy-metrics = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
