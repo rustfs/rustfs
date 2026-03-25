@@ -155,6 +155,17 @@ pub const ENV_OBJECT_MAX_CONCURRENT_DISK_READS: &str = "RUSTFS_OBJECT_MAX_CONCUR
 /// - Default is set to true (enabled).
 pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = true;
 
+/// Environment variable to enable tiered cache (L1 + L2).
+///
+/// When enabled, uses two-level caching:
+/// - L1: Hot small objects (<1MB) with short TTL
+/// - L2: Standard objects (<10MB) with longer TTL
+/// When disabled, uses single-level cache for compatibility.
+pub const ENV_OBJECT_TIERED_CACHE_ENABLE: &str = "RUSTFS_OBJECT_TIERED_CACHE_ENABLE";
+
+/// Default: tiered cache is disabled (use single-level cache for compatibility).
+pub const DEFAULT_OBJECT_TIERED_CACHE_ENABLE: bool = false;
+
 /// Default object cache capacity in MB.
 ///
 /// - Default: 100 MB (can be overridden by `RUSTFS_OBJECT_CACHE_CAPACITY_MB`).
