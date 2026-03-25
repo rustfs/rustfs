@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
+use crate::global::is_first_cluster_node_local;
 
 fn missing_deployment_id_error() -> Error {
     Error::other("store init failed: deployment id is not initialized")
@@ -81,10 +82,6 @@ fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize)
         .ok_or_else(|| store_init_resume_pool_without_endpoints_error(idx))?;
 
     Ok(endpoint.is_local)
-}
-
-fn should_persist_validated_pool_meta(endpoints: &EndpointServerPools) -> bool {
-    endpoints.first_local()
 }
 
 const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
@@ -336,7 +333,7 @@ impl ECStore {
         )?;
         let update = meta.validate(self.pools.clone())?;
         let endpoints = get_global_endpoints();
-        let should_persist_pool_meta = should_persist_validated_pool_meta(&endpoints);
+        let should_persist_pool_meta = is_first_cluster_node_local().await;
 
         if !update {
             {
@@ -407,10 +404,9 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, clone_first_store_pool, require_deployment_id,
-        resolve_store_init_stage_result, should_persist_validated_pool_meta, should_resume_local_decommission,
-        should_retry_local_decommission_resume, store_init_deployment_id_mismatch_error, store_init_load_formats_exhausted_error,
-        store_init_resume_pool_not_found_error, store_init_retry_budget_exhausted_error,
-        wait_for_local_decommission_resume_delay,
+        resolve_store_init_stage_result, should_resume_local_decommission, should_retry_local_decommission_resume,
+        store_init_deployment_id_mismatch_error, store_init_load_formats_exhausted_error, store_init_resume_pool_not_found_error,
+        store_init_retry_budget_exhausted_error, wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
@@ -463,37 +459,6 @@ mod tests {
         }]);
 
         assert!(should_resume_local_decommission(&endpoints, 0).expect("local endpoint should resume"));
-    }
-
-    #[test]
-    fn test_should_persist_validated_pool_meta_only_for_first_local_endpoint() {
-        let mut local_endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("endpoint should parse");
-        local_endpoint.is_local = true;
-        let local_endpoints = EndpointServerPools::from(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 1,
-            endpoints: Endpoints::from(vec![local_endpoint]),
-            cmd_line: "pool-0".to_string(),
-            platform: String::new(),
-        }]);
-
-        assert!(should_persist_validated_pool_meta(&local_endpoints));
-    }
-
-    #[test]
-    fn test_should_persist_validated_pool_meta_skips_remote_first_endpoint() {
-        let remote_endpoint = Endpoint::try_from("http://192.0.2.10:9000/data").expect("endpoint should parse");
-        let remote_endpoints = EndpointServerPools::from(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 1,
-            endpoints: Endpoints::from(vec![remote_endpoint]),
-            cmd_line: "pool-0".to_string(),
-            platform: String::new(),
-        }]);
-
-        assert!(!should_persist_validated_pool_meta(&remote_endpoints));
     }
 
     #[test]
