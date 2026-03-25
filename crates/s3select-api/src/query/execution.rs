@@ -32,6 +32,35 @@ use super::Query;
 use super::logical_planner::Plan;
 use super::session::SessionCtx;
 
+pub struct PhaseTimer {  
+    phase_name: String,  
+    start_time: Instant,  
+}  
+  
+impl PhaseTimer {  
+    pub fn new(phase_name: &str) -> Self {  
+        Self {  
+            phase_name: phase_name.to_string(),  
+            start_time: Instant::now(),  
+        }  
+    }  
+}  
+  
+impl Drop for PhaseTimer {  
+    fn drop(&mut self) {  
+        let duration = self.start_time.elapsed();  
+          
+        #[cfg(all(feature = "metrics", not(test)))]  
+        if !std::thread::panicking() {  
+            use metrics::histogram;  
+            histogram!("rustfs.s3select.phase.duration.seconds", "phase" => &self.phase_name)  
+                .record(duration.as_secs_f64());  
+        }  
+          
+        debug!("Phase '{}' took {:?}", self.phase_name, duration);  
+    }  
+}
+
 pub type QueryExecutionRef = Arc<dyn QueryExecution>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
