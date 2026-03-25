@@ -201,11 +201,10 @@ pub fn detect_storage_media(storage_detection_enabled: bool, storage_media_overr
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(media) = detect_macos_storage_media() {
-            if media != StorageMedia::Unknown {
+        if let Ok(media) = detect_macos_storage_media()
+            && media != StorageMedia::Unknown {
                 return media;
             }
-        }
     }
 
     StorageMedia::Unknown
@@ -257,7 +256,7 @@ fn detect_macos_storage_media() -> Result<StorageMedia, std::io::Error> {
 
     // Use diskutil to get disk information
     let output = Command::new("diskutil")
-        .args(&["info", "/"])
+        .args(["info", "/"])
         .output()?;
 
     if !output.status.success() {

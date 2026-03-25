@@ -257,8 +257,8 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
 
     // Don't use zero-copy if compression is likely (compressible content types)
     // The compression check happens later in the flow
-    if let Some(content_type) = headers.get("content-type") {
-        if let Ok(ct) = content_type.to_str() {
+    if let Some(content_type) = headers.get("content-type")
+        && let Ok(ct) = content_type.to_str() {
             // Skip zero-copy for easily compressible content types
             // since compression will be applied
             let compressible_types = [
@@ -277,7 +277,6 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
                 }
             }
         }
-    }
 
     true
 }

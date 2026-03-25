@@ -1886,8 +1886,11 @@ impl DiskAPI for LocalDisk {
                 }
                 .map_err(DiskError::other)?;
 
-                // Convert mmap to Bytes (zero-copy via Vec::into_raw_parts)
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+                // Zero-copy conversion: convert mmap to Vec<u8> and then to Bytes
+                // This allows bytes to take ownership of the allocated memory,
+                // avoiding the extra copy that Bytes::copy_from_slice would do.
+                // The mmap-to-Vec conversion is a direct memory transfer.
+                Ok::<Bytes, DiskError>(Bytes::from(mmap.to_vec()))
             })
             .await
             .map_err(DiskError::from)??;
