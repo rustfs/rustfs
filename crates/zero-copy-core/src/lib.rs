@@ -49,8 +49,10 @@
 pub mod direct_io;
 pub mod pool;
 pub mod reader;
+pub mod writer;
 
 pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
 pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
+pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
 #[cfg(target_os = "linux")]
 pub use direct_io::{DirectIoReader, DirectIoError};

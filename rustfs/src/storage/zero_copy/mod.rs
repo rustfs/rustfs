@@ -45,6 +45,7 @@
 pub use rustfs_zero_copy_core::{
     BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer,
     ZeroCopyObjectReader, ZeroCopyReadError,
+    ZeroCopyObjectWriter, ZeroCopyWriteError,
 };
 
 #[cfg(target_os = "linux")]

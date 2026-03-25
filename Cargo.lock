@@ -8454,6 +8454,7 @@ dependencies = [
  "memmap2 0.9.10",
  "rustfs-zero-copy-metrics",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
