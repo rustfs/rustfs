@@ -45,12 +45,12 @@ impl CompressionFormat {
     /// Identify compression format from file extension
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_lowercase().as_str() {
-            "gz" | "gzip" => CompressionFormat::Gzip,
-            "bz2" | "bzip2" => CompressionFormat::Bzip2,
+            "gz" | "gzip" | "tgz" => CompressionFormat::Gzip,
+            "bz2" | "bzip2" | "tbz" | "tbz2" => CompressionFormat::Bzip2,
             "zip" => CompressionFormat::Zip,
-            "xz" => CompressionFormat::Xz,
+            "xz" | "txz" => CompressionFormat::Xz,
             "zlib" => CompressionFormat::Zlib,
-            "zst" | "zstd" => CompressionFormat::Zstd,
+            "zst" | "zstd" | "tzst" => CompressionFormat::Zstd,
             "tar" => CompressionFormat::Tar,
             _ => CompressionFormat::Unknown,
         }
@@ -301,17 +301,23 @@ mod tests {
         // Test supported compression format recognition
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("gzip"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_extension("tgz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("bz2"), CompressionFormat::Bzip2);
         assert_eq!(CompressionFormat::from_extension("bzip2"), CompressionFormat::Bzip2);
+        assert_eq!(CompressionFormat::from_extension("tbz"), CompressionFormat::Bzip2);
+        assert_eq!(CompressionFormat::from_extension("tbz2"), CompressionFormat::Bzip2);
         assert_eq!(CompressionFormat::from_extension("zip"), CompressionFormat::Zip);
         assert_eq!(CompressionFormat::from_extension("xz"), CompressionFormat::Xz);
+        assert_eq!(CompressionFormat::from_extension("txz"), CompressionFormat::Xz);
         assert_eq!(CompressionFormat::from_extension("zlib"), CompressionFormat::Zlib);
         assert_eq!(CompressionFormat::from_extension("zst"), CompressionFormat::Zstd);
         assert_eq!(CompressionFormat::from_extension("zstd"), CompressionFormat::Zstd);
+        assert_eq!(CompressionFormat::from_extension("tzst"), CompressionFormat::Zstd);
         assert_eq!(CompressionFormat::from_extension("tar"), CompressionFormat::Tar);
 
         // Test case insensitivity
         assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_extension("TGZ"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
 
         // Test unknown formats

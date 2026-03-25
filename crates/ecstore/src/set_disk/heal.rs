@@ -56,7 +56,8 @@ impl SetDisks {
             }
         };
 
-        let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
+        let (mut parts_metadata, errs) =
+            Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true, false).await?;
 
         info!(
             parts_count = parts_metadata.len(),

@@ -20,7 +20,8 @@ deploy/data/*
 *jsonl
 .env
 .rustfs.sys
-.cargo
+.cargo/
+!.cargo/config.toml
 profile.json
 .docker/openobserve-otel/data
 *.zst

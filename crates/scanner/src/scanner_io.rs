@@ -23,6 +23,7 @@ use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
 use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt};
@@ -530,6 +531,11 @@ impl ScannerIODisk for Disk {
             .iter()
             .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
+        let free_version_infos = fivs
+            .free_versions
+            .iter()
+            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
+            .collect::<Vec<ObjectInfo>>();
 
         let mut size_summary = SizeSummary::default();
 
@@ -563,9 +569,14 @@ impl ScannerIODisk for Disk {
         item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
             .await;
 
-        done_object();
+        if !free_version_infos.is_empty() {
+            let mut expiry_state = GLOBAL_ExpiryState.write().await;
+            for oi in free_version_infos {
+                expiry_state.enqueue_free_version(oi).await;
+            }
+        }
 
-        // TODO: enqueueFreeVersion
+        done_object();
 
         Ok(size_summary)
     }

@@ -701,6 +701,11 @@ impl ObjectIO for SetDisks {
         }
 
         let mut user_defined = opts.user_defined.clone();
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for (key, value) in eval_metadata {
+                user_defined.insert(key.clone(), value.clone());
+            }
+        }
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
@@ -1072,7 +1077,7 @@ impl ObjectOperations for SetDisks {
 
         let (mut metas, errs) = {
             if let Some(vid) = &src_opts.version_id {
-                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false).await?
+                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false, false).await?
             } else {
                 Self::read_all_xl(&disks, src_bucket, src_object, true, false).await
             }
@@ -1560,8 +1565,6 @@ impl ObjectOperations for SetDisks {
             return Ok(oi);
         }
 
-        let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-
         // Create a single object deletion request
         let mut dfi = FileInfo {
             name: object.to_string(),
@@ -1668,7 +1671,7 @@ impl ObjectOperations for SetDisks {
 
         let (metas, errs) = {
             if let Some(version_id) = &opts.version_id {
-                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false).await?
+                Self::read_all_fileinfo(&disks, "", bucket, object, version_id.to_string().as_str(), false, false, false).await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -3274,7 +3277,7 @@ impl HealOperations for SetDisks {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await?;
+        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",

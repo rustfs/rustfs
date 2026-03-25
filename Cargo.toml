@@ -243,7 +243,7 @@ rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "d9556e3c0036bd3f2b330966009cbaa5aebf19a3", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "b296762bc9e7fa608f1bc44f5cd625d606e0dd31", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"
@@ -277,6 +277,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
+dial9-tokio-telemetry = "0.2"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }

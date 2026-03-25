@@ -30,6 +30,7 @@ ftps = []
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
+rustfs-rio.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
@@ -46,16 +47,27 @@ bytes.workspace = true
 serial_test = { workspace = true }
 aws-sdk-s3.workspace = true
 aws-config = { workspace = true }
+aws-smithy-http-client.workspace = true
+async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
+flate2.workspace = true
+http.workspace = true
 reqwest = { workspace = true }
+rustfs-signer.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+urlencoding.workspace = true
+walkdir.workspace = true
 base64 = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
 sha2 = { workspace = true }
+astral-tokio-tar = { workspace = true }
+s3s.workspace = true
+zstd.workspace = true
+time.workspace = true
 suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
 rcgen.workspace = true
 anyhow.workspace = true

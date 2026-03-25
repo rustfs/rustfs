@@ -454,12 +454,12 @@ mod tests {
         Ok(())
     }
 
-    /// Test 7: PutObject should return "null" version_id when versioning is Suspended
+    /// Test 7: PutObject should omit version_id when versioning is Suspended
     #[tokio::test]
     #[serial]
-    async fn test_put_object_returns_null_version_id_with_suspended_versioning() {
+    async fn test_put_object_omits_version_id_with_suspended_versioning() {
         init_logging();
-        info!("🧪 TEST: PutObject returns null version_id with versioning suspended");
+        info!("🧪 TEST: PutObject omits version_id with versioning suspended");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
         env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
@@ -489,13 +489,130 @@ mod tests {
 
         info!("📥 PutObject response - version_id: {:?}", output.version_id);
 
-        // When suspended, version_id must be "null"
+        // When suspended, version_id must be omitted
         assert_eq!(
-            output.version_id.as_deref(),
-            Some("null"),
-            "❌ FAILED: version_id should be 'null' when versioning is suspended"
+            output.version_id, None,
+            "❌ FAILED: version_id should be omitted when versioning is suspended"
         );
 
-        info!("✅ PASSED: PutObject correctly returns 'null' version_id");
+        info!("✅ PASSED: PutObject correctly omits version_id");
+    }
+
+    /// Test 8: CopyObject should omit version_id when versioning is Suspended
+    #[tokio::test]
+    #[serial]
+    async fn test_copy_object_omits_version_id_with_suspended_versioning() {
+        init_logging();
+        info!("🧪 TEST: CopyObject omits version_id with versioning suspended");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-copy-suspended-version-id";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        suspend_versioning(&client, bucket)
+            .await
+            .expect("Failed to suspend versioning");
+
+        let source_key = "source-file.txt";
+        let dest_key = "dest-file.txt";
+        let content = b"Content to copy into suspended bucket";
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(source_key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("Failed to create source object");
+
+        let result = client
+            .copy_object()
+            .bucket(bucket)
+            .key(dest_key)
+            .copy_source(format!("{}/{}", bucket, source_key))
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "CopyObject failed: {:?}", result.err());
+        let output = result.unwrap();
+
+        info!("📥 CopyObject response - version_id: {:?}", output.version_id);
+        assert_eq!(
+            output.version_id, None,
+            "❌ FAILED: version_id should be omitted when versioning is suspended"
+        );
+
+        info!("✅ PASSED: CopyObject correctly omits version_id");
+    }
+
+    /// Test 9: CompleteMultipartUpload should omit version_id when versioning is Suspended
+    #[tokio::test]
+    #[serial]
+    async fn test_multipart_upload_omits_version_id_with_suspended_versioning() {
+        init_logging();
+        info!("🧪 TEST: CompleteMultipartUpload omits version_id with versioning suspended");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-multipart-suspended-version-id";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        suspend_versioning(&client, bucket)
+            .await
+            .expect("Failed to suspend versioning");
+
+        let key = "multipart-file.txt";
+        let content = b"Part 1 content for suspended multipart upload test";
+
+        let create_result = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("Failed to create multipart upload");
+
+        let upload_id = create_result.upload_id().expect("No upload_id returned");
+
+        let upload_part_result = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("Failed to upload part");
+
+        let etag = upload_part_result.e_tag().expect("No etag returned").to_string();
+        let completed_part = CompletedPart::builder().part_number(1).e_tag(etag).build();
+        let completed_upload = CompletedMultipartUpload::builder().parts(completed_part).build();
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "CompleteMultipartUpload failed: {:?}", result.err());
+        let output = result.unwrap();
+
+        info!("📥 CompleteMultipartUpload response - version_id: {:?}", output.version_id);
+        assert_eq!(
+            output.version_id, None,
+            "❌ FAILED: version_id should be omitted when versioning is suspended"
+        );
+
+        info!("✅ PASSED: CompleteMultipartUpload correctly omits version_id");
     }
 }

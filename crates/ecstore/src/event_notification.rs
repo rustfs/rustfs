@@ -21,6 +21,7 @@ use crate::store::ECStore;
 use crate::store_api::ObjectInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -82,4 +83,50 @@ pub struct EventArgs {
 
 impl EventArgs {}
 
-pub fn send_event(args: EventArgs) {}
+type EventDispatchHook = Arc<dyn Fn(EventArgs) + Send + Sync + 'static>;
+
+static EVENT_DISPATCH_HOOK: OnceLock<EventDispatchHook> = OnceLock::new();
+
+pub fn register_event_dispatch_hook<F>(hook: F) -> bool
+where
+    F: Fn(EventArgs) + Send + Sync + 'static,
+{
+    EVENT_DISPATCH_HOOK.set(Arc::new(hook)).is_ok()
+}
+
+pub fn send_event(args: EventArgs) {
+    if let Some(hook) = EVENT_DISPATCH_HOOK.get() {
+        hook(args);
+        return;
+    }
+
+    warn!(
+        event_name = args.event_name,
+        bucket = args.bucket_name,
+        "event send() dropped because no event dispatch hook is registered"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn send_event_dispatches_to_registered_hook() {
+        let _ = register_event_dispatch_hook(|_args| {
+            DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        });
+        let before = DISPATCH_COUNT.load(Ordering::Relaxed);
+
+        send_event(EventArgs {
+            event_name: "s3:ObjectCreated:Put".to_string(),
+            bucket_name: "demo".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), before + 1);
+    }
+}

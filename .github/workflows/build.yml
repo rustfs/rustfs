@@ -204,7 +204,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+      # Always enable Tokio unstable features (required by dial9-tokio-telemetry).
+      # The RUSTFLAGS env var takes precedence over .cargo/config.toml [build] rustflags,
+      # so we must include --cfg tokio_unstable here explicitly; otherwise an empty
+      # RUSTFLAGS value would shadow the config-file flag and silently break tracing.
+      RUSTFLAGS: "--cfg tokio_unstable ${{ matrix.rustflags }}"
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}

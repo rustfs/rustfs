@@ -89,6 +89,7 @@ reqwest = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-rustls = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic = { workspace = true }
@@ -98,7 +99,9 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 # Serialization and Data Formats
 bytes = { workspace = true }
 flatbuffers.workspace = true
+walkdir = { workspace = true }
 rmp-serde.workspace = true
+rustfs-signer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
@@ -167,7 +170,6 @@ pprof = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

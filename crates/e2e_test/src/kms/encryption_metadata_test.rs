@@ -26,27 +26,20 @@ use serial_test::serial;
 use std::collections::{HashMap, VecDeque};
 use tracing::info;
 
-fn assert_encryption_metadata(metadata: &HashMap<String, String>, expected_size: usize) {
+fn assert_managed_encryption_metadata_hidden(metadata: Option<&HashMap<String, String>>) {
+    let Some(metadata) = metadata else { return };
+
     for key in [
         "x-rustfs-encryption-key",
         "x-rustfs-encryption-iv",
         "x-rustfs-encryption-context",
         "x-rustfs-encryption-original-size",
     ] {
-        assert!(metadata.contains_key(key), "expected managed encryption metadata '{key}' to be present");
         assert!(
-            !metadata.get(key).unwrap().is_empty(),
-            "managed encryption metadata '{key}' should not be empty"
+            !metadata.contains_key(key),
+            "managed encryption metadata '{key}' should not be exposed to clients"
         );
     }
-
-    let size_value = metadata
-        .get("x-rustfs-encryption-original-size")
-        .expect("managed encryption metadata should include original size");
-    let parsed_size: usize = size_value
-        .parse()
-        .expect("x-rustfs-encryption-original-size should be numeric");
-    assert_eq!(parsed_size, expected_size, "recorded original size should match uploaded payload length");
 }
 
 fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &str, key: &str, plaintext: &[u8]) {
@@ -142,10 +135,7 @@ async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn s
         "head_object should advertise SSE-S3"
     );
 
-    let metadata = head
-        .metadata()
-        .expect("head_object should return managed encryption metadata");
-    assert_encryption_metadata(metadata, payload.len());
+    assert_managed_encryption_metadata_hidden(head.metadata());
 
     assert_storage_encrypted(std::path::Path::new(&kms_env.base_env.temp_dir), TEST_BUCKET, key, payload);
 
@@ -210,10 +200,7 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
         &default_key_id,
         "source object should maintain the configured KMS key id"
     );
-    let source_metadata = head_source
-        .metadata()
-        .expect("source object should include managed encryption metadata");
-    assert_encryption_metadata(source_metadata, payload.len());
+    assert_managed_encryption_metadata_hidden(head_source.metadata());
 
     let dest_key = "metadata-sse-kms-object-copy";
     let copy_source = format!("{TEST_BUCKET}/{source_key}");
@@ -238,10 +225,7 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
         &default_key_id,
         "copied object should keep the default KMS key id"
     );
-    let dest_metadata = head_dest
-        .metadata()
-        .expect("copied object should include managed encryption metadata");
-    assert_encryption_metadata(dest_metadata, payload.len());
+    assert_managed_encryption_metadata_hidden(head_dest.metadata());
 
     let copied_body = s3_client
         .get_object()
@@ -358,10 +342,7 @@ async fn test_multipart_upload_writes_encrypted_data() -> Result<(), Box<dyn std
         "multipart object should retain bucket default KMS key"
     );
 
-    assert_encryption_metadata(
-        head.metadata().expect("multipart head_object should expose managed metadata"),
-        combined.len(),
-    );
+    assert_managed_encryption_metadata_hidden(head.metadata());
 
     // Data returned to clients should decrypt back to original payload
     let fetched = s3_client

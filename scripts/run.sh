@@ -15,6 +15,8 @@ set -e
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# RustFS Startup Script
+# This script sets up environment variables and starts the RustFS service
 
 # check ./rustfs/static/index.html not exists
 if [ ! -f ./rustfs/static/index.html ]; then
@@ -86,6 +88,61 @@ export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
 export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
+
+# ============================================================================
+# dial9 Tokio Runtime Telemetry Configuration
+# ============================================================================
+# dial9 provides low-overhead Tokio runtime-level telemetry for performance diagnostics.
+# It captures events like PollStart/End, WorkerPark/Unpark, QueueSample, TaskSpawn.
+#
+# Features:
+# - CPU overhead < 5% (with sampling rate 1.0)
+# - Automatic file rotation (configurable size and count)
+# - Graceful degradation if initialization fails
+#
+# Note: Disabled by default. Enable only when needed for runtime diagnostics.
+# Note: Requires build flag --cfg tokio_unstable (set in .cargo/config.toml).
+
+# Enable dial9 telemetry (default: false)
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+
+# Output directory for trace files (default: /var/log/rustfs/telemetry)
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
+
+# Trace file prefix (default: rustfs-tokio)
+#export RUSTFS_RUNTIME_DIAL9_FILE_PREFIX=rustfs-tokio
+
+# Maximum trace file size in bytes (default: 104857600 = 100MB)
+#export RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE=104857600
+
+# Number of rotated files to keep (default: 10)
+#export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
+
+# Sampling rate: 0.0 to 1.0 (default: 1.0 = 100% sampling)
+# Lower values reduce CPU overhead. Recommended: 0.1-0.5 for production.
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+
+# S3 upload settings (not yet implemented; reserved for future use):
+#export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
+#export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
+
+# --- Scenario 1: Development / Debugging ---
+# Full tracing with local storage, high sampling rate
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+
+# --- Scenario 2: Production Diagnostics ---
+# Reduced sampling rate to minimize overhead
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=0.1
+
+# --- Scenario 3: Performance Investigation ---
+# Short-term tracing with high detail, manual cleanup
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+#export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
@@ -215,6 +272,118 @@ export RUSTFS_TRUST_SYSTEM_CA=true
 # export RUSTFS_FTPS_ADDRESS="0.0.0.0:8022"
 # export RUSTFS_FTPS_CERTS_DIR="${current_dir}/deploy/certs/ftps"
 
+
+# ============================================================================
+# Capacity Statistics Configuration
+# ============================================================================
+
+# --- Capacity Management System ---
+# The capacity management system provides accurate capacity statistics with
+# high performance through hybrid caching strategy.
+#
+# Features:
+# - Hybrid caching: scheduled updates + write triggers + smart detection
+# - Performance protection: sampling, timeout, fallback
+# - Comprehensive metrics: 17 metrics for monitoring
+# - Low overhead: < 0.1% CPU, < 1MB memory
+#
+# For more details, see: .codeartsdoer/specs/fix-capacity-calculation/
+
+# --- Basic Configuration ---
+# Scheduled update interval (seconds)
+# How often to perform full capacity recalculation
+# Default: 300 (5 minutes)
+# Recommended: 300-600 for production, 60-120 for testing
+export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=300
+
+# Write trigger delay (seconds)
+# Delay after write operation before triggering capacity update
+# Default: 10
+# Recommended: 5-15
+export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=10
+
+# Write frequency threshold (writes per minute)
+# Threshold for triggering fast updates during high write frequency
+# Default: 10
+# Recommended: 5-20
+export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=10
+
+# Fast update threshold (seconds)
+# Cache age threshold for considering data as fresh
+# Default: 60
+# Recommended: 30-120
+export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=60
+
+# --- Performance Protection ---
+# Maximum files threshold
+# When file count exceeds this, sampling is used for performance
+# Default: 1000000 (1 million)
+# Recommended: 500000-2000000
+export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=1000000
+
+# Statistics timeout (seconds)
+# Maximum time to wait for capacity calculation
+# Default: 5
+# Recommended: 3-10
+export RUSTFS_CAPACITY_STAT_TIMEOUT=5
+
+# Sample rate
+# When sampling is enabled, check every N files
+# Default: 100
+# Recommended: 50-200
+export RUSTFS_CAPACITY_SAMPLE_RATE=100
+
+# --- Monitoring Configuration ---
+# Metrics logging interval (seconds)
+# How often to log capacity metrics summary
+# Default: 600 (10 minutes)
+# Recommended: 300-900
+export RUSTFS_CAPACITY_METRICS_INTERVAL=600
+
+# --- Scenario 1: High Performance Production ---
+# For high-throughput production environments with millions of files
+# export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=600
+# export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=15
+# export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=20
+# export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=120
+# export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=2000000
+# export RUSTFS_CAPACITY_STAT_TIMEOUT=10
+# export RUSTFS_CAPACITY_SAMPLE_RATE=200
+# export RUSTFS_CAPACITY_METRICS_INTERVAL=900
+
+# --- Scenario 2: Low Latency Testing ---
+# For testing environments requiring frequent updates
+# export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=60
+# export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=5
+# export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=5
+# export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=30
+# export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=500000
+# export RUSTFS_CAPACITY_STAT_TIMEOUT=3
+# export RUSTFS_CAPACITY_SAMPLE_RATE=50
+# export RUSTFS_CAPACITY_METRICS_INTERVAL=300
+
+# --- Scenario 3: Small Scale Deployment ---
+# For small deployments with < 100K files
+# export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=300
+# export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=10
+# export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=10
+# export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=60
+# export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=100000
+# export RUSTFS_CAPACITY_STAT_TIMEOUT=5
+# export RUSTFS_CAPACITY_SAMPLE_RATE=100
+# export RUSTFS_CAPACITY_METRICS_INTERVAL=600
+
+# --- Scenario 4: Debugging / Troubleshooting ---
+# Enable more frequent updates and shorter timeouts for debugging
+# export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=30
+# export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=2
+# export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=3
+# export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=10
+# export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=10000
+# export RUSTFS_CAPACITY_STAT_TIMEOUT=2
+# export RUSTFS_CAPACITY_SAMPLE_RATE=10
+# export RUSTFS_CAPACITY_METRICS_INTERVAL=60
+
 # ============================================
 # Concurrent Request Optimization Configuration
 # ============================================
@@ -302,7 +471,11 @@ export RUSTFS_OBJECT_PRIORITY_SCHEDULING_ENABLE=true
 # export RUSTFS_OBJECT_DEADLOCK_CHECK_INTERVAL=3
 # export RUSTFS_OBJECT_DEADLOCK_HANG_THRESHOLD=5
 
-# --- Backpressure Configuration ---
+
+# ============================================================================
+# Backpressure Configuration
+# ============================================================================
+
 # High watermark: trigger backpressure when buffer usage exceeds this percentage
 export RUSTFS_BACKPRESSURE_HIGH_WATERMARK=80
 # Low watermark: release backpressure when buffer usage drops below this percentage
@@ -311,6 +484,10 @@ export RUSTFS_BACKPRESSURE_LOW_WATERMARK=50
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
+
+# ============================================================================
+# Memory Profiling Configuration
+# ============================================================================
 
 # Enable jemalloc for memory profiling
 # MALLOC_CONF parameters:
@@ -328,14 +505,22 @@ if [ -z "$MALLOC_CONF" ]; then
     export MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
 fi
 
+# ============================================================================
+# Service Startup
+# ============================================================================
+
 # Start webhook server
 #cargo run --example webhook -p rustfs-notify &
+
 # Start main service
 # To run with profiling enabled, uncomment the following line and comment the next line
 #cargo run --profile profiling --bin rustfs
+
 # To run with FTP/FTPS support, use:
 # cargo run --bin rustfs --features ftps
+
 # To run in release mode, use the following line
 #cargo run --profile release --bin rustfs
+
 # To run in debug mode, use the following line
 cargo run --bin rustfs

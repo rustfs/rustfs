@@ -35,6 +35,7 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
+use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
@@ -141,12 +142,17 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
         .expect("Failed to create test bucket");
 }
 
-async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
+async fn upload_test_object(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    data: &[u8],
+) -> rustfs_ecstore::store_api::ObjectInfo {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
-        .expect("Failed to upload test object");
+        .expect("Failed to upload test object")
 }
 
 async fn set_bucket_lifecycle_transition_with_tier(
@@ -282,6 +288,42 @@ async fn wait_for_transition(
     }
 }
 
+async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if !backend.objects.lock().await.contains_key(object) {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if ecstore
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .is_err()
+        {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     S3Request {
         input,
@@ -353,7 +395,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
     set_bucket_lifecycle_transition_with_tier(dst_bucket.as_str(), &tier_name)
         .await
         .expect("Failed to set destination lifecycle configuration");
-    upload_test_object(&ecstore, src_bucket.as_str(), src_object, copy_payload).await;
+    let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, copy_payload).await;
 
     let copy_input = CopyObjectInput::builder()
         .copy_source(CopySource::Bucket {
@@ -436,4 +478,64 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-api-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"delete transitioned object through delete API";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+    let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+
+    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+        ecstore.clone(),
+        bucket.as_str(),
+    )
+    .await
+    .expect("Failed to enqueue transitioned object");
+
+    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should transition before delete usecase runs");
+    let remote_object = transitioned.transitioned_object.name.clone();
+
+    assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+    let mut req = build_request(
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::DELETE,
+    );
+    insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+
+    usecase
+        .execute_delete_object(req)
+        .await
+        .expect("Failed to delete object through usecase");
+
+    assert!(
+        wait_for_object_absence(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "object should be removed from hot tier after delete usecase"
+    );
+
+    assert!(
+        wait_for_remote_absence(&backend, &remote_object, TRANSITION_WAIT_TIMEOUT).await,
+        "transitioned object should be removed from remote tier after delete usecase"
+    );
 }
