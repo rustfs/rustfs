@@ -18,8 +18,10 @@ use rustfs_ecstore::{
     bucket::{lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys},
     client::transition_api::{ReadCloser, ReaderImpl},
     disk::endpoint::Endpoint,
+    disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk},
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     global::GLOBAL_TierConfigMgr,
+    pools::path2_bucket_object_with_base_path,
     store::ECStore,
     store_api::{
         BucketOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
@@ -29,7 +31,11 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     },
 };
+use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner::init_data_scanner;
+use rustfs_scanner::scanner_folder::ScannerItem;
+use rustfs_scanner::scanner_io::ScannerIODisk;
+use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
@@ -133,6 +139,70 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
+
+    (disk_paths, ecstore)
+}
+
+async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStore>) {
+    init_tracing();
+
+    let test_base_dir = format!("/tmp/rustfs_scanner_lifecycle_test_{}", uuid::Uuid::new_v4());
+    let temp_dir = std::path::PathBuf::from(&test_base_dir);
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir).await.ok();
+    }
+    fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let disk_paths = vec![
+        temp_dir.join("disk1"),
+        temp_dir.join("disk2"),
+        temp_dir.join("disk3"),
+        temp_dir.join("disk4"),
+    ];
+
+    for disk_path in &disk_paths {
+        fs::create_dir_all(disk_path).await.unwrap();
+    }
+
+    let mut endpoints = Vec::new();
+    for (i, disk_path) in disk_paths.iter().enumerate() {
+        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(i);
+        endpoints.push(endpoint);
+    }
+
+    let pool_endpoints = PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: 4,
+        endpoints: Endpoints::from(endpoints),
+        cmd_line: "test".to_string(),
+        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+    };
+
+    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+
+    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let buckets_list = ecstore
+        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+
+    if init_expiry {
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    }
 
     (disk_paths, ecstore)
 }
@@ -374,6 +444,88 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
+async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if !backend.objects.lock().await.contains_key(object) {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn free_version_count(disk_path: &PathBuf, bucket: &str, object: &str) -> usize {
+    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
+    let disk = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("failed to open local disk");
+    let data = disk
+        .read_metadata(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
+        .await;
+    let Ok(data) = data else {
+        return 0;
+    };
+    let meta = FileMeta::load(&data).expect("failed to load file metadata");
+    meta.get_file_info_versions(bucket, object, false)
+        .expect("failed to decode file info versions")
+        .free_versions
+        .len()
+}
+
+async fn scan_object_metadata(disk_path: &PathBuf, bucket: &str, object: &str) {
+    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
+    let disk = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("failed to open local disk");
+    let metadata_path = disk_path
+        .join(bucket)
+        .join(object)
+        .join(STORAGE_FORMAT_FILE);
+    let relative_path = metadata_path.to_string_lossy().to_string();
+    let (_, scanner_path) = path2_bucket_object_with_base_path(disk_path.to_string_lossy().as_ref(), relative_path.as_str());
+    let file_type = fs::metadata(&metadata_path)
+        .await
+        .expect("failed to stat object metadata")
+        .file_type();
+    let item = ScannerItem {
+        path: scanner_path.clone(),
+        bucket: bucket.to_string(),
+        prefix: object.to_string(),
+        object_name: STORAGE_FORMAT_FILE.to_string(),
+        file_type,
+        lifecycle: None,
+        replication: None,
+        heal_enabled: false,
+        heal_bitrot: false,
+        debug: false,
+    };
+    disk.get_size(item).await.expect("scanner get_size should succeed");
+}
+
 #[derive(Clone, Default)]
 struct MockStoredObject {
     bytes: Vec<u8>,
@@ -480,6 +632,15 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
             version: "v1".to_string(),
             tier_type: TierType::MinIO,
             name: tier_name.to_string(),
+            minio: Some(TierMinIO {
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+                bucket: "mock-tier".to_string(),
+                endpoint: "http://127.0.0.1:0".to_string(),
+                prefix: format!("mock/{}/", Uuid::new_v4()),
+                region: String::new(),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     );
@@ -912,5 +1073,65 @@ mod serial_tests {
             .await
             .expect("Failed to consume restored object stream");
         assert_eq!(data, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_scanner_enqueues_free_version_cleanup_for_stale_transitioned_object() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-scanner-free-version-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let initial_payload = b"scanner should clean stale transitioned null version";
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, initial_payload).await;
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transitioned object");
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition before overwrite");
+        let stale_remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+
+        ecstore
+            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+            .await
+            .expect("Failed to delete transitioned object without expiry workers");
+
+        assert!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
+            "deleting a transitioned null version should leave a free version for async cleanup"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&stale_remote_object),
+            "stale transitioned remote object should still exist before scanner fallback runs"
+        );
+
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            "scanner should enqueue stale free-version cleanup for the transitioned remote object"
+        );
+        assert_eq!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
+            0,
+            "free-version metadata should be removed after scanner-triggered cleanup"
+        );
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(1)).await,
+            "deleted object should remain absent after scanner cleanup"
+        );
     }
 }
