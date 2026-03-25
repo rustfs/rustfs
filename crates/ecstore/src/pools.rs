@@ -1168,8 +1168,8 @@ fn determine_decommission_final_state(items_failed: usize, was_cancelled: bool) 
     }
 }
 
-fn remaining_versions_after_decommission(fivs: &FileInfoVersions) -> usize {
-    fivs.versions.iter().filter(|version| !version.deleted).count()
+fn decommission_remaining_version_count(total_versions: usize, expired: usize) -> usize {
+    total_versions.saturating_sub(expired)
 }
 
 fn should_skip_decommission_delete_marker(
@@ -1459,7 +1459,7 @@ impl ECStore {
                 continue;
             }
 
-            let remaining_versions = remaining_versions_after_decommission(&fivs).saturating_sub(expired);
+            let remaining_versions = decommission_remaining_version_count(fivs.versions.len(), expired);
             if should_skip_decommission_delete_marker(version, remaining_versions, replication_config.is_some()) {
                 //
                 decommissioned += 1;
@@ -2286,24 +2286,10 @@ mod tests {
     }
 
     #[test]
-    fn remaining_versions_after_decommission_ignores_delete_markers() {
-        let fivs = FileInfoVersions {
-            versions: vec![
-                rustfs_filemeta::FileInfo {
-                    deleted: false,
-                    size: 128,
-                    ..Default::default()
-                },
-                rustfs_filemeta::FileInfo {
-                    deleted: true,
-                    size: 0,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
-        assert_eq!(remaining_versions_after_decommission(&fivs), 1);
+    fn decommission_remaining_version_count_excludes_only_expired_versions() {
+        assert_eq!(decommission_remaining_version_count(1, 0), 1);
+        assert_eq!(decommission_remaining_version_count(2, 1), 1);
+        assert_eq!(decommission_remaining_version_count(1, 1), 0);
     }
 
     #[test]

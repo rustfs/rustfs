@@ -77,9 +77,7 @@ impl Index {
     }
 
     fn alloc_infos(&mut self, n: usize) {
-        if n > MAX_INDEX_ENTRIES {
-            panic!("n > MAX_INDEX_ENTRIES");
-        }
+        debug_assert!(n <= MAX_INDEX_ENTRIES, "n > MAX_INDEX_ENTRIES");
         self.info = vec![
             IndexInfo {
                 compressed_offset: 0,

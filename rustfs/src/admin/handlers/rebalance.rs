@@ -98,7 +98,7 @@ pub struct RebalancePoolStatus {
     #[serde(rename = "status")]
     pub status: String, // Active if rebalance is running, empty otherwise
     #[serde(rename = "used")]
-    pub used: f64, // Percentage used space
+    pub used: f64, // Fraction of used space in range 0.0..=1.0
     #[serde(rename = "lastError")]
     pub last_error: Option<String>, // Last rebalance error message for this pool
     #[serde(rename = "progress")]
