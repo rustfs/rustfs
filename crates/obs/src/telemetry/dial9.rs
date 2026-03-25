@@ -18,7 +18,11 @@
 //! capturing events like PollStart/End, WorkerPark/Unpark, QueueSample, etc.
 
 use crate::TelemetryError;
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TelemetryGuard};
+// Import and re-export TelemetryGuard for use in other crates (like rustfs)
+// Use as Dial9TelemetryGuard internally to avoid naming conflicts
+pub use dial9_tokio_telemetry::telemetry::TelemetryGuard;
+use dial9_tokio_telemetry::telemetry::TelemetryGuard as Dial9TelemetryGuard;
+use dial9_tokio_telemetry::telemetry::RotatingWriter;
 // Use rustfs_config which re-exports runtime constants
 use rustfs_config::{
     DEFAULT_RUNTIME_DIAL9_ENABLED, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE,
@@ -111,7 +115,7 @@ impl Dial9Config {
 /// Keep it alive for the duration of your application.
 pub struct Dial9SessionGuard {
     /// The underlying dial9 telemetry guard (if enabled)
-    _guard: Option<TelemetryGuard>,
+    _guard: Option<Dial9TelemetryGuard>,
     /// Configuration
     #[allow(dead_code)]
     config: Dial9Config,
@@ -119,6 +123,10 @@ pub struct Dial9SessionGuard {
 
 impl Dial9SessionGuard {
     /// Create a new dial9 session guard.
+    ///
+    /// Note: This only validates configuration and creates the output directory.
+    /// The actual telemetry session is created when building the Tokio runtime
+    /// via `build_traced_runtime()`.
     ///
     /// Returns `Ok(None)` if dial9 is disabled.
     pub async fn new(config: Dial9Config) -> Result<Option<Self>, TelemetryError> {
@@ -130,42 +138,25 @@ impl Dial9SessionGuard {
         info!(
             output_dir = %config.output_dir,
             file_prefix = %config.file_prefix,
-            max_file_size = config.max_file_size,
-            rotation_count = config.rotation_count,
             sampling_rate = config.sampling_rate,
-            "Initializing dial9 telemetry"
+            "Validating dial9 telemetry configuration"
         );
 
-        // Ensure output directory exists
+        // Only create directory; writer will be created in build_traced_runtime
         if let Err(e) = tokio::fs::create_dir_all(&config.output_dir).await {
             warn!("Failed to create dial9 output directory '{}': {}", config.output_dir, e);
             warn!("Continuing without dial9 telemetry");
             return Ok(None);
         }
 
-        // Create rotating writer
-        let _writer = match RotatingWriter::new(
-            config.base_path(),
-            config.max_file_size,
-            config.max_file_size * config.rotation_count as u64,
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to create dial9 RotatingWriter: {}", e);
-                warn!("Continuing without dial9 telemetry");
-                return Ok(None);
-            }
-        };
-
-        // Writer will be used when building the runtime
-        info!("Dial9 telemetry writer initialized successfully");
+        info!("Dial9 telemetry configuration validated successfully");
 
         Ok(Some(Self { _guard: None, config }))
     }
 
     /// Set the telemetry guard (called after runtime creation)
     #[allow(dead_code)]
-    pub(crate) fn set_guard(&mut self, guard: TelemetryGuard) {
+    pub(crate) fn set_guard(&mut self, guard: Dial9TelemetryGuard) {
         self._guard = Some(guard);
     }
 
@@ -236,7 +227,7 @@ pub fn is_enabled() -> bool {
 /// - Dial9 is enabled but writer creation fails
 pub fn build_traced_runtime(
     builder: tokio::runtime::Builder,
-) -> Result<(tokio::runtime::Runtime, TelemetryGuard), TelemetryError> {
+) -> Result<(tokio::runtime::Runtime, Dial9TelemetryGuard), TelemetryError> {
     if !is_enabled() {
         return Err(TelemetryError::Io("Dial9 is not enabled".to_string()));
     }
@@ -248,7 +239,9 @@ pub fn build_traced_runtime(
     let writer = RotatingWriter::new(base_path, config.max_file_size, config.max_file_size * config.rotation_count as u64)
         .map_err(|e| TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e)))?;
 
-    // Build traced runtime - returns (Runtime, TelemetryGuard) tuple
+    // Build traced runtime
+    // Note: sampling_rate is logged but not directly used in builder
+    // The dial9 library may use sampling internally or it may be a future feature
     dial9_tokio_telemetry::telemetry::TracedRuntime::builder()
         .with_task_tracking(true)
         .build(builder, writer)
@@ -282,7 +275,11 @@ mod tests {
 
     #[test]
     fn test_is_enabled_default() {
-        // Should be disabled by default
+        // Skip if environment variable is explicitly set
+        if std::env::var(ENV_RUNTIME_DIAL9_ENABLED).is_ok() {
+            println!("Skipping test: RUSTFS_RUNTIME_DIAL9_ENABLED is set");
+            return;
+        }
         assert!(!is_enabled());
     }
 }

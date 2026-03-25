@@ -77,17 +77,18 @@ pub struct Dial9Stats {
 /// let metrics = collect_dial9_metrics(&stats);
 /// ```
 pub fn collect_dial9_metrics(stats: &Dial9Stats) -> Vec<PrometheusMetric> {
-    let enabled = if is_dial9_enabled() { 1.0 } else { 0.0 };
+    let enabled = is_dial9_enabled();
+    let enabled_value = if enabled { 1.0 } else { 0.0 };
 
     let mut metrics = vec![PrometheusMetric::new(
         "rustfs_dial9_enabled",
         MetricType::Gauge,
         "Whether dial9 telemetry is enabled (1) or disabled (0)",
-        enabled,
+        enabled_value,
     )];
 
     // If dial9 is disabled, return just the enabled flag
-    if !is_dial9_enabled() {
+    if !enabled {
         return metrics;
     }
 

@@ -201,21 +201,14 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Initialize dial9 Tokio runtime telemetry (if enabled)
-    let _dial9_guard = match rustfs_obs::dial9::init_session().await {
-        Ok(guard) => {
-            if let Some(_g) = &guard {
-                info!(target: "rustfs::main", "Dial9 Tokio telemetry initialized successfully.");
-            } else {
-                info!(target: "rustfs::main", "Dial9 Tokio telemetry is disabled.");
-            }
-            guard
-        }
-        Err(e) => {
-            warn!("Failed to initialize dial9 telemetry: {}, continuing without it", e);
-            None
-        }
-    };
+    // Check dial9 Tokio runtime telemetry status
+    // Note: The actual telemetry session is created in build_tokio_runtime()
+    // which stores the guard globally for the program duration.
+    if rustfs_obs::dial9::is_enabled() {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is enabled via environment variables.");
+    } else {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is disabled.");
+    }
 
     info!("license status: {}", license_status());
     if let Some(token) = current_license() {

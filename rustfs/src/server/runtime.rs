@@ -12,8 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use sysinfo::{RefreshKind, System};
+
+// Import TelemetryGuard from rustfs_obs re-export
+use rustfs_obs::dial9::TelemetryGuard;
+
+// Global storage for TelemetryGuard to keep it alive for the program duration
+static DIAL9_TELEMETRY_GUARD: OnceLock<TelemetryGuard> = OnceLock::new();
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
@@ -161,13 +168,13 @@ fn print_tokio_thread_enable() -> bool {
 
 /// Build Tokio runtime with optional dial9 telemetry support.
 ///
-/// This function creates a Tokio runtime with dial9 telemetry enabled
-/// if `RUSTFS_RUNTIME_DIAL9_ENABLED` is set to `true`. Otherwise, it creates
-/// a standard Tokio runtime.
+/// If dial9 is enabled via environment variables, creates a TracedRuntime
+/// and stores the TelemetryGuard globally to keep it alive for the
+/// duration of the program.
 ///
 /// # Returns
 ///
-/// * `Ok(runtime)` - Successfully created runtime (dial9 guard is handled internally)
+/// * `Ok(runtime)` - Successfully created runtime
 /// * `Err(e)` - Failed to create runtime
 ///
 /// # Errors
@@ -179,10 +186,10 @@ fn print_tokio_thread_enable() -> bool {
 /// # Examples
 ///
 /// ```no_run
-/// use rustfs_server::build_tokio_runtime;
+/// use rustfs::server::runtime::build_tokio_runtime;
 ///
 /// let runtime = build_tokio_runtime().expect("Failed to build runtime");
-/// // runtime.block_on(async { ... })
+/// // runtime.block_on(async { /* ... */ })
 /// ```
 pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
     let mut builder = tokio_runtime_builder();
@@ -192,12 +199,10 @@ pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildErro
         tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
 
         return match rustfs_obs::dial9::build_traced_runtime(builder) {
-            Ok((runtime, _guard)) => {
-                tracing::info!("TracedRuntime created successfully");
-                // The guard will be kept alive by the dial9 session management
-                // For now, we just return the runtime
-                // Note: The guard needs to be stored somewhere to keep it alive
-                // This is handled by the dial9 session in main.rs
+            Ok((runtime, guard)) => {
+                // Store guard in global static to keep it alive for the program duration
+                let _ = DIAL9_TELEMETRY_GUARD.set(guard);
+                tracing::info!("TracedRuntime created successfully, guard stored globally");
                 Ok(runtime)
             }
             Err(e) => {
