@@ -17,6 +17,7 @@ pub mod backpressure;
 pub mod concurrency;
 pub mod deadlock_detector;
 pub mod ecfs;
+pub mod zero_copy;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod lock_optimizer;

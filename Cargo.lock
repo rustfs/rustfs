@@ -7302,6 +7302,7 @@ dependencies = [
  "libsystemd",
  "matchit 0.9.1",
  "md5",
+ "memmap2 0.9.10",
  "metrics",
  "mimalloc",
  "mime_guess",

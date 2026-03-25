@@ -19,6 +19,7 @@ pub mod admin_server_info;
 pub mod batch_processor;
 pub mod bitrot;
 pub mod bucket;
+pub mod bytes_pool;
 pub mod cache_value;
 pub mod compress;
 pub mod config;
