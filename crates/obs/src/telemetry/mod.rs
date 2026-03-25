@@ -39,6 +39,8 @@
 //!    initialised together with an optional stdout mirror.
 //! 3. **Stdout only** — default fallback; no file I/O, no remote export.
 
+// Dial9 module - public types are re-exported at crate level
+pub mod dial9;
 mod filter;
 mod guard;
 mod local;
