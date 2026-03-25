@@ -107,9 +107,8 @@ fn main() {
         eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
     }
 
-    let runtime = server::tokio_runtime_builder()
-        .build()
-        .expect("Failed to build Tokio runtime");
+    // Build Tokio runtime with optional dial9 telemetry support
+    let runtime = server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
         // Use eprintln as tracing may not be initialized at this point
@@ -200,6 +199,15 @@ async fn async_main() -> Result<()> {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
+    }
+
+    // Check dial9 Tokio runtime telemetry status
+    // Note: The actual telemetry session is created in build_tokio_runtime()
+    // which stores the TelemetryGuard globally for the program duration.
+    if rustfs_obs::dial9::is_enabled() {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
+    } else {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
     }
 
     info!("license status: {}", license_status());

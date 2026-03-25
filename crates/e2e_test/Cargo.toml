@@ -30,6 +30,7 @@ ftps = []
 [dependencies]
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
+rustfs-rio.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true

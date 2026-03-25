@@ -22,6 +22,7 @@
 //! - Logging with tracing
 //! - Metrics collection
 //! - Distributed tracing
+//! - Tokio runtime telemetry (via dial9)
 //!
 //! ## Usage
 //!
@@ -69,3 +70,7 @@ pub use config::*;
 pub use error::*;
 pub use global::*;
 pub use telemetry::{OtelGuard, Recorder};
+
+// Dial9 Tokio runtime telemetry
+// Re-export dial9 types at crate root level for easier access
+pub use telemetry::dial9;
