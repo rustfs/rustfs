@@ -49,6 +49,7 @@ use crate::{
     StorageAPI,
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
+    global::is_first_cluster_node_local,
     store::ECStore,
     store_api::{ObjectIO as _, ObjectOptions, PutObjReader},
 };
@@ -1118,7 +1119,15 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 }
                 Err(legacy_err) if is_err_config_not_found(&legacy_err) => {
                     warn!("config not found, start to init");
-                    new_and_save_tiering_config(api).await.map_err(io::Error::other)
+                    if is_first_cluster_node_local().await {
+                        new_and_save_tiering_config(api).await.map_err(io::Error::other)
+                    } else {
+                        Ok(TierConfigMgr {
+                            driver_cache: HashMap::new(),
+                            tiers: HashMap::new(),
+                            last_refreshed_at: OffsetDateTime::now_utc(),
+                        })
+                    }
                 }
                 Err(legacy_err) => Err(io::Error::other(legacy_err)),
             }
@@ -1166,7 +1175,14 @@ async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, dat
 pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
     let target_path = tier_config_path(TIER_CONFIG_FILE);
     if api
-        .get_object_info(RUSTFS_META_BUCKET, &target_path, &ObjectOptions::default())
+        .get_object_info(
+            RUSTFS_META_BUCKET,
+            &target_path,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
         .await
         .is_ok()
     {
