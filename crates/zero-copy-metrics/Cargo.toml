@@ -13,35 +13,19 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-metrics"
+name = "rustfs-zero-copy-metrics"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
 homepage.workspace = true
-description.workspace = true
-keywords.workspace = true
-categories.workspace = true
-authors.workspace = true
-
-[features]
-default = ["metrics", "ecstore"]
-gpu = ["dep:nvml-wrapper"]
-metrics = []
-ecstore = ["dep:rustfs-ecstore"]
-full = ["gpu", "metrics", "ecstore"]
+description = "Zero-copy metrics helpers for RustFS"
+keywords = ["metrics", "zero-copy", "rustfs"]
+categories = ["development-tools", "filesystem"]
 
 [dependencies]
-rustfs-ecstore = { workspace = true, optional = true }
-rustfs-utils = { workspace = true }
 metrics = { workspace = true }
-sysinfo = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "rt", "time", "macros"] }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
-nvml-wrapper = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -71,6 +71,7 @@ reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
+rustfs-zero-copy-metrics.workspace = true
 regex = { workspace = true }
 path-absolutize = { workspace = true }
 rmp.workspace = true

@@ -1894,6 +1894,11 @@ impl DiskAPI for LocalDisk {
 
             // Log successful zero-copy read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Record zero-copy metrics
+            #[cfg(feature = "metrics")]
+            rustfs_zero_copy_metrics::record_zero_copy_read(length, duration_ms);
+
             debug!(
                 size = length,
                 duration_ms = duration_ms,
@@ -1906,6 +1911,10 @@ impl DiskAPI for LocalDisk {
         // Non-Unix fallback: efficient read into Bytes
         #[cfg(not(unix))]
         {
+            // Record zero-copy fallback
+            #[cfg(feature = "metrics")]
+            rustfs_zero_copy_metrics::record_zero_copy_fallback("non_unix_platform");
+
             debug!(reason = "non_unix_platform", "zero_copy_fallback");
 
             let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;

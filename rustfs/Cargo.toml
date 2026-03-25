@@ -74,6 +74,7 @@ rustfs-targets = { workspace = true }
 rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-zero-copy-metrics = { workspace = true }
 rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking

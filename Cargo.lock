@@ -7343,6 +7343,7 @@ dependencies = [
  "rustfs-targets",
  "rustfs-trusted-proxies",
  "rustfs-utils",
+ "rustfs-zero-copy-metrics",
  "rustfs-zip",
  "rustls",
  "s3s",
@@ -7547,6 +7548,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
+ "rustfs-zero-copy-metrics",
  "rustls",
  "s3s",
  "serde",
@@ -8123,6 +8125,7 @@ dependencies = [
  "local-ip-address",
  "lz4",
  "md-5 0.11.0-rc.5",
+ "metrics",
  "netif",
  "rand 0.10.0",
  "regex",
@@ -8154,6 +8157,13 @@ version = "0.0.5"
 dependencies = [
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-zero-copy-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
 ]
 
 [[package]]

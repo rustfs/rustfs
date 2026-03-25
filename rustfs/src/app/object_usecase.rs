@@ -1385,7 +1385,7 @@ impl DefaultObjectUsecase {
             // Cache hits use zero-copy because cached.body is Arc<Bytes>, clone() only increments reference count
             #[cfg(feature = "metrics")]
             {
-                use crate::storage::zero_copy::metrics::{record_memory_copy_saved, record_zero_copy_read};
+                use crate::storage::zero_copy::{record_memory_copy_saved, record_zero_copy_read};
                 record_zero_copy_read(cached.body.len(), cache_serve_duration.as_secs_f64() * 1000.0);
                 // Memory saved: would have copied cached.body.len() bytes without zero-copy
                 record_memory_copy_saved(cached.body.len());
@@ -1654,7 +1654,7 @@ impl DefaultObjectUsecase {
         // Record zero-copy read metrics for non-cache reads
         #[cfg(feature = "metrics")]
         {
-            use crate::storage::zero_copy::metrics::{record_memory_copy_saved, record_zero_copy_read};
+            use crate::storage::zero_copy::{record_memory_copy_saved, record_zero_copy_read};
             let read_duration = read_start.elapsed();
             // Estimate memory saved: assuming zero-copy avoids at least 2 copies (read + response)
             let estimated_saved = (info.size * 2) as usize;

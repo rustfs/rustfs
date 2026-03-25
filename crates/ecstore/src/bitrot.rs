@@ -17,6 +17,7 @@ use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;
+use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
 
@@ -63,8 +64,15 @@ pub async fn create_bitrot_reader(
         // Read from disk
         if use_zero_copy {
             // Try zero-copy read first (uses mmap on Unix)
+            let start = Instant::now();
             match disk.read_file_zero_copy(bucket, path, offset, length - offset).await {
                 Ok(bytes) => {
+                    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Record zero-copy metrics
+                    #[cfg(feature = "metrics")]
+                    rustfs_zero_copy_metrics::record_zero_copy_read(bytes.len(), duration_ms);
+
                     // Log successful zero-copy read
                     debug!(
                         size = bytes.len(),
@@ -84,6 +92,10 @@ pub async fn create_bitrot_reader(
                     Ok(Some(reader))
                 }
                 Err(e) => {
+                    // Record zero-copy fallback
+                    #[cfg(feature = "metrics")]
+                    rustfs_zero_copy_metrics::record_zero_copy_fallback(&format!("{:?}", e));
+
                     // Log zero-copy fallback
                     debug!(
                         reason = %format!("{:?}", e),
