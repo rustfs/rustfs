@@ -41,7 +41,7 @@ use serial_test::serial;
 use std::{
     collections::HashMap,
     io::Cursor,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
@@ -460,7 +460,7 @@ async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeou
     }
 }
 
-async fn free_version_count(disk_path: &PathBuf, bucket: &str, object: &str) -> usize {
+async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usize {
     let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
     endpoint.set_pool_index(0);
     endpoint.set_set_index(0);
@@ -487,7 +487,7 @@ async fn free_version_count(disk_path: &PathBuf, bucket: &str, object: &str) -> 
         .len()
 }
 
-async fn scan_object_metadata(disk_path: &PathBuf, bucket: &str, object: &str) {
+async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
     let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
     endpoint.set_pool_index(0);
     endpoint.set_set_index(0);
