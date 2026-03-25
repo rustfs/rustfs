@@ -674,6 +674,7 @@ impl SetDisks {
                     erasure.shard_size(),
                     checksum_algo.clone(),
                     skip_verify_bitrot,
+                    false, // use_zero_copy: can be enabled via config later
                 )
                 .await
                 {

@@ -605,3 +605,48 @@ pub const DEFAULT_OBJECT_HOT_HIT_THRESHOLD: usize = 3;
 ///
 /// Hot objects TTL is extended by 2x (e.g., 5 min TTL becomes 10 min).
 pub const DEFAULT_OBJECT_TTL_EXTENSION_FACTOR: f64 = 2.0;
+
+// =============================================================================
+// Zero-Copy and Direct I/O Configuration
+// =============================================================================
+
+/// Environment variable for zero-copy read enable.
+///
+/// When enabled, uses mmap (Unix) or optimized reads for zero-copy data access.
+/// Default is true (enabled).
+pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
+
+/// Default: zero-copy reads are enabled.
+///
+/// Zero-copy uses memory mapping (mmap) on Unix systems to avoid data copying.
+/// Falls back to regular I/O on non-Unix platforms.
+pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = true;
+
+/// Environment variable for Direct I/O enable (Linux only).
+///
+/// When enabled, uses O_DIRECT flag to bypass OS page cache for large files.
+/// This is only beneficial for specific workloads (databases, large sequential reads).
+/// Default is false (disabled).
+pub const ENV_OBJECT_DIRECT_IO_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_ENABLE";
+
+/// Default: Direct I/O is disabled.
+///
+/// Direct I/O is disabled by default because it's only beneficial for specific use cases:
+/// - Large file transfers (>128MB)
+/// - Databases with their own cache
+/// - Applications requiring predictable I/O latency
+///
+/// For most workloads, the OS page cache provides better performance.
+pub const DEFAULT_OBJECT_DIRECT_IO_ENABLE: bool = false;
+
+/// Environment variable for Direct I/O minimum file size threshold.
+///
+/// Files smaller than this size will use regular I/O even if Direct I/O is enabled.
+/// Default is 128 MB (128 * 1024 * 1024 bytes).
+pub const ENV_OBJECT_DIRECT_IO_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_THRESHOLD";
+
+/// Default Direct I/O threshold: 128 MB.
+///
+/// Only files larger than 128MB will use Direct I/O when enabled.
+/// Smaller files benefit from OS page cache.
+pub const DEFAULT_OBJECT_DIRECT_IO_THRESHOLD: usize = 128 * 1024 * 1024;

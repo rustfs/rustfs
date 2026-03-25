@@ -14,6 +14,7 @@
 
 use crate::disk::{self, DiskAPI as _, DiskStore, error::DiskError};
 use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
+use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;
 use tokio::io::AsyncRead;
@@ -22,13 +23,15 @@ use tokio::io::AsyncRead;
 ///
 /// # Parameters
 /// * `inline_data` - Optional inline data, if present, will use Cursor to read from memory
-/// * `disk` - Optional disk reference for file stream reading  
+/// * `disk` - Optional disk reference for file stream reading
 /// * `bucket` - Bucket name for file path
 /// * `path` - File path within the bucket
 /// * `offset` - Starting offset for reading
 /// * `length` - Length to read
 /// * `shard_size` - Shard size for erasure coding
 /// * `checksum_algo` - Hash algorithm for bitrot verification
+/// * `skip_verify` - If true, skip checksum verification
+/// * `use_zero_copy` - If true, use zero-copy read (mmap on Unix)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_bitrot_reader(
     inline_data: Option<&[u8]>,
@@ -40,14 +43,14 @@ pub async fn create_bitrot_reader(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
+    use_zero_copy: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
     let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
     let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
     if let Some(data) = inline_data {
         // Use inline data
-        let mut rd = Cursor::new(data.to_vec());
-        rd.set_position(offset as u64);
+        let rd = Cursor::new(Bytes::copy_from_slice(data));
         let reader = BitrotReader::new(
             Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
             shard_size,
@@ -57,12 +60,44 @@ pub async fn create_bitrot_reader(
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
-        match disk.read_file_stream(bucket, path, offset, length - offset).await {
-            Ok(rd) => {
-                let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
-                Ok(Some(reader))
+        if use_zero_copy {
+            // Try zero-copy read first (uses mmap on Unix)
+            match disk.read_file_zero_copy(bucket, path, offset, length - offset).await {
+                Ok(bytes) => {
+                    // Wrap Bytes in Cursor for AsyncRead
+                    // The Bytes is reference-counted, so this is zero-copy
+                    let rd = Cursor::new(bytes);
+                    let reader = BitrotReader::new(
+                        Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
+                        shard_size,
+                        checksum_algo,
+                        skip_verify,
+                    );
+                    Ok(Some(reader))
+                }
+                Err(e) => {
+                    // Fall back to regular stream read on error
+                    match disk.read_file_stream(bucket, path, offset, length - offset).await {
+                        Ok(rd) => {
+                            let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
+                            Ok(Some(reader))
+                        }
+                        Err(_e2) => {
+                            // Return the original error from zero-copy attempt
+                            Err(e)
+                        }
+                    }
+                }
             }
-            Err(e) => Err(e),
+        } else {
+            // Use regular stream read
+            match disk.read_file_stream(bucket, path, offset, length - offset).await {
+                Ok(rd) => {
+                    let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
+                    Ok(Some(reader))
+                }
+                Err(e) => Err(e),
+            }
         }
     } else {
         // Neither inline data nor disk available
@@ -122,7 +157,21 @@ mod tests {
         let checksum_algo = HashAlgorithm::HighwayHash256S;
 
         let result =
-            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false).await;
+            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false, false).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_bitrot_reader_with_zero_copy_enabled() {
+        let test_data = b"hello world test data";
+        let shard_size = 16;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+
+        // Test with zero-copy enabled (should work the same for inline data)
+        let result =
+            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false, true).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
@@ -134,7 +183,7 @@ mod tests {
         let checksum_algo = HashAlgorithm::HighwayHash256S;
 
         let result =
-            create_bitrot_reader(None, None, "test-bucket", "test-path", 0, 1024, shard_size, checksum_algo, false).await;
+            create_bitrot_reader(None, None, "test-bucket", "test-path", 0, 1024, shard_size, checksum_algo, false, false).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());

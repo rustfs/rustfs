@@ -38,7 +38,8 @@ ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
-full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav"]
+direct-io = []  # Direct I/O support for Linux (O_DIRECT)
+full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
 
 [lints]
 workspace = true

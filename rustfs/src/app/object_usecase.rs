@@ -1382,6 +1382,8 @@ impl DefaultObjectUsecase {
             }
 
             // Build response from cached data with full metadata
+            // ZERO-COPY: cached.body is Arc<Bytes>, clone() only increments reference count
+            // No data is copied - the underlying Bytes buffer is shared via reference counting
             let body_data = cached.body.clone();
             let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
 

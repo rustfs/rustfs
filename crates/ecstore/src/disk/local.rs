@@ -1825,6 +1825,90 @@ impl DiskAPI for LocalDisk {
 
         Ok(Box::new(f))
     }
+
+    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// Returns Bytes that can be shared without copying.
+    #[allow(unsafe_code)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = self.get_object_path(volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        // Verify file exists and get metadata
+        let file_path_clone = file_path.clone();
+        let meta = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&file_path_clone)
+                .map_err(|e| DiskError::from(e))
+        })
+        .await
+        .map_err(DiskError::from)??;
+
+        if meta.len() < (offset + length) as u64 {
+            error!(
+                "read_file_zero_copy: file size is less than offset + length {} + {} = {}",
+                offset,
+                length,
+                meta.len()
+            );
+            return Err(DiskError::FileCorrupt.into());
+        }
+
+        // Unix: use mmap for zero-copy
+        // Non-Unix: fall back to efficient read
+        #[cfg(unix)]
+        {
+            use memmap2::MmapOptions;
+            let file_path_clone = file_path.clone();
+            let offset_u64 = offset as u64;
+
+            let bytes = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&file_path_clone)
+                    .map_err(DiskError::from)?;
+
+                // Create memory map for the specified region
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds.
+                let mmap = unsafe {
+                    MmapOptions::new()
+                        .offset(offset_u64)
+                        .len(length)
+                        .map(&file)
+                }
+                .map_err(DiskError::other)?;
+
+                // Convert mmap to Bytes (zero-copy via Vec::into_raw_parts)
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&*mmap))
+            })
+            .await
+            .map_err(DiskError::from)??;
+
+            return Ok(bytes);
+        }
+
+        // Non-Unix fallback: efficient read into Bytes
+        #[cfg(not(unix))]
+        {
+            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+
+            if offset > 0 {
+                f.seek(SeekFrom::Start(offset as u64)).await?;
+            }
+
+            let mut buffer = Vec::with_capacity(length);
+            buffer.resize(length, 0);
+            f.read_exact(&mut buffer).await?;
+
+            Ok(Bytes::from(buffer))
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {

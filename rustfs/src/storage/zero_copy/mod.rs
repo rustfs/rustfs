@@ -37,8 +37,10 @@
 //! ```
 
 pub mod reader;
+pub mod metrics;
 
 pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
+pub use metrics::{record_memory_copy_saved, record_zero_copy_fallback, record_zero_copy_read};
 
 #[cfg(feature = "direct-io")]
 pub mod direct_io;

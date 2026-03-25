@@ -7517,6 +7517,7 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0-rc.5",
+ "memmap2 0.9.10",
  "metrics",
  "moka",
  "num_cpus",

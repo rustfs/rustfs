@@ -119,6 +119,7 @@ impl ZeroCopyObjectReader {
     /// let reader = ZeroCopyObjectReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
     /// ```
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     pub async fn from_file_mmap_path(
         path: &std::path::Path,
         offset: u64,
@@ -141,7 +142,7 @@ impl ZeroCopyObjectReader {
                     .len(size)
                     .map(&std_file)
             }
-            .map_err(|e| ZeroCopyReadError::Mmap(e.to_string()))?;
+                .map_err(|e| ZeroCopyReadError::Mmap(e.to_string()))?;
 
             // Convert to Bytes
             Ok(Self {
@@ -149,8 +150,8 @@ impl ZeroCopyObjectReader {
                 pos: 0,
             })
         })
-        .await
-        .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
+            .await
+            .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
     }
 
     /// Create a zero-copy reader from a file using mmap.

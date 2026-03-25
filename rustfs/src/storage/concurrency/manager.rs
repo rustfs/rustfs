@@ -21,6 +21,7 @@ use super::io_schedule::{
 use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
+use rustfs_ecstore::bytes_pool::BytesPool;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -42,6 +43,8 @@ pub struct ConcurrencyManager {
     /// I/O priority queue for request scheduling
     #[allow(dead_code)]
     priority_queue: Arc<IoPriorityQueue<()>>,
+    /// Bytes pool for buffer allocation and reuse
+    bytes_pool: Arc<BytesPool>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -56,6 +59,7 @@ impl std::fmt::Debug for ConcurrencyManager {
             .field("active_requests", &super::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
             .field("io_metrics", &io_metrics_info)
+            .field("bytes_pool", &self.bytes_pool)
             .finish()
     }
 }
@@ -64,7 +68,8 @@ impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
     /// Reads configuration from environment variables:
-    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: false)
+    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: true)
+    /// - `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`: Maximum concurrent disk reads (default: 64)
     pub fn new() -> Self {
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
@@ -74,12 +79,23 @@ impl ConcurrencyManager {
             rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
         );
 
+        // Bytes pool configuration
+        let buffer_pool_size = rustfs_utils::get_env_usize(
+            "RUSTFS_BUFFER_POOL_SIZE",
+            100, // default: 100 buffers
+        );
+        let default_buffer_size = rustfs_utils::get_env_usize(
+            "RUSTFS_DEFAULT_BUFFER_SIZE",
+            256 * 1024, // default: 256KB
+        );
+
         Self {
             cache: Arc::new(HotObjectCache::new()),
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
             priority_queue: Arc::new(IoPriorityQueue::new(IoPriorityQueueConfig::default())),
+            bytes_pool: Arc::new(BytesPool::new(buffer_pool_size, default_buffer_size)),
         }
     }
 
@@ -112,6 +128,18 @@ impl ConcurrencyManager {
         let size = data.len();
         let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
         self.cache.put(key, cached_obj).await;
+    }
+
+    /// Get the bytes pool for buffer allocation
+    ///
+    /// Returns a reference to the BytesPool which can be used to acquire
+    /// reusable buffers for I/O operations, reducing allocation overhead.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped BytesPool instance
+    pub fn bytes_pool(&self) -> Arc<BytesPool> {
+        self.bytes_pool.clone()
     }
 
     /// Acquire a permit to perform a disk read operation
