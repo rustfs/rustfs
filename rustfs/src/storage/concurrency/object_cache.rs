@@ -303,12 +303,25 @@ impl TieredObjectCache {
         // Check L1 first
         if let Some(cached) = self.l1_cache.get(key).await {
             self.l1_hits.fetch_add(1, Ordering::Relaxed);
+
+            // Record L1 cache hit metric
+            #[cfg(all(feature = "metrics", not(test)))]
+            {
+                metrics::counter!("rustfs.cache.l1.hits").increment(1);
+            }
+
             return Some(Arc::clone(&cached.data));
         }
 
         // Check L2
         if let Some(cached) = self.l2_cache.get(key).await {
             self.l2_hits.fetch_add(1, Ordering::Relaxed);
+
+            // Record L2 cache hit metric
+            #[cfg(all(feature = "metrics", not(test)))]
+            {
+                metrics::counter!("rustfs.cache.l2.hits").increment(1);
+            }
 
             // Promote to L1 if appropriate
             if self.should_promote_to_l1(&cached).await {
@@ -320,6 +333,13 @@ impl TieredObjectCache {
 
         // Cache miss
         self.misses.fetch_add(1, Ordering::Relaxed);
+
+        // Record cache miss metric
+        #[cfg(all(feature = "metrics", not(test)))]
+        {
+            metrics::counter!("rustfs.cache.misses").increment(1);
+        }
+
         None
     }
 
@@ -455,6 +475,58 @@ impl TieredObjectCache {
     /// Get the access tracker reference.
     pub fn access_tracker(&self) -> &Arc<AccessTracker> {
         &self.access_tracker
+    }
+
+    /// Get L1 cache statistics (for detailed monitoring).
+    pub async fn l1_stats(&self) -> CacheLevelStats {
+        self.l1_cache.run_pending_tasks().await;
+        CacheLevelStats {
+            size: self.l1_cache.weighted_size() as usize,
+            entries: self.l1_cache.entry_count() as usize,
+            max_size: self.l1_max_size,
+            max_entries: self.config.l1_max_objects,
+            hits: self.l1_hits.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Get L2 cache statistics (for detailed monitoring).
+    pub async fn l2_stats(&self) -> CacheLevelStats {
+        self.l2_cache.run_pending_tasks().await;
+        CacheLevelStats {
+            size: self.l2_cache.weighted_size() as usize,
+            entries: self.l2_cache.entry_count() as usize,
+            max_size: self.l2_max_size,
+            max_entries: self.config.l2_max_objects,
+            hits: self.l2_hits.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record cache metrics to Prometheus.
+    ///
+    /// This method should be called periodically (e.g., every 10 seconds)
+    /// to export current cache statistics as Prometheus metrics.
+    #[cfg(all(feature = "metrics", not(test)))]
+    pub async fn record_metrics(&self) {
+        use metrics::gauge;
+
+        // Get stats
+        let l1_stats = self.l1_stats().await;
+        let l2_stats = self.l2_stats().await;
+        let tiered_stats = self.stats().await;
+
+        // L1 cache metrics
+        gauge!("rustfs.cache.l1.size").set(l1_stats.size as f64);
+        gauge!("rustfs.cache.l1.entries").set(l1_stats.entries as f64);
+        gauge!("rustfs.cache.l1.size_ratio").set(l1_stats.size as f64 / l1_stats.max_size as f64);
+
+        // L2 cache metrics
+        gauge!("rustfs.cache.l2.size").set(l2_stats.size as f64);
+        gauge!("rustfs.cache.l2.entries").set(l2_stats.entries as f64);
+        gauge!("rustfs.cache.l2.size_ratio").set(l2_stats.size as f64 / l2_stats.max_size as f64);
+
+        // Combined metrics
+        gauge!("rustfs.cache.hit_rate").set(tiered_stats.hit_rate * 100.0);
+        gauge!("rustfs.cache.l1_hit_rate").set(tiered_stats.l1_hit_rate * 100.0);
     }
 
     // ============================================
@@ -717,6 +789,21 @@ impl TieredObjectCache {
             efficiency_score,
         }
     }
+}
+
+/// Statistics for a single cache level (L1 or L2).
+#[derive(Debug, Clone)]
+pub struct CacheLevelStats {
+    /// Current size in bytes
+    pub size: usize,
+    /// Number of entries
+    pub entries: usize,
+    /// Maximum size in bytes
+    pub max_size: usize,
+    /// Maximum number of entries
+    pub max_entries: usize,
+    /// Total hits for this level
+    pub hits: u64,
 }
 
 /// Byte cache statistics (for compatibility with HotObjectCache).
