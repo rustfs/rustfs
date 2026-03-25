@@ -138,7 +138,8 @@ fn calculate_rebalance_progress(
         return Some((elapsed_secs, 0));
     }
 
-    let eta_secs = Duration::from_secs_f64(remaining * elapsed_secs as f64 / bytes as f64).as_secs();
+    let eta_secs_f64 = remaining * elapsed_secs as f64 / bytes as f64;
+    let eta_secs = Duration::try_from_secs_f64(eta_secs_f64).map_or(0, |duration| duration.as_secs());
     Some((elapsed_secs, eta_secs))
 }
 
@@ -530,6 +531,17 @@ mod rebalance_handler_tests {
         let now = OffsetDateTime::from_unix_timestamp(1_010).unwrap();
 
         let (elapsed, eta) = calculate_rebalance_progress(now, Some(start), None, 100, -10.0).unwrap();
+
+        assert_eq!(elapsed, 10);
+        assert_eq!(eta, 0);
+    }
+
+    #[test]
+    fn test_calculate_rebalance_progress_overflow_eta_is_zero() {
+        let start = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_010).unwrap();
+
+        let (elapsed, eta) = calculate_rebalance_progress(now, Some(start), None, 1, f64::MAX).unwrap();
 
         assert_eq!(elapsed, 10);
         assert_eq!(eta, 0);

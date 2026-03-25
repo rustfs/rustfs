@@ -124,39 +124,11 @@ fn cancel_decommission_canceler(canceler: Option<CancellationToken>) -> bool {
     }
 }
 
-fn decommission_routines_not_fully_scheduled_error(bound_count: usize, expected_count: usize) -> Error {
-    Error::other(format!(
-        "failed to start decommission routines: scheduled {bound_count} of {expected_count} expected workers"
-    ))
-}
-
-fn decommission_pool_metadata_missing_error(idx: usize) -> Error {
-    Error::other(format!("failed to resolve decommission final state: pool metadata missing for idx {idx}"))
-}
-
-fn decommission_post_check_failed_error(cmd_line: &str, err: &Error) -> Error {
-    Error::other(format!("failed to finalize decommission for pool {cmd_line}: post-check failed: {err}"))
-}
-
-fn pool_meta_load_no_data_error() -> Error {
-    Error::other("pool metadata load failed: metadata payload is too short")
-}
-
-fn pool_meta_load_unknown_format_error(format: u16) -> Error {
-    Error::other(format!("pool metadata load failed: unknown format {format}"))
-}
-
-fn pool_meta_load_unknown_version_error(version: u16) -> Error {
-    Error::other(format!("pool metadata load failed: unknown version {version}"))
-}
-
-fn pool_meta_loaded_version_mismatch_error(version: u16) -> Error {
-    Error::other(format!("pool metadata load failed: unexpected decoded version {version}"))
-}
-
 fn ensure_decommission_routines_scheduled(bound_count: usize, expected_count: usize) -> Result<()> {
     if bound_count == 0 || bound_count != expected_count {
-        return Err(decommission_routines_not_fully_scheduled_error(bound_count, expected_count));
+        return Err(Error::other(format!(
+            "failed to start decommission routines: scheduled {bound_count} of {expected_count} expected workers"
+        )));
     }
 
     Ok(())
@@ -174,21 +146,13 @@ fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool 
     !complete && !failed && !canceled
 }
 
-fn missing_decommission_pool_error() -> Error {
-    Error::other("failed to start decommission: target pool was not found")
-}
-
-fn missing_decommission_cancel_pool_error() -> Error {
-    Error::other("failed to cancel decommission: target pool was not found")
-}
-
 fn invalid_decommission_pool_index_error(pool_count: usize, idx: usize) -> Error {
     Error::other(format!("invalid decommission pool index {idx} for {pool_count} pools"))
 }
 
 fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bool) -> Result<()> {
     if !pool_present {
-        return Err(missing_decommission_pool_error());
+        return Err(Error::other("failed to start decommission: target pool was not found"));
     }
 
     if decommission_active {
@@ -206,16 +170,13 @@ fn ensure_valid_decommission_pool_index(pool_count: usize, idx: usize) -> Result
     Ok(())
 }
 
-fn decommission_pool_lookup_error(operation: &'static str, pool_count: usize, idx: usize) -> Error {
-    Error::other(format!(
-        "failed to {operation}: invalid decommission pool index {idx} for {pool_count} pools"
-    ))
-}
-
 fn get_by_index<'a, T>(items: &'a [T], idx: usize, operation: &'static str) -> Result<&'a T> {
-    items
-        .get(idx)
-        .ok_or_else(|| decommission_pool_lookup_error(operation, items.len(), idx))
+    items.get(idx).ok_or_else(|| {
+        Error::other(format!(
+            "failed to {operation}: invalid decommission pool index {idx} for {pool_count} pools",
+            pool_count = items.len()
+        ))
+    })
 }
 
 fn decommission_metadata_not_initialized_error(operation: &str) -> Error {
@@ -442,7 +403,7 @@ fn is_decommission_cancel_terminal(complete: bool, failed: bool, canceled: bool)
 
 fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
     if !pool_present {
-        return Err(missing_decommission_cancel_pool_error());
+        return Err(Error::other("failed to cancel decommission: target pool was not found"));
     }
 
     if !decommission_present || terminal {
@@ -704,7 +665,7 @@ impl PoolMeta {
                 if data.is_empty() {
                     return Ok(());
                 } else if data.len() <= 4 {
-                    return Err(pool_meta_load_no_data_error());
+                    return Err(Error::other("pool metadata load failed: metadata payload is too short"));
                 }
                 data
             }
@@ -717,17 +678,20 @@ impl PoolMeta {
         };
         let format = LittleEndian::read_u16(&data[0..2]);
         if format != POOL_META_FORMAT {
-            return Err(pool_meta_load_unknown_format_error(format));
+            return Err(Error::other(format!("pool metadata load failed: unknown format {format}")));
         }
         let version = LittleEndian::read_u16(&data[2..4]);
         if version != POOL_META_VERSION {
-            return Err(pool_meta_load_unknown_version_error(version));
+            return Err(Error::other(format!("pool metadata load failed: unknown version {version}")));
         }
 
         *self = Self::decode_pool_meta_payload(&data[4..])?;
 
         if self.version != POOL_META_VERSION {
-            return Err(pool_meta_loaded_version_mismatch_error(self.version));
+            return Err(Error::other(format!(
+                "pool metadata load failed: unexpected decoded version {}",
+                self.version
+            )));
         }
         Ok(())
     }
@@ -1872,7 +1836,9 @@ impl ECStore {
             let pool_meta = self.pool_meta.read().await;
             let Some(pool) = pool_meta.pools.get(idx) else {
                 error!("decommission: pool metadata missing for idx {}", idx);
-                return Err(decommission_pool_metadata_missing_error(idx));
+                return Err(Error::other(format!(
+                    "failed to resolve decommission final state: pool metadata missing for idx {idx}"
+                )));
             };
 
             let (final_state, canceled) = if let Some(info) = &pool.decommission {
@@ -1913,7 +1879,9 @@ impl ECStore {
                 warn!("Decommissioning complete for pool {}, verifying for any pending objects", cmd_line);
                 if let Err(err) = self.check_after_decommission(idx).await {
                     resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
-                    return Err(decommission_post_check_failed_error(&cmd_line, &err));
+                    return Err(Error::other(format!(
+                        "failed to finalize decommission for pool {cmd_line}: post-check failed: {err}"
+                    )));
                 }
 
                 warn!("Decommissioning complete for pool {}, marking completed state", cmd_line);
@@ -2537,42 +2505,6 @@ mod tests {
         assert!(decommission.bucket.is_empty());
         assert!(decommission.prefix.is_empty());
         assert!(decommission.object.is_empty());
-    }
-
-    #[test]
-    fn pool_meta_load_no_data_error_is_explicit() {
-        assert!(
-            pool_meta_load_no_data_error()
-                .to_string()
-                .contains("pool metadata load failed: metadata payload is too short")
-        );
-    }
-
-    #[test]
-    fn pool_meta_load_unknown_format_error_is_explicit() {
-        assert!(
-            pool_meta_load_unknown_format_error(7)
-                .to_string()
-                .contains("pool metadata load failed: unknown format 7")
-        );
-    }
-
-    #[test]
-    fn pool_meta_load_unknown_version_error_is_explicit() {
-        assert!(
-            pool_meta_load_unknown_version_error(9)
-                .to_string()
-                .contains("pool metadata load failed: unknown version 9")
-        );
-    }
-
-    #[test]
-    fn pool_meta_loaded_version_mismatch_error_is_explicit() {
-        assert!(
-            pool_meta_loaded_version_mismatch_error(11)
-                .to_string()
-                .contains("pool metadata load failed: unexpected decoded version 11")
-        );
     }
 }
 
@@ -3811,24 +3743,6 @@ mod pools_tests {
         assert!(
             err.to_string()
                 .contains("failed to start decommission routines: scheduled 1 of 2 expected workers")
-        );
-    }
-
-    #[test]
-    fn test_decommission_pool_metadata_missing_error_wraps_final_state_context() {
-        let err = super::decommission_pool_metadata_missing_error(3);
-        assert!(
-            err.to_string()
-                .contains("failed to resolve decommission final state: pool metadata missing for idx 3")
-        );
-    }
-
-    #[test]
-    fn test_decommission_post_check_failed_error_wraps_pool_context() {
-        let err = super::decommission_post_check_failed_error("pool-0", &Error::SlowDown);
-        assert!(
-            err.to_string()
-                .contains("failed to finalize decommission for pool pool-0: post-check failed:")
         );
     }
 }
