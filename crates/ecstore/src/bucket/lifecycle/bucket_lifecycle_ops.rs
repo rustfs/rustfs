@@ -45,7 +45,7 @@ use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
-use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
+use rustfs_filemeta::{FileInfo, NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
 use rustfs_s3_common::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::Body;
@@ -393,12 +393,81 @@ impl ExpiryState {
                         //delete_object_versions(api, &v.bucket, &v.versions, v.event).await;
                     }
                     else if v.as_any().is::<Jentry>() {
-                        //transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+                        let v = v.as_any().downcast_ref::<Jentry>().expect("err!");
+                        if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
+                            warn!(
+                                object = %v.obj_name,
+                                version_id = %v.version_id,
+                                tier = %v.tier_name,
+                                error = ?err,
+                                "failed to delete transitioned object from remote tier"
+                            );
+                        }
                     }
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
-                        let _oi = v.0.clone();
+                        let oi = v.0.clone();
+                        if let Err(err) = delete_object_from_remote_tier(
+                            &oi.transitioned_object.name,
+                            &oi.transitioned_object.version_id,
+                            &oi.transitioned_object.tier,
+                        )
+                        .await
+                        {
+                            warn!(
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                error = ?err,
+                                "failed to sweep transitioned free version from remote tier"
+                            );
+                            continue;
+                        }
 
+                        let mut fi = FileInfo {
+                            name: oi.name.clone(),
+                            version_id: oi.version_id,
+                            deleted: true,
+                            ..Default::default()
+                        };
+                        fi.set_tier_free_version();
+
+                        let mut deleted_locally = false;
+                        for pool in api.pools.iter() {
+                            let set = pool.get_disks_by_key(&oi.name);
+                            match set.delete_object_version(&oi.bucket, &oi.name, &fi, false).await {
+                                Ok(()) => {
+                                    deleted_locally = true;
+                                    break;
+                                }
+                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
+                                Err(err) => {
+                                    warn!(
+                                        bucket = %oi.bucket,
+                                        object = %oi.name,
+                                        remote_object = %oi.transitioned_object.name,
+                                        remote_version_id = %oi.transitioned_object.version_id,
+                                        tier = %oi.transitioned_object.tier,
+                                        error = ?err,
+                                        "failed to delete transitioned free version after remote tier sweep"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !deleted_locally {
+                            warn!(
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                "transitioned free version was not found during local cleanup"
+                            );
+                        }
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);

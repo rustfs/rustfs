@@ -105,7 +105,8 @@ impl SetDisks {
         let disks = disks.clone();
 
         let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false).await?;
+            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false, false)
+                .await?;
 
         let map_err_notfound = |err: DiskError| {
             if err == DiskError::FileNotFound {
