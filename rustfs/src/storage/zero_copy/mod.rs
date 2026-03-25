@@ -50,12 +50,8 @@ pub use rustfs_zero_copy_core::{
 #[cfg(target_os = "linux")]
 pub use rustfs_zero_copy_core::{DirectIoReader, DirectIoError};
 
-// Re-export from rustfs-zero-copy-metrics crate for unified metrics handling
-pub use rustfs_zero_copy_metrics::{
-    record_bytes_saved, record_memory_copy_saved, record_zero_copy_read,
-    // BytesPool metrics
-    record_bytes_pool_acquire, record_bytes_pool_allocated, record_bytes_pool_hit_rate,
-    record_bytes_pool_return,
-};
+// NOTE: Do NOT re-export metrics functions from rustfs_zero_copy_metrics.
+// Metrics are internal implementation details only - they should be called
+// directly via `rustfs_zero_copy_metrics::*` when needed, not exposed as API.
 
 

@@ -23,7 +23,7 @@ use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, Warmup
 use super::request_guard::GetObjectGuard;
 use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
 use rustfs_config::{KI_B, MI_B};
-use rustfs_ecstore::bytes_pool::BytesPool;
+use crate::storage::zero_copy::BytesPool;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -101,16 +101,6 @@ impl ConcurrencyManager {
 
         let max_disk_reads = scheduler_config.max_concurrent_reads;
 
-        // Bytes pool configuration
-        let buffer_pool_size = rustfs_utils::get_env_usize(
-            "RUSTFS_BUFFER_POOL_SIZE",
-            100, // default: 100 buffers
-        );
-        let default_buffer_size = rustfs_utils::get_env_usize(
-            "RUSTFS_DEFAULT_BUFFER_SIZE",
-            256 * 1024, // default: 256KB
-        );
-
         // Detect storage media
         let storage_media = detect_storage_media(
             scheduler_config.storage_detection_enabled,
@@ -154,7 +144,7 @@ impl ConcurrencyManager {
             cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
             priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
-            bytes_pool: Arc::new(BytesPool::new(buffer_pool_size, default_buffer_size)),
+            bytes_pool: Arc::new(BytesPool::new_tiered()),
             scheduler_config,
             storage_media,
             pattern_detector,
