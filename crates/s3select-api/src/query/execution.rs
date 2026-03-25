@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-
+use std::time::Instant;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
