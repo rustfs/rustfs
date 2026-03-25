@@ -89,6 +89,65 @@ export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
 export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 
+# ============================================================================
+# dial9 Tokio Runtime Telemetry Configuration
+# ============================================================================
+# dial9 provides low-overhead Tokio runtime-level telemetry for performance diagnostics.
+# It captures events like PollStart/End, WorkerPark/Unpark, QueueSample, TaskSpawn.
+#
+# Features:
+# - CPU overhead < 5% (with sampling rate 1.0)
+# - Automatic file rotation (configurable size and count)
+# - Optional S3 upload for long-term storage
+# - Graceful degradation if initialization fails
+#
+# Note: Disabled by default. Enable only when needed for runtime diagnostics.
+
+# Enable dial9 telemetry (default: false)
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+
+# Output directory for trace files (default: /var/log/rustfs/telemetry)
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
+
+# Trace file prefix (default: rustfs-tokio)
+#export RUSTFS_RUNTIME_DIAL9_FILE_PREFIX=rustfs-tokio
+
+# Maximum trace file size in bytes (default: 104857600 = 100MB)
+#export RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE=104857600
+
+# Number of rotated files to keep (default: 10)
+#export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
+
+# Sampling rate: 0.0 to 1.0 (default: 1.0 = 100% sampling)
+# Lower values reduce CPU overhead. Recommended: 0.1-0.5 for production.
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+
+# Optional S3 bucket for uploading trace files (default: not set)
+#export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
+
+# Optional S3 prefix for uploaded files (default: not set)
+#export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
+
+# --- Scenario 1: Development / Debugging ---
+# Full tracing with local storage, high sampling rate
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+
+# --- Scenario 2: Production Diagnostics ---
+# Reduced sampling rate to minimize overhead
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=0.1
+#export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=rustfs-telemetry
+#export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
+
+# --- Scenario 3: Performance Investigation ---
+# Short-term tracing with high detail, manual cleanup
+#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
+#export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
+#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
+#export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3
+
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"

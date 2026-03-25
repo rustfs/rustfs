@@ -107,9 +107,8 @@ fn main() {
         eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
     }
 
-    let runtime = server::tokio_runtime_builder()
-        .build()
-        .expect("Failed to build Tokio runtime");
+    // Build Tokio runtime with optional dial9 telemetry support
+    let runtime = server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
         // Use eprintln as tracing may not be initialized at this point
@@ -201,6 +200,22 @@ async fn async_main() -> Result<()> {
             return Err(e);
         }
     }
+
+    // Initialize dial9 Tokio runtime telemetry (if enabled)
+    let _dial9_guard = match rustfs_obs::dial9::init_session().await {
+        Ok(guard) => {
+            if let Some(_g) = &guard {
+                info!(target: "rustfs::main", "Dial9 Tokio telemetry initialized successfully.");
+            } else {
+                info!(target: "rustfs::main", "Dial9 Tokio telemetry is disabled.");
+            }
+            guard
+        }
+        Err(e) => {
+            warn!("Failed to initialize dial9 telemetry: {}, continuing without it", e);
+            None
+        }
+    };
 
     info!("license status: {}", license_status());
     if let Some(token) = current_license() {

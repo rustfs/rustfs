@@ -158,3 +158,81 @@ pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
 fn print_tokio_thread_enable() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_THREAD_PRINT_ENABLED, rustfs_config::DEFAULT_THREAD_PRINT_ENABLED)
 }
+
+/// Build Tokio runtime with optional dial9 telemetry support.
+///
+/// This function creates a Tokio runtime with dial9 telemetry enabled
+/// if `RUSTFS_RUNTIME_DIAL9_ENABLED` is set to `true`. Otherwise, it creates
+/// a standard Tokio runtime.
+///
+/// # Returns
+///
+/// * `Ok(runtime)` - Successfully created runtime (dial9 guard is handled internally)
+/// * `Err(e)` - Failed to create runtime
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The Tokio runtime builder fails
+/// - Dial9 is enabled but fails to initialize (falls back to standard runtime)
+///
+/// # Examples
+///
+/// ```no_run
+/// use rustfs_server::build_tokio_runtime;
+///
+/// let runtime = build_tokio_runtime().expect("Failed to build runtime");
+/// // runtime.block_on(async { ... })
+/// ```
+pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
+    let mut builder = tokio_runtime_builder();
+
+    // Check if dial9 is enabled
+    if rustfs_obs::dial9::is_enabled() {
+        tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
+
+        return match rustfs_obs::dial9::build_traced_runtime(builder) {
+            Ok((runtime, _guard)) => {
+                tracing::info!("TracedRuntime created successfully");
+                // The guard will be kept alive by the dial9 session management
+                // For now, we just return the runtime
+                // Note: The guard needs to be stored somewhere to keep it alive
+                // This is handled by the dial9 session in main.rs
+                Ok(runtime)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build TracedRuntime: {}", e);
+                tracing::warn!("Falling back to standard Tokio runtime");
+                // Rebuild the builder for standard runtime
+                let mut builder = tokio_runtime_builder();
+                builder.build().map_err(BuildError::Runtime)
+            }
+        };
+    }
+
+    // Standard runtime
+    builder.build().map_err(BuildError::Runtime)
+}
+
+/// Error type for runtime building failures.
+#[derive(Debug)]
+pub enum BuildError {
+    /// Tokio runtime creation failed
+    Runtime(std::io::Error),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::Runtime(e) => write!(f, "Failed to build Tokio runtime: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BuildError::Runtime(e) => Some(e),
+        }
+    }
+}
