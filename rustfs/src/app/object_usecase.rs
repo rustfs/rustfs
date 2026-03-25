@@ -1598,25 +1598,6 @@ impl DefaultObjectUsecase {
             }
         }
 
-        // Calculate adaptive I/O strategy from permit wait time
-        // This adjusts buffer sizes, read-ahead, and caching behavior based on load
-        // Use 256KB as the base buffer size for strategy calculation
-        let base_buffer_size = self.base_buffer_size();
-        let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
-
-        // Note: I/O priority will be calculated later after we have the actual request size
-        // For now, we use Normal priority as a default until we know the real request size
-
-        // Log strategy details at debug level for troubleshooting
-        debug!(
-            wait_ms = permit_wait_duration.as_millis() as u64,
-            load_level = ?io_strategy.load_level,
-            buffer_size = io_strategy.buffer_size,
-            readahead = io_strategy.enable_readahead,
-            cache_wb = io_strategy.cache_writeback_enabled,
-            "Adaptive I/O strategy calculated (priority TBD after size detection)"
-        );
-
         // Check timeout before reading object
         if wrapper.is_timeout() {
             warn!(
@@ -1703,6 +1684,65 @@ impl DefaultObjectUsecase {
 
         let mut final_stream = reader.stream;
         let mut response_content_length = content_length;
+
+        // ============================================
+        // Enhanced Multi-Factor I/O Strategy Calculation
+        // ============================================
+        //
+        // Now that we have the file size and range information,
+        // calculate the optimal I/O strategy using multiple factors:
+        // - Storage media (NVMe/SSD/HDD)
+        // - Access pattern (sequential/random)
+        // - Bandwidth observations
+        // - Concurrent request count
+        // - Permit wait time (system load)
+        let base_buffer_size = self.base_buffer_size();
+
+        // Determine if this is likely a sequential read:
+        // - Full object reads (no range) are typically sequential
+        // - Range requests from offset 0 may be sequential
+        // - Random range accesses are typically random
+        let is_sequential_hint = if rs.is_none() {
+            // Full object read - likely sequential
+            true
+        } else if let Some(range_spec) = &rs {
+            // Range request - sequential only if starting from beginning
+            range_spec.start == 0 && !range_spec.is_suffix_length
+        } else {
+            false
+        };
+
+        // Record access pattern for future detection
+        if let Some(range_spec) = &rs {
+            if range_spec.start >= 0 {
+                manager.record_access(range_spec.start as u64, response_content_length as u64);
+            }
+        }
+
+        // Calculate multi-factor I/O strategy
+        let io_strategy = manager.calculate_io_strategy_with_context(
+            info.size,
+            base_buffer_size,
+            permit_wait_duration,
+            is_sequential_hint,
+        );
+
+        // Log enhanced strategy details
+        debug!(
+            wait_ms = permit_wait_duration.as_millis() as u64,
+            load_level = ?io_strategy.load_level,
+            buffer_size = io_strategy.buffer_size,
+            buffer_multiplier = io_strategy.buffer_multiplier,
+            readahead = io_strategy.enable_readahead,
+            cache_wb = io_strategy.cache_writeback_enabled,
+            storage_media = ?io_strategy.storage_media,
+            access_pattern = ?io_strategy.access_pattern,
+            bandwidth_tier = ?io_strategy.bandwidth_tier,
+            concurrent_requests = io_strategy.concurrent_requests,
+            file_size = info.size,
+            is_sequential = is_sequential_hint,
+            "Enhanced multi-factor I/O strategy calculated"
+        );
 
         debug!(
             "GET object metadata check: parts={}, provided_sse_key={:?}",
