@@ -42,6 +42,8 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
+// Performance metrics recording (with zero-copy-metrics integration)
+use rustfs_zero_copy_metrics;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -698,6 +700,8 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let start_time = std::time::Instant::now();
+
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -1046,9 +1050,22 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
+
+        // Record PutObject metrics via zero-copy-metrics
+        #[cfg(feature = "metrics")]
+        {
+            let duration_ms = start_time.elapsed().as_millis() as f64;
+            rustfs_zero_copy_metrics::record_put_object(
+                duration_ms,
+                size,
+                enable_zero_copy,  // Track if zero-copy was enabled
+            );
+        }
+
         result
     }
 
@@ -1577,6 +1594,18 @@ impl DefaultObjectUsecase {
             // S3 bucket notifications (s3:GetObject events) are triggered.
             // This ensures event-driven workflows (Lambda, SNS) work correctly
             // for both cache hits and misses.
+
+            // Record GetObject metrics for cache hits via rustfs_zero_copy_metrics
+            #[cfg(feature = "metrics")]
+            {
+                let total_duration = request_start.elapsed();
+                rustfs_zero_copy_metrics::record_get_object(
+                    total_duration.as_millis() as f64,
+                    cached.content_length,
+                    true,  // Cache hit
+                );
+            }
+
             let result = Ok(S3Response::new(output));
             let _ = helper.complete(&result);
             return result;
@@ -2185,6 +2214,14 @@ impl DefaultObjectUsecase {
 
             // Record buffer size that was used
             histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
+
+            // Additional metrics via rustfs_zero_copy_metrics
+            // Note: from_cache is false here because cache hits return early (line 1599)
+            rustfs_zero_copy_metrics::record_get_object(
+                total_duration.as_millis() as f64,
+                response_content_length,
+                false,  // Cache miss - hits are recorded in the cache hit block above
+            );
         }
 
         // Check for timeout before returning

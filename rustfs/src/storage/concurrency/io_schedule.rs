@@ -576,7 +576,7 @@ impl IoStrategy {
         let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
 
         Self {
-            // Enhanced fields with default/unknown values
+            // Core fields
             storage_media: StorageMedia::Unknown,
             access_pattern: AccessPattern::Unknown,
             observed_bandwidth_bps: None,
@@ -593,7 +593,7 @@ impl IoStrategy {
             random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
             low_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
             high_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
-            priority_enabled: rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
+            priority_enabled: false,
             priority: IoPriority::Normal,
             queue_capacity_hint: 0,
             load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
@@ -847,7 +847,7 @@ impl IoStrategy {
         };
 
         Self {
-            // Enhanced fields
+            // Core fields
             storage_media: context.storage_media,
             access_pattern: context.access_pattern,
             observed_bandwidth_bps: context.observed_bandwidth_bps,

@@ -565,6 +565,39 @@ async fn run(config: config::Config) -> Result<()> {
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
         init_metrics_system(ctx.clone());
+
+        // Initialize auto-tuner for performance optimization (optional)
+        #[cfg(feature = "metrics")]
+        {
+            use crate::monitoring::AutoTuner;
+            use crate::monitoring::TunerConfig;
+            use std::env;
+
+            // Check if auto-tuner is enabled via environment variable
+            let autotuner_enabled = env::var("RUSTFS_AUTOTUNER_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .unwrap_or(false);
+
+            if autotuner_enabled {
+                info!(target: "rustfs::main::run", "Starting auto-tuner for performance optimization");
+
+                // Configure auto-tuner with default settings
+                let config = TunerConfig::default();
+
+                tokio::spawn(async move {
+                    let tuner = AutoTuner::with_config(config);
+                    // Run auto-tuner with 60-second intervals
+                    if let Err(e) = tuner.run(std::time::Duration::from_secs(60)).await {
+                        error!(target: "rustfs::autotuner", "Auto-tuner failed: {}", e);
+                    }
+                });
+
+                info!(target: "rustfs::main::run", "Auto-tuner started successfully");
+            } else {
+                info!(target: "rustfs::main::run", "Auto-tuner disabled (set RUSTFS_AUTOTUNER_ENABLED=true to enable)");
+            }
+        }
     }
 
     info!(

@@ -16,9 +16,15 @@
 //!
 //! Provides real-time performance metrics collection with automatic
 //! Prometheus-compatible reporting via the `metrics` crate.
+//!
+//! OTEL initialization is handled in `rustfs-obs` crate, this module
+//! focuses on metrics recording through the `metrics` crate.
 
+pub mod autotuner;
 pub mod collector;
 pub mod metrics;
 
 // Re-exports
+pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
+pub use collector::MetricsCollector;
 pub use metrics::PerformanceMetrics;
