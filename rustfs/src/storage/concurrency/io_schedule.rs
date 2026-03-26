@@ -709,6 +709,7 @@ impl IoStrategy {
 
         // Build minimal scheduling context for compatibility path
         let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
+        #[cfg(feature = "io-scheduler-debug")]
         let load_level_clone = load_level.clone();
         // Build core strategy
         let core = IoStrategyCore {
@@ -944,12 +945,10 @@ impl IoStrategy {
         let clamp_max_applied = buffer_size > clamp_max;
         buffer_size = buffer_size.clamp(clamp_min, clamp_max);
 
-        // Determine readahead preference
-        let mut readahead_reason;
-
         // Start with storage profile preference
         let mut should_enable_readahead = storage_profile.prefers_readahead;
-        readahead_reason = if storage_profile.prefers_readahead {
+        // Determine readahead preference
+        let mut readahead_reason = if storage_profile.prefers_readahead {
             "media-pref"
         } else {
             "media-no-pref"
@@ -1004,6 +1003,7 @@ impl IoStrategy {
         } else {
             IoPriority::Normal
         };
+        #[cfg(feature = "io-scheduler-debug")]
         let load_level_clone = load_level.clone();
         // Build core strategy with essential runtime fields
         let core = IoStrategyCore {
