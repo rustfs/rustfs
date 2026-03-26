@@ -205,7 +205,7 @@ impl AsyncRead for DirectIoReader {
             match self.read_chunk(remaining) {
                 Ok(0) => break,
                 Ok(n) => {
-                    remaining = &mut remaining[n..];
+                    remaining = remaining[n..];
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             }
