@@ -273,11 +273,7 @@ impl BytesPool {
     pub fn hit_rate(&self) -> f64 {
         let hits = self.metrics.pool_hits.load(Ordering::Relaxed);
         let total = self.metrics.total_acquires.load(Ordering::Relaxed);
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
+        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
     }
 
     /// Get the number of available buffers in the pool.
@@ -302,11 +298,7 @@ impl PoolTier {
         *self.metrics.lock().unwrap() = Some(metrics);
     }
 
-    async fn acquire_buffer(
-        &self,
-        size: usize,
-        pool_metrics: &BytesPoolMetrics,
-    ) -> PooledBuffer {
+    async fn acquire_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> PooledBuffer {
         // Acquire semaphore permit (owned for storage in PooledBuffer)
         let permit = Arc::clone(&self.semaphore).acquire_owned().await.unwrap();
 
@@ -335,15 +327,19 @@ impl PoolTier {
         } else {
             // Allocate new buffer
             let buf = BytesMut::with_capacity(size.max(self.buffer_size));
-            pool_metrics.total_bytes_allocated.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
-            pool_metrics.current_allocated_bytes.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics
+                .total_bytes_allocated
+                .fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics
+                .current_allocated_bytes
+                .fetch_add(buf.capacity() as u64, Ordering::Relaxed);
             buf
         };
 
         let buffer_capacity = buffer.capacity();
 
         // Record metrics
-        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
+        rustfs_io_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
 
         // Record hit/miss (pool_metrics and metrics point to same Arc)
         if was_reused {
@@ -359,11 +355,7 @@ impl PoolTier {
         }
     }
 
-    fn try_acquire_buffer(
-        &self,
-        size: usize,
-        pool_metrics: &BytesPoolMetrics,
-    ) -> Option<PooledBuffer> {
+    fn try_acquire_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> Option<PooledBuffer> {
         // Try to acquire permit without blocking
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
 
@@ -392,15 +384,19 @@ impl PoolTier {
         } else {
             // Allocate new buffer
             let buf = BytesMut::with_capacity(size.max(self.buffer_size));
-            pool_metrics.total_bytes_allocated.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
-            pool_metrics.current_allocated_bytes.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics
+                .total_bytes_allocated
+                .fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics
+                .current_allocated_bytes
+                .fetch_add(buf.capacity() as u64, Ordering::Relaxed);
             buf
         };
 
         let buffer_capacity = buffer.capacity();
 
         // Record metrics
-        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
+        rustfs_io_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
 
         // Record hit/miss (pool_metrics and metrics point to same Arc)
         if was_reused {

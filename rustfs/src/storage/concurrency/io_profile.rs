@@ -25,6 +25,7 @@ pub enum StorageMedia {
 }
 
 impl StorageMedia {
+    #[allow(dead_code)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "nvme" => Some(Self::Nvme),
@@ -35,6 +36,7 @@ impl StorageMedia {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Nvme => "nvme",
@@ -64,21 +66,25 @@ impl AccessPattern {
     }
 
     /// Check if this is a sequential access pattern.
+    #[allow(dead_code)]
     pub fn is_sequential(&self) -> bool {
         matches!(self, Self::Sequential)
     }
 
     /// Check if this is a random access pattern.
+    #[allow(dead_code)]
     pub fn is_random(&self) -> bool {
         matches!(self, Self::Random)
     }
 
     /// Check if this is a mixed access pattern.
+    #[allow(dead_code)]
     pub fn is_mixed(&self) -> bool {
         matches!(self, Self::Mixed)
     }
 
     /// Check if this pattern is unknown.
+    #[allow(dead_code)]
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
@@ -202,9 +208,10 @@ pub fn detect_storage_media(storage_detection_enabled: bool, storage_media_overr
     #[cfg(target_os = "macos")]
     {
         if let Ok(media) = detect_macos_storage_media()
-            && media != StorageMedia::Unknown {
-                return media;
-            }
+            && media != StorageMedia::Unknown
+        {
+            return media;
+        }
     }
 
     StorageMedia::Unknown
@@ -255,9 +262,7 @@ fn detect_macos_storage_media() -> Result<StorageMedia, std::io::Error> {
     use std::process::Command;
 
     // Use diskutil to get disk information
-    let output = Command::new("diskutil")
-        .args(["info", "/"])
-        .output()?;
+    let output = Command::new("diskutil").args(["info", "/"]).output()?;
 
     if !output.status.success() {
         return Ok(StorageMedia::Unknown);
@@ -353,10 +358,10 @@ mod tests {
     #[test]
     fn test_pattern_detector_mixed() {
         let mut detector = IoPatternDetector::new(10, 1024);
-        detector.record(0, 4096);      // Sequential to 4096
-        detector.record(4096, 4096);   // Sequential to 8192
-        detector.record(65536, 4096);  // Random jump
-        detector.record(98304, 4096);  // Sequential from random position
+        detector.record(0, 4096); // Sequential to 4096
+        detector.record(4096, 4096); // Sequential to 8192
+        detector.record(65536, 4096); // Random jump
+        detector.record(98304, 4096); // Sequential from random position
         assert_eq!(detector.current_pattern(), AccessPattern::Mixed);
     }
 

@@ -32,7 +32,7 @@ use tokio::io::AsyncWrite;
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_zero_copy_core::ZeroCopyObjectWriter;
+/// use rustfs_io_core::ZeroCopyObjectWriter;
 /// use bytes::Bytes;
 ///
 /// #[tokio::main]
@@ -112,9 +112,7 @@ impl ZeroCopyObjectWriter {
     /// ```
     pub async fn write_zero_copy(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
         if self.finalized {
-            return Err(ZeroCopyWriteError::Finalized(
-                "Cannot write to finalized writer".to_string(),
-            ));
+            return Err(ZeroCopyWriteError::Finalized("Cannot write to finalized writer".to_string()));
         }
 
         let len = data.len();
@@ -138,9 +136,7 @@ impl ZeroCopyObjectWriter {
     /// * `Err(ZeroCopyWriteError)` - Write error
     pub async fn write_slice(&mut self, data: &[u8]) -> Result<usize, ZeroCopyWriteError> {
         if self.finalized {
-            return Err(ZeroCopyWriteError::Finalized(
-                "Cannot write to finalized writer".to_string(),
-            ));
+            return Err(ZeroCopyWriteError::Finalized("Cannot write to finalized writer".to_string()));
         }
 
         let len = data.len();
@@ -253,11 +249,7 @@ impl std::fmt::Debug for ZeroCopyObjectWriter {
 ///
 /// This allows the writer to be used with tokio's async I/O utilities.
 impl AsyncWrite for ZeroCopyObjectWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, tokio::io::Error>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, tokio::io::Error>> {
         if self.finalized {
             return Poll::Ready(Err(tokio::io::Error::new(
                 tokio::io::ErrorKind::WriteZero,
@@ -271,18 +263,12 @@ impl AsyncWrite for ZeroCopyObjectWriter {
         Poll::Ready(Ok(len))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), tokio::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), tokio::io::Error>> {
         // Nothing to flush for in-memory buffer
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), tokio::io::Error>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), tokio::io::Error>> {
         self.finalized = true;
         Poll::Ready(Ok(()))
     }

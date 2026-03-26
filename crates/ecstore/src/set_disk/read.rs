@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_config::{ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE};
+use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 impl SetDisks {
     pub(super) async fn read_parts(

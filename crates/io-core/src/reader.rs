@@ -120,11 +120,7 @@ impl ZeroCopyObjectReader {
     /// ```
     #[cfg(unix)]
     #[allow(unsafe_code)]
-    pub async fn from_file_mmap_path(
-        path: &std::path::Path,
-        offset: u64,
-        size: usize,
-    ) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_mmap_path(path: &std::path::Path, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use memmap2::MmapOptions;
 
         let path = path.to_path_buf();
@@ -132,16 +128,10 @@ impl ZeroCopyObjectReader {
 
         tokio::task::spawn_blocking(move || {
             // Open the file in sync context
-            let std_file = std::fs::File::open(&path)
-                .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?;
+            let std_file = std::fs::File::open(&path).map_err(|e| ZeroCopyReadError::Io(e.to_string()))?;
 
             // Create memory map
-            let mmap = unsafe {
-                MmapOptions::new()
-                    .offset(offset)
-                    .len(size)
-                    .map(&std_file)
-            }
+            let mmap = unsafe { MmapOptions::new().offset(offset).len(size).map(&std_file) }
                 .map_err(|e| ZeroCopyReadError::Mmap(e.to_string()))?;
 
             // Convert to Bytes (this is a copy, but only done once)
@@ -150,8 +140,8 @@ impl ZeroCopyObjectReader {
                 pos: 0,
             })
         })
-            .await
-            .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
+        .await
+        .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
     }
 
     /// Create a zero-copy reader from a file using mmap.
@@ -180,11 +170,7 @@ impl ZeroCopyObjectReader {
     /// let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
     /// ```
     #[cfg(unix)]
-    pub async fn from_file_mmap(
-        file: &tokio::fs::File,
-        offset: u64,
-        size: usize,
-    ) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
         // For mmap, we need the file path - fall back to regular read if not available
@@ -205,11 +191,7 @@ impl ZeroCopyObjectReader {
     ///
     /// On platforms that don't support mmap, this falls back to regular file I/O.
     #[cfg(not(unix))]
-    pub async fn from_file_mmap(
-        file: &tokio::fs::File,
-        offset: u64,
-        size: usize,
-    ) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
         let mut cloned = file.try_clone().await?;
@@ -256,11 +238,7 @@ impl ZeroCopyObjectReader {
 }
 
 impl AsyncRead for ZeroCopyObjectReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let remaining = self.data.len() - self.pos;
         if remaining == 0 {
             return Poll::Ready(Ok(()));
@@ -320,7 +298,7 @@ mod tests {
         assert_eq!(reader.position(), 0);
 
         let mut buf = [0u8; 5];
-        reader.read(&mut buf[..]).await.unwrap();
+        reader.read_exact(&mut buf[..]).await.unwrap();
 
         assert_eq!(reader.position(), 5);
     }

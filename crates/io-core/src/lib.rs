@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use rustfs_zero_copy_core::{ZeroCopyObjectReader, BytesPool};
+//! use rustfs_io_core::{ZeroCopyObjectReader, BytesPool};
 //! use bytes::Bytes;
 //!
 //! // Create from existing bytes (zero-copy)
@@ -51,8 +51,8 @@ pub mod pool;
 pub mod reader;
 pub mod writer;
 
+#[cfg(target_os = "linux")]
+pub use direct_io::{DirectIoError, DirectIoReader};
 pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
 pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
 pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
-#[cfg(target_os = "linux")]
-pub use direct_io::{DirectIoReader, DirectIoError};

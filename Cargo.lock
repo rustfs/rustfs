@@ -7608,6 +7608,8 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
@@ -7627,8 +7629,6 @@ dependencies = [
  "rustfs-targets",
  "rustfs-trusted-proxies",
  "rustfs-utils",
- "rustfs-zero-copy-core",
- "rustfs-zero-copy-metrics",
  "rustfs-zip",
  "rustls",
  "s3s",
@@ -7824,6 +7824,8 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-filemeta",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-policy",
@@ -7833,8 +7835,6 @@ dependencies = [
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
- "rustfs-zero-copy-core",
- "rustfs-zero-copy-metrics",
  "rustls",
  "s3s",
  "serde",
@@ -7939,6 +7939,27 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rustfs-io-core"
+version = "0.0.5"
+dependencies = [
+ "bytes",
+ "memmap2 0.9.10",
+ "rustfs-io-metrics",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-io-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8444,25 +8465,6 @@ version = "0.0.5"
 dependencies = [
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "rustfs-zero-copy-core"
-version = "0.0.5"
-dependencies = [
- "bytes",
- "memmap2 0.9.10",
- "rustfs-zero-copy-metrics",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "rustfs-zero-copy-metrics"
-version = "0.0.5"
-dependencies = [
- "metrics",
 ]
 
 [[package]]

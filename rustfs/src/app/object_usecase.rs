@@ -43,7 +43,6 @@ use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 // Performance metrics recording (with zero-copy-metrics integration)
-use rustfs_zero_copy_metrics;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -78,6 +77,7 @@ use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
+use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, EtagReader, HashReader, Reader, WarpReader};
@@ -260,25 +260,26 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     // Don't use zero-copy if compression is likely (compressible content types)
     // The compression check happens later in the flow
     if let Some(content_type) = headers.get("content-type")
-        && let Ok(ct) = content_type.to_str() {
-            // Skip zero-copy for easily compressible content types
-            // since compression will be applied
-            let compressible_types = [
-                "text/plain",
-                "text/html",
-                "text/css",
-                "text/javascript",
-                "application/javascript",
-                "application/json",
-                "application/xml",
-                "text/xml",
-            ];
-            for ct_type in compressible_types {
-                if ct.contains(ct_type) {
-                    return false;
-                }
+        && let Ok(ct) = content_type.to_str()
+    {
+        // Skip zero-copy for easily compressible content types
+        // since compression will be applied
+        let compressible_types = [
+            "text/plain",
+            "text/html",
+            "text/css",
+            "text/javascript",
+            "application/javascript",
+            "application/json",
+            "application/xml",
+            "text/xml",
+        ];
+        for ct_type in compressible_types {
+            if ct.contains(ct_type) {
+                return false;
             }
         }
+    }
 
     true
 }
@@ -801,10 +802,7 @@ impl DefaultObjectUsecase {
             // Record zero-copy write attempt
             counter!("rustfs.zero_copy.write.attempts.total").increment(1);
             histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
-            debug!(
-                "Zero-copy write enabled for {} byte object (bucket={}, key={})",
-                size, bucket, key
-            );
+            debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
         let body = tokio::io::BufReader::with_capacity(
@@ -1059,10 +1057,10 @@ impl DefaultObjectUsecase {
         #[cfg(feature = "metrics")]
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
-            rustfs_zero_copy_metrics::record_put_object(
+            rustfs_io_metrics::record_put_object(
                 duration_ms,
                 size,
-                enable_zero_copy,  // Track if zero-copy was enabled
+                enable_zero_copy, // Track if zero-copy was enabled
             );
         }
 
@@ -1509,7 +1507,7 @@ impl DefaultObjectUsecase {
             // Cache hits use zero-copy because cached.body is Arc<Bytes>, clone() only increments reference count
             #[cfg(feature = "metrics")]
             {
-                use rustfs_zero_copy_metrics::{record_memory_copy_saved, record_zero_copy_read};
+                use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
                 record_zero_copy_read(cached.body.len(), cache_serve_duration.as_secs_f64() * 1000.0);
                 // Memory saved: would have copied cached.body.len() bytes without zero-copy
                 record_memory_copy_saved(cached.body.len());
@@ -1595,14 +1593,14 @@ impl DefaultObjectUsecase {
             // This ensures event-driven workflows (Lambda, SNS) work correctly
             // for both cache hits and misses.
 
-            // Record GetObject metrics for cache hits via rustfs_zero_copy_metrics
+            // Record GetObject metrics for cache hits via rustfs_io_metrics
             #[cfg(feature = "metrics")]
             {
                 let total_duration = request_start.elapsed();
-                rustfs_zero_copy_metrics::record_get_object(
+                rustfs_io_metrics::record_get_object(
                     total_duration.as_millis() as f64,
                     cached.content_length,
-                    true,  // Cache hit
+                    true, // Cache hit
                 );
             }
 
@@ -1730,12 +1728,16 @@ impl DefaultObjectUsecase {
         // Record zero-copy read metrics for non-cache reads
         #[cfg(feature = "metrics")]
         {
-            use rustfs_zero_copy_metrics::{record_memory_copy_saved, record_zero_copy_read};
+            use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
             let read_duration = read_start.elapsed();
             // Estimate memory saved: assuming zero-copy avoids at least 2 copies (read + response)
             let estimated_saved = (info.size * 2) as usize;
             record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
             record_memory_copy_saved(estimated_saved);
+
+            // Record disk I/O operation for latency tracking (P50, P95, P99)
+            // This updates the MetricsCollector in ConcurrencyManager
+            manager.record_disk_operation(info.size as u64, read_duration, true).await;
         }
 
         check_preconditions(&req.headers, &info)?;
@@ -1819,9 +1821,10 @@ impl DefaultObjectUsecase {
 
         // Record access pattern for future detection
         if let Some(range_spec) = &rs
-            && range_spec.start >= 0 {
-                manager.record_access(range_spec.start as u64, response_content_length as u64);
-            }
+            && range_spec.start >= 0
+        {
+            manager.record_access(range_spec.start as u64, response_content_length as u64);
+        }
 
         // Record transfer for bandwidth monitoring
         // Note: For non-cached data, permit_wait_duration represents queue time, not I/O time.
@@ -1832,12 +1835,8 @@ impl DefaultObjectUsecase {
         }
 
         // Calculate multi-factor I/O strategy
-        let io_strategy = manager.calculate_io_strategy_with_context(
-            info.size,
-            base_buffer_size,
-            permit_wait_duration,
-            is_sequential_hint,
-        );
+        let io_strategy =
+            manager.calculate_io_strategy_with_context(info.size, base_buffer_size, permit_wait_duration, is_sequential_hint);
 
         // Log enhanced strategy details
         debug!(
@@ -2215,12 +2214,12 @@ impl DefaultObjectUsecase {
             // Record buffer size that was used
             histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
 
-            // Additional metrics via rustfs_zero_copy_metrics
+            // Additional metrics via rustfs_io_metrics
             // Note: from_cache is false here because cache hits return early (line 1599)
-            rustfs_zero_copy_metrics::record_get_object(
+            rustfs_io_metrics::record_get_object(
                 total_duration.as_millis() as f64,
                 response_content_length,
-                false,  // Cache miss - hits are recorded in the cache hit block above
+                false, // Cache miss - hits are recorded in the cache hit block above
             );
         }
 

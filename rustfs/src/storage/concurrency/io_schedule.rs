@@ -63,6 +63,7 @@ impl IoLoadLevel {
     }
 
     /// Get the load level as a string for metrics labels.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             IoLoadLevel::Low => "low",
@@ -73,6 +74,7 @@ impl IoLoadLevel {
     }
 
     /// Get the load level as a numeric index (0=Low, 1=Medium, 2=High, 3=Critical).
+    #[allow(dead_code)]
     pub fn level_index(&self) -> u8 {
         match self {
             IoLoadLevel::Low => 0,
@@ -107,8 +109,13 @@ pub enum IoPriority {
 
 impl IoPriority {
     /// Determine priority from request size using scheduler config thresholds.
+    #[allow(dead_code)]
     pub fn from_size(size: i64) -> Self {
-        Self::from_size_with_thresholds(size, IoSchedulerConfig::default().high_priority_size_threshold, IoSchedulerConfig::default().low_priority_size_threshold)
+        Self::from_size_with_thresholds(
+            size,
+            IoSchedulerConfig::default().high_priority_size_threshold,
+            IoSchedulerConfig::default().low_priority_size_threshold,
+        )
     }
 
     pub fn from_size_with_thresholds(size: i64, high_priority_size_threshold: usize, low_priority_size_threshold: usize) -> Self {
@@ -136,16 +143,19 @@ impl IoPriority {
     }
 
     /// Check if this is high priority.
+    #[allow(dead_code)]
     pub fn is_high(&self) -> bool {
         matches!(self, IoPriority::High)
     }
 
     /// Check if this is normal priority.
+    #[allow(dead_code)]
     pub fn is_normal(&self) -> bool {
         matches!(self, IoPriority::Normal)
     }
 
     /// Check if this is low priority.
+    #[allow(dead_code)]
     pub fn is_low(&self) -> bool {
         matches!(self, IoPriority::Low)
     }
@@ -358,6 +368,7 @@ impl IoSchedulerConfig {
 
 /// I/O queue status for monitoring.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct IoQueueStatus {
     /// Total permits available.
     pub total_permits: usize,
@@ -477,11 +488,8 @@ pub struct IoStrategyCore {
 
 impl IoStrategyCore {
     /// Create a minimal IoStrategyCore with essential fields only.
-    pub fn new(
-        storage_media: StorageMedia,
-        access_pattern: AccessPattern,
-        buffer_size: usize,
-    ) -> Self {
+    #[allow(dead_code)]
+    pub fn new(storage_media: StorageMedia, access_pattern: AccessPattern, buffer_size: usize) -> Self {
         Self {
             storage_media,
             access_pattern,
@@ -542,9 +550,9 @@ pub struct IoStrategyDebugInfo {
     pub notes: &'static str,
 
     // ===== Request Classification =====
-    pub request_class: &'static str,  // "small" | "medium" | "large"
-    pub io_path_kind: &'static str,    // "sequential" | "random"
-    pub queue_mode: &'static str,      // "high-priority" | "normal-priority" | "low-priority"
+    pub request_class: &'static str, // "small" | "medium" | "large"
+    pub io_path_kind: &'static str,  // "sequential" | "random"
+    pub queue_mode: &'static str,    // "high-priority" | "normal-priority" | "low-priority"
 
     // ===== State Labels =====
     pub load_level_label: &'static str,
@@ -701,7 +709,7 @@ impl IoStrategy {
 
         // Build minimal scheduling context for compatibility path
         let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
-
+        let load_level_clone = load_level.clone();
         // Build core strategy
         let core = IoStrategyCore {
             // Basic configuration
@@ -763,7 +771,7 @@ impl IoStrategy {
             request_class: "unknown",
             io_path_kind: "compat",
             queue_mode: "standard",
-            load_level_label: load_level.as_str(),
+            load_level_label: load_level_clone.as_str(),
             pattern_label: "unknown",
             media_label: "unknown",
             bandwidth_label: "unknown",
@@ -798,16 +806,16 @@ impl IoStrategy {
             random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
             low_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
             high_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
-            queue_capacity_hint: 0,
-            load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
-            load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
-            load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
-            starvation_prevention_interval_ms: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL,
-            starvation_threshold_secs: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
-            max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-            priority_queue_high_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY,
-            priority_queue_normal_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY,
-            priority_queue_low_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY,
+            // queue_capacity_hint: 0,
+            // load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
+            // load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
+            // load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            // starvation_prevention_interval_ms: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL,
+            // starvation_threshold_secs: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
+            // max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+            // priority_queue_high_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY,
+            // priority_queue_normal_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY,
+            // priority_queue_low_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY,
             pattern_history_size: rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
             sequential_step_tolerance_bytes: rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
             bandwidth_ema_beta: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
@@ -817,8 +825,8 @@ impl IoStrategy {
             is_range_request: false,
             target_read_size: -1,
             source_request_size: -1,
-            profile_prefers_readahead: false,
-            fallback_to_unknown_media: true,
+            // profile_prefers_readahead: false,
+            // fallback_to_unknown_media: true,
             effective_multiplier_stage_concurrency: buffer_multiplier,
             effective_multiplier_stage_pattern: 1.0,
             effective_multiplier_stage_bandwidth: 1.0,
@@ -855,7 +863,7 @@ impl IoStrategy {
     /// An IoStrategy with optimized parameters based on all factors.
     pub fn from_context_with_config(context: &IoSchedulingContext, config: &IoSchedulerConfig) -> Self {
         // Stage 1: Start with base buffer size
-        let mut buffer_size = context.base_buffer_size;
+        let mut buffer_size;
         let mut buffer_multiplier = 1.0;
 
         // Stage 2: Apply load level reduction based on permit wait
@@ -938,15 +946,14 @@ impl IoStrategy {
 
         // Determine readahead preference
         let mut readahead_reason;
-        
-        
-        
-        
-        
 
         // Start with storage profile preference
         let mut should_enable_readahead = storage_profile.prefers_readahead;
-        readahead_reason = if storage_profile.prefers_readahead { "media-pref" } else { "media-no-pref" };
+        readahead_reason = if storage_profile.prefers_readahead {
+            "media-pref"
+        } else {
+            "media-no-pref"
+        };
 
         // Apply access pattern override
         let readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
@@ -997,7 +1004,7 @@ impl IoStrategy {
         } else {
             IoPriority::Normal
         };
-
+        let load_level_clone = load_level.clone();
         // Build core strategy with essential runtime fields
         let core = IoStrategyCore {
             // ===== Basic Configuration =====
@@ -1058,10 +1065,16 @@ impl IoStrategy {
 
             // ===== Request Classification =====
             request_class: if context.file_size > 0 {
-                if context.file_size < config.high_priority_size_threshold as i64 { "small" }
-                else if context.file_size < config.low_priority_size_threshold as i64 { "medium" }
-                else { "large" }
-            } else { "unknown" },
+                if context.file_size < config.high_priority_size_threshold as i64 {
+                    "small"
+                } else if context.file_size < config.low_priority_size_threshold as i64 {
+                    "medium"
+                } else {
+                    "large"
+                }
+            } else {
+                "unknown"
+            },
             io_path_kind: if context.is_sequential_hint { "sequential" } else { "random" },
             queue_mode: match priority {
                 IoPriority::High => "high-priority",
@@ -1070,7 +1083,7 @@ impl IoStrategy {
             },
 
             // ===== State Labels =====
-            load_level_label: load_level.as_str(),
+            load_level_label: load_level_clone.as_str(),
             pattern_label: context.access_pattern.as_str(),
             media_label: match context.storage_media {
                 StorageMedia::Nvme => "nvme",
@@ -1162,6 +1175,7 @@ impl IoStrategy {
     }
 
     /// Get a human-readable description of the current I/O strategy.
+    #[allow(dead_code)]
     pub fn description(&self) -> String {
         format!(
             "IoStrategy[{:?}]: buffer={}KB, multiplier={:.2}, readahead={}, cache_wb={}, wait={:?}",
@@ -1251,6 +1265,7 @@ impl IoLoadMetrics {
     }
 
     /// Get the overall average wait since startup
+    #[allow(dead_code)]
     pub(crate) fn lifetime_average_wait(&self) -> Duration {
         let total = self.total_wait_ns.load(Ordering::Relaxed);
         let count = self.observation_count.load(Ordering::Relaxed);
@@ -1392,6 +1407,7 @@ use tracing::warn;
 
 /// Queued I/O request with metadata.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct QueuedRequest<T> {
     /// The actual request payload.
     request: T,
@@ -1407,6 +1423,7 @@ struct QueuedRequest<T> {
 
 /// Queue statistics for monitoring.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct QueueStats {
     /// Number of high priority requests processed.
     high_processed: u64,
@@ -1492,6 +1509,7 @@ impl Default for IoPriorityQueueConfig {
 
 impl IoPriorityQueueConfig {
     /// Load configuration from environment.
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         Self {
             queue_high_capacity: rustfs_utils::get_env_usize(
@@ -1520,6 +1538,7 @@ impl IoPriorityQueueConfig {
 
 impl<T> IoPriorityQueue<T> {
     /// Create a new priority queue with the given configuration.
+    #[allow(dead_code)]
     pub fn new(config: IoPriorityQueueConfig) -> Self {
         let config_clone = config.clone();
         Self {
@@ -1533,6 +1552,7 @@ impl<T> IoPriorityQueue<T> {
     }
 
     /// Enqueue a request with the given priority.
+    #[allow(dead_code)]
     pub async fn enqueue(&self, priority: IoPriority, request: T) {
         let queued = QueuedRequest {
             request,
@@ -1553,6 +1573,7 @@ impl<T> IoPriorityQueue<T> {
     ///
     /// This method performs starvation prevention checks before dequeuing.
     /// Returns `None` if all queues are empty.
+    #[allow(dead_code)]
     pub async fn dequeue(&self) -> Option<(T, IoPriority)> {
         // 1. Check for starvation prevention
         self.check_starvation().await;
@@ -1630,6 +1651,7 @@ impl<T> IoPriorityQueue<T> {
     }
 
     /// Get current queue status for monitoring.
+    #[allow(dead_code)]
     pub async fn status(&self) -> IoQueueStatus {
         let high_queue = self.high_queue.lock().await;
         let normal_queue = self.normal_queue.lock().await;
@@ -1650,6 +1672,7 @@ impl<T> IoPriorityQueue<T> {
     }
 
     /// Get the total number of queued requests.
+    #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         let high_queue = self.high_queue.lock().await;
         let normal_queue = self.normal_queue.lock().await;
@@ -1659,6 +1682,7 @@ impl<T> IoPriorityQueue<T> {
     }
 
     /// Check if all queues are empty.
+    #[allow(dead_code)]
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
@@ -1672,6 +1696,7 @@ impl<T> IoPriorityQueue<T> {
 ///
 /// These metrics are exposed for Prometheus scraping and provide
 /// visibility into the priority queue behavior.
+#[allow(dead_code)]
 pub struct IoPriorityMetrics {
     /// High priority queue depth.
     pub high_queue_depth: AtomicU64,
@@ -1695,6 +1720,7 @@ pub struct IoPriorityMetrics {
     pub low_processed: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl IoPriorityMetrics {
     /// Create a new metrics instance.
     pub const fn new() -> Self {
@@ -1713,6 +1739,7 @@ impl IoPriorityMetrics {
     }
 
     /// Update queue depths from status.
+    #[allow(dead_code)]
     pub fn update_queue_depths(&self, status: &IoQueueStatus) {
         self.high_queue_depth
             .store(status.high_priority_waiting as u64, Ordering::Relaxed);
@@ -1723,11 +1750,13 @@ impl IoPriorityMetrics {
     }
 
     /// Record a starvation event.
+    #[allow(dead_code)]
     pub fn record_starvation(&self) {
         self.starvation_events.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a processed request.
+    #[allow(dead_code)]
     pub fn record_processed(&self, priority: IoPriority) {
         match priority {
             IoPriority::High => self.high_processed.fetch_add(1, Ordering::Relaxed),
@@ -1781,6 +1810,7 @@ impl IoPriorityMetrics {
 }
 
 /// Global I/O priority metrics instance.
+#[allow(dead_code)]
 pub static IO_PRIORITY_METRICS: IoPriorityMetrics = IoPriorityMetrics::new();
 
 /// Get optimized buffer size for I/O operations.
@@ -1804,12 +1834,11 @@ pub static IO_PRIORITY_METRICS: IoPriorityMetrics = IoPriorityMetrics::new();
 /// let buffer_size = get_buffer_size_opt_in(1024 * 1024); // 1MB file
 /// assert!(buffer_size >= 64 * 1024); // At least 64KB
 /// ```
+#[allow(dead_code)]
 pub fn get_buffer_size_opt_in(file_size: i64) -> usize {
     // Get base buffer size from configuration
-    let base_buffer_size = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE,
-        rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
-    );
+    let base_buffer_size =
+        rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE);
 
     // Apply concurrency-aware adjustments
     get_concurrency_aware_buffer_size(file_size, base_buffer_size)
@@ -1994,14 +2023,14 @@ mod tests {
     async fn test_multi_factor_strategy_nvme_sequential_low_load() {
         // NVMe + Sequential + Low load = maximum buffer size
         let context = IoSchedulingContext {
-            file_size: 100 * 1024 * 1024, // 100MB
-            base_buffer_size: 256 * 1024,   // 256KB
+            file_size: 100 * 1024 * 1024,                   // 100MB
+            base_buffer_size: 256 * 1024,                   // 256KB
             permit_wait_duration: Duration::from_millis(5), // Low load
             is_sequential_hint: true,
             access_pattern: AccessPattern::Sequential,
             storage_media: StorageMedia::Nvme,
             observed_bandwidth_bps: Some(600 * 1024 * 1024), // 600MB/s (High, > 512MB/s threshold)
-            concurrent_requests: 2, // Low concurrency
+            concurrent_requests: 2,                          // Low concurrency
         };
 
         let config = IoSchedulerConfig::default();
@@ -2028,7 +2057,7 @@ mod tests {
             access_pattern: AccessPattern::Random,
             storage_media: StorageMedia::Hdd,
             observed_bandwidth_bps: Some(10 * 1024 * 1024), // 10MB/s (Low)
-            concurrent_requests: 16, // High concurrency
+            concurrent_requests: 16,                        // High concurrency
         };
 
         let config = IoSchedulerConfig::default();
@@ -2055,15 +2084,17 @@ mod tests {
             access_pattern: AccessPattern::Mixed,
             storage_media: StorageMedia::Ssd,
             observed_bandwidth_bps: Some(100 * 1024 * 1024), // 100MB/s (Medium)
-            concurrent_requests: 6, // Medium concurrency
+            concurrent_requests: 6,                          // Medium concurrency
         };
 
         let config = IoSchedulerConfig::default();
         let strategy = IoStrategy::from_context_with_config(&context, &config);
 
         // Should get moderate buffer
-        assert!(strategy.buffer_size >= 128 * 1024 && strategy.buffer_size <= 256 * 1024,
-                "SSD mixed medium load should get moderate buffer");
+        assert!(
+            strategy.buffer_size >= 128 * 1024 && strategy.buffer_size <= 256 * 1024,
+            "SSD mixed medium load should get moderate buffer"
+        );
         assert_eq!(strategy.load_level, IoLoadLevel::Medium);
         assert_eq!(strategy.storage_media, StorageMedia::Ssd);
         assert_eq!(strategy.access_pattern, AccessPattern::Mixed);
@@ -2100,8 +2131,8 @@ mod tests {
     async fn test_multi_factor_strategy_buffer_cap_enforcement() {
         // Test that storage media caps are enforced
         let context = IoSchedulingContext {
-            file_size: 1000 * 1024 * 1024, // 1GB
-            base_buffer_size: 16 * 1024 * 1024, // 16MB (very large)
+            file_size: 1000 * 1024 * 1024,                  // 1GB
+            base_buffer_size: 16 * 1024 * 1024,             // 16MB (very large)
             permit_wait_duration: Duration::from_millis(1), // Low load
             is_sequential_hint: true,
             access_pattern: AccessPattern::Sequential,
@@ -2197,8 +2228,10 @@ mod tests {
         let sequential_strategy = IoStrategy::from_context_with_config(&sequential_context, &config);
         let random_strategy = IoStrategy::from_context_with_config(&random_context, &config);
 
-        assert!(sequential_strategy.buffer_size > random_strategy.buffer_size,
-                "Sequential should get larger buffer than random");
+        assert!(
+            sequential_strategy.buffer_size > random_strategy.buffer_size,
+            "Sequential should get larger buffer than random"
+        );
 
         #[cfg(feature = "io-scheduler-debug")]
         {
@@ -2227,8 +2260,10 @@ mod tests {
 
         assert_eq!(strategy.storage_media, StorageMedia::Unknown);
         assert_eq!(strategy.bandwidth_tier, BandwidthTier::Unknown);
-        assert!(strategy.buffer_size <= context.base_buffer_size,
-                "Unknown media should not exceed base buffer");
+        assert!(
+            strategy.buffer_size <= context.base_buffer_size,
+            "Unknown media should not exceed base buffer"
+        );
     }
 
     #[test]
@@ -2284,11 +2319,51 @@ mod tests {
         // Test readahead enable/disable logic
         let configs = vec![
             // (media, pattern, load, bandwidth, concurrency, expected_readahead, reason)
-            (StorageMedia::Nvme, AccessPattern::Sequential, IoLoadLevel::Low, BandwidthTier::High, 1, true, "all-favorable"),
-            (StorageMedia::Hdd, AccessPattern::Random, IoLoadLevel::Low, BandwidthTier::Medium, 1, false, "random-pattern"),
-            (StorageMedia::Ssd, AccessPattern::Sequential, IoLoadLevel::High, BandwidthTier::Medium, 1, false, "high-load"),
-            (StorageMedia::Nvme, AccessPattern::Sequential, IoLoadLevel::Low, BandwidthTier::Low, 1, false, "low-bandwidth"),
-            (StorageMedia::Ssd, AccessPattern::Random, IoLoadLevel::Low, BandwidthTier::High, 20, false, "high-concurrency-random"),
+            (
+                StorageMedia::Nvme,
+                AccessPattern::Sequential,
+                IoLoadLevel::Low,
+                BandwidthTier::High,
+                1,
+                true,
+                "all-favorable",
+            ),
+            (
+                StorageMedia::Hdd,
+                AccessPattern::Random,
+                IoLoadLevel::Low,
+                BandwidthTier::Medium,
+                1,
+                false,
+                "random-pattern",
+            ),
+            (
+                StorageMedia::Ssd,
+                AccessPattern::Sequential,
+                IoLoadLevel::High,
+                BandwidthTier::Medium,
+                1,
+                false,
+                "high-load",
+            ),
+            (
+                StorageMedia::Nvme,
+                AccessPattern::Sequential,
+                IoLoadLevel::Low,
+                BandwidthTier::Low,
+                1,
+                false,
+                "low-bandwidth",
+            ),
+            (
+                StorageMedia::Ssd,
+                AccessPattern::Random,
+                IoLoadLevel::Low,
+                BandwidthTier::High,
+                20,
+                false,
+                "high-concurrency-random",
+            ),
         ];
 
         for (media, pattern, load, bandwidth, concurrency, expected, reason) in configs {
@@ -2316,9 +2391,11 @@ mod tests {
             let config = IoSchedulerConfig::default();
             let strategy = IoStrategy::from_context_with_config(&context, &config);
 
-            assert_eq!(strategy.enable_readahead, expected,
+            assert_eq!(
+                strategy.enable_readahead, expected,
                 "Readahead mismatch for case: {}, expected={}, got={}",
-                reason, expected, strategy.enable_readahead);
+                reason, expected, strategy.enable_readahead
+            );
         }
     }
 
@@ -2328,13 +2405,13 @@ mod tests {
         // Test that all multiplier stages are applied
         let context = IoSchedulingContext {
             file_size: 100 * 1024 * 1024,
-            base_buffer_size: 1024 * 1024, // 1MB base
+            base_buffer_size: 1024 * 1024,                    // 1MB base
             permit_wait_duration: Duration::from_millis(100), // High load (0.5x)
             is_sequential_hint: false,
             access_pattern: AccessPattern::Random, // Penalty (0.8x)
             storage_media: StorageMedia::Ssd,
             observed_bandwidth_bps: Some(5 * 1024 * 1024), // Low bandwidth (0.6x)
-            concurrent_requests: 12, // High concurrency (0.75x)
+            concurrent_requests: 12,                       // High concurrency (0.75x)
         };
 
         let config = IoSchedulerConfig::default();
@@ -2345,10 +2422,13 @@ mod tests {
         let expected_min = (1024_f64 * 1024_f64) * 0.10_f64; // ~100KB
         let expected_max = (1024_f64 * 1024_f64) * 0.15_f64; // ~150KB
 
-        assert!(strategy.buffer_size >= expected_min as usize &&
-                strategy.buffer_size <= expected_max as usize,
-                "Buffer size {} should be in range [{}, {}] based on combined multipliers",
-                strategy.buffer_size, expected_min, expected_max);
+        assert!(
+            strategy.buffer_size >= expected_min as usize && strategy.buffer_size <= expected_max as usize,
+            "Buffer size {} should be in range [{}, {}] based on combined multipliers",
+            strategy.buffer_size,
+            expected_min,
+            expected_max
+        );
 
         assert!(strategy.should_reduce_for_concurrency);
         assert!(strategy.should_reduce_for_bandwidth);

@@ -13,27 +13,21 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-zero-copy-core"
+name = "rustfs-io-metrics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Zero-copy core reader and writer implementations for RustFS"
-keywords = ["zero-copy", "reader", "writer", "rustfs"]
+description = "Metrics collection and reporting for RustFS (using metrics crate + OTEL)"
+keywords = ["metrics", "zero-copy", "rustfs", "otel", "performance"]
 categories = ["development-tools", "filesystem"]
+
+[dependencies]
+metrics = { workspace = true }
+tokio = { workspace = true, features = ["sync", "full"] }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
-
-[dependencies]
-bytes = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
-memmap2 = { workspace = true }
-rustfs-zero-copy-metrics = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tempfile = { workspace = true }

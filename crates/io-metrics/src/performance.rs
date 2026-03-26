@@ -12,30 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Core performance metrics for RustFS monitoring.
+//! Performance metrics structure with atomic counters.
 //!
-//! This module provides atomic counters for performance metrics that integrate
-//! with the `metrics` crate for Prometheus-compatible reporting.
+//! Provides a shared metrics instance that can be used across all RustFS
+//! components for consistent performance monitoring.
+//!
+//! # Example
+//!
+//! ```rust
+//! use rustfs_io_metrics::PerformanceMetrics;
+//!
+//! let metrics = PerformanceMetrics::new();
+//! metrics.record_cache_hit();
+//! metrics.record_bytes_read(1024);
+//! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Re-export metrics crate macros when feature is enabled
-#[cfg(feature = "metrics")]
-pub use metrics::{counter, gauge};
-
-/// Performance metrics structure for RustFS.
+/// Performance metrics with atomic counters.
 ///
-/// Thread-safe atomic counters for recording performance metrics.
-/// All `record_*` methods automatically report to the metrics crate when
-/// the `metrics` feature is enabled.
-///
-/// # Example
-///
-/// ```rust
-/// let metrics = PerformanceMetrics::new();
-/// metrics.record_cache_hit();
-/// metrics.record_bytes_read(1024);
-/// ```
+/// Thread-safe metrics structure that can be shared across threads.
+/// All fields use atomic operations for lock-free access.
 #[derive(Debug)]
 pub struct PerformanceMetrics {
     // ===== Cache Metrics =====
@@ -43,15 +40,15 @@ pub struct PerformanceMetrics {
     pub cache_hits: AtomicU64,
     /// Total cache misses
     pub cache_misses: AtomicU64,
-    /// L1 cache hits (hot objects)
+    /// L1 cache hits (hot objects < 1MB)
     pub l1_cache_hits: AtomicU64,
-    /// L2 cache hits (standard objects)
+    /// L2 cache hits (standard objects < 10MB)
     pub l2_cache_hits: AtomicU64,
 
     // ===== I/O Metrics =====
-    /// Total bytes read
+    /// Total bytes read from disk
     pub total_bytes_read: AtomicU64,
-    /// Total bytes written
+    /// Total bytes written to disk
     pub total_bytes_written: AtomicU64,
     /// Disk read operation count
     pub disk_read_count: AtomicU64,
@@ -110,11 +107,7 @@ impl PerformanceMetrics {
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
 
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
+        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
     }
 
     /// Get the L1 cache hit rate (0.0 to 1.0).
@@ -137,22 +130,12 @@ impl PerformanceMetrics {
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_cache_hits_total").increment(1);
-        }
     }
 
     /// Record a cache miss.
     #[inline]
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_cache_misses_total").increment(1);
-        }
     }
 
     /// Record an L1 cache hit (includes recording total cache hit).
@@ -160,11 +143,6 @@ impl PerformanceMetrics {
     pub fn record_l1_hit(&self) {
         self.l1_cache_hits.fetch_add(1, Ordering::Relaxed);
         self.record_cache_hit();
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_cache_l1_hits_total").increment(1);
-        }
     }
 
     /// Record an L2 cache hit (includes recording total cache hit).
@@ -172,11 +150,6 @@ impl PerformanceMetrics {
     pub fn record_l2_hit(&self) {
         self.l2_cache_hits.fetch_add(1, Ordering::Relaxed);
         self.record_cache_hit();
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_cache_l2_hits_total").increment(1);
-        }
     }
 
     // ===== I/O Recording Methods =====
@@ -185,44 +158,24 @@ impl PerformanceMetrics {
     #[inline]
     pub fn record_bytes_read(&self, bytes: u64) {
         self.total_bytes_read.fetch_add(bytes, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_io_bytes_read_total").increment(bytes);
-        }
     }
 
     /// Record bytes written.
     #[inline]
     pub fn record_bytes_written(&self, bytes: u64) {
         self.total_bytes_written.fetch_add(bytes, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_io_bytes_written_total").increment(bytes);
-        }
     }
 
     /// Record a disk read operation.
     #[inline]
     pub fn record_disk_read(&self) {
         self.disk_read_count.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_io_disk_reads_total").increment(1);
-        }
     }
 
     /// Record a disk write operation.
     #[inline]
     pub fn record_disk_write(&self) {
         self.disk_write_count.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_io_disk_writes_total").increment(1);
-        }
     }
 
     // ===== Concurrency Recording Methods =====
@@ -232,27 +185,19 @@ impl PerformanceMetrics {
     pub fn update_concurrent_requests(&self, count: u64) {
         self.current_concurrent_requests.store(count, Ordering::Relaxed);
 
-        #[cfg(feature = "metrics")]
-        {
-            gauge!("rustfs_concurrent_requests").set(count as f64);
-        }
-
         // Update peak using lock-free CAS loop
         let mut peak = self.peak_concurrent_requests.load(Ordering::Relaxed);
         loop {
             if count <= peak {
                 break;
             }
-            match self.peak_concurrent_requests.compare_exchange_weak(peak, count, Ordering::Relaxed, Ordering::Relaxed) {
+            match self
+                .peak_concurrent_requests
+                .compare_exchange_weak(peak, count, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(new_peak) => peak = new_peak,
             }
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            let peak = self.peak_concurrent_requests.load(Ordering::Relaxed);
-            gauge!("rustfs_concurrent_requests_peak").set(peak as f64);
         }
     }
 
@@ -262,11 +207,6 @@ impl PerformanceMetrics {
     #[inline]
     pub fn record_error(&self) {
         self.total_errors.fetch_add(1, Ordering::Relaxed);
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_errors_total").increment(1);
-        }
     }
 
     /// Record a timeout error (includes recording total error).
@@ -274,11 +214,6 @@ impl PerformanceMetrics {
     pub fn record_timeout(&self) {
         self.timeout_errors.fetch_add(1, Ordering::Relaxed);
         self.record_error();
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_errors_timeout_total").increment(1);
-        }
     }
 
     /// Record a disk error (includes recording total error).
@@ -286,11 +221,6 @@ impl PerformanceMetrics {
     pub fn record_disk_error(&self) {
         self.disk_errors.fetch_add(1, Ordering::Relaxed);
         self.record_error();
-
-        #[cfg(feature = "metrics")]
-        {
-            counter!("rustfs_errors_disk_total").increment(1);
-        }
     }
 }
 
@@ -343,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn test_io_recording() {
+        let metrics = PerformanceMetrics::new();
+
+        metrics.record_bytes_read(1024 * 1024); // 1MB
+        metrics.record_disk_read();
+
+        assert_eq!(metrics.total_bytes_read.load(Ordering::Relaxed), 1024 * 1024);
+        assert_eq!(metrics.disk_read_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn test_concurrent_tracking() {
         let metrics = PerformanceMetrics::new();
 
@@ -366,16 +307,5 @@ mod tests {
         metrics.record_disk_error();
         assert_eq!(metrics.total_errors.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.disk_errors.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_io_recording() {
-        let metrics = PerformanceMetrics::new();
-
-        metrics.record_bytes_read(1024 * 1024); // 1MB
-        metrics.record_disk_read();
-
-        assert_eq!(metrics.total_bytes_read.load(Ordering::Relaxed), 1024 * 1024);
-        assert_eq!(metrics.disk_read_count.load(Ordering::Relaxed), 1);
     }
 }

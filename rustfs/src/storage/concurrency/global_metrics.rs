@@ -18,8 +18,8 @@
 //! that can be accessed from anywhere in the codebase for consistent
 //! performance monitoring.
 
+use rustfs_io_metrics::PerformanceMetrics;
 use std::sync::{Arc, OnceLock};
-use crate::monitoring::PerformanceMetrics;
 
 // Global performance metrics instance.
 // This singleton is initialized once and shared across all components
@@ -70,5 +70,32 @@ mod tests {
 
         assert!(hits >= 2);
         assert!(misses >= 1);
+    }
+
+    #[test]
+    fn test_global_metrics_singleton() {
+        use rustfs_io_metrics::MetricsCollector;
+
+        // Get global metrics twice
+        let metrics1 = get_global_metrics();
+        let metrics2 = get_global_metrics();
+
+        // Both should point to the same instance
+        assert!(Arc::ptr_eq(&metrics1, &metrics2));
+
+        // Create a MetricsCollector with the global metrics
+        let collector = MetricsCollector::new(metrics1.clone(), 100);
+
+        // Record some data
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            collector
+                .record_io_operation(1024, std::time::Duration::from_millis(10), true)
+                .await;
+        });
+
+        // Verify metrics2 (same instance) sees the updates
+        let bytes_read = metrics2.total_bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(bytes_read, 1024);
     }
 }

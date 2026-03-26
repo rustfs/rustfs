@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_config::{ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE};
+use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
@@ -361,7 +361,8 @@ impl SetDisks {
 
                                 // Read zero-copy configuration from environment variable
                                 // Default: enabled (true) for performance
-                                let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+                                let use_zero_copy =
+                                    rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());

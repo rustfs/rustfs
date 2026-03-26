@@ -14,13 +14,16 @@
 
 //! Object cache module for hot object caching with Moka.
 
+use hashbrown::HashMap;
 use moka::future::Cache;
 use rustfs_config::MI_B;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use hashbrown::HashMap;
 use tokio::sync::RwLock;
+
+/// Type alias for the complex tracking type to reduce complexity warning
+type TrackingData = Arc<RwLock<HashMap<String, (Arc<AtomicU64>, Instant)>>>;
 
 /// Access tracker for adaptive TTL and tiered cache management.
 ///
@@ -33,7 +36,8 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct AccessTracker {
     /// Access counts and last access for each cache key
-    tracking: Arc<RwLock<HashMap<String, (Arc<AtomicU64>, Instant)>>>,
+    #[allow(clippy::type_complexity)]
+    tracking: TrackingData,
 }
 
 impl AccessTracker {
@@ -62,13 +66,11 @@ impl AccessTracker {
     /// Get the access count for a key.
     pub async fn get_hit_count(&self, key: &str) -> u64 {
         let tracking = self.tracking.read().await;
-        tracking
-            .get(key)
-            .map(|(count, _)| count.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        tracking.get(key).map(|(count, _)| count.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// Get the last access time for a key.
+    #[allow(dead_code)]
     pub async fn get_last_access(&self, key: &str) -> Option<Instant> {
         let tracking = self.tracking.read().await;
         tracking.get(key).map(|(_, time)| *time)
@@ -80,6 +82,7 @@ impl AccessTracker {
     }
 
     /// Get the time since last access for a key.
+    #[allow(dead_code)]
     pub async fn time_since_access(&self, key: &str) -> Option<Duration> {
         self.get_last_access(key).await.map(|instant| instant.elapsed())
     }
@@ -91,6 +94,7 @@ impl AccessTracker {
     }
 
     /// Clear all tracking data.
+    #[allow(dead_code)]
     pub async fn clear(&self) {
         let mut tracking = self.tracking.write().await;
         tracking.clear();
@@ -103,9 +107,7 @@ impl AccessTracker {
         let tracking: tokio::sync::RwLockReadGuard<'_, HashMap<String, (Arc<AtomicU64>, Instant)>> = self.tracking.read().await;
         let mut entries: Vec<(String, u64)> = tracking
             .iter()
-            .map(|(key, value): (&String, &(Arc<AtomicU64>, Instant))| {
-                (key.clone(), value.0.load(Ordering::Relaxed))
-            })
+            .map(|(key, value): (&String, &(Arc<AtomicU64>, Instant))| (key.clone(), value.0.load(Ordering::Relaxed)))
             .collect();
 
         entries.sort_by(|a, b| b.1.cmp(&a.1));
@@ -114,6 +116,7 @@ impl AccessTracker {
     }
 
     /// Get tracking statistics.
+    #[allow(dead_code)]
     pub async fn stats(&self) -> AccessTrackerStats {
         let tracking: tokio::sync::RwLockReadGuard<'_, HashMap<String, (Arc<AtomicU64>, Instant)>> = self.tracking.read().await;
         let total_keys = tracking.len();
@@ -142,6 +145,7 @@ impl Default for AccessTracker {
 
 /// Access tracker statistics.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AccessTrackerStats {
     /// Total number of tracked keys
     pub total_keys: usize,
@@ -226,23 +230,20 @@ pub struct TieredObjectCache {
 
 impl TieredObjectCache {
     /// Create a new tiered object cache.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         let config = TieredCacheConfig::default();
 
         let l1_cache = Cache::builder()
             .max_capacity(config.l1_max_size as u64)
-            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
-                value.size.min(u32::MAX as usize) as u32
-            })
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 { value.size.min(u32::MAX as usize) as u32 })
             .time_to_live(Duration::from_secs(config.l1_ttl_secs))
             .time_to_idle(Duration::from_secs(config.l1_tti_secs))
             .build();
 
         let l2_cache = Cache::builder()
             .max_capacity(config.l2_max_size as u64)
-            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
-                value.size.min(u32::MAX as usize) as u32
-            })
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 { value.size.min(u32::MAX as usize) as u32 })
             .time_to_live(Duration::from_secs(config.l2_ttl_secs))
             .time_to_idle(Duration::from_secs(config.l2_tti_secs))
             .build();
@@ -261,21 +262,18 @@ impl TieredObjectCache {
     }
 
     /// Create a new tiered cache with custom configuration.
+    #[allow(dead_code)]
     pub fn with_config(config: TieredCacheConfig) -> Self {
         let l1_cache = Cache::builder()
             .max_capacity(config.l1_max_size as u64)
-            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
-                value.size.min(u32::MAX as usize) as u32
-            })
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 { value.size.min(u32::MAX as usize) as u32 })
             .time_to_live(Duration::from_secs(config.l1_ttl_secs))
             .time_to_idle(Duration::from_secs(config.l1_tti_secs))
             .build();
 
         let l2_cache = Cache::builder()
             .max_capacity(config.l2_max_size as u64)
-            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 {
-                value.size.min(u32::MAX as usize) as u32
-            })
+            .weigher(|_key: &String, value: &Arc<CachedGetObjectInternal>| -> u32 { value.size.min(u32::MAX as usize) as u32 })
             .time_to_live(Duration::from_secs(config.l2_ttl_secs))
             .time_to_idle(Duration::from_secs(config.l2_tti_secs))
             .build();
@@ -393,6 +391,7 @@ impl TieredObjectCache {
     ///
     /// Uses the access tracker to determine if an object is "hot" (frequently accessed).
     /// Hot objects get extended TTL to reduce cache misses.
+    #[allow(dead_code)]
     pub async fn calculate_adaptive_ttl(&self, key: &str, base_ttl: u64) -> Duration {
         if !self.config.adaptive_ttl_enabled {
             return Duration::from_secs(base_ttl);
@@ -414,6 +413,7 @@ impl TieredObjectCache {
     /// Check if an object is considered hot based on access patterns.
     ///
     /// Returns true if the object has been accessed at least the hot threshold number of times.
+    #[allow(dead_code)]
     pub async fn is_hot_object(&self, key: &str) -> bool {
         self.access_tracker.is_hot(key, self.config.hot_hit_threshold).await
     }
@@ -482,11 +482,13 @@ impl TieredObjectCache {
     }
 
     /// Get the access tracker reference.
+    #[allow(dead_code)]
     pub fn access_tracker(&self) -> &Arc<AccessTracker> {
         &self.access_tracker
     }
 
     /// Get L1 cache statistics (for detailed monitoring).
+    #[allow(dead_code)]
     pub async fn l1_stats(&self) -> CacheLevelStats {
         self.l1_cache.run_pending_tasks().await;
         CacheLevelStats {
@@ -499,6 +501,7 @@ impl TieredObjectCache {
     }
 
     /// Get L2 cache statistics (for detailed monitoring).
+    #[allow(dead_code)]
     pub async fn l2_stats(&self) -> CacheLevelStats {
         self.l2_cache.run_pending_tasks().await;
         CacheLevelStats {
@@ -515,6 +518,7 @@ impl TieredObjectCache {
     /// This method should be called periodically (e.g., every 10 seconds)
     /// to export current cache statistics as Prometheus metrics.
     #[cfg(all(feature = "metrics", not(test)))]
+    #[allow(dead_code)]
     pub async fn record_metrics(&self) {
         use metrics::gauge;
 
@@ -591,6 +595,7 @@ impl TieredObjectCache {
     /// Get hot keys for warming purposes.
     ///
     /// Returns the most frequently accessed keys that should be preloaded.
+    #[allow(dead_code)]
     pub async fn get_hot_keys_for_warming(&self, limit: usize) -> Vec<String> {
         self.access_tracker
             .get_hot_keys(limit)
@@ -723,11 +728,15 @@ impl TieredObjectCache {
             miss_count: misses,
             avg_age_secs: 0.0, // Not tracked in tiered cache
             hit_rate: tiered_stats.hit_rate,
-            eviction_count: 0,   // Not tracked in tiered cache
+            eviction_count: 0, // Not tracked in tiered cache
             eviction_rate: 0.0,
             memory_usage: total_size,
-            memory_usage_ratio: if total_max_size > 0 { total_size as f64 / total_max_size as f64 } else { 0.0 },
-            top_keys: Vec::new(),  // Would need to fetch from access tracker
+            memory_usage_ratio: if total_max_size > 0 {
+                total_size as f64 / total_max_size as f64
+            } else {
+                0.0
+            },
+            top_keys: Vec::new(), // Would need to fetch from access tracker
             efficiency_score,
         }
     }
@@ -759,6 +768,7 @@ impl TieredObjectCache {
     }
 
     /// Invalidate a versioned object (byte-level API).
+    #[allow(dead_code)]
     pub async fn invalidate_bytes_versioned(&self, _bucket: &str, key: &str, _version_id: Option<&str>) {
         // Just use the existing invalidate method
         self.invalidate(key).await;
@@ -767,12 +777,14 @@ impl TieredObjectCache {
     /// Get multiple objects as bytes (API compatibility).
     pub async fn get_batch_bytes(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         let results = self.get_batch(keys).await;
-        results.into_iter().map(|(_key, value)| {
-            value.map(|cached| Arc::new(cached.body.to_vec()))
-        }).collect()
+        results
+            .into_iter()
+            .map(|(_key, value)| value.map(|cached| Arc::new(cached.body.to_vec())))
+            .collect()
     }
 
     /// Get byte cache statistics (API compatibility).
+    #[allow(dead_code)]
     pub async fn stats_bytes(&self) -> ByteCacheStats {
         let cache_stats = self.stats().await;
 
@@ -813,6 +825,7 @@ impl TieredObjectCache {
 
 /// Statistics for a single cache level (L1 or L2).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CacheLevelStats {
     /// Current size in bytes
     pub size: usize,
@@ -870,6 +883,7 @@ impl From<ByteCacheStats> for CacheStats {
 ///
 /// Defines different strategies for pre-populating the cache with hot objects.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum WarmupPattern {
     /// Warm up recently accessed hot objects.
     ///
@@ -919,6 +933,7 @@ pub struct TieredCacheStats {
     /// Overall hit rate (0.0 - 1.0)
     pub hit_rate: f64,
     /// L1 hit rate relative to total hits (0.0 - 1.0)
+    #[allow(dead_code)]
     pub l1_hit_rate: f64,
 }
 
@@ -1272,6 +1287,7 @@ impl HotObjectCache {
     /// - TTL of 5 minutes
     /// - TTI of 2 minutes
     /// - Weigher function for accurate size tracking
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         let max_capacity = rustfs_utils::get_env_u64(
             rustfs_config::ENV_OBJECT_CACHE_CAPACITY_MB,
@@ -1318,6 +1334,7 @@ impl HotObjectCache {
     }
 
     /// Soft expiration determination, the number of hits is insufficient and exceeds the soft TTL
+    #[allow(dead_code)]
     pub(crate) fn should_expire(&self, obj: &Arc<CachedObject>) -> bool {
         let age_secs = obj.cached_at.elapsed().as_secs();
         let cache_ttl_secs =
@@ -1336,6 +1353,7 @@ impl HotObjectCache {
     /// Get an object from cache with lock-free concurrent access
     ///
     /// Moka provides lock-free reads, significantly improving concurrent performance.
+    #[allow(dead_code)]
     pub(crate) async fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         match self.cache.get(key).await {
             Some(cached) => {
@@ -1381,6 +1399,7 @@ impl HotObjectCache {
     /// Put an object into cache with automatic size-based eviction
     ///
     /// Moka handles eviction automatically based on the weigher function.
+    #[allow(dead_code)]
     pub(crate) async fn put(&self, key: String, data: Arc<CachedObject>) {
         let size = data.size;
 
@@ -1409,6 +1428,7 @@ impl HotObjectCache {
     }
 
     /// Clear all cached objects
+    #[allow(dead_code)]
     pub(crate) async fn clear(&self) {
         // Clear both simple cache and response cache
         self.cache.invalidate_all();
@@ -1496,6 +1516,7 @@ impl HotObjectCache {
     }
 
     /// Check if a key exists in cache (lock-free)
+    #[allow(dead_code)]
     pub(crate) async fn contains(&self, key: &str) -> bool {
         // Check both simple cache and response cache
         self.cache.contains_key(key) || self.response_cache.contains_key(key)
@@ -1504,6 +1525,7 @@ impl HotObjectCache {
     /// Get multiple objects from cache in parallel
     ///
     /// Leverages Moka's lock-free design for true parallel access.
+    #[allow(dead_code)]
     pub(crate) async fn get_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -1513,6 +1535,7 @@ impl HotObjectCache {
     }
 
     /// Remove a specific key from cache
+    #[allow(dead_code)]
     pub(crate) async fn remove(&self, key: &str) -> bool {
         let had_key = self.cache.contains_key(key);
         self.cache.invalidate(key).await;
@@ -1522,6 +1545,7 @@ impl HotObjectCache {
     /// Get the most frequently accessed keys
     ///
     /// Returns up to `limit` keys sorted by access count in descending order.
+    #[allow(dead_code)]
     pub(crate) async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
         // Run pending tasks to ensure accurate entry count
         self.cache.run_pending_tasks().await;
@@ -1539,6 +1563,7 @@ impl HotObjectCache {
     }
 
     /// Warm up cache with a batch of objects
+    #[allow(dead_code)]
     pub(crate) async fn warm(&self, objects: Vec<(String, Vec<u8>)>) {
         for (key, data) in objects {
             let size = data.len();
@@ -1548,6 +1573,7 @@ impl HotObjectCache {
     }
 
     /// Get hit rate percentage
+    #[allow(dead_code)]
     pub(crate) fn hit_rate(&self) -> f64 {
         let hits = self.hit_count.load(Ordering::Relaxed);
         let misses = self.miss_count.load(Ordering::Relaxed);
@@ -1577,6 +1603,7 @@ impl HotObjectCache {
     ///
     /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
     /// * `None` - Cache miss
+    #[allow(dead_code)]
     pub(crate) async fn get_response(&self, key: &str) -> Option<Arc<CachedGetObject>> {
         match self.response_cache.get(key).await {
             Some(cached) => {
@@ -1639,6 +1666,7 @@ impl HotObjectCache {
     ///
     /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
     /// * `response` - The complete cached response to store
+    #[allow(dead_code)]
     pub(crate) async fn put_response(&self, key: String, response: CachedGetObject) {
         let size = response.size();
 
@@ -1672,6 +1700,7 @@ impl HotObjectCache {
     /// # Arguments
     ///
     /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
+    #[allow(dead_code)]
     pub(crate) async fn invalidate(&self, key: &str) {
         // Invalidate both caches
         self.cache.invalidate(key).await;
@@ -1697,6 +1726,7 @@ impl HotObjectCache {
     /// * `bucket` - Bucket name
     /// * `key` - Object key
     /// * `version_id` - Optional version ID (if None, only invalidates the base key)
+    #[allow(dead_code)]
     pub(crate) async fn invalidate_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
         // Always invalidate the latest version key
         let base_key = format!("{bucket}/{key}");
@@ -1720,6 +1750,7 @@ impl HotObjectCache {
     }
 
     /// Get the maximum object size for caching
+    #[allow(dead_code)]
     pub(crate) fn max_object_size(&self) -> usize {
         self.max_object_size
     }

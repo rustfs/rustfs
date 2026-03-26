@@ -12,11 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy metrics helpers for RustFS.
+//! RustFS metrics collection and reporting.
 //!
-//! This crate provides lightweight metrics recording functions for zero-copy
-//! and buffer pool operations. It has no dependencies on other RustFS crates, making it safe to
-//! use from anywhere in the codebase without creating cyclic dependencies.
+//! This crate provides the **single source of truth** for all metrics
+//! in RustFS. It uses the `metrics` crate for reporting to OTEL exporters.
+//!
+//! # Architecture
+//!
+//! - **Free functions**: Simple `record_*()` functions for quick metric reporting
+//! - **PerformanceMetrics**: Shared atomic counter struct for advanced use cases
+//! - **MetricsCollector**: I/O operation tracking with percentile calculation
+//! - **AutoTuner**: Automatic performance optimization based on metrics
+//!
+//! # Usage
+//!
+//! ```rust
+//! use rustfs_io_metrics::*;
+//!
+//! // Simple recording
+//! record_get_object(100.0, 1024, true);
+//!
+//! // Advanced usage with collector
+//! let collector = MetricsCollector::new(metrics, 1000);
+//! collector.record_io_operation(1024, duration, true).await;
+//! ```
+
+// Import macros from the metrics crate
+#[macro_use]
+extern crate metrics;
+
+// Public modules
+pub mod autotuner;
+pub mod collector;
+pub mod performance;
+
+pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
+// Re-exports for convenience
+pub use collector::MetricsCollector;
+pub use performance::PerformanceMetrics;
 
 /// Record a zero-copy read operation.
 ///
@@ -26,8 +59,6 @@
 /// * `duration_ms` - Time taken for the read operation in milliseconds
 #[inline(always)]
 pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.zero_copy.reads.total").increment(1);
     histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
     histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
@@ -40,7 +71,6 @@ pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
 /// * `bytes_saved` - Number of bytes that would have been copied without zero-copy
 #[inline(always)]
 pub fn record_memory_copy_saved(bytes_saved: usize) {
-    use metrics::counter;
     counter!("rustfs.zero_copy.memory.saved.bytes").increment(bytes_saved as u64);
 }
 
@@ -54,7 +84,6 @@ pub fn record_memory_copy_saved(bytes_saved: usize) {
 /// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
 #[inline(always)]
 pub fn record_zero_copy_fallback(reason: &str) {
-    use metrics::counter;
     counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
 }
 
@@ -71,8 +100,6 @@ pub fn record_zero_copy_fallback(reason: &str) {
 /// * `from_pool` - Whether buffer was reused from pool
 #[inline(always)]
 pub fn record_bytes_pool_acquire(tier: &str, size: usize, from_pool: bool) {
-    use metrics::{counter, gauge};
-
     counter!("rustfs.bytes.pool.acquisitions.total", "tier" => tier.to_string()).increment(1);
     gauge!("rustfs.bytes.pool.size.bytes", "tier" => tier.to_string()).set(size as f64);
 
@@ -90,7 +117,6 @@ pub fn record_bytes_pool_acquire(tier: &str, size: usize, from_pool: bool) {
 /// * `tier` - Pool tier ("small", "medium", "large", "xlarge")
 #[inline(always)]
 pub fn record_bytes_pool_return(tier: &str) {
-    use metrics::counter;
     counter!("rustfs.bytes.pool.returns.total", "tier" => tier.to_string()).increment(1);
 }
 
@@ -102,7 +128,6 @@ pub fn record_bytes_pool_return(tier: &str) {
 /// * `bytes` - Currently allocated bytes
 #[inline(always)]
 pub fn record_bytes_pool_allocated(tier: &str, bytes: u64) {
-    use metrics::gauge;
     gauge!("rustfs.bytes.pool.allocated.bytes", "tier" => tier.to_string()).set(bytes as f64);
 }
 
@@ -114,7 +139,6 @@ pub fn record_bytes_pool_allocated(tier: &str, bytes: u64) {
 /// * `hit_rate` - Hit rate (0.0 - 1.0)
 #[inline(always)]
 pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
-    use metrics::gauge;
     gauge!("rustfs.bytes.pool.hit.rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
 }
 
@@ -126,8 +150,6 @@ pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
 /// * `duration_ms` - Time taken for the write operation in milliseconds
 #[inline(always)]
 pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.zero_copy.write.total").increment(1);
     histogram!("rustfs.zero_copy.write.size.bytes").record(size_bytes as f64);
     histogram!("rustfs.zero_copy.write.duration.ms").record(duration_ms);
@@ -142,7 +164,6 @@ pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
 /// * `reason` - Reason for the fallback
 #[inline(always)]
 pub fn record_zero_copy_write_fallback(reason: &str) {
-    use metrics::counter;
     counter!("rustfs.zero_copy.write.fallback.total", "reason" => reason.to_string()).increment(1);
 }
 
@@ -153,7 +174,6 @@ pub fn record_zero_copy_write_fallback(reason: &str) {
 /// * `size_bytes` - Number of bytes saved from zero-copy
 #[inline(always)]
 pub fn record_bytes_saved(size_bytes: usize) {
-    use metrics::counter;
     counter!("rustfs.zero_copy.bytes.saved.total").increment(size_bytes as u64);
 }
 
@@ -170,8 +190,6 @@ pub fn record_bytes_saved(size_bytes: usize) {
 /// * `from_cache` - Whether the object was served from cache
 #[inline(always)]
 pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.s3.get_object.total").increment(1);
     histogram!("rustfs.s3.get_object.duration.ms").record(duration_ms);
 
@@ -195,8 +213,6 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
 /// * `zero_copy_enabled` - Whether zero-copy was enabled for this operation
 #[inline(always)]
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.s3.put_object.total").increment(1);
     histogram!("rustfs.s3.put_object.duration.ms").record(duration_ms);
 
@@ -218,8 +234,6 @@ pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: b
 /// * `is_truncated` - Whether the response was truncated
 #[inline(always)]
 pub fn record_list_objects(duration_ms: f64, objects_count: u64, is_truncated: bool) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.s3.list_objects.total").increment(1);
     histogram!("rustfs.s3.list_objects.duration.ms").record(duration_ms);
     histogram!("rustfs.s3.list_objects.count").record(objects_count as f64);
@@ -237,8 +251,6 @@ pub fn record_list_objects(duration_ms: f64, objects_count: u64, is_truncated: b
 /// * `version_deleted` - Whether a specific version was deleted
 #[inline(always)]
 pub fn record_delete_object(duration_ms: f64, version_deleted: bool) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.s3.delete_object.total").increment(1);
     histogram!("rustfs.s3.delete_object.duration.ms").record(duration_ms);
 
@@ -260,22 +272,17 @@ pub fn record_delete_object(duration_ms: f64, version_deleted: bool) {
 /// * `buffer_size` - Selected buffer size in bytes
 /// * `concurrent_requests` - Number of concurrent requests
 #[inline(always)]
-pub fn record_io_strategy(
-    storage_media: &str,
-    access_pattern: &str,
-    buffer_size: usize,
-    concurrent_requests: u64,
-) {
-    use metrics::{counter, gauge};
-
+pub fn record_io_strategy(storage_media: &str, access_pattern: &str, buffer_size: usize, concurrent_requests: u64) {
     counter!("rustfs.io.strategy.total",
         "storage_media" => storage_media.to_string(),
         "access_pattern" => access_pattern.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 
     gauge!("rustfs.io.buffer.size.bytes",
         "storage_media" => storage_media.to_string(),
-    ).set(buffer_size as f64);
+    )
+    .set(buffer_size as f64);
 
     gauge!("rustfs.io.concurrent.requests").set(concurrent_requests as f64);
 }
@@ -287,7 +294,6 @@ pub fn record_io_strategy(
 /// * `duration_ms` - Time spent waiting for disk permit
 #[inline(always)]
 pub fn record_permit_wait(duration_ms: f64) {
-    use metrics::histogram;
     histogram!("rustfs.io.permit.wait.duration.ms").record(duration_ms);
 }
 
@@ -299,11 +305,10 @@ pub fn record_permit_wait(duration_ms: f64) {
 /// * `concurrent_requests` - Number of concurrent requests
 #[inline(always)]
 pub fn record_io_load_level(load_level: &str, concurrent_requests: u64) {
-    use metrics::{gauge, counter};
-
     counter!("rustfs.io.load.level",
         "level" => load_level.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 
     gauge!("rustfs.io.concurrent.requests").set(concurrent_requests as f64);
 }
@@ -320,26 +325,22 @@ pub fn record_io_load_level(load_level: &str, concurrent_requests: u64) {
 /// * `operation` - Operation type ("hit", "miss", "put", "evict")
 /// * `size_bytes` - Object size in bytes (for put/evict operations)
 #[inline(always)]
-pub fn record_tiered_cache_operation(
-    tier: &str,
-    operation: &str,
-    size_bytes: Option<usize>,
-) {
-    use metrics::{counter, gauge};
-
+pub fn record_tiered_cache_operation(tier: &str, operation: &str, size_bytes: Option<usize>) {
     counter!("rustfs.cache.operations.total",
         "tier" => tier.to_string(),
         "operation" => operation.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 
     // Track cache size for put/evict operations
-    if let Some(size) = size_bytes {
-        if matches!(operation, "put" | "evict") {
-            gauge!("rustfs.cache.operation.size.bytes",
-                "tier" => tier.to_string(),
-                "operation" => operation.to_string(),
-            ).set(size as f64);
-        }
+    if let Some(size) = size_bytes
+        && matches!(operation, "put" | "evict")
+    {
+        gauge!("rustfs.cache.operation.size.bytes",
+            "tier" => tier.to_string(),
+            "operation" => operation.to_string(),
+        )
+        .set(size as f64);
     }
 }
 
@@ -351,10 +352,10 @@ pub fn record_tiered_cache_operation(
 /// * `hit_rate` - Hit rate as a percentage (0.0 - 100.0)
 #[inline(always)]
 pub fn record_cache_hit_rate(tier: &str, hit_rate: f64) {
-    use metrics::gauge;
     gauge!("rustfs.cache.hit.rate",
         "tier" => tier.to_string(),
-    ).set(hit_rate);
+    )
+    .set(hit_rate);
 }
 
 /// Record cache size and entry count.
@@ -366,15 +367,15 @@ pub fn record_cache_hit_rate(tier: &str, hit_rate: f64) {
 /// * `entries` - Number of entries in the cache
 #[inline(always)]
 pub fn record_cache_size(tier: &str, size_bytes: usize, entries: u64) {
-    use metrics::gauge;
-
     gauge!("rustfs.cache.size.bytes",
         "tier" => tier.to_string(),
-    ).set(size_bytes as f64);
+    )
+    .set(size_bytes as f64);
 
     gauge!("rustfs.cache.entries",
         "tier" => tier.to_string(),
-    ).set(entries as f64);
+    )
+    .set(entries as f64);
 }
 
 // ============================================================================
@@ -389,12 +390,11 @@ pub fn record_cache_size(tier: &str, size_bytes: usize, entries: u64) {
 /// * `tier` - Bandwidth tier ("low", "medium", "high", "unknown")
 #[inline(always)]
 pub fn record_bandwidth(bytes_per_second: u64, tier: &str) {
-    use metrics::{gauge, histogram};
-
     gauge!("rustfs.bandwidth.current.bps").set(bytes_per_second as f64);
     gauge!("rustfs.bandwidth.current.bps",
         "tier" => tier.to_string(),
-    ).set(bytes_per_second as f64);
+    )
+    .set(bytes_per_second as f64);
 
     histogram!("rustfs.bandwidth.observed.bps").record(bytes_per_second as f64);
 }
@@ -407,8 +407,6 @@ pub fn record_bandwidth(bytes_per_second: u64, tier: &str) {
 /// * `duration_ms` - Duration of the transfer in milliseconds
 #[inline(always)]
 pub fn record_data_transfer(bytes: u64, duration_ms: f64) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.io.transfer.bytes").increment(bytes);
     histogram!("rustfs.io.transfer.duration.ms").record(duration_ms);
 
@@ -430,8 +428,6 @@ pub fn record_data_transfer(bytes: u64, duration_ms: f64) {
 /// * `total_bytes` - Total memory in bytes
 #[inline(always)]
 pub fn record_memory_usage(used_bytes: u64, total_bytes: u64) {
-    use metrics::gauge;
-
     gauge!("rustfs.memory.used.bytes").set(used_bytes as f64);
     gauge!("rustfs.memory.total.bytes").set(total_bytes as f64);
 
@@ -448,7 +444,6 @@ pub fn record_memory_usage(used_bytes: u64, total_bytes: u64) {
 /// * `percent` - CPU usage percentage (0.0 - 100.0)
 #[inline(always)]
 pub fn record_cpu_usage(percent: f64) {
-    use metrics::gauge;
     gauge!("rustfs.cpu.usage.percent").set(percent);
 }
 
@@ -461,14 +456,7 @@ pub fn record_cpu_usage(percent: f64) {
 /// * `read_ops` - Number of read operations
 /// * `write_ops` - Number of write operations
 #[inline(always)]
-pub fn record_disk_io(
-    read_bytes: u64,
-    write_bytes: u64,
-    read_ops: u64,
-    write_ops: u64,
-) {
-    use metrics::{counter, gauge};
-
+pub fn record_disk_io(read_bytes: u64, write_bytes: u64, read_ops: u64, write_ops: u64) {
     counter!("rustfs.disk.read.bytes").increment(read_bytes);
     counter!("rustfs.disk.write.bytes").increment(write_bytes);
     counter!("rustfs.disk.read.ops").increment(read_ops);
@@ -490,12 +478,11 @@ pub fn record_disk_io(
 /// * `error_type` - Error type (e.g., "timeout", "disk_error", "network")
 #[inline(always)]
 pub fn record_error(operation: &str, error_type: &str) {
-    use metrics::counter;
-
     counter!("rustfs.errors.total",
         "operation" => operation.to_string(),
         "type" => error_type.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 }
 
 /// Record operation timeout.
@@ -506,15 +493,15 @@ pub fn record_error(operation: &str, error_type: &str) {
 /// * `duration_ms` - Duration before timeout
 #[inline(always)]
 pub fn record_timeout(operation: &str, duration_ms: f64) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.timeouts.total",
         "operation" => operation.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 
     histogram!("rustfs.timeouts.duration.ms",
         "operation" => operation.to_string(),
-    ).record(duration_ms);
+    )
+    .record(duration_ms);
 }
 
 /// Record retry attempt.
@@ -525,15 +512,49 @@ pub fn record_timeout(operation: &str, duration_ms: f64) {
 /// * `attempt_number` - Attempt number (1-based)
 #[inline(always)]
 pub fn record_retry(operation: &str, attempt_number: u32) {
-    use metrics::{counter, histogram};
-
     counter!("rustfs.retries.total",
         "operation" => operation.to_string(),
-    ).increment(1);
+    )
+    .increment(1);
 
     histogram!("rustfs.retries.attempt",
         "operation" => operation.to_string(),
-    ).record(attempt_number as f64);
+    )
+    .record(attempt_number as f64);
+}
+
+// ============================================================================
+// Helper Metrics (for MetricsCollector)
+// ============================================================================
+
+/// Record I/O latency in milliseconds.
+///
+/// # Arguments
+///
+/// * `latency_ms` - I/O latency in milliseconds
+#[inline(always)]
+pub fn record_io_latency(latency_ms: f64) {
+    histogram!("rustfs.io.latency.ms").record(latency_ms);
+}
+
+/// Record I/O latency P95 in milliseconds.
+///
+/// # Arguments
+///
+/// * `latency_ms` - P95 I/O latency in milliseconds
+#[inline(always)]
+pub fn record_io_latency_p95(latency_ms: f64) {
+    gauge!("rustfs.io.latency.p95.ms").set(latency_ms);
+}
+
+/// Record I/O latency P99 in milliseconds.
+///
+/// # Arguments
+///
+/// * `latency_ms` - P99 I/O latency in milliseconds
+#[inline(always)]
+pub fn record_io_latency_p99(latency_ms: f64) {
+    gauge!("rustfs.io.latency.p99.ms").set(latency_ms);
 }
 
 #[cfg(test)]

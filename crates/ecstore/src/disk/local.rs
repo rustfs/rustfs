@@ -31,7 +31,6 @@ use crate::disk::{
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
-use std::mem::ManuallyDrop;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -47,6 +46,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::SeekFrom;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1847,12 +1847,9 @@ impl DiskAPI for LocalDisk {
 
         // Verify file exists and get metadata
         let file_path_clone = file_path.clone();
-        let meta = tokio::task::spawn_blocking(move || {
-            std::fs::metadata(&file_path_clone)
-                .map_err(DiskError::from)
-        })
-        .await
-        .map_err(DiskError::from)??;
+        let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+            .await
+            .map_err(DiskError::from)??;
 
         if meta.len() < (offset + length) as u64 {
             error!(
@@ -1873,19 +1870,12 @@ impl DiskAPI for LocalDisk {
             let offset_u64 = offset as u64;
 
             let bytes = tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&file_path_clone)
-                    .map_err(DiskError::from)?;
+                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
                 // Create memory map for the specified region
                 // SAFETY: The file is opened as read-only, and we're mapping a region
                 // that we've already verified exists and is within file bounds.
-                let mmap = unsafe {
-                    MmapOptions::new()
-                        .offset(offset_u64)
-                        .len(length)
-                        .map(&file)
-                }
-                .map_err(DiskError::other)?;
+                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
 
                 // True zero-copy: take ownership of the mmap's underlying memory
                 // and convert it directly to Bytes without copying.
@@ -1904,9 +1894,7 @@ impl DiskAPI for LocalDisk {
 
                 // Create Vec from raw parts (takes ownership of memory)
                 // SAFETY: The pointer is valid, size is correct, and capacity is correct
-                let vec = unsafe {
-                    Vec::from_raw_parts(mmap_ptr as *mut u8, mmap_len, mmap_capacity)
-                };
+                let vec = unsafe { Vec::from_raw_parts(mmap_ptr as *mut u8, mmap_len, mmap_capacity) };
 
                 // Convert Vec to Bytes (zero-copy ownership transfer)
                 Ok::<Bytes, DiskError>(Bytes::from(vec))
@@ -1919,13 +1907,9 @@ impl DiskAPI for LocalDisk {
 
             // Record zero-copy metrics
             #[cfg(feature = "metrics")]
-            rustfs_zero_copy_metrics::record_zero_copy_read(length, duration_ms);
+            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
 
-            debug!(
-                size = length,
-                duration_ms = duration_ms,
-                "zero_copy_read_success"
-            );
+            debug!(size = length, duration_ms = duration_ms, "zero_copy_read_success");
 
             return Ok(bytes);
         }
@@ -1935,7 +1919,7 @@ impl DiskAPI for LocalDisk {
         {
             // Record zero-copy fallback
             #[cfg(feature = "metrics")]
-            rustfs_zero_copy_metrics::record_zero_copy_fallback("non_unix_platform");
+            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
 
             debug!(reason = "non_unix_platform", "zero_copy_fallback");
 

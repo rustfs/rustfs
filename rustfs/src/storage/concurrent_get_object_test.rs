@@ -388,8 +388,7 @@ mod tests {
 
         // Verify cache size is within limit (Moka manages this automatically)
         let stats = manager.cache_stats().await;
-        eprintln!("DEBUG: size={}, max_size={}, entries={}",
-                  stats.size, stats.max_size, stats.entries);
+        eprintln!("DEBUG: size={}, max_size={}, entries={}", stats.size, stats.max_size, stats.entries);
         assert!(
             stats.size <= stats.max_size,
             "Moka should keep cache size {} within max {}",
@@ -666,8 +665,12 @@ mod tests {
 
         // Check cache stats for debugging
         let stats = manager.cache_stats().await;
-        eprintln!("DEBUG: hit_count={}, miss_count={}, hit_rate={}",
-                  stats.hit_count, stats.miss_count, manager.cache_hit_rate());
+        eprintln!(
+            "DEBUG: hit_count={}, miss_count={}, hit_rate={}",
+            stats.hit_count,
+            stats.miss_count,
+            manager.cache_hit_rate()
+        );
 
         // Hit rate should be around 50% (0.5 on 0.0-1.0 scale)
         let hit_rate = manager.cache_hit_rate();

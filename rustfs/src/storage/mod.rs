@@ -17,7 +17,6 @@ pub mod backpressure;
 pub mod concurrency;
 pub mod deadlock_detector;
 pub mod ecfs;
-pub mod zero_copy;
 pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod lock_optimizer;
@@ -38,9 +37,9 @@ mod ecfs_extend;
 mod ecfs_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
-mod sse_test;
-#[cfg(test)]
 mod multi_factor_scheduler_integration_test;
+#[cfg(test)]
+mod sse_test;
 
 pub(crate) use ecfs_extend::*;
 pub(crate) use sse::{

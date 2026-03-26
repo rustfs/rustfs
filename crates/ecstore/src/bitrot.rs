@@ -71,7 +71,7 @@ pub async fn create_bitrot_reader(
 
                     // Record zero-copy metrics
                     #[cfg(feature = "metrics")]
-                    rustfs_zero_copy_metrics::record_zero_copy_read(bytes.len(), duration_ms);
+                    rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
 
                     // Log successful zero-copy read
                     debug!(
@@ -94,7 +94,7 @@ pub async fn create_bitrot_reader(
                 Err(e) => {
                     // Record zero-copy fallback
                     #[cfg(feature = "metrics")]
-                    rustfs_zero_copy_metrics::record_zero_copy_fallback(&format!("{:?}", e));
+                    rustfs_io_metrics::record_zero_copy_fallback(&format!("{:?}", e));
 
                     // Log zero-copy fallback
                     debug!(
@@ -183,8 +183,19 @@ mod tests {
         let shard_size = 16;
         let checksum_algo = HashAlgorithm::HighwayHash256S;
 
-        let result =
-            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false, false).await;
+        let result = create_bitrot_reader(
+            Some(test_data),
+            None,
+            "test-bucket",
+            "test-path",
+            0,
+            0,
+            shard_size,
+            checksum_algo,
+            false,
+            false,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
@@ -197,8 +208,19 @@ mod tests {
         let checksum_algo = HashAlgorithm::HighwayHash256S;
 
         // Test with zero-copy enabled (should work the same for inline data)
-        let result =
-            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false, true).await;
+        let result = create_bitrot_reader(
+            Some(test_data),
+            None,
+            "test-bucket",
+            "test-path",
+            0,
+            0,
+            shard_size,
+            checksum_algo,
+            false,
+            true,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());

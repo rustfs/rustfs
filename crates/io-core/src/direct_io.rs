@@ -86,7 +86,7 @@ impl From<io::Error> for DirectIoError {
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_zero_copy_core::DirectIoReader;
+/// use rustfs_io_core::DirectIoReader;
 ///
 /// // Linux only
 /// #[cfg(target_os = "linux")]
@@ -197,11 +197,7 @@ impl DirectIoReader {
 
 #[cfg(target_os = "linux")]
 impl AsyncRead for DirectIoReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let filled = buf.filled().len();
         let mut remaining = &mut buf.initialize_unfilled();
 
@@ -241,11 +237,7 @@ impl DirectIoReader {
 
 #[cfg(not(target_os = "linux"))]
 impl AsyncRead for DirectIoReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Direct I/O not supported on this platform",
@@ -265,9 +257,7 @@ impl std::fmt::Debug for DirectIoReader {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            f.debug_struct("DirectIoReader")
-                .field("platform", &"unsupported")
-                .finish()
+            f.debug_struct("DirectIoReader").field("platform", &"unsupported").finish()
         }
     }
 }
@@ -282,34 +272,22 @@ mod tests {
         {
             // Valid alignment
             let file = std::fs::File::open("/dev/zero").unwrap();
-            assert!(
-                DirectIoReader::new(file, 0, 512).is_ok(),
-                "Should succeed with aligned offset and size"
-            );
+            assert!(DirectIoReader::new(file, 0, 512).is_ok(), "Should succeed with aligned offset and size");
 
             // Invalid offset
             let file = std::fs::File::open("/dev/zero").unwrap();
-            assert!(
-                DirectIoReader::new(file, 1, 512).is_err(),
-                "Should fail with unaligned offset"
-            );
+            assert!(DirectIoReader::new(file, 1, 512).is_err(), "Should fail with unaligned offset");
 
             // Invalid size
             let file = std::fs::File::open("/dev/zero").unwrap();
-            assert!(
-                DirectIoReader::new(file, 0, 511).is_err(),
-                "Should fail with unaligned size"
-            );
+            assert!(DirectIoReader::new(file, 0, 511).is_err(), "Should fail with unaligned size");
         }
 
         #[cfg(not(target_os = "linux"))]
         {
             // Non-Linux should return UnsupportedPlatform
             let file = std::fs::File::open("/dev/null").unwrap();
-            assert!(matches!(
-                DirectIoReader::new(file, 0, 512),
-                Err(DirectIoError::UnsupportedPlatform)
-            ));
+            assert!(matches!(DirectIoReader::new(file, 0, 512), Err(DirectIoError::UnsupportedPlatform)));
         }
     }
 }

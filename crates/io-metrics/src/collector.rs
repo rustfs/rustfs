@@ -13,17 +13,20 @@
 // limitations under the License.
 
 //! Metrics collector for I/O operation tracking and latency analysis.
+//!
+//! Provides latency percentile calculation (P50, P95, P99) and automatic
+//! reporting to the `metrics` crate for OTEL export.
 
-use super::metrics::PerformanceMetrics;
-use std::sync::atomic::Ordering;
+use super::performance::PerformanceMetrics;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Metrics collector for tracking I/O operations and computing latency percentiles.
 ///
-/// Maintains a sliding window of I/O latency samples and updates P95/P99 metrics
-/// for monitoring dashboards.
+/// Maintains a sliding window of I/O latency samples and updates P95/P99 metrics.
+/// Automatically reports to the `metrics` crate for OTEL export.
 pub struct MetricsCollector {
     /// The underlying metrics (shared reference)
     metrics: Arc<PerformanceMetrics>,
@@ -55,8 +58,11 @@ impl MetricsCollector {
 
     /// Record an I/O operation with its duration.
     ///
-    /// Updates byte counters, operation counters, and records latency for
-    /// P95/P99 calculation.
+    /// This method:
+    /// 1. Updates byte counters in PerformanceMetrics
+    /// 2. Updates operation counters in PerformanceMetrics
+    /// 3. Records latency for P95/P99 calculation
+    /// 4. Reports to the `metrics` crate for OTEL export
     ///
     /// # Arguments
     ///
@@ -64,21 +70,24 @@ impl MetricsCollector {
     /// * `duration` - Duration of the I/O operation
     /// * `is_read` - true for read operations, false for writes
     pub async fn record_io_operation(&self, bytes: u64, duration: Duration, is_read: bool) {
-        // Update byte counters
+        // Update byte counters in PerformanceMetrics
         if is_read {
             self.metrics.record_bytes_read(bytes);
         } else {
             self.metrics.record_bytes_written(bytes);
         }
 
-        // Update operation counters
+        // Update operation counters in PerformanceMetrics
         if is_read {
             self.metrics.record_disk_read();
         } else {
             self.metrics.record_disk_write();
         }
 
-        // Record latency sample
+        // Report to metrics crate for OTEL export
+        crate::record_data_transfer(bytes, duration.as_millis() as f64);
+
+        // Record latency sample for percentile calculation
         let mut samples = self.io_latency_samples.write().await;
         samples.push(duration);
 
@@ -93,34 +102,44 @@ impl MetricsCollector {
     }
 
     /// Update the latency percentile metrics (P50, P95, P99).
+    ///
+    /// Calculates percentiles from the sliding window of latency samples
+    /// and updates both PerformanceMetrics and reports to metrics crate.
     async fn update_latency_percentiles(&self) {
-        let samples = self.io_latency_samples.read().await;
+        let samples: tokio::sync::RwLockReadGuard<'_, Vec<Duration>> = self.io_latency_samples.read().await;
         if samples.is_empty() {
             return;
         }
 
         // Sort samples to calculate percentiles
-        let mut sorted: Vec<_> = samples.iter().map(|d| d.as_micros()).collect();
+        let mut sorted: Vec<u128> = samples.iter().map(|d| d.as_micros()).collect();
         drop(samples); // Release read lock before sort
         sorted.sort();
 
         let len = sorted.len();
 
-        // Average
+        // Calculate average (P50)
         let sum: u128 = sorted.iter().sum();
         let avg = (sum / len as u128) as u64;
+
+        // Update PerformanceMetrics
         self.metrics.avg_io_latency_us.store(avg, Ordering::Relaxed);
 
-        // P95
+        // Report to metrics crate
+        crate::record_io_latency(avg as f64 / 1000.0); // Convert to ms
+
+        // Calculate P95
         let p95_idx = ((len as f64) * 0.95) as usize;
         if let Some(&p95) = sorted.get(p95_idx.min(len - 1)) {
             self.metrics.p95_io_latency_us.store(p95 as u64, Ordering::Relaxed);
+            crate::record_io_latency_p95(p95 as f64 / 1000.0);
         }
 
-        // P99
+        // Calculate P99
         let p99_idx = ((len as f64) * 0.99) as usize;
         if let Some(&p99) = sorted.get(p99_idx.min(len - 1)) {
             self.metrics.p99_io_latency_us.store(p99 as u64, Ordering::Relaxed);
+            crate::record_io_latency_p99(p99 as f64 / 1000.0);
         }
     }
 

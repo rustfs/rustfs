@@ -14,16 +14,18 @@
 
 //! Concurrency manager for coordinating concurrent GetObject requests.
 
+use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
+use super::global_metrics::get_global_metrics;
+use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
-use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
 use rustfs_config::{KI_B, MI_B};
-use crate::storage::zero_copy::BytesPool;
+use rustfs_io_core::BytesPool;
+use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -56,6 +58,8 @@ pub struct ConcurrencyManager {
     pattern_detector: Arc<Mutex<IoPatternDetector>>,
     /// Bandwidth monitor for adaptive I/O sizing
     bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
+    /// Metrics collector for I/O latency tracking (P50, P95, P99)
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -72,7 +76,10 @@ impl std::fmt::Debug for ConcurrencyManager {
             "locked".to_string()
         };
         f.debug_struct("ConcurrencyManager")
-            .field("active_requests", &crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
+            .field(
+                "active_requests",
+                &crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
+            )
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
             .field("io_metrics", &io_metrics_info)
             .field("storage_media", &self.storage_media)
@@ -96,16 +103,16 @@ impl ConcurrencyManager {
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
 
-        let tiered_cache_enabled =
-            rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE);
+        let tiered_cache_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE,
+        );
 
         let max_disk_reads = scheduler_config.max_concurrent_reads;
 
         // Detect storage media
-        let storage_media = detect_storage_media(
-            scheduler_config.storage_detection_enabled,
-            &scheduler_config.storage_media_override,
-        );
+        let storage_media =
+            detect_storage_media(scheduler_config.storage_detection_enabled, &scheduler_config.storage_media_override);
 
         // Create tiered cache configuration
         let cache = if tiered_cache_enabled {
@@ -129,6 +136,14 @@ impl ConcurrencyManager {
             scheduler_config.bandwidth_high_threshold_bps,
         )));
 
+        // Use global performance metrics instance for consistent metrics tracking
+        // This allows AutoTuner and other components to access the same metrics data
+        let performance_metrics = get_global_metrics();
+
+        // Initialize metrics collector for I/O latency tracking
+        // Keep 1000 samples for P95/P99 calculation
+        let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics.clone(), 1000));
+
         // Build priority queue config
         let queue_config = IoPriorityQueueConfig {
             queue_high_capacity: scheduler_config.queue_high_capacity,
@@ -149,6 +164,7 @@ impl ConcurrencyManager {
             storage_media,
             pattern_detector,
             bandwidth_monitor,
+            metrics_collector,
         }
     }
 
@@ -225,6 +241,57 @@ impl ConcurrencyManager {
             use metrics::histogram;
             histogram!("rustfs.disk.permit.wait.duration.seconds").record(wait_duration.as_secs_f64());
         }
+    }
+
+    // ============================================
+    // Metrics Collection Methods
+    // ============================================
+
+    /// Record a disk I/O operation for latency tracking.
+    ///
+    /// This method delegates to MetricsCollector which:
+    /// 1. Updates atomic counters in PerformanceMetrics
+    /// 2. Records latency for P95/P99 calculation
+    /// 3. Reports to metrics crate (which exports to OTEL)
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes transferred
+    /// * `duration` - Duration of the I/O operation
+    /// * `is_read` - true for read operations, false for writes
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let manager = get_concurrency_manager();
+    /// let start = Instant::now();
+    /// // ... perform disk I/O ...
+    /// let duration = start.elapsed();
+    /// manager.record_disk_operation(1024 * 1024, duration, true).await;
+    /// ```
+    pub async fn record_disk_operation(&self, bytes: u64, duration: Duration, is_read: bool) {
+        self.metrics_collector.record_io_operation(bytes, duration, is_read).await;
+    }
+
+    /// Get a reference to the metrics collector for external use.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped MetricsCollector instance
+    pub fn metrics_collector(&self) -> &Arc<MetricsCollector> {
+        &self.metrics_collector
+    }
+
+    /// Get the global performance metrics instance.
+    ///
+    /// This provides access to the shared PerformanceMetrics that is used
+    /// across all components, including AutoTuner.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped PerformanceMetrics instance
+    pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
+        get_global_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.
@@ -319,7 +386,8 @@ impl ConcurrencyManager {
         };
 
         // Get concurrent request count
-        let concurrent_requests = crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
+        let concurrent_requests =
+            crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
 
         // Build scheduling context
         let context = IoSchedulingContext {
@@ -1012,12 +1080,7 @@ mod integration_tests {
         let permit_wait = Duration::from_millis(5); // Low load
         let is_sequential = true;
 
-        let strategy = manager.calculate_io_strategy_with_context(
-            file_size,
-            base_buffer,
-            permit_wait,
-            is_sequential,
-        );
+        let strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, permit_wait, is_sequential);
 
         // Verify basic optimizations work
         assert_eq!(strategy.storage_media, manager.storage_media());
@@ -1047,7 +1110,10 @@ mod integration_tests {
 
         // Pattern should change to mixed or random
         let pattern_after = manager.current_access_pattern();
-        assert!(!matches!(pattern_after, crate::storage::concurrency::io_profile::AccessPattern::Sequential));
+        assert!(!matches!(
+            pattern_after,
+            crate::storage::concurrency::io_profile::AccessPattern::Sequential
+        ));
     }
 
     #[tokio::test]
@@ -1072,20 +1138,13 @@ mod integration_tests {
         let manager = ConcurrencyManager::new();
 
         // Test that old API still works
-        let old_strategy = manager.calculate_io_strategy(
-            Duration::from_millis(50),
-            256 * 1024,
-        );
+        let old_strategy = manager.calculate_io_strategy(Duration::from_millis(50), 256 * 1024);
 
         assert!(old_strategy.buffer_size > 0);
 
         // New API with context should also work
-        let new_strategy = manager.calculate_io_strategy_with_context(
-            50 * 1024 * 1024,
-            256 * 1024,
-            Duration::from_millis(50),
-            false,
-        );
+        let new_strategy =
+            manager.calculate_io_strategy_with_context(50 * 1024 * 1024, 256 * 1024, Duration::from_millis(50), false);
 
         assert!(new_strategy.buffer_size > 0);
     }
@@ -1098,12 +1157,7 @@ mod integration_tests {
         // Simulate high concurrent requests by keeping guards alive
         let _guards: Vec<_> = (0..20).map(|_| crate::storage::concurrency::GetObjectGuard::new()).collect();
 
-        let strategy = manager.calculate_io_strategy_with_context(
-            100 * 1024 * 1024,
-            512 * 1024,
-            Duration::from_millis(10),
-            true,
-        );
+        let strategy = manager.calculate_io_strategy_with_context(100 * 1024 * 1024, 512 * 1024, Duration::from_millis(10), true);
 
         // High concurrency should reduce buffer
         assert!(strategy.concurrent_requests >= manager.scheduler_config().high_concurrency_threshold);
@@ -1129,8 +1183,10 @@ mod integration_tests {
         assert!(strategy.buffer_size <= MI_B);
 
         #[cfg(feature = "io-scheduler-debug")]
-        assert!(strategy.debug_info.clamp_max_applied || strategy.buffer_size == MI_B,
-                "Should apply max clamp or buffer cap");
+        assert!(
+            strategy.debug_info.clamp_max_applied || strategy.buffer_size == MI_B,
+            "Should apply max clamp or buffer cap"
+        );
 
         #[cfg(not(feature = "io-scheduler-debug"))]
         assert!(strategy.buffer_size == MI_B, "Should apply max clamp or buffer cap");
@@ -1146,11 +1202,12 @@ mod integration_tests {
 
         // Should be one of the known types (not Unknown unless detection failed)
         // We accept Unknown if detection wasn't configured
-        assert!(matches!(media,
-            crate::storage::concurrency::io_profile::StorageMedia::Nvme |
-            crate::storage::concurrency::io_profile::StorageMedia::Ssd |
-            crate::storage::concurrency::io_profile::StorageMedia::Hdd |
-            crate::storage::concurrency::io_profile::StorageMedia::Unknown
+        assert!(matches!(
+            media,
+            crate::storage::concurrency::io_profile::StorageMedia::Nvme
+                | crate::storage::concurrency::io_profile::StorageMedia::Ssd
+                | crate::storage::concurrency::io_profile::StorageMedia::Hdd
+                | crate::storage::concurrency::io_profile::StorageMedia::Unknown
         ));
     }
 

@@ -32,10 +32,10 @@ mod tests {
         let manager = ConcurrencyManager::new();
 
         let strategy = manager.calculate_io_strategy_with_context(
-            5 * 1024 * 1024,  // 5MB file
-            256 * 1024,        // 256KB base buffer
-            Duration::from_millis(5),   // Low load
-            true,              // Sequential
+            5 * 1024 * 1024,          // 5MB file
+            256 * 1024,               // 256KB base buffer
+            Duration::from_millis(5), // Low load
+            true,                     // Sequential
         );
 
         // Verify basic strategy properties
@@ -53,23 +53,13 @@ mod tests {
         let low_strategy = {
             let _g1 = ConcurrencyManager::track_request();
             let _g2 = ConcurrencyManager::track_request();
-            manager.calculate_io_strategy_with_context(
-                50 * 1024 * 1024,
-                512 * 1024,
-                Duration::from_millis(10),
-                true,
-            )
+            manager.calculate_io_strategy_with_context(50 * 1024 * 1024, 512 * 1024, Duration::from_millis(10), true)
         };
 
         // High concurrency
         let high_strategy = {
             let _guards: Vec<_> = (0..16).map(|_| ConcurrencyManager::track_request()).collect();
-            manager.calculate_io_strategy_with_context(
-                50 * 1024 * 1024,
-                512 * 1024,
-                Duration::from_millis(10),
-                true,
-            )
+            manager.calculate_io_strategy_with_context(50 * 1024 * 1024, 512 * 1024, Duration::from_millis(10), true)
         };
 
         // Buffer should decrease with higher concurrency
@@ -86,16 +76,14 @@ mod tests {
         let base_buffer = 512 * 1024;
 
         // Low load
-        let low_strategy = manager.calculate_io_strategy_with_context(
-            file_size, base_buffer, Duration::from_millis(5), true);
+        let low_strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, Duration::from_millis(5), true);
 
         // High load
-        let high_strategy = manager.calculate_io_strategy_with_context(
-            file_size, base_buffer, Duration::from_millis(100), true);
+        let high_strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, Duration::from_millis(100), true);
 
         // Critical load
-        let critical_strategy = manager.calculate_io_strategy_with_context(
-            file_size, base_buffer, Duration::from_millis(300), true);
+        let critical_strategy =
+            manager.calculate_io_strategy_with_context(file_size, base_buffer, Duration::from_millis(300), true);
 
         // Load levels should increase
         assert!(low_strategy.load_level.level_index() < high_strategy.load_level.level_index());
@@ -179,11 +167,9 @@ mod tests {
         let base_buffer = 512 * 1024;
         let wait = Duration::from_millis(20);
 
-        let sequential_strategy = manager.calculate_io_strategy_with_context(
-            file_size, base_buffer, wait, true);
+        let sequential_strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, wait, true);
 
-        let random_strategy = manager.calculate_io_strategy_with_context(
-            file_size, base_buffer, wait, false);
+        let random_strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, wait, false);
 
         // Sequential should get better (or equal) treatment
         assert!(sequential_strategy.buffer_size >= random_strategy.buffer_size);
