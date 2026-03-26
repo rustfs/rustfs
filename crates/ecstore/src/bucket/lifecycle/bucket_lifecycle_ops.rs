@@ -716,6 +716,12 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
+    if remote_delete_succeeded {
+        opts.skip_decommissioned = true;
+    }
+}
+
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
         enqueue_transition_with_lifecycle(oi, &lc, &src).await;
@@ -795,11 +801,10 @@ pub async fn expire_transitioned_object(
         &oi.transitioned_object.tier,
     )
     .await;
-    if ret.is_ok() {
-        opts.skip_decommissioned = true;
-    } else {
+    if ret.is_err() {
         //transitionLogIf(ctx, err);
     }
+    mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
@@ -1277,4 +1282,40 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
         _ => (),
     }
     success
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_delete_opts_skip_decommissioned_on_remote_success;
+    use crate::store_api::ObjectOptions;
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_sets_flag_on_success() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
+
+        assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_false_on_failure() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(!opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_existing_true_on_failure() {
+        let mut opts = ObjectOptions {
+            skip_decommissioned: true,
+            ..ObjectOptions::default()
+        };
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(opts.skip_decommissioned);
+    }
 }
