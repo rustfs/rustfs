@@ -131,7 +131,7 @@ impl DirectIoReader {
     /// - The file doesn't support Direct I/O
     /// - Offset or size are not properly aligned
     /// - The platform doesn't support Direct I/O
-    pub fn new(mut file: std::fs::File, offset: u64, size: usize) -> Result<Self, DirectIoError> {
+    pub fn new(file: std::fs::File, offset: u64, size: usize) -> Result<Self, DirectIoError> {
         // Check alignment
         if offset % Self::ALIGNMENT as u64 != 0 {
             return Err(DirectIoError::AlignmentError { offset, size });
