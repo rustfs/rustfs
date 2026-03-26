@@ -199,7 +199,7 @@ impl DirectIoReader {
 impl AsyncRead for DirectIoReader {
     fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let filled = buf.filled().len();
-        let mut remaining = &mut buf.initialize_unfilled();
+        let mut remaining = buf.initialize_unfilled();
 
         while !remaining.is_empty() {
             match self.read_chunk(remaining) {
