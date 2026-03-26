@@ -14,6 +14,7 @@
 
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_token};
+use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use metrics::counter;
@@ -64,6 +65,12 @@ fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObjectTagConditions(pub HashMap<String, Vec<String>>);
+
+const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
+
+fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(AMZ_WRITE_OFFSET_BYTES_HEADER)
+}
 
 /// Returns true if the bucket has a policy that uses `s3:ExistingObjectTag` (or
 /// `ExistingObjectTag/...`) conditions. Used to skip fetching object tags when
@@ -1436,6 +1443,13 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
+        if has_write_offset_bytes_header(&req.headers) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NotImplemented,
+                ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
+            ));
+        }
+
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
@@ -1781,5 +1795,13 @@ mod tests {
             req.extensions.get::<PostObjectRequestMarker>().is_some(),
             "post object request should carry the marker for downstream handling"
         );
+    }
+
+    #[test]
+    fn write_offset_bytes_header_detection_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Amz-Write-Offset-Bytes", http::HeaderValue::from_static("0"));
+
+        assert!(has_write_offset_bytes_header(&headers));
     }
 }
