@@ -355,6 +355,17 @@ pub fn has_bypass_governance_header(headers: &http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn legal_hold_write_requested(object_lock_legal_hold_status: Option<&ObjectLockLegalHoldStatus>) -> bool {
+    object_lock_legal_hold_status.is_some()
+}
+
+fn retention_write_requested(
+    object_lock_mode: Option<&ObjectLockMode>,
+    object_lock_retain_until_date: Option<&Timestamp>,
+) -> bool {
+    object_lock_mode.is_some() || object_lock_retain_until_date.is_some()
+}
+
 fn get_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::GetBucketPolicyAction)
 }
@@ -521,7 +532,17 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+
+        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+        }
+
+        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
@@ -530,7 +551,17 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+
+        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+        }
+
+        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the DeleteBucket request has accesses to the resources.
@@ -1405,7 +1436,17 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+
+        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+        }
+
+        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+        }
+
+        Ok(())
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -1567,6 +1608,7 @@ mod tests {
     use super::*;
     use http::{HeaderMap, Method, Uri};
     use std::collections::HashMap;
+    use time::OffsetDateTime;
 
     #[test]
     fn get_bucket_policy_uses_get_bucket_policy_action() {
@@ -1591,6 +1633,26 @@ mod tests {
     #[test]
     fn list_parts_uses_list_multipart_upload_parts_action() {
         assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
+    }
+
+    #[test]
+    fn legal_hold_write_requested_is_true_when_status_present() {
+        assert!(legal_hold_write_requested(Some(&ObjectLockLegalHoldStatus::from_static(
+            ObjectLockLegalHoldStatus::ON
+        ))));
+        assert!(!legal_hold_write_requested(None));
+    }
+
+    #[test]
+    fn retention_write_requested_is_true_when_mode_or_date_present() {
+        let retain_until = OffsetDateTime::now_utc().into();
+
+        assert!(retention_write_requested(
+            Some(&ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+            None
+        ));
+        assert!(retention_write_requested(None, Some(&retain_until)));
+        assert!(!retention_write_requested(None, None));
     }
 
     #[test]
