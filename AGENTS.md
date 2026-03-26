@@ -16,6 +16,14 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Respond in the same language used by the requester.
 - Keep source code, comments, commit messages, and PR title/body in English.
 
+## Change Style for Existing Logic
+
+- Prefer direct, local code over extracting one-off helpers.
+- Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
+- Preserve the existing control-flow and logic shape when fixing bugs or addressing review comments, especially in init, distributed coordination, locking, metadata, and concurrency paths.
+- Do not refactor existing code only to make it easier to unit test.
+- Keep fixes narrowly aligned with the requested behavior; avoid semantic-adjacent rewrites while touching sensitive paths.
+
 ## Sources of Truth
 
 - Workspace layout and crate membership: `Cargo.toml` (`[workspace].members`)
