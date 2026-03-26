@@ -596,6 +596,15 @@ impl S3 for FS {
         usecase.execute_list_object_versions(req).await
     }
 
+    async fn list_object_versions_m(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
+        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_list_object_versions_m(req).await
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         record_s3_op(S3Operation::ListObjects, &req.input.bucket);
