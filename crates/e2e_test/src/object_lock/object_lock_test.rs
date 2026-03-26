@@ -1044,7 +1044,7 @@ async fn test_write_paths_require_put_object_retention_permission() {
             .key("put-target")
             .body(ByteStream::from(b"put-body".to_vec()))
             .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
-            .object_lock_retain_until_date(retain_until.clone())
+            .object_lock_retain_until_date(retain_until)
             .send()
             .await,
         "PutObject with retention should require s3:PutObjectRetention",
@@ -1057,7 +1057,7 @@ async fn test_write_paths_require_put_object_retention_permission() {
             .bucket(bucket)
             .key("copy-target")
             .object_lock_mode(aws_sdk_s3::types::ObjectLockMode::Governance)
-            .object_lock_retain_until_date(retain_until.clone())
+            .object_lock_retain_until_date(retain_until)
             .send()
             .await,
         "CopyObject with retention should require s3:PutObjectRetention",
