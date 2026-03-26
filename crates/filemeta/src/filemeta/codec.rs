@@ -267,7 +267,7 @@ impl FileMeta {
 
     pub fn is_latest_delete_marker(buf: &[u8]) -> bool {
         let header = Self::decode_xl_headers(buf).ok();
-        if let Some((versions, _hdr_v, _meta_v, meta)) = header {
+        if let Some((versions, hdr_v, _meta_v, meta)) = header {
             if versions == 0 {
                 return false;
             }
@@ -276,7 +276,7 @@ impl FileMeta {
 
             let _ = Self::decode_versions(meta, versions, |_: usize, hdr: &[u8], _: &[u8]| {
                 let mut header = FileMetaVersionHeader::default();
-                if header.unmarshal_msg(hdr).is_err() {
+                if header.unmarshal_v(hdr_v, hdr).is_err() {
                     return Err(Error::DoneForNow);
                 }
 

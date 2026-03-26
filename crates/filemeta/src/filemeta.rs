@@ -1078,6 +1078,34 @@ mod test {
     }
 
     #[test]
+    fn test_legacy_v1_object_xlmeta_compatibility() {
+        let data = create_legacy_v1_object_xlmeta().expect("Failed to create legacy v1 object xl.meta");
+        let (major, minor, header_ver, meta_ver) = FileMeta::read_format_versions(&data).unwrap();
+        assert_eq!((major, minor, header_ver, meta_ver), (1, 3, 1, 1));
+
+        let fm = FileMeta::load(&data).expect("Failed to parse legacy v1 object xl.meta");
+        assert_eq!(fm.meta_ver, 1);
+        assert_eq!(fm.versions.len(), 1);
+        assert_eq!(fm.versions[0].header.version_type, VersionType::Legacy);
+        assert_eq!(fm.versions[0].header.ec_n, 0);
+        assert_eq!(fm.versions[0].header.ec_m, 0);
+
+        let fi = fm
+            .into_fileinfo("bucket", "hello.txt", "", true, false, true)
+            .expect("Failed to extract file info from legacy v1 object xl.meta");
+        assert_eq!(fi.size, 11);
+        assert_eq!(fi.num_versions, 1);
+        assert_eq!(fi.mode, Some(0o644));
+        assert_eq!(fi.parts.len(), 1);
+        assert_eq!(fi.parts[0].etag, "etag-1");
+        assert_eq!(fi.parts[0].size, 11);
+        assert_eq!(fi.erasure.data_blocks, 4);
+        assert_eq!(fi.erasure.parity_blocks, 2);
+        assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
+        assert!(fi.is_latest);
+    }
+
+    #[test]
     fn test_complex_xlmeta_handling() {
         // Test complex xl.meta files with many versions
         let data = create_complex_xlmeta().expect("Failed to create complex test data");
@@ -1158,6 +1186,7 @@ mod test {
         // Exercise creation and handling of Legacy versions
         let legacy_version = FileMetaVersion {
             version_type: VersionType::Legacy,
+            legacy_object: None,
             object: None,
             delete_marker: None,
             write_version: 1,
@@ -1257,6 +1286,7 @@ mod test {
         let mut fm = FileMeta::new();
         let version = FileMetaVersion {
             version_type: VersionType::Object,
+            legacy_object: None,
             object: Some(MetaObject {
                 version_id: None, // Empty version ID
                 data_dir: None,
@@ -1490,6 +1520,7 @@ mod test {
 
             let delete_version = FileMetaVersion {
                 version_type: VersionType::Delete,
+                legacy_object: None,
                 object: None,
                 delete_marker: Some(delete_marker),
                 write_version: (i + 100) as u64,

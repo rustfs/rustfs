@@ -24,11 +24,113 @@
 
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
+use crate::ChecksumInfo;
+use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
     SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
     contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
 };
+
+const MSGPACK_EXT8: u8 = 0xc7;
+const MSGPACK_EXT16: u8 = 0xc8;
+const MSGPACK_EXT32: u8 = 0xc9;
+const MSGPACK_FIXEXT4: u8 = 0xd6;
+const MSGPACK_FIXEXT8: u8 = 0xd7;
+const MSGPACK_TIME_EXT_LEGACY: i8 = 5;
+const MSGPACK_TIME_EXT_OFFICIAL: i8 = -1;
+
+fn read_msgp_string<R: std::io::Read>(rd: &mut R) -> Result<String> {
+    let len = rmp::decode::read_str_len(rd)? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(String::from_utf8(buf)?)
+}
+
+fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
+    let len = rmp::decode::read_bin_len(rd)? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn decode_msgp_time_payload(ext_type: i8, payload: &[u8]) -> Result<OffsetDateTime> {
+    let (secs, nanos) = match (ext_type, payload.len()) {
+        (MSGPACK_TIME_EXT_LEGACY, 12) => {
+            let secs = i64::from_be_bytes(payload[..8].try_into().unwrap());
+            let nanos = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+            (secs, nanos)
+        }
+        (MSGPACK_TIME_EXT_OFFICIAL, 4) => (u32::from_be_bytes(payload.try_into().unwrap()) as i64, 0),
+        (MSGPACK_TIME_EXT_OFFICIAL, 8) => {
+            let v = u64::from_be_bytes(payload.try_into().unwrap());
+            let nanos = (v >> 34) as u32;
+            let secs = (v & ((1 << 34) - 1)) as i64;
+            (secs, nanos)
+        }
+        (MSGPACK_TIME_EXT_OFFICIAL, 12) => {
+            let nanos = u32::from_be_bytes(payload[..4].try_into().unwrap());
+            let secs = i64::from_be_bytes(payload[4..12].try_into().unwrap());
+            (secs, nanos)
+        }
+        _ => {
+            return Err(Error::other(format!(
+                "unsupported msgpack time ext type {ext_type} len {}",
+                payload.len()
+            )));
+        }
+    };
+
+    if nanos > 999_999_999 {
+        return Err(Error::other(format!("invalid msgpack time nanos: {nanos}")));
+    }
+
+    OffsetDateTime::from_unix_timestamp_nanos(secs as i128 * 1_000_000_000 + nanos as i128).map_err(Error::from)
+}
+
+fn read_msgp_time<R: std::io::Read>(rd: &mut R) -> Result<OffsetDateTime> {
+    let mut tag = [0u8; 1];
+    rd.read_exact(&mut tag)?;
+
+    let (len, ext_type) = match tag[0] {
+        MSGPACK_FIXEXT4 => {
+            let mut typ = [0u8; 1];
+            rd.read_exact(&mut typ)?;
+            (4usize, typ[0] as i8)
+        }
+        MSGPACK_FIXEXT8 => {
+            let mut typ = [0u8; 1];
+            rd.read_exact(&mut typ)?;
+            (8usize, typ[0] as i8)
+        }
+        MSGPACK_EXT8 => {
+            let mut len = [0u8; 1];
+            let mut typ = [0u8; 1];
+            rd.read_exact(&mut len)?;
+            rd.read_exact(&mut typ)?;
+            (len[0] as usize, typ[0] as i8)
+        }
+        MSGPACK_EXT16 => {
+            let mut len = [0u8; 2];
+            let mut typ = [0u8; 1];
+            rd.read_exact(&mut len)?;
+            rd.read_exact(&mut typ)?;
+            (u16::from_be_bytes(len) as usize, typ[0] as i8)
+        }
+        MSGPACK_EXT32 => {
+            let mut len = [0u8; 4];
+            let mut typ = [0u8; 1];
+            rd.read_exact(&mut len)?;
+            rd.read_exact(&mut typ)?;
+            (u32::from_be_bytes(len) as usize, typ[0] as i8)
+        }
+        other => return Err(Error::other(format!("unsupported msgpack time marker: 0x{other:02x}"))),
+    };
+
+    let mut payload = vec![0u8; len];
+    rd.read_exact(&mut payload)?;
+    decode_msgp_time_payload(ext_type, &payload)
+}
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
 pub struct FileMetaShallowVersion {
@@ -63,6 +165,8 @@ impl TryFrom<FileMetaVersion> for FileMetaShallowVersion {
 pub struct FileMetaVersion {
     #[serde(rename = "Type")]
     pub version_type: VersionType,
+    #[serde(rename = "V1Obj")]
+    pub legacy_object: Option<MetaObjectV1>,
     #[serde(rename = "V2Obj")]
     pub object: Option<MetaObject>,
     #[serde(rename = "DelObj")]
@@ -86,6 +190,7 @@ impl FileMetaVersion {
                 .as_ref()
                 .map(|v| v.erasure_algorithm.valid() && v.bitrot_checksum_algo.valid() && v.mod_time.is_some())
                 .unwrap_or_default(),
+            VersionType::Legacy => self.legacy_object.as_ref().map(MetaObjectV1::valid).unwrap_or_default(),
             VersionType::Delete => self
                 .delete_marker
                 .as_ref()
@@ -113,7 +218,8 @@ impl FileMetaVersion {
         match self.version_type {
             VersionType::Object => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
             VersionType::Delete => self.delete_marker.as_ref().map(|v| v.version_id).unwrap_or_default(),
-            _ => None,
+            VersionType::Legacy => self.legacy_object.as_ref().and_then(MetaObjectV1::version_id),
+            VersionType::Invalid => None,
         }
     }
 
@@ -121,7 +227,8 @@ impl FileMetaVersion {
         match self.version_type {
             VersionType::Object => self.object.as_ref().map(|v| v.mod_time).unwrap_or_default(),
             VersionType::Delete => self.delete_marker.as_ref().map(|v| v.mod_time).unwrap_or_default(),
-            _ => None,
+            VersionType::Legacy => self.legacy_object.as_ref().and_then(|v| v.stat.mod_time),
+            VersionType::Invalid => None,
         }
     }
 
@@ -151,15 +258,18 @@ impl FileMetaVersion {
                     self.version_type = VersionType::from_u8(v as u8);
                 }
                 "V1Obj" => {
-                    // Skip V1Obj (legacy), not supported
                     let mut buf = [0u8; 1];
                     rd.read_exact(&mut buf).map_err(Error::from)?;
-                    if buf[0] != 0xc0 {
+                    if buf[0] == 0xc0 {
+                        self.legacy_object = None;
+                    } else {
                         let mut prepend = PrependByteReader {
                             byte: Some(buf[0]),
                             inner: rd,
                         };
-                        skip_msgp_value(&mut prepend)?;
+                        let mut obj = MetaObjectV1::default();
+                        obj.decode_from(&mut prepend)?;
+                        self.legacy_object = Some(obj);
                     }
                 }
                 "V2Obj" => {
@@ -266,11 +376,17 @@ impl FileMetaVersion {
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
         let mut fi = match self.version_type {
-            VersionType::Invalid | VersionType::Legacy => FileInfo {
-                name: path.to_string(),
-                volume: volume.to_string(),
-                ..Default::default()
-            },
+            VersionType::Invalid | VersionType::Legacy => {
+                if let Some(ref legacy) = self.legacy_object {
+                    legacy.to_fileinfo(volume, path)
+                } else {
+                    FileInfo {
+                        name: path.to_string(),
+                        volume: volume.to_string(),
+                        ..Default::default()
+                    }
+                }
+            }
             VersionType::Object => self
                 .object
                 .as_ref()
@@ -324,6 +440,7 @@ impl FileMetaVersion {
                     [0; 4]
                 }
             }
+            VersionType::Legacy => self.legacy_object.as_ref().map(MetaObjectV1::get_signature).unwrap_or([0; 4]),
             _ => [0; 4],
         }
     }
@@ -332,6 +449,7 @@ impl FileMetaVersion {
     pub fn uses_data_dir(&self) -> bool {
         match self.version_type {
             VersionType::Object => self.object.as_ref().map(|obj| obj.uses_data_dir()).unwrap_or(false),
+            VersionType::Legacy => false,
             _ => false,
         }
     }
@@ -340,6 +458,7 @@ impl FileMetaVersion {
     pub fn uses_inline_data(&self) -> bool {
         match self.version_type {
             VersionType::Object => self.object.as_ref().map(|obj| obj.inlinedata()).unwrap_or(false),
+            VersionType::Legacy => false,
             _ => false,
         }
     }
@@ -366,6 +485,7 @@ impl From<FileInfo> for FileMetaVersion {
         if value.deleted {
             FileMetaVersion {
                 version_type: VersionType::Delete,
+                legacy_object: None,
                 delete_marker: Some(MetaDeleteMarker::from(value)),
                 object: None,
                 write_version: 0,
@@ -374,6 +494,7 @@ impl From<FileInfo> for FileMetaVersion {
         } else {
             FileMetaVersion {
                 version_type: VersionType::Object,
+                legacy_object: None,
                 delete_marker: None,
                 object: Some(MetaObject::from(value)),
                 write_version: 0,
@@ -742,6 +863,369 @@ pub struct MetaObject {
     pub meta_sys: HashMap<String, Vec<u8>>, // Object version internal metadata
     #[serde(rename = "MetaUsr")]
     pub meta_user: HashMap<String, String>, // Object version metadata set by user
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct MetaObjectV1 {
+    #[serde(rename = "Version")]
+    pub version: String,
+    #[serde(rename = "Format")]
+    pub format: String,
+    #[serde(rename = "Stat")]
+    pub stat: MetaObjectV1Stat,
+    #[serde(rename = "Erasure")]
+    pub erasure: MetaObjectV1Erasure,
+    #[serde(rename = "Meta")]
+    pub meta: HashMap<String, String>,
+    #[serde(rename = "Parts")]
+    pub parts: Vec<MetaObjectV1Part>,
+    #[serde(rename = "VersionID")]
+    pub version_id: String,
+    #[serde(rename = "DataDir")]
+    pub data_dir: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct MetaObjectV1Stat {
+    #[serde(rename = "Size")]
+    pub size: i64,
+    #[serde(rename = "ModTime")]
+    pub mod_time: Option<OffsetDateTime>,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Dir")]
+    pub dir: bool,
+    #[serde(rename = "Mode")]
+    pub mode: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct MetaObjectV1ChecksumInfo {
+    #[serde(rename = "PartNumber")]
+    pub part_number: usize,
+    #[serde(rename = "Algorithm")]
+    pub algorithm: String,
+    #[serde(rename = "Hash")]
+    pub hash: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct MetaObjectV1Erasure {
+    #[serde(rename = "Algorithm")]
+    pub algorithm: String,
+    #[serde(rename = "DataBlocks")]
+    pub data_blocks: usize,
+    #[serde(rename = "ParityBlocks")]
+    pub parity_blocks: usize,
+    #[serde(rename = "BlockSize")]
+    pub block_size: usize,
+    #[serde(rename = "Index")]
+    pub index: usize,
+    #[serde(rename = "Distribution")]
+    pub distribution: Vec<usize>,
+    #[serde(rename = "Checksums")]
+    pub checksums: Vec<MetaObjectV1ChecksumInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct MetaObjectV1Part {
+    #[serde(rename = "e")]
+    pub etag: String,
+    #[serde(rename = "n")]
+    pub number: usize,
+    #[serde(rename = "s")]
+    pub size: usize,
+    #[serde(rename = "as")]
+    pub actual_size: i64,
+    #[serde(rename = "mt")]
+    pub mod_time: Option<OffsetDateTime>,
+    #[serde(rename = "i")]
+    pub index: Option<Bytes>,
+    #[serde(rename = "crc")]
+    pub checksums: Option<HashMap<String, String>>,
+    #[serde(rename = "err")]
+    pub error: Option<String>,
+}
+
+impl MetaObjectV1 {
+    fn version_id(&self) -> Option<Uuid> {
+        if self.version_id.is_empty() {
+            None
+        } else {
+            Uuid::parse_str(&self.version_id).ok().filter(|id| !id.is_nil())
+        }
+    }
+
+    fn valid(&self) -> bool {
+        if self.format != "xl" || self.stat.mod_time.is_none() {
+            return false;
+        }
+
+        let data_blocks = self.erasure.data_blocks;
+        let parity_blocks = self.erasure.parity_blocks;
+        data_blocks > 0
+            && data_blocks >= parity_blocks
+            && self.erasure.index > 0
+            && self.erasure.distribution.len() == data_blocks + parity_blocks
+    }
+
+    fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_string(rd)?;
+            match key.as_str() {
+                "Version" => self.version = read_msgp_string(rd)?,
+                "Format" => self.format = read_msgp_string(rd)?,
+                "Stat" => self.stat.decode_from(rd)?,
+                "Erasure" => self.erasure.decode_from(rd)?,
+                "Meta" => {
+                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    self.meta.clear();
+                    for _ in 0..len {
+                        self.meta.insert(read_msgp_string(rd)?, read_msgp_string(rd)?);
+                    }
+                }
+                "Parts" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.parts.clear();
+                    self.parts.reserve(len);
+                    for _ in 0..len {
+                        let mut part = MetaObjectV1Part::default();
+                        part.decode_from(rd)?;
+                        self.parts.push(part);
+                    }
+                }
+                "VersionID" => self.version_id = read_msgp_string(rd)?,
+                "DataDir" => self.data_dir = read_msgp_string(rd)?,
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_signature(&self) -> [u8; 4] {
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
+        hasher.update(self.version.as_bytes());
+        hasher.update(self.format.as_bytes());
+        hasher.update(&self.stat.size.to_le_bytes());
+        hasher.update(&self.stat.mode.to_le_bytes());
+        if let Some(mod_time) = self.stat.mod_time {
+            hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
+        }
+        hasher.update(self.erasure.algorithm.as_bytes());
+        hasher.update(&(self.erasure.data_blocks as u64).to_le_bytes());
+        hasher.update(&(self.erasure.parity_blocks as u64).to_le_bytes());
+        hasher.update(&(self.erasure.block_size as u64).to_le_bytes());
+        for v in &self.erasure.distribution {
+            hasher.update(&(*v as u64).to_le_bytes());
+        }
+        for checksum in &self.erasure.checksums {
+            hasher.update(&(checksum.part_number as u64).to_le_bytes());
+            hasher.update(checksum.algorithm.as_bytes());
+            hasher.update(&checksum.hash);
+        }
+        let mut meta_keys: Vec<_> = self.meta.iter().collect();
+        meta_keys.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in meta_keys {
+            hasher.update(k.as_bytes());
+            hasher.update(v.as_bytes());
+        }
+        for part in &self.parts {
+            hasher.update(&(part.number as u64).to_le_bytes());
+            hasher.update(&(part.size as u64).to_le_bytes());
+            hasher.update(&part.actual_size.to_le_bytes());
+            hasher.update(part.etag.as_bytes());
+            if let Some(mod_time) = part.mod_time {
+                hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
+            }
+            if let Some(index) = &part.index {
+                hasher.update(index);
+            }
+        }
+        let hash = hasher.finish();
+        let bytes = hash.to_le_bytes();
+        [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    fn to_fileinfo(&self, volume: &str, path: &str) -> FileInfo {
+        FileInfo {
+            volume: volume.to_string(),
+            name: path.to_string(),
+            version_id: self.version_id(),
+            mod_time: self.stat.mod_time,
+            size: self.stat.size,
+            mode: Some(self.stat.mode),
+            metadata: self.meta.clone(),
+            parts: self.parts.iter().cloned().map(Into::into).collect(),
+            erasure: self.erasure.clone().into(),
+            num_versions: 1,
+            data_dir: Uuid::parse_str(&self.data_dir).ok().filter(|id| !id.is_nil()),
+            ..Default::default()
+        }
+    }
+}
+
+impl MetaObjectV1Stat {
+    fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_string(rd)?;
+            match key.as_str() {
+                "Size" => self.size = rmp::decode::read_int(rd)?,
+                "ModTime" => self.mod_time = Some(read_msgp_time(rd)?),
+                "Name" => self.name = read_msgp_string(rd)?,
+                "Dir" => self.dir = rmp::decode::read_bool(rd)?,
+                "Mode" => self.mode = rmp::decode::read_u32(rd)?,
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl MetaObjectV1Erasure {
+    fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_string(rd)?;
+            match key.as_str() {
+                "Algorithm" => self.algorithm = read_msgp_string(rd)?,
+                "DataBlocks" => self.data_blocks = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "ParityBlocks" => self.parity_blocks = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "BlockSize" => self.block_size = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "Index" => self.index = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "Distribution" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.distribution.clear();
+                    self.distribution.reserve(len);
+                    for _ in 0..len {
+                        self.distribution.push(rmp::decode::read_int::<i64, _>(rd)? as usize);
+                    }
+                }
+                "Checksums" => {
+                    let len = rmp::decode::read_array_len(rd)? as usize;
+                    self.checksums.clear();
+                    self.checksums.reserve(len);
+                    for _ in 0..len {
+                        let mut checksum = MetaObjectV1ChecksumInfo::default();
+                        checksum.decode_from(rd)?;
+                        self.checksums.push(checksum);
+                    }
+                }
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl MetaObjectV1ChecksumInfo {
+    fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_string(rd)?;
+            match key.as_str() {
+                "PartNumber" => self.part_number = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "Algorithm" => self.algorithm = read_msgp_string(rd)?,
+                "Hash" => self.hash = read_msgp_bin(rd)?,
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl MetaObjectV1Part {
+    fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
+        let mut fields = rmp::decode::read_map_len(rd)?;
+        *self = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            let key = read_msgp_string(rd)?;
+            match key.as_str() {
+                "e" => self.etag = read_msgp_string(rd)?,
+                "n" => self.number = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "s" => self.size = rmp::decode::read_int::<i64, _>(rd)? as usize,
+                "as" => self.actual_size = rmp::decode::read_int(rd)?,
+                "mt" => self.mod_time = Some(read_msgp_time(rd)?),
+                "i" => self.index = Some(Bytes::from(read_msgp_bin(rd)?)),
+                "crc" => {
+                    let len = rmp::decode::read_map_len(rd)? as usize;
+                    let mut checksums = HashMap::with_capacity(len);
+                    for _ in 0..len {
+                        checksums.insert(read_msgp_string(rd)?, read_msgp_string(rd)?);
+                    }
+                    self.checksums = Some(checksums);
+                }
+                "err" => self.error = Some(read_msgp_string(rd)?),
+                _ => skip_msgp_value(rd)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl From<MetaObjectV1Erasure> for ErasureInfo {
+    fn from(value: MetaObjectV1Erasure) -> Self {
+        ErasureInfo {
+            algorithm: value.algorithm,
+            data_blocks: value.data_blocks,
+            parity_blocks: value.parity_blocks,
+            block_size: value.block_size,
+            index: value.index,
+            distribution: value.distribution,
+            checksums: value.checksums.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<MetaObjectV1ChecksumInfo> for ChecksumInfo {
+    fn from(value: MetaObjectV1ChecksumInfo) -> Self {
+        ChecksumInfo {
+            part_number: value.part_number,
+            algorithm: match value.algorithm.as_str() {
+                "sha256" => HashAlgorithm::SHA256,
+                "highwayhash256" => HashAlgorithm::HighwayHash256,
+                "highwayhash256S" => HashAlgorithm::HighwayHash256S,
+                "blake2b" | "blake2b512" => HashAlgorithm::BLAKE2b512,
+                _ => HashAlgorithm::HighwayHash256S,
+            },
+            hash: Bytes::from(value.hash),
+        }
+    }
+}
+
+impl From<MetaObjectV1Part> for ObjectPartInfo {
+    fn from(value: MetaObjectV1Part) -> Self {
+        ObjectPartInfo {
+            etag: value.etag,
+            number: value.number,
+            size: value.size,
+            actual_size: value.actual_size,
+            mod_time: value.mod_time,
+            index: value.index,
+            checksums: value.checksums,
+            error: value.error,
+        }
+    }
 }
 
 impl MetaObject {
@@ -2134,6 +2618,94 @@ mod tests {
         wr
     }
 
+    fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
+        wr.push(MSGPACK_EXT8);
+        wr.push(12);
+        wr.push(MSGPACK_TIME_EXT_LEGACY as u8);
+        wr.extend_from_slice(&ts.unix_timestamp().to_be_bytes());
+        wr.extend_from_slice(&ts.nanosecond().to_be_bytes());
+    }
+
+    fn encode_legacy_v1_body() -> Vec<u8> {
+        let mut wr = Vec::new();
+        let mod_time = sample_mod_time();
+
+        rmp::encode::write_map_len(&mut wr, 3).unwrap();
+
+        rmp::encode::write_str(&mut wr, "Type").unwrap();
+        rmp::encode::write_uint8(&mut wr, VersionType::Legacy.to_u8()).unwrap();
+
+        rmp::encode::write_str(&mut wr, "V1Obj").unwrap();
+        rmp::encode::write_map_len(&mut wr, 8).unwrap();
+
+        rmp::encode::write_str(&mut wr, "Version").unwrap();
+        rmp::encode::write_str(&mut wr, "1.0.1").unwrap();
+        rmp::encode::write_str(&mut wr, "Format").unwrap();
+        rmp::encode::write_str(&mut wr, "xl").unwrap();
+
+        rmp::encode::write_str(&mut wr, "Stat").unwrap();
+        rmp::encode::write_map_len(&mut wr, 5).unwrap();
+        rmp::encode::write_str(&mut wr, "Size").unwrap();
+        rmp::encode::write_sint(&mut wr, 11).unwrap();
+        rmp::encode::write_str(&mut wr, "ModTime").unwrap();
+        write_legacy_time(&mut wr, mod_time);
+        rmp::encode::write_str(&mut wr, "Name").unwrap();
+        rmp::encode::write_str(&mut wr, "hello.txt").unwrap();
+        rmp::encode::write_str(&mut wr, "Dir").unwrap();
+        rmp::encode::write_bool(&mut wr, false).unwrap();
+        rmp::encode::write_str(&mut wr, "Mode").unwrap();
+        rmp::encode::write_u32(&mut wr, 0o644).unwrap();
+
+        rmp::encode::write_str(&mut wr, "Erasure").unwrap();
+        rmp::encode::write_map_len(&mut wr, 7).unwrap();
+        rmp::encode::write_str(&mut wr, "Algorithm").unwrap();
+        rmp::encode::write_str(&mut wr, "ReedSolomon").unwrap();
+        rmp::encode::write_str(&mut wr, "DataBlocks").unwrap();
+        rmp::encode::write_sint(&mut wr, 4).unwrap();
+        rmp::encode::write_str(&mut wr, "ParityBlocks").unwrap();
+        rmp::encode::write_sint(&mut wr, 2).unwrap();
+        rmp::encode::write_str(&mut wr, "BlockSize").unwrap();
+        rmp::encode::write_sint(&mut wr, 1_048_576).unwrap();
+        rmp::encode::write_str(&mut wr, "Index").unwrap();
+        rmp::encode::write_sint(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "Distribution").unwrap();
+        rmp::encode::write_array_len(&mut wr, 6).unwrap();
+        for value in 1..=6 {
+            rmp::encode::write_sint(&mut wr, value).unwrap();
+        }
+        rmp::encode::write_str(&mut wr, "Checksums").unwrap();
+        rmp::encode::write_array_len(&mut wr, 0).unwrap();
+
+        rmp::encode::write_str(&mut wr, "Meta").unwrap();
+        rmp::encode::write_map_len(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "content-type").unwrap();
+        rmp::encode::write_str(&mut wr, "text/plain").unwrap();
+
+        rmp::encode::write_str(&mut wr, "Parts").unwrap();
+        rmp::encode::write_array_len(&mut wr, 1).unwrap();
+        rmp::encode::write_map_len(&mut wr, 5).unwrap();
+        rmp::encode::write_str(&mut wr, "e").unwrap();
+        rmp::encode::write_str(&mut wr, "etag-1").unwrap();
+        rmp::encode::write_str(&mut wr, "n").unwrap();
+        rmp::encode::write_sint(&mut wr, 1).unwrap();
+        rmp::encode::write_str(&mut wr, "s").unwrap();
+        rmp::encode::write_sint(&mut wr, 11).unwrap();
+        rmp::encode::write_str(&mut wr, "as").unwrap();
+        rmp::encode::write_sint(&mut wr, 11).unwrap();
+        rmp::encode::write_str(&mut wr, "mt").unwrap();
+        write_legacy_time(&mut wr, mod_time);
+
+        rmp::encode::write_str(&mut wr, "VersionID").unwrap();
+        rmp::encode::write_str(&mut wr, "").unwrap();
+        rmp::encode::write_str(&mut wr, "DataDir").unwrap();
+        rmp::encode::write_str(&mut wr, "legacy").unwrap();
+
+        rmp::encode::write_str(&mut wr, "v").unwrap();
+        rmp::encode::write_uint(&mut wr, 1).unwrap();
+
+        wr
+    }
+
     #[test]
     fn version_header_unmarshal_v1_uses_legacy_layout_defaults() {
         let expected = sample_header();
@@ -2177,5 +2749,28 @@ mod tests {
         decoded.unmarshal_v(3, &encoded).unwrap();
 
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn legacy_v1_object_body_decodes_into_fileinfo() {
+        let encoded = encode_legacy_v1_body();
+        let decoded = FileMetaVersion::try_from(encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded.version_type, VersionType::Legacy);
+        assert!(decoded.valid());
+        assert!(decoded.legacy_object.is_some());
+
+        let fi = decoded.into_fileinfo("bucket", "hello.txt", true);
+        assert_eq!(fi.volume, "bucket");
+        assert_eq!(fi.name, "hello.txt");
+        assert_eq!(fi.size, 11);
+        assert_eq!(fi.mod_time, Some(sample_mod_time()));
+        assert_eq!(fi.mode, Some(0o644));
+        assert_eq!(fi.parts.len(), 1);
+        assert_eq!(fi.parts[0].etag, "etag-1");
+        assert_eq!(fi.parts[0].size, 11);
+        assert_eq!(fi.erasure.data_blocks, 4);
+        assert_eq!(fi.erasure.parity_blocks, 2);
+        assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
     }
 }
