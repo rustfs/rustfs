@@ -71,7 +71,6 @@ reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
-rustfs-io-core.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
 path-absolutize = { workspace = true }
@@ -110,7 +109,6 @@ async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 parking_lot = { workspace = true }
-moka = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
