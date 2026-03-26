@@ -102,6 +102,32 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.marshal_msg()
 }
 
+fn decode_hex_fixture(input: &str) -> Result<Vec<u8>> {
+    let input = input.trim();
+    if !input.len().is_multiple_of(2) {
+        return Err(crate::Error::other("hex fixture must have even length"));
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let bytes = input.as_bytes();
+    for idx in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[idx] as char)
+            .to_digit(16)
+            .ok_or_else(|| crate::Error::other(format!("invalid hex at index {idx}")))?;
+        let lo = (bytes[idx + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| crate::Error::other(format!("invalid hex at index {}", idx + 1)))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+
+    Ok(out)
+}
+
+/// Real legacy xl.meta captured in issue #2288. Header/meta versions are 2/1.
+pub fn create_issue_2288_legacy_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2288_legacy_xlmeta.hex"))
+}
+
 /// Create a complex xl.meta file with multiple versions
 pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     let mut fm = FileMeta::new();

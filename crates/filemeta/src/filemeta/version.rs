@@ -403,6 +403,16 @@ pub struct FileMetaVersionHeader {
 }
 
 impl FileMetaVersionHeader {
+    fn reset_for_unmarshal(&mut self) {
+        self.version_id = None;
+        self.mod_time = None;
+        self.signature = [0; 4];
+        self.version_type = VersionType::Invalid;
+        self.flags = 0;
+        self.ec_n = 0;
+        self.ec_m = 0;
+    }
+
     pub fn has_ec(&self) -> bool {
         self.ec_m > 0 && self.ec_n > 0
     }
@@ -499,7 +509,75 @@ impl FileMetaVersionHeader {
         Ok(wr)
     }
 
+    pub fn unmarshal_v(&mut self, version: u8, buf: &[u8]) -> Result<u64> {
+        match version {
+            1 => self.unmarshal_v1(buf),
+            2 => self.unmarshal_v2(buf),
+            3 => self.unmarshal_msg(buf),
+            _ => Err(Error::other(format!("unknown xl header version: {version}"))),
+        }
+    }
+
+    pub fn unmarshal_v1(&mut self, buf: &[u8]) -> Result<u64> {
+        self.reset_for_unmarshal();
+
+        let mut cur = Cursor::new(buf);
+        let alen = rmp::decode::read_array_len(&mut cur)?;
+        if alen != 4 {
+            return Err(Error::other(format!("version header array len err need 4 got {alen}")));
+        }
+
+        rmp::decode::read_bin_len(&mut cur)?;
+        let mut version_id = [0u8; 16];
+        cur.read_exact(&mut version_id)?;
+        self.version_id = Some(Uuid::from_bytes(version_id));
+
+        let unix: i128 = rmp::decode::read_int(&mut cur)?;
+        let time = OffsetDateTime::from_unix_timestamp_nanos(unix)?;
+        if time != OffsetDateTime::UNIX_EPOCH {
+            self.mod_time = Some(time);
+        }
+
+        let typ: u8 = rmp::decode::read_int(&mut cur)?;
+        self.version_type = VersionType::from_u8(typ);
+        self.flags = rmp::decode::read_int(&mut cur)?;
+
+        Ok(cur.position())
+    }
+
+    pub fn unmarshal_v2(&mut self, buf: &[u8]) -> Result<u64> {
+        self.reset_for_unmarshal();
+
+        let mut cur = Cursor::new(buf);
+        let alen = rmp::decode::read_array_len(&mut cur)?;
+        if alen != 5 {
+            return Err(Error::other(format!("version header array len err need 5 got {alen}")));
+        }
+
+        rmp::decode::read_bin_len(&mut cur)?;
+        let mut version_id = [0u8; 16];
+        cur.read_exact(&mut version_id)?;
+        self.version_id = Some(Uuid::from_bytes(version_id));
+
+        let unix: i128 = rmp::decode::read_int(&mut cur)?;
+        let time = OffsetDateTime::from_unix_timestamp_nanos(unix)?;
+        if time != OffsetDateTime::UNIX_EPOCH {
+            self.mod_time = Some(time);
+        }
+
+        rmp::decode::read_bin_len(&mut cur)?;
+        cur.read_exact(&mut self.signature)?;
+
+        let typ: u8 = rmp::decode::read_int(&mut cur)?;
+        self.version_type = VersionType::from_u8(typ);
+        self.flags = rmp::decode::read_int(&mut cur)?;
+
+        Ok(cur.position())
+    }
+
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
+        self.reset_for_unmarshal();
+
         let mut cur = Cursor::new(buf);
         let alen = rmp::decode::read_array_len(&mut cur)?;
         if alen != 7 {
@@ -2008,5 +2086,96 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
             std::io::ErrorKind::InvalidData,
             "Unknown major metadata version",
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_version_id() -> Uuid {
+        Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()
+    }
+
+    fn sample_mod_time() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789).unwrap()
+    }
+
+    fn sample_header() -> FileMetaVersionHeader {
+        FileMetaVersionHeader {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            signature: [0x96, 0x33, 0x4c, 0x78],
+            version_type: VersionType::Object,
+            flags: 0x06,
+            ec_n: 4,
+            ec_m: 2,
+        }
+    }
+
+    fn encode_v1_header(header: &FileMetaVersionHeader) -> Vec<u8> {
+        let mut wr = Vec::new();
+        rmp::encode::write_array_len(&mut wr, 4).unwrap();
+        rmp::encode::write_bin(&mut wr, header.version_id.unwrap().as_bytes()).unwrap();
+        rmp::encode::write_i64(&mut wr, header.mod_time.unwrap().unix_timestamp_nanos() as i64).unwrap();
+        rmp::encode::write_uint8(&mut wr, header.version_type.to_u8()).unwrap();
+        rmp::encode::write_uint8(&mut wr, header.flags).unwrap();
+        wr
+    }
+
+    fn encode_v2_header(header: &FileMetaVersionHeader) -> Vec<u8> {
+        let mut wr = Vec::new();
+        rmp::encode::write_array_len(&mut wr, 5).unwrap();
+        rmp::encode::write_bin(&mut wr, header.version_id.unwrap().as_bytes()).unwrap();
+        rmp::encode::write_i64(&mut wr, header.mod_time.unwrap().unix_timestamp_nanos() as i64).unwrap();
+        rmp::encode::write_bin(&mut wr, header.signature.as_slice()).unwrap();
+        rmp::encode::write_uint8(&mut wr, header.version_type.to_u8()).unwrap();
+        rmp::encode::write_uint8(&mut wr, header.flags).unwrap();
+        wr
+    }
+
+    #[test]
+    fn version_header_unmarshal_v1_uses_legacy_layout_defaults() {
+        let expected = sample_header();
+        let encoded = encode_v1_header(&expected);
+
+        let mut decoded = FileMetaVersionHeader::default();
+        decoded.unmarshal_v(1, &encoded).unwrap();
+
+        assert_eq!(decoded.version_id, expected.version_id);
+        assert_eq!(decoded.mod_time, expected.mod_time);
+        assert_eq!(decoded.version_type, expected.version_type);
+        assert_eq!(decoded.flags, expected.flags);
+        assert_eq!(decoded.signature, [0; 4]);
+        assert_eq!(decoded.ec_n, 0);
+        assert_eq!(decoded.ec_m, 0);
+    }
+
+    #[test]
+    fn version_header_unmarshal_v2_keeps_signature_and_zeroes_ec() {
+        let expected = sample_header();
+        let encoded = encode_v2_header(&expected);
+
+        let mut decoded = FileMetaVersionHeader::default();
+        decoded.unmarshal_v(2, &encoded).unwrap();
+
+        assert_eq!(decoded.version_id, expected.version_id);
+        assert_eq!(decoded.mod_time, expected.mod_time);
+        assert_eq!(decoded.signature, expected.signature);
+        assert_eq!(decoded.version_type, expected.version_type);
+        assert_eq!(decoded.flags, expected.flags);
+        assert_eq!(decoded.ec_n, 0);
+        assert_eq!(decoded.ec_m, 0);
+    }
+
+    #[test]
+    fn version_header_unmarshal_v3_round_trips_current_layout() {
+        let expected = sample_header();
+        let encoded = expected.marshal_msg().unwrap();
+
+        let mut decoded = FileMetaVersionHeader::default();
+        decoded.unmarshal_v(3, &encoded).unwrap();
+
+        assert_eq!(decoded, expected);
     }
 }

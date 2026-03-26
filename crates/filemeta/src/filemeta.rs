@@ -1056,6 +1056,28 @@ mod test {
     }
 
     #[test]
+    fn test_issue_2288_legacy_xlmeta_compatibility() {
+        let data = create_issue_2288_legacy_xlmeta().expect("Failed to load issue #2288 fixture");
+        let (major, minor, header_ver, meta_ver) = FileMeta::read_format_versions(&data).unwrap();
+        assert_eq!((major, minor, header_ver, meta_ver), (1, 3, 2, 1));
+
+        let fm = FileMeta::load(&data).expect("Failed to parse legacy issue #2288 xl.meta");
+        assert_eq!(fm.meta_ver, 1);
+        assert_eq!(fm.versions.len(), 1);
+        assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
+        assert_eq!(fm.versions[0].header.signature, [0x96, 0x33, 0x4c, 0x78]);
+        assert_eq!(fm.versions[0].header.ec_n, 0);
+        assert_eq!(fm.versions[0].header.ec_m, 0);
+
+        let fi = fm
+            .into_fileinfo("viscom", "test.txt", "", true, false, true)
+            .expect("Failed to extract file info from legacy issue #2288 xl.meta");
+        assert_eq!(fi.size, 35);
+        assert_eq!(fi.num_versions, 1);
+        assert!(fi.is_latest);
+    }
+
+    #[test]
     fn test_complex_xlmeta_handling() {
         // Test complex xl.meta files with many versions
         let data = create_complex_xlmeta().expect("Failed to create complex test data");

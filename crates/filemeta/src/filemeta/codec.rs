@@ -170,7 +170,7 @@ impl FileMeta {
 
         // Parse meta
         if !meta.is_empty() {
-            let (versions_len, _, meta_ver, meta) = Self::decode_xl_headers(meta).map_err(|e| {
+            let (versions_len, header_ver, meta_ver, meta) = Self::decode_xl_headers(meta).map_err(|e| {
                 error!("failed to decode XL headers: {}", e);
                 e
             })?;
@@ -193,7 +193,7 @@ impl FileMeta {
                 cur.read_exact(&mut header_buf)?;
 
                 let mut ver = FileMetaShallowVersion::default();
-                ver.header.unmarshal_msg(&header_buf).map_err(|e| {
+                ver.header.unmarshal_v(header_ver, &header_buf).map_err(|e| {
                     error!("failed to unmarshal version header: {}", e);
                     e
                 })?;
