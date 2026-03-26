@@ -18,9 +18,10 @@
 //! across rustfs and rustfs-ecstore without cyclic dependencies.
 
 use bytes::BytesMut;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // Tier size thresholds
 const SMALL_MAX: usize = 64 * 1024;
@@ -35,6 +36,8 @@ const LARGE_MAX: usize = 4 * 1024 * 1024;
 /// - Large: 512KB - 4MB
 /// - XLarge: > 4MB
 ///
+/// Buffers are automatically reused when returned to the pool.
+///
 /// # Example
 ///
 /// ```ignore
@@ -48,6 +51,10 @@ const LARGE_MAX: usize = 4 * 1024 * 1024;
 ///
 /// // Return to pool (automatic when dropped)
 /// drop(buffer);
+///
+/// // Next acquisition will reuse the buffer
+/// let mut buffer2 = pool.acquire_buffer(8192).await;
+/// assert!(pool.hit_rate() > 0.0); // Buffer was reused!
 /// ```
 #[derive(Clone)]
 pub struct BytesPool {
@@ -63,7 +70,7 @@ pub struct BytesPool {
     metrics: Arc<BytesPoolMetrics>,
 }
 
-/// Single pool tier with concurrent access control.
+/// Single pool tier with concurrent access control and buffer reuse.
 struct PoolTier {
     /// Buffer size for this tier
     buffer_size: usize,
@@ -73,6 +80,10 @@ struct PoolTier {
     semaphore: Arc<Semaphore>,
     /// Pool name for metrics
     name: &'static str,
+    /// Queue of available buffers for reuse
+    available_buffers: Mutex<Vec<BytesMut>>,
+    /// Metrics for tracking this tier
+    metrics: Mutex<Option<Arc<BytesPoolMetrics>>>,
 }
 
 /// Pool metrics for monitoring and optimization.
@@ -90,20 +101,20 @@ pub struct BytesPoolMetrics {
     pub total_bytes_allocated: AtomicU64,
     /// Current allocated bytes
     pub current_allocated_bytes: AtomicU64,
+    /// Current available buffers in pool
+    pub available_buffers: AtomicU64,
 }
 
 /// A buffer managed by the BytesPool.
 ///
-/// When dropped, the semaphore permit is automatically released.
-pub struct PooledBuffer<'a> {
-    /// The underlying buffer
-    pub buffer: BytesMut,
-    /// Reference to pool tier for return
-    _tier: Option<Arc<PoolTier>>,
-    /// The semaphore permit (must be dropped last)
-    _permit: Option<tokio::sync::SemaphorePermit<'a>>,
-    /// Metrics reference
-    _metrics: Option<Arc<BytesPoolMetrics>>,
+/// When dropped, the buffer is automatically returned to the pool for reuse.
+pub struct PooledBuffer {
+    /// The underlying buffer (ManuallyDrop to allow taking on drop)
+    pub buffer: ManuallyDrop<BytesMut>,
+    /// Reference to pool tier for returning buffer
+    tier: Option<Arc<PoolTier>>,
+    /// The semaphore permit (must be dropped last to release slot)
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// BytesPool configuration.
@@ -167,19 +178,31 @@ impl BytesPool {
     /// let pool = BytesPool::with_config(config);
     /// ```
     pub fn with_config(config: BytesPoolConfig) -> Self {
+        let metrics = Arc::new(BytesPoolMetrics::default());
+        let small_pool = Arc::new(PoolTier::new(config.small_size, config.small_max, "small"));
+        let medium_pool = Arc::new(PoolTier::new(config.medium_size, config.medium_max, "medium"));
+        let large_pool = Arc::new(PoolTier::new(config.large_size, config.large_max, "large"));
+        let xlarge_pool = Arc::new(PoolTier::new(config.xlarge_size, config.xlarge_max, "xlarge"));
+
+        // Set metrics reference in all tiers
+        small_pool.set_metrics(Arc::clone(&metrics));
+        medium_pool.set_metrics(Arc::clone(&metrics));
+        large_pool.set_metrics(Arc::clone(&metrics));
+        xlarge_pool.set_metrics(Arc::clone(&metrics));
+
         Self {
-            small_pool: Arc::new(PoolTier::new(config.small_size, config.small_max, "small")),
-            medium_pool: Arc::new(PoolTier::new(config.medium_size, config.medium_max, "medium")),
-            large_pool: Arc::new(PoolTier::new(config.large_size, config.large_max, "large")),
-            xlarge_pool: Arc::new(PoolTier::new(config.xlarge_size, config.xlarge_max, "xlarge")),
-            metrics: Arc::new(BytesPoolMetrics::default()),
+            small_pool,
+            medium_pool,
+            large_pool,
+            xlarge_pool,
+            metrics,
         }
     }
 
     /// Acquire buffer with automatic tier selection.
     ///
     /// Selects the appropriate tier based on requested size and blocks
-    /// until a buffer is available.
+    /// until a buffer is available. Reuses returned buffers when available.
     ///
     /// # Arguments
     ///
@@ -187,16 +210,19 @@ impl BytesPool {
     ///
     /// # Returns
     ///
-    /// A PooledBuffer that releases the permit when dropped.
+    /// A PooledBuffer that releases the permit and returns buffer to pool when dropped.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let mut buffer = pool.acquire_buffer(8192).await;
     /// ```
-    pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer<'_> {
+    pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer {
         let tier = self.select_tier(size);
-        tier.acquire_buffer(size, &self.metrics).await
+        let mut buffer = tier.acquire_buffer(size, &self.metrics).await;
+        // Set tier reference for return on drop
+        buffer.tier = Some(Arc::clone(tier));
+        buffer
     }
 
     /// Try to acquire buffer without blocking.
@@ -217,9 +243,12 @@ impl BytesPool {
     ///     // Use buffer...
     /// }
     /// ```
-    pub fn try_acquire_buffer(&self, size: usize) -> Option<PooledBuffer<'_>> {
+    pub fn try_acquire_buffer(&self, size: usize) -> Option<PooledBuffer> {
         let tier = self.select_tier(size);
-        tier.try_acquire_buffer(size, &self.metrics)
+        let mut buffer = tier.try_acquire_buffer(size, &self.metrics)?;
+        // Set tier reference for return on drop
+        buffer.tier = Some(Arc::clone(tier));
+        Some(buffer)
     }
 
     /// Select appropriate tier based on size.
@@ -250,6 +279,11 @@ impl BytesPool {
             hits as f64 / total as f64
         }
     }
+
+    /// Get the number of available buffers in the pool.
+    pub fn available_buffers(&self) -> u64 {
+        self.metrics.available_buffers.load(Ordering::Relaxed)
+    }
 }
 
 impl PoolTier {
@@ -259,73 +293,170 @@ impl PoolTier {
             max_buffers,
             semaphore: Arc::new(Semaphore::new(max_buffers)),
             name,
+            available_buffers: Mutex::new(Vec::new()),
+            metrics: Mutex::new(None),
         }
+    }
+
+    fn set_metrics(&self, metrics: Arc<BytesPoolMetrics>) {
+        *self.metrics.lock().unwrap() = Some(metrics);
     }
 
     async fn acquire_buffer(
         &self,
         size: usize,
-        metrics: &BytesPoolMetrics,
-    ) -> PooledBuffer<'_> {
-        // Acquire semaphore permit
-        let permit = self.semaphore.acquire().await.unwrap();
+        pool_metrics: &BytesPoolMetrics,
+    ) -> PooledBuffer {
+        // Acquire semaphore permit (owned for storage in PooledBuffer)
+        let permit = Arc::clone(&self.semaphore).acquire_owned().await.unwrap();
+
+        // Use the pool's shared metrics for recording
+        let _metrics_lock = self.metrics.lock().unwrap();
+        let _metrics = _metrics_lock.as_ref().unwrap();
 
         // Record acquisition
-        metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
+        pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
 
-        // Create buffer
-        let buffer = BytesMut::with_capacity(size.max(self.buffer_size));
+        // Try to get a buffer from the pool
+        let buffer_opt = {
+            let mut available = self.available_buffers.lock().unwrap();
+            available.pop()
+        };
+
+        let was_reused = buffer_opt.is_some();
+
+        let buffer = if let Some(mut buf) = buffer_opt {
+            // Reuse existing buffer - clear and ensure capacity
+            buf.clear();
+            if buf.capacity() < size {
+                buf.reserve(size - buf.capacity());
+            }
+            buf
+        } else {
+            // Allocate new buffer
+            let buf = BytesMut::with_capacity(size.max(self.buffer_size));
+            pool_metrics.total_bytes_allocated.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics.current_allocated_bytes.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            buf
+        };
+
+        let buffer_capacity = buffer.capacity();
 
         // Record metrics
-        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer.capacity(), false);
+        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
+
+        // Record hit/miss (pool_metrics and metrics point to same Arc)
+        if was_reused {
+            pool_metrics.pool_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            pool_metrics.pool_misses.fetch_add(1, Ordering::Relaxed);
+        }
 
         PooledBuffer {
-            buffer,
-            _tier: None,
+            buffer: ManuallyDrop::new(buffer),
+            tier: None, // Will be set after creating Arc<PoolTier>
             _permit: Some(permit),
-            _metrics: None,
         }
     }
 
     fn try_acquire_buffer(
         &self,
         size: usize,
-        metrics: &BytesPoolMetrics,
-    ) -> Option<PooledBuffer<'_>> {
+        pool_metrics: &BytesPoolMetrics,
+    ) -> Option<PooledBuffer> {
         // Try to acquire permit without blocking
-        let permit = self.semaphore.try_acquire().ok()?;
+        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
+
+        // Use the pool's shared metrics for recording
+        let _metrics_lock = self.metrics.lock().unwrap();
+        let _metrics = _metrics_lock.as_ref().unwrap();
 
         // Record acquisition
-        metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
+        pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
 
-        // Create buffer
-        let buffer = BytesMut::with_capacity(size.max(self.buffer_size));
+        // Try to get a buffer from the pool
+        let buffer_opt = {
+            let mut available = self.available_buffers.lock().unwrap();
+            available.pop()
+        };
+
+        let was_reused = buffer_opt.is_some();
+
+        let buffer = if let Some(mut buf) = buffer_opt {
+            // Reuse existing buffer
+            buf.clear();
+            if buf.capacity() < size {
+                buf.reserve(size - buf.capacity());
+            }
+            buf
+        } else {
+            // Allocate new buffer
+            let buf = BytesMut::with_capacity(size.max(self.buffer_size));
+            pool_metrics.total_bytes_allocated.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            pool_metrics.current_allocated_bytes.fetch_add(buf.capacity() as u64, Ordering::Relaxed);
+            buf
+        };
+
+        let buffer_capacity = buffer.capacity();
 
         // Record metrics
-        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer.capacity(), false);
+        rustfs_zero_copy_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
+
+        // Record hit/miss (pool_metrics and metrics point to same Arc)
+        if was_reused {
+            pool_metrics.pool_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            pool_metrics.pool_misses.fetch_add(1, Ordering::Relaxed);
+        }
 
         Some(PooledBuffer {
-            buffer,
-            _tier: None,
+            buffer: ManuallyDrop::new(buffer),
+            tier: None,
             _permit: Some(permit),
-            _metrics: None,
         })
+    }
+
+    /// Return a buffer to the pool for reuse.
+    fn return_buffer(&self, buffer: BytesMut) {
+        let mut available = self.available_buffers.lock().unwrap();
+        // Limit the size of the pool to prevent unbounded growth
+        if available.len() < self.max_buffers {
+            available.push(buffer);
+            if let Some(ref metrics) = *self.metrics.lock().unwrap() {
+                metrics.available_buffers.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // If pool is full, buffer is dropped and memory is freed
     }
 }
 
-impl<'a> AsRef<[u8]> for PooledBuffer<'a> {
+impl Drop for PooledBuffer {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // Return buffer to pool if tier reference exists
+        if let Some(ref tier) = self.tier {
+            // Safety: We're in drop(), so this is the last use of the buffer
+            // ManuallyDrop allows us to take the value without running BytesMut's drop
+            let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+            tier.return_buffer(buffer);
+        }
+        // The permit is automatically dropped here, releasing the semaphore slot
+    }
+}
+
+impl AsRef<[u8]> for PooledBuffer {
     fn as_ref(&self) -> &[u8] {
         self.buffer.as_ref()
     }
 }
 
-impl<'a> AsMut<[u8]> for PooledBuffer<'a> {
+impl AsMut<[u8]> for PooledBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
         self.buffer.as_mut()
     }
 }
 
-impl<'a> std::ops::Deref for PooledBuffer<'a> {
+impl std::ops::Deref for PooledBuffer {
     type Target = BytesMut;
 
     fn deref(&self) -> &Self::Target {
@@ -333,7 +464,7 @@ impl<'a> std::ops::Deref for PooledBuffer<'a> {
     }
 }
 
-impl<'a> std::ops::DerefMut for PooledBuffer<'a> {
+impl std::ops::DerefMut for PooledBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.buffer
     }
@@ -357,7 +488,8 @@ impl std::fmt::Debug for PoolTier {
             .field("name", &self.name)
             .field("buffer_size", &self.buffer_size)
             .field("max_buffers", &self.max_buffers)
-            .field("available", &self.semaphore.available_permits())
+            .field("available_permits", &self.semaphore.available_permits())
+            .field("available_buffers", &self.available_buffers.lock().unwrap().len())
             .finish()
     }
 }
@@ -436,8 +568,57 @@ mod tests {
         let _buffer = pool.acquire_buffer(1024).await;
         drop(_buffer);
 
-        // Hit rate is 0.0 because we always allocate new buffers
-        // In real implementation with pooling, this would be higher
+        // First acquire is a miss (no buffers available yet)
         assert_eq!(pool.hit_rate(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_available_buffers() {
+        let pool = BytesPool::new_tiered();
+        assert_eq!(pool.available_buffers(), 0);
+
+        let _buffer = pool.acquire_buffer(1024).await;
+        drop(_buffer);
+
+        // After drop, buffer should be returned to pool
+        assert_eq!(pool.available_buffers(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_reuse() {
+        // This test verifies that buffers are reused when returned to the pool
+        let pool = BytesPool::with_config(BytesPoolConfig {
+            small_size: 1024,
+            small_max: 2,
+            ..Default::default()
+        });
+
+        // Record initial state
+        let initial_acquires = pool.metrics().total_acquires.load(Ordering::Relaxed);
+        let initial_hits = pool.metrics().pool_hits.load(Ordering::Relaxed);
+        assert_eq!(initial_acquires, 0);
+
+        // First acquisition - should allocate new (miss)
+        let buffer1 = pool.acquire_buffer(512).await;
+        let initial_bytes_allocated = pool.metrics().total_bytes_allocated.load(Ordering::Relaxed);
+        assert!(initial_bytes_allocated >= 1024);
+
+        // Return buffer (by dropping)
+        drop(buffer1);
+
+        // Second acquisition - should reuse (hit)
+        let _buffer2 = pool.acquire_buffer(512).await;
+        let bytes_after_reuse = pool.metrics().total_bytes_allocated.load(Ordering::Relaxed);
+
+        // Bytes allocated should be the same (buffer was reused)
+        assert_eq!(initial_bytes_allocated, bytes_after_reuse);
+
+        // Total acquires should be 2
+        let total_acquires = pool.metrics().total_acquires.load(Ordering::Relaxed) - initial_acquires;
+        assert_eq!(total_acquires, 2);
+
+        // Pool hits should be 1
+        let delta_hits = pool.metrics().pool_hits.load(Ordering::Relaxed) - initial_hits;
+        assert_eq!(delta_hits, 1);
     }
 }
