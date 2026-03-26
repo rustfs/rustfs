@@ -39,6 +39,7 @@ swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
 direct-io = []  # Direct I/O support for Linux (O_DIRECT)
+io-scheduler-debug = []  # Enable debug information in I/O scheduler
 full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
 
 [lints]

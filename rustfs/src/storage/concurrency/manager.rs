@@ -1127,8 +1127,13 @@ mod integration_tests {
 
         // Should be limited to max (1MB) by either cap or clamp
         assert!(strategy.buffer_size <= MI_B);
-        assert!(strategy.clamp_max_applied || strategy.buffer_size == MI_B,
+
+        #[cfg(feature = "io-scheduler-debug")]
+        assert!(strategy.debug_info.clamp_max_applied || strategy.buffer_size == MI_B,
                 "Should apply max clamp or buffer cap");
+
+        #[cfg(not(feature = "io-scheduler-debug"))]
+        assert!(strategy.buffer_size == MI_B, "Should apply max clamp or buffer cap");
     }
 
     #[tokio::test]

@@ -406,11 +406,223 @@ impl IoSchedulingContext {
     }
 }
 
+/// Performance-critical I/O strategy with minimal footprint.
+///
+/// This structure contains only the essential runtime fields needed for I/O operations,
+/// optimized for cache performance and memory efficiency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoStrategyCore {
+    // ===== Basic Configuration =====
+    /// Detected storage media type (NVMe/SSD/HDD)
+    pub storage_media: StorageMedia,
+    /// Detected access pattern (Sequential/Random/Mixed)
+    pub access_pattern: AccessPattern,
+    /// Request size in bytes (-1 if unknown)
+    pub request_size: i64,
+    /// Base buffer size before adjustments
+    pub base_buffer_size: usize,
+    /// Maximum buffer size allowed by storage media
+    pub buffer_cap: usize,
+
+    // ===== Runtime Decisions =====
+    /// Recommended buffer size for I/O operations (in bytes)
+    pub buffer_size: usize,
+    /// Buffer size multiplier (0.0 - 1.0) applied to base buffer size
+    pub buffer_multiplier: f64,
+    /// Whether sequential read-ahead should be enabled
+    pub enable_readahead: bool,
+    /// Whether cache writeback should be enabled
+    pub cache_writeback_enabled: bool,
+    /// Whether tokio BufReader should be used
+    pub use_buffered_io: bool,
+
+    // ===== Performance State =====
+    /// Current concurrent request count
+    pub concurrent_requests: usize,
+    /// Observed bandwidth (if available)
+    pub observed_bandwidth_bps: Option<u64>,
+    /// Bandwidth tier (Low/Medium/High/Unknown)
+    pub bandwidth_tier: BandwidthTier,
+    /// Whether I/O is bandwidth-limited
+    pub bandwidth_limited: bool,
+    /// Whether sequential access was detected
+    pub sequential_detected: bool,
+
+    // ===== Decision Flags =====
+    /// Storage profile preferences
+    pub storage_profile: StorageProfile,
+    /// Scheduling context for this request
+    pub scheduling_context: IoSchedulingContext,
+    /// Current I/O load level
+    pub load_level: IoLoadLevel,
+    /// Time spent waiting for disk permit
+    pub permit_wait_duration: Duration,
+
+    // ===== Tuning Multipliers =====
+    pub final_multiplier: f64,
+    pub should_throttle_random_io: bool,
+    pub should_expand_for_sequential: bool,
+    pub should_reduce_for_concurrency: bool,
+    pub should_reduce_for_bandwidth: bool,
+    pub should_disable_cache_writeback: bool,
+    pub should_disable_readahead: bool,
+
+    // ===== Priority Scheduling =====
+    pub priority_enabled: bool,
+    pub priority: IoPriority,
+
+    // ===== Bandwidth Snapshot =====
+    pub bandwidth_snapshot: Option<BandwidthSnapshot>,
+}
+
+impl IoStrategyCore {
+    /// Create a minimal IoStrategyCore with essential fields only.
+    pub fn new(
+        storage_media: StorageMedia,
+        access_pattern: AccessPattern,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            storage_media,
+            access_pattern,
+            request_size: -1,
+            base_buffer_size: buffer_size,
+            buffer_cap: buffer_size,
+            buffer_size,
+            buffer_multiplier: 1.0,
+            enable_readahead: false,
+            cache_writeback_enabled: true,
+            use_buffered_io: true,
+            concurrent_requests: 1,
+            observed_bandwidth_bps: None,
+            bandwidth_tier: BandwidthTier::Unknown,
+            bandwidth_limited: false,
+            sequential_detected: false,
+            storage_profile: StorageProfile::for_media(
+                storage_media,
+                256 * 1024, // default NVMe cap
+                128 * 1024, // default SSD cap
+                64 * 1024,  // default HDD cap
+            ),
+            scheduling_context: IoSchedulingContext::from_wait_duration(Duration::ZERO, buffer_size),
+            load_level: IoLoadLevel::Low,
+            permit_wait_duration: Duration::ZERO,
+            final_multiplier: 1.0,
+            should_throttle_random_io: false,
+            should_expand_for_sequential: false,
+            should_reduce_for_concurrency: false,
+            should_reduce_for_bandwidth: false,
+            should_disable_cache_writeback: false,
+            should_disable_readahead: false,
+            priority_enabled: false,
+            priority: IoPriority::Normal,
+            bandwidth_snapshot: None,
+        }
+    }
+}
+
+/// Debug information for I/O strategy decisions (feature-gated).
+///
+/// This structure contains detailed debugging, tracing, and observability fields
+/// that are only needed during development and troubleshooting.
+/// Disabled in production to reduce memory footprint.
+#[cfg(feature = "io-scheduler-debug")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoStrategyDebugInfo {
+    // ===== Decision Labels =====
+    /// Reason for readahead enable/disable decision
+    pub readahead_reason: &'static str,
+    /// Strategy calculation version
+    pub strategy_version: &'static str,
+    /// High-level reason for strategy selection
+    pub strategy_reason: &'static str,
+    /// Source of this strategy (e.g., "from_wait_duration")
+    pub strategy_source: &'static str,
+    /// Additional notes about this strategy
+    pub notes: &'static str,
+
+    // ===== Request Classification =====
+    pub request_class: &'static str,  // "small" | "medium" | "large"
+    pub io_path_kind: &'static str,    // "sequential" | "random"
+    pub queue_mode: &'static str,      // "high-priority" | "normal-priority" | "low-priority"
+
+    // ===== State Labels =====
+    pub load_level_label: &'static str,
+    pub pattern_label: &'static str,
+    pub media_label: &'static str,
+    pub bandwidth_label: &'static str,
+    pub storage_profile_buffer_cap_source: &'static str,
+
+    // ===== Decision Flags =====
+    pub is_large_request: bool,
+    pub is_small_request: bool,
+    pub storage_detection_enabled: bool,
+    pub storage_media_override_applied: bool,
+    pub used_compatibility_path: bool,
+    pub sequential_hint_applied: bool,
+    pub observed_bandwidth_available: bool,
+    pub read_size_known: bool,
+
+    // ===== Decision Tracking =====
+    pub random_penalty_applied: bool,
+    pub sequential_boost_applied: bool,
+    pub buffer_cap_applied: bool,
+    pub clamp_min_applied: bool,
+    pub clamp_max_applied: bool,
+
+    // ===== Readahead Decisions =====
+    pub readahead_disabled_by_concurrency: bool,
+    pub readahead_disabled_by_pattern: bool,
+    pub readahead_disabled_by_load: bool,
+    pub readahead_disabled_by_bandwidth: bool,
+
+    // ===== Cache Writeback Decisions =====
+    pub cache_writeback_disabled_by_load: bool,
+    pub cache_writeback_disabled_by_pattern: bool,
+    pub cache_writeback_disabled_by_request_size: bool,
+
+    // ===== Threshold Snapshots =====
+    pub final_buffer_floor: usize,
+    pub queue_depth_hint: usize,
+    pub permit_wait_ms: u64,
+
+    // ===== Configuration Thresholds (for debugging) =====
+    pub high_concurrency_threshold: usize,
+    pub medium_concurrency_threshold: usize,
+    pub low_bandwidth_threshold_bps: u64,
+    pub high_bandwidth_threshold_bps: u64,
+    pub random_readahead_disable_concurrency: usize,
+    pub low_priority_size_threshold: usize,
+    pub high_priority_size_threshold: usize,
+
+    // ===== Multiplier Breakdown =====
+    pub effective_multiplier_stage_concurrency: f64,
+    pub effective_multiplier_stage_pattern: f64,
+    pub effective_multiplier_stage_bandwidth: f64,
+
+    // ===== Extended Config =====
+    pub pattern_history_size: usize,
+    pub sequential_step_tolerance_bytes: u64,
+    pub bandwidth_ema_beta: f64,
+    pub nvme_buffer_cap: usize,
+    pub ssd_buffer_cap: usize,
+    pub hdd_buffer_cap: usize,
+    pub is_range_request: bool,
+    pub target_read_size: i64,
+    pub source_request_size: i64,
+}
+
 /// Adaptive I/O strategy calculated from current system load.
 ///
 /// This structure provides optimized I/O parameters based on the observed
 /// disk permit wait times. It helps balance throughput vs. latency and
 /// prevents I/O saturation under high load.
+///
+/// # Architecture
+///
+/// `IoStrategy` now wraps `IoStrategyCore` for better performance and memory efficiency:
+/// - **Core fields**: Only runtime-essential data (~20 fields vs 100+ before)
+/// - **Debug info**: Optional feature-gated debugging details (~40 fields)
 ///
 /// # Usage Example
 ///
@@ -424,112 +636,27 @@ impl IoSchedulingContext {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct IoStrategy {
-    pub storage_media: StorageMedia,
-    pub access_pattern: AccessPattern,
-    pub observed_bandwidth_bps: Option<u64>,
-    pub concurrent_requests: usize,
-    pub bandwidth_tier: BandwidthTier,
-    pub request_size: i64,
-    pub base_buffer_size: usize,
-    pub buffer_cap: usize,
-    pub sequential_detected: bool,
-    pub bandwidth_limited: bool,
-    pub readahead_reason: &'static str,
-    pub low_bandwidth_threshold_bps: u64,
-    pub high_bandwidth_threshold_bps: u64,
-    pub random_readahead_disable_concurrency: usize,
-    pub low_priority_size_threshold: usize,
-    pub high_priority_size_threshold: usize,
-    pub priority_enabled: bool,
-    pub priority: IoPriority,
-    pub queue_capacity_hint: usize,
-    pub load_sample_window: usize,
-    pub load_high_threshold_ms: u64,
-    pub load_low_threshold_ms: u64,
-    pub starvation_prevention_interval_ms: u64,
-    pub starvation_threshold_secs: u64,
-    pub max_concurrent_reads: usize,
-    pub priority_queue_high_capacity: usize,
-    pub priority_queue_normal_capacity: usize,
-    pub priority_queue_low_capacity: usize,
-    pub storage_profile: StorageProfile,
-    pub bandwidth_snapshot: Option<BandwidthSnapshot>,
-    pub scheduling_context: IoSchedulingContext,
-    pub high_concurrency_threshold: usize,
-    pub medium_concurrency_threshold: usize,
-    pub permit_wait_ms: u64,
-    pub strategy_version: &'static str,
-    pub is_large_request: bool,
-    pub is_small_request: bool,
-    pub storage_detection_enabled: bool,
-    pub storage_media_override_applied: bool,
-    pub pattern_history_size: usize,
-    pub sequential_step_tolerance_bytes: u64,
-    pub bandwidth_ema_beta: f64,
-    pub nvme_buffer_cap: usize,
-    pub ssd_buffer_cap: usize,
-    pub hdd_buffer_cap: usize,
-    pub is_range_request: bool,
-    pub target_read_size: i64,
-    pub source_request_size: i64,
-    pub strategy_reason: &'static str,
-    pub used_compatibility_path: bool,
-    pub queue_depth_hint: usize,
-    pub should_throttle_random_io: bool,
-    pub should_expand_for_sequential: bool,
-    pub should_reduce_for_concurrency: bool,
-    pub should_reduce_for_bandwidth: bool,
-    pub should_disable_cache_writeback: bool,
-    pub should_disable_readahead: bool,
-    pub should_use_buffered_io: bool,
-    pub effective_multiplier_stage_concurrency: f64,
-    pub effective_multiplier_stage_pattern: f64,
-    pub effective_multiplier_stage_bandwidth: f64,
-    pub final_multiplier: f64,
-    pub strategy_source: &'static str,
-    pub notes: &'static str,
-    pub profile_prefers_readahead: bool,
-    pub fallback_to_unknown_media: bool,
-    pub request_class: &'static str,
-    pub io_path_kind: &'static str,
-    pub queue_mode: &'static str,
-    pub load_level_label: &'static str,
-    pub pattern_label: &'static str,
-    pub media_label: &'static str,
-    pub bandwidth_label: &'static str,
-    pub sequential_hint_applied: bool,
-    pub observed_bandwidth_available: bool,
-    pub read_size_known: bool,
-    pub random_penalty_applied: bool,
-    pub sequential_boost_applied: bool,
-    pub buffer_cap_applied: bool,
-    pub clamp_min_applied: bool,
-    pub clamp_max_applied: bool,
-    pub readahead_disabled_by_concurrency: bool,
-    pub readahead_disabled_by_pattern: bool,
-    pub readahead_disabled_by_load: bool,
-    pub readahead_disabled_by_bandwidth: bool,
-    pub cache_writeback_disabled_by_load: bool,
-    pub cache_writeback_disabled_by_pattern: bool,
-    pub cache_writeback_disabled_by_request_size: bool,
-    pub storage_profile_buffer_cap_source: &'static str,
-    pub final_buffer_floor: usize,
+    /// Core strategy with runtime-essential fields
+    pub core: IoStrategyCore,
 
-    // ---- Compatibility fields (used by manager and tests) ----
-    /// Recommended buffer size for I/O operations (in bytes).
-    pub buffer_size: usize,
-    /// Buffer size multiplier (0.4 - 1.0) applied to base buffer size.
-    pub buffer_multiplier: f64,
-    /// Whether to enable aggressive read-ahead for sequential reads.
-    pub enable_readahead: bool,
-    /// Whether to enable cache writeback for this request.
-    pub cache_writeback_enabled: bool,
-    /// Whether to use tokio BufReader for improved async I/O.
-    pub use_buffered_io: bool,
-    /// The detected I/O load level.
-    pub load_level: IoLoadLevel,
-    /// The raw permit wait duration that was used to calculate this strategy.
-    pub permit_wait_duration: Duration,
+    /// Optional debug information (only available with io-scheduler-debug feature)
+    #[cfg(feature = "io-scheduler-debug")]
+    pub debug_info: IoStrategyDebugInfo,
+}
+
+// Implement Deref for transparent access to core fields
+impl std::ops::Deref for IoStrategy {
+    type Target = IoStrategyCore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for IoStrategy {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
 }
 
 impl IoStrategy {
@@ -575,79 +702,64 @@ impl IoStrategy {
         // Build minimal scheduling context for compatibility path
         let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
 
-        Self {
-            // Core fields
+        // Build core strategy
+        let core = IoStrategyCore {
+            // Basic configuration
             storage_media: StorageMedia::Unknown,
             access_pattern: AccessPattern::Unknown,
-            observed_bandwidth_bps: None,
-            concurrent_requests: ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
-            bandwidth_tier: BandwidthTier::Unknown,
             request_size: -1,
             base_buffer_size,
             buffer_cap: buffer_size,
-            sequential_detected: false,
+
+            // Runtime decisions
+            buffer_size,
+            buffer_multiplier,
+            enable_readahead,
+            cache_writeback_enabled,
+            use_buffered_io: true,
+
+            // Performance state
+            concurrent_requests: ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
+            observed_bandwidth_bps: None,
+            bandwidth_tier: BandwidthTier::Unknown,
             bandwidth_limited: false,
-            readahead_reason: if enable_readahead { "load-based" } else { "high-load" },
-            low_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
-            high_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
-            random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
-            low_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
-            high_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
-            priority_enabled: false,
-            priority: IoPriority::Normal,
-            queue_capacity_hint: 0,
-            load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
-            load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
-            load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
-            starvation_prevention_interval_ms: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL,
-            starvation_threshold_secs: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
-            max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
-            priority_queue_high_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY,
-            priority_queue_normal_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY,
-            priority_queue_low_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY,
+            sequential_detected: false,
+
+            // Decision flags
             storage_profile: StorageProfile::for_media(
                 StorageMedia::Unknown,
                 rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
                 rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
                 rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
             ),
-            bandwidth_snapshot: None,
             scheduling_context,
-            high_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-            medium_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-            permit_wait_ms: permit_wait_duration.as_millis() as u64,
-            strategy_version: "1.0-compat",
-            is_large_request: false,
-            is_small_request: false,
-            storage_detection_enabled: rustfs_config::DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE,
-            storage_media_override_applied: false,
-            pattern_history_size: rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
-            sequential_step_tolerance_bytes: rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
-            bandwidth_ema_beta: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
-            nvme_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
-            ssd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
-            hdd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
-            is_range_request: false,
-            target_read_size: -1,
-            source_request_size: -1,
-            strategy_reason: "compatibility-path",
-            used_compatibility_path: true,
-            queue_depth_hint: 0,
+            load_level,
+            permit_wait_duration,
+
+            // Tuning multipliers
+            final_multiplier: buffer_multiplier,
             should_throttle_random_io: false,
             should_expand_for_sequential: false,
             should_reduce_for_concurrency: false,
             should_reduce_for_bandwidth: false,
             should_disable_cache_writeback: !cache_writeback_enabled,
             should_disable_readahead: !enable_readahead,
-            should_use_buffered_io: true,
-            effective_multiplier_stage_concurrency: buffer_multiplier,
-            effective_multiplier_stage_pattern: 1.0,
-            effective_multiplier_stage_bandwidth: 1.0,
-            final_multiplier: buffer_multiplier,
+
+            // Priority scheduling
+            priority_enabled: false,
+            priority: IoPriority::Normal,
+
+            // Bandwidth snapshot
+            bandwidth_snapshot: None,
+        };
+
+        #[cfg(feature = "io-scheduler-debug")]
+        let debug_info = IoStrategyDebugInfo {
+            readahead_reason: if enable_readahead { "load-based" } else { "high-load" },
+            strategy_version: "1.0-compat",
+            strategy_reason: "compatibility-path",
             strategy_source: "from_wait_duration",
             notes: "legacy compatibility mode",
-            profile_prefers_readahead: false,
-            fallback_to_unknown_media: true,
             request_class: "unknown",
             io_path_kind: "compat",
             queue_mode: "standard",
@@ -655,6 +767,12 @@ impl IoStrategy {
             pattern_label: "unknown",
             media_label: "unknown",
             bandwidth_label: "unknown",
+            storage_profile_buffer_cap_source: "compat",
+            is_large_request: false,
+            is_small_request: false,
+            storage_detection_enabled: rustfs_config::DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE,
+            storage_media_override_applied: false,
+            used_compatibility_path: true,
             sequential_hint_applied: false,
             observed_bandwidth_available: false,
             read_size_known: false,
@@ -670,16 +788,50 @@ impl IoStrategy {
             cache_writeback_disabled_by_load: !cache_writeback_enabled,
             cache_writeback_disabled_by_pattern: false,
             cache_writeback_disabled_by_request_size: false,
-            storage_profile_buffer_cap_source: "compat",
             final_buffer_floor: 32 * KI_B,
-            // Compatibility fields (primary interface)
-            buffer_size,
-            buffer_multiplier,
-            enable_readahead,
-            cache_writeback_enabled,
-            use_buffered_io: true,
-            load_level,
-            permit_wait_duration,
+            queue_depth_hint: 0,
+            permit_wait_ms: permit_wait_duration.as_millis() as u64,
+            high_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            medium_concurrency_threshold: rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+            low_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS,
+            high_bandwidth_threshold_bps: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS,
+            random_readahead_disable_concurrency: rustfs_config::DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY,
+            low_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
+            high_priority_size_threshold: rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
+            queue_capacity_hint: 0,
+            load_sample_window: rustfs_config::DEFAULT_OBJECT_IO_LOAD_SAMPLE_WINDOW,
+            load_high_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_HIGH_THRESHOLD_MS,
+            load_low_threshold_ms: rustfs_config::DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS,
+            starvation_prevention_interval_ms: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_PREVENTION_INTERVAL,
+            starvation_threshold_secs: rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
+            max_concurrent_reads: rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+            priority_queue_high_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_HIGH_CAPACITY,
+            priority_queue_normal_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_NORMAL_CAPACITY,
+            priority_queue_low_capacity: rustfs_config::DEFAULT_OBJECT_IO_QUEUE_LOW_CAPACITY,
+            pattern_history_size: rustfs_config::DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE,
+            sequential_step_tolerance_bytes: rustfs_config::DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES,
+            bandwidth_ema_beta: rustfs_config::DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA,
+            nvme_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP,
+            ssd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_SSD_BUFFER_CAP,
+            hdd_buffer_cap: rustfs_config::DEFAULT_OBJECT_IO_HDD_BUFFER_CAP,
+            is_range_request: false,
+            target_read_size: -1,
+            source_request_size: -1,
+            profile_prefers_readahead: false,
+            fallback_to_unknown_media: true,
+            effective_multiplier_stage_concurrency: buffer_multiplier,
+            effective_multiplier_stage_pattern: 1.0,
+            effective_multiplier_stage_bandwidth: 1.0,
+        };
+
+        #[cfg(not(feature = "io-scheduler-debug"))]
+        {
+            Self { core }
+        }
+
+        #[cfg(feature = "io-scheduler-debug")]
+        {
+            Self { core, debug_info }
         }
     }
 
@@ -846,81 +998,65 @@ impl IoStrategy {
             IoPriority::Normal
         };
 
-        Self {
-            // Core fields
+        // Build core strategy with essential runtime fields
+        let core = IoStrategyCore {
+            // ===== Basic Configuration =====
             storage_media: context.storage_media,
             access_pattern: context.access_pattern,
-            observed_bandwidth_bps: context.observed_bandwidth_bps,
-            concurrent_requests: context.concurrent_requests,
-            bandwidth_tier,
             request_size: context.file_size,
             base_buffer_size: context.base_buffer_size,
             buffer_cap,
-            sequential_detected: matches!(context.access_pattern, AccessPattern::Sequential),
+
+            // ===== Runtime Decisions =====
+            buffer_size,
+            buffer_multiplier,
+            enable_readahead,
+            cache_writeback_enabled,
+            use_buffered_io: true,
+
+            // ===== Performance State =====
+            concurrent_requests: context.concurrent_requests,
+            observed_bandwidth_bps: context.observed_bandwidth_bps,
+            bandwidth_tier,
             bandwidth_limited,
-            readahead_reason,
-            low_bandwidth_threshold_bps: config.bandwidth_low_threshold_bps,
-            high_bandwidth_threshold_bps: config.bandwidth_high_threshold_bps,
-            random_readahead_disable_concurrency: config.random_readahead_disable_concurrency,
-            low_priority_size_threshold: config.low_priority_size_threshold,
-            high_priority_size_threshold: config.high_priority_size_threshold,
-            priority_enabled: config.enable_priority,
-            priority,
-            queue_capacity_hint: match priority {
-                IoPriority::High => config.queue_high_capacity,
-                IoPriority::Normal => config.queue_normal_capacity,
-                IoPriority::Low => config.queue_low_capacity,
-            },
-            load_sample_window: config.load_sample_window,
-            load_high_threshold_ms: config.load_high_threshold_ms,
-            load_low_threshold_ms: config.load_low_threshold_ms,
-            starvation_prevention_interval_ms: config.starvation_prevention_interval_ms,
-            starvation_threshold_secs: config.starvation_threshold_secs,
-            max_concurrent_reads: config.max_concurrent_reads,
-            priority_queue_high_capacity: config.queue_high_capacity,
-            priority_queue_normal_capacity: config.queue_normal_capacity,
-            priority_queue_low_capacity: config.queue_low_capacity,
+            sequential_detected: matches!(context.access_pattern, AccessPattern::Sequential),
+
+            // ===== Decision Flags =====
             storage_profile,
-            bandwidth_snapshot: context.observed_bandwidth_bps.map(|bps| BandwidthSnapshot {
-                bytes_per_second: bps,
-                tier: bandwidth_tier,
-            }),
             scheduling_context: context.clone(),
-            high_concurrency_threshold: config.high_concurrency_threshold,
-            medium_concurrency_threshold: config.medium_concurrency_threshold,
-            permit_wait_ms: context.permit_wait_duration.as_millis() as u64,
-            strategy_version: "2.0-multi-factor",
-            is_large_request: context.file_size > config.low_priority_size_threshold as i64,
-            is_small_request: context.file_size > 0 && context.file_size < config.high_priority_size_threshold as i64,
-            storage_detection_enabled: config.storage_detection_enabled,
-            storage_media_override_applied: !config.storage_media_override.is_empty(),
-            pattern_history_size: config.pattern_history_size,
-            sequential_step_tolerance_bytes: config.sequential_step_tolerance_bytes,
-            bandwidth_ema_beta: config.bandwidth_ema_beta,
-            nvme_buffer_cap: config.nvme_buffer_cap,
-            ssd_buffer_cap: config.ssd_buffer_cap,
-            hdd_buffer_cap: config.hdd_buffer_cap,
-            is_range_request: context.file_size > 0 && !context.is_sequential_hint,
-            target_read_size: context.file_size,
-            source_request_size: context.file_size,
-            strategy_reason: "multi-factor",
-            used_compatibility_path: false,
-            queue_depth_hint: context.concurrent_requests,
+            load_level,
+            permit_wait_duration: context.permit_wait_duration,
+
+            // ===== Tuning Multipliers =====
+            final_multiplier: buffer_multiplier,
             should_throttle_random_io: matches!(context.access_pattern, AccessPattern::Random),
             should_expand_for_sequential: matches!(context.access_pattern, AccessPattern::Sequential),
             should_reduce_for_concurrency: concurrency_multiplier < 1.0,
             should_reduce_for_bandwidth: bandwidth_limited,
             should_disable_cache_writeback: !cache_writeback_enabled,
             should_disable_readahead: !enable_readahead,
-            should_use_buffered_io: true,
-            effective_multiplier_stage_concurrency: concurrency_multiplier,
-            effective_multiplier_stage_pattern: pattern_multiplier,
-            effective_multiplier_stage_bandwidth: bandwidth_multiplier,
-            final_multiplier: buffer_multiplier,
+
+            // ===== Priority Scheduling =====
+            priority_enabled: config.enable_priority,
+            priority,
+
+            // ===== Bandwidth Snapshot =====
+            bandwidth_snapshot: context.observed_bandwidth_bps.map(|bps| BandwidthSnapshot {
+                bytes_per_second: bps,
+                tier: bandwidth_tier,
+            }),
+        };
+
+        #[cfg(feature = "io-scheduler-debug")]
+        let debug_info = IoStrategyDebugInfo {
+            // ===== Decision Labels =====
+            readahead_reason,
+            strategy_version: "2.0-multi-factor",
+            strategy_reason: "multi-factor",
             strategy_source: "from_context_with_config",
             notes: "Multi-factor strategy with media, pattern, and bandwidth awareness",
-            profile_prefers_readahead: storage_profile.prefers_readahead,
-            fallback_to_unknown_media: matches!(context.storage_media, StorageMedia::Unknown),
+
+            // ===== Request Classification =====
             request_class: if context.file_size > 0 {
                 if context.file_size < config.high_priority_size_threshold as i64 { "small" }
                 else if context.file_size < config.low_priority_size_threshold as i64 { "medium" }
@@ -932,6 +1068,8 @@ impl IoStrategy {
                 IoPriority::Normal => "normal-priority",
                 IoPriority::Low => "low-priority",
             },
+
+            // ===== State Labels =====
             load_level_label: load_level.as_str(),
             pattern_label: context.access_pattern.as_str(),
             media_label: match context.storage_media {
@@ -946,36 +1084,80 @@ impl IoStrategy {
                 BandwidthTier::High => "high",
                 BandwidthTier::Unknown => "unknown",
             },
-            sequential_hint_applied: context.is_sequential_hint,
-            observed_bandwidth_available: context.observed_bandwidth_bps.is_some(),
-            read_size_known: context.file_size > 0,
-            random_penalty_applied: matches!(context.access_pattern, AccessPattern::Random),
-            sequential_boost_applied: matches!(context.access_pattern, AccessPattern::Sequential),
-            buffer_cap_applied,
-            clamp_min_applied,
-            clamp_max_applied,
-            readahead_disabled_by_concurrency,
-            readahead_disabled_by_pattern,
-            readahead_disabled_by_load,
-            readahead_disabled_by_bandwidth,
-            cache_writeback_disabled_by_load,
-            cache_writeback_disabled_by_pattern,
-            cache_writeback_disabled_by_request_size: false,
             storage_profile_buffer_cap_source: match context.storage_media {
                 StorageMedia::Nvme => "nvme-cap",
                 StorageMedia::Ssd => "ssd-cap",
                 StorageMedia::Hdd => "hdd-cap",
                 StorageMedia::Unknown => "unknown-cap",
             },
+
+            // ===== Decision Flags =====
+            is_large_request: context.file_size > config.low_priority_size_threshold as i64,
+            is_small_request: context.file_size > 0 && context.file_size < config.high_priority_size_threshold as i64,
+            storage_detection_enabled: config.storage_detection_enabled,
+            storage_media_override_applied: !config.storage_media_override.is_empty(),
+            used_compatibility_path: false,
+            sequential_hint_applied: context.is_sequential_hint,
+            observed_bandwidth_available: context.observed_bandwidth_bps.is_some(),
+            read_size_known: context.file_size > 0,
+
+            // ===== Decision Tracking =====
+            random_penalty_applied: matches!(context.access_pattern, AccessPattern::Random),
+            sequential_boost_applied: matches!(context.access_pattern, AccessPattern::Sequential),
+            buffer_cap_applied,
+            clamp_min_applied,
+            clamp_max_applied,
+
+            // ===== Readahead Decisions =====
+            readahead_disabled_by_concurrency,
+            readahead_disabled_by_pattern,
+            readahead_disabled_by_load,
+            readahead_disabled_by_bandwidth,
+
+            // ===== Cache Writeback Decisions =====
+            cache_writeback_disabled_by_load,
+            cache_writeback_disabled_by_pattern,
+            cache_writeback_disabled_by_request_size: false,
+
+            // ===== Threshold Snapshots =====
             final_buffer_floor: clamp_min,
-            // Compatibility fields
-            buffer_size,
-            buffer_multiplier,
-            enable_readahead,
-            cache_writeback_enabled,
-            use_buffered_io: true,
-            load_level,
-            permit_wait_duration: context.permit_wait_duration,
+            queue_depth_hint: context.concurrent_requests,
+            permit_wait_ms: context.permit_wait_duration.as_millis() as u64,
+
+            // ===== Configuration Thresholds =====
+            high_concurrency_threshold: config.high_concurrency_threshold,
+            medium_concurrency_threshold: config.medium_concurrency_threshold,
+            low_bandwidth_threshold_bps: config.bandwidth_low_threshold_bps,
+            high_bandwidth_threshold_bps: config.bandwidth_high_threshold_bps,
+            random_readahead_disable_concurrency: config.random_readahead_disable_concurrency,
+            low_priority_size_threshold: config.low_priority_size_threshold,
+            high_priority_size_threshold: config.high_priority_size_threshold,
+
+            // ===== Multiplier Breakdown =====
+            effective_multiplier_stage_concurrency: concurrency_multiplier,
+            effective_multiplier_stage_pattern: pattern_multiplier,
+            effective_multiplier_stage_bandwidth: bandwidth_multiplier,
+
+            // ===== Extended Config =====
+            pattern_history_size: config.pattern_history_size,
+            sequential_step_tolerance_bytes: config.sequential_step_tolerance_bytes,
+            bandwidth_ema_beta: config.bandwidth_ema_beta,
+            nvme_buffer_cap: config.nvme_buffer_cap,
+            ssd_buffer_cap: config.ssd_buffer_cap,
+            hdd_buffer_cap: config.hdd_buffer_cap,
+            is_range_request: context.file_size > 0 && !context.is_sequential_hint,
+            target_read_size: context.file_size,
+            source_request_size: context.file_size,
+        };
+
+        #[cfg(not(feature = "io-scheduler-debug"))]
+        {
+            Self { core }
+        }
+
+        #[cfg(feature = "io-scheduler-debug")]
+        {
+            Self { core, debug_info }
         }
     }
 
@@ -1933,7 +2115,9 @@ mod tests {
 
         // Should be capped at NVMe buffer cap and 1MB max
         assert!(strategy.buffer_size <= MI_B, "Should be capped at 1MB max");
-        assert!(strategy.buffer_cap_applied, "Buffer cap should be applied");
+
+        #[cfg(feature = "io-scheduler-debug")]
+        assert!(strategy.debug_info.buffer_cap_applied, "Buffer cap should be applied");
     }
 
     #[test]
@@ -2015,8 +2199,12 @@ mod tests {
 
         assert!(sequential_strategy.buffer_size > random_strategy.buffer_size,
                 "Sequential should get larger buffer than random");
-        assert!(sequential_strategy.sequential_boost_applied, "Should mark sequential boost");
-        assert!(random_strategy.random_penalty_applied, "Should mark random penalty");
+
+        #[cfg(feature = "io-scheduler-debug")]
+        {
+            assert!(sequential_strategy.debug_info.sequential_boost_applied, "Should mark sequential boost");
+            assert!(random_strategy.debug_info.random_penalty_applied, "Should mark random penalty");
+        }
     }
 
     #[test]
