@@ -18,7 +18,7 @@ use datafusion::{
     execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
     prelude::SessionContext,
 };
-use object_store::{ObjectStore, memory::InMemory, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use std::sync::Arc;
 use tracing::error;
 
