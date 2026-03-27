@@ -17,17 +17,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
-use datafusion::physical_optimizer::coalesce_batches::CoalesceBatches;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{
     DefaultPhysicalPlanner as DFDefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner as DFPhysicalPlanner,
 };
-use rustfs_s3select_api::QueryResult;
 use rustfs_s3select_api::query::physical_planner::PhysicalPlanner;
 use rustfs_s3select_api::query::session::SessionCtx;
+use rustfs_s3select_api::QueryResult;
 
 use super::optimizer::PhysicalOptimizer;
 
@@ -70,7 +69,7 @@ impl Default for DefaultPhysicalPlanner {
             Arc::new(JoinSelection::new()),
             // The CoalesceBatches rule will not influence the distribution and ordering of the
             // whole plan tree. Therefore, to avoid influencing other rules, it should run last.
-            Arc::new(CoalesceBatches::new()),
+            // Arc::new(CoalesceBatches::new()),
         ];
 
         Self {

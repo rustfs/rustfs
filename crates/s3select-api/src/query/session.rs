@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::query::Context;
-use crate::{QueryError, QueryResult, object_store::EcObjectStore};
+use crate::{object_store::EcObjectStore, QueryError, QueryResult};
 use datafusion::{
-    execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
+    execution::{context::SessionState, runtime_env::RuntimeEnvBuilder, SessionStateBuilder},
     prelude::SessionContext,
 };
-use object_store::{ObjectStore, memory::InMemory, path::Path};
+use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use tracing::error;
 
