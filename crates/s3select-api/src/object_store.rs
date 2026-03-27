@@ -19,7 +19,23 @@ use futures::pin_mut;
 use futures::{future::ready, stream, Stream, StreamExt};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
-use object_store::{path::Path, Attributes, CopyOptions, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result};
+use object_store::{
+    path::Path,
+    Attributes,
+    CopyOptions,
+    Error as o_Error,
+    GetOptions,
+    GetResult,
+    ListResult,
+    MultipartUpload,
+    ObjectMeta,
+    ObjectStore,
+    PutMultipartOptions,
+    PutOptions,
+    PutPayload,
+    PutResult,
+    Result,
+};
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_ecstore::new_object_layer_fn;
