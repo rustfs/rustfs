@@ -17,8 +17,8 @@
 use hashbrown::HashMap;
 use moka::future::Cache;
 use rustfs_config::MI_B;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -758,7 +758,7 @@ impl TieredObjectCache {
     pub async fn put_bytes(&self, key: String, data: Arc<Vec<u8>>) {
         // Create a CachedGetObject with minimal required fields
         let cached_obj = CachedGetObject {
-            body: bytes::Bytes::copy_from_slice(data.as_slice()),
+            body: Arc::new(bytes::Bytes::copy_from_slice(data.as_slice())),
             content_length: data.len() as i64,
             ..Default::default()
         };
@@ -1044,7 +1044,7 @@ impl CachedObject {
 #[allow(dead_code)]
 pub struct CachedGetObject {
     /// The object body data
-    pub body: bytes::Bytes,
+    pub body: std::sync::Arc<bytes::Bytes>,
     /// Content length in bytes
     pub content_length: i64,
     /// MIME content type
@@ -1085,7 +1085,7 @@ pub struct CachedGetObject {
 impl Default for CachedGetObject {
     fn default() -> Self {
         Self {
-            body: bytes::Bytes::new(),
+            body: Arc::new(bytes::Bytes::new()),
             content_length: 0,
             content_type: None,
             e_tag: None,
@@ -1111,6 +1111,7 @@ impl Default for CachedGetObject {
 impl CachedGetObject {
     /// Create a new CachedGetObject with the given body and content length
     pub fn new(body: bytes::Bytes, content_length: i64) -> Self {
+        let body = std::sync::Arc::new(body);
         Self {
             body,
             content_length,

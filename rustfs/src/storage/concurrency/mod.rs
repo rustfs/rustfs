@@ -15,9 +15,9 @@
 //! Concurrency optimization module for high-performance object retrieval.
 
 // Sub-modules
-pub mod bandwidth_monitor;
-pub mod global_metrics;
-pub mod io_profile;
+// pub mod bandwidth_monitor; // Migrated to rustfs-io-metrics
+// pub mod global_metrics; // Migrated to rustfs-io-metrics
+// pub mod io_profile; // Migrated to rustfs-io-core
 pub mod io_schedule;
 pub mod manager;
 pub mod object_cache;

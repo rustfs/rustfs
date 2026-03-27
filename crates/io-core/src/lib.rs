@@ -52,6 +52,7 @@ pub mod reader;
 pub mod writer;
 pub mod bufreader_optimizer;
 pub mod shared_memory;
+pub mod io_profile;
 
 #[cfg(target_os = "linux")]
 pub use direct_io::{DirectIoError, DirectIoReader};

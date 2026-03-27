@@ -707,6 +707,8 @@ mod tests {
 // ============================================================================
 
 pub mod metric_names;
+pub mod bandwidth;
+pub mod global_metrics;
 
 pub use metric_names::zero_copy;
 
