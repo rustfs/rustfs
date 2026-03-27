@@ -26,6 +26,8 @@ Those scenarios still need cluster-specific setup and should be verified manuall
 - A pool cmdline string that matches the admin API input, for example:
   `http://server{5...8}/disk{1...4}`
 
+If `mc` is not installed locally, set `MC_MODE=docker` and the helper will use `minio/mc` in a container with a persistent config directory.
+
 ## Recommended Flow
 
 1. Prepare data:

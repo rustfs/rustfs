@@ -47,3 +47,4 @@ Pool cmdlines used by admin decommission:
 - This simulates pools, not separate physical nodes.
 - It is good for validating decommission control flow and object migration behavior.
 - It is not a substitute for a real distributed failure-injection test.
+- If `mc` is not installed on the host, set `MC_MODE=docker` and the helper will use `minio/mc` in a container.

@@ -12,6 +12,12 @@ DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-rustfs-local:decommission-latest}"
 POOL0_CMDLINE="${POOL0_CMDLINE:-/data/pool0/disk{1...4}}"
 POOL1_CMDLINE="${POOL1_CMDLINE:-/data/pool1/disk{1...4}}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-1200}"
+MC_MODE="${MC_MODE:-auto}"
+MC_BIN="${MC_BIN:-mc}"
+MC_DOCKER_IMAGE="${MC_DOCKER_IMAGE:-minio/mc:latest}"
+MC_CONFIG_DIR="${MC_CONFIG_DIR:-.tmp/mc-config}"
+MC_DOCKER_NETWORK="${MC_DOCKER_NETWORK:-rustfs-decommission-network}"
+MC_DOCKER_ENDPOINT="${MC_DOCKER_ENDPOINT:-http://rustfs-decommission-latest:9000}"
 
 usage() {
     cat <<EOF
@@ -28,6 +34,7 @@ Environment:
   DOCKERFILE_PATH          Dockerfile path. Default: ${DOCKERFILE_PATH}
   DOCKER_IMAGE_NAME        Image tag to build/use. Default: ${DOCKER_IMAGE_NAME}
   MC_ALIAS_NAME            mc alias to create. Default: ${MC_ALIAS_NAME}
+  MC_MODE                  mc execution mode: auto, binary, docker. Default: ${MC_MODE}
   S3_ENDPOINT              RustFS S3 endpoint. Default: ${S3_ENDPOINT}
   POOL0_CMDLINE            First pool cmdline. Default: ${POOL0_CMDLINE}
   POOL1_CMDLINE            Second pool cmdline. Default: ${POOL1_CMDLINE}
@@ -47,6 +54,43 @@ require_bin() {
         echo "missing required binary: $1" >&2
         exit 1
     fi
+}
+
+mc_mode() {
+    case "${MC_MODE}" in
+        auto)
+            if command -v "${MC_BIN}" >/dev/null 2>&1; then
+                printf 'binary\n'
+            else
+                printf 'docker\n'
+            fi
+            ;;
+        binary|docker)
+            printf '%s\n' "${MC_MODE}"
+            ;;
+        *)
+            echo "unsupported MC_MODE: ${MC_MODE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+mc_cmd() {
+    case "$(mc_mode)" in
+        binary)
+            "${MC_BIN}" "$@"
+            ;;
+        docker)
+            require_bin docker
+            mkdir -p "${MC_CONFIG_DIR}"
+            docker run --rm -i \
+                --network "${MC_DOCKER_NETWORK}" \
+                -v "${PWD}:/work" \
+                -w /work \
+                -v "${MC_CONFIG_DIR}:/root/.mc" \
+                "${MC_DOCKER_IMAGE}" "$@"
+            ;;
+    esac
 }
 
 compose() {
@@ -79,14 +123,16 @@ wait_healthy() {
 }
 
 configure_alias() {
-    require_bin mc
-    mc alias set "${MC_ALIAS_NAME}" "${S3_ENDPOINT}" "${ACCESS_KEY}" "${SECRET_KEY}" >/dev/null
-    echo "mc alias configured: ${MC_ALIAS_NAME} -> ${S3_ENDPOINT}"
+    local endpoint="${S3_ENDPOINT}"
+    if [[ "$(mc_mode)" == "docker" ]]; then
+        endpoint="${MC_DOCKER_ENDPOINT}"
+    fi
+    mc_cmd alias set "${MC_ALIAS_NAME}" "${endpoint}" "${ACCESS_KEY}" "${SECRET_KEY}" >/dev/null
+    echo "mc alias configured: ${MC_ALIAS_NAME} -> ${endpoint}"
 }
 
 up() {
     require_bin docker
-    require_bin mc
     mkdir -p deploy/data/decommission deploy/logs/decommission
     compose up -d
     wait_healthy

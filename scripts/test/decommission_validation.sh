@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MC_MODE="${MC_MODE:-auto}"
+MC_BIN="${MC_BIN:-mc}"
+MC_DOCKER_IMAGE="${MC_DOCKER_IMAGE:-minio/mc:latest}"
+MC_CONFIG_DIR="${MC_CONFIG_DIR:-.tmp/mc-config}"
+MC_DOCKER_NETWORK="${MC_DOCKER_NETWORK:-rustfs-decommission-network}"
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -14,6 +20,7 @@ Usage:
 Environment:
   DECOM_STATE_DIR   Directory for generated state files. Default: .tmp/decommission-validation
   DECOM_ADMIN_API   Admin API mode: auto, mc, rustfs. Default: auto
+  MC_MODE           mc execution mode: auto, binary, docker. Default: auto
 
 Examples:
   ./scripts/test/decommission_validation.sh prepare rustfs
@@ -28,6 +35,43 @@ require_bin() {
         echo "missing required binary: $1" >&2
         exit 1
     fi
+}
+
+mc_mode() {
+    case "${MC_MODE}" in
+        auto)
+            if command -v "${MC_BIN}" >/dev/null 2>&1; then
+                printf 'binary\n'
+            else
+                printf 'docker\n'
+            fi
+            ;;
+        binary|docker)
+            printf '%s\n' "${MC_MODE}"
+            ;;
+        *)
+            echo "unsupported MC_MODE: ${MC_MODE}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+mc_cmd() {
+    case "$(mc_mode)" in
+        binary)
+            "${MC_BIN}" "$@"
+            ;;
+        docker)
+            require_bin docker
+            mkdir -p "${MC_CONFIG_DIR}"
+            docker run --rm -i \
+                --network "${MC_DOCKER_NETWORK}" \
+                -v "${PWD}:/work" \
+                -w /work \
+                -v "${MC_CONFIG_DIR}:/root/.mc" \
+                "${MC_DOCKER_IMAGE}" "$@"
+            ;;
+    esac
 }
 
 state_dir() {
@@ -64,7 +108,7 @@ mc_alias_field() {
     local field="$2"
     local alias_json
 
-    alias_json="$(mc alias list --json 2>/dev/null | grep -F "\"alias\":\"${alias_name}\"" | tail -n 1 || true)"
+    alias_json="$(mc_cmd alias list --json 2>/dev/null | grep -F "\"alias\":\"${alias_name}\"" | tail -n 1 || true)"
     if [[ -z "$alias_json" ]]; then
         return 1
     fi
@@ -172,36 +216,23 @@ EOF
 prepare() {
     local alias_name="$1"
 
-    require_bin mc
-    require_bin mktemp
     require_bin dd
 
     local run_id
     run_id="$(date +%Y%m%d%H%M%S)-$$"
     local basic_bucket="decom-basic-${run_id}"
     local lock_bucket="decom-lock-${run_id}"
-    local workdir
-    workdir="$(mktemp -d)"
+    mc_cmd mb "${alias_name}/${basic_bucket}"
+    mc_cmd version enable "${alias_name}/${basic_bucket}"
+    printf 'alpha-v1\n' | mc_cmd pipe "${alias_name}/${basic_bucket}/single.txt"
+    printf 'alpha-v2\n' | mc_cmd pipe "${alias_name}/${basic_bucket}/single.txt"
+    dd if=/dev/zero bs=1M count=20 status=none | mc_cmd pipe "${alias_name}/${basic_bucket}/multipart.bin"
+    printf 'tombstone\n' | mc_cmd pipe "${alias_name}/${basic_bucket}/delete-marker.txt"
+    mc_cmd rm "${alias_name}/${basic_bucket}/delete-marker.txt"
 
-    trap "rm -rf -- '$workdir'" EXIT
-
-    printf 'alpha-v1\n' >"${workdir}/single.txt"
-    printf 'tombstone\n' >"${workdir}/delete-marker.txt"
-    dd if=/dev/zero of="${workdir}/multipart.bin" bs=1M count=20 status=none
-
-    mc mb "${alias_name}/${basic_bucket}"
-    mc version enable "${alias_name}/${basic_bucket}"
-    mc cp "${workdir}/single.txt" "${alias_name}/${basic_bucket}/single.txt"
-
-    printf 'alpha-v2\n' >"${workdir}/single.txt"
-    mc cp "${workdir}/single.txt" "${alias_name}/${basic_bucket}/single.txt"
-    mc cp "${workdir}/multipart.bin" "${alias_name}/${basic_bucket}/multipart.bin"
-    mc cp "${workdir}/delete-marker.txt" "${alias_name}/${basic_bucket}/delete-marker.txt"
-    mc rm "${alias_name}/${basic_bucket}/delete-marker.txt"
-
-    mc mb --with-lock "${alias_name}/${lock_bucket}"
-    mc retention set --default GOVERNANCE "1d" "${alias_name}/${lock_bucket}"
-    mc cp "${workdir}/single.txt" "${alias_name}/${lock_bucket}/locked.txt"
+    mc_cmd mb --with-lock "${alias_name}/${lock_bucket}"
+    mc_cmd retention set --default GOVERNANCE "1d" "${alias_name}/${lock_bucket}"
+    printf 'alpha-v2\n' | mc_cmd pipe "${alias_name}/${lock_bucket}/locked.txt"
 
     write_state "$alias_name" "$run_id" "$basic_bucket" "$lock_bucket"
 
@@ -229,8 +260,7 @@ start_decommission() {
             rustfs_admin_request "$alias_name" POST "/pools/decommission?pool=${pool_cmdline}"
             ;;
         mc)
-            require_bin mc
-            mc admin decommission start "$(admin_alias "$alias_name")" "$pool_cmdline"
+            mc_cmd admin decommission start "$(admin_alias "$alias_name")" "$pool_cmdline"
             ;;
     esac
 }
@@ -247,8 +277,7 @@ status_decommission() {
             rustfs_admin_request "$alias_name" GET "/pools/status?pool=${pool_cmdline}"
             ;;
         mc)
-            require_bin mc
-            mc admin decommission status "$(admin_alias "$alias_name")" "$pool_cmdline"
+            mc_cmd admin decommission status "$(admin_alias "$alias_name")" "$pool_cmdline"
             ;;
     esac
 }
@@ -280,8 +309,7 @@ wait_decommission() {
                 json_output="$(rustfs_admin_request "$alias_name" GET "/pools/status?pool=${pool_cmdline}" 2>/dev/null || true)"
                 ;;
             mc)
-                require_bin mc
-                json_output="$(mc admin decommission status --json "$(admin_alias "$alias_name")" "$pool_cmdline" 2>/dev/null || true)"
+                json_output="$(mc_cmd admin decommission status --json "$(admin_alias "$alias_name")" "$pool_cmdline" 2>/dev/null || true)"
                 ;;
         esac
 
@@ -319,20 +347,18 @@ wait_decommission() {
 
 verify() {
     local alias_name="$1"
-    require_bin mc
-
     load_state "$alias_name"
 
-    mc stat "${alias_name}/${BASIC_BUCKET}/single.txt"
-    mc stat "${alias_name}/${BASIC_BUCKET}/multipart.bin"
-    mc stat "${alias_name}/${LOCK_BUCKET}/locked.txt"
+    mc_cmd stat "${alias_name}/${BASIC_BUCKET}/single.txt"
+    mc_cmd stat "${alias_name}/${BASIC_BUCKET}/multipart.bin"
+    mc_cmd stat "${alias_name}/${LOCK_BUCKET}/locked.txt"
 
     echo "version listing for ${BASIC_BUCKET}:"
-    mc ls --versions "${alias_name}/${BASIC_BUCKET}"
+    mc_cmd ls --versions "${alias_name}/${BASIC_BUCKET}"
 
     echo
     echo "object lock bucket listing for ${LOCK_BUCKET}:"
-    mc ls --versions "${alias_name}/${LOCK_BUCKET}"
+    mc_cmd ls --versions "${alias_name}/${LOCK_BUCKET}"
 
     cat <<EOF
 basic verification passed:
@@ -362,11 +388,10 @@ cancel_decommission() {
             fi
             ;;
         mc)
-            require_bin mc
             if [[ -n "$pool_cmdline" ]]; then
-                mc admin decommission cancel "$(admin_alias "$alias_name")" "$pool_cmdline"
+                mc_cmd admin decommission cancel "$(admin_alias "$alias_name")" "$pool_cmdline"
             else
-                mc admin decommission cancel "$(admin_alias "$alias_name")"
+                mc_cmd admin decommission cancel "$(admin_alias "$alias_name")"
             fi
             ;;
     esac

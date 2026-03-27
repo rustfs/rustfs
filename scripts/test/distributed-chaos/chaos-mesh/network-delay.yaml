@@ -1,0 +1,18 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: rustfs-internode-delay
+  namespace: rustfs-chaos
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - rustfs-chaos
+    labelSelectors:
+      app.kubernetes.io/name: rustfs
+  delay:
+    latency: "120ms"
+    jitter: "40ms"
+    correlation: "25"
+  duration: "5m"

@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: rustfs-internode-loss
+  namespace: rustfs-chaos
+spec:
+  action: loss
+  mode: all
+  selector:
+    namespaces:
+      - rustfs-chaos
+    labelSelectors:
+      app.kubernetes.io/name: rustfs
+  loss:
+    loss: "15"
+    correlation: "25"
+  duration: "5m"

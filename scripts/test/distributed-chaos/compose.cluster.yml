@@ -1,0 +1,151 @@
+x-rustfs-common: &rustfs-common
+  image: ${RUSTFS_IMAGE:-rustfs/rustfs:chaos-local}
+  depends_on:
+    volume-permission-helper:
+      condition: service_completed_successfully
+  environment:
+    RUSTFS_ADDRESS: "0.0.0.0:9000"
+    RUSTFS_ACCESS_KEY: "rustfsadmin"
+    RUSTFS_SECRET_KEY: "rustfsadmin"
+    RUSTFS_CONSOLE_ENABLE: "false"
+    RUSTFS_OBS_LOGGER_LEVEL: "info"
+    RUSTFS_OBS_LOG_STDOUT_ENABLED: "true"
+    RUSTFS_OBS_LOG_DIRECTORY: "/logs"
+    RUSTFS_VOLUMES: "http://rustfs-node{1...4}:9000/data/rustfs{0...3}"
+  networks:
+    - rustfs-chaos-net
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "sh",
+        "-c",
+        "curl -fsS http://127.0.0.1:9000/health >/dev/null && curl -fsS http://127.0.0.1:9000/health/ready >/dev/null",
+      ]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 30s
+
+services:
+  volume-permission-helper:
+    image: alpine:3.22
+    command: >
+      sh -c "chown -R 10001:10001
+      /logs-node1 /logs-node2 /logs-node3 /logs-node4
+      /node1-disk0 /node1-disk1 /node1-disk2 /node1-disk3
+      /node2-disk0 /node2-disk1 /node2-disk2 /node2-disk3
+      /node3-disk0 /node3-disk1 /node3-disk2 /node3-disk3
+      /node4-disk0 /node4-disk1 /node4-disk2 /node4-disk3"
+    volumes:
+      - rustfs-node1-disk0:/node1-disk0
+      - rustfs-node1-disk1:/node1-disk1
+      - rustfs-node1-disk2:/node1-disk2
+      - rustfs-node1-disk3:/node1-disk3
+      - rustfs-node1-logs:/logs-node1
+      - rustfs-node2-disk0:/node2-disk0
+      - rustfs-node2-disk1:/node2-disk1
+      - rustfs-node2-disk2:/node2-disk2
+      - rustfs-node2-disk3:/node2-disk3
+      - rustfs-node2-logs:/logs-node2
+      - rustfs-node3-disk0:/node3-disk0
+      - rustfs-node3-disk1:/node3-disk1
+      - rustfs-node3-disk2:/node3-disk2
+      - rustfs-node3-disk3:/node3-disk3
+      - rustfs-node3-logs:/logs-node3
+      - rustfs-node4-disk0:/node4-disk0
+      - rustfs-node4-disk1:/node4-disk1
+      - rustfs-node4-disk2:/node4-disk2
+      - rustfs-node4-disk3:/node4-disk3
+      - rustfs-node4-logs:/logs-node4
+    restart: "no"
+
+  rustfs-node1:
+    <<: *rustfs-common
+    container_name: rustfs-node1
+    build:
+      context: /Users/overtrue/www/rustfs
+      dockerfile: Dockerfile.source
+      args:
+        TARGETPLATFORM: linux/amd64
+    volumes:
+      - rustfs-node1-disk0:/data/rustfs0
+      - rustfs-node1-disk1:/data/rustfs1
+      - rustfs-node1-disk2:/data/rustfs2
+      - rustfs-node1-disk3:/data/rustfs3
+      - rustfs-node1-logs:/logs
+
+  rustfs-node2:
+    <<: *rustfs-common
+    container_name: rustfs-node2
+    volumes:
+      - rustfs-node2-disk0:/data/rustfs0
+      - rustfs-node2-disk1:/data/rustfs1
+      - rustfs-node2-disk2:/data/rustfs2
+      - rustfs-node2-disk3:/data/rustfs3
+      - rustfs-node2-logs:/logs
+
+  rustfs-node3:
+    <<: *rustfs-common
+    container_name: rustfs-node3
+    volumes:
+      - rustfs-node3-disk0:/data/rustfs0
+      - rustfs-node3-disk1:/data/rustfs1
+      - rustfs-node3-disk2:/data/rustfs2
+      - rustfs-node3-disk3:/data/rustfs3
+      - rustfs-node3-logs:/logs
+
+  rustfs-node4:
+    <<: *rustfs-common
+    container_name: rustfs-node4
+    volumes:
+      - rustfs-node4-disk0:/data/rustfs0
+      - rustfs-node4-disk1:/data/rustfs1
+      - rustfs-node4-disk2:/data/rustfs2
+      - rustfs-node4-disk3:/data/rustfs3
+      - rustfs-node4-logs:/logs
+
+  rustfs-lb:
+    image: haproxy:2.9
+    container_name: rustfs-lb
+    depends_on:
+      rustfs-node1:
+        condition: service_healthy
+      rustfs-node2:
+        condition: service_healthy
+      rustfs-node3:
+        condition: service_healthy
+      rustfs-node4:
+        condition: service_healthy
+    networks:
+      - rustfs-chaos-net
+    ports:
+      - "9000:9000"
+    volumes:
+      - /Users/overtrue/www/rustfs/scripts/test/distributed-chaos/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+networks:
+  rustfs-chaos-net:
+    name: rustfs-chaos-net
+
+volumes:
+  rustfs-node1-disk0:
+  rustfs-node1-disk1:
+  rustfs-node1-disk2:
+  rustfs-node1-disk3:
+  rustfs-node1-logs:
+  rustfs-node2-disk0:
+  rustfs-node2-disk1:
+  rustfs-node2-disk2:
+  rustfs-node2-disk3:
+  rustfs-node2-logs:
+  rustfs-node3-disk0:
+  rustfs-node3-disk1:
+  rustfs-node3-disk2:
+  rustfs-node3-disk3:
+  rustfs-node3-logs:
+  rustfs-node4-disk0:
+  rustfs-node4-disk1:
+  rustfs-node4-disk2:
+  rustfs-node4-disk3:
+  rustfs-node4-logs:

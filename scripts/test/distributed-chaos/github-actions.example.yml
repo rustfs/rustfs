@@ -1,0 +1,100 @@
+name: distributed-chaos-example
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  distributed-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start distributed Compose cluster
+        run: ./scripts/test/distributed-chaos/run-compose.sh up
+
+      - name: Run small-file distributed smoke
+        run: ./scripts/test/distributed-chaos/run-warp.sh small
+
+      - name: Kill one RustFS node
+        run: ./scripts/test/distributed-chaos/pumba-chaos.sh kill 're2:^rustfs-node[1-4]$' 1s 1
+
+      - name: Collect admin metrics
+        run: SIGNING_MODE=docker_awscurl BASE_URL=http://rustfs-lb:9000 ./scripts/test/distributed-chaos/collect-admin-metrics.sh once
+
+      - name: Save cluster logs
+        if: always()
+        run: ./scripts/test/distributed-chaos/run-compose.sh logs
+
+  distributed-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start distributed Compose cluster
+        run: ./scripts/test/distributed-chaos/run-compose.sh up
+
+      - name: Start background metrics stream
+        run: |
+          SIGNING_MODE=docker_awscurl BASE_URL=http://rustfs-lb:9000 ./scripts/test/distributed-chaos/collect-admin-metrics.sh stream > /tmp/rustfs-admin-stream.log &
+          echo $! > /tmp/rustfs-admin-stream.pid
+
+      - name: Run mixed workload
+        run: ./scripts/test/distributed-chaos/run-warp.sh mixed
+
+      - name: Run targeted mixed corruption probe
+        run: WARP_MODE=docker WARP_HOST=rustfs-lb:9000 TIMEOUT_SECONDS=90 ATTEMPTS=1 ./scripts/test/distributed-chaos/repro-mixed-corruption.sh
+
+      - name: Evaluate distributed chaos run
+        id: evaluate-chaos
+        continue-on-error: true
+        run: |
+          OUT_FILE=artifacts/distributed-chaos/repros/latest-summary.txt \
+          ./scripts/test/distributed-chaos/evaluate-chaos-run.sh latest
+
+      - name: Render distributed chaos reports
+        if: always()
+        run: |
+          OUT_FILE=artifacts/distributed-chaos/repros/latest-report.md \
+          bash ./scripts/test/distributed-chaos/render-chaos-report.sh markdown latest
+          OUT_FILE=artifacts/distributed-chaos/repros/latest-report.html \
+          bash ./scripts/test/distributed-chaos/render-chaos-report.sh html latest
+
+      - name: Inject latency
+        run: ./scripts/test/distributed-chaos/pumba-chaos.sh delay 're2:^rustfs-node[12]$' 200 5m
+
+      - name: Inject packet loss
+        run: ./scripts/test/distributed-chaos/pumba-chaos.sh loss 're2:^rustfs-node[34]$' 0.05 3m
+
+      - name: Stress one node
+        run: ./scripts/test/distributed-chaos/pumba-chaos.sh stress 're2:^rustfs-node2$' 120s '--cpu 4 --timeout 120s --metrics-brief'
+
+      - name: Capture CPU profile
+        run: SIGNING_MODE=docker_awscurl BASE_URL=http://rustfs-lb:9000 ./scripts/test/distributed-chaos/collect-admin-metrics.sh pprof-cpu 30
+
+      - name: Stop background metrics stream
+        if: always()
+        run: |
+          if [[ -f /tmp/rustfs-admin-stream.pid ]]; then
+            kill "$(cat /tmp/rustfs-admin-stream.pid)" || true
+          fi
+
+      - name: Save cluster logs
+        if: always()
+        run: ./scripts/test/distributed-chaos/run-compose.sh logs
+
+      - name: Upload distributed chaos artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributed-chaos-artifacts
+          path: artifacts/distributed-chaos
+
+      - name: Fail if distributed chaos evaluation failed
+        if: steps.evaluate-chaos.outcome == 'failure'
+        run: exit 1

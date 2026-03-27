@@ -1,0 +1,18 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: rustfs-io-latency
+  namespace: rustfs-chaos
+spec:
+  action: latency
+  mode: one
+  selector:
+    namespaces:
+      - rustfs-chaos
+    labelSelectors:
+      app.kubernetes.io/name: rustfs
+  volumePath: /data
+  path: "/data/**/*"
+  delay: "50ms"
+  percent: 100
+  duration: "5m"

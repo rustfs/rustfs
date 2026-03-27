@@ -1,0 +1,13 @@
+services:
+  rustfs-node1:
+    build: null
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+
+  rustfs-node2:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+
+  rustfs-node3:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
+
+  rustfs-node4:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}

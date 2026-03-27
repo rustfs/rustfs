@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: rustfs-cpu-stress
+  namespace: rustfs-chaos
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - rustfs-chaos
+    labelSelectors:
+      app.kubernetes.io/name: rustfs
+  stressors:
+    cpu:
+      workers: 2
+      load: 80
+  duration: "5m"

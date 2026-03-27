@@ -1,0 +1,18 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: rustfs-chaos
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 32000
+        hostPort: 9000
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 32001
+        hostPort: 9001
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker

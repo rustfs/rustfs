@@ -1,0 +1,22 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: rustfs-full-partition
+  namespace: rustfs-chaos
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - rustfs-chaos
+    labelSelectors:
+      app.kubernetes.io/name: rustfs
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - rustfs-chaos
+      labelSelectors:
+        app.kubernetes.io/name: rustfs
+  duration: "2m"
