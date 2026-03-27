@@ -1670,7 +1670,9 @@ impl DefaultObjectUsecase {
             // We use a minimal duration (1 microsecond) to indicate high-speed cache access
             manager.record_transfer(cached.content_length as u64, Duration::from_micros(1));
 
-            let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
+            // Dereference Arc<Bytes> to get Bytes for StreamingBlob
+            // This is still zero-copy because Bytes uses reference counting internally
+            let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok((*body_data).clone()) })));
 
             // Parse last_modified from RFC3339 string if available
             let last_modified = cached

@@ -192,7 +192,7 @@ impl IoPatternDetector {
 }
 
 pub fn detect_storage_media(storage_detection_enabled: bool, storage_media_override: &str) -> StorageMedia {
-    if let Some(media) = StorageMedia::from_str(storage_media_override) {
+    if let Ok(media) = StorageMedia::from_str(storage_media_override) {
         return media;
     }
 
@@ -317,15 +317,15 @@ mod tests {
 
     #[test]
     fn test_storage_media_from_str() {
-        assert_eq!(StorageMedia::from_str("nvme"), Some(StorageMedia::Nvme));
-        assert_eq!(StorageMedia::from_str("NVMe"), Some(StorageMedia::Nvme));
-        assert_eq!(StorageMedia::from_str("ssd"), Some(StorageMedia::Ssd));
-        assert_eq!(StorageMedia::from_str("SSD"), Some(StorageMedia::Ssd));
-        assert_eq!(StorageMedia::from_str("hdd"), Some(StorageMedia::Hdd));
-        assert_eq!(StorageMedia::from_str("HDD"), Some(StorageMedia::Hdd));
-        assert_eq!(StorageMedia::from_str("unknown"), Some(StorageMedia::Unknown));
-        assert_eq!(StorageMedia::from_str("invalid"), None);
-        assert_eq!(StorageMedia::from_str(""), None);
+        assert_eq!(StorageMedia::from_str("nvme"), Ok(StorageMedia::Nvme));
+        assert_eq!(StorageMedia::from_str("NVMe"), Ok(StorageMedia::Nvme));
+        assert_eq!(StorageMedia::from_str("ssd"), Ok(StorageMedia::Ssd));
+        assert_eq!(StorageMedia::from_str("SSD"), Ok(StorageMedia::Ssd));
+        assert_eq!(StorageMedia::from_str("hdd"), Ok(StorageMedia::Hdd));
+        assert_eq!(StorageMedia::from_str("HDD"), Ok(StorageMedia::Hdd));
+        assert_eq!(StorageMedia::from_str("unknown"), Ok(StorageMedia::Unknown));
+        assert_eq!(StorageMedia::from_str("invalid"), Err(()));
+        assert_eq!(StorageMedia::from_str(""), Err(()));
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! that can be accessed from anywhere in the codebase for consistent
 //! performance monitoring.
 
-use rustfs_io_metrics::PerformanceMetrics;
+use crate::PerformanceMetrics;
 use std::sync::{Arc, OnceLock};
 
 // Global performance metrics instance.
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_global_metrics_singleton() {
-        use rustfs_io_metrics::MetricsCollector;
+        use crate::MetricsCollector;
 
         // Get global metrics twice
         let metrics1 = get_global_metrics();

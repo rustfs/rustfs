@@ -17,10 +17,10 @@
 //! This module provides Arc-based shared memory management for
 //! efficient cross-task data passing without serialization.
 
-use std::ops::Deref;
 use std::convert::AsRef;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Shared memory pool configuration.

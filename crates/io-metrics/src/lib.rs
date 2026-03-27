@@ -778,15 +778,15 @@ pub fn record_direct_io_operation(operation: &str, size: usize, success: bool) {
 
     counter!(
         zero_copy::DIRECT_IO_OPERATIONS_TOTAL,
-        "operation" => operation,
-        "status" => status
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
     )
     .increment(1);
 
     counter!(
         zero_copy::DIRECT_IO_BYTES_TOTAL,
-        "operation" => operation,
-        "status" => status
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
     )
     .increment(size as u64);
 }

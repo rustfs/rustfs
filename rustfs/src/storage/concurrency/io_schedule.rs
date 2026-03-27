@@ -14,9 +14,9 @@
 
 //! I/O scheduling types for adaptive buffer sizing and load management.
 
-use super::bandwidth_monitor::{BandwidthSnapshot, BandwidthTier};
-use super::io_profile::{AccessPattern, StorageMedia, StorageProfile};
 use rustfs_config::{KI_B, MI_B};
+use rustfs_io_core::io_profile::{AccessPattern, StorageMedia, StorageProfile};
+use rustfs_io_metrics::bandwidth::{BandwidthSnapshot, BandwidthTier};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 

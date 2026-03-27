@@ -34,14 +34,6 @@ pub use io_schedule::{
     IoSchedulerConfig, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
 };
 
-// I/O profile types (storage media, access pattern detection)
-#[allow(unused_imports)]
-pub use io_profile::{AccessPattern, IoPatternDetector, StorageMedia, StorageProfile, detect_storage_media};
-
-// Bandwidth monitoring types
-#[allow(unused_imports)]
-pub use bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot, BandwidthTier};
-
 // Request tracking
 pub use request_guard::GetObjectGuard;
 

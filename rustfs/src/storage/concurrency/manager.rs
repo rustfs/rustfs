@@ -14,9 +14,6 @@
 
 //! Concurrency manager for coordinating concurrent GetObject requests.
 
-use super::bandwidth_monitor::{BandwidthMonitor, BandwidthSnapshot};
-use super::global_metrics::get_global_metrics;
-use super::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
@@ -25,6 +22,9 @@ use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, Warmup
 use super::request_guard::GetObjectGuard;
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
+use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
+use rustfs_io_metrics::bandwidth::{BandwidthMonitor, BandwidthSnapshot};
+use rustfs_io_metrics::global_metrics::get_global_metrics;
 use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -370,13 +370,13 @@ impl ConcurrencyManager {
         let access_pattern = if let Ok(detector) = self.pattern_detector.lock() {
             detector.current_pattern()
         } else {
-            crate::storage::concurrency::io_profile::AccessPattern::Unknown
+            AccessPattern::Unknown
         };
 
         // Get current bandwidth snapshot
         let observed_bandwidth_bps = if let Ok(monitor) = self.bandwidth_monitor.lock() {
             let snapshot = monitor.snapshot();
-            if snapshot.tier == crate::storage::concurrency::bandwidth_monitor::BandwidthTier::Unknown {
+            if snapshot.tier == rustfs_io_metrics::bandwidth::BandwidthTier::Unknown {
                 None
             } else {
                 Some(snapshot.bytes_per_second)
@@ -522,7 +522,7 @@ impl ConcurrencyManager {
         } else {
             BandwidthSnapshot {
                 bytes_per_second: 0,
-                tier: crate::storage::concurrency::bandwidth_monitor::BandwidthTier::Unknown,
+                tier: rustfs_io_metrics::bandwidth::BandwidthTier::Unknown,
             }
         }
     }
@@ -1101,7 +1101,7 @@ mod integration_tests {
 
         // Check pattern detection
         let pattern = manager.current_access_pattern();
-        assert_eq!(pattern, crate::storage::concurrency::io_profile::AccessPattern::Sequential);
+        assert_eq!(pattern, AccessPattern::Sequential);
 
         // Record random accesses
         for offset in [0, 10 * 1024, 100 * 1024, 5 * 1024 * 1024] {
@@ -1110,10 +1110,7 @@ mod integration_tests {
 
         // Pattern should change to mixed or random
         let pattern_after = manager.current_access_pattern();
-        assert!(!matches!(
-            pattern_after,
-            crate::storage::concurrency::io_profile::AccessPattern::Sequential
-        ));
+        assert!(!matches!(pattern_after, AccessPattern::Sequential));
     }
 
     #[tokio::test]
@@ -1155,7 +1152,7 @@ mod integration_tests {
         let manager = ConcurrencyManager::new();
 
         // Simulate high concurrent requests by keeping guards alive
-        let _guards: Vec<_> = (0..20).map(|_| crate::storage::concurrency::GetObjectGuard::new()).collect();
+        let _guards: Vec<_> = (0..20).map(|_| GetObjectGuard::new()).collect();
 
         let strategy = manager.calculate_io_strategy_with_context(100 * 1024 * 1024, 512 * 1024, Duration::from_millis(10), true);
 
@@ -1204,10 +1201,7 @@ mod integration_tests {
         // We accept Unknown if detection wasn't configured
         assert!(matches!(
             media,
-            crate::storage::concurrency::io_profile::StorageMedia::Nvme
-                | crate::storage::concurrency::io_profile::StorageMedia::Ssd
-                | crate::storage::concurrency::io_profile::StorageMedia::Hdd
-                | crate::storage::concurrency::io_profile::StorageMedia::Unknown
+            StorageMedia::Nvme | StorageMedia::Ssd | StorageMedia::Hdd | StorageMedia::Unknown
         ));
     }
 
@@ -1231,7 +1225,7 @@ mod integration_tests {
             false,
         );
 
-        assert_eq!(small_file_strategy.priority, crate::storage::concurrency::io_schedule::IoPriority::High);
-        assert_eq!(large_file_strategy.priority, crate::storage::concurrency::io_schedule::IoPriority::Low);
+        assert_eq!(small_file_strategy.priority, IoPriority::High);
+        assert_eq!(large_file_strategy.priority, IoPriority::Low);
     }
 }
