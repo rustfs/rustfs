@@ -72,8 +72,20 @@ pub fn register_kms_management_route(r: &mut S3Router<AdminOperation>) -> std::i
     )?;
 
     r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/create").as_str(),
+        AdminOperation(&CreateKeyHandler {}),
+    )?;
+
+    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/describe-key").as_str(),
+        AdminOperation(&DescribeKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/key/status").as_str(),
         AdminOperation(&DescribeKeyHandler {}),
     )?;
 
@@ -91,6 +103,12 @@ pub fn register_kms_management_route(r: &mut S3Router<AdminOperation>) -> std::i
 
     r.insert(
         Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
+        AdminOperation(&KmsStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/kms/status").as_str(),
         AdminOperation(&KmsStatusHandler {}),
     )?;
