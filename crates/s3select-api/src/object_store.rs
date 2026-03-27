@@ -16,25 +16,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::pin_mut;
-use futures::{future::ready, stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
 use object_store::{
-    path::Path,
-    Attributes,
-    CopyOptions,
-    Error as o_Error,
-    GetOptions,
-    GetResult,
-    ListResult,
-    MultipartUpload,
-    ObjectMeta,
-    ObjectStore,
-    PutMultipartOptions,
-    PutOptions,
-    PutPayload,
-    PutResult,
-    Result,
+    Attributes, CopyOptions, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
@@ -43,14 +30,14 @@ use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::ObjectIO;
 use rustfs_ecstore::store_api::ObjectOptions;
+use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
 use s3s::s3_error;
-use s3s::S3Result;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::ready;
 use std::task::Poll;
+use std::task::ready;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
@@ -204,7 +191,7 @@ impl ObjectStore for EcObjectStore {
                          large files.",
                         MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
                     )
-                        .into(),
+                    .into(),
                 });
             }
             let stream = json_document_ndjson_stream(reader.stream, original_size, self.json_sub_path.clone());
@@ -214,14 +201,14 @@ impl ObjectStore for EcObjectStore {
                 ReaderStream::with_capacity(ConvertStream::new(reader.stream, self.delimiter.clone()), DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             )
-                .boxed();
+            .boxed();
             (object_store::GetResultPayload::Stream(stream), original_size)
         } else {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             )
-                .boxed();
+            .boxed();
             (object_store::GetResultPayload::Stream(stream), original_size)
         };
 
@@ -435,7 +422,7 @@ fn json_document_ndjson_stream(
         }
         Ok(())
     })
-        .boxed()
+    .boxed()
 }
 
 /// Parse a JSON DOCUMENT (a single JSON value, possibly multi-line) into a
@@ -507,7 +494,7 @@ fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) ->
 
 pub fn bytes_stream<S>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes>> + Send + 'static
 where
-    S: Stream<Item=Result<Bytes, std::io::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
         pin_mut!(stream);

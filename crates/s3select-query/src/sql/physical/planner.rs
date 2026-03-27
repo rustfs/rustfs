@@ -17,16 +17,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{
     DefaultPhysicalPlanner as DFDefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner as DFPhysicalPlanner,
 };
+use rustfs_s3select_api::QueryResult;
 use rustfs_s3select_api::query::physical_planner::PhysicalPlanner;
 use rustfs_s3select_api::query::session::SessionCtx;
-use rustfs_s3select_api::QueryResult;
 
 use super::optimizer::PhysicalOptimizer;
 
