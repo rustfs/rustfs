@@ -877,7 +877,6 @@ mod tests {
     use crate::{FileMetaVersion, MetaDeleteMarker};
     use std::collections::HashMap;
     use std::io::Cursor;
-    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -921,6 +920,7 @@ mod tests {
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp")),
                 meta_sys: HashMap::new(),
             }),
+            legacy_object: None,
             write_version: 99,
             uses_legacy_checksum: false,
         };
