@@ -14,6 +14,9 @@
 
 //! Bucket application use-case contracts.
 
+use crate::admin::handlers::site_replication::{
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+};
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
@@ -43,6 +46,7 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -67,6 +71,16 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
 
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
+
+fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
+    SRBucketMeta {
+        bucket,
+        r#type: item_type.to_string(),
+        updated_at: Some(time::OffsetDateTime::now_utc()),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
 }
 
 fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
@@ -190,6 +204,7 @@ impl DefaultBucketUsecase {
             object_lock_enabled_for_bucket,
             ..
         } = req.input;
+        let lock_enabled = object_lock_enabled_for_bucket.is_some_and(|v| v);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -200,7 +215,7 @@ impl DefaultBucketUsecase {
                 &bucket,
                 &MakeBucketOptions {
                     force_create: false,
-                    lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
+                    lock_enabled,
                     ..Default::default()
                 },
             )
@@ -216,6 +231,10 @@ impl DefaultBucketUsecase {
                 return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
+        }
+
+        if let Err(err) = site_replication_make_bucket_hook(&bucket, lock_enabled).await {
+            warn!(bucket = %bucket, error = ?err, "site replication make bucket hook failed");
         }
 
         let output = CreateBucketOutput::default();
@@ -288,6 +307,10 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
+            warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
+        }
 
         let result = Ok(S3Response::new(DeleteBucketOutput {}));
         let _ = helper.complete(&result);
@@ -443,6 +466,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
+        }
+
         Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
@@ -469,6 +497,11 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket cors delete hook failed");
+        }
 
         Ok(S3Response::new(DeleteBucketCorsOutput {}))
     }
@@ -497,6 +530,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
+        }
+
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -523,6 +561,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "policy");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
+        }
+
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
@@ -548,6 +591,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config delete hook failed");
+        }
+
         // TODO: remove targets
         info!(bucket = %bucket, "deleted bucket replication config");
 
@@ -568,6 +616,11 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        let item = sr_bucket_meta_item(bucket.clone(), "tags");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
+        }
 
         Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
     }
@@ -1026,6 +1079,15 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
+        item.sse_config = Some(
+            serialize_config(&server_side_encryption_configuration)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
+        }
         Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
     }
 
@@ -1071,6 +1133,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
+        item.expiry_lc_config =
+            Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        item.expiry_updated_at = item.updated_at;
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
+        }
 
         if lifecycle_has_transition_rules(&input_cfg)
             && let Some(store) = new_object_layer_fn()
@@ -1216,6 +1286,12 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
+        item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
+        }
+
         Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
 
@@ -1244,6 +1320,13 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
+        item.cors =
+            Some(serialize_config(&cors_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket cors hook failed");
+        }
 
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
@@ -1277,6 +1360,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        item.replication_config = Some(
+            serialize_config(&replication_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
+        }
 
         Ok(S3Response::new(replication::build_put_bucket_replication_output()))
     }
@@ -1339,6 +1430,12 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
+        item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
+        }
+
         Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
     }
 
@@ -1362,6 +1459,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
+        item.versioning = Some(
+            serialize_config(&versioning_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
+        }
 
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }

@@ -343,6 +343,8 @@ pub struct SRBucketMeta {
     pub object_lock_config: Option<String>,
     #[serde(rename = "sseConfig", skip_serializing_if = "Option::is_none")]
     pub sse_config: Option<String>,
+    #[serde(rename = "replicationConfig", skip_serializing_if = "Option::is_none")]
+    pub replication_config: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<Value>,
     #[serde(rename = "expLCConfig", skip_serializing_if = "Option::is_none")]
@@ -1000,6 +1002,8 @@ pub struct SRStatusInfo {
     pub user_stats: BTreeMap<String, BTreeMap<String, SRUserStatsSummary>>,
     #[serde(rename = "GroupStats", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub group_stats: BTreeMap<String, BTreeMap<String, SRGroupStatsSummary>>,
+    #[serde(rename = "PeerStates", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_states: BTreeMap<String, SRStateInfo>,
     #[serde(rename = "Metrics", default)]
     pub metrics: SRMetricsSummary,
     #[serde(rename = "ILMExpiryStats", default, skip_serializing_if = "BTreeMap::is_empty")]
