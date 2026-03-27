@@ -42,11 +42,66 @@
 extern crate metrics;
 
 // Public modules
+pub mod adaptive_ttl;
 pub mod autotuner;
+pub mod backpressure_metrics;
+pub mod cache_config;
 pub mod collector;
+pub mod config;
+pub mod deadlock_metrics;
+pub mod io_metrics;
+pub mod lock_metrics;
 pub mod performance;
+pub mod timeout_metrics;
 
 pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
+
+// Cache config exports
+pub use cache_config::{AdaptiveTTL, CacheConfig, CacheConfigError, CacheHealthStatus, CacheStats};
+
+// Adaptive TTL exports
+pub use adaptive_ttl::{
+    AccessRecord, AccessTracker, AdaptiveTTLStats, record_access_pattern_change, record_early_eviction, record_ttl_adjustment,
+    record_ttl_expiration,
+};
+
+// I/O metrics exports
+pub use io_metrics::{
+    IoSchedulerStats, record_bandwidth_observation, record_buffer_size_adjustment, record_io_priority_decision,
+    record_io_scheduler_decision, record_load_level_change, record_queue_operation, record_starvation_event,
+};
+
+// Backpressure metrics exports
+pub use backpressure_metrics::{
+    record_backpressure_activation, record_backpressure_deactivation, record_backpressure_rejection,
+    record_backpressure_state_change, record_concurrent_operations,
+};
+
+// Deadlock metrics exports
+pub use deadlock_metrics::{
+    record_deadlock_detected, record_lock_acquisition, record_lock_contention, record_lock_release, record_long_held_lock,
+    record_wait_edge_added, record_wait_edge_removed,
+};
+
+// Lock metrics exports
+pub use lock_metrics::{
+    LockMetricsSummary, record_contention_event, record_early_release, record_lock_hold_time, record_lock_optimization_enabled,
+    record_spin_attempt, record_spin_count_change,
+};
+
+// Timeout metrics exports
+pub use timeout_metrics::{
+    TimeoutMetricsSummary, record_dynamic_timeout, record_operation_completion, record_operation_duration,
+    record_operation_progress, record_stalled_operation, record_timeout_event,
+};
+
+// Config exports
+pub use config::{
+    BackpressureSettings, CacheSettings, DEFAULT_BASE_BUFFER_SIZE, DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_CACHE_MAX_MEMORY,
+    DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_CONCURRENT_READS, DEFAULT_MIN_BUFFER_SIZE,
+    DeadlockDetectionSettings, IoConfig, IoSchedulerSettings, TimeoutSettings,
+};
+
 // Re-exports for convenience
 pub use collector::MetricsCollector;
 pub use performance::PerformanceMetrics;

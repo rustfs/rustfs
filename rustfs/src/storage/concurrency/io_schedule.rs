@@ -13,6 +13,22 @@
 // limitations under the License.
 
 //! I/O scheduling types for adaptive buffer sizing and load management.
+//!
+//! # Migration Note
+//!
+//! This module contains types that are also available in `rustfs_io_core`.
+//! For new code, prefer using types from `rustfs_io_core` directly:
+//!
+//! ```ignore
+//! // Recommended: Use io-core types
+//! use rustfs_io_core::{
+//!     IoLoadLevel, IoPriority, IoSchedulerConfig,
+//!     calculate_optimal_buffer_size, get_buffer_size_for_media,
+//! };
+//! ```
+//!
+//! This module remains for backward compatibility and provides additional
+//! runtime monitoring features (`IoPriorityMetrics`, `IoStrategyDebugInfo`).
 
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::io_profile::{AccessPattern, StorageMedia, StorageProfile};

@@ -13,6 +13,21 @@
 // limitations under the License.
 
 //! Object cache module for hot object caching with Moka.
+//!
+//! # Migration Note
+//!
+//! This module provides a complete tiered cache implementation. For configuration
+//! and metrics types, consider using `rustfs_io_metrics`:
+//!
+//! ```ignore
+//! // Configuration types from io-metrics
+//! use rustfs_io_metrics::{CacheConfig, AdaptiveTTL, CacheStats};
+//!
+//! // Access tracking from io-metrics
+//! use rustfs_io_metrics::{AccessTracker, AccessRecord};
+//! ```
+//!
+//! This module remains for the full `TieredObjectCache` implementation.
 
 use hashbrown::HashMap;
 use moka::future::Cache;

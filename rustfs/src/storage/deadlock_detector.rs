@@ -17,6 +17,18 @@
 //! This module provides deadlock detection capabilities for diagnosing
 //! hanging requests and lock contention issues in production systems.
 //!
+//! # Migration Note
+//!
+//! This module extends `rustfs_io_core::DeadlockDetector` with request-level
+//! resource tracking (memory, file handles). For basic deadlock detection,
+//! consider using the io-core version directly:
+//!
+//! ```ignore
+//! // Basic deadlock detection
+//! use rustfs_io_core::DeadlockDetector;
+//! let detector = DeadlockDetector::with_defaults();
+//! ```
+//!
 //! # Key Features
 //!
 //! - Request resource tracking (locks, memory, file handles)

@@ -13,6 +13,23 @@
 // limitations under the License.
 
 //! Concurrency optimization module for high-performance object retrieval.
+//!
+//! This module provides concurrency management, I/O scheduling, and object caching
+//! for high-performance object retrieval operations.
+//!
+//! # Architecture
+//!
+//! The module is organized into several components:
+//! - **I/O Scheduling**: Adaptive buffer sizing and load management
+//! - **Object Caching**: Tiered L1/L2 cache for frequently accessed objects
+//! - **Concurrency Management**: Coordination of concurrent GetObject requests
+//! - **Request Tracking**: RAII guards for request lifecycle management
+//!
+//! # Migration Note
+//!
+//! Core algorithms have been migrated to `rustfs-io-core` and metrics to
+//! `rustfs-io-metrics`. This module maintains API compatibility while
+//! delegating to the new implementations.
 
 // Sub-modules
 // pub mod bandwidth_monitor; // Migrated to rustfs-io-metrics
@@ -23,11 +40,14 @@ pub mod manager;
 pub mod object_cache;
 pub mod request_guard;
 
+#[cfg(test)]
+mod api_compat_tests;
+
 // ============================================
 // Public API Re-exports
 // ============================================
 
-// I/O scheduling types
+// I/O scheduling types (from io_schedule.rs for backward compatibility)
 #[allow(unused_imports)]
 pub use io_schedule::{
     IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
@@ -44,7 +64,67 @@ pub use object_cache::{CacheHealthStatus, CacheStats, CachedGetObject};
 // Concurrency manager
 pub use manager::ConcurrencyManager;
 
-// Global metrics
+// ============================================
+// New Module Re-exports (for gradual migration)
+// ============================================
+
+// Re-export types from rustfs-io-core for convenience
+pub use rustfs_io_core::{
+    // Backpressure types
+    BackpressureConfig,
+    BackpressureMonitor,
+    BackpressureState,
+    BandwidthTier,
+    // Config types
+    ConfigError,
+    // Deadlock detection types
+    DeadlockDetector,
+    DeadlockDetectorConfig,
+    IoLoadMetrics,
+    IoPriorityQueueConfig as CorePriorityQueueConfig,
+    // Scheduler types
+    IoScheduler,
+    IoSchedulingContext,
+    // Buffer size functions
+    KI_B,
+    LockInfo,
+    LockOptimizeConfig,
+    // Lock optimization types
+    LockOptimizer,
+    LockStats,
+    LockType,
+    MI_B,
+    OperationProgress,
+    // Timeout types
+    RequestTimeoutWrapper,
+    TimeoutConfig,
+    TimeoutError,
+    TimeoutStats,
+    WaitGraphEdge,
+    calculate_optimal_buffer_size,
+    get_buffer_size_for_media,
+};
+
+// Re-export types from rustfs-io-metrics for convenience
+pub use rustfs_io_metrics::{
+    AccessRecord,
+    // Access tracking
+    AccessTracker as MetricsAccessTracker,
+    AdaptiveTTL,
+    AdaptiveTTLStats,
+    BackpressureSettings,
+    // Cache config types
+    CacheConfig,
+    CacheConfigError,
+    CacheSettings,
+    DeadlockDetectionSettings,
+    // Config settings
+    IoConfig,
+    IoSchedulerSettings,
+    // I/O metrics
+    IoSchedulerStats,
+    TimeoutSettings,
+};
 
 // ============================================
 // Helper Functions
@@ -59,4 +139,24 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 #[allow(dead_code)]
 pub fn reset_active_get_requests() {
     io_schedule::ACTIVE_GET_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Create a new I/O scheduler with default configuration.
+pub fn create_io_scheduler() -> IoScheduler {
+    IoScheduler::with_defaults()
+}
+
+/// Create a new backpressure monitor with default configuration.
+pub fn create_backpressure_monitor() -> BackpressureMonitor {
+    BackpressureMonitor::with_defaults()
+}
+
+/// Create a new deadlock detector with default configuration.
+pub fn create_deadlock_detector() -> DeadlockDetector {
+    DeadlockDetector::with_defaults()
+}
+
+/// Create a new lock optimizer with default configuration.
+pub fn create_lock_optimizer() -> LockOptimizer {
+    LockOptimizer::with_defaults()
 }

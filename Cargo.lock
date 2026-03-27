@@ -7965,6 +7965,8 @@ name = "rustfs-io-metrics"
 version = "0.0.5"
 dependencies = [
  "metrics",
+ "num_cpus",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

@@ -26,6 +26,8 @@ categories = ["development-tools", "filesystem"]
 
 [dependencies]
 metrics = { workspace = true }
+num_cpus = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "full"] }
 tracing = { workspace = true }
 

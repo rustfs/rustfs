@@ -46,12 +46,19 @@
 //! let mut buffer = pool.acquire_buffer(8192).await;
 //! ```
 
+pub mod backpressure;
 pub mod bufreader_optimizer;
+pub mod config;
+pub mod deadlock_detector;
 pub mod direct_io;
+pub mod io_priority_queue;
 pub mod io_profile;
+pub mod lock_optimizer;
 pub mod pool;
 pub mod reader;
+pub mod scheduler;
 pub mod shared_memory;
+pub mod timeout_wrapper;
 pub mod writer;
 
 #[cfg(target_os = "linux")]
@@ -65,3 +72,27 @@ pub use bufreader_optimizer::{BufReaderConfig, BufReaderOptimizer, BufReaderStat
 
 // Shared memory exports
 pub use shared_memory::{ArcData, ArcMetadata, SharedMemoryConfig, SharedMemoryPool, SharedMemoryStats};
+
+// Config exports
+pub use config::{ConfigError, IoPriorityQueueConfig, IoSchedulerConfig};
+
+// Scheduler exports
+pub use scheduler::{
+    BandwidthTier, IoLoadLevel, IoLoadMetrics, IoPriority, IoScheduler, IoSchedulingContext, IoStrategy, KI_B, MI_B,
+    calculate_optimal_buffer_size, get_advanced_buffer_size, get_buffer_size_for_media, get_concurrency_aware_buffer_size,
+};
+
+// Priority queue exports
+pub use io_priority_queue::{IoPriorityQueue, IoQueueStatus, IoRequest};
+
+// Backpressure exports
+pub use backpressure::{BackpressureConfig, BackpressureError, BackpressureMonitor, BackpressureState};
+
+// Deadlock detector exports
+pub use deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig, LockInfo, LockType, WaitGraphEdge};
+
+// Lock optimizer exports
+pub use lock_optimizer::{LockGuard, LockOptimizeConfig, LockOptimizer, LockStats};
+
+// Timeout wrapper exports
+pub use timeout_wrapper::{OperationProgress, RequestTimeoutWrapper, TimeoutConfig, TimeoutError, TimeoutStats};

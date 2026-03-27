@@ -17,6 +17,18 @@
 //! This module provides optimized lock management for read operations,
 //! reducing lock contention by releasing locks early (after metadata read)
 //! rather than holding them for the entire data transfer duration.
+//!
+//! # Migration Note
+//!
+//! For new code, consider using `rustfs_io_core::LockOptimizer` which provides
+//! the same core functionality with better separation of concerns. This module
+//! remains for backward compatibility and storage-specific configuration.
+//!
+//! ```ignore
+//! // Recommended: Use io-core directly
+//! use rustfs_io_core::LockOptimizer;
+//! let optimizer = LockOptimizer::with_defaults();
+//! ```
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]

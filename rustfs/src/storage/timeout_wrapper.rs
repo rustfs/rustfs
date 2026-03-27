@@ -16,6 +16,25 @@
 //!
 //! This module provides timeout protection for GetObject requests to prevent
 //! indefinite hangs caused by deadlocks, resource exhaustion, or slow I/O.
+//!
+//! # Migration Note
+//!
+//! This module extends `rustfs_io_core::RequestTimeoutWrapper` with Tokio
+//! cancellation token support. For basic timeout handling without async
+//! cancellation, consider using the io-core version:
+//!
+//! ```ignore
+//! // Basic timeout handling
+//! use rustfs_io_core::RequestTimeoutWrapper;
+//! let wrapper = RequestTimeoutWrapper::new(config);
+//! ```
+//!
+//! # Key Features
+//!
+//! - Configurable request-level timeout (default 30 seconds)
+//! - Automatic cancellation of sub-tasks on timeout
+//! - Resource cleanup on timeout (locks, memory, file handles)
+//! - Prometheus metrics for timeout monitoring
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
