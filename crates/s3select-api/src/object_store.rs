@@ -249,12 +249,6 @@ impl ObjectStore for EcObjectStore {
         stream::once(ready(Err(unsupported_store_error("delete_stream")))).boxed()
     }
 
-    // async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-    //     info!("{:?}", location);
-    //     let opts = ObjectOptions::default();
-    //     let info = self
-    //         .store
-    //         .get_object_info(&self.input.bucket, &self.input.key, &opts)
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         stream::once(ready(Err(unsupported_store_error("list")))).boxed()
     }
