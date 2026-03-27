@@ -495,7 +495,7 @@ fn flatten_json_document_to_ndjson(bytes: &[u8], json_sub_path: Option<&str>) ->
     Ok(Bytes::from(output))
 }
 
-pub fn bytes_stream<S>(stream: S, content_length: usize) -> impl Stream<Item=Result<Bytes>> + Send + 'static
+pub fn bytes_stream<S>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes>> + Send + 'static
 where
     S: Stream<Item=Result<Bytes, std::io::Error>> + Send + 'static,
 {
