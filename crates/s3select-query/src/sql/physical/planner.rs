@@ -67,16 +67,6 @@ impl Default for DefaultPhysicalPlanner {
             // repartitioning and local sorting steps to meet distribution and ordering requirements.
             // Therefore, it should run before EnforceDistribution and EnforceSorting.
             Arc::new(JoinSelection::new()),
-            // The CoalesceBatches rule will not influence the distribution and ordering of the
-            // whole plan tree, so it should run last when enabled.
-            //
-            // NOTE: CoalesceBatches is intentionally disabled for s3select-query.
-            // Enabling it would change batch sizing behavior (which can affect memory
-            // usage and latency) compared to the current deployment, and we do not yet
-            // have dedicated benchmarks/regression tests for this service to validate
-            // those changes. Re‑enable (or replace with the DataFusion 53+ equivalent,
-            // if renamed) once its impact has been evaluated and covered by tests.
-            // Arc::new(CoalesceBatches::new()),
         ];
 
         Self {
