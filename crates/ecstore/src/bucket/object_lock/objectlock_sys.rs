@@ -52,6 +52,7 @@ pub fn is_retention_active(mode: &str, retain_until_date: Option<&s3s::dto::Date
 /// Check if retention modification is blocked for the given object.
 pub fn check_retention_for_modification(
     user_defined: &std::collections::HashMap<String, String>,
+    new_mode: Option<&str>,
     new_retain_until: Option<OffsetDateTime>,
     bypass_governance: bool,
 ) -> Option<ObjectLockBlockReason> {
@@ -67,6 +68,7 @@ pub fn check_retention_for_modification(
     }
 
     let existing_retain_until = retention.retain_until_date.as_ref().map(|d| OffsetDateTime::from(d.clone()));
+    let mode_changed = new_mode != Some(mode_str);
 
     // Check if new retention period is shorter than existing
     let is_shortening = match (&existing_retain_until, &new_retain_until) {
@@ -78,7 +80,7 @@ pub fn check_retention_for_modification(
     // COMPLIANCE mode: cannot shorten retention at all (even with bypass)
     // Can only extend the retention period
     if mode_str == ObjectLockRetentionMode::COMPLIANCE {
-        if is_shortening {
+        if mode_changed || is_shortening {
             return Some(ObjectLockBlockReason::Retention {
                 mode: mode_str.to_string(),
                 retain_until: existing_retain_until,
@@ -93,7 +95,7 @@ pub fn check_retention_for_modification(
     // - Extending retention: allowed without bypass permission
     // - Shortening/removing retention: requires bypass permission
     if mode_str == ObjectLockRetentionMode::GOVERNANCE {
-        if is_shortening && !bypass_governance {
+        if (mode_changed || is_shortening) && !bypass_governance {
             return Some(ObjectLockBlockReason::Retention {
                 mode: mode_str.to_string(),
                 retain_until: existing_retain_until,
@@ -380,7 +382,7 @@ mod tests {
         // No existing retention - modification should be allowed
         let user_defined = std::collections::HashMap::new();
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
-        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+        assert!(check_retention_for_modification(&user_defined, None, new_retain, false).is_none());
     }
 
     #[test]
@@ -398,7 +400,10 @@ mod tests {
 
         // Extending by another 30 days should be allowed
         let new_retain = Some(existing_retain + time::Duration::days(30));
-        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+        assert!(
+            check_retention_for_modification(&user_defined, Some(ObjectLockRetentionMode::COMPLIANCE), new_retain, false)
+                .is_none()
+        );
     }
 
     #[test]
@@ -416,7 +421,8 @@ mod tests {
 
         // Shortening to 30 days should be blocked
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
-        let result = check_retention_for_modification(&user_defined, new_retain, false);
+        let result =
+            check_retention_for_modification(&user_defined, Some(ObjectLockRetentionMode::COMPLIANCE), new_retain, false);
         assert!(result.is_some());
         assert!(matches!(result, Some(ObjectLockBlockReason::Retention { .. })));
     }
@@ -435,7 +441,7 @@ mod tests {
         );
 
         // Clearing (None) should be blocked
-        let result = check_retention_for_modification(&user_defined, None, false);
+        let result = check_retention_for_modification(&user_defined, None, None, false);
         assert!(result.is_some());
     }
 
@@ -454,7 +460,8 @@ mod tests {
 
         // Shortening from 30 days to 15 days without bypass should be blocked
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
-        let result = check_retention_for_modification(&user_defined, new_retain, false);
+        let result =
+            check_retention_for_modification(&user_defined, Some(ObjectLockRetentionMode::GOVERNANCE), new_retain, false);
         assert!(result.is_some());
     }
 
@@ -474,7 +481,10 @@ mod tests {
 
         // Extending from 30 days to 60 days without bypass should be allowed
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(60));
-        assert!(check_retention_for_modification(&user_defined, new_retain, false).is_none());
+        assert!(
+            check_retention_for_modification(&user_defined, Some(ObjectLockRetentionMode::GOVERNANCE), new_retain, false)
+                .is_none()
+        );
     }
 
     #[test]
@@ -492,7 +502,75 @@ mod tests {
 
         // Shortening from 30 days to 15 days with bypass should be allowed
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
-        assert!(check_retention_for_modification(&user_defined, new_retain, true).is_none());
+        assert!(
+            check_retention_for_modification(&user_defined, Some(ObjectLockRetentionMode::GOVERNANCE), new_retain, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_governance_mode_change_without_bypass() {
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        let result = check_retention_for_modification(
+            &user_defined,
+            Some(ObjectLockRetentionMode::COMPLIANCE),
+            Some(existing_retain),
+            false,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_governance_mode_change_with_bypass() {
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        assert!(
+            check_retention_for_modification(
+                &user_defined,
+                Some(ObjectLockRetentionMode::COMPLIANCE),
+                Some(existing_retain),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_check_retention_for_modification_compliance_mode_change() {
+        let mut user_defined = std::collections::HashMap::new();
+        let existing_retain = OffsetDateTime::now_utc() + time::Duration::days(30);
+        user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+        user_defined.insert(
+            "x-amz-object-lock-retain-until-date".to_string(),
+            existing_retain
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+
+        let result = check_retention_for_modification(
+            &user_defined,
+            Some(ObjectLockRetentionMode::GOVERNANCE),
+            Some(existing_retain),
+            true,
+        );
+        assert!(result.is_some());
     }
 
     #[test]
