@@ -132,6 +132,80 @@ fn read_msgp_time<R: std::io::Read>(rd: &mut R) -> Result<OffsetDateTime> {
     decode_msgp_time_payload(ext_type, &payload)
 }
 
+fn parse_legacy_uuid_bytes(bytes: &[u8], field: &str) -> Result<Option<Uuid>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    if bytes.len() != 16 {
+        return Err(Error::other(format!("legacy {field} must be 16 bytes, got {}", bytes.len())));
+    }
+
+    let id = Uuid::from_slice(bytes).map_err(Error::from)?;
+    Ok((!id.is_nil()).then_some(id))
+}
+
+fn parse_legacy_erasure_algo(value: &str) -> ErasureAlgo {
+    match value {
+        "ReedSolomon" => ErasureAlgo::ReedSolomon,
+        _ => ErasureAlgo::Invalid,
+    }
+}
+
+fn parse_legacy_checksum_algo(value: &str) -> ChecksumAlgo {
+    match value {
+        "HighwayHash" => ChecksumAlgo::HighwayHash,
+        _ => ChecksumAlgo::Invalid,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+enum LegacyMetaV2VersionType {
+    #[serde(rename = "Object")]
+    Object,
+    #[serde(rename = "Delete")]
+    Delete,
+    #[serde(rename = "DeleteMarker")]
+    DeleteMarker,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMetaV2Version {
+    version_type: LegacyMetaV2VersionType,
+    object: Option<LegacyMetaV2Object>,
+    delete_marker: Option<LegacyMetaV2DeleteMarker>,
+    write_version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMetaV2Object {
+    version_id: Vec<u8>,
+    data_dir: Vec<u8>,
+    erasure_algorithm: String,
+    erasure_m: usize,
+    erasure_n: usize,
+    erasure_block_size: usize,
+    erasure_index: usize,
+    erasure_dist: Vec<u8>,
+    bitrot_checksum_algo: String,
+    part_numbers: Vec<usize>,
+    part_etags: Vec<String>,
+    part_sizes: Vec<usize>,
+    part_actual_sizes: Vec<i64>,
+    part_indices: Vec<Vec<u8>>,
+    size: i64,
+    mod_time: Option<OffsetDateTime>,
+    meta_sys: HashMap<String, Vec<u8>>,
+    meta_user: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMetaV2DeleteMarker {
+    version_id: Vec<u8>,
+    mod_time: Option<OffsetDateTime>,
+    meta_sys: HashMap<String, Vec<u8>>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Eq, PartialOrd, Ord)]
 pub struct FileMetaShallowVersion {
     pub header: FileMetaVersionHeader,
@@ -234,10 +308,7 @@ impl FileMetaVersion {
 
     // decode_data_dir_from_meta reads data_dir from meta TODO: directly parse only data_dir from meta buf, msg.skip
     pub fn decode_data_dir_from_meta(buf: &[u8]) -> Result<Option<Uuid>> {
-        let mut ver = Self::default();
-        ver.decode_from(&mut std::io::Cursor::new(buf))?;
-        let data_dir = ver.object.map(|v| v.data_dir).unwrap_or_default();
-        Ok(data_dir)
+        Ok(Self::try_from(buf)?.get_data_dir())
     }
 
     pub fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
@@ -473,10 +544,39 @@ impl TryFrom<&[u8]> for FileMetaVersion {
             ver.uses_legacy_checksum = false;
             return Ok(ver);
         }
+
+        if let Ok(legacy_ver) = rmp_serde::from_slice::<LegacyMetaV2Version>(value) {
+            let mut ver = FileMetaVersion::try_from(legacy_ver)?;
+            ver.uses_legacy_checksum = true;
+            return Ok(ver);
+        }
+
         // Fallback for legacy ver_meta: rmp_serde format
         let mut ver: Self = rmp_serde::from_slice(value).map_err(Error::other)?;
         ver.uses_legacy_checksum = true;
         Ok(ver)
+    }
+}
+
+impl TryFrom<LegacyMetaV2Version> for FileMetaVersion {
+    type Error = Error;
+
+    fn try_from(value: LegacyMetaV2Version) -> std::result::Result<Self, Self::Error> {
+        let (version_type, object, delete_marker) = match value.version_type {
+            LegacyMetaV2VersionType::Object => (VersionType::Object, value.object.map(TryInto::try_into).transpose()?, None),
+            LegacyMetaV2VersionType::Delete | LegacyMetaV2VersionType::DeleteMarker => {
+                (VersionType::Delete, None, value.delete_marker.map(TryInto::try_into).transpose()?)
+            }
+        };
+
+        Ok(Self {
+            version_type,
+            legacy_object: None,
+            object,
+            delete_marker,
+            write_version: value.write_version,
+            uses_legacy_checksum: true,
+        })
     }
 }
 
@@ -863,6 +963,33 @@ pub struct MetaObject {
     pub meta_sys: HashMap<String, Vec<u8>>, // Object version internal metadata
     #[serde(rename = "MetaUsr")]
     pub meta_user: HashMap<String, String>, // Object version metadata set by user
+}
+
+impl TryFrom<LegacyMetaV2Object> for MetaObject {
+    type Error = Error;
+
+    fn try_from(value: LegacyMetaV2Object) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            version_id: parse_legacy_uuid_bytes(&value.version_id, "version_id")?,
+            data_dir: parse_legacy_uuid_bytes(&value.data_dir, "data_dir")?,
+            erasure_algorithm: parse_legacy_erasure_algo(&value.erasure_algorithm),
+            erasure_m: value.erasure_m,
+            erasure_n: value.erasure_n,
+            erasure_block_size: value.erasure_block_size,
+            erasure_index: value.erasure_index,
+            erasure_dist: value.erasure_dist,
+            bitrot_checksum_algo: parse_legacy_checksum_algo(&value.bitrot_checksum_algo),
+            part_numbers: value.part_numbers,
+            part_etags: value.part_etags,
+            part_sizes: value.part_sizes,
+            part_actual_sizes: value.part_actual_sizes,
+            part_indices: value.part_indices.into_iter().map(Bytes::from).collect(),
+            size: value.size,
+            mod_time: value.mod_time,
+            meta_sys: value.meta_sys,
+            meta_user: value.meta_user,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
@@ -2045,6 +2172,18 @@ pub struct MetaDeleteMarker {
     pub mod_time: Option<OffsetDateTime>, // Object delete marker modified time
     #[serde(rename = "MetaSys")]
     pub meta_sys: HashMap<String, Vec<u8>>, // Delete marker internal metadata
+}
+
+impl TryFrom<LegacyMetaV2DeleteMarker> for MetaDeleteMarker {
+    type Error = Error;
+
+    fn try_from(value: LegacyMetaV2DeleteMarker) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            version_id: parse_legacy_uuid_bytes(&value.version_id, "version_id")?,
+            mod_time: value.mod_time,
+            meta_sys: value.meta_sys,
+        })
+    }
 }
 
 impl MetaDeleteMarker {

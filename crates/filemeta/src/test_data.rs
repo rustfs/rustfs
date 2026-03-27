@@ -135,6 +135,16 @@ pub fn create_issue_2288_legacy_xlmeta() -> Result<Vec<u8>> {
     decode_hex_fixture(include_str!("../tests/fixtures/issue_2288_legacy_xlmeta.hex"))
 }
 
+/// Legacy xl.meta captured in issue #2265. Header/meta versions are 3/2.
+pub fn create_issue_2265_legacy_meta_v2_object_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_object.hex"))
+}
+
+/// Legacy config xl.meta captured in issue #2265. Header/meta versions are 3/2.
+pub fn create_issue_2265_legacy_meta_v2_config_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_config.hex"))
+}
+
 fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
     wr.push(MSGPACK_EXT8);
     wr.push(12);
