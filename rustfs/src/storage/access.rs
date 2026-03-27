@@ -1198,6 +1198,13 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
     }
 
+    async fn list_objects_v2m(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+    }
+
     /// Checks whether the ListParts request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.

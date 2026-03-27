@@ -44,7 +44,8 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListOperations, MakeBucketOptions, ObjectInfo,
+    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+    MakeBucketOptions, ObjectInfo,
 };
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -95,6 +96,18 @@ struct ListObjectVersionsMResponseContext {
     version_id_marker: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ListObjectsV2MResponseContext {
+    bucket: String,
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: i32,
+    encoding_type: Option<EncodingType>,
+    continuation_token: Option<String>,
+    start_after: Option<String>,
+    fetch_owner: bool,
+}
+
 fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
     if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
         encode(value).into_owned()
@@ -103,7 +116,19 @@ fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>)
     }
 }
 
-fn build_versions_user_metadata(user_defined: &HashMap<String, String>) -> Option<MinioUserMetadata> {
+fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
+    if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
+        value
+            .split('/')
+            .map(|part| encode(part).into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        value.to_string()
+    }
+}
+
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<MinioUserMetadata> {
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
@@ -118,8 +143,8 @@ fn build_versions_user_metadata(user_defined: &HashMap<String, String>) -> Optio
     }
 }
 
-async fn is_list_object_versions_metadata_action_allowed(
-    req: &S3Request<ListObjectVersionsInput>,
+async fn is_list_objects_metadata_action_allowed<T>(
+    req: &S3Request<T>,
     bucket: &str,
     object: &str,
     action: S3Action,
@@ -149,8 +174,8 @@ async fn is_list_object_versions_metadata_action_allowed(
     }
 }
 
-async fn collect_list_object_versions_m_permissions(
-    req: &S3Request<ListObjectVersionsInput>,
+async fn collect_list_objects_metadata_permissions<T>(
+    req: &S3Request<T>,
     bucket: &str,
     objects: &[ObjectInfo],
 ) -> S3Result<HashMap<String, ObjectMetadataPermissions>> {
@@ -162,9 +187,9 @@ async fn collect_list_object_versions_m_permissions(
         }
 
         let metadata_allowed =
-            is_list_object_versions_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectAction).await?;
+            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectAction).await?;
         let tags_allowed =
-            is_list_object_versions_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
+            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
 
         permissions.insert(
             object.name.clone(),
@@ -204,7 +229,7 @@ fn build_list_object_versions_m_output(
                 .unwrap_or_else(|| "null".to_string());
             let permission = permissions.get(&object.name).copied().unwrap_or_default();
             let user_metadata = if permission.metadata_allowed {
-                build_versions_user_metadata(&object.user_defined)
+                build_metadata_extension_user_metadata(&object.user_defined)
             } else {
                 None
             };
@@ -280,6 +305,87 @@ fn build_list_object_versions_m_output(
         request_charged: None,
         version_id_marker: Some(context.version_id_marker.clone().unwrap_or_default()),
         entries,
+    }
+}
+
+fn build_list_objects_v2m_output(
+    object_infos: ListObjectsV2Info,
+    context: &ListObjectsV2MResponseContext,
+    permissions: &HashMap<String, ObjectMetadataPermissions>,
+) -> ListObjectsV2MOutput {
+    let owner = rustfs_owner();
+
+    let contents = object_infos
+        .objects
+        .iter()
+        .filter(|object| !object.name.is_empty())
+        .map(|object| {
+            let permission = permissions.get(&object.name).copied().unwrap_or_default();
+            let user_metadata = if permission.metadata_allowed {
+                build_metadata_extension_user_metadata(&object.user_defined)
+            } else {
+                None
+            };
+            let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
+                Some(object.user_tags.clone())
+            } else {
+                None
+            };
+            let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
+                Some(ObjectInternalInfo {
+                    k: object.data_blocks as i32,
+                    m: object.parity_blocks as i32,
+                })
+            } else {
+                None
+            };
+
+            ObjectM {
+                key: Some(encode_list_objects_v2_value(&object.name, context.encoding_type.as_ref())),
+                last_modified: object.mod_time.map(Timestamp::from),
+                size: Some(object.get_actual_size().unwrap_or_default()),
+                e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                storage_class: Some(ObjectStorageClass::from(
+                    object
+                        .storage_class
+                        .clone()
+                        .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
+                )),
+                owner: context.fetch_owner.then_some(owner.clone()),
+                user_metadata,
+                user_tags,
+                internal,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let common_prefixes = object_infos
+        .prefixes
+        .into_iter()
+        .map(|prefix| CommonPrefix {
+            prefix: Some(encode_list_objects_v2_value(&prefix, context.encoding_type.as_ref())),
+        })
+        .collect::<Vec<_>>();
+
+    let key_count = (contents.len() + common_prefixes.len()) as i32;
+    let next_continuation_token = object_infos
+        .next_continuation_token
+        .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+
+    ListObjectsV2MOutput {
+        name: Some(context.bucket.clone()),
+        prefix: Some(context.prefix.clone()),
+        max_keys: Some(context.max_keys),
+        key_count: Some(key_count),
+        continuation_token: context.continuation_token.clone(),
+        is_truncated: Some(object_infos.is_truncated),
+        next_continuation_token,
+        contents: Some(contents),
+        common_prefixes: Some(common_prefixes),
+        delimiter: context.delimiter.clone(),
+        encoding_type: context.encoding_type.clone(),
+        start_after: context.start_after.clone(),
+        ..Default::default()
     }
 }
 
@@ -1671,6 +1777,87 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
+    pub async fn execute_list_objects_v2m(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let input = req.input.clone();
+        let ListObjectsV2Input {
+            bucket,
+            continuation_token,
+            delimiter,
+            encoding_type,
+            fetch_owner,
+            max_keys,
+            prefix,
+            start_after,
+            ..
+        } = input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+        if max_keys < 0 {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
+        }
+
+        let delimiter = delimiter.filter(|value| !value.is_empty());
+        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+
+        let response_start_after = start_after.clone();
+        let start_after_for_query = start_after.filter(|value| !value.is_empty());
+        let response_continuation_token = continuation_token.clone();
+        let continuation_token_for_query = continuation_token.filter(|value| !value.is_empty());
+
+        let decoded_continuation_token = continuation_token_for_query
+            .map(|token| {
+                base64_simd::STANDARD
+                    .decode_to_vec(token.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    })
+            })
+            .transpose()?;
+
+        let store = get_validated_store(&bucket).await?;
+        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+            .map(|value| value.as_ref() == "true")
+            .unwrap_or_default();
+
+        let object_infos = store
+            .list_objects_v2(
+                &bucket,
+                &prefix,
+                decoded_continuation_token,
+                delimiter.clone(),
+                max_keys,
+                fetch_owner.unwrap_or_default(),
+                start_after_for_query,
+                incl_deleted,
+            )
+            .await
+            .map_err(ApiError::from)?;
+
+        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
+        let context = ListObjectsV2MResponseContext {
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            encoding_type,
+            continuation_token: response_continuation_token,
+            start_after: response_start_after,
+            fetch_owner: fetch_owner.unwrap_or_default(),
+        };
+        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+
+        Ok(S3Response::new(output))
+    }
+
     pub async fn execute_list_object_versions(
         &self,
         req: S3Request<ListObjectVersionsInput>,
@@ -1797,7 +1984,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let permissions = collect_list_object_versions_m_permissions(&req, &bucket, &object_infos.objects).await?;
+        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
         let context = ListObjectVersionsMResponseContext {
             bucket,
             prefix,
@@ -2409,6 +2596,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_list_objects_v2m_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn build_list_objects_v2m_output_maps_metadata_and_key_count() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: true,
+            next_continuation_token: Some("next-token".to_string()),
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                parity_blocks: 2,
+                data_blocks: 4,
+                user_tags: "env=prod".to_string(),
+                etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+                ..Default::default()
+            }],
+            prefixes: vec!["logs/archive/".to_string()],
+            ..Default::default()
+        };
+
+        let permissions = HashMap::from([(
+            "logs/obj a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+
+        let context = ListObjectsV2MResponseContext {
+            bucket: "demo-bucket".to_string(),
+            prefix: "logs/".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: 1000,
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            continuation_token: Some("start token".to_string()),
+            start_after: Some("logs/start after".to_string()),
+            fetch_owner: true,
+        };
+
+        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs/"));
+        assert_eq!(output.continuation_token.as_deref(), Some("start token"));
+        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
+        assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
+        assert_eq!(output.key_count, Some(2));
+        assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.common_prefixes.as_ref().map(Vec::len), Some(1));
+
+        let object = output.contents.as_ref().unwrap().first().unwrap();
+        assert_eq!(object.key.as_deref(), Some("logs/obj%20a.txt"));
+        assert_eq!(object.user_tags.as_deref(), Some("env=prod"));
+        assert_eq!(object.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+        assert!(object.owner.is_some());
+        assert_eq!(
+            object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
+            Some(vec![MinioMetadataEntry {
+                key: "project".to_string(),
+                value: "alpha".to_string(),
+            }])
+        );
+
+        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
+    }
+
+    #[tokio::test]
     async fn execute_put_bucket_lifecycle_configuration_rejects_missing_configuration() {
         let input = PutBucketLifecycleConfigurationInput::builder()
             .bucket("test-bucket".to_string())
@@ -2511,6 +2782,21 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_list_objects_v2(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_v2m_rejects_negative_max_keys() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .max_keys(Some(-1))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }
