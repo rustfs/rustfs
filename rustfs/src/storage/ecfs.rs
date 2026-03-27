@@ -620,6 +620,13 @@ impl S3 for FS {
     }
 
     #[instrument(level = "debug", skip(self, req))]
+    async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_list_objects_v2m(req).await
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         record_s3_op(S3Operation::ListParts, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
