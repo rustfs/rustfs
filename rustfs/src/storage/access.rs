@@ -25,11 +25,12 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_policy::policy::{Args, BucketPolicyArgs};
+use rustfs_policy::policy::{Args, BucketPolicy, BucketPolicyArgs, bucket_policy_uses_existing_object_tag_conditions};
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use url::Url;
 
 #[derive(Default, Clone, Debug)]
@@ -64,7 +65,27 @@ fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ObjectTagConditions(pub HashMap<String, Vec<String>>);
+pub(crate) struct ObjectTagConditions {
+    bucket: String,
+    object: String,
+    version_id: Option<String>,
+    values: HashMap<String, Vec<String>>,
+}
+
+impl ObjectTagConditions {
+    fn new(bucket: &str, object: &str, version_id: Option<&str>, values: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: version_id.map(str::to_string),
+            values,
+        }
+    }
+
+    fn matches(&self, bucket: &str, object: &str, version_id: Option<&str>) -> bool {
+        self.bucket == bucket && self.object == object && self.version_id.as_deref() == version_id
+    }
+}
 
 const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
 
@@ -79,29 +100,51 @@ async fn bucket_policy_uses_existing_object_tag(bucket: &str) -> bool {
     let Ok((policy_str, _)) = metadata_sys::get_bucket_policy_raw(bucket).await else {
         return false;
     };
-    policy_str.contains("ExistingObjectTag")
+    bucket_policy_doc_uses_existing_object_tag(&policy_str)
 }
 
-impl FS {
-    /// Fetches object tags (when the bucket policy requires them) and wraps them
-    /// as `ObjectTagConditions`. Returns `AccessDenied` on transient storage
-    /// errors to avoid fail-open on Deny policies.
-    async fn fetch_tag_conditions(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<&str>,
-        op: &'static str,
-    ) -> S3Result<ObjectTagConditions> {
-        let tag_conditions = if bucket_policy_uses_existing_object_tag(bucket).await {
-            counter!("rustfs.object_tag_conditions.fetched", "op" => op).increment(1);
-            self.get_object_tag_conditions_for_policy(bucket, key, version_id).await?
-        } else {
-            counter!("rustfs.object_tag_conditions.skipped", "op" => op).increment(1);
-            HashMap::new()
-        };
-        Ok(ObjectTagConditions(tag_conditions))
+fn bucket_policy_doc_uses_existing_object_tag(policy_str: &str) -> bool {
+    // Fast path: avoid JSON parsing when the marker does not exist at all.
+    if !policy_str.contains("ExistingObjectTag") {
+        return false;
     }
+
+    let Ok(policy) = serde_json::from_str::<BucketPolicy>(policy_str) else {
+        // Keep previous fail-safe behavior for malformed policy JSON:
+        // marker present means we conservatively fetch tags.
+        return true;
+    };
+
+    bucket_policy_uses_existing_object_tag_conditions(&policy)
+}
+
+fn merge_object_tag_conditions(conditions: &mut HashMap<String, Vec<String>>, tags: &HashMap<String, Vec<String>>) {
+    for (k, v) in tags {
+        conditions
+            .entry(k.clone())
+            .and_modify(|existing| existing.extend(v.iter().cloned()))
+            .or_insert_with(|| v.clone());
+    }
+}
+
+fn action_tag_metric_label(action: &Action) -> &'static str {
+    match action {
+        Action::S3Action(S3Action::GetObjectAction) => "get_object",
+        Action::S3Action(S3Action::GetObjectAttributesAction) => "get_object_attributes",
+        Action::S3Action(S3Action::GetObjectVersionAction) => "get_object_version",
+        Action::S3Action(S3Action::GetObjectVersionAttributesAction) => "get_object_version_attributes",
+        Action::S3Action(S3Action::GetObjectTaggingAction) => "get_object_tagging",
+        Action::S3Action(S3Action::DeleteObjectAction) => "delete_object",
+        Action::S3Action(S3Action::DeleteObjectVersionAction) => "delete_object_version",
+        Action::S3Action(S3Action::DeleteObjectTaggingAction) => "delete_object_tagging",
+        Action::S3Action(S3Action::PutObjectTaggingAction) => "put_object_tagging",
+        _ => "authorize",
+    }
+}
+
+fn auth_fs() -> &'static FS {
+    static AUTH_FS: OnceLock<FS> = OnceLock::new();
+    AUTH_FS.get_or_init(FS::new)
 }
 
 /// Returns true when the owner (root or parent=root credentials) may bypass bucket policy
@@ -120,11 +163,14 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    let object_tag_conditions = req.extensions.get::<ObjectTagConditions>().cloned();
-
     let req_info = req_info_ref(req)?;
+    let cred = req_info.cred.clone();
+    let is_owner = req_info.is_owner;
+    let bucket = req_info.bucket.clone().unwrap_or_default();
+    let object = req_info.object.clone().unwrap_or_default();
+    let version_id = req_info.version_id.clone();
 
-    if let Some(cred) = &req_info.cred {
+    if let Some(cred) = &cred {
         let Ok(iam_store) = rustfs_iam::get() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
@@ -134,102 +180,131 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let mut conditions = get_condition_values_with_query(
-            &req.headers,
-            cred,
-            req_info.version_id.as_deref(),
-            None,
-            remote_addr,
-            req.uri.query(),
-        );
-        // Merge object tag conditions; extend existing values if the same key exists (e.g. from get_condition_values).
-        if let Some(ref tags) = object_tag_conditions {
-            for (k, v) in &tags.0 {
-                conditions
-                    .entry(k.clone())
-                    .and_modify(|existing| existing.extend(v.iter().cloned()))
-                    .or_insert_with(|| v.clone());
+        let mut conditions =
+            get_condition_values_with_query(&req.headers, cred, version_id.as_deref(), None, remote_addr, req.uri.query());
+
+        let action_args = Args {
+            account: &cred.access_key,
+            groups: &cred.groups,
+            action,
+            bucket: bucket.as_str(),
+            conditions: &conditions,
+            is_owner,
+            object: object.as_str(),
+            claims,
+            deny_only: false,
+        };
+        let prepared = iam_store.prepare_auth(&action_args).await;
+        let needs_tag_from_iam = prepared.needs_existing_object_tag;
+
+        let needs_tag_from_bucket =
+            !bucket.is_empty() && !object.is_empty() && bucket_policy_uses_existing_object_tag(&bucket).await;
+        let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
+        if needs_tag && !bucket.is_empty() && !object.is_empty() {
+            let mut tag_conditions = None;
+            if let Some(cached) = req.extensions.get::<ObjectTagConditions>()
+                && cached.matches(&bucket, &object, version_id.as_deref())
+            {
+                tag_conditions = Some(cached.values.clone());
             }
+
+            if tag_conditions.is_none() {
+                counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
+                let fetched = auth_fs()
+                    .get_object_tag_conditions_for_policy(&bucket, &object, version_id.as_deref())
+                    .await?;
+                req.extensions
+                    .insert(ObjectTagConditions::new(&bucket, &object, version_id.as_deref(), fetched.clone()));
+                tag_conditions = Some(fetched);
+            }
+
+            if let Some(tags) = tag_conditions {
+                merge_object_tag_conditions(&mut conditions, &tags);
+            }
+        } else {
+            counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
         }
-        let bucket_name = req_info.bucket.as_deref().unwrap_or("");
+        let bucket_name = bucket.as_str();
 
         // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
         // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
         // Here "owner" means root or credentials whose parent_user is root (e.g. Console admin via STS).
-        let owner_can_bypass_deny = owner_can_bypass_policy_deny(req_info.is_owner, &action);
+        let owner_can_bypass_deny = owner_can_bypass_policy_deny(is_owner, &action);
         if !bucket_name.is_empty()
             && !owner_can_bypass_deny
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so IAM fallback can still grant access.
+                // Early explicit-deny gate for bucket policy: use owner short-circuit path so
+                // deny statements are enforced before IAM/bucket allow fallback evaluation.
                 is_owner: true,
                 account: &cred.access_key,
                 groups: &cred.groups,
                 conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
+                object: object.as_str(),
             })
             .await
         {
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
 
-        if action == Action::S3Action(S3Action::DeleteObjectAction)
-            && req_info.version_id.is_some()
-            && !iam_store
-                .is_allowed(&Args {
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    action: Action::S3Action(S3Action::DeleteObjectVersionAction),
-                    bucket: req_info.bucket.as_deref().unwrap_or(""),
-                    conditions: &conditions,
-                    is_owner: req_info.is_owner,
-                    object: req_info.object.as_deref().unwrap_or(""),
-                    claims,
-                    deny_only: false,
-                })
-                .await
-            && !PolicySys::is_allowed(&BucketPolicyArgs {
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
-                action: Action::S3Action(S3Action::DeleteObjectVersionAction),
-                is_owner: req_info.is_owner,
+        if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
+            let delete_version_args = Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
+                action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                bucket: bucket.as_str(),
                 conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
-            })
-            .await
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+                is_owner,
+                object: object.as_str(),
+                claims,
+                deny_only: false,
+            };
+            let delete_version_allowed = iam_store.eval_prepared(&prepared, &delete_version_args).await;
+            if !delete_version_allowed
+                && !PolicySys::is_allowed(&BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                    is_owner,
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                })
+                .await
+            {
+                return Err(s3_error!(AccessDenied, "Access Denied"));
+            }
         }
 
-        let iam_allowed = iam_store
-            .is_allowed(&Args {
+        let iam_allowed = {
+            let final_args = Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
                 action,
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                bucket: bucket.as_str(),
                 conditions: &conditions,
-                is_owner: req_info.is_owner,
-                object: req_info.object.as_deref().unwrap_or(""),
+                is_owner,
+                object: object.as_str(),
                 claims,
                 deny_only: false,
-            })
-            .await;
+            };
+            iam_store.eval_prepared(&prepared, &final_args).await
+        };
 
         if iam_allowed {
             return Ok(());
         }
 
         let policy_allowed_fallback = PolicySys::is_allowed(&BucketPolicyArgs {
-            bucket: req_info.bucket.as_deref().unwrap_or(""),
+            bucket: bucket.as_str(),
             action,
-            is_owner: req_info.is_owner,
+            is_owner,
             account: &cred.access_key,
             groups: &cred.groups,
             conditions: &conditions,
-            object: req_info.object.as_deref().unwrap_or(""),
+            object: object.as_str(),
         })
         .await;
 
@@ -238,31 +313,30 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action == Action::S3Action(S3Action::ListBucketVersionsAction) {
-            if iam_store
-                .is_allowed(&Args {
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    action: Action::S3Action(S3Action::ListBucketAction),
-                    bucket: req_info.bucket.as_deref().unwrap_or(""),
-                    conditions: &conditions,
-                    is_owner: req_info.is_owner,
-                    object: req_info.object.as_deref().unwrap_or(""),
-                    claims,
-                    deny_only: false,
-                })
-                .await
-            {
+            let list_bucket_args = Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::S3Action(S3Action::ListBucketAction),
+                bucket: bucket.as_str(),
+                conditions: &conditions,
+                is_owner,
+                object: object.as_str(),
+                claims,
+                deny_only: false,
+            };
+            let list_bucket_allowed = iam_store.eval_prepared(&prepared, &list_bucket_args).await;
+            if list_bucket_allowed {
                 return Ok(());
             }
 
             if PolicySys::is_allowed(&BucketPolicyArgs {
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                bucket: bucket.as_str(),
                 action: Action::S3Action(S3Action::ListBucketAction),
-                is_owner: req_info.is_owner,
+                is_owner,
                 account: &cred.access_key,
                 groups: &cred.groups,
                 conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
+                object: object.as_str(),
             })
             .await
             {
@@ -270,35 +344,52 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             }
         }
     } else {
+        let default_cred = rustfs_credentials::Credentials::default();
         let mut conditions = get_condition_values_with_query(
             &req.headers,
-            &rustfs_credentials::Credentials::default(),
-            req_info.version_id.as_deref(),
+            &default_cred,
+            version_id.as_deref(),
             req.region.clone(),
             remote_addr,
             req.uri.query(),
         );
-        // Merge object tag conditions; extend existing values if the same key exists.
-        if let Some(ref tags) = object_tag_conditions {
-            for (k, v) in &tags.0 {
-                conditions
-                    .entry(k.clone())
-                    .and_modify(|existing| existing.extend(v.iter().cloned()))
-                    .or_insert_with(|| v.clone());
+
+        let needs_tag_from_bucket =
+            !bucket.is_empty() && !object.is_empty() && bucket_policy_uses_existing_object_tag(&bucket).await;
+        if needs_tag_from_bucket {
+            let mut tag_conditions = None;
+            if let Some(cached) = req.extensions.get::<ObjectTagConditions>()
+                && cached.matches(&bucket, &object, version_id.as_deref())
+            {
+                tag_conditions = Some(cached.values.clone());
             }
+            if tag_conditions.is_none() {
+                counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
+                let fetched = auth_fs()
+                    .get_object_tag_conditions_for_policy(&bucket, &object, version_id.as_deref())
+                    .await?;
+                req.extensions
+                    .insert(ObjectTagConditions::new(&bucket, &object, version_id.as_deref(), fetched.clone()));
+                tag_conditions = Some(fetched);
+            }
+            if let Some(tags) = tag_conditions {
+                merge_object_tag_conditions(&mut conditions, &tags);
+            }
+        } else {
+            counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
         }
-        let bucket_name = req_info.bucket.as_deref().unwrap_or("");
+        let bucket_name = bucket.as_str();
 
         if !bucket_name.is_empty()
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so later policy checks are not bypassed.
+                // Early explicit-deny gate for bucket policy in anonymous path.
                 is_owner: true,
                 account: "",
                 groups: &None,
                 conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
+                object: object.as_str(),
             })
             .await
         {
@@ -307,13 +398,13 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
             let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
-                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                bucket: bucket.as_str(),
                 action,
                 is_owner: false,
                 account: "",
                 groups: &None,
                 conditions: &conditions,
-                object: req_info.object.as_deref().unwrap_or(""),
+                object: object.as_str(),
             })
             .await;
 
@@ -335,7 +426,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
             if action == Action::S3Action(S3Action::ListBucketVersionsAction)
                 && PolicySys::is_allowed(&BucketPolicyArgs {
-                    bucket: req_info.bucket.as_deref().unwrap_or(""),
+                    bucket: bucket.as_str(),
                     action: Action::S3Action(S3Action::ListBucketAction),
                     is_owner: false,
                     account: "",
@@ -412,20 +503,6 @@ fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()
 
 #[async_trait::async_trait]
 impl S3Access for FS {
-    // /// Checks whether the current request has accesses to the resources.
-    // ///
-    // /// This method is called before deserializing the operation input.
-    // ///
-    // /// By default, this method rejects all anonymous requests
-    // /// and returns [`AccessDenied`](crate::S3ErrorCode::AccessDenied) error.
-    // ///
-    // /// An access control provider can override this method to implement custom logic.
-    // ///
-    // /// Common fields in the context:
-    // /// + [`cx.credentials()`](S3AccessContext::credentials)
-    // /// + [`cx.s3_path()`](S3AccessContext::s3_path)
-    // /// + [`cx.s3_op().name()`](crate::S3Operation::name)
-    // /// + [`cx.extensions_mut()`](S3AccessContext::extensions_mut)
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // Upper layer has verified ak/sk
         // info!(
@@ -524,11 +601,6 @@ impl S3Access for FS {
             req_info.bucket = Some(src_bucket.clone());
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
-
-            let tag_conds = self
-                .fetch_tag_conditions(&src_bucket, &src_key, version_id.as_deref(), "copy_object_src")
-                .await?;
-            req.extensions.insert(tag_conds);
 
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
@@ -719,11 +791,6 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "delete_object")
-            .await?;
-        req.extensions.insert(tag_conds);
-
         authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -742,16 +809,6 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
-
-        let tag_conds = self
-            .fetch_tag_conditions(
-                &req.input.bucket,
-                &req.input.key,
-                req.input.version_id.as_deref(),
-                "delete_object_tagging",
-            )
-            .await?;
-        req.extensions.insert(tag_conds);
 
         authorize_request(req, Action::S3Action(S3Action::DeleteObjectTaggingAction)).await
     }
@@ -997,11 +1054,6 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "get_object")
-            .await?;
-        req.extensions.insert(tag_conds);
-
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
 
@@ -1025,16 +1077,6 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
-
-        let tag_conds = self
-            .fetch_tag_conditions(
-                &req.input.bucket,
-                &req.input.key,
-                req.input.version_id.as_deref(),
-                "get_object_attributes",
-            )
-            .await?;
-        req.extensions.insert(tag_conds);
 
         if req.input.version_id.is_some() {
             authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAttributesAction)).await?;
@@ -1090,11 +1132,6 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "get_object_tagging")
-            .await?;
-        req.extensions.insert(tag_conds);
-
         authorize_request(req, Action::S3Action(S3Action::GetObjectTaggingAction)).await
     }
 
@@ -1133,11 +1170,6 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
-
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "head_object")
-            .await?;
-        req.extensions.insert(tag_conds);
 
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
@@ -1523,11 +1555,6 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "put_object_tagging")
-            .await?;
-        req.extensions.insert(tag_conds);
-
         authorize_request(req, Action::S3Action(S3Action::PutObjectTaggingAction)).await
     }
 
@@ -1592,11 +1619,6 @@ impl S3Access for FS {
             req_info.bucket = Some(src_bucket.clone());
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
-
-            let tag_conds = self
-                .fetch_tag_conditions(&src_bucket, &src_key, version_id.as_deref(), "upload_part_copy_src")
-                .await?;
-            req.extensions.insert(tag_conds);
 
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
@@ -1729,10 +1751,10 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("ExistingObjectTag/security".to_string(), vec!["public".to_string()]);
         tags.insert("ExistingObjectTag/project".to_string(), vec!["webapp".to_string()]);
-        let object_tag_conditions = ObjectTagConditions(tags);
+        let object_tag_conditions = ObjectTagConditions::new("bucket", "object", None, tags);
         let mut conditions = HashMap::new();
         conditions.insert("delimiter".to_string(), vec!["/".to_string()]);
-        for (k, v) in &object_tag_conditions.0 {
+        for (k, v) in &object_tag_conditions.values {
             conditions.insert(k.clone(), v.clone());
         }
         assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["public".to_string()]));
@@ -1745,6 +1767,48 @@ mod tests {
     async fn test_bucket_policy_uses_existing_object_tag_no_policy() {
         let result = bucket_policy_uses_existing_object_tag("test-bucket-no-policy-xyz-absent").await;
         assert!(!result, "bucket with no policy should not use ExistingObjectTag");
+    }
+
+    #[test]
+    fn test_bucket_policy_doc_uses_existing_object_tag_matches_condition_keys_only() {
+        let condition_key_policy = r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#;
+        assert!(
+            bucket_policy_doc_uses_existing_object_tag(condition_key_policy),
+            "ExistingObjectTag in condition key must be detected"
+        );
+
+        let value_only_policy = r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
+  }]
+}"#;
+        assert!(
+            !bucket_policy_doc_uses_existing_object_tag(value_only_policy),
+            "ExistingObjectTag text in values should not trigger tag dependency"
+        );
+    }
+
+    #[test]
+    fn test_bucket_policy_doc_uses_existing_object_tag_malformed_fallback() {
+        let malformed_with_marker = r#"{"Version":"2012-10-17","Statement":[INVALID,"ExistingObjectTag"]}"#;
+        assert!(
+            bucket_policy_doc_uses_existing_object_tag(malformed_with_marker),
+            "malformed JSON with marker should conservatively require tag fetch"
+        );
     }
 
     /// Owner can bypass bucket policy Deny only for the three policy management APIs (per AWS S3).
