@@ -18,8 +18,9 @@
 //! efficient cross-task data passing without serialization.
 
 use std::ops::Deref;
-use std::sync::Arc;
+use std::convert::AsRef;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Shared memory pool configuration.
@@ -107,11 +108,6 @@ impl<T> ArcData<T> {
         }
     }
 
-    /// Get a reference to the wrapped data.
-    pub fn as_ref(&self) -> &T {
-        &self.inner
-    }
-
     /// Get the reference count.
     pub fn ref_count(&self) -> usize {
         Arc::strong_count(&self.inner)
@@ -130,6 +126,12 @@ impl<T> ArcData<T> {
     /// Get the size if known.
     pub fn size(&self) -> Option<usize> {
         self.metadata.size
+    }
+}
+
+impl<T> AsRef<T> for ArcData<T> {
+    fn as_ref(&self) -> &T {
+        &self.inner
     }
 }
 
@@ -202,9 +204,9 @@ impl SharedMemoryPool {
     ///
     /// This method creates a new ArcData that shares the underlying data
     /// without copying.
-    pub fn share<T>(&self, data: &ArcData<T>) -> &ArcData<T> {
+    pub fn share<'a, T>(&self, data: &'a ArcData<T>) -> &'a ArcData<T> {
         self.stats.total_shared_refs.fetch_add(1, Ordering::Relaxed);
-        data.clone()
+        data
     }
 
     /// Get the statistics for this pool.

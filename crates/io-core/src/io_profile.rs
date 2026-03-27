@@ -15,6 +15,7 @@
 //! I/O profile helpers for adaptive scheduling.
 
 use std::collections::VecDeque;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageMedia {
@@ -26,23 +27,26 @@ pub enum StorageMedia {
 
 impl StorageMedia {
     #[allow(dead_code)]
-    pub fn from_str(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "nvme" => Some(Self::Nvme),
-            "ssd" => Some(Self::Ssd),
-            "hdd" => Some(Self::Hdd),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Nvme => "nvme",
             Self::Ssd => "ssd",
             Self::Hdd => "hdd",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl FromStr for StorageMedia {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "nvme" => Ok(Self::Nvme),
+            "ssd" => Ok(Self::Ssd),
+            "hdd" => Ok(Self::Hdd),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(()),
         }
     }
 }
