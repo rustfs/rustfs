@@ -144,6 +144,10 @@ pub enum StorageError {
     DecommissionNotStarted,
     #[error("Decommission already running")]
     DecommissionAlreadyRunning,
+    #[error("Rebalance already running")]
+    RebalanceAlreadyRunning,
+    #[error("Operation canceled")]
+    OperationCanceled,
     #[error("No heal required")]
     NoHealRequired,
     #[error("DoneForNow")]
@@ -414,6 +418,8 @@ impl Clone for StorageError {
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled => StorageError::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
@@ -482,6 +488,8 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => 0x2E,
             StorageError::DoneForNow => 0x2F,
             StorageError::DecommissionAlreadyRunning => 0x30,
+            StorageError::RebalanceAlreadyRunning => 0x40,
+            StorageError::OperationCanceled => 0x41,
             StorageError::ErasureReadQuorum => 0x31,
             StorageError::ErasureWriteQuorum => 0x32,
             StorageError::NotFirstDisk => 0x33,
@@ -554,6 +562,8 @@ impl StorageError {
             0x2E => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
             0x2F => Some(StorageError::DoneForNow),
             0x30 => Some(StorageError::DecommissionAlreadyRunning),
+            0x40 => Some(StorageError::RebalanceAlreadyRunning),
+            0x41 => Some(StorageError::OperationCanceled),
             0x31 => Some(StorageError::ErasureReadQuorum),
             0x32 => Some(StorageError::ErasureWriteQuorum),
             0x33 => Some(StorageError::NotFirstDisk),
@@ -680,6 +690,22 @@ pub fn is_err_bucket_not_found(err: &Error) -> bool {
 
 pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
+}
+
+pub fn is_err_decommission_running(err: &Error) -> bool {
+    matches!(err, &StorageError::DecommissionAlreadyRunning)
+}
+
+pub fn is_err_rebalance_running(err: &Error) -> bool {
+    matches!(err, &StorageError::RebalanceAlreadyRunning)
+}
+
+pub fn is_err_operation_canceled(err: &Error) -> bool {
+    matches!(err, &StorageError::OperationCanceled)
+}
+
+pub fn is_err_not_initialized(err: &Error) -> bool {
+    err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
 }
 
 pub fn is_err_io(err: &Error) -> bool {
@@ -944,6 +970,8 @@ mod tests {
         assert_eq!(StorageError::VolumeExists.to_u32(), 0x05);
         assert_eq!(StorageError::FileNotFound.to_u32(), 0x06);
         assert_eq!(StorageError::DecommissionAlreadyRunning.to_u32(), 0x30);
+        assert_eq!(StorageError::RebalanceAlreadyRunning.to_u32(), 0x40);
+        assert_eq!(StorageError::OperationCanceled.to_u32(), 0x41);
     }
 
     #[test]
@@ -956,6 +984,8 @@ mod tests {
         assert!(matches!(StorageError::from_u32(0x03), Some(StorageError::DiskFull)));
         assert!(matches!(StorageError::from_u32(0x04), Some(StorageError::VolumeNotFound)));
         assert!(matches!(StorageError::from_u32(0x30), Some(StorageError::DecommissionAlreadyRunning)));
+        assert!(matches!(StorageError::from_u32(0x40), Some(StorageError::RebalanceAlreadyRunning)));
+        assert!(matches!(StorageError::from_u32(0x41), Some(StorageError::OperationCanceled)));
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());
@@ -978,6 +1008,20 @@ mod tests {
 
         let disk_error = StorageError::DiskFull;
         assert_ne!(bucket1, disk_error);
+    }
+
+    #[test]
+    fn test_error_running_state_helpers() {
+        assert!(is_err_decommission_running(&StorageError::DecommissionAlreadyRunning));
+        assert!(!is_err_decommission_running(&StorageError::RebalanceAlreadyRunning));
+
+        assert!(is_err_rebalance_running(&StorageError::RebalanceAlreadyRunning));
+        assert!(!is_err_rebalance_running(&StorageError::DecommissionAlreadyRunning));
+        assert!(is_err_operation_canceled(&StorageError::OperationCanceled));
+        assert!(!is_err_operation_canceled(&StorageError::RebalanceAlreadyRunning));
+        assert!(is_err_not_initialized(&StorageError::other("errServerNotInitialized")));
+        assert!(is_err_not_initialized(&StorageError::other("ServerNotInitialized")));
+        assert!(!is_err_not_initialized(&StorageError::DecommissionAlreadyRunning));
     }
 
     #[test]
@@ -1067,6 +1111,8 @@ mod tests {
             StorageError::BucketExists("test".to_string()),
             StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
             StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled,
         ];
 
         for original_error in test_errors {

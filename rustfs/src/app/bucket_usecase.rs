@@ -35,8 +35,10 @@ use rustfs_ecstore::bucket::{
         BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
+    object_lock::ObjectLockApi,
     policy_sys::PolicySys,
     utils::serialize,
+    versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
@@ -67,6 +69,32 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
 
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
+
+fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
+    config.suspended()
+        || config.exclude_folders.unwrap_or(false)
+        || config
+            .excluded_prefixes
+            .as_ref()
+            .is_some_and(|excluded_prefixes| !excluded_prefixes.is_empty())
+}
+
+async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConfiguration) -> S3Result<()> {
+    match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((object_lock_config, _)) => {
+            if object_lock_config.enabled() && versioning_configuration_has_object_lock_incompatible_settings(config) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidBucketState,
+                    "An Object Lock configuration is present on this bucket, versioning cannot be suspended.".to_string(),
+                ));
+            }
+        }
+        Err(StorageError::ConfigNotFound) => {}
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    Ok(())
 }
 
 fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
@@ -1357,6 +1385,8 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
+        validate_bucket_versioning_update(&bucket, &versioning_configuration).await?;
+
         let data = serialize_config(&versioning_configuration)?;
 
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
@@ -1627,6 +1657,16 @@ mod tests {
         let mut req = build_request(input, method);
         req.extensions.insert(req_info);
         req
+    }
+
+    #[test]
+    fn versioning_configuration_has_object_lock_incompatible_settings_rejects_suspended() {
+        let config = VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+            ..Default::default()
+        };
+
+        assert!(versioning_configuration_has_object_lock_incompatible_settings(&config));
     }
 
     #[test]
