@@ -46,13 +46,13 @@
 //! let mut buffer = pool.acquire_buffer(8192).await;
 //! ```
 
+pub mod bufreader_optimizer;
 pub mod direct_io;
+pub mod io_profile;
 pub mod pool;
 pub mod reader;
-pub mod writer;
-pub mod bufreader_optimizer;
 pub mod shared_memory;
-pub mod io_profile;
+pub mod writer;
 
 #[cfg(target_os = "linux")]
 pub use direct_io::{DirectIoError, DirectIoReader};
@@ -61,18 +61,7 @@ pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
 pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
 
 // BufReader optimizer exports
-pub use bufreader_optimizer::{
-    BufReaderOptimizer,
-    BufReaderConfig,
-    BufReaderStats,
-    BufferedSource,
-};
+pub use bufreader_optimizer::{BufReaderConfig, BufReaderOptimizer, BufReaderStats, BufferedSource};
 
 // Shared memory exports
-pub use shared_memory::{
-    SharedMemoryPool,
-    SharedMemoryConfig,
-    SharedMemoryStats,
-    ArcData,
-    ArcMetadata,
-};
+pub use shared_memory::{ArcData, ArcMetadata, SharedMemoryConfig, SharedMemoryPool, SharedMemoryStats};

@@ -39,8 +39,8 @@ impl Default for BufReaderConfig {
     fn default() -> Self {
         Self {
             max_layers: 2,
-            small_file_buffer: 8 * 1024,      // 8KB
-            large_file_buffer: 64 * 1024,     // 64KB
+            small_file_buffer: 8 * 1024,       // 8KB
+            large_file_buffer: 64 * 1024,      // 64KB
             large_file_threshold: 1024 * 1024, // 1MB
         }
     }
@@ -88,9 +88,7 @@ impl BufReaderOptimizer {
     /// is classified as a small or large file.
     pub fn optimal_buffer_size(&self, data_size: Option<usize>) -> usize {
         match data_size {
-            Some(size) if size >= self.config.large_file_threshold => {
-                self.config.large_file_buffer
-            }
+            Some(size) if size >= self.config.large_file_threshold => self.config.large_file_buffer,
             Some(_) => self.config.small_file_buffer,
             None => self.config.small_file_buffer,
         }
@@ -100,11 +98,7 @@ impl BufReaderOptimizer {
     ///
     /// This method applies the optimal buffer size based on the expected
     /// data size and tracks statistics.
-    pub fn optimize<R: tokio::io::AsyncRead + Unpin>(
-        &self,
-        reader: R,
-        data_size: Option<usize>,
-    ) -> tokio::io::BufReader<R> {
+    pub fn optimize<R: tokio::io::AsyncRead + Unpin>(&self, reader: R, data_size: Option<usize>) -> tokio::io::BufReader<R> {
         let buffer_size = self.optimal_buffer_size(data_size);
         self.stats.total_readers.fetch_add(1, Ordering::Relaxed);
         tokio::io::BufReader::with_capacity(buffer_size, reader)
@@ -140,10 +134,7 @@ impl BufReaderOptimizer {
     ///
     /// This method attempts to reduce the nesting depth of BufReader
     /// layers to improve performance.
-    pub fn eliminate_redundant_layers<R: tokio::io::AsyncRead + Unpin>(
-        &self,
-        reader: R,
-    ) -> R {
+    pub fn eliminate_redundant_layers<R: tokio::io::AsyncRead + Unpin>(&self, reader: R) -> R {
         // For now, just return the reader as-is
         // Future implementation could detect and unwrap nested BufReaders
         self.stats.eliminated_layers.fetch_add(0, Ordering::Relaxed);

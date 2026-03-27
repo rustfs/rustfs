@@ -18,8 +18,8 @@
 //! efficient cross-task data passing without serialization.
 
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Shared memory pool configuration.
@@ -39,7 +39,7 @@ impl Default for SharedMemoryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_pool_size: 100 * 1024 * 1024, // 100MB
+            max_pool_size: 100 * 1024 * 1024,  // 100MB
             max_object_size: 10 * 1024 * 1024, // 10MB
         }
     }

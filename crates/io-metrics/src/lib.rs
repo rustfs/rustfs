@@ -706,9 +706,9 @@ mod tests {
 // Zero-Copy Optimization Metrics (Phase 1 Extension)
 // ============================================================================
 
-pub mod metric_names;
 pub mod bandwidth;
 pub mod global_metrics;
+pub mod metric_names;
 
 pub use metric_names::zero_copy;
 
@@ -737,14 +737,11 @@ pub fn record_zero_copy_buffer_operation(operation: &str, size: usize) {
 /// which should be minimized in zero-copy paths.
 #[inline(always)]
 pub fn record_memory_copy(count: u32, size: usize) {
-    counter!(zero_copy::MEMORY_COPY_TOTAL)
-        .increment(count as u64);
+    counter!(zero_copy::MEMORY_COPY_TOTAL).increment(count as u64);
 
-    counter!(zero_copy::MEMORY_COPY_BYTES_TOTAL)
-        .increment(size as u64);
+    counter!(zero_copy::MEMORY_COPY_BYTES_TOTAL).increment(size as u64);
 
-    histogram!("rustfs_memory_copy_size_bytes")
-        .record(size as f64);
+    histogram!("rustfs_memory_copy_size_bytes").record(size as f64);
 }
 
 /// Record a shared reference operation.
@@ -766,11 +763,9 @@ pub fn record_shared_ref_operation(operation: &str) {
 /// adjustments.
 #[inline(always)]
 pub fn record_bufreader_optimization(layers_eliminated: u32, buffer_size: usize) {
-    counter!(zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL)
-        .increment(layers_eliminated as u64);
+    counter!(zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL).increment(layers_eliminated as u64);
 
-    histogram!(zero_copy::BUFREADER_BUFFER_SIZE_BYTES)
-        .record(buffer_size as f64);
+    histogram!(zero_copy::BUFREADER_BUFFER_SIZE_BYTES).record(buffer_size as f64);
 }
 
 /// Record Direct I/O operation.
@@ -800,19 +795,12 @@ pub fn record_direct_io_operation(operation: &str, size: usize, success: bool) {
 ///
 /// This function updates gauge metrics for overall zero-copy performance.
 #[inline(always)]
-pub fn update_zero_copy_performance_metrics(
-    copy_count: u32,
-    throughput_mbps: f64,
-    memory_saved: u64,
-) {
-    gauge!(zero_copy::AVG_COPY_COUNT)
-        .set(copy_count as f64);
+pub fn update_zero_copy_performance_metrics(copy_count: u32, throughput_mbps: f64, memory_saved: u64) {
+    gauge!(zero_copy::AVG_COPY_COUNT).set(copy_count as f64);
 
-    gauge!(zero_copy::THROUGHPUT_MBPS)
-        .set(throughput_mbps);
+    gauge!(zero_copy::THROUGHPUT_MBPS).set(throughput_mbps);
 
-    gauge!(zero_copy::MEMORY_SAVED_BYTES)
-        .set(memory_saved as f64);
+    gauge!(zero_copy::MEMORY_SAVED_BYTES).set(memory_saved as f64);
 }
 
 // ============================================================================
