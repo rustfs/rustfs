@@ -239,25 +239,6 @@ impl ObjectStore for EcObjectStore {
     //     let info = self
     //         .store
     //         .get_object_info(&self.input.bucket, &self.input.key, &opts)
-    //         .await
-    //         .map_err(|_| o_Error::NotFound {
-    //             path: format!("{}/{}", self.input.bucket, self.input.key),
-    //             source: "can not get object info".into(),
-    //         })?;
-    //
-    //     Ok(ObjectMeta {
-    //         location: location.clone(),
-    //         last_modified: Utc::now(),
-    //         size: info.size as u64,
-    //         e_tag: info.etag,
-    //         version: None,
-    //     })
-    // }
-
-    // async fn delete(&self, _location: &Path) -> Result<()> {
-    //     Err(unsupported_store_error("delete"))
-    // }
-
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         stream::once(ready(Err(unsupported_store_error("list")))).boxed()
     }
