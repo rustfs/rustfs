@@ -248,7 +248,7 @@ impl ObjectStore for EcObjectStore {
     }
 
     async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> Result<()> {
-        Err(unsupported_store_error("copy_if_not_exists"))
+        Err(unsupported_store_error("copy_opts"))
     }
 
     // async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
