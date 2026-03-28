@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
+use crate::server::RemoteAddr;
 use bytes::Bytes;
 use http::Uri;
 use hyper::{Method, StatusCode};
@@ -21,7 +24,10 @@ use matchit::Params;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
+use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
+use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use rustfs_utils::path::path_join;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -46,15 +52,7 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
         obj_prefix: params.get("prefix").map(|s| s.to_string()).unwrap_or_default(),
         ..Default::default()
     };
-    if hip.bucket.is_empty() && !hip.obj_prefix.is_empty() {
-        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
-    }
-    if is_reserved_or_invalid_bucket(&hip.bucket, false) {
-        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
-    }
-    if !is_valid_object_prefix(&hip.obj_prefix) {
-        return Err(s3_error!(InvalidRequest, "invalid object name"));
-    }
+    validate_heal_target(&hip.bucket, &hip.obj_prefix)?;
 
     if let Some(query) = uri.query() {
         let params: Vec<&str> = query.split('&').collect();
@@ -93,9 +91,29 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
     Ok(hip)
 }
 
+fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
+    if bucket.is_empty() && !obj_prefix.is_empty() {
+        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
+    }
+    if !bucket.is_empty() && is_reserved_or_invalid_bucket(bucket, false) {
+        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
+    }
+    if !is_valid_object_prefix(obj_prefix) {
+        return Err(s3_error!(InvalidRequest, "invalid object name"));
+    }
+
+    Ok(())
+}
+
 pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // Some APIs are only available in EC mode
     // if is_dist_erasure().await || is_erasure().await {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/").as_str(),
+        AdminOperation(&HealHandler {}),
+    )?;
+
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}").as_str(),
@@ -136,14 +154,36 @@ fn map_heal_response(result: Option<HealResp>) -> S3Result<(StatusCode, Vec<u8>)
     }
 }
 
+fn encode_background_heal_status(info: &BackgroundHealInfo) -> S3Result<Vec<u8>> {
+    serde_json::to_vec(info).map_err(|e| s3_error!(InternalError, "failed to serialize background heal status: {e}"))
+}
+
+async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    validate_admin_request(
+        &req.headers,
+        &cred,
+        owner,
+        false,
+        vec![Action::AdminAction(AdminAction::HealAdminAction)],
+        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+    )
+    .await
+}
+
 pub struct HealHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle HealHandler, req: {:?}, params: {:?}", req, params);
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-        info!("cred: {:?}", cred);
+        validate_heal_admin_request(&req).await?;
         let mut input = req.input;
         let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
@@ -258,22 +298,31 @@ pub struct BackgroundHealStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for BackgroundHealStatusHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle BackgroundHealStatusHandler");
+        validate_heal_admin_request(&req).await?;
 
-        Err(s3_error!(NotImplemented))
+        let Some(store) = new_object_layer_fn() else {
+            return Err(s3_error!(InternalError, "server not initialized"));
+        };
+
+        let info = read_background_heal_info(store).await;
+        let body = encode_background_heal_status(&info)?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(body))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::extract_heal_init_params;
-    use super::{HealResp, map_heal_response};
+    use super::{HealResp, encode_background_heal_status, map_heal_response, validate_heal_target};
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+    use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::S3ErrorCode;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -343,6 +392,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_extract_heal_init_params_allows_root_heal_target() {
+        let uri: Uri = "/rustfs/admin/v3/heal/".parse().expect("uri should parse");
+        let heal_opts = json!({
+            "recursive": false,
+            "dryRun": false,
+            "remove": false,
+            "recreate": false,
+            "scanMode": 1,
+            "updateParity": false,
+            "nolock": false
+        });
+
+        let mut router = Router::new();
+        router.insert("/rustfs/admin/v3/heal/", ()).expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/heal/").expect("route should match");
+
+        let parsed = extract_heal_init_params(
+            &Bytes::from(serde_json::to_vec(&heal_opts).expect("json should serialize")),
+            &uri,
+            matched.params,
+        )
+        .expect("root heal target should be accepted");
+
+        assert!(parsed.bucket.is_empty());
+        assert!(parsed.obj_prefix.is_empty());
+    }
+
+    #[test]
+    fn test_extract_heal_init_params_rejects_prefix_without_bucket() {
+        let err = validate_heal_target("", "prefix").expect_err("must reject empty bucket");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.to_string().contains("invalid bucket name"));
+    }
+
     #[ignore] // FIXME: failed in github actions - keeping original test
     #[test]
     fn test_decode() {
@@ -380,5 +464,21 @@ mod tests {
         let result = map_heal_response(rx.recv().await).expect("heal response should be successful");
         assert_eq!(result.0, StatusCode::OK);
         assert_eq!(result.1, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_encode_background_heal_status_uses_expected_shape() {
+        let info = BackgroundHealInfo {
+            bitrot_start_time: None,
+            bitrot_start_cycle: 42,
+            current_scan_mode: HealScanMode::Deep,
+        };
+
+        let encoded = encode_background_heal_status(&info).expect("background heal info should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
+
+        assert_eq!(json["bitrotStartCycle"], 42);
+        assert_eq!(json["currentScanMode"], 2);
+        assert!(json["bitrotStartTime"].is_null());
     }
 }
