@@ -1806,7 +1806,7 @@ mod tests {
             .expect("put object input should build");
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-amz-write-offset-bytes", http::HeaderValue::from_static("0"));
+        headers.insert(AMZ_WRITE_OFFSET_BYTES_HEADER, http::HeaderValue::from_static("0"));
 
         let mut req = S3Request {
             input,
