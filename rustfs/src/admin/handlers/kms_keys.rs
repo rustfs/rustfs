@@ -102,6 +102,13 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     params
 }
 
+fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
+    let query_params = extract_query_params(uri);
+    ["keyId", "key-id", "key"]
+        .into_iter()
+        .find_map(|name| query_params.get(name).filter(|value| !value.is_empty()).cloned())
+}
+
 fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
     resolve_kms_runtime_service_manager()
 }
@@ -247,8 +254,7 @@ impl Operation for DescribeKeyHandler {
         )
         .await?;
 
-        let query_params = extract_query_params(&req.uri);
-        let Some(key_id) = query_params.get("keyId") else {
+        let Some(key_id) = extract_key_id(&req.uri) else {
             return Err(s3_error!(InvalidRequest, "missing keyId parameter"));
         };
 
@@ -276,6 +282,24 @@ impl Operation for DescribeKeyHandler {
                 error!("Failed to describe KMS key {}: {}", key_id, e);
                 Err(s3_error!(InternalError, "failed to describe key: {}", e))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_key_id;
+    use http::Uri;
+
+    #[test]
+    fn test_extract_key_id_supports_minio_aliases() {
+        for (uri, expected) in [
+            ("/rustfs/admin/v3/kms/key/status?keyId=legacy-key", "legacy-key"),
+            ("/rustfs/admin/v3/kms/key/status?key-id=minio-key", "minio-key"),
+            ("/rustfs/admin/v3/kms/key/status?key=fallback-key", "fallback-key"),
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            assert_eq!(extract_key_id(&uri).as_deref(), Some(expected));
         }
     }
 }
