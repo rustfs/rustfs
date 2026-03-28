@@ -5126,6 +5126,51 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
     }
 
+    #[test]
+    fn validate_object_lock_configuration_rejects_missing_default_retention() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule { default_retention: None }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_zero_days() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(0),
+                    years: None,
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_too_many_years() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: None,
+                    years: Some(MAXIMUM_RETENTION_YEARS + 1),
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
     #[tokio::test]
     async fn execute_put_object_retention_returns_internal_error_when_store_uninitialized() {
         let input = PutObjectRetentionInput::builder()
