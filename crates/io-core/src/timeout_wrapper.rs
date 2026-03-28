@@ -109,6 +109,8 @@ pub struct OperationProgress {
     last_update: std::sync::Mutex<Instant>,
     /// Stale timeout.
     stale_timeout: Duration,
+    /// Start time for transfer rate calculation.
+    start_time: Instant,
 }
 
 impl OperationProgress {
@@ -119,6 +121,7 @@ impl OperationProgress {
             bytes_processed: AtomicU64::new(0),
             last_update: std::sync::Mutex::new(Instant::now()),
             stale_timeout,
+            start_time: Instant::now(),
         }
     }
 
@@ -170,6 +173,23 @@ impl OperationProgress {
             let processed = self.bytes_processed.load(Ordering::Relaxed);
             total.saturating_sub(processed)
         })
+    }
+
+    /// Calculate transfer rate in bytes per second.
+    ///
+    /// Returns 0 if no time has elapsed or no data transferred.
+    pub fn transfer_rate(&self) -> u64 {
+        let processed = self.bytes_processed.load(Ordering::Relaxed);
+        if processed == 0 {
+            return 0;
+        }
+
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            (processed as f64 / elapsed) as u64
+        } else {
+            0
+        }
     }
 }
 
@@ -335,6 +355,59 @@ impl TimeoutStats {
         self.timed_out.store(0, Ordering::Relaxed);
         self.total_wait_time_ns.store(0, Ordering::Relaxed);
         self.max_wait_time_ns.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Calculate adaptive timeout based on historical data and current conditions.
+///
+/// This function adjusts the timeout based on:
+/// - Historical transfer rate
+/// - Recent timeout count
+/// - Object size
+pub fn calculate_adaptive_timeout(
+    base_timeout: Duration,
+    historical_rate_bps: Option<u64>,
+    recent_timeout_count: u32,
+    object_size: u64,
+) -> Duration {
+    // If we have recent timeouts, increase timeout
+    let timeout_multiplier = if recent_timeout_count > 3 {
+        2.0 // Double timeout if many recent timeouts
+    } else if recent_timeout_count > 1 {
+        1.5 // 50% increase if some timeouts
+    } else {
+        1.0 // No adjustment
+    };
+
+    // If we have historical rate data, use it for estimation
+    let estimated_duration = if let Some(rate) = historical_rate_bps {
+        if rate > 0 {
+            let estimated_secs = (object_size as f64 / rate as f64) * 1.2; // 20% buffer
+            Duration::from_secs_f64(estimated_secs)
+        } else {
+            base_timeout
+        }
+    } else {
+        base_timeout
+    };
+
+    // Apply timeout multiplier but clamp to reasonable bounds
+    let adaptive_duration = Duration::from_secs_f64(estimated_duration.as_secs_f64() * timeout_multiplier);
+
+    // Clamp to 5 seconds minimum and 10 minutes maximum
+    adaptive_duration.clamp(Duration::from_secs(5), Duration::from_secs(600))
+}
+
+/// Estimate bytes per second transfer rate.
+///
+/// This is used for adaptive timeout calculation.
+pub fn estimate_bytes_per_second(object_size: u64, expected_duration: Duration) -> u64 {
+    let secs = expected_duration.as_secs_f64();
+    if secs > 0.0 {
+        (object_size as f64 / secs) as u64
+    } else {
+        // Return a reasonable default (1 MB/s)
+        1024 * 1024
     }
 }
 

@@ -69,6 +69,11 @@ use tracing::{debug, warn};
 #[cfg(feature = "metrics")]
 use metrics::{counter, histogram};
 
+// Re-export types from rustfs_io_core for convenience
+pub use rustfs_io_core::{
+    OperationProgress, TimeoutError, TimeoutStats, calculate_adaptive_timeout, estimate_bytes_per_second,
+};
+
 /// Timeout configuration for GetObject requests.
 #[derive(Debug, Clone)]
 pub struct TimeoutConfig {
@@ -207,66 +212,6 @@ pub struct TimeoutInfo {
     pub object_size: Option<u64>,
     /// Progress percentage (0-100)
     pub progress_percent: Option<f32>,
-}
-
-/// Progress tracking for long-running operations
-#[derive(Debug, Clone)]
-pub struct OperationProgress {
-    /// Start time
-    start_time: Instant,
-    /// Last progress update time
-    last_update: Instant,
-    /// Bytes transferred so far
-    bytes_transferred: u64,
-    /// Total object size (if known)
-    total_size: Option<u64>,
-    /// Stale timeout - if no progress for this duration, consider stuck
-    stale_timeout: Duration,
-}
-
-impl OperationProgress {
-    /// Create a new progress tracker
-    pub fn new(total_size: Option<u64>, stale_timeout: Duration) -> Self {
-        Self {
-            start_time: Instant::now(),
-            last_update: Instant::now(),
-            bytes_transferred: 0,
-            total_size,
-            stale_timeout,
-        }
-    }
-
-    /// Update progress with new bytes transferred
-    pub fn update(&mut self, bytes: u64) {
-        self.bytes_transferred = bytes;
-        self.last_update = Instant::now();
-    }
-
-    /// Check if progress is stale (no updates for stale_timeout)
-    pub fn is_stale(&self) -> bool {
-        self.last_update.elapsed() > self.stale_timeout
-    }
-
-    /// Get progress percentage (0-100)
-    pub fn progress_percent(&self) -> Option<f32> {
-        self.total_size.map(|total| {
-            if total == 0 {
-                100.0
-            } else {
-                (self.bytes_transferred as f32 / total as f32 * 100.0).min(100.0)
-            }
-        })
-    }
-
-    /// Get transfer rate in bytes per second
-    pub fn transfer_rate(&self) -> u64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            (self.bytes_transferred as f64 / elapsed) as u64
-        } else {
-            0
-        }
-    }
 }
 
 /// Result of a timed GetObject operation.
@@ -641,58 +586,6 @@ pub fn get_io_buffer_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE)
 }
 
-/// Calculate adaptive timeout based on historical performance
-///
-/// This function adjusts timeout based on:
-/// - Historical transfer rates
-/// - Recent timeout occurrences
-/// - System load indicators
-pub fn calculate_adaptive_timeout(
-    base_timeout: Duration,
-    historical_rate_bps: Option<u64>,
-    recent_timeout_count: u32,
-    object_size: u64,
-) -> Duration {
-    // If we have recent timeouts, increase timeout
-    let timeout_multiplier = if recent_timeout_count > 3 {
-        2.0 // Double timeout if many recent timeouts
-    } else if recent_timeout_count > 1 {
-        1.5 // 50% increase if some timeouts
-    } else {
-        1.0 // No adjustment
-    };
-
-    // If we have historical rate data, use it for estimation
-    let estimated_duration = if let Some(rate) = historical_rate_bps {
-        if rate > 0 {
-            let estimated_secs = (object_size as f64 / rate as f64) * 1.2; // 20% buffer
-            Duration::from_secs_f64(estimated_secs)
-        } else {
-            base_timeout
-        }
-    } else {
-        base_timeout
-    };
-
-    // Apply timeout multiplier but clamp to reasonable bounds
-    let adaptive_duration = Duration::from_secs_f64(estimated_duration.as_secs_f64() * timeout_multiplier);
-
-    // Clamp to 5 seconds minimum and 10 minutes maximum
-    adaptive_duration.max(Duration::from_secs(5)).min(Duration::from_secs(600))
-}
-
-/// Estimate bytes per second for timeout calculation
-///
-/// Uses a conservative estimate to avoid premature timeouts
-pub fn estimate_bytes_per_second(object_size: u64, expected_duration: Duration) -> u64 {
-    let secs = expected_duration.as_secs_f64();
-    if secs > 0.0 {
-        (object_size as f64 / secs) as u64
-    } else {
-        rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND
-    }
-}
-
 #[cfg(test)]
 mod adaptive_timeout_tests {
     use super::*;
@@ -931,25 +824,16 @@ mod tests {
     #[test]
     fn test_operation_progress_new() {
         let progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
-        assert_eq!(progress.bytes_transferred, 0);
-        assert_eq!(progress.total_size, Some(1000));
-        assert!(!progress.is_stale());
-    }
-
-    #[test]
-    fn test_operation_progress_update() {
-        let mut progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
-
+        assert_eq!(progress.current(), 0);
         progress.update(500);
-        assert_eq!(progress.bytes_transferred, 500);
+        assert_eq!(progress.current(), 500);
         assert!(!progress.is_stale());
 
         // Simulate time passing
         std::thread::sleep(Duration::from_millis(100));
         progress.update(1000);
-        assert_eq!(progress.bytes_transferred, 1000);
+        assert_eq!(progress.current(), 1000);
     }
-
     #[test]
     fn test_operation_progress_stale() {
         let mut progress = OperationProgress::new(Some(1000), Duration::from_millis(100));

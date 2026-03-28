@@ -95,4 +95,7 @@ pub use deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig, LockInfo, 
 pub use lock_optimizer::{LockGuard, LockOptimizeConfig, LockOptimizer, LockStats};
 
 // Timeout wrapper exports
-pub use timeout_wrapper::{OperationProgress, RequestTimeoutWrapper, TimeoutConfig, TimeoutError, TimeoutStats};
+pub use timeout_wrapper::{
+    OperationProgress, RequestTimeoutWrapper, TimeoutConfig, TimeoutError, TimeoutStats,
+    calculate_adaptive_timeout, estimate_bytes_per_second,
+};
