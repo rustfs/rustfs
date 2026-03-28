@@ -19,38 +19,55 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
     use std::error::Error;
-    use std::path::PathBuf;
-    use std::process::Command;
-    use tokio::fs;
+    use std::io::Cursor;
 
-    async fn build_test_archive(
-        env: &RustFSTestEnvironment,
-        archive_name: &str,
-    ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-        let source_dir = PathBuf::from(&env.temp_dir).join(format!("{archive_name}-src"));
-        let archive_path = PathBuf::from(&env.temp_dir).join(format!("{archive_name}.tar"));
+    async fn build_test_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
 
-        fs::create_dir_all(source_dir.join("dir")).await?;
-        fs::create_dir_all(source_dir.join("empty-dir")).await?;
-        fs::write(source_dir.join("dir/file.txt"), b"nested payload\n").await?;
-        fs::write(source_dir.join("root.txt"), b"root payload\n").await?;
-
-        let output = Command::new("tar")
-            .args([
-                "-cf",
-                archive_path.to_str().expect("archive path should be valid UTF-8"),
-                "-C",
-                source_dir.to_str().expect("source path should be valid UTF-8"),
-                "dir",
-                "empty-dir",
-                "root.txt",
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!("tar command failed: stderr='{}'", String::from_utf8_lossy(&output.stderr)).into());
+        for dir in ["dir/", "empty-dir/"] {
+            let mut header = tokio_tar::Header::new_gnu();
+            header.set_entry_type(tokio_tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, dir, Cursor::new(Vec::new())).await?;
         }
 
-        Ok(fs::read(archive_path).await?)
+        for (path, data) in [
+            ("dir/file.txt", b"nested payload\n".as_slice()),
+            ("root.txt", b"root payload\n".as_slice()),
+        ] {
+            let mut header = tokio_tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, Cursor::new(data)).await?;
+        }
+
+        Ok(builder.into_inner().await?.into_inner())
+    }
+
+    async fn build_archive_with_invalid_entry() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+
+        let mut valid_header = tokio_tar::Header::new_gnu();
+        valid_header.set_size(b"valid-body".len() as u64);
+        valid_header.set_mode(0o644);
+        valid_header.set_cksum();
+        builder
+            .append_data(&mut valid_header, "valid.txt", Cursor::new(b"valid-body".as_slice()))
+            .await?;
+
+        let long_name = format!("{}.txt", "a".repeat(1100));
+        let mut invalid_header = tokio_tar::Header::new_gnu();
+        invalid_header.set_size(b"ignored-body".len() as u64);
+        invalid_header.set_mode(0o644);
+        invalid_header.set_cksum();
+        builder
+            .append_data(&mut invalid_header, long_name, Cursor::new(b"ignored-body".as_slice()))
+            .await?;
+
+        Ok(builder.into_inner().await?.into_inner())
     }
 
     #[tokio::test]
@@ -63,7 +80,7 @@ mod tests {
 
         let client = env.create_s3_client();
         let bucket = "snowball-prefix-test";
-        let archive = build_test_archive(&env, "prefix").await?;
+        let archive = build_test_archive().await?;
 
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -100,7 +117,7 @@ mod tests {
 
         let client = env.create_s3_client();
         let bucket = "snowball-ignore-dirs-default";
-        let archive = build_test_archive(&env, "ignore-dirs").await?;
+        let archive = build_test_archive().await?;
 
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -124,6 +141,42 @@ mod tests {
             .expect_err("directory marker should be skipped when ignore-dirs=true");
         let service_err = err.into_service_error();
         assert_eq!(service_err.code(), Some("NotFound"));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snowball_auto_extract_ignores_invalid_entries_when_requested() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-ignore-errors";
+        let archive = build_archive_with_invalid_entry().await?;
+
+        client.create_bucket().bucket(bucket).send().await?;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Prefix", "tenant-c")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
+            .body(ByteStream::from(archive))
+            .send()
+            .await?;
+
+        let valid = client.get_object().bucket(bucket).key("tenant-c/valid.txt").send().await?;
+        assert_eq!(valid.body.collect().await?.into_bytes().as_ref(), b"valid-body");
+
+        let listed = client.list_objects_v2().bucket(bucket).prefix("tenant-c/").send().await?;
+        let keys: Vec<_> = listed.contents().iter().filter_map(|entry| entry.key()).collect();
+        assert_eq!(keys, vec!["tenant-c/valid.txt"]);
 
         env.stop_server();
         Ok(())

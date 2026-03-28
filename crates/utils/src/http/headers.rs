@@ -82,6 +82,8 @@ pub const AMZ_MINIO_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Minio-Snowball-Prefix";
 pub const AMZ_MINIO_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs";
 pub const AMZ_MINIO_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Errors";
 pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";
