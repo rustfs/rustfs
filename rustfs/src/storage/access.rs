@@ -1804,4 +1804,47 @@ mod tests {
 
         assert!(has_write_offset_bytes_header(&headers));
     }
+
+    #[tokio::test]
+    async fn put_object_rejects_write_offset_bytes_before_authorize_request() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("put object input should build");
+
+        let mut req = S3Request {
+            input,
+            method: Method::PUT,
+            uri: Uri::from_static("/test-bucket/test-key"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.headers
+            .insert("x-amz-write-offset-bytes", http::HeaderValue::from_static("0"));
+        req.extensions.insert(ReqInfo {
+            cred: Some(rustfs_credentials::Credentials::default()),
+            ..ReqInfo::default()
+        });
+
+        let err = FS::new()
+            .put_object(&mut req)
+            .await
+            .expect_err("write-offset-bytes requests should be rejected before authorization");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(
+            err.message(),
+            Some(ApiError::error_code_to_message(&S3ErrorCode::NotImplemented).as_str())
+        );
+
+        let req_info = req.extensions.get::<ReqInfo>().expect("req info should remain available");
+        assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(req_info.object.as_deref(), Some("test-key"));
+        assert_eq!(req_info.version_id, None);
+    }
 }
