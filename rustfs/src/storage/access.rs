@@ -1797,6 +1797,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn put_object_rejects_write_offset_bytes_before_authorization() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("put object input should build");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-write-offset-bytes", http::HeaderValue::from_static("0"));
+
+        let mut req = S3Request {
+            input,
+            method: Method::PUT,
+            uri: Uri::from_static("/test-bucket/test-key"),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.extensions.insert(ReqInfo::default());
+
+        let fs = FS::new();
+        let err = fs
+            .put_object(&mut req)
+            .await
+            .expect_err("write-offset-bytes requests should be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(
+            err.message(),
+            Some(ApiError::error_code_to_message(&S3ErrorCode::NotImplemented).as_str())
+        );
+
+        let req_info = req.extensions.get::<ReqInfo>().expect("request info should remain available");
+        assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(req_info.object.as_deref(), Some("test-key"));
+    }
+
     #[test]
     fn write_offset_bytes_header_detection_is_case_insensitive() {
         let mut headers = HeaderMap::new();
