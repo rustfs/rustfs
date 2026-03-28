@@ -77,6 +77,11 @@ pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 
 // AmzSnowballExtract will trigger unpacking of an archive content
 pub const AMZ_SNOWBALL_EXTRACT: &str = "X-Amz-Meta-Snowball-Auto-Extract";
+pub const AMZ_SNOWBALL_EXTRACT_ALT: &str = "X-Amz-Snowball-Auto-Extract";
+pub const AMZ_MINIO_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Minio-Snowball-Prefix";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Errors";
+pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
 
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";
