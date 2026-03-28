@@ -781,13 +781,6 @@ impl<T: Store> IamSys<T> {
         self.store.policy_db_get(name, groups).await
     }
 
-    /// Compatibility wrapper for STS authorization entry points.
-    /// The canonical evaluation path is `prepare_sts_auth + eval_prepared`.
-    pub async fn is_allowed_sts(&self, args: &Args<'_>, parent_user: &str) -> bool {
-        let prepared = self.prepare_sts_auth(args, parent_user).await;
-        self.eval_prepared(&prepared, args).await
-    }
-
     fn is_safe_claim_policy_name(policy: &str) -> bool {
         !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
@@ -914,7 +907,7 @@ impl<T: Store> IamSys<T> {
         }
     }
 
-    async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
+    pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
         let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
 
@@ -1492,7 +1485,8 @@ mod tests {
             deny_only: false,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             allowed,
             "STS temp credentials with no groups in args should still be allowed via parent user's group policy (readwrite)"
@@ -1533,7 +1527,8 @@ mod tests {
             deny_only: true,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             !allowed,
             "session policy Deny must be evaluated even when IAM policies are empty and deny_only is set"
@@ -1572,7 +1567,8 @@ mod tests {
             deny_only: true,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             allowed,
             "deny_only with no matching Deny in session policy should still allow self-service-style checks"
@@ -1605,7 +1601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_auth_eval_matches_is_allowed_for_parent_policy_fallback() {
+    async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
         let store = StsTestMockStore { empty_policies: false };
         let cache_manager = IamCache::new(store).await;
         let iam_sys = IamSys::new(cache_manager);
@@ -1625,10 +1621,11 @@ mod tests {
             deny_only: false,
         };
 
-        let legacy = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let sts_prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let sts_eval = iam_sys.eval_prepared(&sts_prepared, &args).await;
         let prepared = iam_sys.prepare_auth(&args).await;
         let eval = iam_sys.eval_prepared(&prepared, &args).await;
-        assert_eq!(legacy, eval, "prepared auth evaluation must match current STS behavior");
+        assert_eq!(sts_eval, eval, "prepare_auth must match explicit STS preparation for this identity");
     }
 
     #[tokio::test]
