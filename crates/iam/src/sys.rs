@@ -1801,10 +1801,7 @@ mod tests {
         let service_account_access_key = "svc-inherited-tag-hint-test-user";
         let parent_user = "sts-fallback-test-parent";
         let mut service_account_claims = HashMap::new();
-        service_account_claims.insert(
-            iam_policy_claim_name_sa(),
-            Value::String(INHERITED_POLICY_TYPE.to_string()),
-        );
+        service_account_claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
         let service_identity = UserIdentity::from(Credentials {
             access_key: service_account_access_key.to_string(),
             secret_key: "longenoughsecret".to_string(),
@@ -1822,10 +1819,7 @@ mod tests {
 
         let mut request_claims = HashMap::new();
         request_claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
-        request_claims.insert(
-            iam_policy_claim_name_sa(),
-            Value::String(INHERITED_POLICY_TYPE.to_string()),
-        );
+        request_claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
         request_claims.insert(
             SESSION_POLICY_NAME_EXTRACTED.to_string(),
             Value::String(
