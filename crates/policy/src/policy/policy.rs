@@ -272,6 +272,39 @@ pub fn iam_policy_claim_name_sa() -> String {
     rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string()
 }
 
+#[inline]
+pub fn is_existing_object_tag_condition_key(key: &str) -> bool {
+    matches!(key, "ExistingObjectTag" | "s3:ExistingObjectTag")
+        || key.starts_with("ExistingObjectTag/")
+        || key.starts_with("s3:ExistingObjectTag/")
+}
+
+pub fn value_uses_existing_object_tag_condition_key(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj
+            .iter()
+            .any(|(key, value)| is_existing_object_tag_condition_key(key) || value_uses_existing_object_tag_condition_key(value)),
+        Value::Array(items) => items.iter().any(value_uses_existing_object_tag_condition_key),
+        _ => false,
+    }
+}
+
+pub fn policy_uses_existing_object_tag_conditions(policy: &Policy) -> bool {
+    policy.statements.iter().any(|statement| {
+        serde_json::to_value(&statement.conditions)
+            .map(|v| value_uses_existing_object_tag_condition_key(&v))
+            .unwrap_or(false)
+    })
+}
+
+pub fn bucket_policy_uses_existing_object_tag_conditions(policy: &BucketPolicy) -> bool {
+    policy.statements.iter().any(|statement| {
+        serde_json::to_value(&statement.conditions)
+            .map(|v| value_uses_existing_object_tag_condition_key(&v))
+            .unwrap_or(false)
+    })
+}
+
 pub mod default {
     use std::{collections::HashSet, sync::LazyLock};
 
@@ -1229,6 +1262,61 @@ mod test {
         assert_eq!(parsed["Version"], "2012-10-17");
         assert_eq!(statement["Effect"], "Allow");
         assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_existing_object_tag_condition_helpers() {
+        let identity_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with ExistingObjectTag key should parse");
+        assert!(
+            policy_uses_existing_object_tag_conditions(&identity_policy),
+            "identity policy ExistingObjectTag key should be detected"
+        );
+
+        let identity_value_only = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with value-only marker should parse");
+        assert!(
+            !policy_uses_existing_object_tag_conditions(&identity_value_only),
+            "value-only marker must not be treated as ExistingObjectTag condition key"
+        );
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("bucket policy with ExistingObjectTag key should parse");
+        assert!(
+            bucket_policy_uses_existing_object_tag_conditions(&bucket_policy),
+            "bucket policy ExistingObjectTag key should be detected"
+        );
     }
 
     #[test]
