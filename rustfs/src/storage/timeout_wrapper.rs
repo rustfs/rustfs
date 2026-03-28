@@ -70,9 +70,6 @@ use tracing::{debug, warn};
 use metrics::{counter, histogram};
 
 // Re-export types from rustfs_io_core for convenience
-pub use rustfs_io_core::{
-    OperationProgress, TimeoutError, TimeoutStats, calculate_adaptive_timeout, estimate_bytes_per_second,
-};
 
 /// Timeout configuration for GetObject requests.
 #[derive(Debug, Clone)]
@@ -344,7 +341,7 @@ impl RequestTimeoutWrapper {
     pub async fn execute_with_timeout<F, Fut, T, E>(self, operation: F) -> TimedGetObjectResult<T, E>
     where
         F: FnOnce(CancellationToken) -> Fut,
-        Fut: std::future::Future<Output = Result<T, E>>,
+        Fut: std::future::Future<Output=Result<T, E>>,
     {
         if !self.config.is_timeout_enabled() {
             // Timeout disabled, run without timeout
@@ -461,7 +458,7 @@ impl RequestTimeoutWrapper {
     ) -> TimedGetObjectResult<T, E>
     where
         F: FnOnce(CancellationToken) -> Fut,
-        Fut: std::future::Future<Output = Result<T, E>>,
+        Fut: std::future::Future<Output=Result<T, E>>,
     {
         let bucket = bucket.into();
         let key = key.into();
@@ -584,78 +581,6 @@ pub fn get_duplex_buffer_size() -> usize {
 /// Get the I/O buffer size from environment or default.
 pub fn get_io_buffer_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE)
-}
-
-#[cfg(test)]
-mod adaptive_timeout_tests {
-    use super::*;
-
-    #[test]
-    fn test_calculate_adaptive_timeout_basic() {
-        let base_timeout = Duration::from_secs(30);
-        let adaptive = calculate_adaptive_timeout(base_timeout, None, 0, 1024 * 1024);
-
-        // Should return base timeout when no historical data
-        assert_eq!(adaptive, base_timeout);
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_with_history() {
-        let base_timeout = Duration::from_secs(30);
-        let historical_rate = 2 * 1024 * 1024; // 2 MB/s
-        let object_size = 10 * 1024 * 1024; // 10 MB
-
-        let adaptive = calculate_adaptive_timeout(base_timeout, Some(historical_rate), 0, object_size);
-
-        // With 2 MB/s, 10 MB should take ~5 seconds + 20% buffer = 6 seconds
-        assert!(adaptive >= Duration::from_secs(5));
-        assert!(adaptive <= Duration::from_secs(10));
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_with_recent_timeouts() {
-        let base_timeout = Duration::from_secs(30);
-
-        // No timeouts
-        let adaptive1 = calculate_adaptive_timeout(base_timeout, None, 0, 1024 * 1024);
-        assert_eq!(adaptive1, base_timeout);
-
-        // Some timeouts (2 timeouts -> 1.5x multiplier -> 30 * 1.5 = 45 seconds)
-        let adaptive2 = calculate_adaptive_timeout(base_timeout, None, 2, 1024 * 1024);
-        assert!(adaptive2 > base_timeout);
-        assert!(adaptive2 <= Duration::from_secs(45)); // Changed from < to <=
-
-        // Many timeouts
-        let adaptive3 = calculate_adaptive_timeout(base_timeout, None, 5, 1024 * 1024);
-        assert!(adaptive3 >= base_timeout * 2);
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_clamping() {
-        let base_timeout = Duration::from_secs(1);
-        let adaptive = calculate_adaptive_timeout(base_timeout, None, 10, 1024 * 1024);
-
-        // Should clamp to minimum of 5 seconds
-        assert!(adaptive >= Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_estimate_bytes_per_second() {
-        let object_size = 10 * 1024 * 1024; // 10 MB
-        let duration = Duration::from_secs(10);
-
-        let bps = estimate_bytes_per_second(object_size, duration);
-        assert_eq!(bps, 1024 * 1024); // 1 MB/s
-    }
-
-    #[test]
-    fn test_estimate_bytes_per_second_zero_duration() {
-        let object_size = 1024;
-        let duration = Duration::from_secs(0);
-
-        let bps = estimate_bytes_per_second(object_size, duration);
-        assert_eq!(bps, rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND);
-    }
 }
 
 #[cfg(test)]
@@ -820,7 +745,7 @@ mod tests {
         assert_eq!(timeout1, config.get_object_timeout);
         assert_eq!(timeout2, config.get_object_timeout);
     }
-
+    use rustfs_concurrency::OperationProgress;
     #[test]
     fn test_operation_progress_new() {
         let progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
@@ -836,7 +761,7 @@ mod tests {
     }
     #[test]
     fn test_operation_progress_stale() {
-        let mut progress = OperationProgress::new(Some(1000), Duration::from_millis(100));
+        let progress = OperationProgress::new(Some(1000), Duration::from_millis(100));
 
         progress.update(500);
         assert!(!progress.is_stale());
@@ -856,7 +781,7 @@ mod tests {
 
         assert_eq!(progress.progress_percent(), Some(0.0));
 
-        let mut progress = progress;
+        let progress = progress;
         progress.update(500);
         assert_eq!(progress.progress_percent(), Some(50.0));
 

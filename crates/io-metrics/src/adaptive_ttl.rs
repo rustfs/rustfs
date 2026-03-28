@@ -29,30 +29,24 @@ use std::time::{Duration, Instant};
 /// * `adjusted_ttl` - Adjusted TTL in seconds
 #[inline(always)]
 pub fn record_ttl_adjustment(_key: &str, base_ttl: u64, adjusted_ttl: u64) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::{counter, gauge};
+    use metrics::{counter, gauge};
 
-        counter!("rustfs.cache.ttl.adjustments").increment(1);
-        gauge!("rustfs.cache.ttl.base").set(base_ttl as f64);
-        gauge!("rustfs.cache.ttl.adjusted").set(adjusted_ttl as f64);
+    counter!("rustfs.cache.ttl.adjustments").increment(1);
+    gauge!("rustfs.cache.ttl.base").set(base_ttl as f64);
+    gauge!("rustfs.cache.ttl.adjusted").set(adjusted_ttl as f64);
 
-        if adjusted_ttl > base_ttl {
-            counter!("rustfs.cache.ttl.extensions").increment(1);
-        } else if adjusted_ttl < base_ttl {
-            counter!("rustfs.cache.ttl.reductions").increment(1);
-        }
+    if adjusted_ttl > base_ttl {
+        counter!("rustfs.cache.ttl.extensions").increment(1);
+    } else if adjusted_ttl < base_ttl {
+        counter!("rustfs.cache.ttl.reductions").increment(1);
     }
 }
 
 /// Record TTL expiration.
 #[inline(always)]
 pub fn record_ttl_expiration() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.cache.ttl.expirations").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.cache.ttl.expirations").increment(1);
 }
 
 /// Record early eviction.
@@ -62,11 +56,8 @@ pub fn record_ttl_expiration() {
 /// * `reason` - Reason for early eviction
 #[inline(always)]
 pub fn record_early_eviction(reason: &str) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.cache.evictions.early", "reason" => reason.to_string()).increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.cache.evictions.early", "reason" => reason.to_string()).increment(1);
 }
 
 /// Record access pattern change.
@@ -77,11 +68,8 @@ pub fn record_early_eviction(reason: &str) {
 /// * `to` - New pattern
 #[inline(always)]
 pub fn record_access_pattern_change(from: &str, to: &str) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.cache.access_pattern.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.cache.access_pattern.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
 }
 
 /// Adaptive TTL statistics.
@@ -256,12 +244,12 @@ impl AccessTracker {
 
     /// Check if a key is "hot" (high access frequency).
     pub fn is_hot(&self, key: &str, threshold: u64) -> bool {
-        self.records.get(key).map_or(false, |r| r.count >= threshold)
+        self.records.get(key).is_some_and(|r| r.count >= threshold)
     }
 
     /// Check if a key is "cold" (low access frequency).
     pub fn is_cold(&self, key: &str, threshold: u64) -> bool {
-        self.records.get(key).map_or(true, |r| r.count <= threshold)
+        self.records.get(key).is_none_or(|r| r.count <= threshold)
     }
 
     /// Get keys sorted by access count (descending).

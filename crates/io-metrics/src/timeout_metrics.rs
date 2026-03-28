@@ -19,64 +19,46 @@ use std::time::Duration;
 /// Record timeout event.
 #[inline(always)]
 pub fn record_timeout_event(operation: &str) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.timeout.events", "operation" => operation.to_string()).increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.timeout.events", "operation" => operation.to_string()).increment(1);
 }
 
 /// Record operation duration.
 #[inline(always)]
 pub fn record_operation_duration(operation: &str, duration: Duration) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::histogram;
-        histogram!("rustfs.operation.duration.secs", "operation" => operation.to_string()).record(duration.as_secs_f64());
-    }
+    use metrics::histogram;
+    histogram!("rustfs.operation.duration.secs", "operation" => operation.to_string()).record(duration.as_secs_f64());
 }
 
 /// Record dynamic timeout calculation.
 #[inline(always)]
 pub fn record_dynamic_timeout(size_bytes: u64, timeout: Duration) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::{gauge, histogram};
-        gauge!("rustfs.timeout.dynamic.size").set(size_bytes as f64);
-        gauge!("rustfs.timeout.dynamic.secs").set(timeout.as_secs_f64());
-        histogram!("rustfs.timeout.dynamic.size.histogram").record(size_bytes as f64);
-    }
+    use metrics::{gauge, histogram};
+    gauge!("rustfs.timeout.dynamic.size").set(size_bytes as f64);
+    gauge!("rustfs.timeout.dynamic.secs").set(timeout.as_secs_f64());
+    histogram!("rustfs.timeout.dynamic.size.histogram").record(size_bytes as f64);
 }
 
 /// Record operation progress.
 #[inline(always)]
 pub fn record_operation_progress(operation: &str, percent: f64) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::gauge;
-        gauge!("rustfs.operation.progress", "operation" => operation.to_string()).set(percent);
-    }
+    use metrics::gauge;
+    gauge!("rustfs.operation.progress", "operation" => operation.to_string()).set(percent);
 }
 
 /// Record stalled operation.
 #[inline(always)]
 pub fn record_stalled_operation(operation: &str) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.operation.stalled", "operation" => operation.to_string()).increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.operation.stalled", "operation" => operation.to_string()).increment(1);
 }
 
 /// Record operation completion.
 #[inline(always)]
 pub fn record_operation_completion(operation: &str, success: bool) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        let status = if success { "success" } else { "failure" };
-        counter!("rustfs.operation.completions", "operation" => operation.to_string(), "status" => status).increment(1);
-    }
+    use metrics::counter;
+    let status = if success { "success" } else { "failure" };
+    counter!("rustfs.operation.completions", "operation" => operation.to_string(), "status" => status).increment(1);
 }
 
 /// Timeout statistics summary.

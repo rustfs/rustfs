@@ -17,51 +17,36 @@
 /// Record backpressure state change.
 #[inline(always)]
 pub fn record_backpressure_state_change(from: &str, to: &str) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.backpressure.state.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.backpressure.state.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
 }
 
 /// Record backpressure rejection.
 #[inline(always)]
 pub fn record_backpressure_rejection() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.backpressure.rejections").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.backpressure.rejections").increment(1);
 }
 
 /// Record concurrent operations count.
 #[inline(always)]
 pub fn record_concurrent_operations(count: usize) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::gauge;
-        gauge!("rustfs.backpressure.concurrent").set(count as f64);
-    }
+    use metrics::gauge;
+    gauge!("rustfs.backpressure.concurrent").set(count as f64);
 }
 
 /// Record backpressure activation.
 #[inline(always)]
 pub fn record_backpressure_activation() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.backpressure.activations").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.backpressure.activations").increment(1);
 }
 
 /// Record backpressure deactivation.
 #[inline(always)]
 pub fn record_backpressure_deactivation() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.backpressure.deactivations").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.backpressure.deactivations").increment(1);
 }
 
 #[cfg(test)]

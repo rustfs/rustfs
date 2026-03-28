@@ -90,8 +90,10 @@ pub enum BackpressureError {
 
 /// Backpressure state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum BackpressureState {
     /// Normal operation.
+    #[default]
     Normal,
     /// Warning: approaching high water mark.
     Warning,
@@ -99,11 +101,6 @@ pub enum BackpressureState {
     Critical,
 }
 
-impl Default for BackpressureState {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 impl BackpressureState {
     /// Get state as string.
@@ -225,14 +222,13 @@ impl BackpressureMonitor {
 
     /// Set the state.
     fn set_state(&self, new_state: BackpressureState) {
-        if let Ok(mut state) = self.state.lock() {
-            if *state != new_state {
+        if let Ok(mut state) = self.state.lock()
+            && *state != new_state {
                 *state = new_state;
                 if let Ok(mut last) = self.last_state_change.lock() {
                     *last = Some(Instant::now());
                 }
             }
-        }
     }
 
     /// Get total processed operations.
@@ -265,13 +261,11 @@ impl BackpressureMonitor {
         }
 
         // Check cooldown
-        if let Ok(last) = self.last_state_change.lock() {
-            if let Some(last_time) = *last {
-                if last_time.elapsed() < self.config.cooldown {
+        if let Ok(last) = self.last_state_change.lock()
+            && let Some(last_time) = *last
+                && last_time.elapsed() < self.config.cooldown {
                     return false;
                 }
-            }
-        }
 
         true
     }

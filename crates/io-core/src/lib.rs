@@ -96,6 +96,6 @@ pub use lock_optimizer::{LockGuard, LockOptimizeConfig, LockOptimizer, LockStats
 
 // Timeout wrapper exports
 pub use timeout_wrapper::{
-    OperationProgress, RequestTimeoutWrapper, TimeoutConfig, TimeoutError, TimeoutStats,
-    calculate_adaptive_timeout, estimate_bytes_per_second,
+    OperationProgress, RequestTimeoutWrapper, TimeoutConfig, TimeoutError, TimeoutStats, calculate_adaptive_timeout,
+    estimate_bytes_per_second,
 };

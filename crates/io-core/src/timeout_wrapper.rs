@@ -280,7 +280,7 @@ impl RequestTimeoutWrapper {
 
     /// Check if operation is stalled (no progress for a while).
     pub fn is_stalled(&self) -> bool {
-        self.progress.as_ref().map_or(false, |p| p.is_stale())
+        self.progress.as_ref().is_some_and(|p| p.is_stale())
     }
 
     /// Get progress percentage.

@@ -19,65 +19,47 @@ use std::time::Duration;
 /// Record lock optimization enabled.
 #[inline(always)]
 pub fn record_lock_optimization_enabled(enabled: bool) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::gauge;
-        gauge!("rustfs.lock.optimization.enabled").set(if enabled { 1.0 } else { 0.0 });
-    }
+    use metrics::gauge;
+    gauge!("rustfs.lock.optimization.enabled").set(if enabled { 1.0 } else { 0.0 });
 }
 
 /// Record spin attempt.
 #[inline(always)]
 pub fn record_spin_attempt(success: bool) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        if success {
-            counter!("rustfs.lock.spin.successes").increment(1);
-        } else {
-            counter!("rustfs.lock.spin.failures").increment(1);
-        }
+    use metrics::counter;
+    if success {
+        counter!("rustfs.lock.spin.successes").increment(1);
+    } else {
+        counter!("rustfs.lock.spin.failures").increment(1);
     }
 }
 
 /// Record adaptive spin count change.
 #[inline(always)]
 pub fn record_spin_count_change(new_count: usize) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::gauge;
-        gauge!("rustfs.lock.spin.count").set(new_count as f64);
-    }
+    use metrics::gauge;
+    gauge!("rustfs.lock.spin.count").set(new_count as f64);
 }
 
 /// Record lock hold time.
 #[inline(always)]
 pub fn record_lock_hold_time(hold_time: Duration) {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::histogram;
-        histogram!("rustfs.lock.hold_time.secs").record(hold_time.as_secs_f64());
-    }
+    use metrics::histogram;
+    histogram!("rustfs.lock.hold_time.secs").record(hold_time.as_secs_f64());
 }
 
 /// Record early release.
 #[inline(always)]
 pub fn record_early_release() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.lock.early_releases").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.lock.early_releases").increment(1);
 }
 
 /// Record contention event.
 #[inline(always)]
 pub fn record_contention_event() {
-    #[cfg(all(feature = "metrics", not(test)))]
-    {
-        use metrics::counter;
-        counter!("rustfs.lock.contentions").increment(1);
-    }
+    use metrics::counter;
+    counter!("rustfs.lock.contentions").increment(1);
 }
 
 /// Lock statistics summary.

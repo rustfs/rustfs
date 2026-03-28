@@ -166,39 +166,39 @@ impl IoPriorityQueue {
 
         if dequeue_high {
             let request = self.high.pop_front();
-            if let Some(_) = &request {
+            if request.is_some() {
                 self.last_dequeue[0] = Some(Instant::now());
                 self.stats[0].processed += 1;
             }
-            return request;
+            request
         } else if dequeue_normal {
             let request = self.normal.pop_front();
-            if let Some(_) = &request {
+            if request.is_some() {
                 self.last_dequeue[1] = Some(Instant::now());
                 self.stats[1].processed += 1;
             }
-            return request;
+            request
         } else if dequeue_low {
             let request = self.low.pop_front();
-            if let Some(_) = &request {
+            if request.is_some() {
                 self.last_dequeue[2] = Some(Instant::now());
                 self.stats[2].processed += 1;
             }
-            return request;
+            request
         } else if dequeue_high_fallback {
             let request = self.high.pop_front();
-            if let Some(_) = &request {
+            if request.is_some() {
                 self.last_dequeue[0] = Some(Instant::now());
                 self.stats[0].processed += 1;
             }
-            return request;
+            request
         } else if dequeue_normal_fallback {
             let request = self.normal.pop_front();
-            if let Some(_) = &request {
+            if request.is_some() {
                 self.last_dequeue[1] = Some(Instant::now());
                 self.stats[1].processed += 1;
             }
-            return request;
+            request
         } else {
             None
         }

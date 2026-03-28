@@ -40,9 +40,6 @@ pub mod manager;
 pub mod object_cache;
 pub mod request_guard;
 
-#[cfg(test)]
-mod api_compat_tests;
-
 // ============================================
 // Public API Re-exports
 // ============================================
@@ -50,8 +47,8 @@ mod api_compat_tests;
 // I/O scheduling types (from io_schedule.rs for backward compatibility)
 #[allow(unused_imports)]
 pub use io_schedule::{
-    IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
-    IoSchedulerConfig, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
+    get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue,
+    IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy, IO_PRIORITY_METRICS,
 };
 
 // Request tracking
@@ -71,60 +68,16 @@ pub use manager::ConcurrencyManager;
 // Re-export types from rustfs-io-core for convenience
 pub use rustfs_io_core::{
     // Backpressure types
-    BackpressureConfig,
     BackpressureMonitor,
-    BackpressureState,
-    BandwidthTier,
-    // Config types
-    ConfigError,
     // Deadlock detection types
     DeadlockDetector,
-    DeadlockDetectorConfig,
-    IoLoadMetrics,
-    IoPriorityQueueConfig as CorePriorityQueueConfig,
     // Scheduler types
     IoScheduler,
-    IoSchedulingContext,
-    // Buffer size functions
-    KI_B,
-    LockInfo,
-    LockOptimizeConfig,
     // Lock optimization types
     LockOptimizer,
-    LockStats,
-    LockType,
-    MI_B,
-    OperationProgress,
-    // Timeout types
-    RequestTimeoutWrapper,
-    TimeoutConfig,
-    TimeoutError,
-    TimeoutStats,
-    WaitGraphEdge,
-    calculate_optimal_buffer_size,
-    get_buffer_size_for_media,
 };
 
 // Re-export types from rustfs-io-metrics for convenience
-pub use rustfs_io_metrics::{
-    AccessRecord,
-    // Access tracking
-    AccessTracker as MetricsAccessTracker,
-    AdaptiveTTL,
-    AdaptiveTTLStats,
-    BackpressureSettings,
-    // Cache config types
-    CacheConfig,
-    CacheConfigError,
-    CacheSettings,
-    DeadlockDetectionSettings,
-    // Config settings
-    IoConfig,
-    IoSchedulerSettings,
-    // I/O metrics
-    IoSchedulerStats,
-    TimeoutSettings,
-};
 
 // ============================================
 // Helper Functions
