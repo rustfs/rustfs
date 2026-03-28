@@ -101,6 +101,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/background-heal/status"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));
+    assert_route(&router, Method::GET, &admin_path("/v3/tier/HOT"));
     assert_route(&router, Method::POST, &admin_path("/v3/tier/clear"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-bucket-quota"));
     assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
@@ -108,13 +109,19 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
+    assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/import-bucket-metadata"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/status"));
+    assert_route(&router, Method::GET, &admin_path("/v3/kms/key/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/keys/test-key"));
