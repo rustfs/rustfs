@@ -54,11 +54,10 @@ impl MetricDescriptor {
     /// Get the full metric name, including the prefix and formatting path
     #[allow(dead_code)]
     pub fn get_full_metric_name(&self) -> String {
-        let prefix = self.metric_type.as_prom();
         let namespace = self.namespace.as_str();
         let formatted_subsystem = self.subsystem.as_str();
 
-        format!("{}{}_{}_{}", prefix, namespace, formatted_subsystem, self.name.as_str())
+        format!("{}_{}_{}", namespace, formatted_subsystem, self.name.as_str())
     }
 
     /// check whether the label is in the label set
@@ -77,5 +76,38 @@ impl MetricDescriptor {
             self.label_set = Some(set);
         }
         self.label_set.as_ref().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_metric_name_uses_prometheus_convention_without_type_prefix() {
+        let descriptor = MetricDescriptor::new(
+            MetricName::ApiRequestsTotal,
+            MetricType::Counter,
+            "test help".to_string(),
+            vec![],
+            MetricNamespace::RustFS,
+            MetricSubsystem::ApiRequests,
+        );
+
+        assert_eq!(descriptor.get_full_metric_name(), "rustfs_api_requests_total");
+    }
+
+    #[test]
+    fn full_metric_name_formats_custom_subsystems_without_type_prefix() {
+        let descriptor = MetricDescriptor::new(
+            MetricName::Custom("latency_seconds".to_string()),
+            MetricType::Histogram,
+            "test help".to_string(),
+            vec![],
+            MetricNamespace::RustFS,
+            MetricSubsystem::new("/custom/path-metrics"),
+        );
+
+        assert_eq!(descriptor.get_full_metric_name(), "rustfs_custom_path_metrics_latency_seconds");
     }
 }

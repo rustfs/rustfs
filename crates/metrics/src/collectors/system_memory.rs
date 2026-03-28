@@ -122,7 +122,7 @@ mod tests {
         report_metrics(&metrics);
 
         assert_eq!(metrics.len(), 8);
-        assert!(metrics.iter().all(|m| m.name.starts_with("gauge.rustfs_system_memory_")));
+        assert!(metrics.iter().all(|m| m.name.starts_with("rustfs_system_memory_")));
     }
 
     #[test]

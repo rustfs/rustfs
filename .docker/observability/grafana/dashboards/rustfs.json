@@ -91,7 +91,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "gauge_rustfs_process_uptime_seconds{job=~\"$job\"}",
+          "expr": "rustfs_process_uptime_seconds{job=~\"$job\"}",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -223,7 +223,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(gauge_rustfs_cluster_buckets_total{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_buckets_total{job=~\"$job\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -289,7 +289,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(gauge_rustfs_cluster_objects_total{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_objects_total{job=~\"$job\"})",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -427,7 +427,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(gauge_rustfs_cluster_capacity_used_bytes{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"})",
           "legendFormat": "Used",
           "range": true,
           "refId": "A"
@@ -438,7 +438,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(gauge_rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
           "hide": false,
           "legendFormat": "Total",
           "range": true,
@@ -450,7 +450,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(gauge_rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(gauge_rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "Percent",
@@ -1971,7 +1971,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (gauge_rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "legendFormat": "{{drive}} (bytes)",
           "range": true,
           "refId": "A"
@@ -1982,7 +1982,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (gauge_rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(gauge_rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "{{drive}} (percent)",
@@ -2473,7 +2473,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (gauge_rustfs_process_cpu_usage{job=~\"$job\"})",
+          "expr": "sum by (job) (rustfs_process_cpu_usage{job=~\"$job\"})",
           "legendFormat": "{{job}}",
           "range": true,
           "refId": "A"
@@ -2572,7 +2572,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (gauge_rustfs_process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum by (job) (rustfs_process_resident_memory_bytes{job=~\"$job\"})",
           "legendFormat": "{{job}}",
           "range": true,
           "refId": "B"
@@ -2670,7 +2670,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(gauge_rustfs_process_network_io{job=~\"$job\", direction=\"received\"}[5m]))",
+          "expr": "sum by (job) (rate(rustfs_process_network_io{job=~\"$job\", direction=\"received\"}[5m]))",
           "legendFormat": "RX - {{job}}",
           "range": true,
           "refId": "C"
@@ -2681,7 +2681,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(gauge_rustfs_process_network_io{job=~\"$job\", direction=\"transmitted\"}[5m]))",
+          "expr": "sum by (job) (rate(rustfs_process_network_io{job=~\"$job\", direction=\"transmitted\"}[5m]))",
           "legendFormat": "TX - {{job}}",
           "range": true,
           "refId": "D"
