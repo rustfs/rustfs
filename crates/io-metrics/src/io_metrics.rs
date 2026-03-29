@@ -16,7 +16,6 @@
 //!
 //! This module provides metrics recording for I/O scheduler operations.
 
-
 /// Record I/O scheduler decision.
 ///
 /// # Arguments

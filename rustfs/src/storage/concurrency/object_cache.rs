@@ -316,12 +316,7 @@ impl TieredObjectCache {
         // Check L1 first
         if let Some(cached) = self.l1_cache.get(key).await {
             self.l1_hits.fetch_add(1, Ordering::Relaxed);
-
-            // Record L1 cache hit metric
-            #[cfg(all(feature = "metrics", not(test)))]
-            {
-                metrics::counter!("rustfs.cache.l1.hits").increment(1);
-            }
+            rustfs_io_metrics::record_tiered_cache_operation("l1", "hit", None);
 
             return Some(Arc::clone(&cached.data));
         }
@@ -329,12 +324,7 @@ impl TieredObjectCache {
         // Check L2
         if let Some(cached) = self.l2_cache.get(key).await {
             self.l2_hits.fetch_add(1, Ordering::Relaxed);
-
-            // Record L2 cache hit metric
-            #[cfg(all(feature = "metrics", not(test)))]
-            {
-                metrics::counter!("rustfs.cache.l2.hits").increment(1);
-            }
+            rustfs_io_metrics::record_tiered_cache_operation("l2", "hit", None);
 
             // Promote to L1 if appropriate
             if self.should_promote_to_l1(&cached).await {
@@ -346,12 +336,7 @@ impl TieredObjectCache {
 
         // Cache miss
         self.misses.fetch_add(1, Ordering::Relaxed);
-
-        // Record cache miss metric
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            metrics::counter!("rustfs.cache.misses").increment(1);
-        }
+        rustfs_io_metrics::record_tiered_cache_operation("overall", "miss", None);
 
         None
     }
@@ -532,29 +517,17 @@ impl TieredObjectCache {
     ///
     /// This method should be called periodically (e.g., every 10 seconds)
     /// to export current cache statistics as Prometheus metrics.
-    #[cfg(all(feature = "metrics", not(test)))]
     #[allow(dead_code)]
     pub async fn record_metrics(&self) {
-        use metrics::gauge;
-
         // Get stats
         let l1_stats = self.l1_stats().await;
         let l2_stats = self.l2_stats().await;
         let tiered_stats = self.stats().await;
 
-        // L1 cache metrics
-        gauge!("rustfs.cache.l1.size").set(l1_stats.size as f64);
-        gauge!("rustfs.cache.l1.entries").set(l1_stats.entries as f64);
-        gauge!("rustfs.cache.l1.size_ratio").set(l1_stats.size as f64 / l1_stats.max_size as f64);
-
-        // L2 cache metrics
-        gauge!("rustfs.cache.l2.size").set(l2_stats.size as f64);
-        gauge!("rustfs.cache.l2.entries").set(l2_stats.entries as f64);
-        gauge!("rustfs.cache.l2.size_ratio").set(l2_stats.size as f64 / l2_stats.max_size as f64);
-
-        // Combined metrics
-        gauge!("rustfs.cache.hit_rate").set(tiered_stats.hit_rate * 100.0);
-        gauge!("rustfs.cache.l1_hit_rate").set(tiered_stats.l1_hit_rate * 100.0);
+        rustfs_io_metrics::record_cache_size("l1", l1_stats.size, l1_stats.entries as u64);
+        rustfs_io_metrics::record_cache_size("l2", l2_stats.size, l2_stats.entries as u64);
+        rustfs_io_metrics::record_cache_hit_rate("overall", tiered_stats.hit_rate * 100.0);
+        rustfs_io_metrics::record_cache_hit_rate("l1", tiered_stats.l1_hit_rate * 100.0);
     }
 
     // ============================================
@@ -1390,22 +1363,13 @@ impl HotObjectCache {
                 // This HashMap grows unbounded with unique file access, causing memory
                 // leaks in RustFS itself (and also in downstream systems like Prometheus).
                 // Only use low cardinality labels like operation type or status.
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs.object.cache.hits").increment(1);
-                }
+                rustfs_io_metrics::record_tiered_cache_operation("hot", "hit", None);
 
                 Some(Arc::clone(&cached.data))
             }
             None => {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
-
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs.object.cache.misses").increment(1);
-                }
+                rustfs_io_metrics::record_tiered_cache_operation("hot", "miss", None);
 
                 None
             }
@@ -1432,15 +1396,8 @@ impl HotObjectCache {
         });
 
         self.cache.insert(key.clone(), cached_obj).await;
-
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::{counter, gauge};
-            counter!("rustfs.object.cache.insertions").increment(1);
-            gauge!("rustfs_object_cache_size_bytes").set(self.cache.weighted_size() as f64);
-
-            gauge!("rustfs_object_cache_entry_count").set(self.cache.entry_count() as f64);
-        }
+        rustfs_io_metrics::record_tiered_cache_operation("hot", "put", Some(size));
+        rustfs_io_metrics::record_cache_size("hot", self.cache.weighted_size() as usize, self.cache.entry_count());
     }
 
     /// Clear all cached objects
@@ -1651,22 +1608,13 @@ impl HotObjectCache {
                 // See HotObjectCache::get() for details. The metrics crate's internal
                 // HashMap grows unbounded with high cardinality labels, causing memory
                 // leaks in RustFS's own process.
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_response_cache_hits").increment(1);
-                }
+                rustfs_io_metrics::record_tiered_cache_operation("response", "hit", None);
 
                 Some(Arc::clone(&cached.data))
             }
             None => {
                 self.miss_count.fetch_add(1, Ordering::Relaxed);
-
-                #[cfg(all(feature = "metrics", not(test)))]
-                {
-                    use metrics::counter;
-                    counter!("rustfs_object_response_cache_misses").increment(1);
-                }
+                rustfs_io_metrics::record_tiered_cache_operation("response", "miss", None);
 
                 None
             }
@@ -1698,14 +1646,12 @@ impl HotObjectCache {
         });
 
         self.response_cache.insert(key.clone(), cached_internal).await;
-
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::{counter, gauge};
-            counter!("rustfs_object_response_cache_insertions").increment(1);
-            gauge!("rustfs_object_response_cache_size_bytes").set(self.response_cache.weighted_size() as f64);
-            gauge!("rustfs_object_response_cache_entry_count").set(self.response_cache.entry_count() as f64);
-        }
+        rustfs_io_metrics::record_tiered_cache_operation("response", "put", Some(size));
+        rustfs_io_metrics::record_cache_size(
+            "response",
+            self.response_cache.weighted_size() as usize,
+            self.response_cache.entry_count(),
+        );
     }
 
     /// Invalidate a cache entry for a specific object
@@ -1721,12 +1667,7 @@ impl HotObjectCache {
         // Invalidate both caches
         self.cache.invalidate(key).await;
         self.response_cache.invalidate(key).await;
-
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::counter;
-            counter!("rustfs_object_cache_invalidations_total").increment(1);
-        }
+        rustfs_io_metrics::record_tiered_cache_operation("overall", "evict", None);
     }
 
     /// Invalidate cache entries for an object and its latest version

@@ -47,8 +47,8 @@ pub mod request_guard;
 // I/O scheduling types (from io_schedule.rs for backward compatibility)
 #[allow(unused_imports)]
 pub use io_schedule::{
-    get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue,
-    IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy, IO_PRIORITY_METRICS,
+    IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
+    IoSchedulerConfig, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
 };
 
 // Request tracking
@@ -95,21 +95,25 @@ pub fn reset_active_get_requests() {
 }
 
 /// Create a new I/O scheduler with default configuration.
+#[allow(dead_code)]
 pub fn create_io_scheduler() -> IoScheduler {
     IoScheduler::with_defaults()
 }
 
 /// Create a new backpressure monitor with default configuration.
+#[allow(dead_code)]
 pub fn create_backpressure_monitor() -> BackpressureMonitor {
     BackpressureMonitor::with_defaults()
 }
 
 /// Create a new deadlock detector with default configuration.
+#[allow(dead_code)]
 pub fn create_deadlock_detector() -> DeadlockDetector {
     DeadlockDetector::with_defaults()
 }
 
 /// Create a new lock optimizer with default configuration.
+#[allow(dead_code)]
 pub fn create_lock_optimizer() -> LockOptimizer {
     LockOptimizer::with_defaults()
 }

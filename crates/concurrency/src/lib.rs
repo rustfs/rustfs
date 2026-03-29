@@ -45,27 +45,27 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use rustfs_concurrency::{ConcurrencyManager, ConcurrencyConfig};
+//! use rustfs_concurrency::{ConcurrencyConfig, ConcurrencyManager};
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! // Create manager with all features enabled
 //! let config = ConcurrencyConfig::default();
 //! let manager = ConcurrencyManager::new(config);
 //!
 //! // Start services
-//! # #[tokio::main]
-//! # async fn main() {
 //! manager.start().await;
 //!
 //! // Use timeout control (if enabled)
 //! if manager.is_timeout_enabled() {
 //!     let timeout_manager = manager.timeout();
-//!     // Use timeout...
+//!     let _ = timeout_manager;
 //! }
 //!
 //! // Use lock optimization (if enabled)
 //! if manager.is_lock_enabled() {
 //!     let lock_manager = manager.lock();
-//!     // Use lock optimization...
+//!     let _ = lock_manager;
 //! }
 //!
 //! // Stop services
@@ -146,7 +146,7 @@ pub use config::{ConcurrencyConfig, ConcurrencyFeatures};
 
 // Manager
 mod manager;
-pub use manager::ConcurrencyManager;
+pub use manager::{ConcurrencyManager, GetObjectCacheEligibility, GetObjectQueueSnapshot};
 
 // Prelude for convenient imports
 pub mod prelude {

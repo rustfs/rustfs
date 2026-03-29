@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::io_schedule::ACTIVE_GET_REQUESTS;
+use rustfs_io_metrics::{record_get_object_request_start, record_get_object_request_result};
 
 /// RAII guard for tracking active GetObject requests.
 #[derive(Debug)]
@@ -30,18 +31,20 @@ impl GetObjectGuard {
     pub fn new() -> Self {
         ACTIVE_GET_REQUESTS.fetch_add(1, Ordering::Relaxed);
 
-        #[cfg(all(feature = "metrics", not(test)))]
-        if !std::thread::panicking() {
-            use metrics::counter;
-            counter!("rustfs.get.object.requests.started").increment(1);
-        }
+        // Record metrics for a started GetObject request. Capture the
+        // concurrent request count AFTER increment to reflect the current
+        // active requests.
+        let concurrent = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+        record_get_object_request_start(concurrent);
 
-        Self {
-            start_time: Instant::now(),
-        }
+        Self { start_time: Instant::now() }
     }
 
     /// Get the elapsed time since this guard was created.
+    #[allow(dead_code)]
+    // This helper is primarily used by unit tests to assert timing.
+    // It's intentionally kept public for callers that may want to inspect
+    // a guard's duration without dropping it.
     pub fn elapsed(&self) -> std::time::Duration {
         self.start_time.elapsed()
     }
@@ -65,21 +68,22 @@ impl Default for GetObjectGuard {
 
 impl Drop for GetObjectGuard {
     fn drop(&mut self) {
-        if let Err(previous) =
-            ACTIVE_GET_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
-        {
+        // Record duration of this request before decrementing the global
+        // counter. This ensures `start_time` is actually used and the
+        // `elapsed()` method remains meaningful for tests and callers.
+        let duration_secs = self.start_time.elapsed().as_secs_f64();
+        record_get_object_request_result("ok", duration_secs);
+
+        if let Err(previous) = ACTIVE_GET_REQUESTS.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        ) {
             debug_assert_eq!(
                 previous, 0,
                 "ACTIVE_GET_REQUESTS underflow attempt in GetObjectGuard::drop; previous value = {}",
                 previous
             );
-        }
-
-        #[cfg(all(feature = "metrics", not(test)))]
-        if !std::thread::panicking() {
-            use metrics::{counter, histogram};
-            counter!("rustfs.get.object.requests.completed").increment(1);
-            histogram!("rustfs.get.object.duration.seconds").record(self.elapsed().as_secs_f64());
         }
     }
 }

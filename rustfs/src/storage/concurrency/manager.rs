@@ -20,6 +20,7 @@ use super::io_schedule::{
 };
 use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
+use rustfs_concurrency::{GetObjectCacheEligibility, GetObjectQueueSnapshot};
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
 use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
@@ -233,13 +234,6 @@ impl ConcurrencyManager {
     pub fn record_permit_wait(&self, wait_duration: Duration) {
         if let Ok(mut metrics) = self.io_metrics.lock() {
             metrics.record(wait_duration);
-        }
-
-        // Record histogram metric for Prometheus
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::histogram;
-            histogram!("rustfs.disk.permit.wait.duration.seconds").record(wait_duration.as_secs_f64());
         }
     }
 
@@ -828,12 +822,14 @@ impl ConcurrencyManager {
     ///
     /// Returns information about permit usage and waiting requests.
     pub fn io_queue_status(&self) -> IoQueueStatus {
-        let total_permits = self.scheduler_config.max_concurrent_reads;
-        let permits_in_use = total_permits.saturating_sub(self.disk_read_semaphore.available_permits());
+        let snapshot = GetObjectQueueSnapshot::from_available_permits(
+            self.scheduler_config.max_concurrent_reads,
+            self.disk_read_semaphore.available_permits(),
+        );
 
         IoQueueStatus {
-            total_permits,
-            permits_in_use,
+            total_permits: snapshot.total_permits,
+            permits_in_use: snapshot.permits_in_use,
             high_priority_waiting: 0, // Would need additional tracking
             normal_priority_waiting: 0,
             low_priority_waiting: 0,
@@ -861,11 +857,7 @@ impl ConcurrencyManager {
         &self,
         priority: IoPriority,
     ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::counter;
-            counter!("rustfs.disk.read.queue.total", "priority" => priority.as_str()).increment(1);
-        }
+        rustfs_io_metrics::record_io_priority_assignment(priority.as_str());
 
         debug!(
             priority = %priority,
@@ -874,6 +866,26 @@ impl ConcurrencyManager {
         );
 
         self.disk_read_semaphore.acquire().await
+    }
+
+    /// Build the minimal cache eligibility decision for a GetObject response.
+    pub fn get_object_cache_eligibility(
+        &self,
+        cache_writeback_enabled: bool,
+        is_part_request: bool,
+        is_range_request: bool,
+        encryption_applied: bool,
+        response_size: i64,
+    ) -> GetObjectCacheEligibility {
+        GetObjectCacheEligibility {
+            cache_enabled: self.is_cache_enabled(),
+            cache_writeback_enabled,
+            is_part_request,
+            is_range_request,
+            encryption_applied,
+            response_size,
+            max_cacheable_size: self.max_object_size(),
+        }
     }
 
     /// Get the global concurrency manager instance.

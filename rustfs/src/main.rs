@@ -566,10 +566,7 @@ async fn run(config: config::Config) -> Result<()> {
         init_metrics_system(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
-        #[cfg(feature = "metrics")]
-        {
-            crate::init::init_auto_tuner(ctx.clone()).await;
-        }
+        crate::init::init_auto_tuner(ctx.clone()).await;
     }
 
     info!(

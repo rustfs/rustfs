@@ -19,21 +19,14 @@ rustfs-io-metrics = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tokio-util = { workspace = true }
 
-# Serialization
-serde = { workspace = true, features = ["derive"], optional = true }
-
 # Error handling
 thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 
-# Metrics (optional)
-metrics = { workspace = true, optional = true }
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-tokio-test = { workspace = true }
 
 [features]
 default = ["timeout", "lock", "deadlock", "backpressure", "scheduler"]
@@ -44,10 +37,6 @@ lock = []
 deadlock = []
 backpressure = []
 scheduler = []
-
-# Optional features
-metrics = ["dep:metrics"]
-serde = ["dep:serde"]
 
 [package.metadata.docs.rs]
 all-features = true

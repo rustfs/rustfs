@@ -31,7 +31,7 @@ static GLOBAL_PERFORMANCE_METRICS: OnceLock<Arc<PerformanceMetrics>> = OnceLock:
 /// # Example
 ///
 /// ```rust
-/// use rustfs::storage::concurrency::global_metrics::get_global_metrics;
+/// use rustfs_io_metrics::global_metrics::get_global_metrics;
 ///
 /// let metrics = get_global_metrics();
 /// metrics.record_cache_hit();

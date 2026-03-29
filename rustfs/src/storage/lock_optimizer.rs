@@ -54,7 +54,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-#[cfg(feature = "metrics")]
 use metrics::histogram;
 
 /// Lock optimization configuration.
@@ -228,7 +227,6 @@ impl<G> OptimizedLockGuard<G> {
 
         self.stats.record_early_release(hold_time);
 
-        #[cfg(feature = "metrics")]
         histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
 
         debug!(
@@ -253,7 +251,6 @@ impl<G> Drop for OptimizedLockGuard<G> {
 
             self.stats.record_early_release(hold_time);
 
-            #[cfg(feature = "metrics")]
             histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
 
             debug!(

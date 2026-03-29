@@ -7745,13 +7745,10 @@ dependencies = [
 name = "rustfs-concurrency"
 version = "0.0.5"
 dependencies = [
- "metrics",
  "rustfs-io-core",
  "rustfs-io-metrics",
- "serde",
  "thiserror 2.0.18",
  "tokio",
- "tokio-test",
  "tokio-util",
  "tracing",
 ]

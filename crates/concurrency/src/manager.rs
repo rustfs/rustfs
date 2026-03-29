@@ -17,6 +17,76 @@
 use crate::config::ConcurrencyConfig;
 use std::sync::Arc;
 
+/// Snapshot of disk permit queue usage for GetObject orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetObjectQueueSnapshot {
+    /// Total permits configured for disk reads.
+    pub total_permits: usize,
+    /// Permits currently in use.
+    pub permits_in_use: usize,
+}
+
+impl GetObjectQueueSnapshot {
+    /// Create a queue snapshot from total and available permits.
+    pub fn from_available_permits(total_permits: usize, available_permits: usize) -> Self {
+        Self {
+            total_permits,
+            permits_in_use: total_permits.saturating_sub(available_permits),
+        }
+    }
+
+    /// Return currently available permits.
+    pub fn permits_available(&self) -> usize {
+        self.total_permits.saturating_sub(self.permits_in_use)
+    }
+
+    /// Return queue utilization percentage in the 0-100 range.
+    pub fn utilization_percent(&self) -> f64 {
+        if self.total_permits == 0 {
+            0.0
+        } else {
+            (self.permits_in_use as f64 / self.total_permits as f64) * 100.0
+        }
+    }
+
+    /// Return whether the queue is considered congested.
+    pub fn is_congested(&self, threshold_percent: f64) -> bool {
+        self.utilization_percent() > threshold_percent
+    }
+}
+
+/// Minimal cache writeback decision inputs for GetObject orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetObjectCacheEligibility {
+    /// Whether response caching is globally enabled.
+    pub cache_enabled: bool,
+    /// Whether the selected I/O strategy allows cache writeback.
+    pub cache_writeback_enabled: bool,
+    /// Whether the request is for a specific multipart part.
+    pub is_part_request: bool,
+    /// Whether the request is a range read.
+    pub is_range_request: bool,
+    /// Whether server-side or customer-provided encryption was applied.
+    pub encryption_applied: bool,
+    /// Response payload size in bytes.
+    pub response_size: i64,
+    /// Maximum cacheable object size in bytes.
+    pub max_cacheable_size: usize,
+}
+
+impl GetObjectCacheEligibility {
+    /// Return whether this GetObject response should be cached.
+    pub fn should_cache(&self) -> bool {
+        self.cache_enabled
+            && self.cache_writeback_enabled
+            && !self.is_part_request
+            && !self.is_range_request
+            && !self.encryption_applied
+            && self.response_size > 0
+            && (self.response_size as usize) <= self.max_cacheable_size
+    }
+}
+
 /// Main concurrency manager that provides access to all concurrency features
 pub struct ConcurrencyManager {
     config: ConcurrencyConfig,
@@ -241,6 +311,28 @@ impl Default for ConcurrencyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_queue_snapshot() {
+        let snapshot = GetObjectQueueSnapshot::from_available_permits(64, 16);
+        assert_eq!(snapshot.permits_in_use, 48);
+        assert_eq!(snapshot.permits_available(), 16);
+        assert!(snapshot.is_congested(70.0));
+    }
+
+    #[test]
+    fn test_cache_eligibility() {
+        let plan = GetObjectCacheEligibility {
+            cache_enabled: true,
+            cache_writeback_enabled: true,
+            is_part_request: false,
+            is_range_request: false,
+            encryption_applied: false,
+            response_size: 1024,
+            max_cacheable_size: 2048,
+        };
+        assert!(plan.should_cache());
+    }
 
     #[test]
     fn test_manager_creation() {

@@ -171,6 +171,7 @@ impl BackpressurePipe {
 }
 
 /// Backpressure event
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BackpressureEvent {
     /// Event timestamp
@@ -184,6 +185,7 @@ pub struct BackpressureEvent {
 }
 
 /// Backpressure event type
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum BackpressureEventType {
     /// High watermark reached

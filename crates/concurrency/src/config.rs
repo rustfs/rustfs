@@ -159,22 +159,26 @@ impl ConcurrencyConfig {
 
         // Read from environment if available
         if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_DEFAULT")
-            && let Ok(secs) = val.parse::<u64>() {
+            && let Ok(secs) = val.parse::<u64>()
+        {
             config.default_timeout = Duration::from_secs(secs);
         }
 
         if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_MAX")
-            && let Ok(secs) = val.parse::<u64>() {
+            && let Ok(secs) = val.parse::<u64>()
+        {
             config.max_timeout = Duration::from_secs(secs);
         }
 
         if let Ok(val) = std::env::var("RUSTFS_BACKPRESSURE_BUFFER_SIZE")
-            && let Ok(size) = val.parse::<usize>() {
+            && let Ok(size) = val.parse::<usize>()
+        {
             config.backpressure_buffer_size = size;
         }
 
         if let Ok(val) = std::env::var("RUSTFS_IO_BUFFER_SIZE")
-            && let Ok(size) = val.parse::<usize>() {
+            && let Ok(size) = val.parse::<usize>()
+        {
             config.io_buffer_size = size;
         }
 
@@ -202,6 +206,7 @@ impl ConcurrencyConfig {
 }
 
 /// Configuration error
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigError {
     /// Invalid timeout configuration
@@ -229,7 +234,11 @@ mod tests {
 
     #[test]
     fn test_invalid_timeout() {
-        let _config = ConcurrencyConfig { default_timeout: Duration::from_secs(100), max_timeout: Duration::from_secs(50), ..Default::default() };
+        let _config = ConcurrencyConfig {
+            default_timeout: Duration::from_secs(100),
+            max_timeout: Duration::from_secs(50),
+            ..Default::default()
+        };
     }
 
     #[test]

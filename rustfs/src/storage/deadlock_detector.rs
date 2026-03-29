@@ -65,7 +65,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
-#[cfg(feature = "metrics")]
 use metrics::counter;
 
 /// Request identifier type.
@@ -465,7 +464,6 @@ impl DeadlockDetector {
         if let Some(cycle) = Self::find_cycle(&wait_graph) {
             deadlocks_detected.fetch_add(1, Ordering::Relaxed);
 
-            #[cfg(feature = "metrics")]
             counter!("rustfs.deadlock.detected.total").increment(1);
 
             // Log detailed deadlock information

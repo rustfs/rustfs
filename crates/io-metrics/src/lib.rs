@@ -26,15 +26,21 @@
 //!
 //! # Usage
 //!
-//! ```rust
-//! use rustfs_io_metrics::*;
+//! ```rust,no_run
+//! use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics, record_get_object};
+//! use std::sync::Arc;
+//! use std::time::Duration;
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! // Simple recording
 //! record_get_object(100.0, 1024, true);
 //!
 //! // Advanced usage with collector
+//! let metrics = Arc::new(PerformanceMetrics::new());
 //! let collector = MetricsCollector::new(metrics, 1000);
-//! collector.record_io_operation(1024, duration, true).await;
+//! collector.record_io_operation(1024, Duration::from_millis(10), true).await;
+//! # }
 //! ```
 
 // Import macros from the metrics crate
@@ -105,6 +111,92 @@ pub use config::{
 // Re-exports for convenience
 pub use collector::MetricsCollector;
 pub use performance::PerformanceMetrics;
+
+/// Record GetObject request start.
+#[inline(always)]
+pub fn record_get_object_request_start(concurrent_requests: usize) {
+    counter!("rustfs_io_get_object_requests_total").increment(1);
+    gauge!("rustfs_io_get_object_concurrent_requests").set(concurrent_requests as f64);
+}
+
+/// Record GetObject request start without concurrency context.
+#[inline(always)]
+pub fn record_get_object_request_started() {
+    counter!("rustfs_io_get_object_requests_total").increment(1);
+}
+
+/// Record GetObject request result.
+#[inline(always)]
+pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
+    counter!("rustfs_io_get_object_request_results_total", "status" => status.to_string()).increment(1);
+    histogram!("rustfs_io_get_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
+}
+
+/// Record GetObject cache-served response.
+#[inline(always)]
+pub fn record_get_object_cache_served(duration_secs: f64, size_bytes: usize) {
+    counter!("rustfs_io_get_object_cache_served_total").increment(1);
+    histogram!("rustfs_io_get_object_cache_serve_duration_seconds").record(duration_secs);
+    histogram!("rustfs_io_get_object_cache_size_bytes").record(size_bytes as f64);
+}
+
+/// Record GetObject timeout for a specific stage.
+#[inline(always)]
+pub fn record_get_object_timeout(stage: Option<&str>, elapsed_secs: Option<f64>) {
+    match stage {
+        Some(stage) => counter!("rustfs_io_get_object_timeout_total", "stage" => stage.to_string()).increment(1),
+        None => counter!("rustfs_io_get_object_timeout_total").increment(1),
+    }
+
+    if let Some(elapsed_secs) = elapsed_secs {
+        histogram!("rustfs_io_get_object_timeout_elapsed_seconds").record(elapsed_secs);
+    }
+}
+
+/// Record GetObject completion.
+#[inline(always)]
+pub fn record_get_object_completion(total_duration_secs: f64, response_size_bytes: i64, buffer_size_bytes: usize) {
+    counter!("rustfs_io_get_object_completed_total").increment(1);
+    histogram!("rustfs_io_get_object_total_duration_seconds").record(total_duration_secs);
+    histogram!("rustfs_io_get_object_response_size_bytes").record(response_size_bytes as f64);
+    histogram!("rustfs_io_get_object_buffer_size_bytes").record(buffer_size_bytes as f64);
+}
+
+/// Record I/O queue congestion observation.
+#[inline(always)]
+pub fn record_io_queue_congestion() {
+    counter!("rustfs_io_queue_congestion_total").increment(1);
+}
+
+/// Record I/O priority assignment.
+#[inline(always)]
+pub fn record_io_priority_assignment(priority: &str) {
+    counter!("rustfs_io_priority_assigned_total", "priority" => priority.to_string()).increment(1);
+}
+
+/// Record detailed GetObject I/O orchestration metrics.
+#[inline(always)]
+pub fn record_get_object_io_state(
+    permit_wait_secs: f64,
+    queue_utilization_percent: f64,
+    permits_in_use: usize,
+    permits_available: usize,
+    load_level: &str,
+    buffer_multiplier: f64,
+) {
+    histogram!("rustfs_io_disk_permit_wait_duration_seconds").record(permit_wait_secs);
+    gauge!("rustfs_io_queue_utilization_percent").set(queue_utilization_percent);
+    gauge!("rustfs_io_queue_permits_in_use").set(permits_in_use as f64);
+    gauge!("rustfs_io_queue_permits_available").set(permits_available as f64);
+    gauge!("rustfs_io_buffer_multiplier").set(buffer_multiplier);
+    counter!("rustfs_io_strategy_selected_total", "level" => load_level.to_string()).increment(1);
+}
+
+/// Record object cache writeback.
+#[inline(always)]
+pub fn record_object_cache_writeback() {
+    counter!("rustfs_io_object_cache_writeback_total").increment(1);
+}
 
 /// Record a zero-copy read operation.
 ///

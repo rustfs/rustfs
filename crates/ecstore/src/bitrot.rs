@@ -70,7 +70,6 @@ pub async fn create_bitrot_reader(
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                     // Record zero-copy metrics
-                    #[cfg(feature = "metrics")]
                     rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
 
                     // Log successful zero-copy read
@@ -93,7 +92,6 @@ pub async fn create_bitrot_reader(
                 }
                 Err(e) => {
                     // Record zero-copy fallback
-                    #[cfg(feature = "metrics")]
                     rustfs_io_metrics::record_zero_copy_fallback(&format!("{:?}", e));
 
                     // Log zero-copy fallback

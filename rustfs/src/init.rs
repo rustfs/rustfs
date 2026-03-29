@@ -419,7 +419,6 @@ where
 /// The auto-tuner reads `RUSTFS_AUTOTUNER_ENABLED` to decide whether to run.
 /// When enabled, it spawns a background task that tunes concurrency settings
 /// every 60 seconds.
-#[cfg(feature = "metrics")]
 pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
     use crate::storage::concurrency::get_concurrency_manager;
     use rustfs_io_metrics::AutoTuner;

@@ -66,9 +66,6 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-#[cfg(feature = "metrics")]
-use metrics::{counter, histogram};
-
 // Re-export types from rustfs_io_core for convenience
 
 /// Timeout configuration for GetObject requests.
@@ -341,7 +338,7 @@ impl RequestTimeoutWrapper {
     pub async fn execute_with_timeout<F, Fut, T, E>(self, operation: F) -> TimedGetObjectResult<T, E>
     where
         F: FnOnce(CancellationToken) -> Fut,
-        Fut: std::future::Future<Output=Result<T, E>>,
+        Fut: std::future::Future<Output = Result<T, E>>,
     {
         if !self.config.is_timeout_enabled() {
             // Timeout disabled, run without timeout
@@ -366,8 +363,7 @@ impl RequestTimeoutWrapper {
         );
 
         // Record start time for metrics
-        #[cfg(feature = "metrics")]
-        counter!("rustfs.get.object.requests.started").increment(1);
+        rustfs_io_metrics::record_get_object_request_started();
 
         // Clone cancel_token for the operation, keep original for potential cancellation
         let cancel_token_for_op = self.cancel_token.clone();
@@ -377,11 +373,7 @@ impl RequestTimeoutWrapper {
                 // Operation completed successfully
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.completed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -395,11 +387,7 @@ impl RequestTimeoutWrapper {
                 // Operation failed before timeout
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.failed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -416,11 +404,8 @@ impl RequestTimeoutWrapper {
                 // Cancel the operation
                 self.cancel_token.cancel();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.timeout.total").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
+                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     request_id = %request_id,
@@ -458,7 +443,7 @@ impl RequestTimeoutWrapper {
     ) -> TimedGetObjectResult<T, E>
     where
         F: FnOnce(CancellationToken) -> Fut,
-        Fut: std::future::Future<Output=Result<T, E>>,
+        Fut: std::future::Future<Output = Result<T, E>>,
     {
         let bucket = bucket.into();
         let key = key.into();
@@ -488,8 +473,7 @@ impl RequestTimeoutWrapper {
             "Starting timed operation"
         );
 
-        #[cfg(feature = "metrics")]
-        counter!("rustfs.get.object.requests.started").increment(1);
+        rustfs_io_metrics::record_get_object_request_started();
 
         // Clone cancel_token for the operation, keep original for potential cancellation
         let cancel_token_for_op = self.cancel_token.clone();
@@ -498,11 +482,7 @@ impl RequestTimeoutWrapper {
             Ok(Ok(result)) => {
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.completed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -517,11 +497,7 @@ impl RequestTimeoutWrapper {
             Ok(Err(e)) => {
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.failed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -537,11 +513,8 @@ impl RequestTimeoutWrapper {
                 let elapsed = start_time.elapsed();
                 self.cancel_token.cancel();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.timeout.total").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
+                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     request_id = %request_id,

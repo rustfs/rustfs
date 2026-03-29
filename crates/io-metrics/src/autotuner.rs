@@ -18,15 +18,18 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,no_run
 //! use rustfs_io_metrics::AutoTuner;
 //!
+//! # #[tokio::main]
+//! # async fn main() {
 //! let mut tuner = AutoTuner::new();
 //!
 //! // Run a single tuning iteration
 //! if let Err(e) = tuner.tune().await {
 //!     tracing::warn!("Auto-tuner failed: {}", e);
 //! }
+//! # }
 //! ```
 
 use super::performance::PerformanceMetrics;

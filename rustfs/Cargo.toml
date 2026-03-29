@@ -31,16 +31,15 @@ name = "rustfs"
 path = "src/main.rs"
 
 [features]
-default = ["metrics"]
-metrics = []
-metrics-gpu = ["metrics", "rustfs-metrics/gpu"]
+default = ["direct-io"]
+metrics-gpu = ["rustfs-metrics/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
 direct-io = []  # Direct I/O support for Linux (O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
-full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
 
 [lints]
 workspace = true

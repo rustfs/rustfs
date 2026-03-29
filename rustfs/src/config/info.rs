@@ -594,7 +594,7 @@ fn collect_deps_info_json() -> DepsInfoJson {
     let features = vec![
         FeatureInfoJson {
             name: "metrics",
-            enabled: cfg!(feature = "metrics"),
+            enabled: true,
             description: "Metrics collection and reporting",
         },
         FeatureInfoJson {
@@ -760,7 +760,8 @@ fn get_workload_profile_info() -> String {
 fn format_deps_info() -> String {
     // Check which features are enabled at compile time
     let features = [
-        ("metrics", cfg!(feature = "metrics"), "Metrics collection and reporting"),
+        ("direct-io", true, "Direct I/O support for Linux"),
+        ("metrics-gpu", cfg!(feature = "metrics-gpu"), "Metrics GPU support"),
         ("ftps", cfg!(feature = "ftps"), "FTPS protocol support"),
         ("swift", cfg!(feature = "swift"), "Swift storage backend"),
         ("webdav", cfg!(feature = "webdav"), "WebDAV protocol support"),
@@ -790,12 +791,13 @@ fn format_deps_info() -> String {
     output.push_str("\n### Default Features\n\n");
     output.push_str("| Feature | Note |\n");
     output.push_str("|---------|------|\n");
-    output.push_str("| metrics | enabled by default |\n");
+    output.push_str("| direct-io | enabled by default |\n");
 
     output.push_str("\n### Feature Dependencies\n\n");
     output.push_str("| Feature | Dependencies |\n");
     output.push_str("|---------|-------------|\n");
-    output.push_str("| full | metrics + ftps + swift + webdav |\n");
+    output.push_str("| full | direct-io + ftps + swift + webdav |\n");
+    output.push_str("| metrics-gpu | rustfs-metrics/gpu |\n");
     output.push_str("| ftps | rustfs-protocols/ftps |\n");
     output.push_str("| swift | rustfs-protocols/swift |\n");
     output.push_str("| webdav | rustfs-protocols/webdav |\n");

@@ -951,19 +951,23 @@ impl IoStrategy {
 
         // Apply storage media cap
         let buffer_cap = storage_profile.buffer_cap;
+        #[cfg(feature = "io-scheduler-debug")]
         let buffer_cap_applied = buffer_size > buffer_cap;
         buffer_size = buffer_size.min(buffer_cap);
 
         // Apply final clamp (safety bounds)
         let clamp_min = 32 * KI_B;
         let clamp_max = MI_B;
+        #[cfg(feature = "io-scheduler-debug")]
         let clamp_min_applied = buffer_size < clamp_min;
+        #[cfg(feature = "io-scheduler-debug")]
         let clamp_max_applied = buffer_size > clamp_max;
         buffer_size = buffer_size.clamp(clamp_min, clamp_max);
 
         // Start with storage profile preference
         let mut should_enable_readahead = storage_profile.prefers_readahead;
         // Determine readahead preference
+        #[cfg(feature = "io-scheduler-debug")]
         let mut readahead_reason = if storage_profile.prefers_readahead {
             "media-pref"
         } else {
@@ -974,28 +978,40 @@ impl IoStrategy {
         let readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
         if readahead_disabled_by_pattern {
             should_enable_readahead = false;
-            readahead_reason = "random-pattern";
+            #[cfg(feature = "io-scheduler-debug")]
+            {
+                readahead_reason = "random-pattern";
+            }
         }
 
         // Apply concurrency override
         let readahead_disabled_by_concurrency = context.concurrent_requests >= config.random_readahead_disable_concurrency;
         if readahead_disabled_by_concurrency && matches!(context.access_pattern, AccessPattern::Random) {
             should_enable_readahead = false;
-            readahead_reason = "high-concurrency-random";
+            #[cfg(feature = "io-scheduler-debug")]
+            {
+                readahead_reason = "high-concurrency-random";
+            }
         }
 
         // Apply load override
         let readahead_disabled_by_load = matches!(load_level, IoLoadLevel::High | IoLoadLevel::Critical);
         if readahead_disabled_by_load {
             should_enable_readahead = false;
-            readahead_reason = "high-load";
+            #[cfg(feature = "io-scheduler-debug")]
+            {
+                readahead_reason = "high-load";
+            }
         }
 
         // Apply bandwidth override
         let readahead_disabled_by_bandwidth = bandwidth_limited;
         if readahead_disabled_by_bandwidth {
             should_enable_readahead = false;
-            readahead_reason = "low-bandwidth";
+            #[cfg(feature = "io-scheduler-debug")]
+            {
+                readahead_reason = "low-bandwidth";
+            }
         }
 
         let enable_readahead = should_enable_readahead;
@@ -1006,7 +1022,9 @@ impl IoStrategy {
             _ => !bandwidth_limited,
         };
 
+        #[cfg(feature = "io-scheduler-debug")]
         let cache_writeback_disabled_by_load = matches!(load_level, IoLoadLevel::Critical);
+        #[cfg(feature = "io-scheduler-debug")]
         let cache_writeback_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
 
         // Calculate priority based on request size
@@ -1301,7 +1319,6 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
 
     // Record concurrent request metrics
-    #[cfg(all(feature = "metrics", not(test)))]
     {
         use metrics::gauge;
         gauge!("rustfs.concurrent.get.requests").set(concurrent_requests as f64);

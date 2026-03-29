@@ -20,14 +20,14 @@ use std::time::Duration;
 #[inline(always)]
 pub fn record_timeout_event(operation: &str) {
     use metrics::counter;
-    counter!("rustfs.timeout.events", "operation" => operation.to_string()).increment(1);
+    counter!("rustfs_io_timeout_events_total", "operation" => operation.to_string()).increment(1);
 }
 
 /// Record operation duration.
 #[inline(always)]
 pub fn record_operation_duration(operation: &str, duration: Duration) {
     use metrics::histogram;
-    histogram!("rustfs.operation.duration.secs", "operation" => operation.to_string()).record(duration.as_secs_f64());
+    histogram!("rustfs_io_operation_duration_seconds", "operation" => operation.to_string()).record(duration.as_secs_f64());
 }
 
 /// Record dynamic timeout calculation.

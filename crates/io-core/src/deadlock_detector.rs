@@ -182,11 +182,12 @@ impl DeadlockDetector {
         }
 
         if let Ok(mut locks) = self.locks.lock()
-            && let Some(info) = locks.get_mut(&lock_id) {
-                info.owner = Some(thread_id);
-                info.acquired_at = Some(Instant::now());
-                info.waiters.retain(|&w| w != thread_id);
-            }
+            && let Some(info) = locks.get_mut(&lock_id)
+        {
+            info.owner = Some(thread_id);
+            info.acquired_at = Some(Instant::now());
+            info.waiters.retain(|&w| w != thread_id);
+        }
 
         // Remove wait edge
         if let Ok(mut graph) = self.wait_graph.lock() {
@@ -201,10 +202,11 @@ impl DeadlockDetector {
         }
 
         if let Ok(mut locks) = self.locks.lock()
-            && let Some(info) = locks.get_mut(&lock_id) {
-                info.owner = None;
-                info.acquired_at = None;
-            }
+            && let Some(info) = locks.get_mut(&lock_id)
+        {
+            info.owner = None;
+            info.acquired_at = None;
+        }
     }
 
     /// Record a wait for lock.
@@ -215,22 +217,24 @@ impl DeadlockDetector {
 
         // Add to waiters list
         if let Ok(mut locks) = self.locks.lock()
-            && let Some(info) = locks.get_mut(&lock_id) {
-                if !info.waiters.contains(&thread_id) {
-                    info.waiters.push(thread_id);
-                }
-
-                // Add edge to wait graph
-                if let Some(owner) = info.owner
-                    && owner != thread_id
-                        && let Ok(mut graph) = self.wait_graph.lock() {
-                            graph.push(WaitGraphEdge {
-                                waiter: thread_id,
-                                waited_for: owner,
-                                lock_id,
-                            });
-                        }
+            && let Some(info) = locks.get_mut(&lock_id)
+        {
+            if !info.waiters.contains(&thread_id) {
+                info.waiters.push(thread_id);
             }
+
+            // Add edge to wait graph
+            if let Some(owner) = info.owner
+                && owner != thread_id
+                && let Ok(mut graph) = self.wait_graph.lock()
+            {
+                graph.push(WaitGraphEdge {
+                    waiter: thread_id,
+                    waited_for: owner,
+                    lock_id,
+                });
+            }
+        }
     }
 
     /// Detect deadlocks using cycle detection in wait graph.
@@ -311,9 +315,10 @@ impl DeadlockDetector {
 
         for (&id, info) in locks.iter() {
             if let Some(duration) = info.hold_duration()
-                && duration > self.config.max_hold_time {
-                    result.push((id, duration));
-                }
+                && duration > self.config.max_hold_time
+            {
+                result.push((id, duration));
+            }
         }
 
         result
