@@ -399,7 +399,13 @@ impl MetaCacheEntries {
             return None;
         }
 
-        let metadata = match cached.marshal_msg() {
+        let merged_cached = FileMeta {
+            meta_ver: cached.meta_ver,
+            versions,
+            ..Default::default()
+        };
+
+        let metadata = match merged_cached.marshal_msg() {
             Ok(meta) => meta,
             Err(e) => {
                 warn!("decommission_pool: entries resolve entry marshal_msg {:?}", e);
@@ -411,11 +417,7 @@ impl MetaCacheEntries {
         // Create a new merged result.
         let new_selected = MetaCacheEntry {
             name: selected.name.clone(),
-            cached: Some(FileMeta {
-                meta_ver: cached.meta_ver,
-                versions,
-                ..Default::default()
-            }),
+            cached: Some(merged_cached),
             reusable: true,
             metadata,
         };
@@ -871,7 +873,11 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_data::create_real_xlmeta;
+    use crate::{FileMetaVersion, MetaDeleteMarker};
+    use std::collections::HashMap;
     use std::io::Cursor;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_writer() {
@@ -899,5 +905,63 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[test]
+    fn test_resolve_rebuilds_metadata_from_merged_versions() {
+        let base_metadata = create_real_xlmeta().expect("base xl.meta");
+        let base = FileMeta::load(&base_metadata).expect("load base xl.meta");
+
+        let extra_version = FileMetaVersion {
+            version_type: VersionType::Delete,
+            object: None,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(Uuid::from_u128(0x22222222333344445555666666666666)),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp")),
+                meta_sys: HashMap::new(),
+            }),
+            legacy_object: None,
+            write_version: 99,
+            uses_legacy_checksum: false,
+        };
+
+        let extra_shallow = FileMetaShallowVersion::try_from(extra_version).expect("build shallow delete version");
+
+        let mut extended = base.clone();
+        extended.versions.insert(0, extra_shallow);
+
+        let base_versions = base.versions.len();
+        let extended_versions = extended.versions.len();
+        let extended_metadata = extended.marshal_msg().expect("serialize extended xl.meta");
+
+        let resolved = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: extended_metadata,
+                cached: Some(extended),
+                reusable: false,
+            }),
+            Some(MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: base_metadata,
+                cached: Some(base),
+                reusable: false,
+            }),
+        ])
+        .resolve(MetadataResolutionParams {
+            obj_quorum: 2,
+            requested_versions: extended_versions,
+            strict: true,
+            ..Default::default()
+        })
+        .expect("merged entry should resolve");
+
+        let cached = resolved.cached.expect("resolved entry should keep merged cached metadata");
+        let decoded = FileMeta::load(&resolved.metadata).expect("resolved metadata should decode");
+
+        assert_eq!(cached.versions.len(), base_versions);
+        assert_eq!(decoded.versions.len(), base_versions);
+        assert_eq!(decoded.versions, cached.versions);
+        assert_ne!(extended_versions, cached.versions.len());
     }
 }

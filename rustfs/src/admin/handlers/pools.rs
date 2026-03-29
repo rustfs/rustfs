@@ -35,8 +35,83 @@ use crate::{
 use hyper::Method;
 use rustfs_ecstore::new_object_layer_fn;
 
+use std::collections::HashSet;
+
 fn endpoints_from_context() -> Option<rustfs_ecstore::endpoints::EndpointServerPools> {
     resolve_endpoints_handle()
+}
+
+fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> s3s::S3Result<()> {
+    if decommission_running {
+        return Err(s3_error!(InvalidRequest, "DecommissionAlreadyRunning"));
+    }
+
+    if rebalance_running {
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            "Decommission cannot be started, rebalance is already in progress".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn contextualize_admin_pool_api_error(
+    err: crate::error::ApiError,
+    operation: &str,
+    pool_context: impl std::fmt::Display,
+) -> crate::error::ApiError {
+    crate::error::ApiError {
+        code: err.code,
+        message: format!("admin {operation} failed for {pool_context}: {}", err.message),
+        source: err.source,
+    }
+}
+
+fn decommission_admin_not_initialized_error(operation: &str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to {operation}: object layer not initialized"))
+}
+
+fn pool_admin_missing_credentials_error(operation: &str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidRequest, format!("Failed to {operation}: missing credentials"))
+}
+
+fn pool_admin_query_parse_error(operation: &str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid query parameters"))
+}
+
+fn pool_admin_pool_parse_error(operation: &str, pool: &str) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to {operation}: invalid pool `{pool}`"))
+}
+
+fn pool_admin_pool_not_found_error(operation: &str, pool: &str) -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InvalidArgument,
+        format!("Failed to {operation}: pool `{pool}` was not found"),
+    )
+}
+
+fn pool_admin_pool_index_error(operation: &str, idx: usize, pool_count: usize) -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InvalidArgument,
+        format!("Failed to {operation}: pool index {idx} is out of range for {pool_count} pools"),
+    )
+}
+
+fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
+    let idx = pool.parse::<usize>().ok()?;
+    (idx < endpoint_count).then_some(idx)
+}
+
+fn dedup_indices(indices: &[usize]) -> Vec<usize> {
+    let mut seen = HashSet::with_capacity(indices.len());
+    let mut output = Vec::with_capacity(indices.len());
+    for idx in indices {
+        if seen.insert(*idx) {
+            output.push(*idx);
+        }
+    }
+    output
 }
 
 pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -77,7 +152,7 @@ impl Operation for ListPools {
         warn!("handle ListPools");
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(pool_admin_missing_credentials_error("list pools"));
         };
 
         let (cred, owner) =
@@ -127,7 +202,7 @@ impl Operation for StatusPool {
         warn!("handle StatusPool");
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(pool_admin_missing_credentials_error("load pool status"));
         };
 
         let (cred, owner) =
@@ -149,7 +224,7 @@ impl Operation for StatusPool {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| pool_admin_query_parse_error("load pool status"))?;
                 input
             } else {
                 StatusPoolQuery::default()
@@ -185,7 +260,7 @@ impl Operation for StartDecommission {
         warn!("handle StartDecommission");
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(pool_admin_missing_credentials_error("start decommission"));
         };
 
         let (cred, owner) =
@@ -210,27 +285,15 @@ impl Operation for StartDecommission {
         }
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(decommission_admin_not_initialized_error("start decommission"));
         };
 
-        if store.is_decommission_running().await {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                "DecommissionAlreadyRunning".to_string(),
-            ));
-        }
-
-        if store.is_rebalance_started().await {
-            return Err(S3Error::with_message(
-                S3ErrorCode::OperationAborted,
-                "Decommission cannot be started, rebalance is already in progress".to_string(),
-            ));
-        }
+        validate_start_decommission_guards(store.is_decommission_running().await, store.is_rebalance_started().await)?;
 
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| pool_admin_query_parse_error("start decommission"))?;
                 input
             } else {
                 StatusPoolQuery::default()
@@ -239,40 +302,38 @@ impl Operation for StartDecommission {
         let is_byid = query.by_id.as_str() == "true";
 
         let pools: Vec<&str> = query.pool.split(",").collect();
-        let mut pools_indices = Vec::with_capacity(pools.len());
+        let mut parsed_indices = Vec::with_capacity(pools.len());
 
         let ctx = CancellationToken::new();
 
         for pool in pools.iter() {
             let idx = {
                 if is_byid {
-                    pool.parse::<usize>()
-                        .map_err(|_e| s3_error!(InvalidArgument, "pool parse failed"))?
+                    parse_pool_idx_by_id(pool, endpoints.as_ref().len())
+                        .ok_or_else(|| pool_admin_pool_parse_error("start decommission", pool))?
                 } else {
                     let Some(idx) = endpoints.get_pool_idx(pool) else {
-                        return Err(s3_error!(InvalidArgument, "pool parse failed"));
+                        return Err(pool_admin_pool_parse_error("start decommission", pool));
                     };
                     idx
                 }
             };
 
-            let mut has_found = None;
-            for (i, pool) in store.pools.iter().enumerate() {
-                if i == idx {
-                    has_found = Some(pool.clone());
-                    break;
-                }
+            if idx >= store.pools.len() {
+                return Err(pool_admin_pool_index_error("start decommission", idx, store.pools.len()));
             }
 
-            let Some(_p) = has_found else {
-                return Err(s3_error!(InvalidArgument));
-            };
-
-            pools_indices.push(idx);
+            parsed_indices.push(idx);
         }
+        let pools_indices = dedup_indices(&parsed_indices);
 
         if !pools_indices.is_empty() {
-            store.decommission(ctx.clone(), pools_indices).await.map_err(ApiError::from)?;
+            let pool_context = format!("pools {:?}", &pools_indices);
+            store
+                .decommission(ctx.clone(), pools_indices)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
@@ -289,7 +350,7 @@ impl Operation for CancelDecommission {
         warn!("handle CancelDecommission");
 
         let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
+            return Err(pool_admin_missing_credentials_error("cancel decommission"));
         };
 
         let (cred, owner) =
@@ -316,7 +377,7 @@ impl Operation for CancelDecommission {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| pool_admin_query_parse_error("cancel decommission"))?;
                 input
             } else {
                 StatusPoolQuery::default()
@@ -327,8 +388,7 @@ impl Operation for CancelDecommission {
 
         let has_idx = {
             if is_byid {
-                let a = query.pool.parse::<usize>().unwrap_or_default();
-                if a < endpoints.as_ref().len() { Some(a) } else { None }
+                parse_pool_idx_by_id(&query.pool, endpoints.as_ref().len())
             } else {
                 endpoints.get_pool_idx(&query.pool)
             }
@@ -336,15 +396,181 @@ impl Operation for CancelDecommission {
 
         let Some(idx) = has_idx else {
             warn!("specified pool {} not found, please specify a valid pool", &query.pool);
-            return Err(s3_error!(InvalidArgument));
+            return Err(pool_admin_pool_not_found_error("cancel decommission", &query.pool));
         };
 
         let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(decommission_admin_not_initialized_error("cancel decommission"));
         };
 
-        store.decommission_cancel(idx).await.map_err(ApiError::from)?;
+        store
+            .decommission_cancel(idx)
+            .await
+            .map_err(ApiError::from)
+            .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
+    }
+}
+
+#[cfg(test)]
+mod pools_handler_tests {
+    use super::{
+        contextualize_admin_pool_api_error, decommission_admin_not_initialized_error, dedup_indices, parse_pool_idx_by_id,
+        pool_admin_missing_credentials_error, pool_admin_pool_index_error, pool_admin_pool_not_found_error,
+        pool_admin_pool_parse_error, pool_admin_query_parse_error, validate_start_decommission_guards,
+    };
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_non_numeric() {
+        assert_eq!(parse_pool_idx_by_id("invalid", 4), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_out_of_range() {
+        assert_eq!(parse_pool_idx_by_id("4", 4), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_rejects_empty_pool_count() {
+        assert_eq!(parse_pool_idx_by_id("0", 0), None);
+    }
+
+    #[test]
+    fn test_parse_pool_idx_by_id_accepts_valid_index() {
+        assert_eq!(parse_pool_idx_by_id("2", 4), Some(2));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_rejects_decommission_running() {
+        let err = validate_start_decommission_guards(true, false).expect_err("decommission running should be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_rejects_rebalance_running() {
+        let err = validate_start_decommission_guards(false, true).expect_err("rebalance running should be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(err.message(), Some("Decommission cannot be started, rebalance is already in progress"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_prefers_decommission_over_rebalance() {
+        let err = validate_start_decommission_guards(true, true).expect_err("decommission should be checked before rebalance");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
+    }
+
+    #[test]
+    fn test_validate_start_decommission_guards_allows_when_idle() {
+        assert!(validate_start_decommission_guards(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_contextualize_admin_pool_api_error_preserves_code_and_adds_pool_context() {
+        let err = crate::error::ApiError {
+            code: s3s::S3ErrorCode::InvalidRequest,
+            message: "decommission already running".to_string(),
+            source: None,
+        };
+
+        let err = contextualize_admin_pool_api_error(err, "start decommission", "pools [1, 3]");
+
+        assert_eq!(err.code, s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "admin start decommission failed for pools [1, 3]: decommission already running"
+        );
+    }
+
+    #[test]
+    fn test_contextualize_admin_pool_api_error_preserves_source() {
+        let err = contextualize_admin_pool_api_error(
+            crate::error::ApiError::other(std::io::Error::other("boom")),
+            "cancel decommission",
+            "pool 2",
+        );
+
+        assert!(err.message.contains("admin cancel decommission failed for pool 2"));
+        assert!(err.source.is_some());
+    }
+
+    #[test]
+    fn test_decommission_admin_not_initialized_error_formats_start_context() {
+        let err = decommission_admin_not_initialized_error("start decommission");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to start decommission: object layer not initialized"));
+    }
+
+    #[test]
+    fn test_decommission_admin_not_initialized_error_formats_cancel_context() {
+        let err = decommission_admin_not_initialized_error("cancel decommission");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("Failed to cancel decommission: object layer not initialized"));
+    }
+
+    #[test]
+    fn test_pool_admin_missing_credentials_error_formats_list_context() {
+        let err = pool_admin_missing_credentials_error("list pools");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("Failed to list pools: missing credentials"));
+    }
+
+    #[test]
+    fn test_pool_admin_missing_credentials_error_formats_decommission_context() {
+        let err = pool_admin_missing_credentials_error("start decommission");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("Failed to start decommission: missing credentials"));
+    }
+
+    #[test]
+    fn test_pool_admin_query_parse_error_formats_status_context() {
+        let err = pool_admin_query_parse_error("load pool status");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("Failed to load pool status: invalid query parameters"));
+    }
+
+    #[test]
+    fn test_pool_admin_pool_parse_error_formats_pool_context() {
+        let err = pool_admin_pool_parse_error("start decommission", "pool-x");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("Failed to start decommission: invalid pool `pool-x`"));
+    }
+
+    #[test]
+    fn test_pool_admin_pool_index_error_formats_range_context() {
+        let err = pool_admin_pool_index_error("start decommission", 4, 2);
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            Some("Failed to start decommission: pool index 4 is out of range for 2 pools")
+        );
+    }
+
+    #[test]
+    fn test_pool_admin_pool_not_found_error_formats_cancel_context() {
+        let err = pool_admin_pool_not_found_error("cancel decommission", "pool-x");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("Failed to cancel decommission: pool `pool-x` was not found"));
+    }
+
+    #[test]
+    fn test_dedup_indices_removes_duplicates_preserving_order() {
+        assert_eq!(dedup_indices(&[0, 2, 1, 2, 3, 0]), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn test_dedup_indices_handles_empty_input() {
+        let empty: Vec<usize> = Vec::new();
+        assert!(dedup_indices(&empty).is_empty());
     }
 }
