@@ -14,6 +14,7 @@
 
 //! Capacity metrics recording helpers.
 
+use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 
 /// Record capacity cache hit.
