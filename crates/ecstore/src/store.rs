@@ -72,6 +72,7 @@ use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
+use rustfs_io_core::BoxChunkStream;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
@@ -261,6 +262,20 @@ impl ObjectIO for ECStore {
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
+    }
+}
+
+impl ECStore {
+    #[instrument(level = "debug", skip(self))]
+    pub async fn get_object_chunks(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<BoxChunkStream> {
+        self.handle_get_object_chunks(bucket, object, range, h, opts).await
     }
 }
 

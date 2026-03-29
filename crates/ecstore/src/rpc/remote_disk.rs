@@ -30,8 +30,10 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::lock::Mutex;
+use futures_util::stream;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_core::{BoxChunkStream, IoChunk};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
@@ -1069,6 +1071,12 @@ impl DiskAPI for RemoteDisk {
         reader.read_to_end(&mut buffer).await?;
 
         Ok(Bytes::from(buffer))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
+        let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+        Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

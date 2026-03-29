@@ -31,11 +31,13 @@ use crate::disk::{
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
+use futures_util::stream;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     get_file_info, read_xl_meta_no_data,
 };
+use rustfs_io_core::{BoxChunkStream, IoChunk, MappedChunk};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
 use rustfs_utils::path::{
@@ -96,6 +98,9 @@ pub struct LocalDisk {
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
 }
+
+const LOCAL_CHUNK_FAST_PATH_MIN_BYTES: usize = 64 * 1024;
+const LOCAL_CHUNK_FAST_PATH_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 impl Drop for LocalDisk {
     fn drop(&mut self) {
@@ -1919,6 +1924,107 @@ impl DiskAPI for LocalDisk {
         }
     }
 
+    #[allow(unsafe_code)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
+        if length < LOCAL_CHUNK_FAST_PATH_MIN_BYTES {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::LocalDiskChunk,
+                rustfs_io_metrics::FallbackReason::SmallObject,
+            );
+            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+            return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
+        }
+
+        if length > LOCAL_CHUNK_FAST_PATH_MAX_BYTES {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::LocalDiskChunk,
+                rustfs_io_metrics::FallbackReason::WindowLimitExceeded,
+            );
+            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+            return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
+        }
+
+        if offset != 0 {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::LocalDiskChunk,
+                rustfs_io_metrics::FallbackReason::UnalignedWindow,
+            );
+            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+            return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
+        }
+
+        #[cfg(unix)]
+        {
+            use memmap2::MmapOptions;
+
+            let volume_dir = self.get_bucket_path(volume)?;
+            if !skip_access_checks(volume) {
+                access(&volume_dir)
+                    .await
+                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+            }
+
+            let file_path = self.get_object_path(volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+
+            let file_path_clone = file_path.clone();
+            let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+                .await
+                .map_err(DiskError::from)??;
+
+            let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+            if meta.len() < end_offset as u64 {
+                error!(
+                    "read_file_chunks: file size is less than offset + length {} + {} = {}",
+                    offset,
+                    length,
+                    meta.len()
+                );
+                return Err(DiskError::FileCorrupt);
+            }
+
+            let file_path_clone = file_path.clone();
+            let mapped_bytes = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+                let mmap = unsafe { MmapOptions::new().offset(0).len(length).map(&file) }.map_err(DiskError::other)?;
+                Ok::<Bytes, DiskError>(Bytes::from_owner(mmap))
+            })
+            .await
+            .map_err(DiskError::from);
+
+            match mapped_bytes {
+                Ok(Ok(mapped_bytes)) => {
+                    let chunk = MappedChunk::new(mapped_bytes, 0, length).map_err(DiskError::other)?;
+                    return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Mapped(chunk))])));
+                }
+                Ok(Err(err)) => {
+                    debug!(error = %err, "local disk chunk fast path mmap failed, falling back to shared chunk");
+                }
+                Err(err) => {
+                    debug!(error = %err, "local disk chunk fast path task failed, falling back to shared chunk");
+                }
+            }
+
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::LocalDiskChunk,
+                rustfs_io_metrics::FallbackReason::MmapUnavailable,
+            );
+            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+            return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
+        }
+
+        #[cfg(not(unix))]
+        {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::LocalDiskChunk,
+                rustfs_io_metrics::FallbackReason::MmapUnavailable,
+            );
+            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
+            Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])))
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
@@ -2674,6 +2780,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
+    use futures_util::StreamExt;
 
     #[tokio::test]
     async fn test_skip_access_checks() {
@@ -3021,6 +3128,91 @@ mod test {
 
         // Clean up
         let _ = fs::remove_file(test_file).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_chunks_returns_shared_chunk_for_local_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "chunk-bucket";
+        let object = "obj.txt";
+        let content = b"chunk-data";
+
+        fs::create_dir_all(dir.path().join(bucket)).await.unwrap();
+        fs::write(dir.path().join(bucket).join(object), content).await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let mut stream = disk.read_file_chunks(bucket, object, 0, content.len()).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.as_bytes(), Bytes::from_static(content));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_chunks_prefers_mapped_chunk_when_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "chunk-bucket";
+        let object = "obj-large.txt";
+        let content = vec![7u8; LOCAL_CHUNK_FAST_PATH_MIN_BYTES];
+
+        fs::create_dir_all(dir.path().join(bucket)).await.unwrap();
+        fs::write(dir.path().join(bucket).join(object), &content).await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let mut stream = disk.read_file_chunks(bucket, object, 0, content.len()).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        #[cfg(unix)]
+        assert!(matches!(first, IoChunk::Mapped(_)));
+        #[cfg(not(unix))]
+        assert!(matches!(first, IoChunk::Shared(_)));
+        assert_eq!(first.as_bytes(), Bytes::from(content));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_chunks_falls_back_to_shared_for_small_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "chunk-bucket";
+        let object = "obj-small.txt";
+        let content = b"small-object";
+
+        fs::create_dir_all(dir.path().join(bucket)).await.unwrap();
+        fs::write(dir.path().join(bucket).join(object), content).await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let mut stream = disk.read_file_chunks(bucket, object, 0, content.len()).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(first, IoChunk::Shared(_)));
+        assert_eq!(first.as_bytes(), Bytes::from_static(content));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_chunks_falls_back_to_shared_for_non_zero_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = "chunk-bucket";
+        let object = "obj-offset.txt";
+        let content = vec![3u8; LOCAL_CHUNK_FAST_PATH_MIN_BYTES + 16];
+
+        fs::create_dir_all(dir.path().join(bucket)).await.unwrap();
+        fs::write(dir.path().join(bucket).join(object), &content).await.unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let mut stream = disk
+            .read_file_chunks(bucket, object, 1, LOCAL_CHUNK_FAST_PATH_MIN_BYTES)
+            .await
+            .unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(first, IoChunk::Shared(_)));
+        assert_eq!(first.as_bytes(), Bytes::copy_from_slice(&content[1..1 + LOCAL_CHUNK_FAST_PATH_MIN_BYTES]));
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

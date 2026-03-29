@@ -118,7 +118,106 @@ pub use config::{
 
 // Re-exports for convenience
 pub use collector::MetricsCollector;
+pub use metric_names::{data_plane, zero_copy};
 pub use performance::PerformanceMetrics;
+
+/// High-level request path selected for an I/O operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoPath {
+    Fast,
+    Legacy,
+}
+
+impl IoPath {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Effective copy mode observed for an I/O operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyMode {
+    TrueZeroCopy,
+    SharedBytes,
+    SingleCopy,
+    Reconstructed,
+    Transformed,
+}
+
+impl CopyMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrueZeroCopy => "true_zero_copy",
+            Self::SharedBytes => "shared_bytes",
+            Self::SingleCopy => "single_copy",
+            Self::Reconstructed => "reconstructed",
+            Self::Transformed => "transformed",
+        }
+    }
+}
+
+/// Stage where a data plane decision or fallback happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoStage {
+    Unknown,
+    ReadSetup,
+    HttpBridge,
+    CacheWriteback,
+    LocalDiskChunk,
+    RangeGuard,
+}
+
+impl IoStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::ReadSetup => "read_setup",
+            Self::HttpBridge => "http_bridge",
+            Self::CacheWriteback => "cache_writeback",
+            Self::LocalDiskChunk => "local_disk_chunk",
+            Self::RangeGuard => "range_guard",
+        }
+    }
+}
+
+/// Reason why the data plane fell back from a preferred path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    Unknown,
+    MmapUnavailable,
+    SmallObject,
+    WindowLimitExceeded,
+    UnalignedWindow,
+    RangeNotSupported,
+    EncryptionEnabled,
+    CompressionEnabled,
+    ChunkBridgeUnavailable,
+    NonLocalBackend,
+}
+
+impl FallbackReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::MmapUnavailable => "mmap_unavailable",
+            Self::SmallObject => "small_object",
+            Self::WindowLimitExceeded => "window_limit_exceeded",
+            Self::UnalignedWindow => "unaligned_window",
+            Self::RangeNotSupported => "range_not_supported",
+            Self::EncryptionEnabled => "encryption_enabled",
+            Self::CompressionEnabled => "compression_enabled",
+            Self::ChunkBridgeUnavailable => "chunk_bridge_unavailable",
+            Self::NonLocalBackend => "non_local_backend",
+        }
+    }
+}
 
 /// Record GetObject request start.
 #[inline(always)]
@@ -206,7 +305,54 @@ pub fn record_object_cache_writeback() {
     counter!("rustfs_io_object_cache_writeback_total").increment(1);
 }
 
-/// Record a zero-copy read operation.
+/// Record which request path was selected for an operation.
+#[inline(always)]
+pub fn record_io_path_selected(operation: &'static str, io_path: IoPath) {
+    counter!(
+        metric_names::data_plane::PATH_SELECTED_TOTAL,
+        "path" => operation,
+        "mode" => io_path.as_str()
+    )
+    .increment(1);
+}
+
+/// Record the effective copy mode for an operation.
+#[inline(always)]
+pub fn record_io_copy_mode(operation: &'static str, copy_mode: CopyMode, size_bytes: usize) {
+    counter!(
+        metric_names::data_plane::COPY_MODE_BYTES_TOTAL,
+        "path" => operation,
+        "mode" => copy_mode.as_str()
+    )
+    .increment(size_bytes as u64);
+}
+
+/// Record a data plane fallback decision.
+#[inline(always)]
+pub fn record_io_fallback(stage: IoStage, reason: FallbackReason) {
+    counter!(
+        metric_names::data_plane::FALLBACK_TOTAL,
+        "stage" => stage.as_str(),
+        "reason" => reason.as_str()
+    )
+    .increment(1);
+}
+
+/// Record an attempted PUT fast path.
+#[inline(always)]
+pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
+    counter!(metric_names::data_plane::PUT_FAST_PATH_ATTEMPTS_TOTAL).increment(1);
+
+    if size_bytes > 0 {
+        histogram!(metric_names::data_plane::PUT_FAST_PATH_ATTEMPT_SIZE_BYTES).record(size_bytes as f64);
+    }
+}
+
+/// Record a legacy low-level zero-copy read operation.
+///
+/// This helper is kept for backward compatibility with existing low-level
+/// instrumentation. It must not be treated as a high-level signal that a
+/// request selected the fast path or avoided all intermediate copies.
 ///
 /// # Arguments
 ///
@@ -229,10 +375,11 @@ pub fn record_memory_copy_saved(bytes_saved: usize) {
     counter!("rustfs.zero_copy.memory.saved.bytes").increment(bytes_saved as u64);
 }
 
-/// Record a fallback from zero-copy to regular read.
+/// Record a legacy low-level zero-copy read fallback.
 ///
-/// This happens when zero-copy read fails (e.g., mmap not available,
-/// file too large, etc.) and the system falls back to regular I/O.
+/// This helper is kept for backward compatibility with existing low-level
+/// instrumentation. It does not capture the full request-level copy-mode
+/// semantics introduced by ADR 0001.
 ///
 /// # Arguments
 ///
@@ -343,6 +490,9 @@ pub fn record_bytes_saved(size_bytes: usize) {
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
 /// * `from_cache` - Whether the object was served from cache
+///
+/// Note: this function records aggregate S3 GET metrics only. It must not be
+/// interpreted as the definitive source of truth for data-plane copy mode.
 #[inline(always)]
 pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
     counter!("rustfs.s3.get_object.total").increment(1);
@@ -365,7 +515,11 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
 ///
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
-/// * `zero_copy_enabled` - Whether zero-copy was enabled for this operation
+/// * `zero_copy_enabled` - Legacy aggregate flag preserved for compatibility
+///
+/// Note: this function records aggregate S3 PUT metrics only. The definitive
+/// outcome of request-level fast-path attempts must be tracked separately via
+/// ADR 0001 data-plane helpers.
 #[inline(always)]
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
     counter!("rustfs.s3.put_object.total").increment(1);
@@ -717,6 +871,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_io_path_as_str_values_stable() {
+        assert_eq!(IoPath::Fast.as_str(), "fast");
+        assert_eq!(IoPath::Legacy.as_str(), "legacy");
+    }
+
+    #[test]
+    fn test_copy_mode_as_str_values_stable() {
+        assert_eq!(CopyMode::TrueZeroCopy.as_str(), "true_zero_copy");
+        assert_eq!(CopyMode::SharedBytes.as_str(), "shared_bytes");
+        assert_eq!(CopyMode::SingleCopy.as_str(), "single_copy");
+        assert_eq!(CopyMode::Reconstructed.as_str(), "reconstructed");
+        assert_eq!(CopyMode::Transformed.as_str(), "transformed");
+    }
+
+    #[test]
+    fn test_fallback_reason_as_str_values_stable() {
+        assert_eq!(FallbackReason::Unknown.as_str(), "unknown");
+        assert_eq!(FallbackReason::MmapUnavailable.as_str(), "mmap_unavailable");
+        assert_eq!(FallbackReason::SmallObject.as_str(), "small_object");
+        assert_eq!(FallbackReason::WindowLimitExceeded.as_str(), "window_limit_exceeded");
+        assert_eq!(FallbackReason::UnalignedWindow.as_str(), "unaligned_window");
+        assert_eq!(FallbackReason::RangeNotSupported.as_str(), "range_not_supported");
+        assert_eq!(FallbackReason::EncryptionEnabled.as_str(), "encryption_enabled");
+        assert_eq!(FallbackReason::CompressionEnabled.as_str(), "compression_enabled");
+        assert_eq!(FallbackReason::ChunkBridgeUnavailable.as_str(), "chunk_bridge_unavailable");
+        assert_eq!(FallbackReason::NonLocalBackend.as_str(), "non_local_backend");
+    }
+
+    #[test]
+    fn test_record_io_path_selected() {
+        record_io_path_selected("get", IoPath::Fast);
+        record_io_path_selected("put", IoPath::Legacy);
+    }
+
+    #[test]
+    fn test_record_io_copy_mode() {
+        record_io_copy_mode("get", CopyMode::SharedBytes, 1024);
+        record_io_copy_mode("put", CopyMode::Transformed, 2048);
+    }
+
+    #[test]
+    fn test_record_io_fallback() {
+        record_io_fallback(IoStage::ReadSetup, FallbackReason::MmapUnavailable);
+        record_io_fallback(IoStage::HttpBridge, FallbackReason::ChunkBridgeUnavailable);
+    }
+
+    #[test]
+    fn test_record_put_object_attempted_fast_path() {
+        record_put_object_attempted_fast_path(1024 * 1024);
+        record_put_object_attempted_fast_path(0);
+    }
+
+    #[test]
     fn test_record_zero_copy_read() {
         record_zero_copy_read(1024, 10.5);
         record_memory_copy_saved(1024);
@@ -864,8 +1071,6 @@ mod tests {
 pub mod bandwidth;
 pub mod global_metrics;
 pub mod metric_names;
-
-pub use metric_names::zero_copy;
 
 /// Record a zero-copy buffer operation.
 ///

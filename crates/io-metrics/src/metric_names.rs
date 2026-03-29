@@ -14,7 +14,11 @@
 
 //! Metric name constants for consistent naming across the codebase.
 
-/// Zero-copy operation metric names.
+/// Legacy low-level zero-copy operation metric names.
+///
+/// These names are kept for backward compatibility with existing low-level
+/// instrumentation. They do not represent high-level request copy-mode
+/// semantics introduced by ADR 0001.
 pub mod zero_copy {
     /// Total number of zero-copy buffer operations
     pub const BUFFER_OPERATIONS_TOTAL: &str = "rustfs_zero_copy_buffer_operations_total";
@@ -51,4 +55,22 @@ pub mod zero_copy {
 
     /// Memory saved by zero-copy in bytes
     pub const MEMORY_SAVED_BYTES: &str = "rustfs_zero_copy_memory_saved_bytes";
+}
+
+/// Request-level data plane metric names introduced by ADR 0001.
+pub mod data_plane {
+    /// Total number of selected request paths.
+    pub const PATH_SELECTED_TOTAL: &str = "rustfs.io.path.selected_total";
+
+    /// Total bytes observed for a given effective copy mode.
+    pub const COPY_MODE_BYTES_TOTAL: &str = "rustfs.io.copy_mode.bytes_total";
+
+    /// Total number of data plane fallbacks.
+    pub const FALLBACK_TOTAL: &str = "rustfs.io.zero_copy.fallback_total";
+
+    /// Total number of attempted PUT fast paths.
+    pub const PUT_FAST_PATH_ATTEMPTS_TOTAL: &str = "rustfs.io.put.fast_path.attempts_total";
+
+    /// Size distribution for attempted PUT fast paths.
+    pub const PUT_FAST_PATH_ATTEMPT_SIZE_BYTES: &str = "rustfs.io.put.fast_path.attempt.size.bytes";
 }

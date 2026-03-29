@@ -83,6 +83,7 @@ use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
+use rustfs_io_core::BoxChunkStream;
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -182,7 +183,7 @@ struct GetObjectRequestContext {
 struct GetObjectReadSetup {
     info: ObjectInfo,
     event_info: ObjectInfo,
-    final_stream: Box<dyn Reader>,
+    body_source: GetObjectBodySource,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -193,6 +194,11 @@ struct GetObjectReadSetup {
     sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     ssekms_key_id: Option<SSEKMSKeyId>,
     encryption_applied: bool,
+}
+
+enum GetObjectBodySource {
+    Reader(Box<dyn Reader>),
+    Chunk(BoxChunkStream),
 }
 
 struct GetObjectPreparedRead<'a> {
@@ -215,6 +221,7 @@ struct GetObjectOutputContext {
     event_info: ObjectInfo,
     response_content_length: i64,
     optimal_buffer_size: usize,
+    copy_mode_override: Option<rustfs_io_metrics::CopyMode>,
 }
 
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
@@ -1014,6 +1021,26 @@ impl DefaultObjectUsecase {
         )))
     }
 
+    fn build_chunk_blob(chunk_stream: BoxChunkStream) -> Option<StreamingBlob> {
+        Some(StreamingBlob::wrap(chunk_stream.map(|result| result.map(|chunk| chunk.as_bytes()))))
+    }
+
+    fn get_object_chunk_fast_path_guard(
+        req: &S3Request<GetObjectInput>,
+        rs: Option<&HTTPRangeSpec>,
+        part_number: Option<usize>,
+    ) -> std::result::Result<(), rustfs_io_metrics::FallbackReason> {
+        if part_number.is_some() || rs.is_some() {
+            return Err(rustfs_io_metrics::FallbackReason::RangeNotSupported);
+        }
+
+        if req.input.sse_customer_key.is_some() || req.input.sse_customer_key_md5.is_some() {
+            return Err(rustfs_io_metrics::FallbackReason::EncryptionEnabled);
+        }
+
+        Ok(())
+    }
+
     fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
         let timeout_config = TimeoutConfig::from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
@@ -1190,10 +1217,126 @@ impl DefaultObjectUsecase {
         let store = get_validated_store(bucket).await?;
 
         let read_start = std::time::Instant::now();
-        let read_setup =
-            Self::prepare_get_object_read(req, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?;
+        let read_setup = match Self::get_object_chunk_fast_path_guard(req, rs.as_ref(), part_number) {
+            Ok(()) => match Self::prepare_get_object_chunk_read(req, &store, manager, bucket, key, opts, read_start).await? {
+                Some(read_setup) => read_setup,
+                None => {
+                    Self::prepare_get_object_read(req, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?
+                }
+            },
+            Err(reason) => {
+                rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::ReadSetup, reason);
+                Self::prepare_get_object_read(req, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?
+            }
+        };
 
         Ok(GetObjectPreparedRead { io_planning, read_setup })
+    }
+
+    async fn prepare_get_object_chunk_read(
+        req: &S3Request<GetObjectInput>,
+        store: &rustfs_ecstore::store::ECStore,
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+        read_start: std::time::Instant,
+    ) -> S3Result<Option<GetObjectReadSetup>> {
+        let info = store.get_object_info(bucket, key, opts).await.map_err(ApiError::from)?;
+
+        if info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
+            }
+            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
+        }
+
+        let (_, is_compressed) = info.is_compressed_ok().map_err(ApiError::from)?;
+        if is_compressed {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::ReadSetup,
+                rustfs_io_metrics::FallbackReason::CompressionEnabled,
+            );
+            return Ok(None);
+        }
+
+        if info.transitioned_object.status == lifecycle::TRANSITION_COMPLETE {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::ReadSetup,
+                rustfs_io_metrics::FallbackReason::NonLocalBackend,
+            );
+            return Ok(None);
+        }
+
+        if info.user_defined.contains_key("x-rustfs-encryption-original-size")
+            || info
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-original-size")
+        {
+            rustfs_io_metrics::record_io_fallback(
+                rustfs_io_metrics::IoStage::ReadSetup,
+                rustfs_io_metrics::FallbackReason::EncryptionEnabled,
+            );
+            return Ok(None);
+        }
+
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+        validate_ssec_for_read(
+            &info.user_defined,
+            req.input.sse_customer_key.as_ref(),
+            req.input.sse_customer_key_md5.as_ref(),
+        )?;
+        check_preconditions(&req.headers, &info)?;
+
+        let read_duration = read_start.elapsed();
+        rustfs_io_metrics::record_io_path_selected("get", rustfs_io_metrics::IoPath::Legacy);
+        manager.record_disk_operation(info.size as u64, read_duration, true).await;
+
+        let content_type = if let Some(content_type) = &info.content_type {
+            match ContentType::from_str(content_type) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    error!("parse content-type err {} {:?}", content_type, err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let last_modified = info.mod_time.map(Timestamp::from);
+        let response_content_length = info.get_actual_size().map_err(ApiError::from)?;
+        let event_info = info.clone();
+
+        let chunk_stream = match store
+            .get_object_chunks(bucket, key, None, HeaderMap::new(), opts)
+            .await
+            .map_err(ApiError::from)
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                rustfs_io_metrics::record_io_fallback(
+                    rustfs_io_metrics::IoStage::HttpBridge,
+                    rustfs_io_metrics::FallbackReason::ChunkBridgeUnavailable,
+                );
+                return Err(err.into());
+            }
+        };
+
+        Ok(Some(GetObjectReadSetup {
+            info,
+            event_info,
+            body_source: GetObjectBodySource::Chunk(chunk_stream),
+            rs: None,
+            content_type,
+            last_modified,
+            response_content_length,
+            content_range: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            encryption_applied: false,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1216,11 +1359,8 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
         let read_duration = read_start.elapsed();
-        let estimated_saved = (info.size * 2) as usize;
-        record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
-        record_memory_copy_saved(estimated_saved);
+        rustfs_io_metrics::record_io_path_selected("get", rustfs_io_metrics::IoPath::Legacy);
 
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
 
@@ -1331,7 +1471,7 @@ impl DefaultObjectUsecase {
         Ok(GetObjectReadSetup {
             info,
             event_info,
-            final_stream,
+            body_source: GetObjectBodySource::Reader(final_stream),
             rs,
             content_type,
             last_modified,
@@ -1722,13 +1862,14 @@ impl DefaultObjectUsecase {
         let buffer_size = get_buffer_size_opt_in(size);
 
         // Detect zero-copy opportunity before encryption/compression decisions
-        // Zero-copy is beneficial for large unencrypted, uncompressed objects
+        // This is an attempt signal only. The effective copy mode is determined later
+        // after compression and encryption branches are resolved.
         let enable_zero_copy = should_use_zero_copy(size, &req.headers);
+        let mut applied_compression = false;
+        let mut applied_encryption = false;
 
         if enable_zero_copy {
-            // Record zero-copy write attempt
-            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
-            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            rustfs_io_metrics::record_put_object_attempted_fast_path(size);
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
@@ -1839,6 +1980,7 @@ impl DefaultObjectUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+            applied_compression = true;
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
@@ -1885,6 +2027,7 @@ impl DefaultObjectUsecase {
         };
 
         if let Some(material) = sse_encryption(encryption_request).await? {
+            applied_encryption = true;
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
@@ -1995,11 +2138,14 @@ impl DefaultObjectUsecase {
         // Record PutObject metrics via zero-copy-metrics
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
-            rustfs_io_metrics::record_put_object(
-                duration_ms,
-                size,
-                enable_zero_copy, // Track if zero-copy was enabled
-            );
+            rustfs_io_metrics::record_put_object(duration_ms, size, enable_zero_copy);
+            rustfs_io_metrics::record_io_path_selected("put", rustfs_io_metrics::IoPath::Legacy);
+            let effective_copy_mode = if applied_compression || applied_encryption {
+                rustfs_io_metrics::CopyMode::Transformed
+            } else {
+                rustfs_io_metrics::CopyMode::SingleCopy
+            };
+            rustfs_io_metrics::record_io_copy_mode("put", effective_copy_mode, actual_size.max(0) as usize);
         }
 
         result
@@ -2412,10 +2558,8 @@ impl DefaultObjectUsecase {
         debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
         rustfs_io_metrics::record_get_object_cache_served(cache_serve_duration.as_secs_f64(), cached.body.len());
-
-        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
-        record_zero_copy_read(cached.body.len(), cache_serve_duration.as_secs_f64() * 1000.0);
-        record_memory_copy_saved(cached.body.len());
+        rustfs_io_metrics::record_io_path_selected("get", rustfs_io_metrics::IoPath::Fast);
+        rustfs_io_metrics::record_io_copy_mode("get", rustfs_io_metrics::CopyMode::SharedBytes, cached.body.len());
 
         manager.record_transfer(cached.content_length as u64, Duration::from_micros(1));
 
@@ -2434,6 +2578,7 @@ impl DefaultObjectUsecase {
         total_duration: Duration,
         response_content_length: i64,
         optimal_buffer_size: usize,
+        copy_mode_override: Option<rustfs_io_metrics::CopyMode>,
     ) {
         rustfs_io_metrics::record_get_object_completion(
             total_duration.as_secs_f64(),
@@ -2442,6 +2587,11 @@ impl DefaultObjectUsecase {
         );
 
         rustfs_io_metrics::record_get_object(total_duration.as_millis() as f64, response_content_length, false);
+        rustfs_io_metrics::record_io_copy_mode(
+            "get",
+            copy_mode_override.unwrap_or(rustfs_io_metrics::CopyMode::SingleCopy),
+            response_content_length.max(0) as usize,
+        );
 
         if wrapper.is_timeout() {
             warn!(
@@ -2484,7 +2634,7 @@ impl DefaultObjectUsecase {
         key: &str,
         info: ObjectInfo,
         event_info: ObjectInfo,
-        final_stream: Box<dyn Reader>,
+        body_source: GetObjectBodySource,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -2519,18 +2669,24 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         } = strategy;
 
-        let body = Self::build_get_object_body(
-            final_stream,
-            &info,
-            cache_key,
-            response_content_length,
-            optimal_buffer_size,
-            part_number,
-            rs.is_some(),
-            encryption_applied,
-            io_strategy.cache_writeback_enabled,
-        )
-        .await?;
+        let (body, copy_mode_override) = match body_source {
+            GetObjectBodySource::Reader(final_stream) => (
+                Self::build_get_object_body(
+                    final_stream,
+                    &info,
+                    cache_key,
+                    response_content_length,
+                    optimal_buffer_size,
+                    part_number,
+                    rs.is_some(),
+                    encryption_applied,
+                    io_strategy.cache_writeback_enabled,
+                )
+                .await?,
+                None,
+            ),
+            GetObjectBodySource::Chunk(chunk_stream) => (Self::build_chunk_blob(chunk_stream), None),
+        };
 
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
 
@@ -2575,6 +2731,7 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
+            copy_mode_override,
         })
     }
 
@@ -2643,7 +2800,7 @@ impl DefaultObjectUsecase {
         let GetObjectReadSetup {
             info,
             event_info,
-            final_stream,
+            body_source,
             rs,
             content_type,
             last_modified,
@@ -2666,7 +2823,7 @@ impl DefaultObjectUsecase {
                 &key,
                 info,
                 event_info,
-                final_stream,
+                body_source,
                 rs,
                 content_type,
                 last_modified,
@@ -2690,6 +2847,7 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
+            copy_mode_override,
         } = output_context;
 
         let total_duration = request_start.elapsed();
@@ -2700,6 +2858,7 @@ impl DefaultObjectUsecase {
             total_duration,
             response_content_length,
             optimal_buffer_size,
+            copy_mode_override,
         );
 
         let result = Self::finalize_get_object_response(
@@ -5381,6 +5540,63 @@ mod tests {
 
         let err = usecase.execute_get_object(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn get_object_chunk_fast_path_guard_allows_plain_request() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        assert!(DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, None, None).is_ok());
+    }
+
+    #[test]
+    fn get_object_chunk_fast_path_guard_rejects_range_requests() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 10,
+        };
+        let err = DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, Some(&range), None).unwrap_err();
+        assert_eq!(err, rustfs_io_metrics::FallbackReason::RangeNotSupported);
+    }
+
+    #[test]
+    fn get_object_chunk_fast_path_guard_rejects_part_requests() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let err = DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, None, Some(1)).unwrap_err();
+        assert_eq!(err, rustfs_io_metrics::FallbackReason::RangeNotSupported);
+    }
+
+    #[test]
+    fn get_object_chunk_fast_path_guard_rejects_ssec_requests() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .sse_customer_key(Some("test-key".to_string()))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let err = DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, None, None).unwrap_err();
+        assert_eq!(err, rustfs_io_metrics::FallbackReason::EncryptionEnabled);
     }
 
     #[tokio::test]

@@ -7847,6 +7847,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-filemeta",
+ "rustfs-io-core",
  "rustfs-io-metrics",
  "rustfs-lock",
  "rustfs-madmin",
@@ -7968,6 +7969,8 @@ name = "rustfs-io-core"
 version = "0.0.5"
 dependencies = [
  "bytes",
+ "futures-core",
+ "futures-util",
  "memmap2 0.9.10",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
