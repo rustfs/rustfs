@@ -38,6 +38,24 @@ pub struct Statement {
     pub conditions: Functions,
 }
 
+/// Builds the same [`VariableResolver`] as [`Statement::is_allowed`].
+pub(crate) fn variable_resolver_for_policy_args(args: &Args<'_>) -> VariableResolver {
+    let mut context = VariableContext::new();
+    context.claims = Some(args.claims.clone());
+    context.conditions = args.conditions.clone();
+    context.account_id = Some(args.account.to_string());
+
+    let username = if let Some(parent) = args.claims.get("parent").and_then(|v| v.as_str()) {
+        parent.to_string()
+    } else {
+        args.account.to_string()
+    };
+
+    context.username = Some(username);
+
+    VariableResolver::new(context)
+}
+
 impl Statement {
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
@@ -69,67 +87,62 @@ impl Statement {
         false
     }
 
-    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
-        let mut context = VariableContext::new();
-        context.claims = Some(args.claims.clone());
-        context.conditions = args.conditions.clone();
-        context.account_id = Some(args.account.to_string());
+    /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
+    /// [`Statement::is_allowed`] (including the KMS shortcut path). Does not evaluate conditions.
+    pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+            return false;
+        }
 
-        let username = if let Some(parent) = args.claims.get("parent").and_then(|v| v.as_str()) {
-            // For temp credentials or service account credentials, username is parent_user
-            parent.to_string()
-        } else {
-            // For regular user credentials, username is access_key
-            args.account.to_string()
-        };
-
-        context.username = Some(username);
-
-        let resolver = VariableResolver::new(context);
-
-        let check = 'c: {
-            if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
-                break 'c false;
-            }
-
-            let mut resource = String::from(args.bucket);
-            if !args.object.is_empty() {
-                if !args.object.starts_with('/') {
-                    resource.push('/');
-                }
-
-                resource.push_str(args.object);
-            } else {
+        let mut resource = String::from(args.bucket);
+        if !args.object.is_empty() {
+            if !args.object.starts_with('/') {
                 resource.push('/');
             }
 
-            if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-                break 'c self.conditions.evaluate_with_resolver(args.conditions, Some(&resolver)).await;
-            }
+            resource.push_str(args.object);
+        } else {
+            resource.push('/');
+        }
 
-            if self.resources.is_empty() && self.not_resources.is_empty() && !self.is_admin() && !self.is_sts() {
-                break 'c false;
-            }
+        if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
+            return true;
+        }
 
-            if !self.resources.is_empty()
-                && !self
-                    .resources
-                    .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
-                    .await
-                && !self.is_admin()
-                && !self.is_sts()
-            {
-                break 'c false;
-            }
+        if self.resources.is_empty() && self.not_resources.is_empty() && !self.is_admin() && !self.is_sts() {
+            return false;
+        }
 
-            if !self.not_resources.is_empty()
-                && self
-                    .not_resources
-                    .is_match_with_resolver(&resource, args.conditions, Some(&resolver))
-                    .await
-                && !self.is_admin()
-                && !self.is_sts()
-            {
+        if !self.resources.is_empty()
+            && !self
+                .resources
+                .is_match_with_resolver(&resource, args.conditions, Some(resolver))
+                .await
+            && !self.is_admin()
+            && !self.is_sts()
+        {
+            return false;
+        }
+
+        if !self.not_resources.is_empty()
+            && self
+                .not_resources
+                .is_match_with_resolver(&resource, args.conditions, Some(resolver))
+                .await
+            && !self.is_admin()
+            && !self.is_sts()
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        let resolver = variable_resolver_for_policy_args(args);
+
+        let check = 'c: {
+            if !self.request_reaches_condition_eval(args, &resolver).await {
                 break 'c false;
             }
 
@@ -207,32 +220,41 @@ pub struct BPStatement {
 }
 
 impl BPStatement {
-    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
-        let check = 'c: {
-            if !self.principal.is_match(args.account) {
-                break 'c false;
-            }
+    /// Returns true when this statement would reach `conditions.evaluate` in [`BPStatement::is_allowed`].
+    pub(crate) async fn request_reaches_condition_eval(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        if !self.principal.is_match(args.account) {
+            return false;
+        }
 
-            if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
-                break 'c false;
-            }
+        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+            return false;
+        }
 
-            let mut resource = String::from(args.bucket);
-            if !args.object.is_empty() {
-                if !args.object.starts_with('/') {
-                    resource.push('/');
-                }
-
-                resource.push_str(args.object);
-            } else {
+        let mut resource = String::from(args.bucket);
+        if !args.object.is_empty() {
+            if !args.object.starts_with('/') {
                 resource.push('/');
             }
 
-            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
-                break 'c false;
-            }
+            resource.push_str(args.object);
+        } else {
+            resource.push('/');
+        }
 
-            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
+        if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
+            return false;
+        }
+
+        if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions).await {
+            return false;
+        }
+
+        true
+    }
+
+    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        let check = 'c: {
+            if !self.request_reaches_condition_eval(args).await {
                 break 'c false;
             }
 
