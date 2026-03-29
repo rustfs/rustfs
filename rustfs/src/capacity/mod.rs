@@ -52,7 +52,7 @@
 //! - `rustfs.capacity.cache.{hits,misses}` - Cache hit/miss tracking
 //! - `rustfs.capacity.current` - Current capacity in bytes
 //! - `rustfs.capacity.write.operations` - Write operation count
-//! - `rustfs.capacity.update.{scheduled,write_triggered,fallures}` - Update statistics
+//! - `rustfs.capacity.update.{scheduled,write_triggered,failures}` - Update statistics
 //! - `rustfs.capacity.symlinks.*` - Symlink tracking statistics
 //! - `rustfs.capacity.timeout.*` - Timeout and stall detection
 //!

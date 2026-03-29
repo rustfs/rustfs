@@ -106,7 +106,6 @@ fn get_cached_config() -> &'static CachedCapacityConfig {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 fn get_cached_config() -> CachedCapacityConfig {
     // Don't cache in tests to allow temp_env::with_var to work
     CachedCapacityConfig::from_env()
@@ -121,7 +120,7 @@ pub fn get_scheduled_update_interval() -> Duration {
 /// Get scheduled update interval from environment or default (test mode)
 #[cfg(test)]
 pub fn get_scheduled_update_interval() -> Duration {
-    CachedCapacityConfig::from_env().scheduled_update_interval
+    get_cached_config().scheduled_update_interval
 }
 
 /// Get write trigger delay from environment or default
@@ -133,7 +132,7 @@ pub fn get_write_trigger_delay() -> Duration {
 /// Get write trigger delay from environment or default (test mode)
 #[cfg(test)]
 pub fn get_write_trigger_delay() -> Duration {
-    CachedCapacityConfig::from_env().write_trigger_delay
+    get_cached_config().write_trigger_delay
 }
 
 /// Get write frequency threshold from environment or default
@@ -145,7 +144,7 @@ pub fn get_write_frequency_threshold() -> usize {
 /// Get write frequency threshold from environment or default (test mode)
 #[cfg(test)]
 pub fn get_write_frequency_threshold() -> usize {
-    CachedCapacityConfig::from_env().write_frequency_threshold
+    get_cached_config().write_frequency_threshold
 }
 
 /// Get fast update threshold from environment or default
@@ -157,7 +156,7 @@ pub fn get_fast_update_threshold() -> Duration {
 /// Get fast update threshold from environment or default (test mode)
 #[cfg(test)]
 pub fn get_fast_update_threshold() -> Duration {
-    CachedCapacityConfig::from_env().fast_update_threshold
+    get_cached_config().fast_update_threshold
 }
 
 /// Get max files threshold from environment or default
@@ -169,7 +168,7 @@ pub fn get_max_files_threshold() -> usize {
 /// Get max files threshold from environment or default (test mode)
 #[cfg(test)]
 pub fn get_max_files_threshold() -> usize {
-    CachedCapacityConfig::from_env().max_files_threshold
+    get_cached_config().max_files_threshold
 }
 
 /// Get stat timeout from environment or default
@@ -181,7 +180,7 @@ pub fn get_stat_timeout() -> Duration {
 /// Get stat timeout from environment or default (test mode)
 #[cfg(test)]
 pub fn get_stat_timeout() -> Duration {
-    CachedCapacityConfig::from_env().stat_timeout
+    get_cached_config().stat_timeout
 }
 
 /// Get sample rate from environment or default
@@ -193,7 +192,7 @@ pub fn get_sample_rate() -> usize {
 /// Get sample rate from environment or default (test mode)
 #[cfg(test)]
 pub fn get_sample_rate() -> usize {
-    CachedCapacityConfig::from_env().sample_rate
+    get_cached_config().sample_rate
 }
 
 /// Get follow symlinks flag from environment or default
@@ -205,7 +204,7 @@ pub fn get_follow_symlinks() -> bool {
 /// Get follow symlinks flag from environment or default (test mode)
 #[cfg(test)]
 pub fn get_follow_symlinks() -> bool {
-    CachedCapacityConfig::from_env().follow_symlinks
+    get_cached_config().follow_symlinks
 }
 
 /// Get max symlink depth from environment or default
@@ -217,7 +216,7 @@ pub fn get_max_symlink_depth() -> u8 {
 /// Get max symlink depth from environment or default (test mode)
 #[cfg(test)]
 pub fn get_max_symlink_depth() -> u8 {
-    CachedCapacityConfig::from_env().max_symlink_depth
+    get_cached_config().max_symlink_depth
 }
 
 /// Get enable dynamic timeout flag from environment or default
@@ -229,7 +228,7 @@ pub fn get_enable_dynamic_timeout() -> bool {
 /// Get enable dynamic timeout flag from environment or default (test mode)
 #[cfg(test)]
 pub fn get_enable_dynamic_timeout() -> bool {
-    CachedCapacityConfig::from_env().enable_dynamic_timeout
+    get_cached_config().enable_dynamic_timeout
 }
 
 /// Get min timeout from environment or default
@@ -241,7 +240,7 @@ pub fn get_min_timeout() -> Duration {
 /// Get min timeout from environment or default (test mode)
 #[cfg(test)]
 pub fn get_min_timeout() -> Duration {
-    CachedCapacityConfig::from_env().min_timeout
+    get_cached_config().min_timeout
 }
 
 /// Get max timeout from environment or default
@@ -253,7 +252,7 @@ pub fn get_max_timeout() -> Duration {
 /// Get max timeout from environment or default (test mode)
 #[cfg(test)]
 pub fn get_max_timeout() -> Duration {
-    CachedCapacityConfig::from_env().max_timeout
+    get_cached_config().max_timeout
 }
 
 /// Get stall timeout from environment or default
@@ -265,7 +264,7 @@ pub fn get_stall_timeout() -> Duration {
 /// Get stall timeout from environment or default (test mode)
 #[cfg(test)]
 pub fn get_stall_timeout() -> Duration {
-    CachedCapacityConfig::from_env().stall_timeout
+    get_cached_config().stall_timeout
 }
 
 // ============================================================================

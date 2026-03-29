@@ -179,9 +179,9 @@ impl CapacityMetrics {
     /// Record symlink encountered
     pub fn record_symlink(&self, size: u64) {
         self.symlink_count.fetch_add(1, Ordering::Relaxed);
-        self.symlink_size.fetch_add(size, Ordering::Relaxed);
+        let total_size = self.symlink_size.fetch_add(size, Ordering::Relaxed) + size;
         counter!(CAPACITY_SYMLINKS_ENCOUNTERED).increment(1);
-        gauge!(CAPACITY_SYMLINKS_SIZE).set(size as f64);
+        gauge!(CAPACITY_SYMLINKS_SIZE).set(total_size as f64);
     }
 
     /// Record dynamic timeout usage
