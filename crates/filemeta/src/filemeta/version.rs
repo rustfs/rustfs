@@ -540,7 +540,7 @@ impl TryFrom<&[u8]> for FileMetaVersion {
 
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
         let mut ver = FileMetaVersion::default();
-        if ver.unmarshal_msg(value).is_ok() {
+        if ver.unmarshal_msg(value).is_ok() && ver.valid() {
             ver.uses_legacy_checksum = false;
             return Ok(ver);
         }
@@ -2715,6 +2715,28 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    enum LegacyDeleteVersionTypeFixture {
+        #[serde(rename = "DeleteMarker")]
+        DeleteMarker,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyDeleteMarkerFixture {
+        version_id: Vec<u8>,
+        mod_time: Option<OffsetDateTime>,
+        meta_sys: HashMap<String, Vec<u8>>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyDeleteVersionFixture {
+        version_type: LegacyDeleteVersionTypeFixture,
+        object: Option<()>,
+        delete_marker: Option<LegacyDeleteMarkerFixture>,
+        write_version: u64,
+    }
 
     fn sample_version_id() -> Uuid {
         Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()
@@ -2911,5 +2933,54 @@ mod tests {
         assert_eq!(fi.erasure.data_blocks, 4);
         assert_eq!(fi.erasure.parity_blocks, 2);
         assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
+    }
+
+    #[test]
+    fn legacy_meta_v2_delete_marker_decodes_into_delete_fileinfo() {
+        let payload = LegacyDeleteVersionFixture {
+            version_type: LegacyDeleteVersionTypeFixture::DeleteMarker,
+            object: None,
+            delete_marker: Some(LegacyDeleteMarkerFixture {
+                version_id: sample_version_id().as_bytes().to_vec(),
+                mod_time: Some(sample_mod_time()),
+                meta_sys: HashMap::from([("x-rustfs-test".to_string(), b"gone".to_vec())]),
+            }),
+            write_version: 9,
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).unwrap();
+
+        let decoded = FileMetaVersion::try_from(encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded.version_type, VersionType::Delete);
+        assert!(decoded.object.is_none());
+        assert!(decoded.delete_marker.is_some());
+        assert!(decoded.uses_legacy_checksum);
+
+        let fi = decoded.into_fileinfo("bucket", "gone.txt", true);
+        assert!(fi.deleted);
+        assert_eq!(fi.volume, "bucket");
+        assert_eq!(fi.name, "gone.txt");
+        assert_eq!(fi.version_id, Some(sample_version_id()));
+        assert_eq!(fi.mod_time, Some(sample_mod_time()));
+        assert_eq!(fi.metadata.get("x-rustfs-test").map(String::as_str), Some("gone"));
+        assert!(fi.uses_legacy_checksum);
+    }
+
+    #[test]
+    fn legacy_meta_v2_delete_marker_rejects_invalid_uuid_bytes() {
+        let payload = LegacyDeleteVersionFixture {
+            version_type: LegacyDeleteVersionTypeFixture::DeleteMarker,
+            object: None,
+            delete_marker: Some(LegacyDeleteMarkerFixture {
+                version_id: vec![7; 15],
+                mod_time: Some(sample_mod_time()),
+                meta_sys: HashMap::new(),
+            }),
+            write_version: 10,
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).unwrap();
+
+        let err = FileMetaVersion::try_from(encoded.as_slice()).expect_err("invalid legacy delete marker UUID must fail");
+        assert!(err.to_string().contains("legacy version_id must be 16 bytes"));
     }
 }

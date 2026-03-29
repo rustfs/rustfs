@@ -24,6 +24,7 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::HealOperations;
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
@@ -166,6 +167,21 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     Ok(())
 }
 
+fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
+    hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.client_token.is_empty() && !hip.force_stop
+}
+
+fn map_root_heal_status(heal_err: Option<rustfs_ecstore::error::Error>) -> S3Result<()> {
+    match heal_err {
+        None => Ok(()),
+        Some(rustfs_ecstore::error::StorageError::NoHealRequired) => {
+            warn!("root heal completed with non-fatal status: no heal required");
+            Ok(())
+        }
+        Some(err) => Err(s3_error!(InternalError, "root heal failed: {err}")),
+    }
+}
+
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -207,6 +223,22 @@ impl Operation for HealHandler {
         };
         info!("bytes: {:?}", bytes);
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
+        // The heal channel currently models bucket/object work. Root heal reuses the
+        // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
+        if should_handle_root_heal_directly(&hip) {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(s3_error!(InternalError, "server not initialized"));
+            };
+
+            let (_, heal_err) = store
+                .heal_format(hip.hs.dry_run)
+                .await
+                .map_err(|e| s3_error!(InternalError, "root heal failed: {e}"))?;
+
+            map_root_heal_status(heal_err)?;
+
+            return Ok(S3Response::new((StatusCode::OK, Body::empty())));
+        }
         validate_heal_request_mode(&hip)?;
         info!("body: {:?}", hip);
 
@@ -331,14 +363,15 @@ impl Operation for BackgroundHealStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        HealInitParams, HealResp, encode_background_heal_status, json_response, map_heal_response, validate_heal_request_mode,
-        validate_heal_target,
+        HealInitParams, HealResp, encode_background_heal_status, json_response, map_heal_response, map_root_heal_status,
+        should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
     use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+    use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{S3ErrorCode, header::CONTENT_TYPE};
     use serde_json::json;
@@ -445,6 +478,43 @@ mod tests {
             err.to_string()
                 .contains("starting heal without a bucket target is not supported")
         );
+    }
+
+    #[test]
+    fn test_should_handle_root_heal_directly_for_root_start_modes() {
+        assert!(should_handle_root_heal_directly(&HealInitParams::default()));
+        assert!(should_handle_root_heal_directly(&HealInitParams {
+            force_start: true,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn test_should_handle_root_heal_directly_skips_query_cancel_and_bucket_targets() {
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
+            client_token: "heal-token".to_string(),
+            ..Default::default()
+        }));
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
+            force_stop: true,
+            ..Default::default()
+        }));
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
+            bucket: "bucket".to_string(),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn test_map_root_heal_status_allows_no_heal_required() {
+        map_root_heal_status(Some(StorageError::NoHealRequired)).expect("NoHealRequired should stay non-fatal");
+    }
+
+    #[test]
+    fn test_map_root_heal_status_rejects_fatal_errors() {
+        let err = map_root_heal_status(Some(StorageError::Unexpected)).expect_err("fatal status must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.to_string().contains("root heal failed: Unexpected error"));
     }
 
     #[test]
