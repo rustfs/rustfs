@@ -35,7 +35,7 @@ use rustfs_policy::auth::{
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -63,6 +63,78 @@ fn get_policy_plugin_client() -> Arc<RwLock<Option<rustfs_policy::policy::opa::A
 pub struct IamSys<T> {
     store: Arc<IamCache<T>>,
     roles_map: HashMap<ARN, String>,
+}
+
+#[derive(Clone)]
+enum PreparedSessionPolicy {
+    None,
+    DenyAll,
+    Policy(Policy),
+}
+
+#[derive(Clone, Copy)]
+enum PreparedServicePolicyMode {
+    Inherited,
+    SessionBound,
+}
+
+#[derive(Clone)]
+enum PreparedIamMode {
+    Opa,
+    Owner,
+    Deny,
+    Regular {
+        combined_policy: Policy,
+    },
+    Sts {
+        is_owner: bool,
+        combined_policy: Policy,
+        session_policy: PreparedSessionPolicy,
+    },
+    ServiceAccount {
+        is_owner: bool,
+        parent_user: String,
+        combined_policy: Policy,
+        mode: PreparedServicePolicyMode,
+        session_policy: PreparedSessionPolicy,
+    },
+}
+
+#[derive(Clone)]
+pub struct PreparedIamAuth {
+    pub needs_existing_object_tag: bool,
+    mode: PreparedIamMode,
+}
+
+impl PreparedIamAuth {
+    /// Evaluate whether the already-prepared IAM context needs ExistingObjectTag
+    /// conditions for the provided request args.
+    pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
+        match &self.mode {
+            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Regular { combined_policy } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+            }
+            PreparedIamMode::Sts {
+                combined_policy,
+                session_policy,
+                ..
+            } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+                    || prepared_session_policy_needs_existing_object_tag_for_args(session_policy, args).await
+            }
+            PreparedIamMode::ServiceAccount {
+                combined_policy,
+                mode,
+                session_policy,
+                ..
+            } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+                    || matches!(mode, PreparedServicePolicyMode::SessionBound)
+                        && prepared_session_policy_needs_existing_object_tag_for_args(session_policy, args).await
+            }
+        }
+    }
 }
 
 impl<T: Store> IamSys<T> {
@@ -740,14 +812,150 @@ impl<T: Store> IamSys<T> {
         self.store.policy_db_get(name, groups).await
     }
 
-    pub async fn is_allowed_sts(&self, args: &Args<'_>, parent_user: &str) -> bool {
+    fn is_safe_claim_policy_name(policy: &str) -> bool {
+        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Compatibility wrapper for service-account authorization entry points.
+    /// The canonical evaluation path is `prepare_service_account_auth + eval_prepared`.
+    pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
+        let prepared = self.prepare_service_account_auth(args, parent_user).await;
+        self.eval_prepared(&prepared, args).await
+    }
+
+    pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
+        self.store.merge_policies(&policies.join(",")).await.1
+    }
+
+    /// Prepare IAM authorization context once so callers can:
+    /// 1) know whether policy evaluation may need `s3:ExistingObjectTag`, and
+    /// 2) evaluate with final conditions without re-merging identity policies.
+    pub async fn prepare_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
+        if args.is_owner {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Owner,
+            };
+        }
+
+        if Self::get_policy_plugin_client().await.is_some() {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Opa,
+            };
+        }
+
+        let Ok((is_temp, parent_user)) = self.is_temp_user(args.account).await else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+        if is_temp {
+            return self.prepare_sts_auth(args, &parent_user).await;
+        }
+
+        let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+        if is_svc {
+            return self.prepare_service_account_auth(args, &parent_user).await;
+        }
+
+        self.prepare_regular_auth(args).await
+    }
+
+    pub async fn eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> bool {
+        match &prepared.mode {
+            PreparedIamMode::Opa => {
+                let Some(opa_enable) = Self::get_policy_plugin_client().await else {
+                    tracing::warn!("eval_prepared: OPA mode requested but plugin is unavailable");
+                    return false;
+                };
+                opa_enable.is_allowed(args).await
+            }
+            PreparedIamMode::Owner => true,
+            PreparedIamMode::Deny => false,
+            PreparedIamMode::Regular { combined_policy } => combined_policy.is_allowed(args).await,
+            PreparedIamMode::Sts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            } => {
+                let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
+                if let Some(ok) = session_ok {
+                    return ok && (*is_owner || combined_policy.is_allowed(args).await);
+                }
+                *is_owner || combined_policy.is_allowed(args).await
+            }
+            PreparedIamMode::ServiceAccount {
+                is_owner,
+                parent_user,
+                combined_policy,
+                mode,
+                session_policy,
+            } => {
+                let mut parent_args = args.clone();
+                parent_args.account = parent_user;
+
+                let parent_allowed = *is_owner || combined_policy.is_allowed(&parent_args).await;
+                match mode {
+                    PreparedServicePolicyMode::Inherited => parent_allowed,
+                    PreparedServicePolicyMode::SessionBound => {
+                        let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
+                        if let Some(ok) = session_ok {
+                            return ok && parent_allowed;
+                        }
+                        parent_allowed
+                    }
+                }
+            }
+        }
+    }
+
+    async fn prepare_regular_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
+        let Ok(policies) = self.policy_db_get(args.account, args.groups).await else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+
+        if policies.is_empty() {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        }
+
+        let combined_policy = self.get_combined_policy(&policies).await;
+        PreparedIamAuth {
+            needs_existing_object_tag: policy_needs_existing_object_tag_for_args(&combined_policy, args).await,
+            mode: PreparedIamMode::Regular { combined_policy },
+        }
+    }
+
+    pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
         let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
 
         let (effective_groups, groups_source, policies) = if is_owner {
             (None, "owner", Vec::new())
         } else if let Some(arn_str) = role_arn {
-            let Ok(arn) = ARN::parse(arn_str) else { return false };
+            let Ok(arn) = ARN::parse(arn_str) else {
+                tracing::warn!(
+                    parent_user = %parent_user,
+                    role_arn = %arn_str,
+                    "prepare_sts_auth: invalid role ARN in STS claims"
+                );
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            };
             let p = MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice();
             (None, "role", p)
         } else {
@@ -758,7 +966,7 @@ impl<T: Store> IamSys<T> {
                     None => {
                         tracing::warn!(
                             parent_user = %parent_user,
-                            "is_allowed_sts: groups fallback failed — parent user not found; policy evaluation will use no groups"
+                            "prepare_sts_auth: groups fallback failed, parent user not found"
                         );
                         (None, "parent_user_credentials")
                     }
@@ -768,9 +976,10 @@ impl<T: Store> IamSys<T> {
             (effective_groups, groups_source, p)
         };
 
+        let mut combined_policy = Policy::default();
+
         if !is_owner && policies.is_empty() {
             // For OIDC/STS users, policies may be specified in JWT claims rather than IAM DB.
-            // Resolve claim-based policy names against built-in default policies.
             if let Some(claim_policies) = args.claims.get("policy").and_then(|v| v.as_str()) {
                 use rustfs_policy::policy::default::DEFAULT_POLICIES;
                 let mut resolved = Vec::new();
@@ -786,162 +995,161 @@ impl<T: Store> IamSys<T> {
                     }
                 }
                 if !resolved.is_empty() {
-                    let combined = Policy::merge_policies(resolved);
-                    let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
-                    if has_session_policy {
-                        return is_allowed_sp && combined.is_allowed(args).await;
-                    }
-                    return combined.is_allowed(args).await;
+                    combined_policy = Policy::merge_policies(resolved);
+                } else if args.deny_only {
+                    combined_policy = Policy::default();
+                } else {
+                    return PreparedIamAuth {
+                        needs_existing_object_tag: false,
+                        mode: PreparedIamMode::Deny,
+                    };
                 }
+            } else if args.deny_only {
+                combined_policy = Policy::default();
+            } else {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
             }
-
-            if args.deny_only {
-                let combined_policy = Policy::default();
-                let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
-                if has_session_policy {
-                    return is_allowed_sp && combined_policy.is_allowed(args).await;
+        } else if !is_owner {
+            let (a, c) = self.store.merge_policies(&policies.join(",")).await;
+            if a.is_empty() {
+                if args.deny_only {
+                    combined_policy = Policy::default();
+                } else {
+                    return PreparedIamAuth {
+                        needs_existing_object_tag: false,
+                        mode: PreparedIamMode::Deny,
+                    };
                 }
-                return combined_policy.is_allowed(args).await;
+            } else {
+                combined_policy = c;
             }
-            return false;
         }
 
-        let combined_policy = {
-            if is_owner {
-                Policy::default()
-            } else {
-                let (a, c) = self.store.merge_policies(&policies.join(",")).await;
-                if a.is_empty() {
-                    if args.deny_only {
-                        Policy::default()
-                    } else {
-                        return false;
-                    }
-                } else {
-                    c
-                }
-            }
-        };
-
-        let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+        let session_policy = prepare_session_policy(args, false);
         tracing::debug!(
-            "is_allowed_sts: action={:?}, has_session_policy={}, is_allowed_sp={}, is_owner={}, parent_user={}, groups_source={}, effective_groups={:?}",
+            "prepare_sts_auth: action={:?}, is_owner={}, parent_user={}, groups_source={}, effective_groups={:?}",
             args.action,
-            has_session_policy,
-            is_allowed_sp,
             is_owner,
             parent_user,
             groups_source,
             effective_groups
         );
-        if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
+        PreparedIamAuth {
+            needs_existing_object_tag: policy_needs_existing_object_tag_for_args(&combined_policy, args).await
+                || prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await,
+            mode: PreparedIamMode::Sts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            },
         }
-
-        is_owner || combined_policy.is_allowed(args).await
     }
 
-    fn is_safe_claim_policy_name(policy: &str) -> bool {
-        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    }
-
-    pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
+    async fn prepare_service_account_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
         let Some(p) = args.claims.get("parent") else {
-            return false;
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
         };
 
         if p.as_str() != Some(parent_user) {
-            return false;
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
         }
 
         let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
-
         let role_arn = args.get_role_arn();
 
-        let svc_policies = {
-            if is_owner {
-                Vec::new()
-            } else if role_arn.is_some() {
-                let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else { return false };
-                MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice()
-            } else {
-                let Ok(p) = self.policy_db_get(parent_user, args.groups).await else { return false };
-                p
-            }
+        let svc_policies = if is_owner {
+            Vec::new()
+        } else if role_arn.is_some() {
+            let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else {
+                tracing::warn!(
+                    parent_user = %parent_user,
+                    role_arn = ?role_arn,
+                    "prepare_service_account_auth: invalid role ARN in service account claims"
+                );
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            };
+            MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice()
+        } else {
+            let Ok(policies) = self.policy_db_get(parent_user, args.groups).await else {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            };
+            policies
         };
 
         if !is_owner && svc_policies.is_empty() {
-            return false;
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
         }
 
-        let combined_policy = {
-            if is_owner {
-                Policy::default()
-            } else {
-                let (a, c) = self.store.merge_policies(&svc_policies.join(",")).await;
-                if a.is_empty() {
-                    return false;
-                }
-                c
+        let combined_policy = if is_owner {
+            Policy::default()
+        } else {
+            let (a, c) = self.store.merge_policies(&svc_policies.join(",")).await;
+            if a.is_empty() {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
             }
+            c
         };
-
-        let mut parent_args = args.clone();
-        parent_args.account = parent_user;
 
         let Some(sa) = args.claims.get(&iam_policy_claim_name_sa()) else {
-            return false;
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
         };
-
         let Some(sa_str) = sa.as_str() else {
-            return false;
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
         };
 
-        if sa_str == INHERITED_POLICY_TYPE {
-            return is_owner || combined_policy.is_allowed(&parent_args).await;
+        let mode = if sa_str == INHERITED_POLICY_TYPE {
+            PreparedServicePolicyMode::Inherited
+        } else {
+            PreparedServicePolicyMode::SessionBound
+        };
+
+        let session_policy = prepare_session_policy(args, true);
+        let needs_existing_object_tag = policy_needs_existing_object_tag_for_args(&combined_policy, args).await
+            || matches!(mode, PreparedServicePolicyMode::SessionBound)
+                && prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await;
+
+        PreparedIamAuth {
+            needs_existing_object_tag,
+            mode: PreparedIamMode::ServiceAccount {
+                is_owner,
+                parent_user: parent_user.to_string(),
+                combined_policy,
+                mode,
+                session_policy,
+            },
         }
-
-        let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy_for_service_account(args);
-        if has_session_policy {
-            return is_allowed_sp && (is_owner || combined_policy.is_allowed(&parent_args).await);
-        }
-
-        is_owner || combined_policy.is_allowed(&parent_args).await
-    }
-
-    pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
-        self.store.merge_policies(&policies.join(",")).await.1
     }
 
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
-        if args.is_owner {
-            return true;
-        }
-
-        let opa_enable = Self::get_policy_plugin_client().await;
-        if let Some(opa_enable) = opa_enable {
-            return opa_enable.is_allowed(args).await;
-        }
-
-        let Ok((is_temp, parent_user)) = self.is_temp_user(args.account).await else { return false };
-
-        if is_temp {
-            return self.is_allowed_sts(args, &parent_user).await;
-        }
-
-        let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else { return false };
-
-        if is_svc {
-            return self.is_allowed_service_account(args, &parent_user).await;
-        }
-
-        let Ok(policies) = self.policy_db_get(args.account, args.groups).await else { return false };
-
-        if policies.is_empty() {
-            return false;
-        }
-
-        self.get_combined_policy(&policies).await.is_allowed(args).await
+        let prepared = self.prepare_auth(args).await;
+        self.eval_prepared(&prepared, args).await
     }
 
     /// Check if the underlying store is ready
@@ -950,55 +1158,56 @@ impl<T: Store> IamSys<T> {
     }
 }
 
-fn is_allowed_by_session_policy(args: &Args<'_>) -> (bool, bool) {
-    let Some(policy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
-        return (false, false);
-    };
-
-    let has_session_policy = true;
-
-    let Some(policy_str) = policy.as_str() else {
-        return (has_session_policy, false);
-    };
-
-    let Ok(sub_policy) = Policy::parse_config(policy_str.as_bytes()) else {
-        return (has_session_policy, false);
-    };
-
-    if sub_policy.version.is_empty() {
-        return (has_session_policy, false);
+async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &PreparedSessionPolicy, args: &Args<'_>) -> bool {
+    match policy {
+        PreparedSessionPolicy::Policy(p) => policy_needs_existing_object_tag_for_args(p, args).await,
+        PreparedSessionPolicy::None | PreparedSessionPolicy::DenyAll => false,
     }
-
-    let mut session_policy_args = args.clone();
-    session_policy_args.is_owner = false;
-
-    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
 }
 
-fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, bool) {
-    let Some(policy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
-        return (false, false);
-    };
-
-    let mut has_session_policy = true;
-
-    let Some(policy_str) = policy.as_str() else {
-        return (has_session_policy, false);
+fn prepare_session_policy(args: &Args<'_>, empty_is_none: bool) -> PreparedSessionPolicy {
+    let Some(policy_str) = extract_session_policy_text(args.claims) else {
+        return PreparedSessionPolicy::None;
     };
 
     let Ok(sub_policy) = Policy::parse_config(policy_str.as_bytes()) else {
-        return (has_session_policy, false);
+        return PreparedSessionPolicy::DenyAll;
     };
 
-    if sub_policy.version.is_empty() && sub_policy.statements.is_empty() && sub_policy.id.is_empty() {
-        has_session_policy = false;
-        return (has_session_policy, false);
+    if empty_is_none {
+        if sub_policy.version.is_empty() && sub_policy.statements.is_empty() && sub_policy.id.is_empty() {
+            return PreparedSessionPolicy::None;
+        }
+        return PreparedSessionPolicy::Policy(sub_policy);
     }
 
-    let mut session_policy_args = args.clone();
-    session_policy_args.is_owner = false;
+    if sub_policy.version.is_empty() {
+        return PreparedSessionPolicy::DenyAll;
+    }
 
-    (has_session_policy, pollster::block_on(sub_policy.is_allowed(&session_policy_args)))
+    PreparedSessionPolicy::Policy(sub_policy)
+}
+
+fn extract_session_policy_text(claims: &HashMap<String, Value>) -> Option<String> {
+    if let Some(policy_str) = claims.get(SESSION_POLICY_NAME_EXTRACTED).and_then(|v| v.as_str()) {
+        return Some(policy_str.to_string());
+    }
+
+    let encoded = claims.get(SESSION_POLICY_NAME).and_then(|v| v.as_str())?;
+    let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+async fn evaluate_prepared_session_policy(policy: &PreparedSessionPolicy, args: &Args<'_>) -> Option<bool> {
+    match policy {
+        PreparedSessionPolicy::None => None,
+        PreparedSessionPolicy::DenyAll => Some(false),
+        PreparedSessionPolicy::Policy(p) => {
+            let mut session_policy_args = args.clone();
+            session_policy_args.is_owner = false;
+            Some(p.is_allowed(&session_policy_args).await)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1050,6 +1259,7 @@ mod tests {
     use rustfs_policy::auth::UserIdentity;
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
     use std::collections::HashMap;
     use time::OffsetDateTime;
@@ -1301,7 +1511,8 @@ mod tests {
             deny_only: false,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             allowed,
             "STS temp credentials with no groups in args should still be allowed via parent user's group policy (readwrite)"
@@ -1342,7 +1553,8 @@ mod tests {
             deny_only: true,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             !allowed,
             "session policy Deny must be evaluated even when IAM policies are empty and deny_only is set"
@@ -1381,7 +1593,8 @@ mod tests {
             deny_only: true,
         };
 
-        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let allowed = iam_sys.eval_prepared(&prepared, &args).await;
         assert!(
             allowed,
             "deny_only with no matching Deny in session policy should still allow self-service-style checks"
@@ -1410,6 +1623,254 @@ mod tests {
         assert!(
             bucket_users.contains_key("notify-user"),
             "regular user mapped policy must be written to user_policies for bucket user listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-fallback-test-parent";
+        let claims = HashMap::new();
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let sts_prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        let sts_eval = iam_sys.eval_prepared(&sts_prepared, &args).await;
+        let prepared = iam_sys.prepare_auth(&args).await;
+        let eval = iam_sys.eval_prepared(&prepared, &args).await;
+        assert_eq!(sts_eval, eval, "prepare_auth must match explicit STS preparation for this identity");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_detects_existing_object_tag_in_session_policy() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+        let sts_access_key = "sts-session-tag-test-user";
+
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: "sts-empty-parent-policy-test".to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let mut claims = HashMap::new();
+        claims.insert(
+            SESSION_POLICY_NAME_EXTRACTED.to_string(),
+            Value::String(
+                r#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]
+}"#
+                .to_string(),
+            ),
+        );
+
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "obj",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            prepared.needs_existing_object_tag,
+            "session policy with ExistingObjectTag must request object tag loading"
+        );
+    }
+
+    #[test]
+    fn test_policy_uses_existing_object_tag_matches_condition_keys_only() {
+        let with_value_only = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
+  }]
+}"#,
+        )
+        .expect("policy with value-only ExistingObjectTag text should parse");
+        assert!(
+            !policy_uses_existing_object_tag_conditions(&with_value_only),
+            "ExistingObjectTag text in values should not trigger tag dependency"
+        );
+
+        let with_condition_key = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("policy with ExistingObjectTag condition key should parse");
+        assert!(
+            policy_uses_existing_object_tag_conditions(&with_condition_key),
+            "ExistingObjectTag condition key must trigger tag dependency"
+        );
+    }
+
+    #[test]
+    fn test_policy_uses_existing_object_tag_when_only_secondary_action_has_tag_condition() {
+        let split_action_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObjectVersion"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("split-action policy should parse");
+
+        assert!(
+            policy_uses_existing_object_tag_conditions(&split_action_policy),
+            "full merged policy must still be detectable as containing ExistingObjectTag keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_detects_existing_object_tag_in_encoded_session_policy() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+        let sts_access_key = "sts-session-tag-encoded-test-user";
+
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: "sts-empty-parent-policy-test".to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let session_policy_json = r#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]
+}"#;
+        let mut claims = HashMap::new();
+        claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(session_policy_json.as_bytes())),
+        );
+
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "obj",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            prepared.needs_existing_object_tag,
+            "base64 sessionPolicy with ExistingObjectTag must request object tag loading"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let service_account_access_key = "svc-inherited-tag-hint-test-user";
+        let parent_user = "sts-fallback-test-parent";
+        let mut service_account_claims = HashMap::new();
+        service_account_claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+        let service_identity = UserIdentity::from(Credentials {
+            access_key: service_account_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent_user.to_string(),
+            claims: Some(service_account_claims),
+            ..Default::default()
+        });
+        Cache::add_or_update(
+            &iam_sys.store.cache.users,
+            service_account_access_key,
+            &service_identity,
+            OffsetDateTime::now_utc(),
+        );
+
+        let mut request_claims = HashMap::new();
+        request_claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
+        request_claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+        request_claims.insert(
+            SESSION_POLICY_NAME_EXTRACTED.to_string(),
+            Value::String(
+                r#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]
+}"#
+                .to_string(),
+            ),
+        );
+
+        let groups: Option<Vec<String>> = Some(vec!["testgroup".to_string()]);
+        let args = Args {
+            account: service_account_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "obj",
+            claims: &request_claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            !prepared.needs_existing_object_tag,
+            "inherited service account should not require object tag fetch based on session policy hint"
         );
     }
 }

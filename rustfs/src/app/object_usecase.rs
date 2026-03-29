@@ -98,10 +98,12 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
-        AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
-        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
-        AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
+        AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
+        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS,
+        AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -475,6 +477,17 @@ const AMZ_META_PREFIX_LOWER: &str = "x-amz-meta-";
 const SNOWBALL_PREFIX_SUFFIX_LOWER: &str = "snowball-prefix";
 const SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER: &str = "snowball-ignore-dirs";
 const SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER: &str = "snowball-ignore-errors";
+const SNOWBALL_PREFIX_HEADER_KEYS: &[&str] = &[AMZ_MINIO_SNOWBALL_PREFIX, AMZ_SNOWBALL_PREFIX, AMZ_RUSTFS_SNOWBALL_PREFIX];
+const SNOWBALL_IGNORE_DIRS_HEADER_KEYS: &[&str] = &[
+    AMZ_MINIO_SNOWBALL_IGNORE_DIRS,
+    AMZ_SNOWBALL_IGNORE_DIRS,
+    AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS,
+];
+const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
+    AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
+    AMZ_SNOWBALL_IGNORE_ERRORS,
+    AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
@@ -494,15 +507,23 @@ fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
     header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
 }
 
-fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> Option<String> {
-    if let Some(preferred) = headers.get(preferred_key).and_then(|value| value.to_str().ok()) {
-        return Some(preferred.trim().to_string());
-    }
+fn trimmed_header_value(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+}
 
+fn is_exact_snowball_meta_key(key: &str, exact_keys: &[&str]) -> bool {
+    exact_keys.iter().any(|exact_key| key.eq_ignore_ascii_case(exact_key))
+}
+
+fn snowball_meta_value_by_suffix(headers: &HeaderMap, suffix_lower: &str, exact_keys: &[&str]) -> Option<String> {
     for (name, value) in headers {
-        let key = name.as_str().to_ascii_lowercase();
+        let key = name.as_str();
         if key.starts_with(AMZ_META_PREFIX_LOWER)
             && key.ends_with(suffix_lower)
+            && !is_exact_snowball_meta_key(key, exact_keys)
             && let Ok(parsed) = value.to_str()
         {
             return Some(parsed.trim().to_string());
@@ -512,8 +533,18 @@ fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffi
     None
 }
 
-fn snowball_meta_flag_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> bool {
-    snowball_meta_value_by_suffix(headers, preferred_key, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+fn snowball_meta_value(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &str) -> Option<String> {
+    for key in exact_keys {
+        if let Some(value) = trimmed_header_value(headers, key) {
+            return Some(value);
+        }
+    }
+
+    snowball_meta_value_by_suffix(headers, suffix_lower, exact_keys)
+}
+
+fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &str) -> bool {
+    snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
@@ -796,11 +827,10 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
-    let prefix = snowball_meta_value_by_suffix(headers, AMZ_SNOWBALL_PREFIX_INTERNAL, SNOWBALL_PREFIX_SUFFIX_LOWER)
+    let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .and_then(|value| normalize_snowball_prefix(&value));
-    let ignore_dirs = snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
-    let ignore_errors =
-        snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
+    let ignore_dirs = snowball_meta_flag(headers, SNOWBALL_IGNORE_DIRS_HEADER_KEYS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
+    let ignore_errors = snowball_meta_flag(headers, SNOWBALL_IGNORE_ERRORS_HEADER_KEYS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
 
     PutObjectExtractOptions {
         prefix,
@@ -5065,6 +5095,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_put_object_extract_options_accepts_standard_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static(" /standard/prefix/ "));
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static(" true "));
+        headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("standard/prefix"));
+        assert!(options.ignore_dirs);
+        assert!(options.ignore_errors);
+    }
+
+    #[test]
     fn resolve_put_object_extract_options_accepts_suffix_compatible_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5084,6 +5127,31 @@ mod tests {
         assert_eq!(options.prefix.as_deref(), Some("partner/import"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_prefers_exact_headers_over_suffix_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-acme-snowball-prefix", HeaderValue::from_static("/fallback/prefix/"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_PREFIX, HeaderValue::from_static("/internal/prefix/"));
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("/standard/prefix/"));
+        headers.insert(AMZ_MINIO_SNOWBALL_PREFIX, HeaderValue::from_static("/minio/prefix/"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("minio/prefix"));
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_exact_flags_override_suffix_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static("false"));
+        headers.insert("x-amz-meta-acme-snowball-ignore-dirs", HeaderValue::from_static("true"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("false"));
+        headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("true"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert!(!options.ignore_dirs);
+        assert!(!options.ignore_errors);
     }
 
     #[tokio::test]
@@ -5564,6 +5632,51 @@ mod tests {
 
         let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_missing_default_retention() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule { default_retention: None }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_zero_days() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(0),
+                    years: None,
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_too_many_years() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: None,
+                    years: Some(MAXIMUM_RETENTION_YEARS + 1),
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
     }
 
     #[tokio::test]

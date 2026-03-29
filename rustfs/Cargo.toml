@@ -140,6 +140,7 @@ matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
+percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true

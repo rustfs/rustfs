@@ -26,6 +26,7 @@ use http::Uri;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_common::data_usage::TierStats;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
@@ -83,8 +84,14 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 
 fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
-    if let Some(tier) = params.get("tier").map(str::trim).filter(|tier| !tier.is_empty()) {
-        return Ok(tier.to_string());
+    if let Some(tier) = params.get("tier") {
+        let decoded = percent_decode_str(tier)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))?;
+        let trimmed = decoded.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
     }
 
     let query = if let Some(query) = uri.query() {
@@ -710,6 +717,46 @@ mod tests {
 
         let tier = resolve_tier_name(&uri, &params).expect("query parameter should resolve");
         assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_when_path_parameter_is_blank() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20?tier=WARM".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_preserves_plus_in_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/WARM+PLUS".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/WARM+PLUS").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "WARM+PLUS");
+    }
+
+    #[test]
+    fn resolve_tier_name_rejects_blank_path_without_query_fallback() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let err = resolve_tier_name(&uri, &matched.params).expect_err("blank path should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
     }
 
     #[test]
