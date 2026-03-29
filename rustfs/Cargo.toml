@@ -20,6 +20,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
+default-run = "rustfs"
 description = "RustFS is a high-performance, distributed file system designed for modern cloud-native applications, providing efficient data storage and retrieval with advanced features like S3 Select, IAM, and policy management."
 keywords.workspace = true
 categories.workspace = true
@@ -29,6 +30,13 @@ documentation = "https://docs.rustfs.com/"
 [[bin]]
 name = "rustfs"
 path = "src/main.rs"
+
+[[bin]]
+name = "manual-test-dial9"
+path = "tests/manual/test_dial9.rs"
+test = false
+bench = false
+required-features = ["manual-test-runners"]
 
 [features]
 default = ["direct-io"]
@@ -40,6 +48,7 @@ license = []
 direct-io = []  # Direct I/O support for Linux (O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
+manual-test-runners = []
 
 [lints]
 workspace = true
