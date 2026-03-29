@@ -754,7 +754,6 @@ mod tests {
 
         assert_eq!(progress.progress_percent(), Some(0.0));
 
-        let progress = progress;
         progress.update(500);
         assert_eq!(progress.progress_percent(), Some(50.0));
 
