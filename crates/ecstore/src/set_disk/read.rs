@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 impl SetDisks {
     pub(super) async fn read_parts(
@@ -667,6 +668,10 @@ impl SetDisks {
                     checksum_info.algorithm
                 };
 
+            // Read zero-copy configuration from environment variable
+            // Default: enabled (true) for performance
+            let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -680,6 +685,7 @@ impl SetDisks {
                     erasure.shard_size(),
                     checksum_algo.clone(),
                     skip_verify_bitrot,
+                    use_zero_copy,
                 )
                 .await
                 {

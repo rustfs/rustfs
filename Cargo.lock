@@ -7584,6 +7584,7 @@ dependencies = [
  "flatbuffers",
  "futures",
  "futures-util",
+ "hashbrown 0.16.1",
  "hex-simd",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -7611,6 +7612,7 @@ dependencies = [
  "rustfs-appauth",
  "rustfs-audit",
  "rustfs-common",
+ "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-crypto",
@@ -7618,6 +7620,8 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
@@ -7739,6 +7743,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-concurrency"
+version = "0.0.5"
+dependencies = [
+ "rustfs-io-core",
+ "rustfs-io-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-config"
 version = "0.0.5"
 dependencies = [
@@ -7811,8 +7827,8 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0-rc.5",
+ "memmap2 0.9.10",
  "metrics",
- "moka",
  "num_cpus",
  "parking_lot 0.12.5",
  "path-absolutize",
@@ -7831,6 +7847,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-filemeta",
+ "rustfs-io-metrics",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-policy",
@@ -7944,6 +7961,28 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rustfs-io-core"
+version = "0.0.5"
+dependencies = [
+ "bytes",
+ "memmap2 0.9.10",
+ "rustfs-io-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-io-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "num_cpus",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

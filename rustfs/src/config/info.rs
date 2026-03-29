@@ -582,6 +582,82 @@ struct FeatureInfoJson {
     description: &'static str,
 }
 
+struct FeatureSpec {
+    name: &'static str,
+    enabled: bool,
+    description: &'static str,
+    dependencies: &'static str,
+    default_enabled: bool,
+}
+
+fn feature_specs() -> [FeatureSpec; 9] {
+    [
+        FeatureSpec {
+            name: "direct-io",
+            enabled: cfg!(feature = "direct-io"),
+            description: "Aligned pread-based direct I/O reader support",
+            dependencies: "(none)",
+            default_enabled: true,
+        },
+        FeatureSpec {
+            name: "metrics-gpu",
+            enabled: cfg!(feature = "metrics-gpu"),
+            description: "Metrics GPU support",
+            dependencies: "rustfs-metrics/gpu",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "ftps",
+            enabled: cfg!(feature = "ftps"),
+            description: "FTPS protocol support",
+            dependencies: "rustfs-protocols/ftps",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "swift",
+            enabled: cfg!(feature = "swift"),
+            description: "Swift storage backend",
+            dependencies: "rustfs-protocols/swift",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "webdav",
+            enabled: cfg!(feature = "webdav"),
+            description: "WebDAV protocol support",
+            dependencies: "rustfs-protocols/webdav",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "license",
+            enabled: cfg!(feature = "license"),
+            description: "License validation",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "io-scheduler-debug",
+            enabled: cfg!(feature = "io-scheduler-debug"),
+            description: "Enable debug information in I/O scheduler",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "manual-test-runners",
+            enabled: cfg!(feature = "manual-test-runners"),
+            description: "Enable manual test binaries",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "full",
+            enabled: cfg!(feature = "full"),
+            description: "All features enabled",
+            dependencies: "metrics-gpu + ftps + swift + webdav + direct-io",
+            default_enabled: false,
+        },
+    ]
+}
+
 /// Dependency information for JSON output
 #[derive(Serialize)]
 struct DepsInfoJson {
@@ -591,38 +667,14 @@ struct DepsInfoJson {
 }
 
 fn collect_deps_info_json() -> DepsInfoJson {
-    let features = vec![
-        FeatureInfoJson {
-            name: "metrics",
-            enabled: cfg!(feature = "metrics"),
-            description: "Metrics collection and reporting",
-        },
-        FeatureInfoJson {
-            name: "ftps",
-            enabled: cfg!(feature = "ftps"),
-            description: "FTPS protocol support",
-        },
-        FeatureInfoJson {
-            name: "swift",
-            enabled: cfg!(feature = "swift"),
-            description: "Swift storage backend",
-        },
-        FeatureInfoJson {
-            name: "webdav",
-            enabled: cfg!(feature = "webdav"),
-            description: "WebDAV protocol support",
-        },
-        FeatureInfoJson {
-            name: "license",
-            enabled: cfg!(feature = "license"),
-            description: "License validation",
-        },
-        FeatureInfoJson {
-            name: "full",
-            enabled: cfg!(feature = "full"),
-            description: "All features enabled",
-        },
-    ];
+    let features: Vec<FeatureInfoJson> = feature_specs()
+        .into_iter()
+        .map(|feature| FeatureInfoJson {
+            name: feature.name,
+            enabled: feature.enabled,
+            description: feature.description,
+        })
+        .collect();
 
     let enabled_count = features.iter().filter(|f| f.enabled).count();
     let total_count = features.len();
@@ -758,17 +810,9 @@ fn get_workload_profile_info() -> String {
 
 /// Dependency information
 fn format_deps_info() -> String {
-    // Check which features are enabled at compile time
-    let features = [
-        ("metrics", cfg!(feature = "metrics"), "Metrics collection and reporting"),
-        ("ftps", cfg!(feature = "ftps"), "FTPS protocol support"),
-        ("swift", cfg!(feature = "swift"), "Swift storage backend"),
-        ("webdav", cfg!(feature = "webdav"), "WebDAV protocol support"),
-        ("license", cfg!(feature = "license"), "License validation"),
-        ("full", cfg!(feature = "full"), "All features enabled"),
-    ];
+    let features = feature_specs();
 
-    let enabled_count = features.iter().filter(|(_, enabled, _)| *enabled).count();
+    let enabled_count = features.iter().filter(|feature| feature.enabled).count();
 
     let mut output = format!(
         "## Build Features\n\n\
@@ -782,23 +826,24 @@ fn format_deps_info() -> String {
     output.push_str("### Feature Status\n\n");
     output.push_str("| Feature | Status | Description |\n");
     output.push_str("|---------|--------|-------------|\n");
-    for (name, enabled, description) in features {
-        let status = if enabled { "✓" } else { "✗" };
-        output.push_str(&format!("| {} | {} | {} |\n", name, status, description));
+    for feature in &features {
+        let status = if feature.enabled { "✓" } else { "✗" };
+        output.push_str(&format!("| {} | {} | {} |\n", feature.name, status, feature.description));
     }
 
     output.push_str("\n### Default Features\n\n");
     output.push_str("| Feature | Note |\n");
     output.push_str("|---------|------|\n");
-    output.push_str("| metrics | enabled by default |\n");
+    for feature in features.iter().filter(|feature| feature.default_enabled) {
+        output.push_str(&format!("| {} | enabled by default |\n", feature.name));
+    }
 
     output.push_str("\n### Feature Dependencies\n\n");
     output.push_str("| Feature | Dependencies |\n");
     output.push_str("|---------|-------------|\n");
-    output.push_str("| full | metrics + ftps + swift + webdav |\n");
-    output.push_str("| ftps | rustfs-protocols/ftps |\n");
-    output.push_str("| swift | rustfs-protocols/swift |\n");
-    output.push_str("| webdav | rustfs-protocols/webdav |\n");
+    for feature in &features {
+        output.push_str(&format!("| {} | {} |\n", feature.name, feature.dependencies));
+    }
 
     output
 }
@@ -874,5 +919,30 @@ mod tests {
     fn test_runtime_info_collect() {
         let info = RuntimeInfo::collect();
         assert!(info.process_id > 0);
+    }
+
+    #[test]
+    fn test_collect_deps_info_json_matches_cargo_features() {
+        let info = collect_deps_info_json();
+        let feature_names: Vec<_> = info.features.iter().map(|feature| feature.name).collect();
+
+        assert_eq!(info.total_count, 9);
+        assert_eq!(info.features.len(), 9);
+        assert!(feature_names.contains(&"direct-io"));
+        assert!(feature_names.contains(&"metrics-gpu"));
+        assert!(feature_names.contains(&"io-scheduler-debug"));
+        assert!(feature_names.contains(&"manual-test-runners"));
+        assert!(!feature_names.contains(&"metrics"));
+    }
+
+    #[test]
+    fn test_format_deps_info_matches_cargo_feature_output() {
+        let output = format_deps_info();
+
+        assert!(output.contains("| metrics-gpu |"));
+        assert!(output.contains("| io-scheduler-debug |"));
+        assert!(output.contains("| manual-test-runners |"));
+        assert!(output.contains("| direct-io | enabled by default |"));
+        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav + direct-io |"));
     }
 }
