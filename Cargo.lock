@@ -7601,6 +7601,7 @@ dependencies = [
  "mime_guess",
  "moka",
  "opentelemetry",
+ "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
  "rand 0.10.0",
