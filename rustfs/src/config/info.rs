@@ -594,7 +594,7 @@ fn collect_deps_info_json() -> DepsInfoJson {
     let features = vec![
         FeatureInfoJson {
             name: "metrics",
-            enabled: true,
+            enabled: cfg!(feature = "metrics"),
             description: "Metrics collection and reporting",
         },
         FeatureInfoJson {
@@ -760,7 +760,7 @@ fn get_workload_profile_info() -> String {
 fn format_deps_info() -> String {
     // Check which features are enabled at compile time
     let features = [
-        ("direct-io", true, "Direct I/O support for Linux"),
+        ("direct-io", cfg!(feature = "direct-io"), "Aligned pread-based direct I/O reader support"),
         ("metrics-gpu", cfg!(feature = "metrics-gpu"), "Metrics GPU support"),
         ("ftps", cfg!(feature = "ftps"), "FTPS protocol support"),
         ("swift", cfg!(feature = "swift"), "Swift storage backend"),

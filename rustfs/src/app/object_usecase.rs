@@ -157,7 +157,7 @@ struct GetObjectBootstrap {
     timeout_config: TimeoutConfig,
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
-    _request_guard: GetObjectGuard,
+    request_guard: GetObjectGuard,
     _deadlock_request_guard: DeadlockRequestGuard,
     concurrent_requests: usize,
 }
@@ -1048,7 +1048,7 @@ impl DefaultObjectUsecase {
             timeout_config,
             wrapper,
             request_start,
-            _request_guard: request_guard,
+            request_guard,
             _deadlock_request_guard: deadlock_request_guard,
             concurrent_requests,
         })
@@ -2553,6 +2553,7 @@ impl DefaultObjectUsecase {
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
         let concurrent_requests = bootstrap.concurrent_requests;
+        let mut request_guard = bootstrap.request_guard;
 
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
         // mc get 3
@@ -2661,8 +2662,15 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
-            .await
+        let result =
+            Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
+                .await;
+        if result.is_ok() {
+            request_guard.finish_ok();
+        } else {
+            request_guard.finish_err();
+        }
+        result
     }
 
     pub async fn execute_get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {

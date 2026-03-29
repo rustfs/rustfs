@@ -39,13 +39,14 @@ bench = false
 required-features = ["manual-test-runners"]
 
 [features]
-default = ["direct-io"]
+default = ["direct-io", "metrics"]
+metrics = []  # Metrics collection and reporting (always compiled in; flag exists for feature reporting)
 metrics-gpu = ["rustfs-metrics/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
-direct-io = []  # Direct I/O support for Linux (O_DIRECT)
+direct-io = []  # Aligned direct I/O reader support (uses aligned pread, does not set O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
 manual-test-runners = []

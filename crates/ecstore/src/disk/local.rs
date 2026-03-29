@@ -1809,7 +1809,8 @@ impl DiskAPI for LocalDisk {
         let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
 
         let meta = f.metadata().await?;
-        if meta.len() < (offset + length) as u64 {
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
             error!(
                 "read_file_stream: file size is less than offset + length {} + {} = {}",
                 offset,
@@ -1850,7 +1851,8 @@ impl DiskAPI for LocalDisk {
             .await
             .map_err(DiskError::from)??;
 
-        if meta.len() < (offset + length) as u64 {
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
             error!(
                 "read_file_zero_copy: file size is less than offset + length {} + {} = {}",
                 offset,
@@ -1860,7 +1862,7 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileCorrupt);
         }
 
-        // Unix: use mmap for zero-copy
+        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
         // Non-Unix: fall back to efficient read
         #[cfg(unix)]
         {
@@ -1884,13 +1886,13 @@ impl DiskAPI for LocalDisk {
             .await
             .map_err(DiskError::from)??;
 
-            // Log successful zero-copy read metrics
+            // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-            // Record zero-copy metrics
+            // Record mmap read metrics
             rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
 
-            debug!(size = length, duration_ms = duration_ms, "zero_copy_read_success");
+            debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
 
             return Ok(bytes);
         }

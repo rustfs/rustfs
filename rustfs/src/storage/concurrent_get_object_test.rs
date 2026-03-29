@@ -663,18 +663,9 @@ mod tests {
             let _ = manager.get_cached(&key).await;
         }
 
-        // Check cache stats for debugging
-        let stats = manager.cache_stats().await;
-        eprintln!(
-            "DEBUG: hit_count={}, miss_count={}, hit_rate={}",
-            stats.hit_count,
-            stats.miss_count,
-            manager.cache_hit_rate()
-        );
-
         // Hit rate should be around 50% (0.5 on 0.0-1.0 scale)
         let hit_rate = manager.cache_hit_rate();
-        assert!((0.4..=0.6).contains(&hit_rate), "Hit rate should be ~50%, got {hit_rate:.1}%");
+        assert!((0.4..=0.6).contains(&hit_rate), "Hit rate should be ~50% (0.5), got {hit_rate:.3}");
     }
 
     /// Test TTL expiration (Moka automatic cleanup)

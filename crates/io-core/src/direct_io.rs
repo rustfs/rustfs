@@ -102,7 +102,7 @@ impl From<io::Error> for DirectIoError {
 /// ```
 #[cfg(target_os = "linux")]
 pub struct DirectIoReader {
-    /// File opened with O_DIRECT flag
+    /// Underlying file handle used for aligned pread I/O
     file: std::fs::File,
     /// Current read position
     pos: u64,
