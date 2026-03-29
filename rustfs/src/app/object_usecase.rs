@@ -95,10 +95,12 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
-        AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
-        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
-        AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
+        AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
+        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_EXTRACT_ALT,
+        AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -334,10 +336,6 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
-const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
-const AMZ_SNOWBALL_PREFIX_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
-const AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
-const AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 const AMZ_META_PREFIX_LOWER: &str = "x-amz-meta-";
 const SNOWBALL_PREFIX_SUFFIX_LOWER: &str = "snowball-prefix";
 const SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER: &str = "snowball-ignore-dirs";
@@ -358,7 +356,7 @@ fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
 }
 
 fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
-    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
+    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_ALT)
 }
 
 fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> Option<String> {
@@ -393,7 +391,7 @@ fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
 }
 
 fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> String {
-    let path = path.trim_matches('/');
+    let path = path.trim_start_matches("./").trim_start_matches('/');
     let mut key = match prefix {
         Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
         Some(prefix) => prefix.to_string(),
@@ -663,11 +661,14 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
-    let prefix = snowball_meta_value_by_suffix(headers, AMZ_SNOWBALL_PREFIX_INTERNAL, SNOWBALL_PREFIX_SUFFIX_LOWER)
+    let prefix = snowball_meta_value_by_suffix(headers, AMZ_MINIO_SNOWBALL_PREFIX, SNOWBALL_PREFIX_SUFFIX_LOWER)
+        .or_else(|| snowball_meta_value_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_PREFIX, SNOWBALL_PREFIX_SUFFIX_LOWER))
         .and_then(|value| normalize_snowball_prefix(&value));
-    let ignore_dirs = snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
+    let ignore_dirs = snowball_meta_flag_by_suffix(headers, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER)
+        || snowball_meta_flag_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
     let ignore_errors =
-        snowball_meta_flag_by_suffix(headers, AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
+        snowball_meta_flag_by_suffix(headers, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER)
+            || snowball_meta_flag_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
 
     PutObjectExtractOptions {
         prefix,
@@ -4518,7 +4519,7 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4576,7 +4577,7 @@ mod tests {
     #[test]
     fn is_put_object_extract_requested_accepts_compat_header_case_insensitive() {
         let mut headers = HeaderMap::new();
-        headers.insert(AMZ_SNOWBALL_EXTRACT_COMPAT, HeaderValue::from_static(" TRUE "));
+        headers.insert(AMZ_SNOWBALL_EXTRACT_ALT, HeaderValue::from_static(" TRUE "));
 
         assert!(is_put_object_extract_requested(&headers));
     }
@@ -4599,7 +4600,7 @@ mod tests {
     #[test]
     fn normalize_extract_entry_key_applies_prefix_and_directory_suffix() {
         assert_eq!(
-            normalize_extract_entry_key("nested/path.txt", Some("imports"), false),
+            normalize_extract_entry_key("./nested/path.txt", Some("imports"), false),
             "imports/nested/path.txt"
         );
         assert_eq!(normalize_extract_entry_key("nested/dir/", Some("imports"), true), "imports/nested/dir/");
@@ -4623,9 +4624,9 @@ mod tests {
     #[test]
     fn resolve_put_object_extract_options_accepts_internal_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(AMZ_SNOWBALL_PREFIX_INTERNAL, HeaderValue::from_static("/internal/prefix/"));
-        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, HeaderValue::from_static("true"));
-        headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, HeaderValue::from_static("TRUE"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_PREFIX, HeaderValue::from_static("/internal/prefix/"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static("true"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
 
         let options = resolve_put_object_extract_options(&headers);
         assert_eq!(options.prefix.as_deref(), Some("internal/prefix"));
@@ -4636,25 +4637,15 @@ mod tests {
     #[test]
     fn resolve_put_object_extract_options_accepts_suffix_compatible_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("x-amz-meta-acme-snowball-prefix"),
-            HeaderValue::from_static(" /partner/import "),
-        );
-        headers.insert(
-            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-dirs"),
-            HeaderValue::from_static(" true "),
-        );
-        headers.insert(
-            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-errors"),
-            HeaderValue::from_static("TRUE"),
-        );
+        headers.insert("x-amz-meta-acme-snowball-prefix", HeaderValue::from_static(" /partner/import "));
+        headers.insert("x-amz-meta-acme-snowball-ignore-dirs", HeaderValue::from_static(" true "));
+        headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("TRUE"));
 
         let options = resolve_put_object_extract_options(&headers);
         assert_eq!(options.prefix.as_deref(), Some("partner/import"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
     }
-
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
         let input = PutObjectInput::builder()

@@ -40,6 +40,10 @@ mod quota_test;
 #[cfg(test)]
 mod bucket_policy_check_test;
 
+/// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
+#[cfg(test)]
+mod existing_object_tag_policy_test;
+
 // Regression tests for Issue #2036: anonymous access with PublicAccessBlock
 #[cfg(test)]
 mod anonymous_access_test;
@@ -104,3 +108,6 @@ mod object_lambda_test;
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;
+
+#[cfg(test)]
+mod snowball_auto_extract_test;

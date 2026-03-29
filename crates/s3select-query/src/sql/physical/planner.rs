@@ -19,7 +19,6 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
-use datafusion::physical_optimizer::coalesce_batches::CoalesceBatches;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{
@@ -68,9 +67,6 @@ impl Default for DefaultPhysicalPlanner {
             // repartitioning and local sorting steps to meet distribution and ordering requirements.
             // Therefore, it should run before EnforceDistribution and EnforceSorting.
             Arc::new(JoinSelection::new()),
-            // The CoalesceBatches rule will not influence the distribution and ordering of the
-            // whole plan tree. Therefore, to avoid influencing other rules, it should run last.
-            Arc::new(CoalesceBatches::new()),
         ];
 
         Self {
