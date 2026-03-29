@@ -470,8 +470,11 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
+#[cfg(test)]
 const AMZ_SNOWBALL_PREFIX_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+#[cfg(test)]
 const AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+#[cfg(test)]
 const AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 const AMZ_META_PREFIX_LOWER: &str = "x-amz-meta-";
 const SNOWBALL_PREFIX_SUFFIX_LOWER: &str = "snowball-prefix";
