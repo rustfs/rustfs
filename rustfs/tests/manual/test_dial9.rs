@@ -6,7 +6,7 @@
 // This file lives under `rustfs/tests/manual` and is registered explicitly in
 // `rustfs/Cargo.toml` so it stays out of `cargo test` auto-discovery.
 use rustfs_obs::dial9::{Dial9Config, Dial9SessionGuard};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,4 +79,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== All Tests Passed! ===");
     Ok(())
 }
-

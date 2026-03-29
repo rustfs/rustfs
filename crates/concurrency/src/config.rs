@@ -239,7 +239,10 @@ mod tests {
             max_timeout: Duration::from_secs(50),
             ..Default::default()
         };
-        assert!(config.validate().is_err(), "validate() should return an error when default_timeout > max_timeout");
+        assert!(
+            config.validate().is_err(),
+            "validate() should return an error when default_timeout > max_timeout"
+        );
     }
 
     #[test]

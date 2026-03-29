@@ -99,8 +99,7 @@ fn percentile(values: &[u128], p: f64) -> u128 {
 
 impl DownloadSettings {
     fn from_env() -> Result<Self> {
-        let urls_raw = env::var("DOWNLOAD_URLS")
-            .context("missing DOWNLOAD_URLS, expected comma-separated URLs")?;
+        let urls_raw = env::var("DOWNLOAD_URLS").context("missing DOWNLOAD_URLS, expected comma-separated URLs")?;
 
         let urls: Vec<String> = urls_raw
             .split(',')
@@ -110,9 +109,7 @@ impl DownloadSettings {
             .collect();
 
         if urls.is_empty() {
-            return Err(anyhow!(
-                "DOWNLOAD_URLS is empty, expected comma-separated URLs"
-            ));
+            return Err(anyhow!("DOWNLOAD_URLS is empty, expected comma-separated URLs"));
         }
 
         let output_dir = env::var("DOWNLOAD_OUTPUT_DIR")
@@ -159,7 +156,7 @@ fn original_filename(url: &str) -> String {
         .and_then(|parsed| {
             parsed
                 .path_segments()
-                .and_then(|segments| segments.filter(|s| !s.is_empty()).next_back())
+                .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
                 .map(ToString::to_string)
         })
         .filter(|name| !name.is_empty())
@@ -301,8 +298,7 @@ async fn run_concurrent_downloads(settings: DownloadSettings) -> Result<Download
             let retry_backoff_ms = settings.retry_backoff_ms;
             async move {
                 let current_url = url.clone();
-                let result =
-                    download_one(&client, &output_dir, index, url, max_retries, retry_backoff_ms).await;
+                let result = download_one(&client, &output_dir, index, url, max_retries, retry_backoff_ms).await;
                 (index, current_url, result)
             }
         })
@@ -404,12 +400,8 @@ async fn concurrent_download_tool() -> Result<()> {
             );
         }
 
-        return Err(anyhow!(
-            "download finished with {} failures",
-            summary.failures.len()
-        ));
+        return Err(anyhow!("download finished with {} failures", summary.failures.len()));
     }
 
     Ok(())
 }
-

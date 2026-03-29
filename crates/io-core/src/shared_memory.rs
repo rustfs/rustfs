@@ -76,13 +76,21 @@ pub struct ArcMetadata {
 ///
 /// This wrapper uses Arc to enable shared ownership of data
 /// across multiple tasks without copying.
-#[derive(Clone)]
 pub struct ArcData<T> {
     /// The wrapped data
     inner: Arc<T>,
 
     /// Metadata about the data
     metadata: ArcMetadata,
+}
+
+impl<T> Clone for ArcData<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 impl<T> ArcData<T> {
@@ -204,9 +212,9 @@ impl SharedMemoryPool {
     ///
     /// This method creates a new ArcData that shares the underlying data
     /// without copying.
-    pub fn share<'a, T>(&self, data: &'a ArcData<T>) -> &'a ArcData<T> {
+    pub fn share<T>(&self, data: &ArcData<T>) -> ArcData<T> {
         self.stats.total_shared_refs.fetch_add(1, Ordering::Relaxed);
-        data
+        data.clone()
     }
 
     /// Get the statistics for this pool.
