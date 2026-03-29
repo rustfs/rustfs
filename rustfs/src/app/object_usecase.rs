@@ -5086,6 +5086,37 @@ mod tests {
     }
 
     #[test]
+    fn should_use_zero_copy_rejects_small_objects() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy(1024 * 1024 - 1, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_encrypted_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption", HeaderValue::from_static("AES256"));
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_compressible_content_types() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json; charset=utf-8"));
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_allows_large_unencrypted_binary_objects() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+
+        assert!(should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
     fn resolve_put_object_extract_options_defaults_when_headers_missing() {
         let headers = HeaderMap::new();
         let options = resolve_put_object_extract_options(&headers);
