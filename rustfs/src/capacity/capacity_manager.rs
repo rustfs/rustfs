@@ -27,7 +27,7 @@ use rustfs_config::{
     ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -80,39 +80,20 @@ impl CachedCapacityConfig {
                 ENV_CAPACITY_WRITE_TRIGGER_DELAY,
                 DEFAULT_WRITE_TRIGGER_DELAY_SECS,
             )),
-            write_frequency_threshold: get_env_usize(
-                ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
-                DEFAULT_WRITE_FREQUENCY_THRESHOLD,
-            ),
+            write_frequency_threshold: get_env_usize(ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_FREQUENCY_THRESHOLD),
             fast_update_threshold: Duration::from_secs(get_env_u64(
                 ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
                 DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
             )),
-            max_files_threshold: get_env_usize(
-                ENV_CAPACITY_MAX_FILES_THRESHOLD,
-                DEFAULT_MAX_FILES_THRESHOLD,
-            ),
-            stat_timeout: Duration::from_secs(get_env_u64(
-                ENV_CAPACITY_STAT_TIMEOUT,
-                DEFAULT_STAT_TIMEOUT_SECS,
-            )),
+            max_files_threshold: get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD),
+            stat_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS)),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
-            follow_symlinks: get_env_bool(
-                ENV_CAPACITY_FOLLOW_SYMLINKS,
-                DEFAULT_CAPACITY_FOLLOW_SYMLINKS,
-            ),
-            max_symlink_depth:
-                get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8,
-            enable_dynamic_timeout: get_env_bool(
-                ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
-                DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
-            ),
+            follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
+            max_symlink_depth: get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8,
+            enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
             min_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS)),
             max_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS)),
-            stall_timeout: Duration::from_secs(get_env_u64(
-                ENV_CAPACITY_STALL_TIMEOUT,
-                DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
-            )),
+            stall_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_STALL_TIMEOUT, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS)),
         }
     }
 }
@@ -120,11 +101,12 @@ impl CachedCapacityConfig {
 /// Get cached capacity configuration (reads environment variables once)
 #[cfg(not(test))]
 fn get_cached_config() -> &'static CachedCapacityConfig {
-    static CONFIG: OnceLock<CachedCapacityConfig> = OnceLock::new();
+    static CONFIG: std::sync::OnceLock<CachedCapacityConfig> = std::sync::OnceLock::new();
     CONFIG.get_or_init(CachedCapacityConfig::from_env)
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn get_cached_config() -> CachedCapacityConfig {
     // Don't cache in tests to allow temp_env::with_var to work
     CachedCapacityConfig::from_env()

@@ -205,10 +205,7 @@ impl CapacityMetrics {
     /// Get symlink statistics
     #[allow(dead_code)]
     pub fn get_symlink_stats(&self) -> (u64, u64) {
-        (
-            self.symlink_count.load(Ordering::Relaxed),
-            self.symlink_size.load(Ordering::Relaxed),
-        )
+        (self.symlink_count.load(Ordering::Relaxed), self.symlink_size.load(Ordering::Relaxed))
     }
 
     /// Get timeout statistics
@@ -236,11 +233,7 @@ impl CapacityMetrics {
         let hits = self.cache_hits.load(Ordering::Relaxed);
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
+        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
     }
 
     /// Get average update duration
@@ -329,9 +322,7 @@ static CAPACITY_METRICS: std::sync::OnceLock<Arc<CapacityMetrics>> = std::sync::
 
 /// Get global metrics
 pub fn get_capacity_metrics() -> Arc<CapacityMetrics> {
-    CAPACITY_METRICS
-        .get_or_init(|| Arc::new(CapacityMetrics::new()))
-        .clone()
+    CAPACITY_METRICS.get_or_init(|| Arc::new(CapacityMetrics::new())).clone()
 }
 
 /// Start metrics logging task
