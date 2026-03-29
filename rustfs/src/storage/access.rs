@@ -25,7 +25,10 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_policy::policy::{Args, BucketPolicy, BucketPolicyArgs, bucket_policy_uses_existing_object_tag_conditions};
+use rustfs_policy::policy::{
+    Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
+    bucket_policy_uses_existing_object_tag_conditions,
+};
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
@@ -93,29 +96,93 @@ fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
     headers.contains_key(AMZ_WRITE_OFFSET_BYTES_HEADER)
 }
 
-/// Returns true if the bucket has a policy that uses `s3:ExistingObjectTag` (or
-/// `ExistingObjectTag/...`) conditions. Used to skip fetching object tags when
-/// no tag-based policy is in effect.
-async fn bucket_policy_uses_existing_object_tag(bucket: &str) -> bool {
-    let Ok((policy_str, _)) = metadata_sys::get_bucket_policy_raw(bucket).await else {
-        return false;
-    };
-    bucket_policy_doc_uses_existing_object_tag(&policy_str)
+/// True when the bucket policy may evaluate `s3:ExistingObjectTag` for this request (statement
+/// matches principal/action/resource and conditions reference ExistingObjectTag keys).
+enum BucketPolicyExistingObjectTagHint {
+    NoTagRequirement,
+    ConservativeTagRequired,
+    Parsed(BucketPolicy),
 }
 
-fn bucket_policy_doc_uses_existing_object_tag(policy_str: &str) -> bool {
-    // Fast path: avoid JSON parsing when the marker does not exist at all.
-    if !policy_str.contains("ExistingObjectTag") {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketPolicyRawLoadErrorKind {
+    PolicyMissing,
+    BucketMissing,
+    Other,
+}
+
+fn classify_bucket_policy_raw_load_error(err: &StorageError) -> BucketPolicyRawLoadErrorKind {
+    if err == &StorageError::ConfigNotFound {
+        BucketPolicyRawLoadErrorKind::PolicyMissing
+    } else if is_err_bucket_not_found(err) {
+        BucketPolicyRawLoadErrorKind::BucketMissing
+    } else {
+        BucketPolicyRawLoadErrorKind::Other
     }
+}
 
-    let Ok(policy) = serde_json::from_str::<BucketPolicy>(policy_str) else {
-        // Keep previous fail-safe behavior for malformed policy JSON:
-        // marker present means we conservatively fetch tags.
-        return true;
+/// Load and parse bucket policy once for ExistingObjectTag hint checks.
+async fn load_bucket_policy_existing_object_tag_hint(bucket: &str, action: Action) -> BucketPolicyExistingObjectTagHint {
+    let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(bucket).await {
+        Ok(v) => v,
+        Err(err) => match classify_bucket_policy_raw_load_error(&err) {
+            BucketPolicyRawLoadErrorKind::PolicyMissing => {
+                tracing::debug!(
+                    bucket = %bucket,
+                    ?action,
+                    "bucket policy not configured while checking ExistingObjectTag hint; treating as no tag requirement"
+                );
+                return BucketPolicyExistingObjectTagHint::NoTagRequirement;
+            }
+            BucketPolicyRawLoadErrorKind::BucketMissing => {
+                tracing::debug!(
+                    bucket = %bucket,
+                    ?action,
+                    error = %err,
+                    "bucket missing while checking ExistingObjectTag hint; treating as no tag requirement"
+                );
+                return BucketPolicyExistingObjectTagHint::NoTagRequirement;
+            }
+            BucketPolicyRawLoadErrorKind::Other => {
+                tracing::warn!(
+                    bucket = %bucket,
+                    ?action,
+                    error = %err,
+                    "failed to load bucket policy while checking ExistingObjectTag hint; conservatively enabling tag fetch"
+                );
+                return BucketPolicyExistingObjectTagHint::ConservativeTagRequired;
+            }
+        },
     };
+    match serde_json::from_str::<BucketPolicy>(policy_str.as_str()) {
+        Ok(policy) => {
+            if bucket_policy_uses_existing_object_tag_conditions(&policy) {
+                BucketPolicyExistingObjectTagHint::Parsed(policy)
+            } else {
+                BucketPolicyExistingObjectTagHint::NoTagRequirement
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                bucket = %bucket,
+                ?action,
+                error = %err,
+                "malformed bucket policy while checking ExistingObjectTag hint; conservatively enabling tag fetch"
+            );
+            BucketPolicyExistingObjectTagHint::ConservativeTagRequired
+        }
+    }
+}
 
-    bucket_policy_uses_existing_object_tag_conditions(&policy)
+async fn bucket_policy_needs_existing_object_tag_from_hint(
+    hint: &BucketPolicyExistingObjectTagHint,
+    args: &BucketPolicyArgs<'_>,
+) -> bool {
+    match hint {
+        BucketPolicyExistingObjectTagHint::NoTagRequirement => false,
+        BucketPolicyExistingObjectTagHint::ConservativeTagRequired => true,
+        BucketPolicyExistingObjectTagHint::Parsed(policy) => bucket_policy_needs_existing_object_tag_for_args(policy, args).await,
+    }
 }
 
 fn merge_object_tag_conditions(conditions: &mut HashMap<String, Vec<String>>, tags: &HashMap<String, Vec<String>>) {
@@ -145,6 +212,58 @@ fn action_tag_metric_label(action: &Action) -> &'static str {
 fn auth_fs() -> &'static FS {
     static AUTH_FS: OnceLock<FS> = OnceLock::new();
     AUTH_FS.get_or_init(FS::new)
+}
+
+/// Extra action that may be evaluated in the same authorization flow and can
+/// independently require `ExistingObjectTag` conditions.
+fn secondary_tag_hint_action(action: Action, version_id: Option<&str>) -> Option<Action> {
+    match action {
+        Action::S3Action(S3Action::DeleteObjectAction) if version_id.is_some() => {
+            Some(Action::S3Action(S3Action::DeleteObjectVersionAction))
+        }
+        _ => None,
+    }
+}
+
+async fn get_or_fetch_object_tag_conditions<T>(
+    req: &mut S3Request<T>,
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    action: Action,
+) -> S3Result<HashMap<String, Vec<String>>> {
+    if let Some(cached) = req.extensions.get::<ObjectTagConditions>()
+        && cached.matches(bucket, object, version_id)
+    {
+        return Ok(cached.values.clone());
+    }
+
+    counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
+    let fetched = auth_fs()
+        .get_object_tag_conditions_for_policy(bucket, object, version_id)
+        .await?;
+    req.extensions
+        .insert(ObjectTagConditions::new(bucket, object, version_id, fetched.clone()));
+    Ok(fetched)
+}
+
+async fn maybe_merge_object_tag_conditions<T>(
+    req: &mut S3Request<T>,
+    action: Action,
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    conditions: &mut HashMap<String, Vec<String>>,
+    needs_tag: bool,
+) -> S3Result<()> {
+    if !needs_tag || bucket.is_empty() || object.is_empty() {
+        counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
+        return Ok(());
+    }
+
+    let tags = get_or_fetch_object_tag_conditions(req, bucket, object, version_id, action).await?;
+    merge_object_tag_conditions(conditions, &tags);
+    Ok(())
 }
 
 /// Returns true when the owner (root or parent=root credentials) may bypass bucket policy
@@ -195,35 +314,78 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             deny_only: false,
         };
         let prepared = iam_store.prepare_auth(&action_args).await;
-        let needs_tag_from_iam = prepared.needs_existing_object_tag;
+        let mut needs_tag_from_iam = prepared.needs_existing_object_tag;
 
-        let needs_tag_from_bucket =
-            !bucket.is_empty() && !object.is_empty() && bucket_policy_uses_existing_object_tag(&bucket).await;
-        let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
-        if needs_tag && !bucket.is_empty() && !object.is_empty() {
-            let mut tag_conditions = None;
-            if let Some(cached) = req.extensions.get::<ObjectTagConditions>()
-                && cached.matches(&bucket, &object, version_id.as_deref())
-            {
-                tag_conditions = Some(cached.values.clone());
-            }
-
-            if tag_conditions.is_none() {
-                counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
-                let fetched = auth_fs()
-                    .get_object_tag_conditions_for_policy(&bucket, &object, version_id.as_deref())
-                    .await?;
-                req.extensions
-                    .insert(ObjectTagConditions::new(&bucket, &object, version_id.as_deref(), fetched.clone()));
-                tag_conditions = Some(fetched);
-            }
-
-            if let Some(tags) = tag_conditions {
-                merge_object_tag_conditions(&mut conditions, &tags);
-            }
+        let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
+            Some(load_bucket_policy_existing_object_tag_hint(bucket.as_str(), action).await)
         } else {
-            counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
+            None
+        };
+        let mut needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
+            let bucket_args = BucketPolicyArgs {
+                bucket: bucket.as_str(),
+                action,
+                is_owner,
+                account: cred.access_key.as_str(),
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: object.as_str(),
+            };
+            bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await
+        } else {
+            false
+        };
+
+        let secondary_action = secondary_tag_hint_action(action, version_id.as_deref());
+        if let Some(extra_action) = secondary_action {
+            let extra_args = Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: extra_action,
+                bucket: bucket.as_str(),
+                conditions: &conditions,
+                is_owner,
+                object: object.as_str(),
+                claims,
+                deny_only: false,
+            };
+            needs_tag_from_iam |= prepared.needs_existing_object_tag_for_args(&extra_args).await;
+
+            if let Some(hint) = bucket_tag_hint.as_ref() {
+                let extra_bucket_args = BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action: extra_action,
+                    is_owner,
+                    account: cred.access_key.as_str(),
+                    groups: &cred.groups,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                };
+                needs_tag_from_bucket |= bucket_policy_needs_existing_object_tag_from_hint(hint, &extra_bucket_args).await;
+            }
         }
+
+        let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
+        if needs_tag {
+            tracing::debug!(
+                bucket = %bucket,
+                ?action,
+                ?secondary_action,
+                needs_tag_from_iam,
+                needs_tag_from_bucket,
+                "authorize_request ExistingObjectTag hint requires tag conditions"
+            );
+        }
+        maybe_merge_object_tag_conditions(
+            req,
+            action,
+            bucket.as_str(),
+            object.as_str(),
+            version_id.as_deref(),
+            &mut conditions,
+            needs_tag,
+        )
+        .await?;
         let bucket_name = bucket.as_str();
 
         // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
@@ -354,30 +516,59 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             req.uri.query(),
         );
 
-        let needs_tag_from_bucket =
-            !bucket.is_empty() && !object.is_empty() && bucket_policy_uses_existing_object_tag(&bucket).await;
-        if needs_tag_from_bucket {
-            let mut tag_conditions = None;
-            if let Some(cached) = req.extensions.get::<ObjectTagConditions>()
-                && cached.matches(&bucket, &object, version_id.as_deref())
-            {
-                tag_conditions = Some(cached.values.clone());
-            }
-            if tag_conditions.is_none() {
-                counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
-                let fetched = auth_fs()
-                    .get_object_tag_conditions_for_policy(&bucket, &object, version_id.as_deref())
-                    .await?;
-                req.extensions
-                    .insert(ObjectTagConditions::new(&bucket, &object, version_id.as_deref(), fetched.clone()));
-                tag_conditions = Some(fetched);
-            }
-            if let Some(tags) = tag_conditions {
-                merge_object_tag_conditions(&mut conditions, &tags);
-            }
+        let no_groups: Option<Vec<String>> = None;
+        let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
+            Some(load_bucket_policy_existing_object_tag_hint(bucket.as_str(), action).await)
         } else {
-            counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
+            None
+        };
+        let mut needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
+            let bucket_args = BucketPolicyArgs {
+                bucket: bucket.as_str(),
+                action,
+                is_owner: false,
+                account: "",
+                groups: &no_groups,
+                conditions: &conditions,
+                object: object.as_str(),
+            };
+            bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await
+        } else {
+            false
+        };
+        let secondary_action = secondary_tag_hint_action(action, version_id.as_deref());
+        if let Some(extra_action) = secondary_action
+            && let Some(hint) = bucket_tag_hint.as_ref()
+        {
+            let extra_bucket_args = BucketPolicyArgs {
+                bucket: bucket.as_str(),
+                action: extra_action,
+                is_owner: false,
+                account: "",
+                groups: &no_groups,
+                conditions: &conditions,
+                object: object.as_str(),
+            };
+            needs_tag_from_bucket |= bucket_policy_needs_existing_object_tag_from_hint(hint, &extra_bucket_args).await;
         }
+        if needs_tag_from_bucket {
+            tracing::debug!(
+                bucket = %bucket,
+                ?action,
+                ?secondary_action,
+                "anonymous authorize_request ExistingObjectTag hint requires tag conditions"
+            );
+        }
+        maybe_merge_object_tag_conditions(
+            req,
+            action,
+            bucket.as_str(),
+            object.as_str(),
+            version_id.as_deref(),
+            &mut conditions,
+            needs_tag_from_bucket,
+        )
+        .await?;
         let bucket_name = bucket.as_str();
 
         if !bucket_name.is_empty()
@@ -397,6 +588,22 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
+            if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
+                let delete_version_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                    is_owner: false,
+                    account: "",
+                    groups: &None,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                })
+                .await;
+                if !delete_version_allowed {
+                    return Err(s3_error!(AccessDenied, "Access Denied"));
+                }
+            }
+
             let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action,
@@ -1643,6 +1850,7 @@ impl S3Access for FS {
 mod tests {
     use super::*;
     use http::{HeaderMap, Method, Uri};
+    use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use std::collections::HashMap;
     use time::OffsetDateTime;
 
@@ -1762,15 +1970,34 @@ mod tests {
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
 
-    /// When bucket has no policy or policy fetch fails, tag-based check is skipped (returns false).
+    /// When policy metadata cannot be loaded, tag-based check is conservative (returns true).
     #[tokio::test]
-    async fn test_bucket_policy_uses_existing_object_tag_no_policy() {
-        let result = bucket_policy_uses_existing_object_tag("test-bucket-no-policy-xyz-absent").await;
-        assert!(!result, "bucket with no policy should not use ExistingObjectTag");
+    async fn test_bucket_policy_needs_existing_object_tag_load_failure_is_conservative() {
+        let conditions = HashMap::new();
+        let hint = load_bucket_policy_existing_object_tag_hint(
+            "test-bucket-no-policy-xyz-absent",
+            Action::S3Action(S3Action::GetObjectAction),
+        )
+        .await;
+        let no_groups: Option<Vec<String>> = None;
+        let args = BucketPolicyArgs {
+            bucket: "test-bucket-no-policy-xyz-absent",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "",
+            groups: &no_groups,
+            conditions: &conditions,
+            object: "obj",
+        };
+        let result = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args).await;
+        assert!(
+            result,
+            "when policy metadata cannot be loaded, ExistingObjectTag should be fetched conservatively"
+        );
     }
 
     #[test]
-    fn test_bucket_policy_doc_uses_existing_object_tag_matches_condition_keys_only() {
+    fn test_bucket_policy_existing_object_tag_condition_key_detection() {
         let condition_key_policy = r#"{
   "Version":"2012-10-17",
   "Statement":[{
@@ -1781,8 +2008,9 @@ mod tests {
     "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
   }]
 }"#;
+        let policy: BucketPolicy = serde_json::from_str(condition_key_policy).expect("valid bucket policy JSON");
         assert!(
-            bucket_policy_doc_uses_existing_object_tag(condition_key_policy),
+            bucket_policy_uses_existing_object_tag_conditions(&policy),
             "ExistingObjectTag in condition key must be detected"
         );
 
@@ -1796,18 +2024,45 @@ mod tests {
     "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
   }]
 }"#;
+        let policy: BucketPolicy = serde_json::from_str(value_only_policy).expect("valid bucket policy JSON");
         assert!(
-            !bucket_policy_doc_uses_existing_object_tag(value_only_policy),
+            !bucket_policy_uses_existing_object_tag_conditions(&policy),
             "ExistingObjectTag text in values should not trigger tag dependency"
         );
     }
 
     #[test]
-    fn test_bucket_policy_doc_uses_existing_object_tag_malformed_fallback() {
-        let malformed_with_marker = r#"{"Version":"2012-10-17","Statement":[INVALID,"ExistingObjectTag"]}"#;
-        assert!(
-            bucket_policy_doc_uses_existing_object_tag(malformed_with_marker),
-            "malformed JSON with marker should conservatively require tag fetch"
+    fn test_unparsable_bucket_policy_json_implies_conservative_existing_object_tag_fetch() {
+        // Matches `load_bucket_policy_existing_object_tag_hint`: unparsable policy => conservative tag fetch.
+        let malformed = r#"{"Version":"2012-10-17","Statement":[INVALID]}"#;
+        assert!(serde_json::from_str::<BucketPolicy>(malformed).is_err());
+        let conservative_fetch = serde_json::from_str::<BucketPolicy>(malformed)
+            .map(|p| bucket_policy_uses_existing_object_tag_conditions(&p))
+            .unwrap_or(true);
+        assert!(conservative_fetch);
+
+        // Invalid JSON that still contains real ExistingObjectTag condition keys (trailing comma).
+        let malformed_with_tag_keys = r#"{"Version":"2012-10-17","Statement":[{"Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}},]}"#;
+        assert!(serde_json::from_str::<BucketPolicy>(malformed_with_tag_keys).is_err());
+        let conservative_with_tag_keys = serde_json::from_str::<BucketPolicy>(malformed_with_tag_keys)
+            .map(|p| bucket_policy_uses_existing_object_tag_conditions(&p))
+            .unwrap_or(true);
+        assert!(conservative_with_tag_keys);
+    }
+
+    #[test]
+    fn test_classify_bucket_policy_raw_load_error() {
+        assert_eq!(
+            classify_bucket_policy_raw_load_error(&StorageError::ConfigNotFound),
+            BucketPolicyRawLoadErrorKind::PolicyMissing
+        );
+        assert_eq!(
+            classify_bucket_policy_raw_load_error(&StorageError::BucketNotFound("b".to_string())),
+            BucketPolicyRawLoadErrorKind::BucketMissing
+        );
+        assert_eq!(
+            classify_bucket_policy_raw_load_error(&StorageError::Io(std::io::Error::other("boom"))),
+            BucketPolicyRawLoadErrorKind::Other
         );
     }
 
@@ -1829,6 +2084,87 @@ mod tests {
             false,
             &Action::S3Action(S3Action::DeleteBucketPolicyAction)
         ));
+    }
+
+    #[test]
+    fn test_secondary_tag_hint_action_for_delete_object_version() {
+        assert_eq!(
+            secondary_tag_hint_action(Action::S3Action(S3Action::DeleteObjectAction), Some("v1")),
+            Some(Action::S3Action(S3Action::DeleteObjectVersionAction))
+        );
+        assert_eq!(secondary_tag_hint_action(Action::S3Action(S3Action::DeleteObjectAction), None), None);
+        assert_eq!(
+            secondary_tag_hint_action(Action::S3Action(S3Action::ListBucketVersionsAction), None),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_delete_object_with_version_requires_secondary_policy_and_tag_hint() {
+        let policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:DeleteObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:DeleteObjectVersion"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+        let hint = BucketPolicyExistingObjectTagHint::Parsed(policy.clone());
+        let no_groups: Option<Vec<String>> = None;
+        let conditions = HashMap::new();
+
+        let args_delete = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::DeleteObjectAction),
+            is_owner: false,
+            account: "",
+            groups: &no_groups,
+            conditions: &conditions,
+            object: "obj",
+        };
+        assert!(
+            policy.is_allowed(&args_delete).await,
+            "anonymous DeleteObject can be allowed by bucket policy"
+        );
+
+        let args_delete_version = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+            is_owner: false,
+            account: "",
+            groups: &no_groups,
+            conditions: &conditions,
+            object: "obj",
+        };
+        assert!(
+            !policy.is_allowed(&args_delete_version).await,
+            "DeleteObjectVersion should still be denied without matching ExistingObjectTag conditions"
+        );
+
+        let needs_tag_main = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete).await;
+        let needs_tag_secondary = bucket_policy_needs_existing_object_tag_from_hint(&hint, &args_delete_version).await;
+        assert!(!needs_tag_main, "DeleteObject statement itself does not require ExistingObjectTag");
+        assert!(
+            needs_tag_secondary,
+            "DeleteObjectVersion statement requires ExistingObjectTag when version delete is evaluated"
+        );
+        assert!(
+            needs_tag_main || needs_tag_secondary,
+            "combined primary+secondary check must require tag fetch for DeleteObject(versionId)"
+        );
     }
 
     #[tokio::test]

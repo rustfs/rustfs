@@ -35,7 +35,7 @@ use rustfs_policy::auth::{
 };
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
-use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_uses_existing_object_tag_conditions};
+use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -104,6 +104,37 @@ enum PreparedIamMode {
 pub struct PreparedIamAuth {
     pub needs_existing_object_tag: bool,
     mode: PreparedIamMode,
+}
+
+impl PreparedIamAuth {
+    /// Evaluate whether the already-prepared IAM context needs ExistingObjectTag
+    /// conditions for the provided request args.
+    pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
+        match &self.mode {
+            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Regular { combined_policy } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+            }
+            PreparedIamMode::Sts {
+                combined_policy,
+                session_policy,
+                ..
+            } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+                    || prepared_session_policy_needs_existing_object_tag_for_args(session_policy, args).await
+            }
+            PreparedIamMode::ServiceAccount {
+                combined_policy,
+                mode,
+                session_policy,
+                ..
+            } => {
+                policy_needs_existing_object_tag_for_args(combined_policy, args).await
+                    || matches!(mode, PreparedServicePolicyMode::SessionBound)
+                        && prepared_session_policy_needs_existing_object_tag_for_args(session_policy, args).await
+            }
+        }
+    }
 }
 
 impl<T: Store> IamSys<T> {
@@ -902,7 +933,7 @@ impl<T: Store> IamSys<T> {
 
         let combined_policy = self.get_combined_policy(&policies).await;
         PreparedIamAuth {
-            needs_existing_object_tag: policy_uses_existing_object_tag(&combined_policy),
+            needs_existing_object_tag: policy_needs_existing_object_tag_for_args(&combined_policy, args).await,
             mode: PreparedIamMode::Regular { combined_policy },
         }
     }
@@ -1007,8 +1038,8 @@ impl<T: Store> IamSys<T> {
             effective_groups
         );
         PreparedIamAuth {
-            needs_existing_object_tag: policy_uses_existing_object_tag(&combined_policy)
-                || prepared_session_policy_uses_existing_object_tag(&session_policy),
+            needs_existing_object_tag: policy_needs_existing_object_tag_for_args(&combined_policy, args).await
+                || prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await,
             mode: PreparedIamMode::Sts {
                 is_owner,
                 combined_policy,
@@ -1100,9 +1131,9 @@ impl<T: Store> IamSys<T> {
         };
 
         let session_policy = prepare_session_policy(args, true);
-        let needs_existing_object_tag = policy_uses_existing_object_tag(&combined_policy)
+        let needs_existing_object_tag = policy_needs_existing_object_tag_for_args(&combined_policy, args).await
             || matches!(mode, PreparedServicePolicyMode::SessionBound)
-                && prepared_session_policy_uses_existing_object_tag(&session_policy);
+                && prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await;
 
         PreparedIamAuth {
             needs_existing_object_tag,
@@ -1127,15 +1158,9 @@ impl<T: Store> IamSys<T> {
     }
 }
 
-#[inline]
-fn policy_uses_existing_object_tag(policy: &Policy) -> bool {
-    policy_uses_existing_object_tag_conditions(policy)
-}
-
-#[inline]
-fn prepared_session_policy_uses_existing_object_tag(policy: &PreparedSessionPolicy) -> bool {
+async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &PreparedSessionPolicy, args: &Args<'_>) -> bool {
     match policy {
-        PreparedSessionPolicy::Policy(policy) => policy_uses_existing_object_tag(policy),
+        PreparedSessionPolicy::Policy(p) => policy_needs_existing_object_tag_for_args(p, args).await,
         PreparedSessionPolicy::None | PreparedSessionPolicy::DenyAll => false,
     }
 }
@@ -1234,6 +1259,7 @@ mod tests {
     use rustfs_policy::auth::UserIdentity;
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
     use std::collections::HashMap;
     use time::OffsetDateTime;
@@ -1692,7 +1718,7 @@ mod tests {
         )
         .expect("policy with value-only ExistingObjectTag text should parse");
         assert!(
-            !policy_uses_existing_object_tag(&with_value_only),
+            !policy_uses_existing_object_tag_conditions(&with_value_only),
             "ExistingObjectTag text in values should not trigger tag dependency"
         );
 
@@ -1709,7 +1735,7 @@ mod tests {
         )
         .expect("policy with ExistingObjectTag condition key should parse");
         assert!(
-            policy_uses_existing_object_tag(&with_condition_key),
+            policy_uses_existing_object_tag_conditions(&with_condition_key),
             "ExistingObjectTag condition key must trigger tag dependency"
         );
     }
@@ -1737,8 +1763,8 @@ mod tests {
         .expect("split-action policy should parse");
 
         assert!(
-            policy_uses_existing_object_tag(&split_action_policy),
-            "tag dependency must be detected from full merged policy, not only primary action"
+            policy_uses_existing_object_tag_conditions(&split_action_policy),
+            "full merged policy must still be detectable as containing ExistingObjectTag keys"
         );
     }
 

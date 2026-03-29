@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{Effect, Error as IamError, ID, Statement, action::Action, statement::BPStatement};
+use super::{
+    Effect, Error as IamError, Functions, ID, Statement, action::Action, statement::BPStatement,
+    statement::variable_resolver_for_policy_args,
+};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -289,20 +292,58 @@ pub fn value_uses_existing_object_tag_condition_key(value: &Value) -> bool {
     }
 }
 
+/// True if `conditions` JSON references `s3:ExistingObjectTag` / `ExistingObjectTag/...` keys.
+pub fn functions_use_existing_object_tag(conditions: &Functions) -> bool {
+    serde_json::to_value(conditions)
+        .map(|v| value_uses_existing_object_tag_condition_key(&v))
+        .unwrap_or(false)
+}
+
 pub fn policy_uses_existing_object_tag_conditions(policy: &Policy) -> bool {
-    policy.statements.iter().any(|statement| {
-        serde_json::to_value(&statement.conditions)
-            .map(|v| value_uses_existing_object_tag_condition_key(&v))
-            .unwrap_or(false)
-    })
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
 }
 
 pub fn bucket_policy_uses_existing_object_tag_conditions(policy: &BucketPolicy) -> bool {
-    policy.statements.iter().any(|statement| {
-        serde_json::to_value(&statement.conditions)
-            .map(|v| value_uses_existing_object_tag_condition_key(&v))
-            .unwrap_or(false)
-    })
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
+}
+
+/// True when at least one statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn policy_needs_existing_object_tag_for_args(policy: &Policy, args: &Args<'_>) -> bool {
+    if !policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    let resolver = variable_resolver_for_policy_args(args);
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args, &resolver).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when at least one bucket-policy statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn bucket_policy_needs_existing_object_tag_for_args(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
+    if !bucket_policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args).await {
+            return true;
+        }
+    }
+    false
 }
 
 pub mod default {
@@ -1446,5 +1487,210 @@ mod test {
         assert!(!bp.is_allowed(&args_no_enc).await, "Should deny PutObject with no encryption header");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_action() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let split_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObjectVersion"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("split-action policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_get = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_get).await,
+            "GetObject should not match statements with DeleteObject/DeleteObjectVersion"
+        );
+
+        let args_del = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_del).await,
+            "DeleteObject matches only the statement without ExistingObjectTag"
+        );
+
+        let args_delv = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&split_policy, &args_delv).await,
+            "DeleteObjectVersion matches the statement with ExistingObjectTag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_resource() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_public = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "public/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&policy, &args_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_private = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "private/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&policy, &args_private).await,
+            "resource match should keep ExistingObjectTag fetch hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_needs_existing_object_tag_narrows_by_principal() {
+        use crate::policy::BucketPolicyArgs;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":["alice"]},
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+
+        let args_bob = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "bob",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_bob).await,
+            "principal mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_public = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "public/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_private = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_private).await,
+            "principal and resource match should keep ExistingObjectTag fetch hint"
+        );
     }
 }
