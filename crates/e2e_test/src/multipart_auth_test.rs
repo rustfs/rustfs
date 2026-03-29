@@ -5216,6 +5216,59 @@ async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<()
 
 #[tokio::test]
 #[serial]
+async fn test_anonymous_put_object_write_offset_bytes_returns_not_implemented()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "anon-put-write-offset";
+    let key = "write-offset-object";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let response = local_http_client()
+        .put(format!("{}/{bucket}/{key}", env.url))
+        .header("x-amz-write-offset-bytes", "0")
+        .body("write-offset-body")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("<Code>NotImplemented</Code>"), "unexpected response body: {body}");
+
+    let head_after_reject = admin_client.head_object().bucket(bucket).key(key).send().await;
+    match head_after_reject.expect_err("rejected request should not create the object") {
+        SdkError::ServiceError(service_err) => {
+            let s3_err = service_err.into_err();
+            assert!(
+                s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound"),
+                "expected the rejected write to leave no object behind, got: {s3_err:?}"
+            );
+        }
+        other_err => panic!("expected missing object error after rejected write, got: {other_err:?}"),
+    }
+
+    let ok_response = local_http_client()
+        .put(format!("{}/{bucket}/{key}", env.url))
+        .body("plain-body")
+        .send()
+        .await?;
+    assert_eq!(ok_response.status(), reqwest::StatusCode::OK);
+
+    admin_client.head_object().bucket(bucket).key(key).send().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_error_body()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
