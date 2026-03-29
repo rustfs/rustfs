@@ -1670,6 +1670,28 @@ mod tests {
     }
 
     #[test]
+    fn versioning_configuration_has_object_lock_incompatible_settings_rejects_exclude_folders() {
+        let config = VersioningConfiguration {
+            exclude_folders: Some(true),
+            ..Default::default()
+        };
+
+        assert!(versioning_configuration_has_object_lock_incompatible_settings(&config));
+    }
+
+    #[test]
+    fn versioning_configuration_has_object_lock_incompatible_settings_rejects_excluded_prefixes() {
+        let config = VersioningConfiguration {
+            excluded_prefixes: Some(vec![ExcludedPrefix {
+                prefix: Some("archive/".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        assert!(versioning_configuration_has_object_lock_incompatible_settings(&config));
+    }
+
+    #[test]
     fn resolve_notification_region_prefers_global_region() {
         let binding = resolve_notification_region(Some("us-east-1".parse().unwrap()), Some("ap-southeast-1".parse().unwrap()));
         assert_eq!(binding, "us-east-1");
