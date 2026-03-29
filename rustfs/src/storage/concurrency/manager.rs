@@ -1093,11 +1093,16 @@ mod integration_tests {
         let is_sequential = true;
 
         let strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, permit_wait, is_sequential);
+        let media = manager.storage_media();
 
         // Verify basic optimizations work
-        assert_eq!(strategy.storage_media, manager.storage_media());
+        assert_eq!(strategy.storage_media, media);
         assert!(strategy.buffer_size >= base_buffer * 8 / 10, "Sequential should maintain or boost buffer");
-        assert!(strategy.enable_readahead, "Sequential reads should enable readahead");
+        let expected_readahead = !matches!(media, StorageMedia::Hdd);
+        assert_eq!(
+            strategy.enable_readahead, expected_readahead,
+            "Readahead should follow storage profile preference under low load"
+        );
         assert_eq!(strategy.load_level, IoLoadLevel::Low);
     }
 
@@ -1177,6 +1182,8 @@ mod integration_tests {
     #[serial]
     async fn test_concurrency_manager_multi_factor_strategy_buffer_clamp() {
         let manager = ConcurrencyManager::new();
+        let media = manager.storage_media();
+        let config = manager.scheduler_config();
 
         // Request very large base buffer
         let large_base = 16 * 1024 * 1024; // 16MB
@@ -1188,17 +1195,19 @@ mod integration_tests {
             true,
         );
 
-        // Should be limited to max (1MB) by either cap or clamp
-        assert!(strategy.buffer_size <= MI_B);
+        let media_cap = match media {
+            StorageMedia::Nvme => config.nvme_buffer_cap,
+            StorageMedia::Ssd => config.ssd_buffer_cap,
+            StorageMedia::Hdd => config.hdd_buffer_cap,
+            StorageMedia::Unknown => config.ssd_buffer_cap,
+        };
+        let expected_max = media_cap.min(MI_B);
 
-        #[cfg(feature = "io-scheduler-debug")]
-        assert!(
-            strategy.debug_info.clamp_max_applied || strategy.buffer_size == MI_B,
-            "Should apply max clamp or buffer cap"
+        // Large base buffer should be constrained by storage cap first, then global clamp.
+        assert_eq!(
+            strategy.buffer_size, expected_max,
+            "Buffer should be capped by media profile and global clamp"
         );
-
-        #[cfg(not(feature = "io-scheduler-debug"))]
-        assert!(strategy.buffer_size == MI_B, "Should apply max clamp or buffer cap");
     }
 
     #[tokio::test]

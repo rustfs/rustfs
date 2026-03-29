@@ -2662,9 +2662,16 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        let result =
-            Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
-                .await;
+        let result = Self::finalize_get_object_response(
+            helper,
+            &bucket,
+            &req.method,
+            &req.headers,
+            event_info,
+            version_id_for_event,
+            output,
+        )
+        .await;
         if result.is_ok() {
             request_guard.finish_ok();
         } else {
