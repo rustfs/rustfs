@@ -742,49 +742,49 @@ mod tests {
     #[serial]
     fn test_get_scheduled_update_interval() {
         let interval = get_scheduled_update_interval();
-        assert_eq!(interval, Duration::from_secs(300));
+        assert_eq!(interval, Duration::from_secs(120));
     }
 
     #[test]
     #[serial]
     fn test_get_write_trigger_delay() {
         let delay = get_write_trigger_delay();
-        assert_eq!(delay, Duration::from_secs(10));
+        assert_eq!(delay, Duration::from_secs(5));
     }
 
     #[test]
     #[serial]
     fn test_get_write_frequency_threshold() {
         let threshold = get_write_frequency_threshold();
-        assert_eq!(threshold, 10);
+        assert_eq!(threshold, 5);
     }
 
     #[test]
     #[serial]
     fn test_get_fast_update_threshold() {
         let threshold = get_fast_update_threshold();
-        assert_eq!(threshold, Duration::from_secs(60));
+        assert_eq!(threshold, Duration::from_secs(30));
     }
 
     #[test]
     #[serial]
     fn test_get_max_files_threshold() {
         let threshold = get_max_files_threshold();
-        assert_eq!(threshold, 1_000_000);
+        assert_eq!(threshold, 200_000);
     }
 
     #[test]
     #[serial]
     fn test_get_stat_timeout() {
         let timeout = get_stat_timeout();
-        assert_eq!(timeout, Duration::from_secs(5));
+        assert_eq!(timeout, Duration::from_secs(3));
     }
 
     #[test]
     #[serial]
     fn test_get_sample_rate() {
         let rate = get_sample_rate();
-        assert_eq!(rate, 100);
+        assert_eq!(rate, 200);
     }
 
     #[test]
@@ -907,10 +907,10 @@ mod tests {
         let config = HybridStrategyConfig::from_env();
 
         // Check default values
-        assert_eq!(config.scheduled_update_interval, Duration::from_secs(300));
-        assert_eq!(config.write_trigger_delay, Duration::from_secs(10));
-        assert_eq!(config.write_frequency_threshold, 10);
-        assert_eq!(config.fast_update_threshold, Duration::from_secs(60));
+        assert_eq!(config.scheduled_update_interval, Duration::from_secs(120));
+        assert_eq!(config.write_trigger_delay, Duration::from_secs(5));
+        assert_eq!(config.write_frequency_threshold, 5);
+        assert_eq!(config.fast_update_threshold, Duration::from_secs(30));
         assert!(config.enable_smart_update);
         assert!(config.enable_write_trigger);
     }

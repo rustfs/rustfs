@@ -122,10 +122,10 @@ mod tests {
     async fn test_config_from_env() {
         let config = HybridStrategyConfig::from_env();
 
-        assert_eq!(config.scheduled_update_interval, Duration::from_secs(300));
-        assert_eq!(config.write_trigger_delay, Duration::from_secs(10));
-        assert_eq!(config.write_frequency_threshold, 10);
-        assert_eq!(config.fast_update_threshold, Duration::from_secs(60));
+        assert_eq!(config.scheduled_update_interval, Duration::from_secs(120));
+        assert_eq!(config.write_trigger_delay, Duration::from_secs(5));
+        assert_eq!(config.write_frequency_threshold, 5);
+        assert_eq!(config.fast_update_threshold, Duration::from_secs(30));
         assert!(config.enable_smart_update);
         assert!(config.enable_write_trigger);
     }
