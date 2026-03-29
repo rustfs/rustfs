@@ -2912,4 +2912,48 @@ mod tests {
         assert_eq!(fi.erasure.parity_blocks, 2);
         assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
     }
+
+    #[test]
+    fn legacy_meta_v2_delete_marker_decodes_into_delete_fileinfo() {
+        let version_id = sample_version_id();
+        let mod_time = sample_mod_time();
+        let version = LegacyMetaV2Version {
+            version_type: LegacyMetaV2VersionType::DeleteMarker,
+            object: None,
+            delete_marker: Some(LegacyMetaV2DeleteMarker {
+                version_id: version_id.as_bytes().to_vec(),
+                mod_time: Some(mod_time),
+                meta_sys: std::collections::HashMap::from([("x-minio-internal".to_string(), b"present".to_vec())]),
+            }),
+            write_version: 7,
+        };
+
+        let decoded = FileMetaVersion::try_from(version).unwrap();
+
+        assert_eq!(decoded.version_type, VersionType::Delete);
+        assert!(decoded.uses_legacy_checksum);
+        assert!(decoded.object.is_none());
+
+        let delete_marker = decoded.delete_marker.as_ref().expect("delete marker should be decoded");
+        assert_eq!(delete_marker.version_id, Some(version_id));
+        assert_eq!(delete_marker.mod_time, Some(mod_time));
+
+        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true);
+        assert!(fi.deleted);
+        assert_eq!(fi.version_id, Some(version_id));
+        assert_eq!(fi.mod_time, Some(mod_time));
+        assert_eq!(fi.metadata.get("x-minio-internal").map(String::as_str), Some("present"));
+    }
+
+    #[test]
+    fn legacy_meta_v2_delete_marker_rejects_invalid_uuid_bytes() {
+        let err = MetaDeleteMarker::try_from(LegacyMetaV2DeleteMarker {
+            version_id: vec![1, 2, 3],
+            mod_time: Some(sample_mod_time()),
+            meta_sys: std::collections::HashMap::new(),
+        })
+        .expect_err("invalid legacy delete-marker version ids should be rejected");
+
+        assert!(err.to_string().contains("legacy version_id must be 16 bytes"));
+    }
 }
