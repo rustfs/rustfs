@@ -312,7 +312,9 @@ impl ProgressMonitor {
                 files_processed, elapsed, dynamic_timeout
             );
 
-            record_capacity_dynamic_timeout(dynamic_timeout);
+            if self.enable_dynamic_timeout {
+                record_capacity_dynamic_timeout(dynamic_timeout);
+            }
 
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -510,12 +512,33 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 scan_duration: start_time.elapsed(),
                 had_partial_errors,
             })
-        } else {
-            if file_count > max_files_threshold {
-                record_capacity_scan_sampling(sampled_count, true);
+        } else if file_count > max_files_threshold {
+            // sampled_count == 0: too few overflow files to reach the sample rate threshold.
+            // Fall back to estimating the overflow using the average file size from the exact
+            // prefix so that overflow files are not silently dropped from the total.
+            let overflow_count = file_count - max_files_threshold;
+            let avg_prefix_size = if max_files_threshold > 0 {
+                exact_prefix_bytes / max_files_threshold as u64
             } else {
-                record_capacity_scan_sampling(0, false);
-            }
+                0
+            };
+            let estimated_overflow = avg_prefix_size.saturating_mul(overflow_count as u64);
+            let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
+            info!(
+                "Large directory detected: {} files, estimated size: {} bytes (no overflow samples, used prefix average {} bytes/file)",
+                file_count, estimated_size, avg_prefix_size
+            );
+            record_capacity_scan_sampling(0, true);
+            Ok(CapacityScanResult {
+                used_bytes: estimated_size,
+                file_count,
+                sampled_count: 0,
+                is_estimated: true,
+                scan_duration: start_time.elapsed(),
+                had_partial_errors,
+            })
+        } else {
+            record_capacity_scan_sampling(0, false);
             debug!(
                 "Directory size calculation completed: {} files, {} bytes, took {:?}",
                 file_count,

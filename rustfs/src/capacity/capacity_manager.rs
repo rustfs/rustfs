@@ -30,7 +30,7 @@ use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -403,19 +403,21 @@ impl HybridStrategyConfig {
 // Hybrid Capacity Manager
 // ============================================================================
 
-#[derive(Debug)]
 struct RefreshState {
     running: bool,
-    last_result: Option<Result<CapacityUpdate, String>>,
-    notify: Arc<Notify>,
+    /// Sender for the current refresh cycle. Joiners subscribe to this before releasing the
+    /// mutex so they cannot miss the completion notification. A new channel is created at the
+    /// start of every refresh cycle so stale subscribers from previous cycles are not confused
+    /// by results that were already published.
+    result_tx: watch::Sender<Option<Result<CapacityUpdate, String>>>,
 }
 
 impl Default for RefreshState {
     fn default() -> Self {
+        let (tx, _) = watch::channel(None);
         Self {
             running: false,
-            last_result: None,
-            notify: Arc::new(Notify::new()),
+            result_tx: tx,
         }
     }
 }
@@ -560,28 +562,38 @@ impl HybridCapacityManager {
     }
 
     /// Run a singleflight refresh. Callers either join an existing in-flight refresh or become the leader.
+    ///
+    /// Joiners subscribe to the watch channel *before* releasing the mutex, which guarantees
+    /// they cannot miss the completion notification even if the leader finishes very quickly.
     pub async fn refresh_or_join<F, Fut>(&self, source: DataSource, refresh_fn: F) -> Result<CapacityUpdate, String>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<CapacityUpdate, String>>,
     {
-        let notify = {
+        let maybe_rx = {
             let mut state = self.refresh_state.lock().await;
             if state.running {
-                Some(state.notify.clone())
+                // Subscribe while holding the lock so the send that completes the current
+                // refresh cycle cannot happen before we are subscribed.
+                Some(state.result_tx.subscribe())
             } else {
+                // Become the leader. Create a fresh channel so that joiners from a previous
+                // cycle cannot observe the result that was published for the new cycle.
+                let (tx, _) = watch::channel(None);
+                state.result_tx = tx;
                 state.running = true;
-                state.last_result = None;
                 None
             }
         };
 
-        if let Some(notify) = notify {
-            notify.notified().await;
-            let state = self.refresh_state.lock().await;
-            return state
-                .last_result
-                .clone()
+        if let Some(mut result_rx) = maybe_rx {
+            // Wait until the leader publishes Some(result). Because we subscribed before
+            // releasing the mutex, we cannot miss the notification.
+            let _ = result_rx.wait_for(|v| v.is_some()).await;
+            return result_rx
+                .borrow()
+                .as_ref()
+                .cloned()
                 .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
         }
 
@@ -590,13 +602,11 @@ impl HybridCapacityManager {
             self.update_capacity(update.clone(), source).await;
         }
 
-        let notify = {
+        {
             let mut state = self.refresh_state.lock().await;
             state.running = false;
-            state.last_result = Some(result.clone());
-            state.notify.clone()
-        };
-        notify.notify_waiters();
+            let _ = state.result_tx.send(Some(result.clone()));
+        }
 
         result
     }
@@ -612,8 +622,9 @@ impl HybridCapacityManager {
             if state.running {
                 false
             } else {
+                let (tx, _) = watch::channel(None);
+                state.result_tx = tx;
                 state.running = true;
-                state.last_result = None;
                 true
             }
         };
@@ -628,13 +639,9 @@ impl HybridCapacityManager {
                 self.update_capacity(update.clone(), source).await;
             }
 
-            let notify = {
-                let mut state = self.refresh_state.lock().await;
-                state.running = false;
-                state.last_result = Some(result);
-                state.notify.clone()
-            };
-            notify.notify_waiters();
+            let mut state = self.refresh_state.lock().await;
+            state.running = false;
+            let _ = state.result_tx.send(Some(result));
         });
 
         true
