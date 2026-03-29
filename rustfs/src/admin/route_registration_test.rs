@@ -149,7 +149,10 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
     system::register_system_route(&mut router).expect("register system route");
     pools::register_pool_route(&mut router).expect("register pool route");
     rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
+    tier::register_tier_route(&mut router).expect("register tier route");
     quota::register_quota_route(&mut router).expect("register quota route");
+    bucket_meta::register_bucket_meta_route(&mut router).expect("register bucket meta route");
+    kms::register_kms_route(&mut router).expect("register kms route");
     oidc::register_oidc_route(&mut router).expect("register oidc route");
 
     for (method, path) in [
@@ -168,11 +171,20 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
+        (Method::GET, compat_admin_alias_path("/v3/tier/HOT")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
         (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
+        (Method::GET, compat_admin_alias_path("/export-bucket-metadata")),
+        (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/import-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/key/create")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/status")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/status")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),
