@@ -20,6 +20,88 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::info;
 
+// ============================================================================
+// Metric Name Constants (following existing naming convention)
+// ============================================================================
+
+/// Cache hit counter
+const CAPACITY_CACHE_HIT: &str = "rustfs.capacity.cache.hits";
+
+/// Cache miss counter
+const CAPACITY_CACHE_MISS: &str = "rustfs.capacity.cache.misses";
+
+/// Cache hit rate gauge
+const CAPACITY_CACHE_HIT_RATE: &str = "rustfs.capacity.cache.hit_rate";
+
+/// Cache hits total gauge
+const CAPACITY_CACHE_HITS_TOTAL: &str = "rustfs.capacity.cache.hits_total";
+
+/// Cache misses total gauge
+const CAPACITY_CACHE_MISSES_TOTAL: &str = "rustfs.capacity.cache.misses_total";
+
+/// Scheduled update counter
+const CAPACITY_UPDATE_SCHEDULED: &str = "rustfs.capacity.update.scheduled";
+
+/// Write-triggered update counter
+const CAPACITY_UPDATE_WRITE_TRIGGERED: &str = "rustfs.capacity.update.write_triggered";
+
+/// Update failure counter
+const CAPACITY_UPDATE_FAILURES: &str = "rustfs.capacity.update.failures";
+
+/// Current capacity in bytes gauge
+#[allow(dead_code)]
+const CAPACITY_CURRENT_BYTES: &str = "rustfs.capacity.current";
+
+/// Write operations counter
+const CAPACITY_WRITE_OPERATIONS: &str = "rustfs.capacity.write.operations";
+
+/// Write frequency gauge
+#[allow(dead_code)]
+const CAPACITY_WRITE_FREQUENCY: &str = "rustfs.capacity.write.frequency";
+
+/// Update duration in microseconds histogram
+const CAPACITY_UPDATE_DURATION_US: &str = "rustfs.capacity.update.duration_us";
+
+/// Scheduled updates total gauge
+const CAPACITY_UPDATE_SCHEDULED_TOTAL: &str = "rustfs.capacity.update.scheduled_total";
+
+/// Write-triggered updates total gauge
+const CAPACITY_UPDATE_WRITE_TRIGGERED_TOTAL: &str = "rustfs.capacity.update.write_triggered_total";
+
+/// Update failures total gauge
+const CAPACITY_UPDATE_FAILURES_TOTAL: &str = "rustfs.capacity.update.failures_total";
+
+/// Symlinks encountered counter
+const CAPACITY_SYMLINKS_ENCOUNTERED: &str = "rustfs.capacity.symlinks.encountered";
+
+/// Symlinks total size gauge
+const CAPACITY_SYMLINKS_SIZE: &str = "rustfs.capacity.symlinks.total_size";
+
+/// Symlinks count gauge
+const CAPACITY_SYMLINKS_COUNT: &str = "rustfs.capacity.symlinks.count";
+
+/// Dynamic timeout counter
+const CAPACITY_TIMEOUT_DYNAMIC: &str = "rustfs.capacity.timeout.dynamic";
+
+/// Timeout fallback counter
+const CAPACITY_TIMEOUT_FALLBACK: &str = "rustfs.capacity.timeout.fallback";
+
+/// Stall detected counter
+const CAPACITY_TIMEOUT_STALL: &str = "rustfs.capacity.timeout.stall";
+
+/// Dynamic timeout total gauge
+const CAPACITY_TIMEOUT_DYNAMIC_TOTAL: &str = "rustfs.capacity.timeout.dynamic_total";
+
+/// Timeout fallback total gauge
+const CAPACITY_TIMEOUT_FALLBACK_TOTAL: &str = "rustfs.capacity.timeout.fallback_total";
+
+/// Stall detected total gauge
+const CAPACITY_TIMEOUT_STALL_TOTAL: &str = "rustfs.capacity.timeout.stall_total";
+
+// ============================================================================
+// Capacity Metrics
+// ============================================================================
+
 /// Capacity metrics for monitoring
 #[derive(Debug, Default)]
 pub struct CapacityMetrics {
@@ -58,72 +140,75 @@ impl CapacityMetrics {
     /// Record cache hit
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.cache.hits").increment(1);
+        counter!(CAPACITY_CACHE_HIT).increment(1);
     }
 
     /// Record cache miss
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.cache.misses").increment(1);
+        counter!(CAPACITY_CACHE_MISS).increment(1);
     }
 
     /// Record scheduled update
     #[allow(dead_code)]
     pub fn record_scheduled_update(&self) {
         self.scheduled_updates.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.update.scheduled").increment(1);
+        counter!(CAPACITY_UPDATE_SCHEDULED).increment(1);
     }
 
     /// Record write triggered update
     #[allow(dead_code)]
     pub fn record_write_triggered_update(&self) {
         self.write_triggered_updates.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.update.write_triggered").increment(1);
+        counter!(CAPACITY_UPDATE_WRITE_TRIGGERED).increment(1);
     }
 
     /// Record update failure
     #[allow(dead_code)]
     pub fn record_update_failure(&self) {
         self.update_failures.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.update.failures").increment(1);
+        counter!(CAPACITY_UPDATE_FAILURES).increment(1);
     }
 
     /// Record write operation
     #[allow(dead_code)]
     pub fn record_write_operation(&self) {
-        counter!("rustfs.capacity.write.operations").increment(1);
+        counter!(CAPACITY_WRITE_OPERATIONS).increment(1);
     }
 
     /// Record symlink encountered
     pub fn record_symlink(&self, size: u64) {
         self.symlink_count.fetch_add(1, Ordering::Relaxed);
         self.symlink_size.fetch_add(size, Ordering::Relaxed);
-        counter!("rustfs.capacity.symlinks.encountered").increment(1);
-        gauge!("rustfs.capacity.symlinks.total_size").set(size as f64);
+        counter!(CAPACITY_SYMLINKS_ENCOUNTERED).increment(1);
+        gauge!(CAPACITY_SYMLINKS_SIZE).set(size as f64);
     }
 
     /// Record dynamic timeout usage
     pub fn record_dynamic_timeout(&self) {
         self.dynamic_timeout_count.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.timeout.dynamic").increment(1);
+        counter!(CAPACITY_TIMEOUT_DYNAMIC).increment(1);
     }
 
     /// Record timeout fallback to sampling
     pub fn record_timeout_fallback(&self) {
         self.timeout_fallback_count.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.timeout.fallback").increment(1);
+        counter!(CAPACITY_TIMEOUT_FALLBACK).increment(1);
     }
 
     /// Record stall detection
     pub fn record_stall_detected(&self) {
         self.stall_detected_count.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.capacity.timeout.stall").increment(1);
+        counter!(CAPACITY_TIMEOUT_STALL).increment(1);
     }
 
     /// Get symlink statistics
     #[allow(dead_code)]
     pub fn get_symlink_stats(&self) -> (u64, u64) {
-        (self.symlink_count.load(Ordering::Relaxed), self.symlink_size.load(Ordering::Relaxed))
+        (
+            self.symlink_count.load(Ordering::Relaxed),
+            self.symlink_size.load(Ordering::Relaxed),
+        )
     }
 
     /// Get timeout statistics
@@ -143,7 +228,7 @@ impl CapacityMetrics {
         self.total_update_duration_us.fetch_add(duration_us, Ordering::Relaxed);
         self.update_count.fetch_add(1, Ordering::Relaxed);
 
-        histogram!("rustfs.capacity.update.duration_us").record(duration_us as f64);
+        histogram!(CAPACITY_UPDATE_DURATION_US).record(duration_us as f64);
     }
 
     /// Get cache hit rate
@@ -151,7 +236,11 @@ impl CapacityMetrics {
         let hits = self.cache_hits.load(Ordering::Relaxed);
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 
     /// Get average update duration
@@ -187,18 +276,18 @@ impl CapacityMetrics {
     pub fn log_summary(&self) {
         let summary = self.get_summary();
 
-        // Update gauges for current values
-        gauge!("rustfs.capacity.cache.hit_rate").set(summary.cache_hit_rate);
-        gauge!("rustfs.capacity.cache.hits_total").set(summary.cache_hits as f64);
-        gauge!("rustfs.capacity.cache.misses_total").set(summary.cache_misses as f64);
-        gauge!("rustfs.capacity.update.scheduled_total").set(summary.scheduled_updates as f64);
-        gauge!("rustfs.capacity.update.write_triggered_total").set(summary.write_triggered_updates as f64);
-        gauge!("rustfs.capacity.update.failures_total").set(summary.update_failures as f64);
-        gauge!("rustfs.capacity.symlinks.count").set(summary.symlink_count as f64);
-        gauge!("rustfs.capacity.symlinks.size").set(summary.symlink_size as f64);
-        gauge!("rustfs.capacity.timeout.dynamic_total").set(summary.dynamic_timeout_count as f64);
-        gauge!("rustfs.capacity.timeout.fallback_total").set(summary.timeout_fallback_count as f64);
-        gauge!("rustfs.capacity.timeout.stall_total").set(summary.stall_detected_count as f64);
+        // Update gauges for current values using constant names
+        gauge!(CAPACITY_CACHE_HIT_RATE).set(summary.cache_hit_rate);
+        gauge!(CAPACITY_CACHE_HITS_TOTAL).set(summary.cache_hits as f64);
+        gauge!(CAPACITY_CACHE_MISSES_TOTAL).set(summary.cache_misses as f64);
+        gauge!(CAPACITY_UPDATE_SCHEDULED_TOTAL).set(summary.scheduled_updates as f64);
+        gauge!(CAPACITY_UPDATE_WRITE_TRIGGERED_TOTAL).set(summary.write_triggered_updates as f64);
+        gauge!(CAPACITY_UPDATE_FAILURES_TOTAL).set(summary.update_failures as f64);
+        gauge!(CAPACITY_SYMLINKS_COUNT).set(summary.symlink_count as f64);
+        gauge!(CAPACITY_SYMLINKS_SIZE).set(summary.symlink_size as f64);
+        gauge!(CAPACITY_TIMEOUT_DYNAMIC_TOTAL).set(summary.dynamic_timeout_count as f64);
+        gauge!(CAPACITY_TIMEOUT_FALLBACK_TOTAL).set(summary.timeout_fallback_count as f64);
+        gauge!(CAPACITY_TIMEOUT_STALL_TOTAL).set(summary.stall_detected_count as f64);
 
         info!(
             "Capacity Metrics: cache_hit_rate={:.2}%, cache_hits={}, cache_misses={}, scheduled_updates={}, write_triggered_updates={}, update_failures={}, avg_update_duration={:?}, symlinks={}, symlink_size={}, dynamic_timeouts={}, timeout_fallbacks={}, stalls={}",
@@ -240,7 +329,9 @@ static CAPACITY_METRICS: std::sync::OnceLock<Arc<CapacityMetrics>> = std::sync::
 
 /// Get global metrics
 pub fn get_capacity_metrics() -> Arc<CapacityMetrics> {
-    CAPACITY_METRICS.get_or_init(|| Arc::new(CapacityMetrics::new())).clone()
+    CAPACITY_METRICS
+        .get_or_init(|| Arc::new(CapacityMetrics::new()))
+        .clone()
 }
 
 /// Start metrics logging task
@@ -277,6 +368,10 @@ pub fn record_global_cache_miss() {
     let metrics = get_capacity_metrics();
     metrics.record_cache_miss();
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {

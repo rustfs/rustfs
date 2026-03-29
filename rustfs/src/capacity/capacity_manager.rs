@@ -27,78 +27,263 @@ use rustfs_config::{
     ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
 // ============================================================================
 // Configuration Functions
 // ============================================================================
 
+/// Cached capacity configuration to avoid repeated environment variable reads
+#[derive(Clone, Debug)]
+struct CachedCapacityConfig {
+    /// Scheduled update interval
+    scheduled_update_interval: Duration,
+    /// Write trigger delay
+    write_trigger_delay: Duration,
+    /// Write frequency threshold
+    write_frequency_threshold: usize,
+    /// Fast update threshold
+    fast_update_threshold: Duration,
+    /// Max files threshold for sampling
+    max_files_threshold: usize,
+    /// Stat timeout
+    stat_timeout: Duration,
+    /// Sample rate
+    sample_rate: usize,
+    /// Follow symlinks flag
+    follow_symlinks: bool,
+    /// Max symlink depth
+    max_symlink_depth: u8,
+    /// Enable dynamic timeout flag
+    enable_dynamic_timeout: bool,
+    /// Min timeout
+    min_timeout: Duration,
+    /// Max timeout
+    max_timeout: Duration,
+    /// Stall timeout
+    stall_timeout: Duration,
+}
+
+impl CachedCapacityConfig {
+    /// Build configuration from environment variables
+    fn from_env() -> Self {
+        Self {
+            scheduled_update_interval: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_SCHEDULED_INTERVAL,
+                DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
+            )),
+            write_trigger_delay: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+                DEFAULT_WRITE_TRIGGER_DELAY_SECS,
+            )),
+            write_frequency_threshold: get_env_usize(
+                ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+                DEFAULT_WRITE_FREQUENCY_THRESHOLD,
+            ),
+            fast_update_threshold: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
+                DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
+            )),
+            max_files_threshold: get_env_usize(
+                ENV_CAPACITY_MAX_FILES_THRESHOLD,
+                DEFAULT_MAX_FILES_THRESHOLD,
+            ),
+            stat_timeout: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_STAT_TIMEOUT,
+                DEFAULT_STAT_TIMEOUT_SECS,
+            )),
+            sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
+            follow_symlinks: get_env_bool(
+                ENV_CAPACITY_FOLLOW_SYMLINKS,
+                DEFAULT_CAPACITY_FOLLOW_SYMLINKS,
+            ),
+            max_symlink_depth:
+                get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8,
+            enable_dynamic_timeout: get_env_bool(
+                ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
+                DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
+            ),
+            min_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS)),
+            max_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS)),
+            stall_timeout: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_STALL_TIMEOUT,
+                DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
+            )),
+        }
+    }
+}
+
+/// Get cached capacity configuration (reads environment variables once)
+#[cfg(not(test))]
+fn get_cached_config() -> &'static CachedCapacityConfig {
+    static CONFIG: OnceLock<CachedCapacityConfig> = OnceLock::new();
+    CONFIG.get_or_init(CachedCapacityConfig::from_env)
+}
+
+#[cfg(test)]
+fn get_cached_config() -> CachedCapacityConfig {
+    // Don't cache in tests to allow temp_env::with_var to work
+    CachedCapacityConfig::from_env()
+}
+
 /// Get scheduled update interval from environment or default
+#[cfg(not(test))]
 pub fn get_scheduled_update_interval() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_SCHEDULED_INTERVAL, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS))
+    get_cached_config().scheduled_update_interval
+}
+
+/// Get scheduled update interval from environment or default (test mode)
+#[cfg(test)]
+pub fn get_scheduled_update_interval() -> Duration {
+    CachedCapacityConfig::from_env().scheduled_update_interval
 }
 
 /// Get write trigger delay from environment or default
+#[cfg(not(test))]
 pub fn get_write_trigger_delay() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_WRITE_TRIGGER_DELAY, DEFAULT_WRITE_TRIGGER_DELAY_SECS))
+    get_cached_config().write_trigger_delay
+}
+
+/// Get write trigger delay from environment or default (test mode)
+#[cfg(test)]
+pub fn get_write_trigger_delay() -> Duration {
+    CachedCapacityConfig::from_env().write_trigger_delay
 }
 
 /// Get write frequency threshold from environment or default
+#[cfg(not(test))]
 pub fn get_write_frequency_threshold() -> usize {
-    get_env_usize(ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_FREQUENCY_THRESHOLD)
+    get_cached_config().write_frequency_threshold
+}
+
+/// Get write frequency threshold from environment or default (test mode)
+#[cfg(test)]
+pub fn get_write_frequency_threshold() -> usize {
+    CachedCapacityConfig::from_env().write_frequency_threshold
 }
 
 /// Get fast update threshold from environment or default
+#[cfg(not(test))]
 pub fn get_fast_update_threshold() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_FAST_UPDATE_THRESHOLD, DEFAULT_FAST_UPDATE_THRESHOLD_SECS))
+    get_cached_config().fast_update_threshold
+}
+
+/// Get fast update threshold from environment or default (test mode)
+#[cfg(test)]
+pub fn get_fast_update_threshold() -> Duration {
+    CachedCapacityConfig::from_env().fast_update_threshold
 }
 
 /// Get max files threshold from environment or default
+#[cfg(not(test))]
 pub fn get_max_files_threshold() -> usize {
-    get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD)
+    get_cached_config().max_files_threshold
+}
+
+/// Get max files threshold from environment or default (test mode)
+#[cfg(test)]
+pub fn get_max_files_threshold() -> usize {
+    CachedCapacityConfig::from_env().max_files_threshold
 }
 
 /// Get stat timeout from environment or default
+#[cfg(not(test))]
 pub fn get_stat_timeout() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS))
+    get_cached_config().stat_timeout
+}
+
+/// Get stat timeout from environment or default (test mode)
+#[cfg(test)]
+pub fn get_stat_timeout() -> Duration {
+    CachedCapacityConfig::from_env().stat_timeout
 }
 
 /// Get sample rate from environment or default
+#[cfg(not(test))]
 pub fn get_sample_rate() -> usize {
-    get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE)
+    get_cached_config().sample_rate
+}
+
+/// Get sample rate from environment or default (test mode)
+#[cfg(test)]
+pub fn get_sample_rate() -> usize {
+    CachedCapacityConfig::from_env().sample_rate
 }
 
 /// Get follow symlinks flag from environment or default
+#[cfg(not(test))]
 pub fn get_follow_symlinks() -> bool {
-    get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS)
+    get_cached_config().follow_symlinks
+}
+
+/// Get follow symlinks flag from environment or default (test mode)
+#[cfg(test)]
+pub fn get_follow_symlinks() -> bool {
+    CachedCapacityConfig::from_env().follow_symlinks
 }
 
 /// Get max symlink depth from environment or default
+#[cfg(not(test))]
 pub fn get_max_symlink_depth() -> u8 {
-    get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8
+    get_cached_config().max_symlink_depth
+}
+
+/// Get max symlink depth from environment or default (test mode)
+#[cfg(test)]
+pub fn get_max_symlink_depth() -> u8 {
+    CachedCapacityConfig::from_env().max_symlink_depth
 }
 
 /// Get enable dynamic timeout flag from environment or default
+#[cfg(not(test))]
 pub fn get_enable_dynamic_timeout() -> bool {
-    get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT)
+    get_cached_config().enable_dynamic_timeout
+}
+
+/// Get enable dynamic timeout flag from environment or default (test mode)
+#[cfg(test)]
+pub fn get_enable_dynamic_timeout() -> bool {
+    CachedCapacityConfig::from_env().enable_dynamic_timeout
 }
 
 /// Get min timeout from environment or default
+#[cfg(not(test))]
 pub fn get_min_timeout() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS))
+    get_cached_config().min_timeout
+}
+
+/// Get min timeout from environment or default (test mode)
+#[cfg(test)]
+pub fn get_min_timeout() -> Duration {
+    CachedCapacityConfig::from_env().min_timeout
 }
 
 /// Get max timeout from environment or default
+#[cfg(not(test))]
 pub fn get_max_timeout() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS))
+    get_cached_config().max_timeout
+}
+
+/// Get max timeout from environment or default (test mode)
+#[cfg(test)]
+pub fn get_max_timeout() -> Duration {
+    CachedCapacityConfig::from_env().max_timeout
 }
 
 /// Get stall timeout from environment or default
+#[cfg(not(test))]
 pub fn get_stall_timeout() -> Duration {
-    Duration::from_secs(get_env_u64(ENV_CAPACITY_STALL_TIMEOUT, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS))
+    get_cached_config().stall_timeout
+}
+
+/// Get stall timeout from environment or default (test mode)
+#[cfg(test)]
+pub fn get_stall_timeout() -> Duration {
+    CachedCapacityConfig::from_env().stall_timeout
 }
 
 // ============================================================================
@@ -107,22 +292,22 @@ pub fn get_stall_timeout() -> Duration {
 
 /// Cached capacity data
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct CachedCapacity {
     /// Total used capacity in bytes
     pub total_used: u64,
     /// Last update time
     pub last_update: Instant,
     /// File count (optional)
+    #[allow(dead_code)]
     pub file_count: usize,
     /// Whether it's an estimated value
+    #[allow(dead_code)]
     pub is_estimated: bool,
     /// Data source
     pub source: DataSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
-#[allow(dead_code)]
 pub enum DataSource {
     /// Real-time statistics
     RealTime,
@@ -131,6 +316,7 @@ pub enum DataSource {
     /// Write triggered
     WriteTriggered,
     /// Fallback value
+    #[allow(dead_code)]
     Fallback,
 }
 
@@ -342,13 +528,29 @@ impl HybridCapacityManager {
 }
 
 /// Global capacity manager instance
-static CAPACITY_MANAGER: std::sync::OnceLock<Arc<HybridCapacityManager>> = std::sync::OnceLock::new();
+static GLOBAL_CAPACITY_MANAGER: std::sync::OnceLock<Arc<HybridCapacityManager>> = std::sync::OnceLock::new();
 
 /// Get or initialize the global capacity manager
 pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
-    CAPACITY_MANAGER
+    GLOBAL_CAPACITY_MANAGER
         .get_or_init(|| Arc::new(HybridCapacityManager::from_env()))
         .clone()
+}
+
+/// Create an isolated capacity manager instance for testing
+///
+/// This factory function allows tests to create independent instances
+/// without affecting the global singleton, avoiding test pollution.
+///
+/// # Example
+/// ```no_run
+/// let manager = create_isolated_manager(HybridStrategyConfig::default());
+/// manager.update_capacity(1000, DataSource::RealTime).await;
+/// ```
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
+    Arc::new(HybridCapacityManager::new(config))
 }
 
 /// Start background update task
