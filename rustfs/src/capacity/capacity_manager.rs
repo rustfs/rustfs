@@ -589,7 +589,11 @@ impl HybridCapacityManager {
         if let Some(mut result_rx) = maybe_rx {
             // Wait until the leader publishes Some(result). Because we subscribed before
             // releasing the mutex, we cannot miss the notification.
-            let _ = result_rx.wait_for(|v| v.is_some()).await;
+            if result_rx.wait_for(|v| v.is_some()).await.is_err() {
+                // The leader's sender was dropped (e.g. due to a panic) without publishing
+                // a result. Surface a clear error rather than silently returning the default.
+                return Err("capacity refresh leader exited without publishing a result".to_string());
+            }
             return result_rx
                 .borrow()
                 .as_ref()
