@@ -16,9 +16,8 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::capacity_manager::{
-    CapacityUpdate, DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks,
-    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate,
-    get_stall_timeout, get_stat_timeout,
+    CapacityUpdate, DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
+    get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout, get_stat_timeout,
 };
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
@@ -29,8 +28,8 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_io_metrics::{
-    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected,
-    record_capacity_symlink, record_capacity_timeout_fallback,
+    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected, record_capacity_symlink,
+    record_capacity_timeout_fallback,
 };
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
@@ -684,21 +683,26 @@ impl DefaultAdminUsecase {
 
                 if needs_update && should_block {
                     let start = Instant::now();
-                    match calculate_data_dir_used_capacity(&storage_info.disks).await {
-                        Ok(scan) => {
-                            info.total_used_capacity = scan.used_bytes;
-                            capacity_manager
-                                .update_capacity(scan.to_capacity_update(), DataSource::WriteTriggered)
-                                .await;
+                    match capacity_manager
+                        .refresh_or_join(DataSource::WriteTriggered, || async {
+                            calculate_data_dir_used_capacity(&storage_info.disks)
+                                .await
+                                .map(|scan| scan.to_capacity_update())
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        Ok(update) => {
+                            info.total_used_capacity = update.total_used;
 
                             let elapsed = start.elapsed();
                             debug!(
-                                "Foreground capacity refresh completed in {:?} (files={}, sampled={}, estimated={})",
-                                elapsed, scan.file_count, scan.sampled_count, scan.is_estimated
+                                "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
+                                elapsed, update.file_count, update.is_estimated
                             );
                         }
                         Err(e) => {
-                            warn!("Foreground capacity refresh failed: {:?}, using cached value", e);
+                            warn!("Foreground capacity refresh failed: {}, using cached value", e);
                             info.total_used_capacity = cached.total_used;
                         }
                     }
@@ -715,19 +719,19 @@ impl DefaultAdminUsecase {
                         should_block
                     );
 
-                    if capacity_manager.try_start_background_update() {
-                        let disks = storage_info.disks.clone();
-                        let manager = capacity_manager.clone();
-                        tokio::spawn(async move {
-                            if let Ok(scan) = calculate_data_dir_used_capacity(&disks).await {
-                                manager.update_capacity(scan.to_capacity_update(), DataSource::Scheduled).await;
-                                debug!(
-                                    "Background capacity update completed: {} bytes (files={}, sampled={}, estimated={})",
-                                    scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated
-                                );
-                            }
-                            manager.complete_background_update();
-                        });
+                    let disks = storage_info.disks.clone();
+                    let manager = capacity_manager.clone();
+                    if manager
+                        .clone()
+                        .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                            calculate_data_dir_used_capacity(&disks)
+                                .await
+                                .map(|scan| scan.to_capacity_update())
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        debug!("Background capacity update started");
                     } else {
                         debug!("Background update already in progress, skipping spawn");
                     }
@@ -736,22 +740,27 @@ impl DefaultAdminUsecase {
         } else {
             // No cache, perform initial calculation
             let start = Instant::now();
-            match calculate_data_dir_used_capacity(&storage_info.disks).await {
-                Ok(scan) => {
-                    info.total_used_capacity = scan.used_bytes;
-                    capacity_manager
-                        .update_capacity(scan.to_capacity_update(), DataSource::RealTime)
-                        .await;
+            match capacity_manager
+                .refresh_or_join(DataSource::RealTime, || async {
+                    calculate_data_dir_used_capacity(&storage_info.disks)
+                        .await
+                        .map(|scan| scan.to_capacity_update())
+                        .map_err(|e| e.to_string())
+                })
+                .await
+            {
+                Ok(update) => {
+                    info.total_used_capacity = update.total_used;
 
                     let elapsed = start.elapsed();
                     info!(
-                        "Initial capacity calculation completed: {} bytes in {:?} (files={}, sampled={}, estimated={}, partial_errors={})",
-                        scan.used_bytes, elapsed, scan.file_count, scan.sampled_count, scan.is_estimated, scan.had_partial_errors
+                        "Initial capacity calculation completed: {} bytes in {:?} (files={}, estimated={})",
+                        update.total_used, elapsed, update.file_count, update.is_estimated
                     );
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to calculate data directory used capacity: {:?}, falling back to disk used capacity",
+                        "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
                         e
                     );
                     info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);

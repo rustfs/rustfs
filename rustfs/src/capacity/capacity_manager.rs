@@ -27,11 +27,11 @@ use rustfs_config::{
 };
 use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, Notify, RwLock};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // Configuration Functions
@@ -403,6 +403,23 @@ impl HybridStrategyConfig {
 // Hybrid Capacity Manager
 // ============================================================================
 
+#[derive(Debug)]
+struct RefreshState {
+    running: bool,
+    last_result: Option<Result<CapacityUpdate, String>>,
+    notify: Arc<Notify>,
+}
+
+impl Default for RefreshState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            last_result: None,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
 /// Hybrid capacity manager
 pub struct HybridCapacityManager {
     /// Capacity cache
@@ -411,8 +428,8 @@ pub struct HybridCapacityManager {
     write_record: Arc<RwLock<WriteRecord>>,
     /// Configuration
     config: HybridStrategyConfig,
-    /// Background update in progress flag
-    update_in_progress: Arc<AtomicBool>,
+    /// Shared singleflight refresh state
+    refresh_state: Arc<Mutex<RefreshState>>,
 }
 
 impl HybridCapacityManager {
@@ -432,7 +449,7 @@ impl HybridCapacityManager {
                 write_window: Vec::new(),
             })),
             config,
-            update_in_progress: Arc::new(AtomicBool::new(false)),
+            refresh_state: Arc::new(Mutex::new(RefreshState::default())),
         }
     }
 
@@ -542,6 +559,87 @@ impl HybridCapacityManager {
         record.write_window.len()
     }
 
+    /// Run a singleflight refresh. Callers either join an existing in-flight refresh or become the leader.
+    pub async fn refresh_or_join<F, Fut>(&self, source: DataSource, refresh_fn: F) -> Result<CapacityUpdate, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<CapacityUpdate, String>>,
+    {
+        let notify = {
+            let mut state = self.refresh_state.lock().await;
+            if state.running {
+                Some(state.notify.clone())
+            } else {
+                state.running = true;
+                state.last_result = None;
+                None
+            }
+        };
+
+        if let Some(notify) = notify {
+            notify.notified().await;
+            let state = self.refresh_state.lock().await;
+            return state
+                .last_result
+                .clone()
+                .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
+        }
+
+        let result = refresh_fn().await;
+        if let Ok(update) = &result {
+            self.update_capacity(update.clone(), source).await;
+        }
+
+        let notify = {
+            let mut state = self.refresh_state.lock().await;
+            state.running = false;
+            state.last_result = Some(result.clone());
+            state.notify.clone()
+        };
+        notify.notify_waiters();
+
+        result
+    }
+
+    /// Start a background refresh if one is not already in flight.
+    pub async fn spawn_refresh_if_needed<F, Fut>(self: Arc<Self>, source: DataSource, refresh_fn: F) -> bool
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CapacityUpdate, String>> + Send + 'static,
+    {
+        let should_spawn = {
+            let mut state = self.refresh_state.lock().await;
+            if state.running {
+                false
+            } else {
+                state.running = true;
+                state.last_result = None;
+                true
+            }
+        };
+
+        if !should_spawn {
+            return false;
+        }
+
+        tokio::spawn(async move {
+            let result = refresh_fn().await;
+            if let Ok(update) = &result {
+                self.update_capacity(update.clone(), source).await;
+            }
+
+            let notify = {
+                let mut state = self.refresh_state.lock().await;
+                state.running = false;
+                state.last_result = Some(result);
+                state.notify.clone()
+            };
+            notify.notify_waiters();
+        });
+
+        true
+    }
+
     /// Get config
     pub fn get_config(&self) -> &HybridStrategyConfig {
         &self.config
@@ -552,16 +650,10 @@ impl HybridCapacityManager {
         cache_age >= self.max_stale_age()
     }
 
-    /// Try to start a background update, returns true if update was started (false if already in progress)
-    pub fn try_start_background_update(&self) -> bool {
-        self.update_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    /// Mark background update as complete
-    pub fn complete_background_update(&self) {
-        self.update_in_progress.store(false, Ordering::Release);
+    /// Return whether a refresh is currently in flight.
+    #[cfg(test)]
+    pub async fn refresh_in_progress(&self) -> bool {
+        self.refresh_state.lock().await.running
     }
 }
 
@@ -612,17 +704,22 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
 
             info!("Starting scheduled capacity update");
             let start = Instant::now();
+            let manager = manager.clone();
+            let disks = disks.clone();
+            let started = manager
+                .clone()
+                .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                    calculate_data_dir_used_capacity(&disks)
+                        .await
+                        .map(|scan| scan.to_capacity_update())
+                        .map_err(|e| e.to_string())
+                })
+                .await;
 
-            // Import the calculate function
-            match calculate_data_dir_used_capacity(&disks).await {
-                Ok(scan) => {
-                    let elapsed = start.elapsed();
-                    info!("Scheduled update completed: {} bytes in {:?}", scan.used_bytes, elapsed);
-                    manager.update_capacity(scan.to_capacity_update(), DataSource::Scheduled).await;
-                }
-                Err(e) => {
-                    error!("Scheduled update failed: {:?}", e);
-                }
+            if started {
+                debug!("Scheduled capacity refresh started in {:?}", start.elapsed());
+            } else {
+                debug!("Scheduled capacity refresh skipped because another refresh is already in progress");
             }
         }
     });
@@ -767,7 +864,9 @@ mod tests {
     async fn test_update_capacity() {
         let manager = HybridCapacityManager::from_env();
 
-        manager.update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime).await;
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
 
         let cached = manager.get_capacity().await;
         assert!(cached.is_some());
@@ -794,7 +893,9 @@ mod tests {
         assert!(!manager.needs_fast_update().await);
 
         // Update cache
-        manager.update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime).await;
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
 
         // Fresh cache, should not need update
         assert!(!manager.needs_fast_update().await);

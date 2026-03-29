@@ -19,6 +19,7 @@ mod tests {
     use crate::capacity::capacity_manager::{CapacityUpdate, DataSource, HybridCapacityManager, HybridStrategyConfig};
     use serial_test::serial;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -111,9 +112,7 @@ mod tests {
         ];
 
         for source in sources {
-            manager
-                .update_capacity(CapacityUpdate::exact(1000, 1), source)
-                .await;
+            manager.update_capacity(CapacityUpdate::exact(1000, 1), source).await;
             let cached = manager.get_capacity().await.unwrap();
             assert_eq!(cached.source, source);
         }
@@ -188,5 +187,81 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1));
 
         println!("1000 operations completed in {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_or_join_singleflight() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mgr1 = manager.clone();
+        let calls1 = calls.clone();
+        let first = tokio::spawn(async move {
+            mgr1.refresh_or_join(DataSource::Scheduled, move || async move {
+                calls1.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::exact(2048, 8))
+            })
+            .await
+        });
+
+        sleep(Duration::from_millis(10)).await;
+
+        let mgr2 = manager.clone();
+        let calls2 = calls.clone();
+        let second = tokio::spawn(async move {
+            mgr2.refresh_or_join(DataSource::WriteTriggered, move || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(4096, 16))
+            })
+            .await
+        });
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.total_used, 2048);
+        assert_eq!(second.total_used, 2048);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 2048);
+        assert_eq!(cached.file_count, 8);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_refresh_if_needed_deduplicates_background_refresh() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_manager = manager.clone();
+        let first_calls = calls.clone();
+        let started = first_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::estimated(8192, 32))
+            })
+            .await;
+        assert!(started);
+
+        let second_manager = manager.clone();
+        let second_calls = calls.clone();
+        let started = second_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(1, 1))
+            })
+            .await;
+        assert!(!started);
+
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!manager.refresh_in_progress().await);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 8192);
+        assert!(cached.is_estimated);
     }
 }

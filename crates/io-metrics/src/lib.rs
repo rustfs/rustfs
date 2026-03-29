@@ -74,10 +74,9 @@ pub use adaptive_ttl::{
 
 // Capacity metrics exports
 pub use capacity_metrics::{
-    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_current_bytes,
-    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected,
-    record_capacity_symlink, record_capacity_timeout_fallback, record_capacity_update_completed,
-    record_capacity_update_failed, record_capacity_write_operation,
+    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_current_bytes, record_capacity_dynamic_timeout,
+    record_capacity_scan_sampling, record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,
+    record_capacity_update_completed, record_capacity_update_failed, record_capacity_write_operation,
 };
 
 // I/O metrics exports
