@@ -14,7 +14,7 @@
 
 //! Tests for AWS IAM policy variables with single-value, multi-value, and nested scenarios
 
-use crate::common::{awscurl_put, init_logging};
+use crate::common::{awscurl_delete, awscurl_put, init_logging};
 use crate::policy::test_env::PolicyTestEnvironment;
 use aws_sdk_s3::primitives::ByteStream;
 use serial_test::serial;
@@ -113,11 +113,11 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
 
     // Remove user
     let remove_user_url = format!("{}/rustfs/admin/v3/remove-user?accessKey={}", env.url, username);
-    let _ = awscurl_put(&remove_user_url, "", &env.access_key, &env.secret_key).await;
+    let _ = awscurl_delete(&remove_user_url, &env.access_key, &env.secret_key).await;
 
     // Remove policy
     let remove_policy_url = format!("{}/rustfs/admin/v3/remove-canned-policy?name={}", env.url, policy_name);
-    let _ = awscurl_put(&remove_policy_url, "", &env.access_key, &env.secret_key).await;
+    let _ = awscurl_delete(&remove_policy_url, &env.access_key, &env.secret_key).await;
 }
 
 /// Test AWS policy variables with single-value scenarios
