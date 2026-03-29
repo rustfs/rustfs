@@ -52,7 +52,9 @@ pub async fn create_bitrot_reader(
     let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
     if let Some(data) = inline_data {
         // Use inline data
-        let rd = Cursor::new(Bytes::copy_from_slice(data));
+        let mut rd = Cursor::new(Bytes::copy_from_slice(data));
+        // Apply the computed offset so inline data matches disk read behavior
+        rd.set_position(offset as u64);
         let reader = BitrotReader::new(
             Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
             shard_size,
@@ -65,7 +67,7 @@ pub async fn create_bitrot_reader(
         if use_zero_copy {
             // Try zero-copy read first (uses mmap on Unix)
             let start = Instant::now();
-            match disk.read_file_zero_copy(bucket, path, offset, length - offset).await {
+            match disk.read_file_zero_copy(bucket, path, offset, length).await {
                 Ok(bytes) => {
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -102,7 +104,7 @@ pub async fn create_bitrot_reader(
                     );
 
                     // Fall back to regular stream read on error
-                    match disk.read_file_stream(bucket, path, offset, length - offset).await {
+                    match disk.read_file_stream(bucket, path, offset, length).await {
                         Ok(rd) => {
                             let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
                             Ok(Some(reader))
@@ -116,7 +118,7 @@ pub async fn create_bitrot_reader(
             }
         } else {
             // Use regular stream read
-            match disk.read_file_stream(bucket, path, offset, length - offset).await {
+            match disk.read_file_stream(bucket, path, offset, length).await {
                 Ok(rd) => {
                     let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
                     Ok(Some(reader))

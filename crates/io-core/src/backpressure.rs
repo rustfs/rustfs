@@ -182,28 +182,43 @@ impl BackpressureMonitor {
             return true;
         }
 
-        let current = self.current.load(Ordering::Relaxed);
         let high_threshold = self.config.high_threshold();
 
-        if current >= self.config.max_concurrent {
-            // At capacity: reject
-            self.total_rejected.fetch_add(1, Ordering::Relaxed);
-            return false;
+        // Use a CAS loop to ensure we never exceed `max_concurrent` under contention.
+        loop {
+            let current = self.current.load(Ordering::Relaxed);
+
+            if current >= self.config.max_concurrent {
+                // At capacity: reject
+                self.total_rejected.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+
+            let new = current + 1;
+            match self
+                .current
+                .compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    // Successfully acquired a slot.
+                    self.total_processed.fetch_add(1, Ordering::Relaxed);
+
+                    // Update state if needed, based on the pre-increment value `current`.
+                    if current >= high_threshold {
+                        self.set_state(BackpressureState::Critical);
+                        self.active.store(true, Ordering::Relaxed);
+                    } else if current >= self.config.low_threshold() {
+                        self.set_state(BackpressureState::Warning);
+                    }
+
+                    return true;
+                }
+                Err(_) => {
+                    // Another thread raced with us; retry with the updated value.
+                    continue;
+                }
+            }
         }
-
-        // Proceed with operation
-        self.current.fetch_add(1, Ordering::Relaxed);
-        self.total_processed.fetch_add(1, Ordering::Relaxed);
-
-        // Update state if needed
-        if current >= high_threshold {
-            self.set_state(BackpressureState::Critical);
-            self.active.store(true, Ordering::Relaxed);
-        } else if current >= self.config.low_threshold() {
-            self.set_state(BackpressureState::Warning);
-        }
-
-        true
     }
 
     /// Release a slot after operation completes.

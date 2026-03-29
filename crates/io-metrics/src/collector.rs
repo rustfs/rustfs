@@ -18,6 +18,7 @@
 //! reporting to the `metrics` crate for OTEL export.
 
 use super::performance::PerformanceMetrics;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -31,7 +32,7 @@ pub struct MetricsCollector {
     /// The underlying metrics (shared reference)
     metrics: Arc<PerformanceMetrics>,
     /// I/O latency samples for percentile calculation
-    io_latency_samples: RwLock<Vec<Duration>>,
+    io_latency_samples: RwLock<VecDeque<Duration>>,
     /// Maximum number of latency samples to keep
     max_latency_samples: usize,
 }
@@ -46,7 +47,7 @@ impl MetricsCollector {
     pub fn new(metrics: Arc<PerformanceMetrics>, max_latency_samples: usize) -> Self {
         Self {
             metrics,
-            io_latency_samples: RwLock::new(Vec::new()),
+            io_latency_samples: RwLock::new(VecDeque::new()),
             max_latency_samples,
         }
     }
@@ -89,11 +90,11 @@ impl MetricsCollector {
 
         // Record latency sample for percentile calculation
         let mut samples = self.io_latency_samples.write().await;
-        samples.push(duration);
+        samples.push_back(duration);
 
-        // Keep only the most recent samples
+        // Keep only the most recent samples (O(1) removal from front)
         if samples.len() > self.max_latency_samples {
-            samples.remove(0);
+            samples.pop_front();
         }
 
         // Update latency percentiles
@@ -106,7 +107,7 @@ impl MetricsCollector {
     /// Calculates percentiles from the sliding window of latency samples
     /// and updates both PerformanceMetrics and reports to metrics crate.
     async fn update_latency_percentiles(&self) {
-        let samples: tokio::sync::RwLockReadGuard<'_, Vec<Duration>> = self.io_latency_samples.read().await;
+        let samples: tokio::sync::RwLockReadGuard<'_, VecDeque<Duration>> = self.io_latency_samples.read().await;
         if samples.is_empty() {
             return;
         }

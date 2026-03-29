@@ -46,7 +46,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::SeekFrom;
-use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1877,27 +1876,10 @@ impl DiskAPI for LocalDisk {
                 // that we've already verified exists and is within file bounds.
                 let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
 
-                // True zero-copy: take ownership of the mmap's underlying memory
-                // and convert it directly to Bytes without copying.
-                //
-                // SAFETY:
-                // - The mmap is valid and won't be freed (we use ManuallyDrop)
-                // - We create a Vec from raw parts that takes ownership of the memory
-                // - Bytes::from() takes ownership of the Vec without copying
-                // - The final Bytes object manages the memory correctly
-                let mmap_ptr = mmap.as_ptr();
-                let mmap_len = mmap.len();
-                let mmap_capacity = mmap.len();
-
-                // Prevent mmap from dropping and freeing the memory
-                let _mmap = ManuallyDrop::new(mmap);
-
-                // Create Vec from raw parts (takes ownership of memory)
-                // SAFETY: The pointer is valid, size is correct, and capacity is correct
-                let vec = unsafe { Vec::from_raw_parts(mmap_ptr as *mut u8, mmap_len, mmap_capacity) };
-
-                // Convert Vec to Bytes (zero-copy ownership transfer)
-                Ok::<Bytes, DiskError>(Bytes::from(vec))
+                // Copy the mapped region into a Bytes buffer. This avoids undefined
+                // behavior from treating OS-managed mmap memory as allocator-managed
+                // Vec storage, at the cost of an extra copy.
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
             })
             .await
             .map_err(DiskError::from)??;

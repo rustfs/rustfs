@@ -234,11 +234,12 @@ mod tests {
 
     #[test]
     fn test_invalid_timeout() {
-        let _config = ConcurrencyConfig {
+        let config = ConcurrencyConfig {
             default_timeout: Duration::from_secs(100),
             max_timeout: Duration::from_secs(50),
             ..Default::default()
         };
+        assert!(config.validate().is_err(), "validate() should return an error when default_timeout > max_timeout");
     }
 
     #[test]

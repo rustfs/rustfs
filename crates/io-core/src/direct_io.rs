@@ -12,44 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Direct I/O support for Linux.
+//! Aligned pread-based file reader.
 //!
-//! This module provides Direct I/O (O_DIRECT) functionality for Linux systems,
-//! allowing I/O operations to bypass the OS page cache for specific use cases.
+//! This module provides an aligned, position-based file reader that uses
+//! `pread`/`FileExt::read_at` for I/O operations. It performs reads at
+//! 512-byte-aligned offsets and sizes, making it suitable as a foundation
+//! for workloads where alignment matters.
 //!
-//! Direct I/O is useful for:
-//! - Large file transfers where caching isn't beneficial
-//! - Databases that manage their own cache
-//! - Applications requiring predictable I/O latency
+//! Note: This reader does **not** set the `O_DIRECT` flag and therefore does
+//! not bypass the OS page cache. It is an aligned `pread`-based reader, not
+//! true Direct I/O. To implement true O_DIRECT on Linux, the file must be
+//! opened with `O_DIRECT` via `libc::open`.
 //!
 //! # Platform Support
 //!
-//! Direct I/O is only supported on Linux. On other platforms, attempting to
-//! create a DirectIoReader will return an error.
+//! The `read_at` implementation is only available on Unix-like platforms.
+//! On other platforms, this reader will return an error.
 
 use std::io::{self};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-/// Errors that can occur during Direct I/O operations.
+/// Errors that can occur during aligned pread operations.
 #[derive(Debug, Clone)]
 pub enum DirectIoError {
-    /// Platform doesn't support Direct I/O
+    /// Platform doesn't support `read_at`-based I/O
     UnsupportedPlatform,
-    /// File descriptor doesn't support Direct I/O
+    /// File descriptor doesn't support this reader
     UnsupportedFile,
     /// I/O error occurred
     Io(String),
-    /// Invalid alignment (Direct I/O requires aligned buffers)
+    /// Invalid alignment (reads require 512-byte-aligned offset and size)
     AlignmentError { offset: u64, size: usize },
 }
 
 impl std::fmt::Display for DirectIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedPlatform => write!(f, "Direct I/O not supported on this platform"),
-            Self::UnsupportedFile => write!(f, "File doesn't support Direct I/O"),
+            Self::UnsupportedPlatform => write!(f, "Aligned pread not supported on this platform"),
+            Self::UnsupportedFile => write!(f, "File doesn't support this reader"),
             Self::Io(msg) => write!(f, "I/O error: {}", msg),
             Self::AlignmentError { offset, size } => {
                 write!(f, "Alignment error: offset={}, size={}", offset, size)
@@ -66,19 +68,25 @@ impl From<io::Error> for DirectIoError {
     }
 }
 
-/// Direct I/O object reader for Linux.
+/// Aligned pread-based file reader for Unix platforms.
 ///
-/// This reader uses O_DIRECT flag to bypass the OS page cache,
-/// providing direct access to disk storage.
+/// This reader performs I/O using `pread`/`FileExt::read_at` at
+/// 512-byte-aligned offsets and sizes, without modifying the file's
+/// current position.
+///
+/// **Note:** This reader does **not** set the `O_DIRECT` flag and therefore
+/// does **not** bypass the OS page cache. It is an aligned `pread`-based
+/// reader. To implement true O_DIRECT, the file must be opened with
+/// `O_DIRECT` via `libc::open`.
 ///
 /// # Platform Support
 ///
-/// Only available on Linux. On other platforms, use `ZeroCopyObjectReader`
-/// with memory mapping instead.
+/// Only available on Linux (uses `FileExt::read_at`). On other platforms,
+/// use `ZeroCopyObjectReader` with memory mapping instead.
 ///
 /// # Alignment Requirements
 ///
-/// Direct I/O has strict alignment requirements:
+/// Reads have strict alignment requirements:
 /// - File offset must be aligned to 512 bytes
 /// - Buffer size must be a multiple of 512 bytes
 /// - Buffer address must be aligned (handled internally)
@@ -110,27 +118,24 @@ pub struct DirectIoReader {
 
 #[cfg(target_os = "linux")]
 impl DirectIoReader {
-    /// Direct I/O alignment requirement (512 bytes for most systems)
+    /// Alignment requirement for reads (512 bytes for most systems)
     pub const ALIGNMENT: usize = 512;
 
-    /// Create a new Direct I/O reader.
+    /// Create a new aligned pread-based reader.
     ///
     /// # Arguments
     ///
-    /// * `file` - File to read from (will be reopened with O_DIRECT)
+    /// * `file` - File to read from
     /// * `offset` - Starting offset in the file (must be 512-byte aligned)
     /// * `size` - Number of bytes to read (must be 512-byte aligned)
     ///
     /// # Returns
     ///
-    /// A `DirectIoReader` that provides direct access to the file.
+    /// A `DirectIoReader` that reads the file at the given offset.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The file doesn't support Direct I/O
-    /// - Offset or size are not properly aligned
-    /// - The platform doesn't support Direct I/O
+    /// Returns an error if offset or size are not 512-byte aligned.
     pub fn new(file: std::fs::File, offset: u64, size: usize) -> Result<Self, DirectIoError> {
         // Check alignment
         if offset % Self::ALIGNMENT as u64 != 0 {
@@ -139,10 +144,6 @@ impl DirectIoReader {
         if size % Self::ALIGNMENT != 0 {
             return Err(DirectIoError::AlignmentError { offset, size });
         }
-
-        // Try to enable O_DIRECT on the file
-        // Note: This requires the file to be opened with O_DIRECT flag
-        // In production, you'd need to reopen the file with proper flags
 
         Ok(Self {
             file,
@@ -216,10 +217,10 @@ impl AsyncRead for DirectIoReader {
     }
 }
 
-/// Direct I/O reader stub for non-Linux platforms.
+/// Aligned pread reader stub for non-Linux platforms.
 ///
-/// On non-Linux platforms, Direct I/O is not supported. This type
-/// exists to provide a consistent API across platforms.
+/// On non-Linux platforms, `read_at`-based I/O is not available through this
+/// type. This stub exists to provide a consistent API across platforms.
 #[cfg(not(target_os = "linux"))]
 pub struct DirectIoReader {
     _priv: (),
@@ -227,7 +228,7 @@ pub struct DirectIoReader {
 
 #[cfg(not(target_os = "linux"))]
 impl DirectIoReader {
-    /// Create a new Direct I/O reader (not supported on this platform).
+    /// Create a new aligned pread reader (not supported on this platform).
     ///
     /// Always returns an error on non-Linux platforms.
     pub fn new(_file: std::fs::File, _offset: u64, _size: usize) -> Result<Self, DirectIoError> {
@@ -240,7 +241,7 @@ impl AsyncRead for DirectIoReader {
     fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Direct I/O not supported on this platform",
+            "Aligned pread-based I/O not supported on this platform",
         )))
     }
 }

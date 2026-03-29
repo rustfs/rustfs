@@ -1065,7 +1065,7 @@ impl DiskAPI for RemoteDisk {
         let mut reader = reader;
 
         // Read all data into Bytes (single allocation)
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(length);
         reader.read_to_end(&mut buffer).await?;
 
         Ok(Bytes::from(buffer))

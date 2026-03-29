@@ -15,9 +15,9 @@
 //! Zero-copy core reader and writer implementations for RustFS.
 //!
 //! This crate provides zero-copy readers and writers that minimize memory
-//! allocations and data copying during I/O operations. It has no dependencies
-//! on other RustFS crates, making it safe to use from anywhere in the codebase
-//! without creating cyclic dependencies.
+//! allocations and data copying during I/O operations. It depends on
+//! `rustfs-io-metrics` for metrics reporting and is designed to avoid
+//! introducing cyclic dependencies in the RustFS crate graph.
 //!
 //! # Features
 //!
