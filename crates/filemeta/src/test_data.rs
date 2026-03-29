@@ -16,6 +16,10 @@ use crate::{ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, Met
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
+use xxhash_rust::xxh64;
+
+const MSGPACK_EXT8: u8 = 0xc7;
+const MSGPACK_TIME_EXT_LEGACY: i8 = 5;
 
 /// Create real xl.meta file data for testing
 pub fn create_real_xlmeta() -> Result<Vec<u8>> {
@@ -53,6 +57,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
 
     let file_version = FileMetaVersion {
         version_type: VersionType::Object,
+        legacy_object: None,
         object: Some(object_version),
         delete_marker: None,
         write_version: 1,
@@ -72,6 +77,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
 
     let delete_file_version = FileMetaVersion {
         version_type: VersionType::Delete,
+        legacy_object: None,
         object: None,
         delete_marker: Some(delete_marker),
         write_version: 2,
@@ -85,6 +91,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     let legacy_version_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")?;
     let legacy_version = FileMetaVersion {
         version_type: VersionType::Legacy,
+        legacy_object: None,
         object: None,
         delete_marker: None,
         write_version: 3,
@@ -100,6 +107,171 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
 
     fm.marshal_msg()
+}
+
+fn decode_hex_fixture(input: &str) -> Result<Vec<u8>> {
+    let input = input.trim();
+    if !input.len().is_multiple_of(2) {
+        return Err(crate::Error::other("hex fixture must have even length"));
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let bytes = input.as_bytes();
+    for idx in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[idx] as char)
+            .to_digit(16)
+            .ok_or_else(|| crate::Error::other(format!("invalid hex at index {idx}")))?;
+        let lo = (bytes[idx + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| crate::Error::other(format!("invalid hex at index {}", idx + 1)))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+
+    Ok(out)
+}
+
+/// Real legacy xl.meta captured in issue #2288. Header/meta versions are 2/1.
+pub fn create_issue_2288_legacy_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2288_legacy_xlmeta.hex"))
+}
+
+/// Legacy xl.meta captured in issue #2265. Header/meta versions are 3/2.
+pub fn create_issue_2265_legacy_meta_v2_object_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_object.hex"))
+}
+
+/// Legacy config xl.meta captured in issue #2265. Header/meta versions are 3/2.
+pub fn create_issue_2265_legacy_meta_v2_config_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_config.hex"))
+}
+
+fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
+    wr.push(MSGPACK_EXT8);
+    wr.push(12);
+    wr.push(MSGPACK_TIME_EXT_LEGACY as u8);
+    wr.extend_from_slice(&ts.unix_timestamp().to_be_bytes());
+    wr.extend_from_slice(&ts.nanosecond().to_be_bytes());
+}
+
+fn encode_legacy_v1_header(version_id: Uuid, mod_time: OffsetDateTime) -> Vec<u8> {
+    let mut wr = Vec::new();
+    rmp::encode::write_array_len(&mut wr, 4).unwrap();
+    rmp::encode::write_bin(&mut wr, version_id.as_bytes()).unwrap();
+    rmp::encode::write_i64(&mut wr, mod_time.unix_timestamp_nanos() as i64).unwrap();
+    rmp::encode::write_uint8(&mut wr, VersionType::Legacy.to_u8()).unwrap();
+    rmp::encode::write_uint8(&mut wr, 0).unwrap();
+    wr
+}
+
+fn encode_legacy_v1_body(version_id: Uuid, data_dir: Uuid, mod_time: OffsetDateTime) -> Vec<u8> {
+    let mut wr = Vec::new();
+
+    rmp::encode::write_map_len(&mut wr, 3).unwrap();
+
+    rmp::encode::write_str(&mut wr, "Type").unwrap();
+    rmp::encode::write_uint8(&mut wr, VersionType::Legacy.to_u8()).unwrap();
+
+    rmp::encode::write_str(&mut wr, "V1Obj").unwrap();
+    rmp::encode::write_map_len(&mut wr, 8).unwrap();
+
+    rmp::encode::write_str(&mut wr, "Version").unwrap();
+    rmp::encode::write_str(&mut wr, "1.0.1").unwrap();
+    rmp::encode::write_str(&mut wr, "Format").unwrap();
+    rmp::encode::write_str(&mut wr, "xl").unwrap();
+
+    rmp::encode::write_str(&mut wr, "Stat").unwrap();
+    rmp::encode::write_map_len(&mut wr, 5).unwrap();
+    rmp::encode::write_str(&mut wr, "Size").unwrap();
+    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_str(&mut wr, "ModTime").unwrap();
+    write_legacy_time(&mut wr, mod_time);
+    rmp::encode::write_str(&mut wr, "Name").unwrap();
+    rmp::encode::write_str(&mut wr, "hello.txt").unwrap();
+    rmp::encode::write_str(&mut wr, "Dir").unwrap();
+    rmp::encode::write_bool(&mut wr, false).unwrap();
+    rmp::encode::write_str(&mut wr, "Mode").unwrap();
+    rmp::encode::write_u32(&mut wr, 0o644).unwrap();
+
+    rmp::encode::write_str(&mut wr, "Erasure").unwrap();
+    rmp::encode::write_map_len(&mut wr, 7).unwrap();
+    rmp::encode::write_str(&mut wr, "Algorithm").unwrap();
+    rmp::encode::write_str(&mut wr, "ReedSolomon").unwrap();
+    rmp::encode::write_str(&mut wr, "DataBlocks").unwrap();
+    rmp::encode::write_sint(&mut wr, 4).unwrap();
+    rmp::encode::write_str(&mut wr, "ParityBlocks").unwrap();
+    rmp::encode::write_sint(&mut wr, 2).unwrap();
+    rmp::encode::write_str(&mut wr, "BlockSize").unwrap();
+    rmp::encode::write_sint(&mut wr, 1_048_576).unwrap();
+    rmp::encode::write_str(&mut wr, "Index").unwrap();
+    rmp::encode::write_sint(&mut wr, 1).unwrap();
+    rmp::encode::write_str(&mut wr, "Distribution").unwrap();
+    rmp::encode::write_array_len(&mut wr, 6).unwrap();
+    for value in 1..=6 {
+        rmp::encode::write_sint(&mut wr, value).unwrap();
+    }
+    rmp::encode::write_str(&mut wr, "Checksums").unwrap();
+    rmp::encode::write_array_len(&mut wr, 0).unwrap();
+
+    rmp::encode::write_str(&mut wr, "Meta").unwrap();
+    rmp::encode::write_map_len(&mut wr, 1).unwrap();
+    rmp::encode::write_str(&mut wr, "content-type").unwrap();
+    rmp::encode::write_str(&mut wr, "text/plain").unwrap();
+
+    rmp::encode::write_str(&mut wr, "Parts").unwrap();
+    rmp::encode::write_array_len(&mut wr, 1).unwrap();
+    rmp::encode::write_map_len(&mut wr, 5).unwrap();
+    rmp::encode::write_str(&mut wr, "e").unwrap();
+    rmp::encode::write_str(&mut wr, "etag-1").unwrap();
+    rmp::encode::write_str(&mut wr, "n").unwrap();
+    rmp::encode::write_sint(&mut wr, 1).unwrap();
+    rmp::encode::write_str(&mut wr, "s").unwrap();
+    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_str(&mut wr, "as").unwrap();
+    rmp::encode::write_sint(&mut wr, 11).unwrap();
+    rmp::encode::write_str(&mut wr, "mt").unwrap();
+    write_legacy_time(&mut wr, mod_time);
+
+    rmp::encode::write_str(&mut wr, "VersionID").unwrap();
+    rmp::encode::write_str(&mut wr, &version_id.to_string()).unwrap();
+    rmp::encode::write_str(&mut wr, "DataDir").unwrap();
+    rmp::encode::write_str(&mut wr, &data_dir.to_string()).unwrap();
+
+    rmp::encode::write_str(&mut wr, "v").unwrap();
+    rmp::encode::write_uint(&mut wr, 1).unwrap();
+
+    wr
+}
+
+/// Legacy xl.meta with a V1Obj body and v1 header layout.
+pub fn create_legacy_v1_object_xlmeta() -> Result<Vec<u8>> {
+    let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef")?;
+    let data_dir = Uuid::parse_str("fedcba98-7654-3210-fedc-ba9876543210")?;
+    let mod_time = OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789)?;
+
+    let header = encode_legacy_v1_header(version_id, mod_time);
+    let body = encode_legacy_v1_body(version_id, data_dir, mod_time);
+
+    let mut wr = Vec::new();
+    wr.extend_from_slice(b"XL2 ");
+    wr.extend_from_slice(&1u16.to_le_bytes());
+    wr.extend_from_slice(&3u16.to_le_bytes());
+    wr.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
+
+    let offset = wr.len();
+    rmp::encode::write_uint(&mut wr, 1).unwrap();
+    rmp::encode::write_uint(&mut wr, 1).unwrap();
+    rmp::encode::write_sint(&mut wr, 1).unwrap();
+    rmp::encode::write_bin(&mut wr, &header).unwrap();
+    rmp::encode::write_bin(&mut wr, &body).unwrap();
+
+    let data_len = (wr.len() - offset) as u32;
+    wr[offset - 4..offset].copy_from_slice(&data_len.to_be_bytes());
+
+    let crc = xxh64::xxh64(&wr[offset..], 0) as u32;
+    wr.push(0xce);
+    wr.extend_from_slice(&crc.to_be_bytes());
+
+    Ok(wr)
 }
 
 /// Create a complex xl.meta file with multiple versions
@@ -139,6 +311,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
 
         let file_version = FileMetaVersion {
             version_type: VersionType::Object,
+            legacy_object: None,
             object: Some(object_version),
             delete_marker: None,
             write_version: (i + 1) as u64,
@@ -159,6 +332,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
 
             let delete_file_version = FileMetaVersion {
                 version_type: VersionType::Delete,
+                legacy_object: None,
                 object: None,
                 delete_marker: Some(delete_marker),
                 write_version: (i + 100) as u64,
@@ -247,6 +421,7 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
 
     let file_version = FileMetaVersion {
         version_type: VersionType::Object,
+        legacy_object: None,
         object: Some(object_version),
         delete_marker: None,
         write_version: 1,
