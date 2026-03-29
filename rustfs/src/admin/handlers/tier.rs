@@ -26,6 +26,7 @@ use http::Uri;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_common::data_usage::TierStats;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
@@ -53,7 +54,6 @@ use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
-use urlencoding::decode;
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -85,7 +85,9 @@ pub struct AddTier {}
 
 fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
     if let Some(tier) = params.get("tier") {
-        let decoded = decode(tier).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+        let decoded = percent_decode_str(tier)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))?;
         let trimmed = decoded.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -728,6 +730,19 @@ mod tests {
 
         let tier = resolve_tier_name(&uri, &matched.params).expect("query parameter should resolve");
         assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_preserves_plus_in_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/WARM+PLUS".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/WARM+PLUS").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "WARM+PLUS");
     }
 
     #[test]
