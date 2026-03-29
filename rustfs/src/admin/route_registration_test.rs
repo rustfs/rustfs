@@ -149,7 +149,11 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
     system::register_system_route(&mut router).expect("register system route");
     pools::register_pool_route(&mut router).expect("register pool route");
     rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
+    heal::register_heal_route(&mut router).expect("register heal route");
+    tier::register_tier_route(&mut router).expect("register tier route");
+    bucket_meta::register_bucket_meta_route(&mut router).expect("register bucket meta route");
     quota::register_quota_route(&mut router).expect("register quota route");
+    kms::register_kms_route(&mut router).expect("register kms route");
     oidc::register_oidc_route(&mut router).expect("register oidc route");
 
     for (method, path) in [
@@ -164,10 +168,18 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/set-policy")),
         (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
+        (Method::POST, compat_admin_alias_path("/v3/heal/")),
+        (Method::GET, compat_admin_alias_path("/v3/tier/HOT")),
+        (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/attach")),
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/key/create")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/status")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/keys/test-key")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
