@@ -171,6 +171,17 @@ fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
     hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.client_token.is_empty() && !hip.force_stop
 }
 
+fn map_root_heal_status(heal_err: Option<rustfs_ecstore::error::Error>) -> S3Result<()> {
+    match heal_err {
+        None => Ok(()),
+        Some(rustfs_ecstore::error::StorageError::NoHealRequired) => {
+            warn!("root heal completed with non-fatal status: no heal required");
+            Ok(())
+        }
+        Some(err) => Err(s3_error!(InternalError, "root heal failed: {err}")),
+    }
+}
+
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -224,9 +235,7 @@ impl Operation for HealHandler {
                 .await
                 .map_err(|e| s3_error!(InternalError, "root heal failed: {e}"))?;
 
-            if let Some(err) = heal_err {
-                return Err(s3_error!(InternalError, "root heal failed: {err}"));
-            }
+            map_root_heal_status(heal_err)?;
 
             return Ok(S3Response::new((StatusCode::OK, Body::empty())));
         }
@@ -354,7 +363,7 @@ impl Operation for BackgroundHealStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        HealInitParams, HealResp, encode_background_heal_status, json_response, map_heal_response,
+        HealInitParams, HealResp, encode_background_heal_status, json_response, map_heal_response, map_root_heal_status,
         should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use bytes::Bytes;
@@ -362,6 +371,7 @@ mod tests {
     use http::Uri;
     use matchit::Router;
     use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+    use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{S3ErrorCode, header::CONTENT_TYPE};
     use serde_json::json;
@@ -493,6 +503,18 @@ mod tests {
             bucket: "bucket".to_string(),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn test_map_root_heal_status_allows_no_heal_required() {
+        map_root_heal_status(Some(StorageError::NoHealRequired)).expect("NoHealRequired should stay non-fatal");
+    }
+
+    #[test]
+    fn test_map_root_heal_status_rejects_fatal_errors() {
+        let err = map_root_heal_status(Some(StorageError::Unexpected)).expect_err("fatal status must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.to_string().contains("root heal failed: Unexpected error"));
     }
 
     #[test]
