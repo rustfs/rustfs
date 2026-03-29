@@ -82,3 +82,9 @@ data:
   RUSTFS_SCANNER_IDLE_MODE: {{ .idle_mode | quote }}
     {{- end }}
   {{- end }}
+  {{- if .Values.mode.distributed.enabled }}
+  {{- with .Values.config.rustfs.ec }}
+  RUSTFS_ERASURE_SET_DRIVE_COUNT: {{ 16 | quote }}
+  RUSTFS_STORAGE_CLASS_STANDARD: {{ .storage_class_standard | quote }}
+  {{- end }}
+  {{- end }}
