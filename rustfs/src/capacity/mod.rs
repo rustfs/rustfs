@@ -18,7 +18,7 @@
 //! - Scheduled background updates (configurable interval)
 //! - Write-triggered updates for high-frequency write scenarios
 //! - Configurable caching thresholds and smart update strategies
-//! - Comprehensive metrics collection for monitoring
+//! - Capacity metrics emitted through `rustfs-io-metrics`
 //!
 //! ## Configuration
 //!
@@ -45,16 +45,8 @@
 //! 3. **Cached responses**: Returns cached data when fresh
 //! 4. **Timeout protection**: Dynamic timeouts prevent hangs on large directories
 //!
-//! ## Metrics
-//!
-//! Metrics are automatically recorded via the `metrics` crate and accessible
-//! through the `rustfs-metrics` collection system. Key metrics include:
-//! - `rustfs.capacity.cache.{hits,misses}` - Cache hit/miss tracking
-//! - `rustfs.capacity.current` - Current capacity in bytes
-//! - `rustfs.capacity.write.operations` - Write operation count
-//! - `rustfs.capacity.update.{scheduled,write_triggered,failures}` - Update statistics
-//! - `rustfs.capacity.symlinks.*` - Symlink tracking statistics
-//! - `rustfs.capacity.timeout.*` - Timeout and stall detection
+//! Capacity metrics flow through the existing observability pipeline via the `metrics`
+//! crate and `rustfs-io-metrics`; this module does not expose a Prometheus HTTP endpoint.
 //!
 //! ## Testing
 //!
@@ -73,6 +65,5 @@ pub mod capacity_integration;
 pub mod capacity_manager;
 #[cfg(test)]
 mod capacity_manager_test;
-pub mod capacity_metrics;
 #[cfg(test)]
 mod write_trigger_test;

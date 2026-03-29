@@ -52,6 +52,7 @@ pub mod adaptive_ttl;
 pub mod autotuner;
 pub mod backpressure_metrics;
 pub mod cache_config;
+pub mod capacity_metrics;
 pub mod collector;
 pub mod config;
 pub mod deadlock_metrics;
@@ -69,6 +70,14 @@ pub use cache_config::{AdaptiveTTL, CacheConfig, CacheConfigError, CacheHealthSt
 pub use adaptive_ttl::{
     AccessRecord, AccessTracker, AdaptiveTTLStats, record_access_pattern_change, record_early_eviction, record_ttl_adjustment,
     record_ttl_expiration,
+};
+
+// Capacity metrics exports
+pub use capacity_metrics::{
+    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_current_bytes,
+    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected,
+    record_capacity_symlink, record_capacity_timeout_fallback, record_capacity_update_completed,
+    record_capacity_update_failed, record_capacity_write_operation,
 };
 
 // I/O metrics exports

@@ -15,7 +15,6 @@
 //! Hybrid Capacity Manager for efficient capacity statistics
 
 use crate::app::admin_usecase::calculate_data_dir_used_capacity;
-use metrics::{counter, gauge};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
@@ -26,6 +25,7 @@ use rustfs_config::{
     ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
     ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
+use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -279,13 +279,51 @@ pub struct CachedCapacity {
     /// Last update time
     pub last_update: Instant,
     /// File count (optional)
-    #[allow(dead_code)]
     pub file_count: usize,
     /// Whether it's an estimated value
-    #[allow(dead_code)]
     pub is_estimated: bool,
     /// Data source
     pub source: DataSource,
+}
+
+/// Structured capacity update payload.
+#[derive(Clone, Debug)]
+pub struct CapacityUpdate {
+    /// Total used capacity in bytes.
+    pub total_used: u64,
+    /// Number of files observed during scan.
+    pub file_count: usize,
+    /// Whether the value is estimated instead of exact.
+    pub is_estimated: bool,
+}
+
+impl CapacityUpdate {
+    /// Create an exact capacity update.
+    pub fn exact(total_used: u64, file_count: usize) -> Self {
+        Self {
+            total_used,
+            file_count,
+            is_estimated: false,
+        }
+    }
+
+    /// Create an estimated capacity update.
+    pub fn estimated(total_used: u64, file_count: usize) -> Self {
+        Self {
+            total_used,
+            file_count,
+            is_estimated: true,
+        }
+    }
+
+    /// Create a fallback capacity update.
+    pub fn fallback(total_used: u64) -> Self {
+        Self {
+            total_used,
+            file_count: 0,
+            is_estimated: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
@@ -299,6 +337,17 @@ pub enum DataSource {
     /// Fallback value
     #[allow(dead_code)]
     Fallback,
+}
+
+impl DataSource {
+    fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::RealTime => "realtime",
+            Self::Scheduled => "scheduled",
+            Self::WriteTriggered => "write_triggered",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// Write record for tracking write operations
@@ -367,6 +416,12 @@ pub struct HybridCapacityManager {
 }
 
 impl HybridCapacityManager {
+    fn max_stale_age(&self) -> Duration {
+        self.config
+            .scheduled_update_interval
+            .max(self.config.fast_update_threshold.checked_mul(3).unwrap_or(Duration::MAX))
+    }
+
     /// Create a new hybrid capacity manager
     pub fn new(config: HybridStrategyConfig) -> Self {
         Self {
@@ -393,25 +448,23 @@ impl HybridCapacityManager {
     }
 
     /// Update capacity
-    pub async fn update_capacity(&self, capacity: u64, source: DataSource) {
+    pub async fn update_capacity(&self, update: CapacityUpdate, source: DataSource) {
+        let start = Instant::now();
         let mut cache = self.cache.write().await;
         *cache = Some(CachedCapacity {
-            total_used: capacity,
+            total_used: update.total_used,
             last_update: Instant::now(),
-            file_count: 0,
-            is_estimated: false,
+            file_count: update.file_count,
+            is_estimated: update.is_estimated,
             source,
         });
 
-        debug!("Capacity updated: {} bytes, source: {:?}", capacity, source);
-        // Update metrics
-        gauge!("rustfs.capacity.current").set(capacity as f64);
-        match source {
-            DataSource::RealTime => counter!("rustfs.capacity.update.realtime").increment(1),
-            DataSource::Scheduled => counter!("rustfs.capacity.update.scheduled").increment(1),
-            DataSource::WriteTriggered => counter!("rustfs.capacity.update.write_triggered").increment(1),
-            DataSource::Fallback => counter!("rustfs.capacity.update.fallback").increment(1),
-        }
+        debug!(
+            "Capacity updated: {} bytes, files={}, estimated={}, source: {:?}",
+            update.total_used, update.file_count, update.is_estimated, source
+        );
+        record_capacity_current_bytes(update.total_used);
+        record_capacity_update_completed(source.as_metric_label(), start.elapsed(), update.total_used, update.is_estimated);
     }
 
     /// Record write operation
@@ -432,8 +485,7 @@ impl HybridCapacityManager {
             record.write_window.push(now);
         }
 
-        counter!("rustfs.capacity.write.operations").increment(1);
-        gauge!("rustfs.capacity.write.frequency").set(record.write_window.len() as f64);
+        record_capacity_write_operation(record.write_window.len());
         debug!(
             "Write operation recorded: total writes = {}, recent writes = {}",
             record.write_count,
@@ -495,6 +547,11 @@ impl HybridCapacityManager {
         &self.config
     }
 
+    /// Check if the cache is too stale to keep serving without a foreground refresh.
+    pub fn should_block_on_refresh(&self, cache_age: Duration) -> bool {
+        cache_age >= self.max_stale_age()
+    }
+
     /// Try to start a background update, returns true if update was started (false if already in progress)
     pub fn try_start_background_update(&self) -> bool {
         self.update_in_progress
@@ -526,7 +583,9 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 /// # Example
 /// ```no_run
 /// let manager = create_isolated_manager(HybridStrategyConfig::default());
-/// manager.update_capacity(1000, DataSource::RealTime).await;
+/// manager
+///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+///     .await;
 /// ```
 #[cfg(test)]
 #[allow(dead_code)]
@@ -556,10 +615,10 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
 
             // Import the calculate function
             match calculate_data_dir_used_capacity(&disks).await {
-                Ok(new_capacity) => {
+                Ok(scan) => {
                     let elapsed = start.elapsed();
-                    info!("Scheduled update completed: {} bytes in {:?}", new_capacity, elapsed);
-                    manager.update_capacity(new_capacity, DataSource::Scheduled).await;
+                    info!("Scheduled update completed: {} bytes in {:?}", scan.used_bytes, elapsed);
+                    manager.update_capacity(scan.to_capacity_update(), DataSource::Scheduled).await;
                 }
                 Err(e) => {
                     error!("Scheduled update failed: {:?}", e);
@@ -708,7 +767,7 @@ mod tests {
     async fn test_update_capacity() {
         let manager = HybridCapacityManager::from_env();
 
-        manager.update_capacity(1000, DataSource::RealTime).await;
+        manager.update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime).await;
 
         let cached = manager.get_capacity().await;
         assert!(cached.is_some());
@@ -735,7 +794,7 @@ mod tests {
         assert!(!manager.needs_fast_update().await);
 
         // Update cache
-        manager.update_capacity(1000, DataSource::RealTime).await;
+        manager.update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime).await;
 
         // Fresh cache, should not need update
         assert!(!manager.needs_fast_update().await);
