@@ -138,10 +138,10 @@ impl DirectIoReader {
     /// Returns an error if offset or size are not 512-byte aligned.
     pub fn new(file: std::fs::File, offset: u64, size: usize) -> Result<Self, DirectIoError> {
         // Check alignment
-        if offset % Self::ALIGNMENT as u64 != 0 {
+        if !offset.is_multiple_of(Self::ALIGNMENT as u64) {
             return Err(DirectIoError::AlignmentError { offset, size });
         }
-        if size % Self::ALIGNMENT != 0 {
+        if !size.is_multiple_of(Self::ALIGNMENT) {
             return Err(DirectIoError::AlignmentError { offset, size });
         }
 
@@ -168,7 +168,7 @@ impl DirectIoReader {
 
             // Allocate aligned buffer
             let chunk_size = (self.remaining).min(64 * 1024); // 64KB chunks
-            let aligned_size = (chunk_size + Self::ALIGNMENT - 1) / Self::ALIGNMENT * Self::ALIGNMENT;
+            let aligned_size = chunk_size.div_ceil(Self::ALIGNMENT) * Self::ALIGNMENT;
 
             self.buffer = vec![0u8; aligned_size];
 

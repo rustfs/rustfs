@@ -203,10 +203,10 @@ pub fn detect_storage_media(storage_detection_enabled: bool, storage_media_overr
     // Try platform-specific detection
     #[cfg(target_os = "linux")]
     {
-        if let Ok(media) = detect_linux_storage_media() {
-            if media != StorageMedia::Unknown {
-                return media;
-            }
+        if let Ok(media) = detect_linux_storage_media()
+            && media != StorageMedia::Unknown
+        {
+            return media;
         }
     }
 
