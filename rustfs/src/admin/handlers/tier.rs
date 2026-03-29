@@ -53,6 +53,7 @@ use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
+use urlencoding::decode;
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -83,8 +84,12 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 
 fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
-    if let Some(tier) = params.get("tier").map(str::trim).filter(|tier| !tier.is_empty()) {
-        return Ok(tier.to_string());
+    if let Some(tier) = params.get("tier") {
+        let decoded = decode(tier).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+        let trimmed = decoded.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
     }
 
     let query = if let Some(query) = uri.query() {
@@ -710,6 +715,33 @@ mod tests {
 
         let tier = resolve_tier_name(&uri, &params).expect("query parameter should resolve");
         assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_when_path_parameter_is_blank() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20?tier=WARM".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_rejects_blank_path_without_query_fallback() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let err = resolve_tier_name(&uri, &matched.params).expect_err("blank path should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
     }
 
     #[test]
