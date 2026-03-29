@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::io_schedule::ACTIVE_GET_REQUESTS;
-use rustfs_io_metrics::{record_get_object_request_start, record_get_object_request_result};
+use rustfs_io_metrics::{record_get_object_request_result, record_get_object_request_start};
 
 /// RAII guard for tracking active GetObject requests.
 #[derive(Debug)]
@@ -37,7 +37,9 @@ impl GetObjectGuard {
         let concurrent = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
         record_get_object_request_start(concurrent);
 
-        Self { start_time: Instant::now() }
+        Self {
+            start_time: Instant::now(),
+        }
     }
 
     /// Get the elapsed time since this guard was created.
@@ -74,11 +76,9 @@ impl Drop for GetObjectGuard {
         let duration_secs = self.start_time.elapsed().as_secs_f64();
         record_get_object_request_result("ok", duration_secs);
 
-        if let Err(previous) = ACTIVE_GET_REQUESTS.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| current.checked_sub(1),
-        ) {
+        if let Err(previous) =
+            ACTIVE_GET_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+        {
             debug_assert_eq!(
                 previous, 0,
                 "ACTIVE_GET_REQUESTS underflow attempt in GetObjectGuard::drop; previous value = {}",
