@@ -302,6 +302,18 @@ mod tests {
             assert_eq!(extract_key_id(&uri).as_deref(), Some(expected));
         }
     }
+
+    #[test]
+    fn test_extract_key_id_skips_empty_aliases() {
+        for (uri, expected) in [
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key", Some("minio-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=fallback-key", Some("fallback-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=", None),
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            assert_eq!(extract_key_id(&uri).as_deref(), expected);
+        }
+    }
 }
 
 /// List KMS keys (legacy endpoint)
