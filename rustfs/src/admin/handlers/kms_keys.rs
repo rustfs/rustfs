@@ -304,15 +304,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_key_id_skips_empty_aliases() {
-        for (uri, expected) in [
-            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key", Some("minio-key")),
-            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=fallback-key", Some("fallback-key")),
-            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=", None),
-        ] {
-            let uri: Uri = uri.parse().expect("uri should parse");
-            assert_eq!(extract_key_id(&uri).as_deref(), expected);
-        }
+    fn test_extract_key_id_skips_empty_values_and_uses_next_alias() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key&key=fallback-key"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(extract_key_id(&uri).as_deref(), Some("minio-key"));
+    }
+
+    #[test]
+    fn test_extract_key_id_prefers_legacy_name_over_aliases() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/status?keyId=legacy-key&key-id=minio-key&key=fallback-key"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(extract_key_id(&uri).as_deref(), Some("legacy-key"));
     }
 
     #[test]
