@@ -147,7 +147,8 @@ async fn send_direct_data_shard_chunks(
     }
 
     let start_block = offset / block_size;
-    let end_block = (offset + length) / block_size;
+    let end_block = offset.saturating_add(length - 1) / block_size;
+    let mut block = BytesMut::with_capacity(block_size.min(length));
 
     for block_index in start_block..=end_block {
         let (block_offset, block_length) = block_window(offset, length, block_size, block_index, start_block, end_block);
@@ -155,7 +156,9 @@ async fn send_direct_data_shard_chunks(
             break;
         }
 
-        let mut block = BytesMut::with_capacity(block_length);
+        if block.capacity() < block_length {
+            block.reserve(block_length - block.capacity());
+        }
         let mut write_left = block_length;
         let mut skip = block_offset;
 
@@ -202,7 +205,7 @@ async fn send_direct_data_shard_chunks(
             return;
         }
 
-        if sender.send(Ok(IoChunk::Shared(block.freeze()))).is_err() {
+        if sender.send(Ok(IoChunk::Shared(block.split().freeze()))).is_err() {
             return;
         }
     }

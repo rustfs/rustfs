@@ -98,6 +98,7 @@ rand.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
+libc.workspace = true
 rustfs-madmin.workspace = true
 rustfs-workers.workspace = true
 reqwest = { workspace = true }

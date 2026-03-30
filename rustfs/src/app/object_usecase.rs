@@ -5877,8 +5877,9 @@ mod tests {
         .expect("expected chunk fast path");
 
         match read_setup.body_source {
-            GetObjectBodySource::Chunk { path, .. } => {
-                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path")
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(copy_mode, rustfs_io_metrics::CopyMode::TrueZeroCopy);
             }
             GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
         }

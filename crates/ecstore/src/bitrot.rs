@@ -199,7 +199,7 @@ pub async fn create_bitrot_chunk_stream(
     let normalized_source = if source_chunks.len() == 1 {
         source_chunks.into_iter().next().unwrap()
     } else {
-        let mut aggregate = BytesMut::new();
+        let mut aggregate = BytesMut::with_capacity(encoded_length);
         for chunk in source_chunks {
             aggregate.extend_from_slice(&chunk.as_bytes());
         }

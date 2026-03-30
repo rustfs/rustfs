@@ -102,6 +102,17 @@ pub struct LocalDisk {
 const LOCAL_CHUNK_FAST_PATH_MIN_BYTES: usize = 64 * 1024;
 const LOCAL_CHUNK_FAST_PATH_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn mmap_page_size() -> usize {
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+
+    *PAGE_SIZE.get_or_init(|| {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 { 4096 } else { page_size as usize }
+    })
+}
+
 impl Drop for LocalDisk {
     fn drop(&mut self) {
         if let Some(exit_signal) = self.exit_signal.take() {
@@ -1945,15 +1956,6 @@ impl DiskAPI for LocalDisk {
             return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
         }
 
-        if offset != 0 {
-            rustfs_io_metrics::record_io_fallback(
-                rustfs_io_metrics::IoStage::LocalDiskChunk,
-                rustfs_io_metrics::FallbackReason::UnalignedWindow,
-            );
-            let bytes = self.read_file_zero_copy(volume, path, offset, length).await?;
-            return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Shared(bytes))])));
-        }
-
         #[cfg(unix)]
         {
             use memmap2::MmapOptions;
@@ -1985,9 +1987,14 @@ impl DiskAPI for LocalDisk {
             }
 
             let file_path_clone = file_path.clone();
+            let aligned_offset = offset / mmap_page_size() * mmap_page_size();
+            let logical_offset = offset - aligned_offset;
+            let map_length = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+            let aligned_offset_u64 = aligned_offset as u64;
             let mapped_bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
-                let mmap = unsafe { MmapOptions::new().offset(0).len(length).map(&file) }.map_err(DiskError::other)?;
+                let mmap = unsafe { MmapOptions::new().offset(aligned_offset_u64).len(map_length).map(&file) }
+                    .map_err(DiskError::other)?;
                 Ok::<Bytes, DiskError>(Bytes::from_owner(mmap))
             })
             .await
@@ -1995,7 +2002,7 @@ impl DiskAPI for LocalDisk {
 
             match mapped_bytes {
                 Ok(Ok(mapped_bytes)) => {
-                    let chunk = MappedChunk::new(mapped_bytes, 0, length).map_err(DiskError::other)?;
+                    let chunk = MappedChunk::new(mapped_bytes, logical_offset, length).map_err(DiskError::other)?;
                     return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Mapped(chunk))])));
                 }
                 Ok(Err(err)) => {
@@ -3227,7 +3234,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_read_file_chunks_falls_back_to_shared_for_non_zero_offset() {
+    async fn test_read_file_chunks_supports_non_zero_offset() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
         let object = "obj-offset.txt";
@@ -3244,6 +3251,9 @@ mod test {
             .await
             .unwrap();
         let first = stream.next().await.unwrap().unwrap();
+        #[cfg(unix)]
+        assert!(matches!(first, IoChunk::Mapped(_)));
+        #[cfg(not(unix))]
         assert!(matches!(first, IoChunk::Shared(_)));
         assert_eq!(first.as_bytes(), Bytes::copy_from_slice(&content[1..1 + LOCAL_CHUNK_FAST_PATH_MIN_BYTES]));
         assert!(stream.next().await.is_none());
