@@ -18,24 +18,24 @@
 //! - Scheduled background updates (configurable interval)
 //! - Write-triggered updates for high-frequency write scenarios
 //! - Configurable caching thresholds and smart update strategies
-//! - Comprehensive metrics collection for monitoring
+//! - Capacity metrics emitted through `rustfs-io-metrics`
 //!
 //! ## Configuration
 //!
 //! All configuration is via environment variables (see `rustfs_config`):
-//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 300)
-//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 10s)
-//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 10 writes/min)
-//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 60s)
-//! - `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` - Max files before sampling (default: 1,000,000)
-//! - `RUSTFS_CAPACITY_STAT_TIMEOUT` - Stat operation timeout (default: 5s)
-//! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 100)
+//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 120)
+//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 5s)
+//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 5 writes/min)
+//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 30s)
+//! - `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` - Max files before sampling (default: 200,000)
+//! - `RUSTFS_CAPACITY_STAT_TIMEOUT` - Stat operation timeout (default: 3s)
+//! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 200)
 //! - `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` - Follow symlinks during traversal (default: false)
-//! - `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` - Max symlink depth (default: 8)
-//! - `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` - Enable dynamic timeout (default: false)
-//! - `RUSTFS_CAPACITY_MIN_TIMEOUT` - Minimum timeout (default: 1s)
-//! - `RUSTFS_CAPACITY_MAX_TIMEOUT` - Maximum timeout (default: 300s)
-//! - `RUSTFS_CAPACITY_STALL_TIMEOUT` - Stall detection timeout (default: 30s)
+//! - `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` - Max symlink depth (default: 3)
+//! - `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` - Enable dynamic timeout (default: true)
+//! - `RUSTFS_CAPACITY_MIN_TIMEOUT` - Minimum timeout (default: 2s)
+//! - `RUSTFS_CAPACITY_MAX_TIMEOUT` - Maximum timeout (default: 15s)
+//! - `RUSTFS_CAPACITY_STALL_TIMEOUT` - Stall detection timeout (default: 20s)
 //!
 //! ## Architecture
 //!
@@ -45,16 +45,8 @@
 //! 3. **Cached responses**: Returns cached data when fresh
 //! 4. **Timeout protection**: Dynamic timeouts prevent hangs on large directories
 //!
-//! ## Metrics
-//!
-//! Metrics are automatically recorded via the `metrics` crate and accessible
-//! through the `rustfs-metrics` collection system. Key metrics include:
-//! - `rustfs.capacity.cache.{hits,misses}` - Cache hit/miss tracking
-//! - `rustfs.capacity.current` - Current capacity in bytes
-//! - `rustfs.capacity.write.operations` - Write operation count
-//! - `rustfs.capacity.update.{scheduled,write_triggered,failures}` - Update statistics
-//! - `rustfs.capacity.symlinks.*` - Symlink tracking statistics
-//! - `rustfs.capacity.timeout.*` - Timeout and stall detection
+//! Capacity metrics flow through the existing observability pipeline via the `metrics`
+//! crate and `rustfs-io-metrics`; this module does not expose a Prometheus HTTP endpoint.
 //!
 //! ## Testing
 //!
@@ -73,6 +65,5 @@ pub mod capacity_integration;
 pub mod capacity_manager;
 #[cfg(test)]
 mod capacity_manager_test;
-pub mod capacity_metrics;
 #[cfg(test)]
 mod write_trigger_test;

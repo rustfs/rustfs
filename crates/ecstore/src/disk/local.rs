@@ -2926,6 +2926,40 @@ mod test {
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
+    #[tokio::test]
+    async fn test_read_file_stream_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_stream("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
     #[test]
     fn test_is_valid_volname() {
         // Valid volume names (length >= 3)
