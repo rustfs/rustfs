@@ -148,7 +148,6 @@ async fn send_direct_data_shard_chunks(
 
     let start_block = offset / block_size;
     let end_block = offset.saturating_add(length - 1) / block_size;
-    let mut block = BytesMut::with_capacity(block_size.min(length));
 
     for block_index in start_block..=end_block {
         let (block_offset, block_length) = block_window(offset, length, block_size, block_index, start_block, end_block);
@@ -156,9 +155,6 @@ async fn send_direct_data_shard_chunks(
             break;
         }
 
-        if block.capacity() < block_length {
-            block.reserve(block_length - block.capacity());
-        }
         let mut write_left = block_length;
         let mut skip = block_offset;
 
@@ -179,17 +175,30 @@ async fn send_direct_data_shard_chunks(
                 }
             };
 
-            let bytes = chunk.as_bytes();
-            if skip >= bytes.len() {
-                skip -= bytes.len();
+            let chunk_len = chunk.len();
+            if skip >= chunk_len {
+                skip -= chunk_len;
                 continue;
             }
 
-            let available = &bytes[skip..];
+            let start = skip;
             skip = 0;
+            let take = (chunk_len - start).min(write_left);
+            let chunk = if start == 0 && take == chunk_len {
+                chunk
+            } else {
+                match chunk.slice(start, take) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        let _ = sender.send(Err(err));
+                        return;
+                    }
+                }
+            };
 
-            let take = available.len().min(write_left);
-            block.extend_from_slice(&available[..take]);
+            if sender.send(Ok(chunk)).is_err() {
+                return;
+            }
             write_left -= take;
 
             if write_left == 0 {
@@ -204,11 +213,27 @@ async fn send_direct_data_shard_chunks(
             )));
             return;
         }
-
-        if sender.send(Ok(IoChunk::Shared(block.split().freeze()))).is_err() {
-            return;
-        }
     }
+}
+
+#[doc(hidden)]
+pub async fn collect_direct_data_shard_chunks_for_benchmark(
+    shard_streams: Vec<BoxChunkStream>,
+    data_shards: usize,
+    block_size: usize,
+    offset: usize,
+    length: usize,
+) -> io::Result<Vec<IoChunk>> {
+    let (tx, rx) = unbounded_channel();
+    send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, offset, length).await;
+
+    let mut stream = ChannelChunkStream::new(rx);
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        chunks.push(chunk?);
+    }
+
+    Ok(chunks)
 }
 
 impl SetDisks {
@@ -367,6 +392,7 @@ impl SetDisks {
                     let shard_length = till_offset.saturating_sub(read_offset);
                     let shard_total_size = erasure.shard_file_size(part_size as i64) as usize;
                     let mut shard_streams = Vec::with_capacity(erasure.data_shards);
+                    let mut part_copy_mode = GetObjectChunkCopyMode::TrueZeroCopy;
 
                     for shard_index in 0..erasure.data_shards {
                         let data_path =
@@ -404,6 +430,7 @@ impl SetDisks {
                                 break;
                             }
                         };
+                        part_copy_mode = merge_chunk_copy_mode(part_copy_mode, chunk_result.copy_mode);
                         shard_streams.push(chunk_result.stream);
                     }
 
@@ -422,7 +449,7 @@ impl SetDisks {
                         part_length,
                     ));
 
-                    merged_copy_mode = merge_chunk_copy_mode(merged_copy_mode, GetObjectChunkCopyMode::SingleCopy);
+                    merged_copy_mode = merge_chunk_copy_mode(merged_copy_mode, part_copy_mode);
                     part_streams.push(Box::pin(ChannelChunkStream::new(rx)));
                 }
                 part_total_read += part_length;
@@ -430,19 +457,8 @@ impl SetDisks {
             }
 
             if !part_streams.is_empty() {
-                let (tx, rx) = unbounded_channel();
-                tokio::spawn(async move {
-                    for mut stream in part_streams {
-                        while let Some(chunk) = stream.next().await {
-                            if tx.send(chunk).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                });
-
                 return Ok(GetObjectChunkResult {
-                    stream: Box::pin(ChannelChunkStream::new(rx)),
+                    stream: Box::pin(stream::iter(part_streams).flatten()),
                     path: GetObjectChunkPath::Direct,
                     copy_mode: merged_copy_mode,
                 });

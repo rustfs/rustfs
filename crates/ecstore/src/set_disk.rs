@@ -151,6 +151,9 @@ mod read;
 mod replication;
 mod write;
 
+#[doc(hidden)]
+pub use read::collect_direct_data_shard_chunks_for_benchmark;
+
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
 pub fn get_lock_acquire_timeout() -> Duration {

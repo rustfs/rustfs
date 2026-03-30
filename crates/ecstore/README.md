@@ -32,6 +32,36 @@
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
 
+## 📈 Benchmarks
+
+ECStore ships several Criterion benchmarks under [`crates/ecstore/benches/`](./benches/).
+
+### Direct Chunk Path
+
+Use the direct chunk benchmark to compare the current slice-forwarding path against the previous assembled-copy path:
+
+```bash
+cargo bench -p rustfs-ecstore --bench direct_chunk_benchmark
+```
+
+To run only the end-to-end ECStore range-read benchmark:
+
+```bash
+cargo bench -p rustfs-ecstore --bench direct_chunk_benchmark ecstore_get_object_chunks
+```
+
+### Saved Comparison Points
+
+Latest local measurements on this branch:
+
+- `direct_chunk_path/slice_forwarding/single_block_aligned`: about `477 ns`
+- `direct_chunk_path/assembled_copy/single_block_aligned`: about `3.25 us`
+- `direct_chunk_path/slice_forwarding/multi_block_unaligned`: about `963 ns`
+- `direct_chunk_path/assembled_copy/multi_block_unaligned`: about `7.25 us`
+- `ecstore_get_object_chunks/drain/multi_disk_range`: about `644-654 us`, throughput about `2.86-2.90 GiB/s`
+
+These numbers are intended as branch-local reference points. Re-run the benchmark on your target machine before treating them as a regression baseline.
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

@@ -6015,10 +6015,17 @@ mod tests {
         match read_setup.body_source {
             GetObjectBodySource::Chunk { path, copy_mode, .. } => {
                 assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                #[cfg(unix)]
                 assert_eq!(
                     copy_mode,
-                    rustfs_io_metrics::CopyMode::SingleCopy,
-                    "multi-data-shard direct path should remain non-bridge but incur a single assembly copy"
+                    rustfs_io_metrics::CopyMode::TrueZeroCopy,
+                    "multi-data-shard direct path should preserve shard mmap slices without assembly copies"
+                );
+                #[cfg(not(unix))]
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::SharedBytes,
+                    "multi-data-shard direct path should avoid assembly copies even without mmap"
                 );
             }
             GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),

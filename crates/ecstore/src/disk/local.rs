@@ -113,6 +113,24 @@ fn mmap_page_size() -> usize {
     })
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn map_file_region_bytes(file_path: &Path, offset: usize, length: usize) -> Result<Bytes> {
+    use memmap2::MmapOptions;
+
+    let aligned_offset = offset / mmap_page_size() * mmap_page_size();
+    let logical_offset = offset - aligned_offset;
+    let map_length = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+    let visible_end = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+    let file = std::fs::File::open(file_path).map_err(DiskError::from)?;
+
+    let mmap =
+        unsafe { MmapOptions::new().offset(aligned_offset as u64).len(map_length).map(&file) }.map_err(DiskError::other)?;
+    let bytes = Bytes::from_owner(mmap);
+
+    Ok(bytes.slice(logical_offset..visible_end))
+}
+
 impl Drop for LocalDisk {
     fn drop(&mut self) {
         if let Some(exit_signal) = self.exit_signal.take() {
@@ -1878,29 +1896,15 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileCorrupt);
         }
 
-        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
-        // Non-Unix: fall back to efficient read
+        // Unix: use mmap to return a shared Bytes view without copying.
+        // Non-Unix: fall back to efficient read.
         #[cfg(unix)]
         {
-            use memmap2::MmapOptions;
             let file_path_clone = file_path.clone();
-            let offset_u64 = offset as u64;
 
-            let bytes = tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
-
-                // Create memory map for the specified region
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds.
-                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
-
-                // Copy the mapped region into a Bytes buffer. This avoids undefined
-                // behavior from treating OS-managed mmap memory as allocator-managed
-                // Vec storage, at the cost of an extra copy.
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
-            })
-            .await
-            .map_err(DiskError::from)??;
+            let bytes = tokio::task::spawn_blocking(move || map_file_region_bytes(&file_path_clone, offset, length))
+                .await
+                .map_err(DiskError::from)??;
 
             // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1958,8 +1962,6 @@ impl DiskAPI for LocalDisk {
 
         #[cfg(unix)]
         {
-            use memmap2::MmapOptions;
-
             let volume_dir = self.get_bucket_path(volume)?;
             if !skip_access_checks(volume) {
                 access(&volume_dir)
@@ -1987,22 +1989,13 @@ impl DiskAPI for LocalDisk {
             }
 
             let file_path_clone = file_path.clone();
-            let aligned_offset = offset / mmap_page_size() * mmap_page_size();
-            let logical_offset = offset - aligned_offset;
-            let map_length = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-            let aligned_offset_u64 = aligned_offset as u64;
-            let mapped_bytes = tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
-                let mmap = unsafe { MmapOptions::new().offset(aligned_offset_u64).len(map_length).map(&file) }
-                    .map_err(DiskError::other)?;
-                Ok::<Bytes, DiskError>(Bytes::from_owner(mmap))
-            })
-            .await
-            .map_err(DiskError::from);
+            let mapped_bytes = tokio::task::spawn_blocking(move || map_file_region_bytes(&file_path_clone, offset, length))
+                .await
+                .map_err(DiskError::from);
 
             match mapped_bytes {
                 Ok(Ok(mapped_bytes)) => {
-                    let chunk = MappedChunk::new(mapped_bytes, logical_offset, length).map_err(DiskError::other)?;
+                    let chunk = MappedChunk::new(mapped_bytes, 0, length).map_err(DiskError::other)?;
                     return Ok(Box::pin(stream::iter(vec![Ok(IoChunk::Mapped(chunk))])));
                 }
                 Ok(Err(err)) => {
@@ -3072,6 +3065,22 @@ mod test {
 
         let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
         assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_zero_copy_supports_non_zero_offset() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        let content = Bytes::from_static(b"0123456789abcdef");
+        disk.write_all("test-volume", "test-file.txt", content.clone()).await.unwrap();
+
+        let result = disk.read_file_zero_copy("test-volume", "test-file.txt", 3, 7).await.unwrap();
+        assert_eq!(result, Bytes::from_static(b"3456789"));
     }
 
     #[test]

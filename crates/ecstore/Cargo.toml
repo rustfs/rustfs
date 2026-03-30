@@ -140,5 +140,9 @@ harness = false
 name = "comparison_benchmark"
 harness = false
 
+[[bench]]
+name = "direct_chunk_benchmark"
+harness = false
+
 [lib]
 doctest = false
