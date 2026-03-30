@@ -2010,13 +2010,14 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let PutObjectAclInput {
             bucket,
             key,
             access_control_policy,
             version_id,
             ..
-        } = req.input;
+        } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2025,7 +2026,7 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if access_control_policy.is_some() {
             return Err(s3_error!(
@@ -2034,7 +2035,14 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        Ok(S3Response::new(PutObjectAclOutput::default()))
+        let event_version_id = version_id
+            .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
+            .unwrap_or_default();
+        helper = helper.object(object_info).version_id(event_version_id);
+
+        let result = Ok(S3Response::new(PutObjectAclOutput::default()));
+        let _ = helper.complete(&result);
+        result
     }
 
     pub async fn execute_put_object_legal_hold(
@@ -2045,7 +2053,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold).suppress_event();
         let PutObjectLegalHoldInput {
             bucket,
             key,
@@ -2176,7 +2185,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention).suppress_event();
         let PutObjectRetentionInput {
             bucket,
             key,
@@ -2269,7 +2279,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, S3Operation::PutObjectTagging);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
             bucket,
             key: object,
@@ -2329,20 +2339,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?req.input.version_id,
+                    error = %err,
+                    "failed to load object info for put-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id = req.input.version_id.clone();
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
             debug!("Cache invalidated for tagged object: {}", cache_key);
         });
 
         counter!("rustfs.put_object_tagging.success").increment(1);
 
-        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = req
+            .input
+            .version_id
+            .as_deref()
+            .filter(|version_id| !version_id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(PutObjectTaggingOutput {
             version_id: req.input.version_id.clone(),
@@ -2555,7 +2595,7 @@ impl DefaultObjectUsecase {
         let concurrent_requests = bootstrap.concurrent_requests;
         let mut request_guard = bootstrap.request_guard;
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
         let request_context = Self::prepare_get_object_request_context(&req).await?;
@@ -2709,7 +2749,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes).suppress_event();
         let GetObjectAttributesInput {
             bucket,
             key,
@@ -2941,7 +2982,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold).suppress_event();
         let GetObjectLegalHoldInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -3032,7 +3074,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention).suppress_event();
         let GetObjectRetentionInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -3949,7 +3992,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, S3Operation::DeleteObjectTagging);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
             bucket,
             key: object,
@@ -3973,22 +4016,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?version_id,
+                    error = %err,
+                    "failed to load object info for delete-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id_clone = version_id.clone();
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
             debug!(
                 "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                bucket, object, version_id_clone
+                cache_bucket, cache_object, version_id_clone
             );
         });
 
         counter!("rustfs.delete_object_tagging.success").increment(1);
 
-        let version_id_resp = version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = version_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
@@ -4003,7 +4074,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject).suppress_event();
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -4329,6 +4400,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        let mut helper = OperationHelper::new(&req, EventName::ObjectRestorePost, S3Operation::RestoreObject);
         let RestoreObjectInput {
             bucket,
             key: object,
@@ -4392,6 +4464,7 @@ impl DefaultObjectUsecase {
 
         let mut header = HeaderMap::new();
 
+        let event_object_info = obj_info.clone();
         let obj_info_ = obj_info.clone();
         if rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") {
             obj_info.metadata_only = true;
@@ -4445,7 +4518,13 @@ impl DefaultObjectUsecase {
             if already_restored {
                 let output =
                     restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
-                return Ok(S3Response::new(output));
+                helper = helper
+                    .object(event_object_info.clone())
+                    .version_id(version_id_str.clone())
+                    .suppress_event();
+                let result = Ok(S3Response::new(output));
+                let _ = helper.complete(&result);
+                return result;
             }
         }
 
@@ -4496,8 +4575,10 @@ impl DefaultObjectUsecase {
         });
 
         let output = restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
-
-        Ok(S3Response::with_headers(output, header))
+        helper = helper.object(event_object_info).version_id(version_id_str);
+        let result = Ok(S3Response::with_headers(output, header));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
