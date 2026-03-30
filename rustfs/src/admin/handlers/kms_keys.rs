@@ -320,7 +320,6 @@ mod tests {
 
         assert_eq!(extract_key_id(&uri).as_deref(), Some("legacy-key"));
     }
- 
     #[test]
     fn test_extract_key_id_skips_empty_aliases() {
         for (uri, expected) in [
