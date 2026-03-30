@@ -1449,6 +1449,12 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
+    async fn list_object_versions_m(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
+    }
+
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
@@ -1463,6 +1469,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+    }
+
+    async fn list_objects_v2m(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
