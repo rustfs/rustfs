@@ -189,8 +189,8 @@ ingress:
 
 gatewayApi:
   enabled: false
-  gatewayClass: traefik
-  listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
+  gatewayClass: traefik # Only support for traefik and contour gatewayClass at the moment.
+  listeners: # Specify which listeners to create on the Gateway. 
     http:
       name: web
       port: 8000
