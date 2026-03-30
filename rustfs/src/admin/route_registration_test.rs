@@ -38,24 +38,29 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
+fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
+    health::register_health_route(router).expect("register health route");
+    sts::register_admin_auth_route(router).expect("register sts route");
+    user::register_user_route(router).expect("register user route");
+    system::register_system_route(router).expect("register system route");
+    pools::register_pool_route(router).expect("register pool route");
+    rebalance::register_rebalance_route(router).expect("register rebalance route");
+    heal::register_heal_route(router).expect("register heal route");
+    tier::register_tier_route(router).expect("register tier route");
+    quota::register_quota_route(router).expect("register quota route");
+    bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    replication::register_replication_route(router).expect("register replication route");
+    profile_admin::register_profiling_route(router).expect("register profile route");
+    kms::register_kms_route(router).expect("register kms route");
+    oidc::register_oidc_route(router).expect("register oidc route");
+}
+
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
-    health::register_health_route(&mut router).expect("register health route");
-    sts::register_admin_auth_route(&mut router).expect("register sts route");
-    user::register_user_route(&mut router).expect("register user route");
-    system::register_system_route(&mut router).expect("register system route");
-    pools::register_pool_route(&mut router).expect("register pool route");
-    rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
-    heal::register_heal_route(&mut router).expect("register heal route");
-    tier::register_tier_route(&mut router).expect("register tier route");
-    quota::register_quota_route(&mut router).expect("register quota route");
-    bucket_meta::register_bucket_meta_route(&mut router).expect("register bucket meta route");
-    replication::register_replication_route(&mut router).expect("register replication route");
-    profile_admin::register_profiling_route(&mut router).expect("register profile route");
-    kms::register_kms_route(&mut router).expect("register kms route");
-    oidc::register_oidc_route(&mut router).expect("register oidc route");
+    register_admin_routes(&mut router);
+
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -143,18 +148,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 fn test_admin_alias_paths_match_existing_admin_routes() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
-    health::register_health_route(&mut router).expect("register health route");
-    sts::register_admin_auth_route(&mut router).expect("register sts route");
-    user::register_user_route(&mut router).expect("register user route");
-    system::register_system_route(&mut router).expect("register system route");
-    pools::register_pool_route(&mut router).expect("register pool route");
-    rebalance::register_rebalance_route(&mut router).expect("register rebalance route");
-    heal::register_heal_route(&mut router).expect("register heal route");
-    tier::register_tier_route(&mut router).expect("register tier route");
-    bucket_meta::register_bucket_meta_route(&mut router).expect("register bucket meta route");
-    quota::register_quota_route(&mut router).expect("register quota route");
-    kms::register_kms_route(&mut router).expect("register kms route");
-    oidc::register_oidc_route(&mut router).expect("register oidc route");
+    register_admin_routes(&mut router);
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),
