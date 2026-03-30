@@ -296,7 +296,7 @@ mod tests {
             ..Default::default()
         });
 
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, S3Operation::PutObjectTagging);
+        let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let event_args = helper.event_builder.clone().expect("event builder should exist").build();
 
         assert_eq!(event_args.bucket_name, "issue-2292-bucket");

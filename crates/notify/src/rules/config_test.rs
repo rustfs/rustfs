@@ -417,16 +417,12 @@ mod integration_tests {
 
         let rules_map = config.get_rules_map();
 
-        // ObjectCreated:* should be expanded to all ObjectCreated events
+        // AWS ObjectCreated:* should only include object creation operations.
         let event_types = [
             EventName::ObjectCreatedPut,
             EventName::ObjectCreatedPost,
             EventName::ObjectCreatedCopy,
             EventName::ObjectCreatedCompleteMultipartUpload,
-            EventName::ObjectCreatedPutRetention,
-            EventName::ObjectCreatedPutLegalHold,
-            EventName::ObjectCreatedPutTagging,
-            EventName::ObjectCreatedDeleteTagging,
         ];
 
         for event_type in event_types {
@@ -436,5 +432,8 @@ mod integration_tests {
             let targets = rules_map.match_rules(event_type, "data/file.csv");
             assert!(!targets.is_empty(), "Event {:?} should match", event_type);
         }
+
+        assert!(!rules_map.has_subscriber(&EventName::ObjectTaggingPut));
+        assert!(!rules_map.has_subscriber(&EventName::ObjectTaggingDelete));
     }
 }
