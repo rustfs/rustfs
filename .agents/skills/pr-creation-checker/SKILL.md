@@ -26,6 +26,8 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 - Review the diff and summarize what changed.
 - Call out unrelated edits, generated artifacts, logs, or secrets as blockers.
 - Mark risky areas explicitly: auth, storage, config, network, migrations, breaking changes.
+- Scan the diff for newly added string literals and confirm whether they duplicate values already defined as constants/enums/typed wrappers in the same module or shared modules.
+- Treat introducing a new hardcoded literal where a project constant already exists as a likely regression risk; require either a refactor to reuse the constant or an explicit exception explanation in the PR body.
 
 3. Verify readiness requirements
 - Require `make pre-commit` before marking the PR ready.
@@ -82,6 +84,7 @@ Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whe
 - Return `BLOCKED` if required template sections are missing.
 - Return `BLOCKED` if the title/body is not in English.
 - Return `BLOCKED` if the title does not follow the repository's Conventional Commit rule.
+- Return `BLOCKED` if the diff introduces string literals that should use existing constants but did not.
 
 ## Reference
 
