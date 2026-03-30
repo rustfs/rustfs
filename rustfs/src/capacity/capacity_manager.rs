@@ -15,7 +15,6 @@
 //! Hybrid Capacity Manager for efficient capacity statistics
 
 use crate::app::admin_usecase::calculate_data_dir_used_capacity;
-use metrics::{counter, gauge};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
@@ -26,12 +25,13 @@ use rustfs_config::{
     ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
     ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
+use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, RwLock, watch};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // Configuration Functions
@@ -279,13 +279,51 @@ pub struct CachedCapacity {
     /// Last update time
     pub last_update: Instant,
     /// File count (optional)
-    #[allow(dead_code)]
     pub file_count: usize,
     /// Whether it's an estimated value
-    #[allow(dead_code)]
     pub is_estimated: bool,
     /// Data source
     pub source: DataSource,
+}
+
+/// Structured capacity update payload.
+#[derive(Clone, Debug)]
+pub struct CapacityUpdate {
+    /// Total used capacity in bytes.
+    pub total_used: u64,
+    /// Number of files observed during scan.
+    pub file_count: usize,
+    /// Whether the value is estimated instead of exact.
+    pub is_estimated: bool,
+}
+
+impl CapacityUpdate {
+    /// Create an exact capacity update.
+    pub fn exact(total_used: u64, file_count: usize) -> Self {
+        Self {
+            total_used,
+            file_count,
+            is_estimated: false,
+        }
+    }
+
+    /// Create an estimated capacity update.
+    pub fn estimated(total_used: u64, file_count: usize) -> Self {
+        Self {
+            total_used,
+            file_count,
+            is_estimated: true,
+        }
+    }
+
+    /// Create a fallback capacity update.
+    pub fn fallback(total_used: u64) -> Self {
+        Self {
+            total_used,
+            file_count: 0,
+            is_estimated: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
@@ -299,6 +337,17 @@ pub enum DataSource {
     /// Fallback value
     #[allow(dead_code)]
     Fallback,
+}
+
+impl DataSource {
+    fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::RealTime => "realtime",
+            Self::Scheduled => "scheduled",
+            Self::WriteTriggered => "write_triggered",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// Write record for tracking write operations
@@ -354,6 +403,25 @@ impl HybridStrategyConfig {
 // Hybrid Capacity Manager
 // ============================================================================
 
+struct RefreshState {
+    running: bool,
+    /// Sender for the current refresh cycle. Joiners subscribe to this before releasing the
+    /// mutex so they cannot miss the completion notification. A new channel is created at the
+    /// start of every refresh cycle so stale subscribers from previous cycles are not confused
+    /// by results that were already published.
+    result_tx: watch::Sender<Option<Result<CapacityUpdate, String>>>,
+}
+
+impl Default for RefreshState {
+    fn default() -> Self {
+        let (tx, _) = watch::channel(None);
+        Self {
+            running: false,
+            result_tx: tx,
+        }
+    }
+}
+
 /// Hybrid capacity manager
 pub struct HybridCapacityManager {
     /// Capacity cache
@@ -362,11 +430,17 @@ pub struct HybridCapacityManager {
     write_record: Arc<RwLock<WriteRecord>>,
     /// Configuration
     config: HybridStrategyConfig,
-    /// Background update in progress flag
-    update_in_progress: Arc<AtomicBool>,
+    /// Shared singleflight refresh state
+    refresh_state: Arc<Mutex<RefreshState>>,
 }
 
 impl HybridCapacityManager {
+    fn max_stale_age(&self) -> Duration {
+        self.config
+            .scheduled_update_interval
+            .max(self.config.fast_update_threshold.checked_mul(3).unwrap_or(Duration::MAX))
+    }
+
     /// Create a new hybrid capacity manager
     pub fn new(config: HybridStrategyConfig) -> Self {
         Self {
@@ -377,7 +451,7 @@ impl HybridCapacityManager {
                 write_window: Vec::new(),
             })),
             config,
-            update_in_progress: Arc::new(AtomicBool::new(false)),
+            refresh_state: Arc::new(Mutex::new(RefreshState::default())),
         }
     }
 
@@ -393,25 +467,23 @@ impl HybridCapacityManager {
     }
 
     /// Update capacity
-    pub async fn update_capacity(&self, capacity: u64, source: DataSource) {
+    pub async fn update_capacity(&self, update: CapacityUpdate, source: DataSource) {
+        let start = Instant::now();
         let mut cache = self.cache.write().await;
         *cache = Some(CachedCapacity {
-            total_used: capacity,
+            total_used: update.total_used,
             last_update: Instant::now(),
-            file_count: 0,
-            is_estimated: false,
+            file_count: update.file_count,
+            is_estimated: update.is_estimated,
             source,
         });
 
-        debug!("Capacity updated: {} bytes, source: {:?}", capacity, source);
-        // Update metrics
-        gauge!("rustfs.capacity.current").set(capacity as f64);
-        match source {
-            DataSource::RealTime => counter!("rustfs.capacity.update.realtime").increment(1),
-            DataSource::Scheduled => counter!("rustfs.capacity.update.scheduled").increment(1),
-            DataSource::WriteTriggered => counter!("rustfs.capacity.update.write_triggered").increment(1),
-            DataSource::Fallback => counter!("rustfs.capacity.update.fallback").increment(1),
-        }
+        debug!(
+            "Capacity updated: {} bytes, files={}, estimated={}, source: {:?}",
+            update.total_used, update.file_count, update.is_estimated, source
+        );
+        record_capacity_current_bytes(update.total_used);
+        record_capacity_update_completed(source.as_metric_label(), start.elapsed(), update.total_used, update.is_estimated);
     }
 
     /// Record write operation
@@ -432,8 +504,7 @@ impl HybridCapacityManager {
             record.write_window.push(now);
         }
 
-        counter!("rustfs.capacity.write.operations").increment(1);
-        gauge!("rustfs.capacity.write.frequency").set(record.write_window.len() as f64);
+        record_capacity_write_operation(record.write_window.len());
         debug!(
             "Write operation recorded: total writes = {}, recent writes = {}",
             record.write_count,
@@ -490,21 +561,110 @@ impl HybridCapacityManager {
         record.write_window.len()
     }
 
+    /// Run a singleflight refresh. Callers either join an existing in-flight refresh or become the leader.
+    ///
+    /// Joiners subscribe to the watch channel *before* releasing the mutex, which guarantees
+    /// they cannot miss the completion notification even if the leader finishes very quickly.
+    pub async fn refresh_or_join<F, Fut>(&self, source: DataSource, refresh_fn: F) -> Result<CapacityUpdate, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<CapacityUpdate, String>>,
+    {
+        let maybe_rx = {
+            let mut state = self.refresh_state.lock().await;
+            if state.running {
+                // Subscribe while holding the lock so the send that completes the current
+                // refresh cycle cannot happen before we are subscribed.
+                Some(state.result_tx.subscribe())
+            } else {
+                // Become the leader. Create a fresh channel so that joiners from a previous
+                // cycle cannot observe the result that was published for the new cycle.
+                let (tx, _) = watch::channel(None);
+                state.result_tx = tx;
+                state.running = true;
+                None
+            }
+        };
+
+        if let Some(mut result_rx) = maybe_rx {
+            // Wait until the leader publishes Some(result). Because we subscribed before
+            // releasing the mutex, we cannot miss the notification.
+            if result_rx.wait_for(|v| v.is_some()).await.is_err() {
+                // The leader's sender was dropped (e.g. due to a panic) without publishing
+                // a result. Surface a clear error rather than silently returning the default.
+                return Err("capacity refresh leader exited without publishing a result".to_string());
+            }
+            return result_rx
+                .borrow()
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
+        }
+
+        let result = refresh_fn().await;
+        if let Ok(update) = &result {
+            self.update_capacity(update.clone(), source).await;
+        }
+
+        {
+            let mut state = self.refresh_state.lock().await;
+            state.running = false;
+            let _ = state.result_tx.send(Some(result.clone()));
+        }
+
+        result
+    }
+
+    /// Start a background refresh if one is not already in flight.
+    pub async fn spawn_refresh_if_needed<F, Fut>(self: Arc<Self>, source: DataSource, refresh_fn: F) -> bool
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CapacityUpdate, String>> + Send + 'static,
+    {
+        let should_spawn = {
+            let mut state = self.refresh_state.lock().await;
+            if state.running {
+                false
+            } else {
+                let (tx, _) = watch::channel(None);
+                state.result_tx = tx;
+                state.running = true;
+                true
+            }
+        };
+
+        if !should_spawn {
+            return false;
+        }
+
+        tokio::spawn(async move {
+            let result = refresh_fn().await;
+            if let Ok(update) = &result {
+                self.update_capacity(update.clone(), source).await;
+            }
+
+            let mut state = self.refresh_state.lock().await;
+            state.running = false;
+            let _ = state.result_tx.send(Some(result));
+        });
+
+        true
+    }
+
     /// Get config
     pub fn get_config(&self) -> &HybridStrategyConfig {
         &self.config
     }
 
-    /// Try to start a background update, returns true if update was started (false if already in progress)
-    pub fn try_start_background_update(&self) -> bool {
-        self.update_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    /// Check if the cache is too stale to keep serving without a foreground refresh.
+    pub fn should_block_on_refresh(&self, cache_age: Duration) -> bool {
+        cache_age >= self.max_stale_age()
     }
 
-    /// Mark background update as complete
-    pub fn complete_background_update(&self) {
-        self.update_in_progress.store(false, Ordering::Release);
+    /// Return whether a refresh is currently in flight.
+    #[cfg(test)]
+    pub async fn refresh_in_progress(&self) -> bool {
+        self.refresh_state.lock().await.running
     }
 }
 
@@ -526,7 +686,9 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 /// # Example
 /// ```no_run
 /// let manager = create_isolated_manager(HybridStrategyConfig::default());
-/// manager.update_capacity(1000, DataSource::RealTime).await;
+/// manager
+///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+///     .await;
 /// ```
 #[cfg(test)]
 #[allow(dead_code)]
@@ -553,17 +715,22 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
 
             info!("Starting scheduled capacity update");
             let start = Instant::now();
+            let manager = manager.clone();
+            let disks = disks.clone();
+            let started = manager
+                .clone()
+                .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                    calculate_data_dir_used_capacity(&disks)
+                        .await
+                        .map(|scan| scan.to_capacity_update())
+                        .map_err(|e| e.to_string())
+                })
+                .await;
 
-            // Import the calculate function
-            match calculate_data_dir_used_capacity(&disks).await {
-                Ok(new_capacity) => {
-                    let elapsed = start.elapsed();
-                    info!("Scheduled update completed: {} bytes in {:?}", new_capacity, elapsed);
-                    manager.update_capacity(new_capacity, DataSource::Scheduled).await;
-                }
-                Err(e) => {
-                    error!("Scheduled update failed: {:?}", e);
-                }
+            if started {
+                debug!("Scheduled capacity refresh started in {:?}", start.elapsed());
+            } else {
+                debug!("Scheduled capacity refresh skipped because another refresh is already in progress");
             }
         }
     });
@@ -586,49 +753,49 @@ mod tests {
     #[serial]
     fn test_get_scheduled_update_interval() {
         let interval = get_scheduled_update_interval();
-        assert_eq!(interval, Duration::from_secs(300));
+        assert_eq!(interval, Duration::from_secs(120));
     }
 
     #[test]
     #[serial]
     fn test_get_write_trigger_delay() {
         let delay = get_write_trigger_delay();
-        assert_eq!(delay, Duration::from_secs(10));
+        assert_eq!(delay, Duration::from_secs(5));
     }
 
     #[test]
     #[serial]
     fn test_get_write_frequency_threshold() {
         let threshold = get_write_frequency_threshold();
-        assert_eq!(threshold, 10);
+        assert_eq!(threshold, 5);
     }
 
     #[test]
     #[serial]
     fn test_get_fast_update_threshold() {
         let threshold = get_fast_update_threshold();
-        assert_eq!(threshold, Duration::from_secs(60));
+        assert_eq!(threshold, Duration::from_secs(30));
     }
 
     #[test]
     #[serial]
     fn test_get_max_files_threshold() {
         let threshold = get_max_files_threshold();
-        assert_eq!(threshold, 1_000_000);
+        assert_eq!(threshold, 200_000);
     }
 
     #[test]
     #[serial]
     fn test_get_stat_timeout() {
         let timeout = get_stat_timeout();
-        assert_eq!(timeout, Duration::from_secs(5));
+        assert_eq!(timeout, Duration::from_secs(3));
     }
 
     #[test]
     #[serial]
     fn test_get_sample_rate() {
         let rate = get_sample_rate();
-        assert_eq!(rate, 100);
+        assert_eq!(rate, 200);
     }
 
     #[test]
@@ -708,7 +875,9 @@ mod tests {
     async fn test_update_capacity() {
         let manager = HybridCapacityManager::from_env();
 
-        manager.update_capacity(1000, DataSource::RealTime).await;
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
 
         let cached = manager.get_capacity().await;
         assert!(cached.is_some());
@@ -735,7 +904,9 @@ mod tests {
         assert!(!manager.needs_fast_update().await);
 
         // Update cache
-        manager.update_capacity(1000, DataSource::RealTime).await;
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
 
         // Fresh cache, should not need update
         assert!(!manager.needs_fast_update().await);
@@ -747,10 +918,10 @@ mod tests {
         let config = HybridStrategyConfig::from_env();
 
         // Check default values
-        assert_eq!(config.scheduled_update_interval, Duration::from_secs(300));
-        assert_eq!(config.write_trigger_delay, Duration::from_secs(10));
-        assert_eq!(config.write_frequency_threshold, 10);
-        assert_eq!(config.fast_update_threshold, Duration::from_secs(60));
+        assert_eq!(config.scheduled_update_interval, Duration::from_secs(120));
+        assert_eq!(config.write_trigger_delay, Duration::from_secs(5));
+        assert_eq!(config.write_frequency_threshold, 5);
+        assert_eq!(config.fast_update_threshold, Duration::from_secs(30));
         assert!(config.enable_smart_update);
         assert!(config.enable_write_trigger);
     }
