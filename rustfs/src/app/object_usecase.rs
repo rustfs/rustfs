@@ -1025,6 +1025,17 @@ impl DefaultObjectUsecase {
         Some(StreamingBlob::wrap(chunk_stream.map(|result| result.map(|chunk| chunk.as_bytes()))))
     }
 
+    fn chunk_body_data_plane_labels(direct: bool) -> (rustfs_io_metrics::IoPath, rustfs_io_metrics::CopyMode) {
+        (
+            rustfs_io_metrics::IoPath::Fast,
+            if direct {
+                rustfs_io_metrics::CopyMode::TrueZeroCopy
+            } else {
+                rustfs_io_metrics::CopyMode::SharedBytes
+            },
+        )
+    }
+
     fn get_object_chunk_fast_path_guard(
         req: &S3Request<GetObjectInput>,
         _rs: Option<&HTTPRangeSpec>,
@@ -1293,7 +1304,6 @@ impl DefaultObjectUsecase {
         check_preconditions(&req.headers, &info)?;
 
         let read_duration = read_start.elapsed();
-        rustfs_io_metrics::record_io_path_selected("get", rustfs_io_metrics::IoPath::Legacy);
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
 
         let content_type = if let Some(content_type) = &info.content_type {
@@ -1331,6 +1341,8 @@ impl DefaultObjectUsecase {
                 return Err(err.into());
             }
         };
+        let (io_path, _) = Self::chunk_body_data_plane_labels(chunk_result.direct);
+        rustfs_io_metrics::record_io_path_selected("get", io_path);
 
         Ok(Some(GetObjectReadSetup {
             info,
@@ -2701,14 +2713,7 @@ impl DefaultObjectUsecase {
             GetObjectBodySource::Chunk {
                 stream: chunk_stream,
                 direct,
-            } => (
-                Self::build_chunk_blob(chunk_stream),
-                Some(if direct {
-                    rustfs_io_metrics::CopyMode::TrueZeroCopy
-                } else {
-                    rustfs_io_metrics::CopyMode::SharedBytes
-                }),
-            ),
+            } => (Self::build_chunk_blob(chunk_stream), Some(Self::chunk_body_data_plane_labels(direct).1)),
         };
 
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
@@ -5713,7 +5718,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_body_source_direct_and_bridge_produce_distinct_copy_modes() {
+    fn chunk_body_source_direct_and_bridge_produce_distinct_data_plane_labels() {
         let direct = GetObjectBodySource::Chunk {
             stream: Box::pin(futures_util::stream::iter(Vec::<std::io::Result<rustfs_io_core::IoChunk>>::new())),
             direct: true,
@@ -5723,27 +5728,17 @@ mod tests {
             direct: false,
         };
 
-        let direct_mode = match direct {
-            GetObjectBodySource::Chunk { direct, .. } => {
-                if direct {
-                    rustfs_io_metrics::CopyMode::TrueZeroCopy
-                } else {
-                    rustfs_io_metrics::CopyMode::SharedBytes
-                }
-            }
+        let (direct_path, direct_mode) = match direct {
+            GetObjectBodySource::Chunk { direct, .. } => DefaultObjectUsecase::chunk_body_data_plane_labels(direct),
             GetObjectBodySource::Reader(_) => unreachable!("expected chunk body source"),
         };
-        let bridged_mode = match bridged {
-            GetObjectBodySource::Chunk { direct, .. } => {
-                if direct {
-                    rustfs_io_metrics::CopyMode::TrueZeroCopy
-                } else {
-                    rustfs_io_metrics::CopyMode::SharedBytes
-                }
-            }
+        let (bridged_path, bridged_mode) = match bridged {
+            GetObjectBodySource::Chunk { direct, .. } => DefaultObjectUsecase::chunk_body_data_plane_labels(direct),
             GetObjectBodySource::Reader(_) => unreachable!("expected chunk body source"),
         };
 
+        assert_eq!(direct_path, rustfs_io_metrics::IoPath::Fast);
+        assert_eq!(bridged_path, rustfs_io_metrics::IoPath::Fast);
         assert_eq!(direct_mode, rustfs_io_metrics::CopyMode::TrueZeroCopy);
         assert_eq!(bridged_mode, rustfs_io_metrics::CopyMode::SharedBytes);
     }
