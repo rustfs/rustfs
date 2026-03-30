@@ -15,7 +15,6 @@
 //! Hybrid Capacity Manager for efficient capacity statistics
 
 use crate::app::admin_usecase::calculate_data_dir_used_capacity;
-use futures::FutureExt;
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
@@ -29,7 +28,6 @@ use rustfs_config::{
 use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
@@ -603,10 +601,7 @@ impl HybridCapacityManager {
                 .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
         }
 
-        let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-            warn!(error = ?err, "capacity refresh function panicked");
-            Err("capacity refresh panicked".to_string())
-        });
+        let result = refresh_fn().await;
         if let Ok(update) = &result {
             self.update_capacity(update.clone(), source).await;
         }
@@ -643,10 +638,7 @@ impl HybridCapacityManager {
         }
 
         tokio::spawn(async move {
-            let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-                warn!(error = ?err, "capacity refresh function panicked");
-                Err("capacity refresh panicked".to_string())
-            });
+            let result = refresh_fn().await;
             if let Ok(update) = &result {
                 self.update_capacity(update.clone(), source).await;
             }
