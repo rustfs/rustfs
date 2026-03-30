@@ -722,11 +722,12 @@ mod tests {
 
     #[test]
     fn target_mutation_block_reason_allows_config_only_target() {
+        let target_name = "config-only-target";
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
-            HashMap::from([("primary".to_string(), enabled_kvs("on"))]),
+            HashMap::from([(target_name.to_string(), enabled_kvs("on"))]),
         )]));
-        assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary").is_none());
+        assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, target_name).is_none());
     }
 
     #[test]
