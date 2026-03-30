@@ -1907,7 +1907,6 @@ mod test {
 
 #[tokio::test]
 async fn test_read_xl_meta_no_data() {
-    use tokio::fs;
     use tokio::fs::File;
     use tokio::io::AsyncWriteExt;
 
@@ -1942,8 +1941,6 @@ async fn test_read_xl_meta_no_data() {
 
     let mut newfm = FileMeta::default();
     newfm.unmarshal_msg(&data).unwrap();
-
-    fs::remove_file(&filepath).await.unwrap();
 
     assert_eq!(fm, newfm)
 }

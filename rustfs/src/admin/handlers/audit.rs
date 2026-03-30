@@ -96,6 +96,10 @@ enum AuditEndpointSource {
     Runtime,
 }
 
+fn normalized_endpoint_key(account_id: &str, service: &str) -> EndpointKey {
+    (account_id.to_lowercase(), service.to_string())
+}
+
 async fn check_permissions(req: &S3Request<Body>) -> S3Result<()> {
     let Some(input_cred) = &req.credentials else {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
@@ -205,7 +209,7 @@ fn collect_config_entry_keys(config: &Config) -> HbHashSet<EndpointKey> {
             if target_name == DEFAULT_DELIMITER {
                 continue;
             }
-            endpoints.insert((target_name.clone(), service.to_string()));
+            endpoints.insert(normalized_endpoint_key(target_name, service));
         }
     }
     endpoints
@@ -236,7 +240,7 @@ fn collect_env_endpoint_keys() -> HbHashSet<EndpointKey> {
             }
 
             if valid_keys.contains(&field_name.as_str()) {
-                endpoints.insert((instance_id, service.to_string()));
+                endpoints.insert(normalized_endpoint_key(&instance_id, service));
             }
         }
     }
@@ -266,7 +270,8 @@ fn audit_endpoint_source(config: &Config, target_type: &str, target_name: &str) 
         _ => "",
     };
 
-    classify_audit_endpoint_source(&config_targets, &env_targets, &(target_name.to_lowercase(), service.to_string()))
+    let key = normalized_endpoint_key(target_name, service);
+    classify_audit_endpoint_source(&config_targets, &env_targets, &key)
 }
 
 fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
@@ -283,19 +288,28 @@ fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target
     }
 }
 
-fn merge_audit_endpoints(config: &Config, mut runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
+fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
     let mut audit_endpoints = Vec::new();
     let mut seen = HashSet::new();
     let configured_keys = collect_configured_audit_endpoint_keys(config);
     let config_targets = collect_config_entry_keys(config);
     let env_targets = collect_env_endpoint_keys();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    for ((account_id, service), status) in runtime_statuses {
+        let normalized = normalized_endpoint_key(&account_id, &service);
+        normalized_runtime_statuses.entry(normalized).or_insert((account_id, service, status));
+    }
 
     for key in configured_keys {
-        if !seen.insert(key.clone()) {
+        let normalized = normalized_endpoint_key(&key.0, &key.1);
+        if !seen.insert(normalized.clone()) {
             continue;
         }
-        let status = runtime_statuses.remove(&key).unwrap_or_else(|| "offline".to_string());
-        let source = classify_audit_endpoint_source(&config_targets, &env_targets, &key);
+        let status = normalized_runtime_statuses
+            .remove(&normalized)
+            .map(|(_, _, status)| status)
+            .unwrap_or_else(|| "offline".to_string());
+        let source = classify_audit_endpoint_source(&config_targets, &env_targets, &normalized);
         audit_endpoints.push(AuditEndpoint {
             account_id: key.0,
             service: key.1,
@@ -304,14 +318,13 @@ fn merge_audit_endpoints(config: &Config, mut runtime_statuses: HashMap<Endpoint
         });
     }
 
-    for ((account_id, service), status) in runtime_statuses {
-        let key = (account_id.clone(), service.clone());
-        if seen.insert((account_id.clone(), service.clone())) {
+    for (normalized, (account_id, service, status)) in normalized_runtime_statuses {
+        if seen.insert(normalized.clone()) {
             audit_endpoints.push(AuditEndpoint {
                 account_id,
                 service,
                 status,
-                source: classify_audit_endpoint_source(&config_targets, &env_targets, &key),
+                source: classify_audit_endpoint_source(&config_targets, &env_targets, &normalized),
             });
         }
     }
@@ -767,5 +780,39 @@ mod tests {
 
         let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
         assert!(err.to_string().contains("duplicate key"));
+    }
+
+    #[test]
+    fn merge_audit_endpoints_marks_mixed_with_case_insensitive_instance_id() {
+        let config = Config(HashMap::from([(
+            AUDIT_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARYCASE", Some("on")),
+                ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARYCASE", Some("https://example.com/hook")),
+            ],
+            || {
+                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), "online".to_string())]);
+                let merged = merge_audit_endpoints(&config, runtime);
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "PrimaryCase" && entry.service == "webhook")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+            },
+        );
+    }
+
+    #[test]
+    fn audit_target_mutation_block_reason_allows_case_insensitive_config_target_lookup() {
+        let config = Config(HashMap::from([(
+            AUDIT_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
     }
 }

@@ -303,7 +303,9 @@ fn decode_notify_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KV
 }
 
 fn is_notify_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
-    section.keys().any(|key| valid_keys.contains(&key.as_str()))
+    section
+        .iter()
+        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_notify_scalar_value(key, value).is_some())
 }
 
 fn apply_external_notify_section(
@@ -1215,6 +1217,53 @@ mod tests {
             .expect("mqtt target should be decoded");
         assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER), "tcp://127.0.0.1:1883");
         assert_eq!(mqtt.get(rustfs_config::MQTT_QUEUE_DIR), "");
+    }
+
+    #[test]
+    fn test_decode_server_config_reads_notify_shorthand_default() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "notify":{
+            "webhook":{
+              "enable":true,
+              "endpoint":"https://example.com/shorthand"
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+        let webhook_default = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("default webhook config should be decoded");
+        assert_eq!(webhook_default.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(webhook_default.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/shorthand");
+    }
+
+    #[test]
+    fn test_decode_server_config_keeps_instance_named_like_field() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "notify":{
+            "webhook":{
+              "enable":{
+                "enable":true,
+                "endpoint":"https://example.com/instance-enable"
+              }
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+        let named = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, "enable")
+            .expect("instance named 'enable' should be decoded");
+        assert_eq!(named.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(
+            named.get(rustfs_config::WEBHOOK_ENDPOINT),
+            "https://example.com/instance-enable"
+        );
     }
 
     #[test]
