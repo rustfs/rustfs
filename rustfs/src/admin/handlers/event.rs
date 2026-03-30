@@ -289,10 +289,7 @@ fn target_mutation_block_reason(config: &Config, target_type: &str, target_name:
     }
 }
 
-fn merge_notification_endpoints(
-    config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
-) -> Vec<NotificationEndpoint> {
+fn merge_notification_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<NotificationEndpoint> {
     let mut notification_endpoints = Vec::new();
     let mut seen = HashSet::new();
     let configured_keys = collect_configured_endpoint_keys(config);
@@ -301,7 +298,9 @@ fn merge_notification_endpoints(
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
-        normalized_runtime_statuses.entry(normalized).or_insert((account_id, service, status));
+        normalized_runtime_statuses
+            .entry(normalized)
+            .or_insert((account_id, service, status));
     }
 
     for key in configured_keys {

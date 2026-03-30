@@ -297,7 +297,9 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
-        normalized_runtime_statuses.entry(normalized).or_insert((account_id, service, status));
+        normalized_runtime_statuses
+            .entry(normalized)
+            .or_insert((account_id, service, status));
     }
 
     for key in configured_keys {

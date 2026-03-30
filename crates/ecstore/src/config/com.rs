@@ -1260,10 +1260,7 @@ mod tests {
             .get_value(NOTIFY_WEBHOOK_SUB_SYS, "enable")
             .expect("instance named 'enable' should be decoded");
         assert_eq!(named.get(ENABLE_KEY), EnableState::On.to_string());
-        assert_eq!(
-            named.get(rustfs_config::WEBHOOK_ENDPOINT),
-            "https://example.com/instance-enable"
-        );
+        assert_eq!(named.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/instance-enable");
     }
 
     #[test]
