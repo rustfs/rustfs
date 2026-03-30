@@ -12,3 +12,4 @@
 - Confirm non-applicable sections are filled with `N/A`.
 - Confirm the PR body does not include local absolute paths unless explicitly required.
 - Confirm multiline GitHub CLI commands use `--body-file`.
+- Confirm new hardcoded string literals were not introduced for values already represented by existing constants/enums (including protocol labels, error identifiers, headers, and metric names), or record a justified exception.
