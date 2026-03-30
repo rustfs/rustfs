@@ -1630,13 +1630,13 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
+        let mut req = req;
 
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
         let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
-        let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         if req.extensions.get::<PostObjectRequestMarker>().is_some() && is_post_object_sse_kms_requested(&req.input, &req.headers)
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
@@ -1650,7 +1650,7 @@ impl DefaultObjectUsecase {
             return self.execute_put_object_extract(req).await;
         }
 
-        let input = req.input;
+        let input = std::mem::take(&mut req.input);
 
         let PutObjectInput {
             body,
@@ -1869,6 +1869,8 @@ impl DefaultObjectUsecase {
             opts.want_checksum = reader.checksum();
         }
 
+        let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
+
         // Apply encryption using unified SSE API.
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
@@ -1884,7 +1886,16 @@ impl DefaultObjectUsecase {
             part_nonce: None,
         };
 
-        if let Some(material) = sse_encryption(encryption_request).await? {
+        let encryption_material = match sse_encryption(encryption_request).await {
+            Ok(material) => material,
+            Err(err) => {
+                let result = Err(err.into());
+                let _ = helper.complete(&result);
+                return result;
+            }
+        };
+
+        if let Some(material) = encryption_material {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
@@ -1916,10 +1927,18 @@ impl DefaultObjectUsecase {
             );
         }
 
-        let obj_info = store
+        let obj_info = match store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)
+        {
+            Ok(obj_info) => obj_info,
+            Err(err) => {
+                let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
+                let _ = helper.complete(&result);
+                return result;
+            }
+        };
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
