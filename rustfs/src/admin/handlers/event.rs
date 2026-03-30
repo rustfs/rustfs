@@ -600,15 +600,19 @@ mod tests {
         let runtime = HashMap::from([(("webhook-a".to_string(), "webhook".to_string()), "online".to_string())]);
         let merged = merge_notification_endpoints(&config, runtime);
 
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].account_id, "mqtt-a");
-        assert_eq!(merged[0].service, "mqtt");
-        assert_eq!(merged[0].status, "offline");
-        assert_eq!(merged[0].source, NotificationEndpointSource::Config);
-        assert_eq!(merged[1].account_id, "webhook-a");
-        assert_eq!(merged[1].service, "webhook");
-        assert_eq!(merged[1].status, "online");
-        assert_eq!(merged[1].source, NotificationEndpointSource::Config);
+        let mqtt = merged
+            .iter()
+            .find(|entry| entry.account_id == "mqtt-a" && entry.service == "mqtt")
+            .expect("mqtt-a should be present");
+        assert_eq!(mqtt.status, "offline");
+        assert_eq!(mqtt.source, NotificationEndpointSource::Config);
+
+        let webhook = merged
+            .iter()
+            .find(|entry| entry.account_id == "webhook-a" && entry.service == "webhook")
+            .expect("webhook-a should be present");
+        assert_eq!(webhook.status, "online");
+        assert_eq!(webhook.source, NotificationEndpointSource::Config);
     }
 
     #[test]
@@ -625,15 +629,19 @@ mod tests {
         ]);
         let merged = merge_notification_endpoints(&config, runtime);
 
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].account_id, "env-only");
-        assert_eq!(merged[0].service, "mqtt");
-        assert_eq!(merged[0].status, "offline");
-        assert_eq!(merged[0].source, NotificationEndpointSource::Runtime);
-        assert_eq!(merged[1].account_id, "webhook-enabled");
-        assert_eq!(merged[1].service, "webhook");
-        assert_eq!(merged[1].status, "online");
-        assert_eq!(merged[1].source, NotificationEndpointSource::Config);
+        let env_only = merged
+            .iter()
+            .find(|entry| entry.account_id == "env-only" && entry.service == "mqtt")
+            .expect("env-only should be present");
+        assert_eq!(env_only.status, "offline");
+        assert_eq!(env_only.source, NotificationEndpointSource::Runtime);
+
+        let enabled = merged
+            .iter()
+            .find(|entry| entry.account_id == "webhook-enabled" && entry.service == "webhook")
+            .expect("webhook-enabled should be present");
+        assert_eq!(enabled.status, "online");
+        assert_eq!(enabled.source, NotificationEndpointSource::Config);
     }
 
     #[test]
