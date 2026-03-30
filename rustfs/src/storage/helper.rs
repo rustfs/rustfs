@@ -108,9 +108,11 @@ impl OperationHelper {
             audit_builder = audit_builder.request_id(id_str);
         }
 
-        let mut event_object = ObjectInfo::default();
-        event_object.bucket = bucket.clone();
-        event_object.name = object_key.clone();
+        let event_object = ObjectInfo {
+            bucket: bucket.clone(),
+            name: object_key.clone(),
+            ..Default::default()
+        };
 
         let mut req_params = extract_params_header(&req.headers);
         if let Some(principal_id) = req_info
