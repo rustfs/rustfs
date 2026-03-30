@@ -315,7 +315,7 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
 ///
 /// `true` if zero-copy should be used, `false` otherwise
 fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
-    // Only use zero-copy for large objects (> 1MB)
+    // Only use zero-copy for objects larger than 1MB
     const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
 
     if size <= ZERO_COPY_MIN_SIZE {
@@ -5087,6 +5087,13 @@ mod tests {
     }
 
     #[test]
+    fn should_use_zero_copy_rejects_boundary_at_1mb() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy(1024 * 1024, &headers));
+    }
+
+    #[test]
     fn should_use_zero_copy_rejects_small_objects() {
         let headers = HeaderMap::new();
 
@@ -5109,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn should_use_zero_copy_rejects_sse_customer_algorithm_requests() {
+    fn should_use_zero_copy_rejects_encrypted_requests_with_sse_customer_algorithm() {
         let mut headers = HeaderMap::new();
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, HeaderValue::from_static("AES256"));
 
@@ -5117,9 +5124,12 @@ mod tests {
     }
 
     #[test]
-    fn should_use_zero_copy_rejects_sse_kms_key_id_requests() {
+    fn should_use_zero_copy_rejects_encrypted_requests_with_kms_key_id() {
         let mut headers = HeaderMap::new();
-        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-key-id"));
+        headers.insert(
+            AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+            HeaderValue::from_static("test-kms-key-id"),
+        );
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
     }
