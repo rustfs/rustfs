@@ -195,6 +195,19 @@ nix build
 nix run
 ```
 
+### 6\. X-CMD (Option 6)
+
+If you are an [x-cmd](https://www.x-cmd.com/install/rustfs) user:
+
+```bash
+# Run directly without installing
+x rustfs
+
+# Download the binary and install it to the global environment
+x env use rustfs
+rustfs --help
+```
+
 ---
 
 ### Accessing RustFS

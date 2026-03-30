@@ -287,7 +287,7 @@ fn merge_audit_endpoints(config: &Config, mut runtime_statuses: HashMap<Endpoint
     let mut audit_endpoints = Vec::new();
     let mut seen = HashSet::new();
     let configured_keys = collect_configured_audit_endpoint_keys(config);
-    let config_targets = configured_keys.iter().cloned().collect::<HbHashSet<_>>();
+    let config_targets = collect_config_entry_keys(config);
     let env_targets = collect_env_endpoint_keys();
 
     for key in configured_keys {
@@ -316,8 +316,49 @@ fn merge_audit_endpoints(config: &Config, mut runtime_statuses: HashMap<Endpoint
         }
     }
 
+    for key in &env_targets {
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        audit_endpoints.push(AuditEndpoint {
+            account_id: key.0.clone(),
+            service: key.1.clone(),
+            status: "offline".to_string(),
+            source: classify_audit_endpoint_source(&config_targets, &env_targets, key),
+        });
+    }
+
     audit_endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
     audit_endpoints
+}
+
+fn collect_validated_key_values(
+    key_values: &[KeyValue],
+    allowed_keys: &HashSet<&str>,
+    target_type: &str,
+) -> S3Result<HashMap<String, String>> {
+    let mut kv_map = HashMap::new();
+    let mut seen = HashSet::new();
+
+    for kv in key_values {
+        if !allowed_keys.contains(kv.key.as_str()) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "key '{}' not allowed for audit target type '{}'",
+                kv.key,
+                target_type
+            ));
+        }
+
+        if !seen.insert(kv.key.as_str()) {
+            return Err(s3_error!(InvalidArgument, "duplicate key '{}' in request body", kv.key));
+        }
+
+        kv_map.insert(kv.key.clone(), kv.value.clone());
+    }
+
+    Ok(kv_map)
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
@@ -432,26 +473,12 @@ impl Operation for AuditTargetConfig {
             _ => unreachable!(),
         };
 
-        let kv_map: HashMap<&str, &str> = audit_body
-            .key_values
-            .iter()
-            .map(|kv| (kv.key.as_str(), kv.value.as_str()))
-            .collect();
-
-        for key in kv_map.keys() {
-            if !allowed_keys.contains(key) {
-                return Err(s3_error!(
-                    InvalidArgument,
-                    "key '{}' not allowed for audit target type '{}'",
-                    key,
-                    target_type
-                ));
-            }
-        }
+        let kv_map = collect_validated_key_values(&audit_body.key_values, &allowed_keys, target_type)?;
 
         if target_type == AUDIT_WEBHOOK_SUB_SYS {
             let endpoint = kv_map
                 .get("endpoint")
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
             let url = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
             let host = url
@@ -465,7 +492,7 @@ impl Operation for AuditTargetConfig {
                 return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
             }
             if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
+                validate_queue_dir(queue_dir.as_str()).await?;
             }
             if kv_map.contains_key("client_cert") != kv_map.contains_key("client_key") {
                 return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
@@ -473,18 +500,20 @@ impl Operation for AuditTargetConfig {
         } else if target_type == AUDIT_MQTT_SUB_SYS {
             let endpoint = kv_map
                 .get(rustfs_config::MQTT_BROKER)
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
             let topic = kv_map
                 .get(rustfs_config::MQTT_TOPIC)
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
-            let username = kv_map.get(rustfs_config::MQTT_USERNAME).copied();
-            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).copied();
+            let username = kv_map.get(rustfs_config::MQTT_USERNAME).map(String::as_str);
+            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).map(String::as_str);
             check_mqtt_broker_available(endpoint, topic, username, password)
                 .await
                 .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
+                validate_queue_dir(queue_dir.as_str()).await?;
                 if let Some(qos) = kv_map.get("qos") {
                     match qos.parse::<u8>() {
                         Ok(1) | Ok(2) => {}
@@ -495,28 +524,18 @@ impl Operation for AuditTargetConfig {
             }
         }
 
-        let mut kvs_vec: Vec<_> = audit_body
-            .key_values
-            .into_iter()
-            .map(|kv| rustfs_ecstore::config::KV {
-                key: kv.key,
-                value: kv.value,
-                hidden_if_empty: false,
-            })
-            .collect();
-
-        kvs_vec.push(rustfs_ecstore::config::KV {
-            key: ENABLE_KEY.to_string(),
-            value: EnableState::On.to_string(),
-            hidden_if_empty: false,
-        });
+        let mut kvs = rustfs_ecstore::config::KVS::new();
+        for (key, value) in kv_map {
+            kvs.insert(key, value);
+        }
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
 
         update_audit_config_and_reload(|config| {
             config
                 .0
                 .entry(target_type.to_lowercase())
                 .or_default()
-                .insert(target_name.to_lowercase(), rustfs_ecstore::config::KVS(kvs_vec.clone()));
+                .insert(target_name.to_lowercase(), kvs.clone());
             true
         })
         .await?;
@@ -603,7 +622,7 @@ impl Operation for RemoveAuditTarget {
 mod tests {
     use super::*;
     use rustfs_ecstore::config::{KV, KVS};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
 
     fn enabled_kvs(value: &str) -> KVS {
@@ -685,5 +704,68 @@ mod tests {
             assert!(reason.is_some());
             assert!(reason.unwrap().contains("both persisted config and environment variables"));
         });
+    }
+
+    #[test]
+    fn merge_audit_endpoints_marks_disabled_config_with_env_override_as_mixed() {
+        let config = Config(HashMap::from([(
+            AUDIT_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("mixed-disabled".to_string(), enabled_kvs("off"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_WEBHOOK_ENABLE_MIXED-DISABLED", Some("on")),
+                ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
+            ],
+            || {
+                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-disabled")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+                assert_eq!(mixed.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    fn merge_audit_endpoints_includes_env_only_target_without_runtime_status() {
+        let config = Config(HashMap::new());
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_WEBHOOK_ENABLE_ENV-ONLY", Some("on")),
+                ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
+            ],
+            || {
+                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-only")
+                    .expect("env-only target should be present");
+                assert_eq!(env_only.source, AuditEndpointSource::Env);
+                assert_eq!(env_only.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    fn collect_validated_key_values_rejects_duplicate_keys() {
+        let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
+        let key_values = vec![
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/one".to_string(),
+            },
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/two".to_string(),
+            },
+        ];
+
+        let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
+        assert!(err.to_string().contains("duplicate key"));
     }
 }

@@ -38,6 +38,23 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
+fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
+    health::register_health_route(router).expect("register health route");
+    sts::register_admin_auth_route(router).expect("register sts route");
+    user::register_user_route(router).expect("register user route");
+    system::register_system_route(router).expect("register system route");
+    pools::register_pool_route(router).expect("register pool route");
+    rebalance::register_rebalance_route(router).expect("register rebalance route");
+    heal::register_heal_route(router).expect("register heal route");
+    tier::register_tier_route(router).expect("register tier route");
+    quota::register_quota_route(router).expect("register quota route");
+    bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    replication::register_replication_route(router).expect("register replication route");
+    profile_admin::register_profiling_route(router).expect("register profile route");
+    kms::register_kms_route(router).expect("register kms route");
+    oidc::register_oidc_route(router).expect("register oidc route");
+}
+
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
@@ -57,6 +74,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     profile_admin::register_profiling_route(&mut router).expect("register profile route");
     kms::register_kms_route(&mut router).expect("register kms route");
     oidc::register_oidc_route(&mut router).expect("register oidc route");
+    register_admin_routes(&mut router);
+
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -160,6 +179,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
     audit::register_audit_target_route(&mut router).expect("register audit target route");
     kms::register_kms_route(&mut router).expect("register kms route");
     oidc::register_oidc_route(&mut router).expect("register oidc route");
+    register_admin_routes(&mut router);
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),
@@ -184,15 +204,20 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/idp/builtin/policy/detach")),
         (Method::GET, compat_admin_alias_path("/v3/idp/builtin/policy-entities")),
         (Method::POST, compat_admin_alias_path("/v3/rebalance/start")),
-        (Method::POST, compat_admin_alias_path("/v3/kms/key/create")),
-        (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
-        (Method::POST, compat_admin_alias_path("/v3/kms/status")),
-        (Method::GET, compat_admin_alias_path("/v3/kms/keys/test-key")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
         (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
+        (Method::GET, compat_admin_alias_path("/export-bucket-metadata")),
+        (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/import-bucket-metadata")),
+        (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/key/create")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/keys/test-key")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/status")),
+        (Method::POST, compat_admin_alias_path("/v3/kms/status")),
+        (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

@@ -291,7 +291,7 @@ fn merge_notification_endpoints(
     let mut notification_endpoints = Vec::new();
     let mut seen = HashSet::new();
     let configured_keys = collect_configured_endpoint_keys(config);
-    let config_targets = configured_keys.iter().cloned().collect::<HbHashSet<_>>();
+    let config_targets = collect_config_entry_keys(config);
     let env_targets = collect_env_endpoint_keys();
 
     for key in configured_keys {
@@ -320,8 +320,49 @@ fn merge_notification_endpoints(
         }
     }
 
+    for key in &env_targets {
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        notification_endpoints.push(NotificationEndpoint {
+            account_id: key.0.clone(),
+            service: key.1.clone(),
+            status: "offline".to_string(),
+            source: classify_notification_endpoint_source(&config_targets, &env_targets, key),
+        });
+    }
+
     notification_endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
     notification_endpoints
+}
+
+fn collect_validated_key_values(
+    key_values: &[KeyValue],
+    allowed_keys: &HashSet<&str>,
+    target_type: &str,
+) -> S3Result<HashMap<String, String>> {
+    let mut kv_map = HashMap::new();
+    let mut seen = HashSet::new();
+
+    for kv in key_values {
+        if !allowed_keys.contains(kv.key.as_str()) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "key '{}' not allowed for target type '{}'",
+                kv.key,
+                target_type
+            ));
+        }
+
+        if !seen.insert(kv.key.as_str()) {
+            return Err(s3_error!(InvalidArgument, "duplicate key '{}' in request body", kv.key));
+        }
+
+        kv_map.insert(kv.key.clone(), kv.value.clone());
+    }
+
+    Ok(kv_map)
 }
 
 // --- Operations ---
@@ -356,23 +397,13 @@ impl Operation for NotificationTarget {
             _ => unreachable!(),
         };
 
-        let kv_map: HashMap<&str, &str> = notification_body
-            .key_values
-            .iter()
-            .map(|kv| (kv.key.as_str(), kv.value.as_str()))
-            .collect();
-
-        // Validate keys
-        for key in kv_map.keys() {
-            if !allowed_keys.contains(key) {
-                return Err(s3_error!(InvalidArgument, "key '{}' not allowed for target type '{}'", key, target_type));
-            }
-        }
+        let kv_map = collect_validated_key_values(&notification_body.key_values, &allowed_keys, target_type)?;
 
         // Type-specific validation
         if target_type == NOTIFY_WEBHOOK_SUB_SYS {
             let endpoint = kv_map
                 .get("endpoint")
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
             let url = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
             let host = url
@@ -386,7 +417,7 @@ impl Operation for NotificationTarget {
                 return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
             }
             if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
+                validate_queue_dir(queue_dir.as_str()).await?;
             }
             if kv_map.contains_key("client_cert") != kv_map.contains_key("client_key") {
                 return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
@@ -394,18 +425,20 @@ impl Operation for NotificationTarget {
         } else if target_type == NOTIFY_MQTT_SUB_SYS {
             let endpoint = kv_map
                 .get(rustfs_config::MQTT_BROKER)
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
             let topic = kv_map
                 .get(rustfs_config::MQTT_TOPIC)
+                .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
-            let username = kv_map.get(rustfs_config::MQTT_USERNAME).copied();
-            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).copied();
+            let username = kv_map.get(rustfs_config::MQTT_USERNAME).map(String::as_str);
+            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).map(String::as_str);
             check_mqtt_broker_available(endpoint, topic, username, password)
                 .await
                 .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir).await?;
+                validate_queue_dir(queue_dir.as_str()).await?;
                 if let Some(qos) = kv_map.get("qos") {
                     match qos.parse::<u8>() {
                         Ok(1) | Ok(2) => {}
@@ -416,24 +449,14 @@ impl Operation for NotificationTarget {
             }
         }
 
-        let mut kvs_vec: Vec<_> = notification_body
-            .key_values
-            .into_iter()
-            .map(|kv| rustfs_ecstore::config::KV {
-                key: kv.key,
-                value: kv.value,
-                hidden_if_empty: false,
-            })
-            .collect();
-
-        kvs_vec.push(rustfs_ecstore::config::KV {
-            key: ENABLE_KEY.to_string(),
-            value: EnableState::On.to_string(),
-            hidden_if_empty: false,
-        });
+        let mut kvs = rustfs_ecstore::config::KVS::new();
+        for (key, value) in kv_map {
+            kvs.insert(key, value);
+        }
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
 
         info!("Setting target config for type '{}', name '{}'", target_type, target_name);
-        ns.set_target_config(target_type, target_name, rustfs_ecstore::config::KVS(kvs_vec))
+        ns.set_target_config(target_type, target_name, kvs)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set target config: {}", e))?;
 
@@ -550,7 +573,7 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
 mod tests {
     use super::*;
     use rustfs_ecstore::config::{KV, KVS};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
 
     fn enabled_kvs(value: &str) -> KVS {
@@ -696,5 +719,68 @@ mod tests {
             HashMap::from([("primary".to_string(), enabled_kvs("on"))]),
         )]));
         assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary").is_none());
+    }
+
+    #[test]
+    fn merge_notification_endpoints_marks_disabled_config_with_env_override_as_mixed() {
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("mixed-disabled".to_string(), enabled_kvs("off"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_MIXED-DISABLED", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
+            ],
+            || {
+                let merged = merge_notification_endpoints(&config, HashMap::new());
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-disabled")
+                    .expect("mixed target should be present");
+                assert_eq!(mixed.source, NotificationEndpointSource::Mixed);
+                assert_eq!(mixed.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    fn merge_notification_endpoints_includes_env_only_target_without_runtime_status() {
+        let config = Config(HashMap::new());
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_ENV-ONLY", Some("on")),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
+            ],
+            || {
+                let merged = merge_notification_endpoints(&config, HashMap::new());
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-only")
+                    .expect("env-only target should be present");
+                assert_eq!(env_only.source, NotificationEndpointSource::Env);
+                assert_eq!(env_only.status, "offline");
+            },
+        );
+    }
+
+    #[test]
+    fn collect_validated_key_values_rejects_duplicate_keys() {
+        let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
+        let key_values = vec![
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/one".to_string(),
+            },
+            KeyValue {
+                key: "endpoint".to_string(),
+                value: "https://example.com/two".to_string(),
+            },
+        ];
+
+        let err = collect_validated_key_values(&key_values, &allowed_keys, NOTIFY_WEBHOOK_SUB_SYS).unwrap_err();
+        assert!(err.to_string().contains("duplicate key"));
     }
 }
