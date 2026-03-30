@@ -18,7 +18,9 @@ use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
 };
 use hashbrown::HashMap;
-use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
+use rustfs_config::notify::{
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
@@ -33,6 +35,21 @@ use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
+
+fn subsystem_target_type(target_type: &str) -> &str {
+    match target_type {
+        NOTIFY_WEBHOOK_SUB_SYS => "webhook",
+        NOTIFY_MQTT_SUB_SYS => "mqtt",
+        _ => target_type,
+    }
+}
+
+fn runtime_target_id_for_subsystem(target_type: &str, target_name: &str) -> TargetID {
+    TargetID {
+        id: target_name.to_lowercase(),
+        name: subsystem_target_type(target_type).to_string(),
+    }
+}
 
 #[derive(Clone)]
 pub struct LiveEventBatch {
@@ -333,7 +350,7 @@ impl NotificationSystem {
         info!("Attempting to remove target: {}", target_id);
 
         let ttype = target_type.to_lowercase();
-        let tname = target_id.name.to_lowercase();
+        let tname = target_id.id.to_lowercase();
 
         self.update_config_and_reload(|config| {
             let mut changed = false;
@@ -405,11 +422,7 @@ impl NotificationSystem {
 
         let ttype = target_type.to_lowercase();
         let tname = target_name.to_lowercase();
-
-        let target_id = TargetID {
-            id: tname.clone(),
-            name: ttype.clone(),
-        };
+        let target_id = runtime_target_id_for_subsystem(&ttype, &tname);
 
         // Deletion is prohibited if bucket rules refer to it
         if self.notifier.is_target_bound_to_any_bucket(&target_id).await {
@@ -664,5 +677,19 @@ mod tests {
         assert!(batch.truncated);
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].s3.object.key, "one");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_webhook_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_WEBHOOK_SUB_SYS, "Primary");
+        assert_eq!(target_id.id, "primary");
+        assert_eq!(target_id.name, "webhook");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_mqtt_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_MQTT_SUB_SYS, "Analytics");
+        assert_eq!(target_id.id, "analytics");
+        assert_eq!(target_id.name, "mqtt");
     }
 }

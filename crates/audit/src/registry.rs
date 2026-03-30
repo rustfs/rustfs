@@ -109,9 +109,6 @@ impl AuditRegistry {
         let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
         // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
-        // let final_config = config.clone(); // Clone a configuration for aggregating the final result
-        // Record the defaults for each segment so that the segment can eventually be rebuilt
-        let mut section_defaults: HashMap<String, KVS> = HashMap::new();
         // 1. Traverse all registered plants and process them by target type
         for (target_type, factory) in &self.factories {
             tracing::Span::current().record("target_type", target_type.as_str());
@@ -124,9 +121,6 @@ impl AuditRegistry {
             // 2.2. Get the default configuration for that type
             let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
             debug!(?default_cfg, "Get the default configuration");
-
-            // Save defaults for eventual write back
-            section_defaults.insert(section_name.clone(), default_cfg.clone());
 
             // *** Optimization point 1: Get all legitimate fields of the current target type ***
             let valid_fields = factory.get_valid_fields();
@@ -235,103 +229,28 @@ impl AuditRegistry {
                 if enabled {
                     info!(instance_id = %id, "Target is enabled, ready to create a task");
                     // 5.3. Create asynchronous tasks for enabled instances
-                    let target_type_clone = target_type.clone();
                     let tid = id.clone();
                     let merged_config_arc = Arc::new(merged_config);
                     tasks.push(async move {
                         let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                        (target_type_clone, tid, result, Arc::clone(&merged_config_arc))
+                        (tid, result)
                     });
                 } else {
-                    info!(instance_id = %id, "Skip the disabled target and will be removed from the final configuration");
-                    // Remove disabled target from final configuration
-                    // final_config.0.entry(section_name.clone()).or_default().remove(&id);
+                    info!(instance_id = %id, "Skip disabled target");
                 }
             }
         }
 
         // 6. Concurrently execute all creation tasks and collect results
         let mut successful_targets = Vec::new();
-        let mut successful_configs = Vec::new();
-        while let Some((target_type, id, result, final_config)) = tasks.next().await {
+        while let Some((id, result)) = tasks.next().await {
             match result {
                 Ok(target) => {
-                    info!(target_type = %target_type, instance_id = %id, "Create a target successfully");
+                    info!(target_type = %target.id().name, instance_id = %id, "Create a target successfully");
                     successful_targets.push(target);
-                    successful_configs.push((target_type, id, final_config));
                 }
                 Err(e) => {
-                    error!(target_type = %target_type, instance_id = %id, error = %e, "Failed to create a target");
-                }
-            }
-        }
-
-        // 7. Aggregate new configuration and write back to system configuration
-        if !successful_configs.is_empty() || !section_defaults.is_empty() {
-            info!(
-                "Prepare to update {} successfully created target configurations to the system configuration...",
-                successful_configs.len()
-            );
-
-            let mut successes_by_section: HashMap<String, HashMap<String, KVS>> = HashMap::new();
-
-            for (target_type, id, kvs) in successful_configs {
-                let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
-                successes_by_section
-                    .entry(section_name)
-                    .or_default()
-                    .insert(id.to_lowercase(), (*kvs).clone());
-            }
-
-            let mut new_config = config.clone();
-            // Collection of segments that need to be processed: Collect all segments where default items exist or where successful instances exist
-            let mut sections: HashSet<String> = HashSet::new();
-            sections.extend(section_defaults.keys().cloned());
-            sections.extend(successes_by_section.keys().cloned());
-
-            for section in sections {
-                let mut section_map: std::collections::HashMap<String, KVS> = std::collections::HashMap::new();
-                // Add default item
-                if let Some(default_kvs) = section_defaults.get(&section)
-                    && !default_kvs.is_empty()
-                {
-                    section_map.insert(DEFAULT_DELIMITER.to_string(), default_kvs.clone());
-                }
-
-                // Add successful instance item
-                if let Some(instances) = successes_by_section.get(&section) {
-                    for (id, kvs) in instances {
-                        section_map.insert(id.clone(), kvs.clone());
-                    }
-                }
-
-                // Empty breaks are removed and non-empty breaks are replaced entirely.
-                if section_map.is_empty() {
-                    new_config.0.remove(&section);
-                } else {
-                    new_config.0.insert(section, section_map);
-                }
-            }
-
-            if &new_config == config {
-                info!("Audit target configuration unchanged, skip persisting server config");
-                info!(count = successful_targets.len(), "All target processing completed");
-                return Ok(successful_targets);
-            }
-
-            let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-                return Err(AuditError::StorageNotAvailable(
-                    "Failed to save target configuration: server storage not initialized".to_string(),
-                ));
-            };
-
-            match rustfs_ecstore::config::com::save_server_config(store, &new_config).await {
-                Ok(_) => {
-                    info!("The new configuration was saved to the system successfully.")
-                }
-                Err(e) => {
-                    error!("Failed to save the new configuration: {}", e);
-                    return Err(AuditError::SaveConfig(Box::new(e)));
+                    error!(instance_id = %id, error = %e, "Failed to create a target");
                 }
             }
         }
@@ -369,6 +288,11 @@ impl AuditRegistry {
     /// * `Option<&(dyn Target<AuditEntry> + Send + Sync)>` - The target if it exists.
     pub fn get_target(&self, id: &str) -> Option<&(dyn Target<AuditEntry> + Send + Sync)> {
         self.targets.get(id).map(|t| t.as_ref())
+    }
+
+    /// Lists cloned target values for runtime inspection without exposing mutable registry access.
+    pub fn list_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
+        self.targets.values().map(|target| target.clone_dyn()).collect()
     }
 
     /// Lists all target IDs

@@ -594,6 +594,12 @@ impl AuditSystem {
         registry.list_targets()
     }
 
+    /// Returns cloned target values for read-only runtime inspection.
+    pub async fn get_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
+        let registry = self.registry.lock().await;
+        registry.list_target_values()
+    }
+
     /// Gets information about a specific target
     ///
     /// # Arguments

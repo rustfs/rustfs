@@ -1926,13 +1926,15 @@ async fn test_read_xl_meta_no_data() {
 
     buff.resize(buff.len() + 100, 0);
 
-    let filepath = "./test_xl.meta";
+    // Use tempfile to avoid conflicts with parallel tests or previous runs
+    let dir = tempfile::tempdir().unwrap();
+    let filepath = dir.path().join("test_xl.meta");
 
-    let mut file = File::create(filepath).await.unwrap();
+    let mut file = File::create(&filepath).await.unwrap();
     // Write string data
     file.write_all(&buff).await.unwrap();
 
-    let mut f = File::open(filepath).await.unwrap();
+    let mut f = File::open(&filepath).await.unwrap();
 
     let stat = f.metadata().await.unwrap();
 
@@ -1941,7 +1943,7 @@ async fn test_read_xl_meta_no_data() {
     let mut newfm = FileMeta::default();
     newfm.unmarshal_msg(&data).unwrap();
 
-    fs::remove_file(filepath).await.unwrap();
+    fs::remove_file(&filepath).await.unwrap();
 
     assert_eq!(fm, newfm)
 }
