@@ -2329,20 +2329,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?req.input.version_id,
+                    error = %err,
+                    "failed to load object info for put-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id = req.input.version_id.clone();
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
             debug!("Cache invalidated for tagged object: {}", cache_key);
         });
 
         counter!("rustfs.put_object_tagging.success").increment(1);
 
-        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = req
+            .input
+            .version_id
+            .as_deref()
+            .filter(|version_id| !version_id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(PutObjectTaggingOutput {
             version_id: req.input.version_id.clone(),
@@ -3973,22 +4003,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?version_id,
+                    error = %err,
+                    "failed to load object info for delete-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id_clone = version_id.clone();
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
             debug!(
                 "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                bucket, object, version_id_clone
+                cache_bucket, cache_object, version_id_clone
             );
         });
 
         counter!("rustfs.delete_object_tagging.success").increment(1);
 
-        let version_id_resp = version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = version_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
