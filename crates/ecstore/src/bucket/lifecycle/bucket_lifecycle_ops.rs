@@ -817,12 +817,17 @@ pub async fn expire_transitioned_object(
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
+    let event_name = if oi.delete_marker {
+        EventName::LifecycleExpirationDelete
+    } else if dobj.delete_marker {
+        EventName::LifecycleExpirationDeleteMarkerCreated
+    } else {
+        EventName::LifecycleExpirationDelete
+    };
     let obj_info = ObjectInfo {
+        bucket: oi.bucket.clone(),
         name: oi.name.clone(),
+        size: oi.size,
         version_id: oi.version_id,
         delete_marker: oi.delete_marker,
         ..Default::default()
@@ -1230,15 +1235,12 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
-    match lc_event.action {
-        IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
-        IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::LifecycleDelMarkerExpirationDelete,
-        _ => (),
-    }
+    let event_name = match lc_event.action {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => EventName::LifecycleExpirationDelete,
+        _ if oi.delete_marker => EventName::LifecycleExpirationDelete,
+        _ if dobj.delete_marker => EventName::LifecycleExpirationDeleteMarkerCreated,
+        _ => EventName::LifecycleExpirationDelete,
+    };
     send_event(EventArgs {
         event_name: event_name.to_string(),
         bucket_name: dobj.bucket.clone(),
