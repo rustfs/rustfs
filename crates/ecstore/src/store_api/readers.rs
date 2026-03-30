@@ -54,6 +54,11 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
+pub struct GetObjectChunkResult {
+    pub stream: BoxChunkStream,
+    pub direct: bool,
+}
+
 impl GetObjectReader {
     #[tracing::instrument(level = "debug", skip(reader, rs, opts, _h))]
     pub fn new(

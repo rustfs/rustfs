@@ -59,9 +59,10 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
-        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectChunkResult,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions,
+        MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -72,7 +73,6 @@ use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
-use rustfs_io_core::BoxChunkStream;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
@@ -274,7 +274,7 @@ impl ECStore {
         range: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
-    ) -> Result<BoxChunkStream> {
+    ) -> Result<GetObjectChunkResult> {
         self.handle_get_object_chunks(bucket, object, range, h, opts).await
     }
 }

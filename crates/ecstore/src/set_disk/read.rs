@@ -13,9 +13,316 @@
 // limitations under the License.
 
 use super::*;
+use crate::bitrot::create_bitrot_chunk_stream;
+use crate::store_api::GetObjectChunkResult;
+use bytes::BytesMut;
+use futures_util::{Stream, StreamExt, stream};
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
+use rustfs_io_core::{BoxChunkStream, IoChunk};
+use std::io;
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio_util::io::ReaderStream;
+
+struct ChannelChunkStream {
+    receiver: Mutex<UnboundedReceiver<io::Result<IoChunk>>>,
+}
+
+impl ChannelChunkStream {
+    fn new(receiver: UnboundedReceiver<io::Result<IoChunk>>) -> Self {
+        Self {
+            receiver: Mutex::new(receiver),
+        }
+    }
+}
+
+impl Stream for ChannelChunkStream {
+    type Item = io::Result<IoChunk>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut receiver = self.receiver.lock().unwrap();
+        receiver.poll_recv(cx)
+    }
+}
+
+struct ChannelChunkWriter {
+    sender: UnboundedSender<io::Result<IoChunk>>,
+    buffer: BytesMut,
+    chunk_size: usize,
+}
+
+impl ChannelChunkWriter {
+    fn new(sender: UnboundedSender<io::Result<IoChunk>>, chunk_size: usize) -> Self {
+        Self {
+            sender,
+            buffer: BytesMut::with_capacity(chunk_size.max(1)),
+            chunk_size: chunk_size.max(1),
+        }
+    }
+
+    fn push_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = self.buffer.split().freeze();
+        self.sender
+            .send(Ok(IoChunk::Shared(bytes)))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "chunk stream receiver dropped"))
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.push_buffer()
+    }
+
+    fn send_error(&self, err: io::Error) {
+        let _ = self.sender.send(Err(err));
+    }
+}
+
+impl AsyncWrite for ChannelChunkWriter {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::result::Result<usize, io::Error>> {
+        self.buffer.extend_from_slice(buf);
+        let chunk_size = self.chunk_size;
+        while self.buffer.len() >= chunk_size {
+            let chunk = self.buffer.split_to(chunk_size).freeze();
+            if self.sender.send(Ok(IoChunk::Shared(chunk))).is_err() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "chunk stream receiver dropped")));
+            }
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
+        Poll::Ready(self.push_buffer())
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
+        Poll::Ready(self.finish())
+    }
+}
 
 impl SetDisks {
+    #[tracing::instrument(level = "debug", skip(self, h, opts))]
+    pub(crate) async fn get_object_chunks(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectChunkResult> {
+        let lock_optimization_enabled = is_lock_optimization_enabled();
+
+        let read_lock_guard = if !opts.no_lock {
+            let acquire_start = Instant::now();
+
+            if is_deadlock_detection_enabled() {
+                debug!(
+                    lock_id = format!("{}:{}", bucket, object),
+                    lock_type = "read",
+                    resource = format!("{}/{}", bucket, object),
+                    "Waiting for read lock"
+                );
+            }
+
+            let guard = self
+                .new_ns_lock(bucket, object)
+                .await?
+                .get_read_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|e| {
+                    Error::other(format!(
+                        "Failed to acquire read lock: {}",
+                        self.format_lock_error_from_error(bucket, object, "read", &e)
+                    ))
+                })?;
+
+            let _lock_id = record_lock_acquire(bucket, object, "read");
+            metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
+            metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+
+            Some(guard)
+        } else {
+            None
+        };
+
+        let (fi, files, disks) = self
+            .get_object_fileinfo(bucket, object, opts, true)
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+        let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+
+        if object_info.delete_marker {
+            if opts.version_id.is_none() {
+                return Err(to_object_err(Error::FileNotFound, vec![bucket, object]));
+            }
+            return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
+        }
+
+        if object_info.size == 0 {
+            return Ok(GetObjectChunkResult {
+                stream: Box::pin(stream::iter(Vec::<io::Result<IoChunk>>::new())),
+                direct: true,
+            });
+        }
+
+        if object_info.is_remote() {
+            let mut opts = opts.clone();
+            if object_info.parts.len() == 1 {
+                opts.part_number = Some(1);
+            }
+            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
+            let stream = ReaderStream::new(gr.stream).map(|result| result.map(IoChunk::Shared));
+            return Ok(GetObjectChunkResult {
+                stream: Box::pin(stream),
+                direct: false,
+            });
+        }
+
+        if fi.erasure.data_blocks == 1 {
+            let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
+            let total_size = fi.size as usize;
+            let requested_length = if let Some(range) = &range {
+                let (offset, length) = range
+                    .get_offset_length(fi.size)
+                    .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+                (offset, length as usize)
+            } else {
+                (0, total_size)
+            };
+
+            let (part_index, mut part_offset) = fi.to_part_offset(requested_length.0)?;
+            let mut end_offset = requested_length.0;
+            if requested_length.1 > 0 {
+                end_offset += requested_length.1 - 1;
+            }
+            let (last_part_index, _) = fi.to_part_offset(end_offset)?;
+
+            let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+            let mut part_streams = Vec::new();
+            let mut part_total_read = 0usize;
+            let mut all_direct = true;
+
+            for current_part in part_index..=last_part_index {
+                let part_number = fi.parts[current_part].number;
+                let part_size = fi.parts[current_part].size;
+                let mut part_length = part_size - part_offset;
+                if part_length > (requested_length.1 - part_total_read) {
+                    part_length = requested_length.1 - part_total_read;
+                }
+
+                let checksum_info = fi.erasure.get_checksum_info(part_number);
+                let checksum_algo =
+                    if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                    } else {
+                        checksum_info.algorithm.clone()
+                    };
+
+                let data_path = format!("{}/{}/part.{}", object, files[current_part].data_dir.unwrap_or_default(), part_number);
+                let chunk_result = create_bitrot_chunk_stream(
+                    files[current_part].data.as_deref(),
+                    disks[current_part].as_ref(),
+                    bucket,
+                    &data_path,
+                    part_offset,
+                    part_length,
+                    part_size,
+                    fi.erasure.shard_size(),
+                    checksum_algo,
+                    opts.skip_verify_bitrot,
+                    use_zero_copy,
+                )
+                .await?;
+
+                let Some(chunk_result) = chunk_result else {
+                    part_streams.clear();
+                    all_direct = false;
+                    break;
+                };
+                all_direct &= chunk_result.direct;
+                part_streams.push(chunk_result.stream);
+                part_total_read += part_length;
+                part_offset = 0;
+            }
+
+            if !part_streams.is_empty() {
+                let (tx, rx) = unbounded_channel();
+                tokio::spawn(async move {
+                    for mut stream in part_streams {
+                        while let Some(chunk) = stream.next().await {
+                            if tx.send(chunk).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                return Ok(GetObjectChunkResult {
+                    stream: Box::pin(ChannelChunkStream::new(rx)),
+                    direct: all_direct,
+                });
+            }
+        }
+
+        let read_lock_guard = if lock_optimization_enabled {
+            if read_lock_guard.is_some() {
+                let lock_id = format!("{}:{}", bucket, object);
+                record_lock_release(bucket, object, &lock_id, "read");
+                metrics::counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
+            }
+            drop(read_lock_guard);
+            debug!(bucket, object, "Lock optimization: released read lock after metadata read");
+            None
+        } else {
+            read_lock_guard
+        };
+
+        let chunk_size = get_duplex_buffer_size();
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        let set_index = self.set_index;
+        let pool_index = self.pool_index;
+        let skip_verify = opts.skip_verify_bitrot;
+        let (tx, rx) = unbounded_channel();
+
+        tokio::spawn(async move {
+            let _guard = read_lock_guard;
+            let mut writer = ChannelChunkWriter::new(tx, chunk_size);
+            if let Err(err) = Self::get_object_with_fileinfo(
+                &bucket,
+                &object,
+                0,
+                fi.size,
+                &mut writer,
+                fi,
+                files,
+                &disks,
+                set_index,
+                pool_index,
+                skip_verify,
+            )
+            .await
+            {
+                error!("get_object_with_fileinfo {bucket}/{object} err {:?}", err);
+                writer.send_error(io::Error::other(err.to_string()));
+            }
+
+            if let Err(err) = writer.finish() {
+                debug!(bucket, object, error = %err, "failed to flush chunk writer");
+            }
+        });
+
+        Ok(GetObjectChunkResult {
+            stream: Box::pin(ChannelChunkStream::new(rx)),
+            direct: false,
+        })
+    }
+
     pub(super) async fn read_parts(
         disks: &[Option<DiskStore>],
         bucket: &str,

@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use futures_util::StreamExt;
-use rustfs_io_core::{BoxChunkStream, IoChunk};
-use tokio_util::io::ReaderStream;
+use crate::store_api::GetObjectChunkResult;
 
 fn select_data_movement_target_pool(
     existing_pool_idx: Result<usize>,
@@ -224,10 +222,24 @@ impl ECStore {
         range: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
-    ) -> Result<BoxChunkStream> {
-        let reader = self.handle_get_object_reader(bucket, object, range, h, opts).await?;
-        let stream = ReaderStream::new(reader.stream).map(|result| result.map(IoChunk::Shared));
-        Ok(Box::pin(stream))
+    ) -> Result<GetObjectChunkResult> {
+        check_get_obj_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].get_object_chunks(bucket, object.as_str(), range, h, opts).await;
+        }
+
+        let mut opts = opts.clone();
+        opts.no_lock = true;
+
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            .await?;
+        self.pools[idx]
+            .get_object_chunks(bucket, object.as_str(), range, h, &opts)
+            .await
     }
 
     #[instrument(level = "debug", skip(self, data))]
