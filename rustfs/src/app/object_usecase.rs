@@ -76,8 +76,8 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
-    PutObjReader,
+    BucketOperations, BucketOptions, GetObjectChunkCopyMode, GetObjectChunkPath, HTTPRangeSpec, ObjectIO, ObjectInfo,
+    ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
@@ -198,7 +198,11 @@ struct GetObjectReadSetup {
 
 enum GetObjectBodySource {
     Reader(Box<dyn Reader>),
-    Chunk { stream: BoxChunkStream, direct: bool },
+    Chunk {
+        stream: BoxChunkStream,
+        path: GetObjectChunkPath,
+        copy_mode: rustfs_io_metrics::CopyMode,
+    },
 }
 
 struct GetObjectPreparedRead<'a> {
@@ -1025,14 +1029,23 @@ impl DefaultObjectUsecase {
         Some(StreamingBlob::wrap(chunk_stream.map(|result| result.map(|chunk| chunk.as_bytes()))))
     }
 
-    fn chunk_body_data_plane_labels(direct: bool) -> (rustfs_io_metrics::IoPath, rustfs_io_metrics::CopyMode) {
+    fn map_chunk_copy_mode(copy_mode: GetObjectChunkCopyMode) -> rustfs_io_metrics::CopyMode {
+        match copy_mode {
+            GetObjectChunkCopyMode::TrueZeroCopy => rustfs_io_metrics::CopyMode::TrueZeroCopy,
+            GetObjectChunkCopyMode::SharedBytes => rustfs_io_metrics::CopyMode::SharedBytes,
+            GetObjectChunkCopyMode::SingleCopy => rustfs_io_metrics::CopyMode::SingleCopy,
+        }
+    }
+
+    fn chunk_body_data_plane_labels(
+        path: GetObjectChunkPath,
+        copy_mode: rustfs_io_metrics::CopyMode,
+    ) -> (rustfs_io_metrics::IoPath, rustfs_io_metrics::CopyMode) {
         (
-            rustfs_io_metrics::IoPath::Fast,
-            if direct {
-                rustfs_io_metrics::CopyMode::TrueZeroCopy
-            } else {
-                rustfs_io_metrics::CopyMode::SharedBytes
+            match path {
+                GetObjectChunkPath::Direct | GetObjectChunkPath::Bridge => rustfs_io_metrics::IoPath::Fast,
             },
+            copy_mode,
         )
     }
 
@@ -1341,7 +1354,8 @@ impl DefaultObjectUsecase {
                 return Err(err.into());
             }
         };
-        let (io_path, _) = Self::chunk_body_data_plane_labels(chunk_result.direct);
+        let copy_mode = Self::map_chunk_copy_mode(chunk_result.copy_mode);
+        let (io_path, _) = Self::chunk_body_data_plane_labels(chunk_result.path, copy_mode);
         rustfs_io_metrics::record_io_path_selected("get", io_path);
 
         Ok(Some(GetObjectReadSetup {
@@ -1349,7 +1363,8 @@ impl DefaultObjectUsecase {
             event_info,
             body_source: GetObjectBodySource::Chunk {
                 stream: chunk_result.stream,
-                direct: chunk_result.direct,
+                path: chunk_result.path,
+                copy_mode,
             },
             rs,
             content_type,
@@ -2712,8 +2727,12 @@ impl DefaultObjectUsecase {
             ),
             GetObjectBodySource::Chunk {
                 stream: chunk_stream,
-                direct,
-            } => (Self::build_chunk_blob(chunk_stream), Some(Self::chunk_body_data_plane_labels(direct).1)),
+                path,
+                copy_mode,
+            } => (
+                Self::build_chunk_blob(chunk_stream),
+                Some(Self::chunk_body_data_plane_labels(path, copy_mode).1),
+            ),
         };
 
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
@@ -5284,6 +5303,7 @@ mod tests {
     use uuid::Uuid;
 
     static DIRECT_CHUNK_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
+    static DIRECT_CHUNK_MULTI_DISK_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
     static DIRECT_CHUNK_TEST_INIT: Once = Once::new();
 
     fn init_direct_chunk_test_tracing() {
@@ -5343,6 +5363,72 @@ mod tests {
         let _ = DIRECT_CHUNK_TEST_ENV.set((vec![disk_path], ecstore.clone()));
 
         (DIRECT_CHUNK_TEST_ENV.get().unwrap().0.clone(), ecstore)
+    }
+
+    async fn setup_direct_chunk_multi_disk_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
+        init_direct_chunk_test_tracing();
+
+        if let Some((paths, store)) = DIRECT_CHUNK_MULTI_DISK_TEST_ENV.get() {
+            return (paths.clone(), store.clone());
+        }
+
+        let test_base_dir = format!("/tmp/rustfs_app_chunk_direct_multi_test_{}", Uuid::new_v4());
+        let temp_dir = PathBuf::from(&test_base_dir);
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).await.ok();
+        }
+        fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let disk_paths = vec![
+            temp_dir.join("disk1"),
+            temp_dir.join("disk2"),
+            temp_dir.join("disk3"),
+            temp_dir.join("disk4"),
+        ];
+        for disk_path in &disk_paths {
+            fs::create_dir_all(disk_path).await.unwrap();
+        }
+
+        let mut endpoints = Vec::new();
+        for (i, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            endpoints.push(endpoint);
+        }
+
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        };
+
+        let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+
+        rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+
+        let server_addr: std::net::SocketAddr = "127.0.0.1:9014".parse().unwrap();
+        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let buckets_list = ecstore
+            .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+
+        let _ = DIRECT_CHUNK_MULTI_DISK_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
+
+        (DIRECT_CHUNK_MULTI_DISK_TEST_ENV.get().unwrap().0.clone(), ecstore)
     }
 
     async fn create_direct_chunk_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
@@ -5718,29 +5804,35 @@ mod tests {
     }
 
     #[test]
-    fn chunk_body_source_direct_and_bridge_produce_distinct_data_plane_labels() {
+    fn chunk_body_source_preserves_fast_path_copy_mode_labels() {
         let direct = GetObjectBodySource::Chunk {
             stream: Box::pin(futures_util::stream::iter(Vec::<std::io::Result<rustfs_io_core::IoChunk>>::new())),
-            direct: true,
+            path: GetObjectChunkPath::Direct,
+            copy_mode: rustfs_io_metrics::CopyMode::TrueZeroCopy,
         };
         let bridged = GetObjectBodySource::Chunk {
             stream: Box::pin(futures_util::stream::iter(Vec::<std::io::Result<rustfs_io_core::IoChunk>>::new())),
-            direct: false,
+            path: GetObjectChunkPath::Bridge,
+            copy_mode: rustfs_io_metrics::CopyMode::SingleCopy,
         };
 
         let (direct_path, direct_mode) = match direct {
-            GetObjectBodySource::Chunk { direct, .. } => DefaultObjectUsecase::chunk_body_data_plane_labels(direct),
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                DefaultObjectUsecase::chunk_body_data_plane_labels(path, copy_mode)
+            }
             GetObjectBodySource::Reader(_) => unreachable!("expected chunk body source"),
         };
         let (bridged_path, bridged_mode) = match bridged {
-            GetObjectBodySource::Chunk { direct, .. } => DefaultObjectUsecase::chunk_body_data_plane_labels(direct),
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                DefaultObjectUsecase::chunk_body_data_plane_labels(path, copy_mode)
+            }
             GetObjectBodySource::Reader(_) => unreachable!("expected chunk body source"),
         };
 
         assert_eq!(direct_path, rustfs_io_metrics::IoPath::Fast);
         assert_eq!(bridged_path, rustfs_io_metrics::IoPath::Fast);
         assert_eq!(direct_mode, rustfs_io_metrics::CopyMode::TrueZeroCopy);
-        assert_eq!(bridged_mode, rustfs_io_metrics::CopyMode::SharedBytes);
+        assert_eq!(bridged_mode, rustfs_io_metrics::CopyMode::SingleCopy);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -5785,7 +5877,9 @@ mod tests {
         .expect("expected chunk fast path");
 
         match read_setup.body_source {
-            GetObjectBodySource::Chunk { direct, .. } => assert!(direct, "expected direct chunk path"),
+            GetObjectBodySource::Chunk { path, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path")
+            }
             GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
         }
 
@@ -5846,7 +5940,9 @@ mod tests {
         .expect("expected chunk fast path");
 
         match read_setup.body_source {
-            GetObjectBodySource::Chunk { direct, .. } => assert!(direct, "expected direct chunk path"),
+            GetObjectBodySource::Chunk { path, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path")
+            }
             GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
         }
 
@@ -5859,6 +5955,83 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(collected, payload[..(63 * 1024 + 1)].to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_range_marks_direct_path_for_multi_disk_store_without_rebuild() {
+        let (_disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-multi-range-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multi-range.bin";
+        let payload_len = 3 * 1024 * 1024 + 137;
+        let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let put_info = ecstore
+            .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            put_info.data_blocks > 1,
+            "expected multi-data-shard object, got {}+{}",
+            put_info.data_blocks,
+            put_info.parity_blocks
+        );
+
+        let range_start = 123_457_u64;
+        let range_end = 2 * 1024 * 1024 + 33_333_u64;
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .range(Some(Range::Int {
+                first: range_start,
+                last: Some(range_end),
+            }))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+
+        let read_setup = DefaultObjectUsecase::prepare_get_object_chunk_read(
+            &req,
+            &ecstore,
+            manager,
+            &request_context.bucket,
+            &request_context.key,
+            request_context.rs.clone(),
+            &request_context.opts,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap()
+        .expect("expected chunk fast path");
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::SingleCopy,
+                    "multi-data-shard direct path should remain non-bridge but incur a single assembly copy"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, payload[range_start as usize..=range_end as usize].to_vec());
     }
 
     #[tokio::test]

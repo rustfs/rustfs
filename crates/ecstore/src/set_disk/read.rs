@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bitrot::create_bitrot_chunk_stream;
-use crate::store_api::GetObjectChunkResult;
+use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt, stream};
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
@@ -105,6 +105,109 @@ impl AsyncWrite for ChannelChunkWriter {
     }
 }
 
+fn merge_chunk_copy_mode(current: GetObjectChunkCopyMode, next: GetObjectChunkCopyMode) -> GetObjectChunkCopyMode {
+    use GetObjectChunkCopyMode::{SharedBytes, SingleCopy, TrueZeroCopy};
+
+    match (current, next) {
+        (SingleCopy, _) | (_, SingleCopy) => SingleCopy,
+        (SharedBytes, _) | (_, SharedBytes) => SharedBytes,
+        (TrueZeroCopy, TrueZeroCopy) => TrueZeroCopy,
+    }
+}
+
+fn block_window(
+    offset: usize,
+    length: usize,
+    block_size: usize,
+    block_index: usize,
+    start_block: usize,
+    end_block: usize,
+) -> (usize, usize) {
+    if start_block == end_block {
+        (offset % block_size, length)
+    } else if block_index == start_block {
+        (offset % block_size, block_size - (offset % block_size))
+    } else if block_index == end_block {
+        (0, (offset + length) % block_size)
+    } else {
+        (0, block_size)
+    }
+}
+
+async fn send_direct_data_shard_chunks(
+    sender: UnboundedSender<io::Result<IoChunk>>,
+    mut shard_streams: Vec<BoxChunkStream>,
+    data_shards: usize,
+    block_size: usize,
+    offset: usize,
+    length: usize,
+) {
+    if length == 0 {
+        return;
+    }
+
+    let start_block = offset / block_size;
+    let end_block = (offset + length) / block_size;
+
+    for block_index in start_block..=end_block {
+        let (block_offset, block_length) = block_window(offset, length, block_size, block_index, start_block, end_block);
+        if block_length == 0 {
+            break;
+        }
+
+        let mut block = BytesMut::with_capacity(block_length);
+        let mut write_left = block_length;
+        let mut skip = block_offset;
+
+        for (shard_index, shard_stream) in shard_streams.iter_mut().enumerate().take(data_shards) {
+            let Some(chunk) = shard_stream.next().await else {
+                let _ = sender.send(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("missing chunk for data shard {shard_index}"),
+                )));
+                return;
+            };
+
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    let _ = sender.send(Err(err));
+                    return;
+                }
+            };
+
+            let bytes = chunk.as_bytes();
+            if skip >= bytes.len() {
+                skip -= bytes.len();
+                continue;
+            }
+
+            let available = &bytes[skip..];
+            skip = 0;
+
+            let take = available.len().min(write_left);
+            block.extend_from_slice(&available[..take]);
+            write_left -= take;
+
+            if write_left == 0 {
+                break;
+            }
+        }
+
+        if write_left != 0 {
+            let _ = sender.send(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "not enough decoded shard data for requested block",
+            )));
+            return;
+        }
+
+        if sender.send(Ok(IoChunk::Shared(block.freeze()))).is_err() {
+            return;
+        }
+    }
+}
+
 impl SetDisks {
     #[tracing::instrument(level = "debug", skip(self, h, opts))]
     pub(crate) async fn get_object_chunks(
@@ -166,7 +269,8 @@ impl SetDisks {
         if object_info.size == 0 {
             return Ok(GetObjectChunkResult {
                 stream: Box::pin(stream::iter(Vec::<io::Result<IoChunk>>::new())),
-                direct: true,
+                path: GetObjectChunkPath::Direct,
+                copy_mode: GetObjectChunkCopyMode::SharedBytes,
             });
         }
 
@@ -179,11 +283,12 @@ impl SetDisks {
             let stream = ReaderStream::new(gr.stream).map(|result| result.map(IoChunk::Shared));
             return Ok(GetObjectChunkResult {
                 stream: Box::pin(stream),
-                direct: false,
+                path: GetObjectChunkPath::Bridge,
+                copy_mode: GetObjectChunkCopyMode::SingleCopy,
             });
         }
 
-        if fi.erasure.data_blocks == 1 {
+        if fi.erasure.data_blocks > 0 {
             let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
             let total_size = fi.size as usize;
             let requested_length = if let Some(range) = &range {
@@ -205,7 +310,7 @@ impl SetDisks {
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
             let mut part_streams = Vec::new();
             let mut part_total_read = 0usize;
-            let mut all_direct = true;
+            let mut merged_copy_mode = GetObjectChunkCopyMode::TrueZeroCopy;
 
             for current_part in part_index..=last_part_index {
                 let part_number = fi.parts[current_part].number;
@@ -223,29 +328,100 @@ impl SetDisks {
                         checksum_info.algorithm.clone()
                     };
 
-                let data_path = format!("{}/{}/part.{}", object, files[current_part].data_dir.unwrap_or_default(), part_number);
-                let chunk_result = create_bitrot_chunk_stream(
-                    files[current_part].data.as_deref(),
-                    disks[current_part].as_ref(),
-                    bucket,
-                    &data_path,
-                    part_offset,
-                    part_length,
-                    part_size,
-                    fi.erasure.shard_size(),
-                    checksum_algo,
-                    opts.skip_verify_bitrot,
-                    use_zero_copy,
-                )
-                .await?;
+                if fi.erasure.data_blocks == 1 {
+                    let data_path =
+                        format!("{}/{}/part.{}", object, files[current_part].data_dir.unwrap_or_default(), part_number);
+                    let chunk_result = create_bitrot_chunk_stream(
+                        files[current_part].data.as_deref(),
+                        disks[current_part].as_ref(),
+                        bucket,
+                        &data_path,
+                        part_offset,
+                        part_length,
+                        part_size,
+                        fi.erasure.shard_size(),
+                        checksum_algo,
+                        opts.skip_verify_bitrot,
+                        use_zero_copy,
+                    )
+                    .await?;
 
-                let Some(chunk_result) = chunk_result else {
-                    part_streams.clear();
-                    all_direct = false;
-                    break;
-                };
-                all_direct &= chunk_result.direct;
-                part_streams.push(chunk_result.stream);
+                    let Some(chunk_result) = chunk_result else {
+                        part_streams.clear();
+                        break;
+                    };
+                    merged_copy_mode = merge_chunk_copy_mode(merged_copy_mode, chunk_result.copy_mode);
+                    part_streams.push(chunk_result.stream);
+                } else {
+                    let erasure = erasure_coding::Erasure::new_with_options(
+                        fi.erasure.data_blocks,
+                        fi.erasure.parity_blocks,
+                        fi.erasure.block_size,
+                        fi.uses_legacy_checksum,
+                    );
+                    let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+                    let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
+                    let shard_length = till_offset.saturating_sub(read_offset);
+                    let shard_total_size = erasure.shard_file_size(part_size as i64) as usize;
+                    let mut shard_streams = Vec::with_capacity(erasure.data_shards);
+
+                    for shard_index in 0..erasure.data_shards {
+                        let data_path =
+                            format!("{}/{}/part.{}", object, files[shard_index].data_dir.unwrap_or_default(), part_number);
+                        let chunk_result = match create_bitrot_chunk_stream(
+                            files[shard_index].data.as_deref(),
+                            disks[shard_index].as_ref(),
+                            bucket,
+                            &data_path,
+                            read_offset,
+                            shard_length,
+                            shard_total_size,
+                            erasure.shard_size(),
+                            checksum_algo.clone(),
+                            opts.skip_verify_bitrot,
+                            use_zero_copy,
+                        )
+                        .await
+                        {
+                            Ok(Some(chunk_result)) => chunk_result,
+                            Ok(None) => {
+                                shard_streams.clear();
+                                break;
+                            }
+                            Err(err) => {
+                                debug!(
+                                    bucket,
+                                    object,
+                                    part_number,
+                                    shard_index,
+                                    error = %err,
+                                    "multi-shard direct chunk path unavailable, falling back to decoded read path"
+                                );
+                                shard_streams.clear();
+                                break;
+                            }
+                        };
+                        shard_streams.push(chunk_result.stream);
+                    }
+
+                    if shard_streams.len() != erasure.data_shards {
+                        part_streams.clear();
+                        break;
+                    }
+
+                    let (tx, rx) = unbounded_channel();
+                    tokio::spawn(send_direct_data_shard_chunks(
+                        tx,
+                        shard_streams,
+                        erasure.data_shards,
+                        erasure.block_size,
+                        part_offset,
+                        part_length,
+                    ));
+
+                    merged_copy_mode = merge_chunk_copy_mode(merged_copy_mode, GetObjectChunkCopyMode::SingleCopy);
+                    part_streams.push(Box::pin(ChannelChunkStream::new(rx)));
+                }
                 part_total_read += part_length;
                 part_offset = 0;
             }
@@ -264,7 +440,8 @@ impl SetDisks {
 
                 return Ok(GetObjectChunkResult {
                     stream: Box::pin(ChannelChunkStream::new(rx)),
-                    direct: all_direct,
+                    path: GetObjectChunkPath::Direct,
+                    copy_mode: merged_copy_mode,
                 });
             }
         }
@@ -319,7 +496,8 @@ impl SetDisks {
 
         Ok(GetObjectChunkResult {
             stream: Box::pin(ChannelChunkStream::new(rx)),
-            direct: false,
+            path: GetObjectChunkPath::Bridge,
+            copy_mode: GetObjectChunkCopyMode::SingleCopy,
         })
     }
 
@@ -1138,5 +1316,47 @@ impl SetDisks {
         debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn send_direct_data_shard_chunks_reassembles_multi_block_range() {
+        let data_shards = 4;
+        let block_size = 16;
+        let shard_streams: Vec<BoxChunkStream> = vec![
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[0, 1, 2, 3]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[16, 17, 18, 19]))),
+            ])),
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[4, 5, 6, 7]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[20, 21, 22, 23]))),
+            ])),
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[8, 9, 10, 11]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[24, 25, 26, 27]))),
+            ])),
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[12, 13, 14, 15]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[28, 29, 30, 31]))),
+            ])),
+        ];
+        let (tx, rx) = unbounded_channel();
+
+        send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, 3, 18).await;
+
+        let mut stream = ChannelChunkStream::new(rx);
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap().as_bytes());
+        }
+
+        assert_eq!(collected, (3u8..21).collect::<Vec<_>>());
     }
 }

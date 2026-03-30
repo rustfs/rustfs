@@ -14,7 +14,7 @@
 
 use crate::disk::{self, DiskAPI as _, DiskStore, error::DiskError};
 use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
-use crate::store_api::GetObjectChunkResult;
+use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use rustfs_io_core::IoChunk;
@@ -23,6 +23,16 @@ use std::io::Cursor;
 use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
+
+fn classify_chunk_copy_mode(source_direct: bool, source_chunk_count: usize) -> GetObjectChunkCopyMode {
+    if source_direct && source_chunk_count == 1 {
+        GetObjectChunkCopyMode::TrueZeroCopy
+    } else if source_chunk_count == 1 {
+        GetObjectChunkCopyMode::SharedBytes
+    } else {
+        GetObjectChunkCopyMode::SingleCopy
+    }
+}
 
 /// Create a BitrotReader from either inline data or disk file stream
 ///
@@ -185,7 +195,7 @@ pub async fn create_bitrot_chunk_stream(
         return Ok(None);
     };
 
-    let direct = source_direct && source_chunks.len() == 1;
+    let copy_mode = classify_chunk_copy_mode(source_direct, source_chunks.len());
     let normalized_source = if source_chunks.len() == 1 {
         source_chunks.into_iter().next().unwrap()
     } else {
@@ -202,7 +212,8 @@ pub async fn create_bitrot_chunk_stream(
     let stream = stream::iter(data_chunks.into_iter().map(Ok::<IoChunk, std::io::Error>));
     Ok(Some(GetObjectChunkResult {
         stream: Box::pin(stream),
-        direct,
+        path: GetObjectChunkPath::Direct,
+        copy_mode,
     }))
 }
 
