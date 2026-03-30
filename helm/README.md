@@ -48,6 +48,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
 | config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
 | config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
+| extraEnv | list | `[]` |  Extra environment variables for RustFS container. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
