@@ -108,6 +108,10 @@ spec:
               containerPort: {{ .Values.service.endpoint.port }}
             - name: console
               containerPort: {{ .Values.service.console.port }}
+          env:
+            {{- if .Values.extraEnv }}
+            {{- toYaml .Values.extraEnv | nindent 12 }}
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
