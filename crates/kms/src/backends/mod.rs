@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 pub mod local;
 pub mod vault;
+pub mod vault_transit;
 
 /// Abstract KMS client interface that all backends must implement
 #[async_trait]

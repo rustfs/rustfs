@@ -172,6 +172,9 @@ pub const DEFAULT_KMS_ENABLE: bool = false;
 /// Environment variable for server KMS backend.
 pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
 
+/// Environment variable for Vault Transit mount path.
+pub const ENV_RUSTFS_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
+
 /// Default KMS backend for server-side encryption
 /// This is the default KMS backend for server-side encryption.
 /// Default value: local

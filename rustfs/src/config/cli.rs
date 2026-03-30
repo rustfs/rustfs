@@ -234,6 +234,10 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_KMS_VAULT_TOKEN")]
     pub kms_vault_token: Option<String>,
 
+    /// Vault mount path for vault or vault-transit backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_MOUNT_PATH")]
+    pub kms_vault_mount_path: Option<String>,
+
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
@@ -284,6 +288,7 @@ pub fn default_server_opts() -> ServerOpts {
         kms_key_dir: None,
         kms_vault_address: None,
         kms_vault_token: None,
+        kms_vault_mount_path: None,
         kms_default_key_id: None,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),

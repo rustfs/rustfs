@@ -203,9 +203,39 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
                 token: vault_token.clone(),
             },
             namespace: None,
-            mount_path: "transit".to_string(),
+            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
             kv_mount: "secret".to_string(),
             key_path_prefix: "rustfs/kms/keys".to_string(),
+            tls: None,
+        })),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Build KMS configuration for Vault Transit backend
+fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let vault_address = cfg
+        .kms_vault_address
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault address is required for vault-transit backend"))?;
+    let vault_token = cfg
+        .kms_vault_token
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault token is required for vault-transit backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::VaultTransit,
+        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(rustfs_kms::config::VaultTransitConfig {
+            address: vault_address.clone(),
+            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                token: vault_token.clone(),
+            },
+            namespace: None,
+            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
             tls: None,
         })),
         default_key_id: cfg.kms_default_key_id.clone(),
@@ -259,6 +289,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
         let kms_config = match config.kms_backend.as_str() {
             "local" => build_local_kms_config(config)?,
             "vault" => build_vault_kms_config(config)?,
+            "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 

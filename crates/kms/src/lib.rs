@@ -71,8 +71,8 @@ pub mod types;
 // Re-export public API
 pub use api_types::{
     CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureVaultKmsRequest,
-    KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse,
-    UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+    ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse,
+    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
 pub use error::{KmsError, Result};

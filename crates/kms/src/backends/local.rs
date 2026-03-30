@@ -566,7 +566,9 @@ impl LocalKmsBackend {
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let local_config = match &config.backend_config {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
-            _ => return Err(KmsError::configuration_error("Expected Local backend configuration")),
+            crate::config::BackendConfig::Vault(_) | crate::config::BackendConfig::VaultTransit(_) => {
+                return Err(KmsError::configuration_error("Expected Local backend configuration"));
+            }
         };
 
         let client = LocalKmsClient::new(local_config).await?;
