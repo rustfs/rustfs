@@ -1053,12 +1053,8 @@ impl DefaultObjectUsecase {
     fn get_object_chunk_fast_path_guard(
         req: &S3Request<GetObjectInput>,
         _rs: Option<&HTTPRangeSpec>,
-        part_number: Option<usize>,
+        _part_number: Option<usize>,
     ) -> std::result::Result<(), rustfs_io_metrics::FallbackReason> {
-        if part_number.is_some() {
-            return Err(rustfs_io_metrics::FallbackReason::RangeNotSupported);
-        }
-
         if req.input.sse_customer_key.is_some() || req.input.sse_customer_key_md5.is_some() {
             return Err(rustfs_io_metrics::FallbackReason::EncryptionEnabled);
         }
@@ -1243,8 +1239,18 @@ impl DefaultObjectUsecase {
 
         let read_start = std::time::Instant::now();
         let read_setup = match Self::get_object_chunk_fast_path_guard(req, rs.as_ref(), part_number) {
-            Ok(()) => match Self::prepare_get_object_chunk_read(req, &store, manager, bucket, key, rs.clone(), opts, read_start)
-                .await?
+            Ok(()) => match Self::prepare_get_object_chunk_read(
+                req,
+                &store,
+                manager,
+                bucket,
+                key,
+                rs.clone(),
+                part_number,
+                opts,
+                read_start,
+            )
+            .await?
             {
                 Some(read_setup) => read_setup,
                 None => {
@@ -1267,7 +1273,8 @@ impl DefaultObjectUsecase {
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
-        rs: Option<HTTPRangeSpec>,
+        mut rs: Option<HTTPRangeSpec>,
+        part_number: Option<usize>,
         opts: &ObjectOptions,
         read_start: std::time::Instant,
     ) -> S3Result<Option<GetObjectReadSetup>> {
@@ -1297,11 +1304,12 @@ impl DefaultObjectUsecase {
             return Ok(None);
         }
 
-        if info.user_defined.contains_key("x-rustfs-encryption-original-size")
+        let has_encryption_metadata = info.user_defined.contains_key("x-rustfs-encryption-key")
+            || info.user_defined.contains_key("x-amz-server-side-encryption")
             || info
                 .user_defined
-                .contains_key("x-amz-server-side-encryption-customer-original-size")
-        {
+                .contains_key("x-amz-server-side-encryption-customer-algorithm");
+        if has_encryption_metadata {
             rustfs_io_metrics::record_io_fallback(
                 rustfs_io_metrics::IoStage::ReadSetup,
                 rustfs_io_metrics::FallbackReason::EncryptionEnabled,
@@ -1316,6 +1324,12 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key_md5.as_ref(),
         )?;
         check_preconditions(&req.headers, &info)?;
+
+        if let Some(part_number) = part_number
+            && rs.is_none()
+        {
+            rs = HTTPRangeSpec::from_object_info(&info, part_number);
+        }
 
         let read_duration = read_start.elapsed();
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
@@ -5292,7 +5306,9 @@ mod tests {
         disk::endpoint::Endpoint,
         endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         store::ECStore,
-        store_api::{BucketOperations, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader},
+        store_api::{
+            BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOptions, PutObjReader,
+        },
     };
     use serial_test::serial;
     use std::{
@@ -5443,6 +5459,40 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn create_direct_chunk_test_multipart_object(
+        ecstore: &Arc<ECStore>,
+        bucket: &str,
+        key: &str,
+        parts: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        let upload = ecstore
+            .new_multipart_upload(bucket, key, &ObjectOptions::default())
+            .await
+            .unwrap();
+
+        let mut completed_parts = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(part.clone());
+            let part_info = ecstore
+                .put_object_part(bucket, key, &upload.upload_id, idx + 1, &mut reader, &ObjectOptions::default())
+                .await
+                .unwrap();
+            completed_parts.push(CompletePart {
+                part_num: idx + 1,
+                etag: part_info.etag,
+                ..Default::default()
+            });
+        }
+
+        ecstore
+            .clone()
+            .complete_multipart_upload(bucket, key, &upload.upload_id, completed_parts, &ObjectOptions::default())
+            .await
+            .unwrap();
+
+        parts
     }
 
     fn find_part_file(root: &std::path::Path, part_name: &str) -> Option<PathBuf> {
@@ -5797,7 +5847,7 @@ mod tests {
     }
 
     #[test]
-    fn get_object_chunk_fast_path_guard_rejects_part_requests() {
+    fn get_object_chunk_fast_path_guard_allows_part_requests() {
         let input = GetObjectInput::builder()
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
@@ -5805,8 +5855,7 @@ mod tests {
             .unwrap();
 
         let req = build_request(input, Method::GET);
-        let err = DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, None, Some(1)).unwrap_err();
-        assert_eq!(err, rustfs_io_metrics::FallbackReason::RangeNotSupported);
+        assert!(DefaultObjectUsecase::get_object_chunk_fast_path_guard(&req, None, Some(1)).is_ok());
     }
 
     #[test]
@@ -5889,6 +5938,7 @@ mod tests {
             &request_context.bucket,
             &request_context.key,
             request_context.rs.clone(),
+            request_context.part_number,
             &request_context.opts,
             std::time::Instant::now(),
         )
@@ -5953,6 +6003,7 @@ mod tests {
             &request_context.bucket,
             &request_context.key,
             request_context.rs.clone(),
+            request_context.part_number,
             &request_context.opts,
             std::time::Instant::now(),
         )
@@ -6025,6 +6076,7 @@ mod tests {
             &request_context.bucket,
             &request_context.key,
             request_context.rs.clone(),
+            request_context.part_number,
             &request_context.opts,
             std::time::Instant::now(),
         )
@@ -6108,6 +6160,7 @@ mod tests {
             &request_context.bucket,
             &request_context.key,
             request_context.rs.clone(),
+            request_context.part_number,
             &request_context.opts,
             std::time::Instant::now(),
         )
@@ -6136,6 +6189,65 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(collected, payload[range_start as usize..=range_end as usize].to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_part_number_marks_direct_path_for_single_disk_store() {
+        let (_disk_paths, ecstore) = setup_direct_chunk_test_env().await;
+        let bucket = format!("direct-part-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart.bin";
+        let part_one = vec![11u8; 5 * 1024 * 1024];
+        let part_two = vec![22u8; 5 * 1024 * 1024];
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts =
+            create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one.clone(), part_two.clone()]).await;
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .part_number(Some(1))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+
+        let read_setup = DefaultObjectUsecase::prepare_get_object_chunk_read(
+            &req,
+            &ecstore,
+            manager,
+            &request_context.bucket,
+            &request_context.key,
+            request_context.rs.clone(),
+            request_context.part_number,
+            &request_context.opts,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap()
+        .expect("expected chunk fast path");
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(copy_mode, rustfs_io_metrics::CopyMode::TrueZeroCopy);
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some(parts[0].len() as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, parts[0]);
     }
 
     #[tokio::test]
