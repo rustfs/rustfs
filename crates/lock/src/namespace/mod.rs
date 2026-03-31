@@ -151,8 +151,9 @@ impl NamespaceLock {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
     }
 
-    /// Create namespace lock with clients and an explicit quorum size.
-    /// Quorum will be clamped into [1, clients.len()].
+    /// Create namespace lock with clients and an explicit write quorum size.
+    /// Shared/read locks still use the distributed read quorum derived from client count.
+    /// The write quorum will be clamped into [1, clients.len()].
     pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
     }
