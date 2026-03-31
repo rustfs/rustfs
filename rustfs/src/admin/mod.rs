@@ -24,7 +24,10 @@ mod console_test;
 #[cfg(test)]
 mod route_registration_test;
 
-use handlers::{audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system, tier, user};
+use handlers::{
+    audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts,
+    system, tier, user,
+};
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
 

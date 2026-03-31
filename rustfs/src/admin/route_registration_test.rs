@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system,
-        tier, user,
+        audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts,
+        system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
