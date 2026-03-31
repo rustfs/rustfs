@@ -65,6 +65,7 @@ pub enum GetObjectChunkCopyMode {
     TrueZeroCopy,
     SharedBytes,
     SingleCopy,
+    Reconstructed,
 }
 
 pub struct GetObjectChunkResult {

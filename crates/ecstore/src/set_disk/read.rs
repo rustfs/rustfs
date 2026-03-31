@@ -106,9 +106,10 @@ impl AsyncWrite for ChannelChunkWriter {
 }
 
 fn merge_chunk_copy_mode(current: GetObjectChunkCopyMode, next: GetObjectChunkCopyMode) -> GetObjectChunkCopyMode {
-    use GetObjectChunkCopyMode::{SharedBytes, SingleCopy, TrueZeroCopy};
+    use GetObjectChunkCopyMode::{Reconstructed, SharedBytes, SingleCopy, TrueZeroCopy};
 
     match (current, next) {
+        (Reconstructed, _) | (_, Reconstructed) => Reconstructed,
         (SingleCopy, _) | (_, SingleCopy) => SingleCopy,
         (SharedBytes, _) | (_, SharedBytes) => SharedBytes,
         (TrueZeroCopy, TrueZeroCopy) => TrueZeroCopy,
@@ -234,6 +235,109 @@ pub async fn collect_direct_data_shard_chunks_for_benchmark(
     }
 
     Ok(chunks)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_reconstructed_part_stream(
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    part_offset: usize,
+    part_length: usize,
+    part_size: usize,
+    read_offset: usize,
+    till_offset: usize,
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    erasure: &erasure_coding::Erasure,
+    checksum_algo: rustfs_utils::HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_zero_copy: bool,
+) -> Result<Option<BoxChunkStream>> {
+    let mut readers = Vec::with_capacity(disks.len());
+    let mut errors = Vec::with_capacity(disks.len());
+    for (idx, disk_op) in disks.iter().enumerate() {
+        match create_bitrot_reader(
+            files[idx].data.as_deref(),
+            disk_op.as_ref(),
+            bucket,
+            &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+            read_offset,
+            till_offset,
+            erasure.shard_size(),
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_zero_copy,
+        )
+        .await
+        {
+            Ok(Some(reader)) => {
+                readers.push(Some(reader));
+                errors.push(None);
+            }
+            Ok(None) => {
+                readers.push(None);
+                errors.push(Some(DiskError::DiskNotFound));
+            }
+            Err(err) => {
+                readers.push(None);
+                errors.push(Some(err));
+            }
+        }
+    }
+
+    let available_shards = errors.iter().filter(|error| error.is_none()).count();
+    if available_shards < erasure.data_shards {
+        return Ok(None);
+    }
+
+    let missing_shards = readers.len().saturating_sub(available_shards);
+    if missing_shards > 0 {
+        debug!(
+            bucket,
+            object,
+            part_number,
+            missing_shards,
+            available_shards,
+            data_shards = erasure.data_shards,
+            parity_shards = erasure.parity_shards,
+            "using reconstructed part stream for missing shards"
+        );
+    }
+
+    let (tx, rx) = unbounded_channel();
+    let bucket = bucket.to_string();
+    let object = object.to_string();
+    let erasure = erasure.clone();
+    tokio::spawn(async move {
+        let mut writer = ChannelChunkWriter::new(tx, get_duplex_buffer_size());
+        let (written, err) = erasure
+            .decode(&mut writer, readers, part_offset, part_length, part_size)
+            .await;
+        if let Some(err) = err {
+            let disk_err: DiskError = err.into();
+            let allow_heal_only = written == part_length && matches!(disk_err, DiskError::FileNotFound | DiskError::FileCorrupt);
+            if !allow_heal_only {
+                writer.send_error(io::Error::other(disk_err.to_string()));
+                return;
+            }
+
+            debug!(
+                bucket,
+                object,
+                part_number,
+                bytes_written = written,
+                error = %disk_err,
+                "reconstructed part completed with healable shard error"
+            );
+        }
+
+        if let Err(err) = writer.finish() {
+            debug!(bucket, object, part_number, error = %err, "failed to flush reconstructed chunk writer");
+        }
+    });
+
+    Ok(Some(Box::pin(ChannelChunkStream::new(rx))))
 }
 
 impl SetDisks {
@@ -393,6 +497,7 @@ impl SetDisks {
                     let shard_total_size = erasure.shard_file_size(part_size as i64) as usize;
                     let mut shard_streams = Vec::with_capacity(erasure.data_shards);
                     let mut part_copy_mode = GetObjectChunkCopyMode::TrueZeroCopy;
+                    let mut needs_reconstruct = false;
 
                     for shard_index in 0..erasure.data_shards {
                         let data_path =
@@ -414,6 +519,7 @@ impl SetDisks {
                         {
                             Ok(Some(chunk_result)) => chunk_result,
                             Ok(None) => {
+                                needs_reconstruct = true;
                                 shard_streams.clear();
                                 break;
                             }
@@ -426,12 +532,46 @@ impl SetDisks {
                                     error = %err,
                                     "multi-shard direct chunk path unavailable, falling back to decoded read path"
                                 );
+                                needs_reconstruct = true;
                                 shard_streams.clear();
                                 break;
                             }
                         };
                         part_copy_mode = merge_chunk_copy_mode(part_copy_mode, chunk_result.copy_mode);
                         shard_streams.push(chunk_result.stream);
+                    }
+
+                    if needs_reconstruct {
+                        let reconstructed_stream = match build_reconstructed_part_stream(
+                            bucket,
+                            object,
+                            part_number,
+                            part_offset,
+                            part_length,
+                            part_size,
+                            read_offset,
+                            till_offset,
+                            &files,
+                            &disks,
+                            &erasure,
+                            checksum_algo,
+                            opts.skip_verify_bitrot,
+                            use_zero_copy,
+                        )
+                        .await?
+                        {
+                            Some(stream) => stream,
+                            None => {
+                                part_streams.clear();
+                                break;
+                            }
+                        };
+
+                        merged_copy_mode = merge_chunk_copy_mode(merged_copy_mode, GetObjectChunkCopyMode::Reconstructed);
+                        part_streams.push(reconstructed_stream);
+                        part_total_read += part_length;
+                        part_offset = 0;
+                        continue;
                     }
 
                     if shard_streams.len() != erasure.data_shards {

@@ -1034,6 +1034,7 @@ impl DefaultObjectUsecase {
             GetObjectChunkCopyMode::TrueZeroCopy => rustfs_io_metrics::CopyMode::TrueZeroCopy,
             GetObjectChunkCopyMode::SharedBytes => rustfs_io_metrics::CopyMode::SharedBytes,
             GetObjectChunkCopyMode::SingleCopy => rustfs_io_metrics::CopyMode::SingleCopy,
+            GetObjectChunkCopyMode::Reconstructed => rustfs_io_metrics::CopyMode::Reconstructed,
         }
     }
 
@@ -5444,6 +5445,25 @@ mod tests {
             .unwrap();
     }
 
+    fn find_part_file(root: &std::path::Path, part_name: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_part_file(&path, part_name) {
+                    return Some(found);
+                }
+                continue;
+            }
+
+            if path.file_name().and_then(|name| name.to_str()) == Some(part_name) {
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -6026,6 +6046,82 @@ mod tests {
                     copy_mode,
                     rustfs_io_metrics::CopyMode::SharedBytes,
                     "multi-data-shard direct path should avoid assembly copies even without mmap"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, payload[range_start as usize..=range_end as usize].to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_range_marks_reconstructed_path_for_multi_disk_store_with_missing_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-multi-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multi-reconstructed.bin";
+        let payload_len = 3 * 1024 * 1024 + 137;
+        let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let put_info = ecstore
+            .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
+            .await
+            .unwrap();
+        assert!(put_info.data_blocks > 1, "expected multi-data-shard object");
+
+        let object_root = disk_paths[0].join(&bucket).join("test").join("multi-reconstructed.bin");
+        let missing_part = find_part_file(&object_root, "part.1").expect("part file on first disk");
+        fs::remove_file(&missing_part).await.expect("remove first shard part");
+
+        let range_start = 123_457_u64;
+        let range_end = 2 * 1024 * 1024 + 33_333_u64;
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .range(Some(Range::Int {
+                first: range_start,
+                last: Some(range_end),
+            }))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+
+        let read_setup = DefaultObjectUsecase::prepare_get_object_chunk_read(
+            &req,
+            &ecstore,
+            manager,
+            &request_context.bucket,
+            &request_context.key,
+            request_context.rs.clone(),
+            &request_context.opts,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap()
+        .expect("expected chunk fast path");
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "missing data shard should trigger reconstructed chunk path"
                 );
             }
             GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
