@@ -33,6 +33,7 @@ pub mod quota;
 pub mod rebalance;
 pub mod replication;
 pub mod service_account;
+pub mod site_replication;
 pub mod sts;
 pub mod system;
 pub mod tier;
@@ -64,6 +65,9 @@ mod tests {
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
+        let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
+        let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
+        let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking
