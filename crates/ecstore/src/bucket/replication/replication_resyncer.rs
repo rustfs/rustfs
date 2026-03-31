@@ -110,6 +110,10 @@ fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> 
     }
 }
 
+fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
+    state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
     pub bucket: String,
@@ -360,16 +364,13 @@ static RESYNC_WORKER_COUNT: usize = 10;
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
-    pub resync_cancel_tx: CancellationToken,
-    pub resync_cancel_rx: CancellationToken,
+    pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     pub worker_tx: tokio::sync::broadcast::Sender<()>,
     pub worker_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl ReplicationResyncer {
     pub async fn new() -> Self {
-        let resync_cancel_tx = CancellationToken::new();
-        let resync_cancel_rx = resync_cancel_tx.clone();
         let (worker_tx, worker_rx) = tokio::sync::broadcast::channel(RESYNC_WORKER_COUNT);
 
         for _ in 0..RESYNC_WORKER_COUNT {
@@ -381,16 +382,34 @@ impl ReplicationResyncer {
         Self {
             status_map: Arc::new(RwLock::new(HashMap::new())),
             worker_size: RESYNC_WORKER_COUNT,
-            resync_cancel_tx,
-            resync_cancel_rx,
+            cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             worker_tx,
             worker_rx,
+        }
+    }
+
+    fn cancel_key(opts: &ResyncOpts) -> String {
+        format!("{}:{}", opts.bucket, opts.arn)
+    }
+
+    pub async fn register_cancel_token(&self, opts: &ResyncOpts, token: CancellationToken) {
+        self.cancel_tokens.write().await.insert(Self::cancel_key(opts), token);
+    }
+
+    pub async fn clear_cancel_token(&self, opts: &ResyncOpts) {
+        self.cancel_tokens.write().await.remove(&Self::cancel_key(opts));
+    }
+
+    pub async fn cancel(&self, opts: &ResyncOpts) {
+        if let Some(token) = self.cancel_tokens.write().await.remove(&Self::cancel_key(opts)) {
+            token.cancel();
         }
     }
 
     pub async fn mark_status<S: StorageAPI>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()> {
         let bucket_status = {
             let mut status_map = self.status_map.write().await;
+            let now = OffsetDateTime::now_utc();
 
             let bucket_status = if let Some(bucket_status) = status_map.get_mut(&opts.bucket) {
                 bucket_status
@@ -409,10 +428,33 @@ impl ReplicationResyncer {
                 bucket_status.targets_map.get_mut(&opts.arn).unwrap()
             };
 
-            state.resync_status = status;
-            state.last_update = Some(OffsetDateTime::now_utc());
+            if !resync_state_accepts_update(state, &opts) {
+                warn!(
+                    bucket = %opts.bucket,
+                    arn = %opts.arn,
+                    incoming_resync_id = %opts.resync_id,
+                    current_resync_id = %state.resync_id,
+                    "ignoring stale resync status update"
+                );
+                return Ok(());
+            }
 
-            bucket_status.last_update = Some(OffsetDateTime::now_utc());
+            if state.resync_id.is_empty() {
+                state.resync_id = opts.resync_id.clone();
+            }
+            if state.resync_before_date.is_none() {
+                state.resync_before_date = opts.resync_before;
+            }
+            if state.bucket.is_empty() {
+                state.bucket = opts.bucket.clone();
+            }
+            if status == ResyncStatusType::ResyncStarted && state.start_time.is_none() {
+                state.start_time = Some(now);
+            }
+            state.resync_status = status;
+            state.last_update = Some(now);
+
+            bucket_status.last_update = Some(now);
 
             bucket_status.clone()
         };
@@ -424,6 +466,7 @@ impl ReplicationResyncer {
 
     pub async fn inc_stats(&self, status: &TargetReplicationResyncStatus, opts: ResyncOpts) {
         let mut status_map = self.status_map.write().await;
+        let now = OffsetDateTime::now_utc();
 
         let bucket_status = if let Some(bucket_status) = status_map.get_mut(&opts.bucket) {
             bucket_status
@@ -442,13 +485,30 @@ impl ReplicationResyncer {
             bucket_status.targets_map.get_mut(&opts.arn).unwrap()
         };
 
+        if !resync_state_accepts_update(state, &opts) {
+            warn!(
+                bucket = %opts.bucket,
+                arn = %opts.arn,
+                incoming_resync_id = %opts.resync_id,
+                current_resync_id = %state.resync_id,
+                "ignoring stale resync stats update"
+            );
+            return;
+        }
+
+        if state.resync_id.is_empty() {
+            state.resync_id = opts.resync_id.clone();
+        }
+        if state.bucket.is_empty() {
+            state.bucket = opts.bucket.clone();
+        }
         state.object = status.object.clone();
         state.replicated_count += status.replicated_count;
         state.replicated_size += status.replicated_size;
         state.failed_count += status.failed_count;
         state.failed_size += status.failed_size;
-        state.last_update = Some(OffsetDateTime::now_utc());
-        bucket_status.last_update = Some(OffsetDateTime::now_utc());
+        state.last_update = Some(now);
+        bucket_status.last_update = Some(now);
     }
 
     pub async fn persist_to_disk<S: StorageAPI>(&self, cancel_token: CancellationToken, api: Arc<S>) {
@@ -640,7 +700,6 @@ impl ReplicationResyncer {
 
             let cancel_token = cancellation_token.clone();
             let target_client = target_client.clone();
-            let resync_cancel_rx = self.resync_cancel_rx.clone();
             let storage = storage.clone();
             let results_tx = results_tx.clone();
             let bucket_name = opts.bucket.clone();
@@ -714,10 +773,6 @@ impl ReplicationResyncer {
                         err,
                     );
 
-                    if resync_cancel_rx.is_cancelled() {
-                        return;
-                    }
-
                     if cancel_token.is_cancelled() {
                         return;
                     }
@@ -731,8 +786,6 @@ impl ReplicationResyncer {
             futures.push(f);
         }
 
-        let resync_cancel_rx = self.resync_cancel_rx.clone();
-
         while let Some(res) = rx.recv().await {
             if let Some(err) = res.err {
                 error!("Failed to get object info: {}", err);
@@ -741,14 +794,8 @@ impl ReplicationResyncer {
                 return;
             }
 
-            if resync_cancel_rx.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
-                    .await;
-                return;
-            }
-
             if cancellation_token.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
             }
@@ -770,14 +817,8 @@ impl ReplicationResyncer {
                 continue;
             }
 
-            if resync_cancel_rx.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
-                    .await;
-                return;
-            }
-
             if cancellation_token.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
             }
@@ -3429,5 +3470,55 @@ mod tests {
             roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
             "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_marks_only_matching_bucket_target_token() {
+        let resyncer = ReplicationResyncer::new().await;
+        let opts_a = ResyncOpts {
+            bucket: "bucket-a".to_string(),
+            arn: "arn:replication::a".to_string(),
+            resync_id: "rid-a".to_string(),
+            resync_before: None,
+        };
+        let opts_b = ResyncOpts {
+            bucket: "bucket-b".to_string(),
+            arn: "arn:replication::b".to_string(),
+            resync_id: "rid-b".to_string(),
+            resync_before: None,
+        };
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        resyncer.register_cancel_token(&opts_a, token_a.clone()).await;
+        resyncer.register_cancel_token(&opts_b, token_b.clone()).await;
+
+        resyncer.cancel(&opts_a).await;
+
+        assert!(token_a.is_cancelled());
+        assert!(!token_b.is_cancelled());
+    }
+
+    #[test]
+    fn test_resync_state_accepts_update_only_for_matching_run() {
+        let current = TargetReplicationResyncStatus {
+            resync_id: "run-new".to_string(),
+            ..Default::default()
+        };
+        let matching = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let stale = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-old".to_string(),
+            resync_before: None,
+        };
+
+        assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
+        assert!(resync_state_accepts_update(&current, &matching));
+        assert!(!resync_state_accepts_update(&current, &stale));
     }
 }
