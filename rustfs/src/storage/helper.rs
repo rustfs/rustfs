@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::access::ReqInfo;
 use http::StatusCode;
 use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
@@ -59,8 +60,17 @@ impl OperationHelper {
         // Parse path -> bucket/object
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
-        let bucket = segs.next().unwrap_or("").to_string();
-        let object_key = segs.next().unwrap_or("").to_string();
+        let path_bucket = segs.next().unwrap_or("").to_string();
+        let path_object_key = segs.next().unwrap_or("").to_string();
+        let req_info = req.extensions.get::<ReqInfo>();
+        let bucket = req_info
+            .and_then(|info| info.bucket.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(path_bucket);
+        let object_key = req_info
+            .and_then(|info| info.object.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(path_object_key);
 
         // Infer remote address
         let remote_host = req
@@ -98,13 +108,34 @@ impl OperationHelper {
             audit_builder = audit_builder.request_id(id_str);
         }
 
+        let event_object = ObjectInfo {
+            bucket: bucket.clone(),
+            name: object_key.clone(),
+            ..Default::default()
+        };
+
+        let mut req_params = extract_params_header(&req.headers);
+        if let Some(principal_id) = req_info
+            .and_then(|info| info.cred.as_ref())
+            .map(|cred| cred.access_key.clone())
+            .filter(|value| !value.is_empty())
+        {
+            req_params.entry("principalId".to_string()).or_insert(principal_id);
+        }
+
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
-        let event_builder = EventArgsBuilder::new(event, bucket, ObjectInfo::default())
+        let mut event_builder = EventArgsBuilder::new(event, bucket, event_object)
             .host(get_request_host(&req.headers))
             .port(get_request_port(&req.headers))
             .user_agent(get_request_user_agent(&req.headers))
-            .req_params(extract_params_header(&req.headers));
+            .req_params(req_params);
+        if let Some(version_id) = req_info
+            .and_then(|info| info.version_id.clone())
+            .filter(|value| !value.is_empty())
+        {
+            event_builder = event_builder.version_id(version_id);
+        }
 
         Self {
             audit_builder: Some(audit_builder),
@@ -220,5 +251,58 @@ impl Drop for OperationHelper {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+    use rustfs_credentials::Credentials;
+    use s3s::dto::DeleteObjectTaggingInput;
+
+    fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[test]
+    fn operation_helper_uses_req_info_for_notification_context() {
+        let input = DeleteObjectTaggingInput::builder()
+            .bucket("input-bucket".to_string())
+            .key("input-object".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::DELETE, Uri::from_static("/from-uri/ignored"));
+        req.headers.insert("host", HeaderValue::from_static("example.com"));
+        req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+        req.extensions.insert(ReqInfo {
+            cred: Some(Credentials {
+                access_key: "notifyTag".to_string(),
+                ..Default::default()
+            }),
+            bucket: Some("issue-2292-bucket".to_string()),
+            object: Some("prefix/issue-2292.txt".to_string()),
+            version_id: Some("version-123".to_string()),
+            ..Default::default()
+        });
+
+        let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
+        let event_args = helper.event_builder.clone().expect("event builder should exist").build();
+
+        assert_eq!(event_args.bucket_name, "issue-2292-bucket");
+        assert_eq!(event_args.object.bucket, "issue-2292-bucket");
+        assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
+        assert_eq!(event_args.version_id, "version-123");
+        assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
     }
 }

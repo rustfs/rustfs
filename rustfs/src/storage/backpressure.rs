@@ -45,7 +45,6 @@ use std::time::Instant;
 use tokio::io::{DuplexStream, duplex};
 use tracing::{debug, warn};
 
-#[cfg(feature = "metrics")]
 use metrics::counter;
 
 /// Backpressure pipe configuration.
@@ -281,7 +280,6 @@ impl BackpressurePipe {
         if usage >= threshold && !self.state.load(Ordering::Relaxed) {
             self.state.store(true, Ordering::Relaxed);
 
-            #[cfg(feature = "metrics")]
             counter!("rustfs.backpressure.events.total", "state" => "high_watermark").increment(1);
 
             warn!(
@@ -302,7 +300,6 @@ impl BackpressurePipe {
         if usage <= threshold && self.state.load(Ordering::Relaxed) {
             self.state.store(false, Ordering::Relaxed);
 
-            #[cfg(feature = "metrics")]
             counter!("rustfs.backpressure.events.total", "state" => "normal").increment(1);
 
             debug!(
@@ -409,7 +406,6 @@ impl BackpressureMonitor {
 
         if usage >= high {
             if !self.in_high_watermark.swap(true, Ordering::Relaxed) {
-                #[cfg(feature = "metrics")]
                 counter!("rustfs.backpressure.events.total", "state" => "high_watermark").increment(1);
 
                 debug!(usage_percent = self.usage_percent() as u32, "Backpressure: entered high watermark");
@@ -417,7 +413,6 @@ impl BackpressureMonitor {
             BackpressureState::HighWatermark
         } else if usage <= low {
             if self.in_high_watermark.swap(false, Ordering::Relaxed) {
-                #[cfg(feature = "metrics")]
                 counter!("rustfs.backpressure.events.total", "state" => "normal").increment(1);
 
                 debug!(usage_percent = self.usage_percent() as u32, "Backpressure: returned to normal");

@@ -400,6 +400,13 @@ mod tests {
             "usecase.execute_list_objects_v2(req).await",
             "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2",
         );
+
+        assert_delegates_within_method(
+            src,
+            "async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>)",
+            "usecase.execute_list_objects_v2m(req).await",
+            "list_objects_v2m must delegate to DefaultBucketUsecase::execute_list_objects_v2m",
+        );
     }
 
     #[test]

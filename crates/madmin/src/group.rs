@@ -17,7 +17,7 @@ use serde::Deserializer;
 use serde::Serialize;
 use time::OffsetDateTime;
 
-#[derive(Debug, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupStatus {
     #[default]
@@ -39,7 +39,7 @@ impl<'de> Deserialize<'de> for GroupStatus {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GroupAddRemove {
     pub group: String,
     pub members: Vec<String>,

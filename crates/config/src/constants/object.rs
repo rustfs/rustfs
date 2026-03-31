@@ -41,6 +41,60 @@ pub const ENV_OBJECT_CACHE_CAPACITY_MB: &str = "RUSTFS_OBJECT_CACHE_CAPACITY_MB"
 /// - Note: Setting this too low may reduce cache effectiveness; setting it too high may lead to inefficient memory usage.
 pub const ENV_OBJECT_CACHE_MAX_OBJECT_SIZE_MB: &str = "RUSTFS_OBJECT_CACHE_MAX_OBJECT_SIZE_MB";
 
+// =============================================================================
+// L1/L2 Tiered Cache Configuration
+// =============================================================================
+
+/// Environment variable for L1 cache maximum size in megabytes.
+///
+/// L1 cache is for hot small objects (<1MB). Higher values improve hit rate for small objects.
+pub const ENV_OBJECT_L1_CACHE_MAX_SIZE_MB: &str = "RUSTFS_OBJECT_L1_CACHE_MAX_SIZE_MB";
+
+/// Environment variable for L1 cache maximum number of objects.
+pub const ENV_OBJECT_L1_CACHE_MAX_OBJECTS: &str = "RUSTFS_OBJECT_L1_CACHE_MAX_OBJECTS";
+
+/// Environment variable for L1 cache TTL (time-to-live) in seconds.
+pub const ENV_OBJECT_L1_CACHE_TTL_SECS: &str = "RUSTFS_OBJECT_L1_CACHE_TTL_SECS";
+
+/// Environment variable for L1 cache TTI (time-to-idle) in seconds.
+pub const ENV_OBJECT_L1_CACHE_TTI_SECS: &str = "RUSTFS_OBJECT_L1_CACHE_TTI_SECS";
+
+/// Environment variable for L1 cache maximum object size in megabytes.
+pub const ENV_OBJECT_L1_MAX_OBJECT_SIZE_MB: &str = "RUSTFS_OBJECT_L1_MAX_OBJECT_SIZE_MB";
+
+/// Environment variable for L2 cache maximum size in megabytes.
+///
+/// L2 cache is for standard objects (<10MB).
+pub const ENV_OBJECT_L2_CACHE_MAX_SIZE_MB: &str = "RUSTFS_OBJECT_L2_CACHE_MAX_SIZE_MB";
+
+/// Environment variable for L2 cache maximum number of objects.
+pub const ENV_OBJECT_L2_CACHE_MAX_OBJECTS: &str = "RUSTFS_OBJECT_L2_CACHE_MAX_OBJECTS";
+
+/// Environment variable for L2 cache TTL (time-to-live) in seconds.
+pub const ENV_OBJECT_L2_CACHE_TTL_SECS: &str = "RUSTFS_OBJECT_L2_CACHE_TTL_SECS";
+
+/// Environment variable for L2 cache TTI (time-to-idle) in seconds.
+pub const ENV_OBJECT_L2_CACHE_TTI_SECS: &str = "RUSTFS_OBJECT_L2_CACHE_TTI_SECS";
+
+// =============================================================================
+// Adaptive TTL Configuration
+// =============================================================================
+
+/// Environment variable to enable adaptive TTL.
+///
+/// When enabled, hot objects (with high hit counts) get extended TTL.
+pub const ENV_OBJECT_ADAPTIVE_TTL_ENABLE: &str = "RUSTFS_OBJECT_ADAPTIVE_TTL_ENABLE";
+
+/// Environment variable for hot object hit threshold.
+///
+/// Objects with hit count >= this threshold are considered "hot" and get extended TTL.
+pub const ENV_OBJECT_HOT_HIT_THRESHOLD: &str = "RUSTFS_OBJECT_HOT_HIT_THRESHOLD";
+
+/// Environment variable for TTL extension factor.
+///
+/// Hot objects TTL is extended by this factor (e.g., 2.0 = 2x longer).
+pub const ENV_OBJECT_TTL_EXTENSION_FACTOR: &str = "RUSTFS_OBJECT_TTL_EXTENSION_FACTOR";
+
 /// Environment variable name for object cache TTL (time-to-live) in seconds.
 ///
 /// - Purpose: Specify the maximum lifetime of a cached entry from the moment it is written.
@@ -94,11 +148,25 @@ pub const ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: &str = "RUSTFS_OBJECT_MEDIUM_
 /// - Note: This setting may interact with OS-level I/O scheduling and should be tuned based on hardware capabilities.
 pub const ENV_OBJECT_MAX_CONCURRENT_DISK_READS: &str = "RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS";
 
-/// Default: object caching is disabled.
+/// Default: object caching is enabled.
 ///
-/// - Semantics: Safe default to avoid unexpected memory usage or cache consistency concerns when not explicitly enabled.
-/// - Default is set to false (disabled).
-pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = false;
+/// - Semantics: Caching is now enabled by default for improved performance. Hot objects are kept in memory
+///   to reduce backend requests. Set RUSTFS_OBJECT_CACHE_ENABLE=false to disable if needed.
+/// - Default is set to true (enabled).
+pub const DEFAULT_OBJECT_CACHE_ENABLE: bool = true;
+
+/// Environment variable to enable tiered cache (L1 + L2).
+///
+/// When enabled, uses two-level caching:
+/// - L1: Hot small objects (<1MB) with short TTL
+/// - L2: Standard objects (<10MB) with longer TTL
+///
+/// When enabled, provides L1 (hot small objects) and L2 (standard objects) caching.
+/// When disabled, uses single-level cache for backward compatibility.
+pub const ENV_OBJECT_TIERED_CACHE_ENABLE: &str = "RUSTFS_OBJECT_TIERED_CACHE_ENABLE";
+
+/// Default: tiered cache is enabled for improved cache hit rates.
+pub const DEFAULT_OBJECT_TIERED_CACHE_ENABLE: bool = true;
 
 /// Default object cache capacity in MB.
 ///
@@ -402,11 +470,11 @@ pub const DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD: usize = 1024 * 1024;
 /// Requests larger than this threshold are classified as low priority.
 /// Low priority requests are processed last to avoid blocking small requests.
 ///
-/// Default: 104857600 (100 MB, can be overridden by `RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD`).
+/// Default: 10485760 (10 MB, can be overridden by `RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD`).
 pub const ENV_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: &str = "RUSTFS_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD";
 
-/// Default low priority size threshold: 100 MB.
-pub const DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: usize = 100 * 1024 * 1024;
+/// Default low priority size threshold: 10 MB.
+pub const DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD: usize = 10 * 1024 * 1024;
 
 /// Environment variable for high priority queue capacity.
 ///
@@ -490,3 +558,175 @@ pub const ENV_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: &str = "RUSTFS_OBJECT_IO_LOAD_LOW
 
 /// Default low load threshold: 10 ms.
 pub const DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: u64 = 10;
+
+/// Environment variable for enabling storage media detection for adaptive I/O scheduling.
+///
+/// When disabled, the scheduler falls back to `Unknown` storage media unless an explicit
+/// override is provided.
+///
+/// Default: true (can be overridden by `RUSTFS_OBJECT_IO_STORAGE_DETECTION_ENABLE`).
+pub const ENV_OBJECT_IO_STORAGE_DETECTION_ENABLE: &str = "RUSTFS_OBJECT_IO_STORAGE_DETECTION_ENABLE";
+
+/// Default storage media detection setting: enabled.
+pub const DEFAULT_OBJECT_IO_STORAGE_DETECTION_ENABLE: bool = true;
+
+/// Environment variable for overriding detected storage media.
+///
+/// Supported values: `nvme`, `ssd`, `hdd`, `unknown`.
+/// Empty value means auto-detect or fallback to `Unknown`.
+///
+/// Default: empty string (can be overridden by `RUSTFS_OBJECT_IO_STORAGE_MEDIA_OVERRIDE`).
+pub const ENV_OBJECT_IO_STORAGE_MEDIA_OVERRIDE: &str = "RUSTFS_OBJECT_IO_STORAGE_MEDIA_OVERRIDE";
+
+/// Default storage media override: no override.
+pub const DEFAULT_OBJECT_IO_STORAGE_MEDIA_OVERRIDE: &str = "";
+
+/// Environment variable for access-pattern history size.
+///
+/// Controls how many recent offset/length observations are used to classify
+/// sequential, random, or mixed reads.
+///
+/// Default: 8 (can be overridden by `RUSTFS_OBJECT_IO_PATTERN_HISTORY_SIZE`).
+pub const ENV_OBJECT_IO_PATTERN_HISTORY_SIZE: &str = "RUSTFS_OBJECT_IO_PATTERN_HISTORY_SIZE";
+
+/// Default access-pattern history size: 8 samples.
+pub const DEFAULT_OBJECT_IO_PATTERN_HISTORY_SIZE: usize = 8;
+
+/// Environment variable for sequential access step tolerance in bytes.
+///
+/// Small gaps between adjacent reads within this tolerance are still treated as sequential.
+///
+/// Default: 131072 bytes (128 KiB, can be overridden by `RUSTFS_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES`).
+pub const ENV_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES: &str = "RUSTFS_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES";
+
+/// Default sequential step tolerance: 128 KiB.
+pub const DEFAULT_OBJECT_IO_SEQUENTIAL_STEP_TOLERANCE_BYTES: u64 = 128 * 1024;
+
+/// Environment variable for bandwidth EMA beta.
+///
+/// Lower values react faster to recent throughput changes while higher values smooth
+/// short-term fluctuations more aggressively.
+///
+/// Default: 0.1 (can be overridden by `RUSTFS_OBJECT_IO_BANDWIDTH_EMA_BETA`).
+pub const ENV_OBJECT_IO_BANDWIDTH_EMA_BETA: &str = "RUSTFS_OBJECT_IO_BANDWIDTH_EMA_BETA";
+
+/// Default bandwidth EMA beta: 0.1.
+pub const DEFAULT_OBJECT_IO_BANDWIDTH_EMA_BETA: f64 = 0.1;
+
+/// Environment variable for the low bandwidth threshold in bytes per second.
+///
+/// Observed throughput below this value causes the scheduler to be more conservative
+/// with buffer growth and read-ahead.
+///
+/// Default: 67108864 bytes/sec (64 MiB/s, can be overridden by `RUSTFS_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS`).
+pub const ENV_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS: &str = "RUSTFS_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS";
+
+/// Default low bandwidth threshold: 64 MiB/s.
+pub const DEFAULT_OBJECT_IO_BANDWIDTH_LOW_THRESHOLD_BPS: u64 = 64 * 1024 * 1024;
+
+/// Environment variable for the high bandwidth threshold in bytes per second.
+///
+/// Observed throughput above this value allows the scheduler to be more aggressive
+/// for sequential workloads.
+///
+/// Default: 536870912 bytes/sec (512 MiB/s, can be overridden by `RUSTFS_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS`).
+pub const ENV_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS: &str = "RUSTFS_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS";
+
+/// Default high bandwidth threshold: 512 MiB/s.
+pub const DEFAULT_OBJECT_IO_BANDWIDTH_HIGH_THRESHOLD_BPS: u64 = 512 * 1024 * 1024;
+
+/// Environment variable for NVMe buffer cap in bytes.
+///
+/// Sequential reads on NVMe can scale up to this buffer cap.
+///
+/// Default: 2097152 bytes (2 MiB, can be overridden by `RUSTFS_OBJECT_IO_NVME_BUFFER_CAP`).
+pub const ENV_OBJECT_IO_NVME_BUFFER_CAP: &str = "RUSTFS_OBJECT_IO_NVME_BUFFER_CAP";
+
+/// Default NVMe buffer cap: 2 MiB.
+pub const DEFAULT_OBJECT_IO_NVME_BUFFER_CAP: usize = 2 * 1024 * 1024;
+
+/// Environment variable for SSD buffer cap in bytes.
+///
+/// Default: 1048576 bytes (1 MiB, can be overridden by `RUSTFS_OBJECT_IO_SSD_BUFFER_CAP`).
+pub const ENV_OBJECT_IO_SSD_BUFFER_CAP: &str = "RUSTFS_OBJECT_IO_SSD_BUFFER_CAP";
+
+/// Default SSD buffer cap: 1 MiB.
+pub const DEFAULT_OBJECT_IO_SSD_BUFFER_CAP: usize = 1024 * 1024;
+
+/// Environment variable for HDD buffer cap in bytes.
+///
+/// Default: 524288 bytes (512 KiB, can be overridden by `RUSTFS_OBJECT_IO_HDD_BUFFER_CAP`).
+pub const ENV_OBJECT_IO_HDD_BUFFER_CAP: &str = "RUSTFS_OBJECT_IO_HDD_BUFFER_CAP";
+
+/// Default HDD buffer cap: 512 KiB.
+pub const DEFAULT_OBJECT_IO_HDD_BUFFER_CAP: usize = 512 * 1024;
+
+/// Environment variable for disabling read-ahead under random or mixed access with concurrency.
+///
+/// When concurrent requests reach this threshold, random-heavy workloads stop using read-ahead.
+///
+/// Default: 4 (can be overridden by `RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY`).
+pub const ENV_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: &str = "RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY";
+
+/// Default read-ahead disable concurrency threshold: 4.
+pub const DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: usize = 4;
+
+// =============================================================================
+// L1/L2 Tiered Cache Default Values
+// =============================================================================
+
+/// Default L1 cache maximum size: 50 MB.
+///
+/// L1 cache is for hot small objects (<1MB). Smaller values reduce memory usage.
+pub const DEFAULT_OBJECT_L1_CACHE_MAX_SIZE_MB: u64 = 50;
+
+/// Default L1 cache maximum number of objects: 1000.
+pub const DEFAULT_OBJECT_L1_CACHE_MAX_OBJECTS: usize = 1000;
+
+/// Default L1 cache TTL: 60 seconds (1 minute).
+///
+/// Shorter TTL for L1 cache ensures only very hot objects stay in L1.
+pub const DEFAULT_OBJECT_L1_CACHE_TTL_SECS: u64 = 60;
+
+/// Default L1 cache TTI: 30 seconds.
+///
+/// Shorter TTI means L1 evicts idle objects quickly.
+pub const DEFAULT_OBJECT_L1_CACHE_TTI_SECS: u64 = 30;
+
+/// Default L1 maximum object size: 1 MB.
+///
+/// Only objects smaller than 1MB are cached in L1.
+pub const DEFAULT_OBJECT_L1_MAX_OBJECT_SIZE_MB: usize = 1;
+
+/// Default L2 cache maximum size: 200 MB.
+///
+/// L2 cache is for standard objects (<10MB).
+pub const DEFAULT_OBJECT_L2_CACHE_MAX_SIZE_MB: u64 = 200;
+
+/// Default L2 cache maximum number of objects: 500.
+pub const DEFAULT_OBJECT_L2_CACHE_MAX_OBJECTS: usize = 500;
+
+/// Default L2 cache TTL: 300 seconds (5 minutes).
+pub const DEFAULT_OBJECT_L2_CACHE_TTL_SECS: u64 = 300;
+
+/// Default L2 cache TTI: 120 seconds (2 minutes).
+pub const DEFAULT_OBJECT_L2_CACHE_TTI_SECS: u64 = 120;
+
+// =============================================================================
+// Adaptive TTL Default Values
+// =============================================================================
+
+/// Default: adaptive TTL is enabled.
+///
+/// When enabled, hot objects get extended TTL based on access patterns.
+pub const DEFAULT_OBJECT_ADAPTIVE_TTL_ENABLE: bool = true;
+
+/// Default hot object hit threshold: 3.
+///
+/// Objects with hit count >= 3 are considered "hot" and get extended TTL.
+pub const DEFAULT_OBJECT_HOT_HIT_THRESHOLD: usize = 3;
+
+/// Default TTL extension factor: 2.0.
+///
+/// Hot objects TTL is extended by 2x (e.g., 5 min TTL becomes 10 min).
+pub const DEFAULT_OBJECT_TTL_EXTENSION_FACTOR: f64 = 2.0;

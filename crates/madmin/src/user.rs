@@ -21,7 +21,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::BackendInfo;
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AccountStatus {
     #[serde(rename = "enabled")]
     Enabled,
@@ -94,7 +94,7 @@ pub struct UserInfo {
     pub updated_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddOrUpdateUserReq {
     #[serde(rename = "secretKey")]
     pub secret_key: String,

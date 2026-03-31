@@ -16,7 +16,7 @@
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use async_compression::tokio::write::{BzEncoder, XzEncoder};
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
@@ -25,8 +25,13 @@ use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{Compression, write::GzEncoder};
 use http::HeaderValue;
+use http::header::{CONTENT_TYPE, HOST};
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::sign_v4;
+use s3s::Body;
 use serial_test::serial;
 use std::collections::HashMap;
+use std::error::Error;
 use std::io::Cursor;
 use std::io::Write;
 use tokio::io::AsyncWriteExt;
@@ -154,10 +159,11 @@ async fn xz_bytes(data: &[u8]) -> Vec<u8> {
     encoder.into_inner().into_inner()
 }
 
-fn assert_s3_error_code<T: std::fmt::Debug>(
-    result: Result<T, aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>,
-    code: &str,
-) {
+fn assert_s3_error_code<T, E>(result: Result<T, SdkError<E>>, code: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
     let err = result.expect_err("request should fail");
     match err {
         SdkError::ServiceError(service_err) => {
@@ -166,6 +172,43 @@ fn assert_s3_error_code<T: std::fmt::Debug>(
         }
         other_err => panic!("Expected service error {code}, got: {other_err:?}"),
     }
+}
+
+async fn signed_raw_request(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+
+    let content_len = body.as_ref().map(|value| value.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
 }
 
 async fn allow_anonymous_put_object(
@@ -5113,6 +5156,158 @@ async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Resul
         .await;
 
     assert_s3_error_code(result, "InvalidStorageClass");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "put-write-offset-reject";
+    let key = "write-offset-object";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let result = admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"write-offset-body"))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("x-amz-write-offset-bytes", HeaderValue::from_static("0"));
+        })
+        .send()
+        .await;
+
+    assert_s3_error_code(result, "NotImplemented");
+
+    let head_after_reject = admin_client.head_object().bucket(bucket).key(key).send().await;
+    match head_after_reject.expect_err("rejected request should not create the object") {
+        SdkError::ServiceError(service_err) => {
+            let s3_err = service_err.into_err();
+            assert!(
+                s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound"),
+                "expected the rejected write to leave no object behind, got: {s3_err:?}"
+            );
+        }
+        other_err => panic!("expected missing object error after rejected write, got: {other_err:?}"),
+    }
+
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"regular-put-body"))
+        .send()
+        .await?;
+
+    admin_client.head_object().bucket(bucket).key(key).send().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_error_body()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "put-write-offset-raw";
+    let key = "write-offset-raw-object";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+
+    let response = signed_raw_request(
+        http::Method::PUT,
+        &format!("{}/{bucket}/{key}", env.url),
+        &env.access_key,
+        &env.secret_key,
+        Some(b"write-offset-body".to_vec()),
+        None,
+        &[("x-amz-write-offset-bytes", "0")],
+    )
+    .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("<Code>NotImplemented</Code>"), "unexpected response body: {body}");
+    assert!(
+        body.contains("A header you provided implies functionality that is not implemented"),
+        "unexpected response body: {body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_anonymous_put_object_write_offset_bytes_returns_minio_compatible_error_body()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "put-write-offset-anon";
+    let key = "write-offset-anon-object";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let response = local_http_client()
+        .put(format!("{}/{bucket}/{key}", env.url))
+        .header("x-amz-write-offset-bytes", "0")
+        .body("write-offset-body")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("<Code>NotImplemented</Code>"), "unexpected response body: {body}");
+    assert!(
+        body.contains("A header you provided implies functionality that is not implemented"),
+        "unexpected response body: {body}"
+    );
+
+    let head_after_reject = admin_client.head_object().bucket(bucket).key(key).send().await;
+    match head_after_reject.expect_err("rejected anonymous request should not create the object") {
+        SdkError::ServiceError(service_err) => {
+            let s3_err = service_err.into_err();
+            assert!(
+                s3_err.meta().code() == Some("NoSuchKey") || s3_err.meta().code() == Some("NotFound"),
+                "expected the rejected write to leave no object behind, got: {s3_err:?}"
+            );
+        }
+        other_err => panic!("expected missing object error after rejected anonymous write, got: {other_err:?}"),
+    }
+
+    let ok_response = local_http_client()
+        .put(format!("{}/{bucket}/{key}", env.url))
+        .body("anonymous-plain-put-body")
+        .send()
+        .await?;
+    assert_eq!(ok_response.status(), reqwest::StatusCode::OK);
+
+    let stored = admin_client.get_object().bucket(bucket).key(key).send().await?;
+    let stored_body = stored.body.collect().await?.into_bytes();
+    assert_eq!(stored_body.as_ref(), b"anonymous-plain-put-body");
 
     Ok(())
 }
