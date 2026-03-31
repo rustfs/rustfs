@@ -14,7 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, sts, system, tier, user,
+        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system,
+        tier, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -50,6 +51,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
     replication::register_replication_route(router).expect("register replication route");
+    site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
     kms::register_kms_route(router).expect("register kms route");
     oidc::register_oidc_route(router).expect("register oidc route");
@@ -60,7 +62,6 @@ fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
 
     register_admin_routes(&mut router);
-
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -119,6 +120,23 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/metainfo"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-meta"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/peer/idp-settings"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
@@ -178,6 +196,10 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
         (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
+        (Method::PUT, compat_admin_alias_path("/v3/site-replication/add")),
+        (Method::GET, compat_admin_alias_path("/v3/site-replication/info")),
+        (Method::GET, compat_admin_alias_path("/v3/site-replication/status")),
+        (Method::PUT, compat_admin_alias_path("/v3/site-replication/peer/join")),
         (Method::GET, compat_admin_alias_path("/export-bucket-metadata")),
         (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
         (Method::PUT, compat_admin_alias_path("/import-bucket-metadata")),
