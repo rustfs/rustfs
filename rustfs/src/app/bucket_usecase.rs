@@ -14,6 +14,9 @@
 
 //! Bucket application use-case contracts.
 
+use crate::admin::handlers::site_replication::{
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+};
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
@@ -21,6 +24,7 @@ use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::OperationHelper;
 use crate::storage::s3_api::bucket::{build_list_buckets_output, build_list_objects_v2_output};
+use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
@@ -44,7 +48,11 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
+use rustfs_ecstore::store_api::{
+    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+    MakeBucketOptions, ObjectInfo,
+};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
@@ -55,13 +63,19 @@ use rustfs_targets::{
     arn::{ARN, TargetIDError},
 };
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
+use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
 use s3s::dto::*;
 use s3s::region::Region;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    sync::Arc,
+};
 use tracing::{debug, error, info, instrument, warn};
+use urlencoding::encode;
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -69,6 +83,16 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
 
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
+}
+
+fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
+    SRBucketMeta {
+        bucket,
+        r#type: item_type.to_string(),
+        updated_at: Some(time::OffsetDateTime::now_utc()),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
 }
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
@@ -95,6 +119,316 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConf
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ObjectMetadataPermissions {
+    metadata_allowed: bool,
+    tags_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ListObjectVersionsMResponseContext {
+    bucket: String,
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: i32,
+    encoding_type: Option<EncodingType>,
+    key_marker: Option<String>,
+    version_id_marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ListObjectsV2MResponseContext {
+    bucket: String,
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: i32,
+    encoding_type: Option<EncodingType>,
+    continuation_token: Option<String>,
+    start_after: Option<String>,
+    fetch_owner: bool,
+}
+
+fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
+    if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
+        encode(value).into_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
+    if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
+        value
+            .split('/')
+            .map(|part| encode(part).into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        value.to_string()
+    }
+}
+
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<MinioUserMetadata> {
+    let mut items = extract_user_defined_metadata(user_defined)
+        .into_iter()
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| MinioMetadataEntry { key, value })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.key.cmp(&right.key));
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(MinioUserMetadata { items })
+    }
+}
+
+async fn is_list_objects_metadata_action_allowed<T>(
+    req: &S3Request<T>,
+    bucket: &str,
+    object: &str,
+    action: S3Action,
+) -> S3Result<bool> {
+    let mut auth_req = S3Request {
+        input: (),
+        method: req.method.clone(),
+        uri: req.uri.clone(),
+        headers: req.headers.clone(),
+        extensions: req.extensions.clone(),
+        credentials: req.credentials.clone(),
+        region: req.region.clone(),
+        service: req.service.clone(),
+        trailing_headers: req.trailing_headers.clone(),
+    };
+
+    let mut req_info = req_info_ref(req)?.clone();
+    req_info.bucket = Some(bucket.to_string());
+    req_info.object = Some(object.to_string());
+    req_info.version_id = None;
+    auth_req.extensions.insert(req_info);
+
+    match authorize_request(&mut auth_req, Action::S3Action(action)).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+async fn collect_list_objects_metadata_permissions<T>(
+    req: &S3Request<T>,
+    bucket: &str,
+    objects: &[ObjectInfo],
+) -> S3Result<HashMap<String, ObjectMetadataPermissions>> {
+    let mut permissions = HashMap::new();
+
+    for object in objects {
+        if object.name.is_empty() || permissions.contains_key(&object.name) {
+            continue;
+        }
+
+        let metadata_allowed =
+            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectAction).await?;
+        let tags_allowed =
+            is_list_objects_metadata_action_allowed(req, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
+
+        permissions.insert(
+            object.name.clone(),
+            ObjectMetadataPermissions {
+                metadata_allowed,
+                tags_allowed,
+            },
+        );
+    }
+
+    Ok(permissions)
+}
+
+fn build_list_object_versions_m_output(
+    object_infos: ListObjectVersionsInfo,
+    context: &ListObjectVersionsMResponseContext,
+    permissions: &HashMap<String, ObjectMetadataPermissions>,
+) -> ListObjectVersionsMOutput {
+    let owner = rustfs_owner();
+    let common_prefixes = object_infos
+        .prefixes
+        .into_iter()
+        .map(|prefix_value| CommonPrefix {
+            prefix: Some(encode_list_versions_value(&prefix_value, context.encoding_type.as_ref())),
+        })
+        .collect::<Vec<_>>();
+
+    let entries = object_infos
+        .objects
+        .into_iter()
+        .filter(|object| !object.name.is_empty())
+        .map(|object| {
+            let object_name = encode_list_versions_value(&object.name, context.encoding_type.as_ref());
+            let version_id = object
+                .version_id
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let permission = permissions.get(&object.name).copied().unwrap_or_default();
+            let user_metadata = if permission.metadata_allowed {
+                build_metadata_extension_user_metadata(&object.user_defined)
+            } else {
+                None
+            };
+            let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
+                Some(object.user_tags.clone())
+            } else {
+                None
+            };
+            let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
+                Some(ObjectInternalInfo {
+                    k: object.data_blocks as i32,
+                    m: object.parity_blocks as i32,
+                })
+            } else {
+                None
+            };
+
+            if object.delete_marker {
+                ListObjectVersionMEntry::DeleteMarker(DeleteMarkerM {
+                    key: Some(object_name),
+                    last_modified: object.mod_time.map(Timestamp::from),
+                    owner: Some(owner.clone()),
+                    version_id: Some(version_id),
+                    is_latest: Some(object.is_latest),
+                    user_metadata,
+                    user_tags,
+                    internal,
+                })
+            } else {
+                ListObjectVersionMEntry::Version(ObjectVersionM {
+                    key: Some(object_name),
+                    last_modified: object.mod_time.map(Timestamp::from),
+                    size: Some(object.size),
+                    version_id: Some(version_id),
+                    is_latest: Some(object.is_latest),
+                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: Some(ObjectVersionStorageClass::from(
+                        object
+                            .storage_class
+                            .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
+                    )),
+                    owner: Some(owner.clone()),
+                    user_metadata,
+                    user_tags,
+                    internal,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let next_key_marker = object_infos
+        .next_marker
+        .filter(|marker| !marker.is_empty())
+        .map(|marker| encode_list_versions_value(&marker, context.encoding_type.as_ref()));
+
+    ListObjectVersionsMOutput {
+        common_prefixes: Some(common_prefixes),
+        delimiter: context
+            .delimiter
+            .clone()
+            .map(|value| encode_list_versions_value(&value, context.encoding_type.as_ref())),
+        encoding_type: context.encoding_type.clone(),
+        is_truncated: Some(object_infos.is_truncated),
+        key_marker: Some(encode_list_versions_value(
+            context.key_marker.as_deref().unwrap_or_default(),
+            context.encoding_type.as_ref(),
+        )),
+        max_keys: Some(context.max_keys),
+        name: Some(context.bucket.clone()),
+        next_key_marker,
+        next_version_id_marker: Some(object_infos.next_version_idmarker.unwrap_or_default()),
+        prefix: Some(encode_list_versions_value(&context.prefix, context.encoding_type.as_ref())),
+        request_charged: None,
+        version_id_marker: Some(context.version_id_marker.clone().unwrap_or_default()),
+        entries,
+    }
+}
+
+fn build_list_objects_v2m_output(
+    object_infos: ListObjectsV2Info,
+    context: &ListObjectsV2MResponseContext,
+    permissions: &HashMap<String, ObjectMetadataPermissions>,
+) -> ListObjectsV2MOutput {
+    let owner = rustfs_owner();
+
+    let contents = object_infos
+        .objects
+        .iter()
+        .filter(|object| !object.name.is_empty())
+        .map(|object| {
+            let permission = permissions.get(&object.name).copied().unwrap_or_default();
+            let user_metadata = if permission.metadata_allowed {
+                build_metadata_extension_user_metadata(&object.user_defined)
+            } else {
+                None
+            };
+            let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
+                Some(object.user_tags.clone())
+            } else {
+                None
+            };
+            let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
+                Some(ObjectInternalInfo {
+                    k: object.data_blocks as i32,
+                    m: object.parity_blocks as i32,
+                })
+            } else {
+                None
+            };
+
+            ObjectM {
+                key: Some(encode_list_objects_v2_value(&object.name, context.encoding_type.as_ref())),
+                last_modified: object.mod_time.map(Timestamp::from),
+                size: Some(object.get_actual_size().unwrap_or_default()),
+                e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                storage_class: Some(ObjectStorageClass::from(
+                    object
+                        .storage_class
+                        .clone()
+                        .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
+                )),
+                owner: context.fetch_owner.then_some(owner.clone()),
+                user_metadata,
+                user_tags,
+                internal,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let common_prefixes = object_infos
+        .prefixes
+        .into_iter()
+        .map(|prefix| CommonPrefix {
+            prefix: Some(encode_list_objects_v2_value(&prefix, context.encoding_type.as_ref())),
+        })
+        .collect::<Vec<_>>();
+
+    let key_count = (contents.len() + common_prefixes.len()) as i32;
+    let next_continuation_token = object_infos
+        .next_continuation_token
+        .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+
+    ListObjectsV2MOutput {
+        name: Some(context.bucket.clone()),
+        prefix: Some(context.prefix.clone()),
+        max_keys: Some(context.max_keys),
+        key_count: Some(key_count),
+        continuation_token: context.continuation_token.clone(),
+        is_truncated: Some(object_infos.is_truncated),
+        next_continuation_token,
+        contents: Some(contents),
+        common_prefixes: Some(common_prefixes),
+        delimiter: context.delimiter.clone(),
+        encoding_type: context.encoding_type.clone(),
+        start_after: context.start_after.clone(),
+        ..Default::default()
+    }
 }
 
 fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
@@ -218,6 +552,7 @@ impl DefaultBucketUsecase {
             object_lock_enabled_for_bucket,
             ..
         } = req.input;
+        let lock_enabled = object_lock_enabled_for_bucket.is_some_and(|v| v);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -228,7 +563,7 @@ impl DefaultBucketUsecase {
                 &bucket,
                 &MakeBucketOptions {
                     force_create: false,
-                    lock_enabled: object_lock_enabled_for_bucket.is_some_and(|v| v),
+                    lock_enabled,
                     ..Default::default()
                 },
             )
@@ -244,6 +579,10 @@ impl DefaultBucketUsecase {
                 return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
+        }
+
+        if let Err(err) = site_replication_make_bucket_hook(&bucket, lock_enabled).await {
+            warn!(bucket = %bucket, error = ?err, "site replication make bucket hook failed");
         }
 
         let output = CreateBucketOutput::default();
@@ -316,6 +655,10 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
+            warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
+        }
 
         let result = Ok(S3Response::new(DeleteBucketOutput {}));
         let _ = helper.complete(&result);
@@ -471,6 +814,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
+        }
+
         Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
@@ -497,6 +845,11 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket cors delete hook failed");
+        }
 
         Ok(S3Response::new(DeleteBucketCorsOutput {}))
     }
@@ -525,6 +878,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
+        }
+
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -551,6 +909,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "policy");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
+        }
+
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
@@ -576,6 +939,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config delete hook failed");
+        }
+
         // TODO: remove targets
         info!(bucket = %bucket, "deleted bucket replication config");
 
@@ -596,6 +964,11 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        let item = sr_bucket_meta_item(bucket.clone(), "tags");
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
+        }
 
         Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
     }
@@ -1054,6 +1427,15 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
+        item.sse_config = Some(
+            serialize_config(&server_side_encryption_configuration)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
+        }
         Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
     }
 
@@ -1099,6 +1481,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
+        item.expiry_lc_config =
+            Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        item.expiry_updated_at = item.updated_at;
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
+        }
 
         if lifecycle_has_transition_rules(&input_cfg)
             && let Some(store) = new_object_layer_fn()
@@ -1244,6 +1634,12 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
+        item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
+        }
+
         Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
 
@@ -1272,6 +1668,13 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
+        item.cors =
+            Some(serialize_config(&cors_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket cors hook failed");
+        }
 
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
@@ -1305,6 +1708,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
+        item.replication_config = Some(
+            serialize_config(&replication_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
+        }
 
         Ok(S3Response::new(replication::build_put_bucket_replication_output()))
     }
@@ -1367,6 +1778,12 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
+        item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
+        }
+
         Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
     }
 
@@ -1392,6 +1809,14 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
+        item.versioning = Some(
+            serialize_config(&versioning_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+        );
+        if let Err(err) = site_replication_bucket_meta_hook(item).await {
+            warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
+        }
 
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
@@ -1487,6 +1912,87 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
+    pub async fn execute_list_objects_v2m(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let input = req.input.clone();
+        let ListObjectsV2Input {
+            bucket,
+            continuation_token,
+            delimiter,
+            encoding_type,
+            fetch_owner,
+            max_keys,
+            prefix,
+            start_after,
+            ..
+        } = input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+        if max_keys < 0 {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
+        }
+
+        let delimiter = delimiter.filter(|value| !value.is_empty());
+        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+
+        let response_start_after = start_after.clone();
+        let start_after_for_query = start_after.filter(|value| !value.is_empty());
+        let response_continuation_token = continuation_token.clone();
+        let continuation_token_for_query = continuation_token.filter(|value| !value.is_empty());
+
+        let decoded_continuation_token = continuation_token_for_query
+            .map(|token| {
+                base64_simd::STANDARD
+                    .decode_to_vec(token.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    })
+            })
+            .transpose()?;
+
+        let store = get_validated_store(&bucket).await?;
+        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+            .map(|value| value.as_ref() == "true")
+            .unwrap_or_default();
+
+        let object_infos = store
+            .list_objects_v2(
+                &bucket,
+                &prefix,
+                decoded_continuation_token,
+                delimiter.clone(),
+                max_keys,
+                fetch_owner.unwrap_or_default(),
+                start_after_for_query,
+                incl_deleted,
+            )
+            .await
+            .map_err(ApiError::from)?;
+
+        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
+        let context = ListObjectsV2MResponseContext {
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            encoding_type,
+            continuation_token: response_continuation_token,
+            start_after: response_start_after,
+            fetch_owner: fetch_owner.unwrap_or_default(),
+        };
+        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+
+        Ok(S3Response::new(output))
+    }
+
     pub async fn execute_list_object_versions(
         &self,
         req: S3Request<ListObjectVersionsInput>,
@@ -1570,6 +2076,60 @@ impl DefaultBucketUsecase {
             next_version_id_marker,
             ..Default::default()
         };
+
+        Ok(S3Response::new(output))
+    }
+
+    pub async fn execute_list_object_versions_m(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let input = req.input.clone();
+        let ListObjectVersionsInput {
+            bucket,
+            delimiter,
+            encoding_type,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            prefix,
+            ..
+        } = input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+        let key_marker = key_marker.filter(|value| !value.is_empty());
+        let version_id_marker = version_id_marker.filter(|value| !value.is_empty());
+        let delimiter = delimiter.filter(|value| !value.is_empty());
+
+        let store = get_validated_store(&bucket).await?;
+        let object_infos = store
+            .list_object_versions(
+                &bucket,
+                &prefix,
+                key_marker.clone(),
+                version_id_marker.clone(),
+                delimiter.clone(),
+                max_keys,
+            )
+            .await
+            .map_err(ApiError::from)?;
+
+        let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
+        let context = ListObjectVersionsMResponseContext {
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            encoding_type,
+            key_marker,
+            version_id_marker,
+        };
+        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
 
         Ok(S3Response::new(output))
     }
@@ -2072,6 +2632,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_list_object_versions_m_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectVersionsInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_object_versions_m(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn build_list_object_versions_m_output_maps_metadata_and_preserves_entry_order() {
+        use time::macros::datetime;
+        use uuid::Uuid;
+
+        let object_infos = ListObjectVersionsInfo {
+            is_truncated: true,
+            next_marker: Some("obj-z".to_string()),
+            next_version_idmarker: Some("null".to_string()),
+            prefixes: vec!["logs/".to_string()],
+            objects: vec![
+                ObjectInfo {
+                    bucket: "demo-bucket".to_string(),
+                    name: "obj-a".to_string(),
+                    mod_time: Some(datetime!(2025-01-01 00:00 UTC)),
+                    size: 11,
+                    user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                    parity_blocks: 2,
+                    data_blocks: 4,
+                    version_id: Some(Uuid::nil()),
+                    user_tags: "env=prod".to_string(),
+                    is_latest: true,
+                    etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+                    ..Default::default()
+                },
+                ObjectInfo {
+                    bucket: "demo-bucket".to_string(),
+                    name: "obj-b".to_string(),
+                    mod_time: Some(datetime!(2025-01-02 00:00 UTC)),
+                    delete_marker: true,
+                    user_defined: HashMap::from([("marker".to_string(), "true".to_string())]),
+                    version_id: None,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let permissions = HashMap::from([
+            (
+                "obj-a".to_string(),
+                ObjectMetadataPermissions {
+                    metadata_allowed: true,
+                    tags_allowed: true,
+                },
+            ),
+            (
+                "obj-b".to_string(),
+                ObjectMetadataPermissions {
+                    metadata_allowed: true,
+                    tags_allowed: false,
+                },
+            ),
+        ]);
+
+        let context = ListObjectVersionsMResponseContext {
+            bucket: "demo-bucket".to_string(),
+            prefix: "pre".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: 1000,
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            key_marker: Some("start marker".to_string()),
+            version_id_marker: Some("vid-1".to_string()),
+        };
+        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("pre"));
+        assert_eq!(output.key_marker.as_deref(), Some("start%20marker"));
+        assert_eq!(output.next_key_marker.as_deref(), Some("obj-z"));
+        assert_eq!(output.next_version_id_marker.as_deref(), Some("null"));
+        assert_eq!(output.entries.len(), 2);
+
+        match &output.entries[0] {
+            ListObjectVersionMEntry::Version(version) => {
+                assert_eq!(version.key.as_deref(), Some("obj-a"));
+                assert_eq!(version.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
+                assert_eq!(version.user_tags.as_deref(), Some("env=prod"));
+                assert_eq!(version.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+                assert_eq!(
+                    version.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
+                    Some(vec![MinioMetadataEntry {
+                        key: "project".to_string(),
+                        value: "alpha".to_string(),
+                    }])
+                );
+            }
+            other => panic!("expected version entry, got {other:?}"),
+        }
+
+        match &output.entries[1] {
+            ListObjectVersionMEntry::DeleteMarker(marker) => {
+                assert_eq!(marker.key.as_deref(), Some("obj-b"));
+                assert_eq!(marker.version_id.as_deref(), Some("null"));
+                assert!(marker.user_tags.is_none());
+                assert_eq!(
+                    marker.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
+                    Some(vec![MinioMetadataEntry {
+                        key: "marker".to_string(),
+                        value: "true".to_string(),
+                    }])
+                );
+            }
+            other => panic!("expected delete marker entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn execute_list_objects_returns_internal_error_when_store_uninitialized() {
         let input = ListObjectsInput::builder().bucket("test-bucket".to_string()).build().unwrap();
 
@@ -2080,6 +2760,90 @@ mod tests {
 
         let err = usecase.execute_list_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_v2m_returns_internal_error_when_store_uninitialized() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn build_list_objects_v2m_output_maps_metadata_and_key_count() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: true,
+            next_continuation_token: Some("next-token".to_string()),
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                parity_blocks: 2,
+                data_blocks: 4,
+                user_tags: "env=prod".to_string(),
+                etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+                ..Default::default()
+            }],
+            prefixes: vec!["logs/archive/".to_string()],
+            ..Default::default()
+        };
+
+        let permissions = HashMap::from([(
+            "logs/obj a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+
+        let context = ListObjectsV2MResponseContext {
+            bucket: "demo-bucket".to_string(),
+            prefix: "logs/".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: 1000,
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            continuation_token: Some("start token".to_string()),
+            start_after: Some("logs/start after".to_string()),
+            fetch_owner: true,
+        };
+
+        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs/"));
+        assert_eq!(output.continuation_token.as_deref(), Some("start token"));
+        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
+        assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
+        assert_eq!(output.key_count, Some(2));
+        assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.common_prefixes.as_ref().map(Vec::len), Some(1));
+
+        let object = output.contents.as_ref().unwrap().first().unwrap();
+        assert_eq!(object.key.as_deref(), Some("logs/obj%20a.txt"));
+        assert_eq!(object.user_tags.as_deref(), Some("env=prod"));
+        assert_eq!(object.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+        assert!(object.owner.is_some());
+        assert_eq!(
+            object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
+            Some(vec![MinioMetadataEntry {
+                key: "project".to_string(),
+                value: "alpha".to_string(),
+            }])
+        );
+
+        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
     }
 
     #[tokio::test]
@@ -2185,6 +2949,21 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_list_objects_v2(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_v2m_rejects_negative_max_keys() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .max_keys(Some(-1))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }

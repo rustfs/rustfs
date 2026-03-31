@@ -75,6 +75,14 @@ mod delete_objects_versioning_test;
 #[cfg(test)]
 mod list_object_versions_regression_test;
 
+// versions&metadata=true extension regression test
+#[cfg(test)]
+mod list_object_versions_metadata_extension_test;
+
+// list-type=2&metadata=true extension regression test
+#[cfg(test)]
+mod list_objects_v2_metadata_extension_test;
+
 #[cfg(test)]
 mod protocols;
 

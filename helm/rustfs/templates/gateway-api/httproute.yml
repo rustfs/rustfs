@@ -33,7 +33,7 @@ spec:
           port: {{ .Values.service.console.port }}
           kind: TraefikService
           group: traefik.io
-        {{- else if eq .Values.gatewayApi.gatewayClass "contour" }}
+        {{- else }}
         - name: {{ include "rustfs.fullname" $ }}-svc
           port: {{ .Values.service.console.port }}
         {{- end }}
