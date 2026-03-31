@@ -5514,6 +5514,96 @@ mod tests {
         None
     }
 
+    fn find_part_files(root: &std::path::Path, part_name: &str, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                find_part_files(&path, part_name, out);
+                continue;
+            }
+
+            if path.file_name().and_then(|name| name.to_str()) == Some(part_name) {
+                out.push(path);
+            }
+        }
+    }
+
+    async fn remove_part_files(root: &std::path::Path, part_name: &str) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut paths = Vec::new();
+        find_part_files(root, part_name, &mut paths);
+
+        let mut removed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content = fs::read(&path).await.expect("read part file before removal");
+            fs::remove_file(&path).await.expect("remove part file");
+            removed.push((path, content));
+        }
+
+        removed
+    }
+
+    async fn restore_part_files(files: Vec<(PathBuf, Vec<u8>)>) {
+        for (path, content) in files {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await.expect("ensure parent for part restore");
+            }
+            fs::write(&path, content).await.expect("restore part file");
+        }
+    }
+
+    async fn select_reconstructed_chunk_read(
+        disk_paths: &[PathBuf],
+        bucket: &str,
+        key: &str,
+        missing_part_name: &str,
+        req: &S3Request<GetObjectInput>,
+        ecstore: &Arc<ECStore>,
+        manager: &ConcurrencyManager,
+        request_context: &GetObjectRequestContext,
+    ) -> GetObjectReadSetup {
+        for disk_path in disk_paths {
+            let object_root = disk_path.join(bucket).join(key);
+            let removed_parts = remove_part_files(&object_root, missing_part_name).await;
+            if removed_parts.is_empty() {
+                continue;
+            }
+
+            let candidate = DefaultObjectUsecase::prepare_get_object_chunk_read(
+                req,
+                ecstore,
+                manager,
+                &request_context.bucket,
+                &request_context.key,
+                request_context.rs.clone(),
+                request_context.part_number,
+                &request_context.opts,
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
+
+            let is_reconstructed = matches!(
+                &candidate.body_source,
+                GetObjectBodySource::Chunk {
+                    path: GetObjectChunkPath::Direct,
+                    copy_mode: rustfs_io_metrics::CopyMode::Reconstructed,
+                    ..
+                }
+            );
+            if is_reconstructed {
+                return candidate;
+            }
+
+            restore_part_files(removed_parts).await;
+        }
+
+        panic!("expected reconstructed chunk path after removing one disk shard copy of {missing_part_name}");
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -6248,6 +6338,352 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(collected, parts[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_part_number_marks_reconstructed_path_for_multi_disk_store_with_missing_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-part-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-reconstructed.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 137)).map(|idx| ((idx + 11) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 77)).map(|idx| ((idx + 29) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts = create_direct_chunk_test_multipart_object(
+            &ecstore,
+            &bucket,
+            key,
+            vec![part_one.clone(), part_two.clone(), part_three],
+        )
+        .await;
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .part_number(Some(1))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.1", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "missing data shard in multipart part should trigger reconstructed chunk path"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some(parts[0].len() as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, parts[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_part_number_marks_reconstructed_path_for_second_multipart_part_with_missing_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-part2-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-reconstructed-second-part.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 137)).map(|idx| ((idx + 11) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 77)).map(|idx| ((idx + 29) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts =
+            create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one, part_two.clone(), part_three]).await;
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .part_number(Some(2))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.2", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "missing data shard in multipart part 2 should trigger reconstructed chunk path"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some(parts[1].len() as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, parts[1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_part_number_marks_reconstructed_path_for_final_multipart_part_with_missing_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-part3-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-reconstructed-final-part.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 137)).map(|idx| ((idx + 11) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 77)).map(|idx| ((idx + 29) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts =
+            create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one, part_two, part_three.clone()]).await;
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .part_number(Some(3))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.3", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "missing data shard in the final multipart part should trigger reconstructed chunk path"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some(parts[2].len() as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, part_three);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_multipart_range_marks_reconstructed_path_for_missing_shard_part() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-multipart-range-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-range-reconstructed.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 257)).map(|idx| ((idx + 17) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 211)).map(|idx| ((idx + 33) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts = create_direct_chunk_test_multipart_object(
+            &ecstore,
+            &bucket,
+            key,
+            vec![part_one.clone(), part_two.clone(), part_three],
+        )
+        .await;
+
+        let range_start = 1024_u64;
+        let range_end = 64 * 1024 + 2048;
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .range(Some(Range::Int {
+                first: range_start,
+                last: Some(range_end),
+            }))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.1", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "multipart partial range should stay on reconstructed fast path when the covered part has a missing shard"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let mut expected = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in &parts {
+            expected.extend_from_slice(part);
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, expected[range_start as usize..=range_end as usize].to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_cross_part_multipart_range_marks_reconstructed_path_for_missing_next_part_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-multipart-cross-range-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-cross-range-reconstructed.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 257)).map(|idx| ((idx + 17) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 211)).map(|idx| ((idx + 33) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts = create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one, part_two, part_three]).await;
+
+        let part_one_len = parts[0].len() as u64;
+        let range_start = part_one_len - 32 * 1024;
+        let range_end = part_one_len + 96 * 1024;
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .range(Some(Range::Int {
+                first: range_start,
+                last: Some(range_end),
+            }))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.2", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "cross-part multipart range should keep the reconstructed chunk fast path when the next part has a missing shard"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let mut expected = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in &parts {
+            expected.extend_from_slice(part);
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, expected[range_start as usize..=range_end as usize].to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn execute_get_object_cross_part_multipart_range_marks_reconstructed_path_for_missing_final_part_shard() {
+        let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+        let bucket = format!("direct-multipart-final-cross-range-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let key = "test/multipart-final-cross-range-reconstructed.bin";
+        let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 257)).map(|idx| ((idx + 17) % 251) as u8).collect();
+        let part_three: Vec<u8> = (0..(1024 * 1024 + 211)).map(|idx| ((idx + 33) % 251) as u8).collect();
+
+        create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+        let parts = create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one, part_two, part_three]).await;
+
+        let part_two_end = (parts[0].len() + parts[1].len()) as u64;
+        let range_start = part_two_end - 32 * 1024;
+        let range_end = part_two_end + 96 * 1024;
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .range(Some(Range::Int {
+                first: range_start,
+                last: Some(range_end),
+            }))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let request_context = DefaultObjectUsecase::prepare_get_object_request_context(&req).await.unwrap();
+        let manager = get_concurrency_manager();
+        let read_setup =
+            select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.3", &req, &ecstore, manager, &request_context).await;
+
+        match read_setup.body_source {
+            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+                assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+                assert_eq!(
+                    copy_mode,
+                    rustfs_io_metrics::CopyMode::Reconstructed,
+                    "cross-part multipart range into the final part should keep the reconstructed chunk fast path"
+                );
+            }
+            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+        }
+
+        let mut expected = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in &parts {
+            expected.extend_from_slice(part);
+        }
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let response = usecase.execute_get_object(req).await.unwrap();
+        assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
+        let mut body = response.output.body.expect("expected body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, expected[range_start as usize..=range_end as usize].to_vec());
     }
 
     #[tokio::test]

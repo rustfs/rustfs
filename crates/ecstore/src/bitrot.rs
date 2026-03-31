@@ -24,13 +24,124 @@ use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
 
-fn classify_chunk_copy_mode(source_direct: bool, source_chunk_count: usize) -> GetObjectChunkCopyMode {
-    if source_direct && source_chunk_count == 1 {
-        GetObjectChunkCopyMode::TrueZeroCopy
-    } else if source_chunk_count == 1 {
-        GetObjectChunkCopyMode::SharedBytes
-    } else {
+fn classify_chunk_copy_mode(source_direct: bool, copied: bool) -> GetObjectChunkCopyMode {
+    if copied {
         GetObjectChunkCopyMode::SingleCopy
+    } else if source_direct {
+        GetObjectChunkCopyMode::TrueZeroCopy
+    } else {
+        GetObjectChunkCopyMode::SharedBytes
+    }
+}
+
+struct ChunkSpan {
+    bytes: Bytes,
+    chunk: IoChunk,
+    copied: bool,
+}
+
+struct ChunkCursor<'a> {
+    chunks: &'a [IoChunk],
+    chunk_index: usize,
+    chunk_offset: usize,
+    consumed: usize,
+    total_len: usize,
+}
+
+impl<'a> ChunkCursor<'a> {
+    fn new(chunks: &'a [IoChunk]) -> Self {
+        Self {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+            consumed: 0,
+            total_len: chunks.iter().map(IoChunk::len).sum(),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.total_len.saturating_sub(self.consumed)
+    }
+
+    fn skip_empty_chunks(&mut self) {
+        while let Some(chunk) = self.chunks.get(self.chunk_index) {
+            if self.chunk_offset < chunk.len() {
+                break;
+            }
+            self.chunk_index += 1;
+            self.chunk_offset = 0;
+        }
+    }
+
+    fn advance(&mut self, len: usize) {
+        self.consumed += len;
+        self.chunk_offset += len;
+        self.skip_empty_chunks();
+    }
+
+    fn take_span(&mut self, len: usize) -> std::io::Result<ChunkSpan> {
+        self.skip_empty_chunks();
+        if self.remaining() < len {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
+        }
+
+        let Some(chunk) = self.chunks.get(self.chunk_index) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "missing bitrot chunk source"));
+        };
+        let available = chunk.len().saturating_sub(self.chunk_offset);
+
+        if len <= available {
+            let span = match chunk {
+                IoChunk::Shared(bytes) => {
+                    let bytes = bytes.slice(self.chunk_offset..self.chunk_offset + len);
+                    ChunkSpan {
+                        bytes: bytes.clone(),
+                        chunk: IoChunk::Shared(bytes),
+                        copied: false,
+                    }
+                }
+                IoChunk::Mapped(mapped) => {
+                    let chunk = IoChunk::Mapped(mapped.slice(self.chunk_offset, len)?);
+                    let bytes = chunk.as_bytes();
+                    ChunkSpan {
+                        bytes,
+                        chunk,
+                        copied: false,
+                    }
+                }
+                IoChunk::Pooled(pooled) => {
+                    let bytes = pooled.as_bytes().slice(self.chunk_offset..self.chunk_offset + len);
+                    ChunkSpan {
+                        bytes: bytes.clone(),
+                        chunk: IoChunk::Shared(bytes),
+                        copied: true,
+                    }
+                }
+            };
+            self.advance(len);
+            return Ok(span);
+        }
+
+        let mut aggregate = BytesMut::with_capacity(len);
+        let mut remaining = len;
+        while remaining > 0 {
+            self.skip_empty_chunks();
+            let Some(chunk) = self.chunks.get(self.chunk_index) else {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
+            };
+            let available = chunk.len().saturating_sub(self.chunk_offset);
+            let take = available.min(remaining);
+            aggregate.extend_from_slice(&chunk.as_bytes()[self.chunk_offset..self.chunk_offset + take]);
+            self.advance(take);
+            remaining -= take;
+        }
+
+        let bytes = aggregate.freeze();
+        Ok(ChunkSpan {
+            bytes: bytes.clone(),
+            chunk: IoChunk::Shared(bytes),
+            copied: true,
+        })
     }
 }
 
@@ -195,25 +306,14 @@ pub async fn create_bitrot_chunk_stream(
         return Ok(None);
     };
 
-    let copy_mode = classify_chunk_copy_mode(source_direct, source_chunks.len());
-    let normalized_source = if source_chunks.len() == 1 {
-        source_chunks.into_iter().next().unwrap()
-    } else {
-        let mut aggregate = BytesMut::with_capacity(encoded_length);
-        for chunk in source_chunks {
-            aggregate.extend_from_slice(&chunk.as_bytes());
-        }
-        IoChunk::Shared(aggregate.freeze())
-    };
-
-    let data_chunks =
-        decode_bitrot_chunk_source(normalized_source, shard_size, checksum_algo, skip_verify).map_err(DiskError::other)?;
+    let (data_chunks, copied) =
+        decode_bitrot_chunk_source(&source_chunks, shard_size, checksum_algo, skip_verify).map_err(DiskError::other)?;
     let data_chunks = trim_chunk_vec(data_chunks, trim_prefix, length).map_err(DiskError::other)?;
     let stream = stream::iter(data_chunks.into_iter().map(Ok::<IoChunk, std::io::Error>));
     Ok(Some(GetObjectChunkResult {
         stream: Box::pin(stream),
         path: GetObjectChunkPath::Direct,
-        copy_mode,
+        copy_mode: classify_chunk_copy_mode(source_direct, copied),
     }))
 }
 
@@ -244,52 +344,41 @@ fn trim_chunk_vec(chunks: Vec<IoChunk>, offset: usize, length: usize) -> std::io
 }
 
 fn decode_bitrot_chunk_source(
-    source: IoChunk,
+    source_chunks: &[IoChunk],
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
-) -> std::io::Result<Vec<IoChunk>> {
+) -> std::io::Result<(Vec<IoChunk>, bool)> {
     let hash_size = checksum_algo.size();
-    let source_bytes = source.as_bytes();
-    let mut cursor = 0usize;
+    let mut cursor = ChunkCursor::new(source_chunks);
     let mut result = Vec::new();
+    let mut copied = false;
 
-    while cursor < source_bytes.len() {
-        if hash_size > 0 {
-            let hash_end = cursor
-                .checked_add(hash_size)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash offset overflow"))?;
-            if hash_end > source_bytes.len() {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot hash block"));
-            }
-            cursor = hash_end;
-        }
+    while cursor.remaining() > 0 {
+        let expected_hash = if hash_size > 0 {
+            Some(cursor.take_span(hash_size)?)
+        } else {
+            None
+        };
 
-        let data_len = shard_size.min(source_bytes.len().saturating_sub(cursor));
+        let data_len = shard_size.min(cursor.remaining());
         if data_len == 0 {
             break;
         }
 
-        let data_end = cursor + data_len;
-        let data = &source_bytes[cursor..data_end];
-
-        if hash_size > 0 && !skip_verify {
-            let expected_hash = &source_bytes[cursor - hash_size..cursor];
-            let actual_hash = checksum_algo.hash_encode(data);
-            if actual_hash.as_ref() != expected_hash {
+        let data_span = cursor.take_span(data_len)?;
+        copied |= data_span.copied;
+        if let Some(expected_hash) = expected_hash {
+            copied |= expected_hash.copied;
+            if !skip_verify && checksum_algo.hash_encode(data_span.bytes.as_ref()).as_ref() != expected_hash.bytes.as_ref() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
             }
         }
 
-        result.push(
-            source
-                .slice(cursor, data_len)
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?,
-        );
-        cursor = data_end;
+        result.push(data_span.chunk);
     }
 
-    Ok(result)
+    Ok((result, copied))
 }
 
 /// Create a new BitrotWriterWrapper based on the provided parameters
@@ -493,6 +582,61 @@ mod tests {
         }
 
         assert_eq!(collected, b"bcdef");
+    }
+
+    #[test]
+    fn test_decode_bitrot_chunk_source_preserves_aligned_multi_chunk_slices() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::Md5;
+        let shard1 = b"abcd";
+        let shard2 = b"efgh";
+
+        let mut encoded_chunk_one = Vec::new();
+        encoded_chunk_one.extend_from_slice(checksum_algo.hash_encode(shard1).as_ref());
+        encoded_chunk_one.extend_from_slice(shard1);
+
+        let mut encoded_chunk_two = Vec::new();
+        encoded_chunk_two.extend_from_slice(checksum_algo.hash_encode(shard2).as_ref());
+        encoded_chunk_two.extend_from_slice(shard2);
+
+        let source_chunks = vec![
+            IoChunk::Shared(Bytes::from(encoded_chunk_one)),
+            IoChunk::Shared(Bytes::from(encoded_chunk_two)),
+        ];
+        let (decoded, copied) = decode_bitrot_chunk_source(&source_chunks, shard_size, checksum_algo, false).unwrap();
+
+        assert!(!copied, "frame-aligned multi-chunk source should not require aggregate copies");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
+        assert_eq!(decoded[1].as_bytes(), Bytes::from_static(b"efgh"));
+    }
+
+    #[test]
+    fn test_decode_bitrot_chunk_source_marks_cross_chunk_frame_as_copied() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::Md5;
+        let shard1 = b"abcd";
+        let shard2 = b"efgh";
+
+        let hash1 = checksum_algo.hash_encode(shard1).as_ref().to_vec();
+        let hash2 = checksum_algo.hash_encode(shard2).as_ref().to_vec();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&hash1);
+        encoded.extend_from_slice(shard1);
+        encoded.extend_from_slice(&hash2);
+        encoded.extend_from_slice(shard2);
+
+        let split = hash1.len() + 2;
+        let source_chunks = vec![
+            IoChunk::Shared(Bytes::copy_from_slice(&encoded[..split])),
+            IoChunk::Shared(Bytes::copy_from_slice(&encoded[split..])),
+        ];
+        let (decoded, copied) = decode_bitrot_chunk_source(&source_chunks, shard_size, checksum_algo, false).unwrap();
+
+        assert!(copied, "cross-chunk frame should be classified as requiring a copy");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
+        assert_eq!(decoded[1].as_bytes(), Bytes::from_static(b"efgh"));
     }
 
     #[tokio::test]
