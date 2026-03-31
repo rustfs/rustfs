@@ -5207,10 +5207,7 @@ mod tests {
     #[test]
     fn should_use_zero_copy_rejects_encrypted_requests_with_kms_key_id() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
-            HeaderValue::from_static("test-kms-key-id"),
-        );
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
     }
