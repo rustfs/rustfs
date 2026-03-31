@@ -25,6 +25,7 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
@@ -206,10 +207,16 @@ impl Operation for DeleteGroup {
         )
         .await?;
 
-        let group = params
+        let group_raw = params
             .get("group")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing group name in request"))?
             .trim();
+
+        // Path segments stay percent-encoded in `req.uri.path()` / matchit; IAM uses decoded names (same as GET query).
+        let group_decoded = percent_decode_str(group_raw)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidArgument, "invalid group name encoding"))?;
+        let group = group_decoded.trim();
 
         // Validate the group name format
         if group.is_empty() || group.len() > 256 {
