@@ -14,9 +14,68 @@
 // limitations under the License.
 
 use super::{grpc_lock_client::GrpcLockClient, grpc_lock_server::spawn_lock_server};
-use rustfs_lock::{GlobalLockManager, NamespaceLock, ObjectKey, client::local::LocalClient};
+use rustfs_lock::client::local::LocalClient;
+use rustfs_lock::{GlobalLockManager, LockError, LockInfo, LockResponse, LockStats, NamespaceLock, ObjectKey};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn test_resource() -> ObjectKey {
+    ObjectKey {
+        bucket: Arc::from("test-bucket"),
+        object: Arc::from("test-object"),
+        version: None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailingClient;
+
+#[async_trait::async_trait]
+impl rustfs_lock::LockClient for FailingClient {
+    async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+        Err(LockError::internal("simulated gRPC node failure"))
+    }
+
+    async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        Ok(false)
+    }
+
+    async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        Ok(false)
+    }
+
+    async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        Ok(false)
+    }
+
+    async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+        Ok(None)
+    }
+
+    async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+        Ok(LockStats::default())
+    }
+
+    async fn close(&self) -> rustfs_lock::Result<()> {
+        Ok(())
+    }
+
+    async fn is_online(&self) -> bool {
+        false
+    }
+
+    async fn is_local(&self) -> bool {
+        false
+    }
+}
+
+async fn failing_grpc_client() -> (Arc<dyn rustfs_lock::LockClient>, tokio::task::JoinHandle<()>) {
+    let failing_client: Arc<dyn rustfs_lock::LockClient> = Arc::new(FailingClient);
+    let (addr, handle) = spawn_lock_server(failing_client)
+        .await
+        .expect("Failed to spawn failing gRPC lock server");
+    (Arc::new(GrpcLockClient::new(addr)), handle)
+}
 
 #[tokio::test]
 async fn test_distributed_lock_4_nodes_grpc() {
@@ -52,11 +111,7 @@ async fn test_distributed_lock_4_nodes_grpc() {
     let lock = NamespaceLock::with_clients_and_quorum("grpc-4-node".to_string(), clients, 3);
     assert_eq!(lock.namespace(), "grpc-4-node");
 
-    let resource = ObjectKey {
-        bucket: Arc::from("test-bucket"),
-        object: Arc::from("test-object"),
-        version: None,
-    };
+    let resource = test_resource();
 
     // Test 1: Owner A acquires write lock successfully
     let mut guard_a = lock
@@ -123,6 +178,91 @@ async fn test_distributed_lock_4_nodes_grpc() {
     drop(guard_b);
 
     // Shutdown servers
+    handle1.abort();
+    handle2.abort();
+    handle3.abort();
+    handle4.abort();
+}
+
+#[tokio::test]
+async fn test_distributed_lock_2_nodes_grpc_read_survives_failed_node() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let local_client: Arc<dyn rustfs_lock::LockClient> = Arc::new(LocalClient::with_manager(manager));
+
+    let (addr, handle) = spawn_lock_server(local_client).await.expect("Failed to spawn server");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let grpc_client_ok: Arc<dyn rustfs_lock::LockClient> = Arc::new(GrpcLockClient::new(addr));
+    let (grpc_client_bad, failing_handle) = failing_grpc_client().await;
+    let lock = NamespaceLock::with_clients_and_quorum("grpc-2-node".to_string(), vec![grpc_client_ok, grpc_client_bad], 2);
+    let resource = test_resource();
+
+    let guard = lock
+        .get_read_lock(resource.clone(), "owner-a", Duration::from_secs(2))
+        .await
+        .expect("Read lock should succeed with one healthy node in a two-node gRPC cluster");
+
+    match guard {
+        rustfs_lock::NamespaceLockGuard::Standard(_) => {}
+        rustfs_lock::NamespaceLockGuard::Fast(_) => panic!("Expected Standard guard for distributed lock"),
+    }
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_secs(2))
+        .await
+        .expect_err("Write lock should fail with one healthy node in a two-node gRPC cluster");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "Error should be quorum related, got: {}",
+        err
+    );
+
+    handle.abort();
+    failing_handle.abort();
+}
+
+#[tokio::test]
+async fn test_distributed_lock_4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes() {
+    let manager1 = Arc::new(GlobalLockManager::new());
+    let manager2 = Arc::new(GlobalLockManager::new());
+    let client1: Arc<dyn rustfs_lock::LockClient> = Arc::new(LocalClient::with_manager(manager1));
+    let client2: Arc<dyn rustfs_lock::LockClient> = Arc::new(LocalClient::with_manager(manager2));
+
+    let (addr1, handle1) = spawn_lock_server(client1).await.expect("Failed to spawn server 1");
+    let (addr2, handle2) = spawn_lock_server(client2).await.expect("Failed to spawn server 2");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let grpc_client1: Arc<dyn rustfs_lock::LockClient> = Arc::new(GrpcLockClient::new(addr1));
+    let grpc_client2: Arc<dyn rustfs_lock::LockClient> = Arc::new(GrpcLockClient::new(addr2));
+    let (grpc_client3, handle3) = failing_grpc_client().await;
+    let (grpc_client4, handle4) = failing_grpc_client().await;
+
+    let lock = NamespaceLock::with_clients(
+        "grpc-4-node-partial".to_string(),
+        vec![grpc_client1, grpc_client2, grpc_client3, grpc_client4],
+    );
+    let resource = test_resource();
+
+    let mut read_guard = lock
+        .get_read_lock(resource.clone(), "owner-a", Duration::from_secs(2))
+        .await
+        .expect("Read lock should succeed with two healthy nodes in a four-node gRPC cluster");
+    assert!(read_guard.release(), "Read guard should release cleanly");
+
+    let err = lock
+        .get_write_lock(resource, "owner-b", Duration::from_secs(2))
+        .await
+        .expect_err("Write lock should fail when only two of four gRPC nodes are healthy");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "Error should be quorum related, got: {}",
+        err
+    );
+
     handle1.abort();
     handle2.abort();
     handle3.abort();

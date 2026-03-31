@@ -37,18 +37,22 @@ pub fn record_capacity_current_bytes(used_bytes: u64) {
 
 /// Record capacity update completion.
 #[inline(always)]
-pub fn record_capacity_update_completed(source: &str, duration: Duration, used_bytes: u64, is_estimated: bool) {
-    counter!("rustfs.capacity.update.total", "source" => source.to_string()).increment(1);
-    histogram!("rustfs.capacity.update.duration.seconds", "source" => source.to_string()).record(duration.as_secs_f64());
-    histogram!("rustfs.capacity.update.bytes", "source" => source.to_string()).record(used_bytes as f64);
-    counter!("rustfs.capacity.update.estimated.total", "source" => source.to_string(), "estimated" => is_estimated.to_string())
-        .increment(1);
+pub fn record_capacity_update_completed(source: &'static str, duration: Duration, used_bytes: u64, is_estimated: bool) {
+    counter!("rustfs.capacity.update.total", "source" => source).increment(1);
+    histogram!("rustfs.capacity.update.duration.seconds", "source" => source).record(duration.as_secs_f64());
+    histogram!("rustfs.capacity.update.bytes", "source" => source).record(used_bytes as f64);
+    counter!(
+        "rustfs.capacity.update.estimated.total",
+        "source" => source,
+        "estimated" => if is_estimated { "true" } else { "false" }
+    )
+    .increment(1);
 }
 
 /// Record failed capacity update.
 #[inline(always)]
-pub fn record_capacity_update_failed(source: &str) {
-    counter!("rustfs.capacity.update.failures", "source" => source.to_string()).increment(1);
+pub fn record_capacity_update_failed(source: &'static str) {
+    counter!("rustfs.capacity.update.failures", "source" => source).increment(1);
 }
 
 /// Record capacity write activity.
@@ -88,5 +92,9 @@ pub fn record_capacity_dynamic_timeout(timeout: Duration) {
 #[inline(always)]
 pub fn record_capacity_scan_sampling(sampled_count: usize, estimated: bool) {
     histogram!("rustfs.capacity.scan.sampled.count").record(sampled_count as f64);
-    counter!("rustfs.capacity.scan.estimated.total", "estimated" => estimated.to_string()).increment(1);
+    counter!(
+        "rustfs.capacity.scan.estimated.total",
+        "estimated" => if estimated { "true" } else { "false" }
+    )
+    .increment(1);
 }

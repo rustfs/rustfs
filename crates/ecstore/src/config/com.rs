@@ -1069,14 +1069,542 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
 mod tests {
     use super::{
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        storage_class_kvs_mut,
+        read_config_with_metadata, storage_class_kvs_mut,
     };
     use crate::config::{Config, audit, notify, oidc};
     use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use crate::disk::endpoint::Endpoint;
+    use crate::endpoints::SetupType;
+    use crate::error::{Error, Result};
+    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
+    use crate::set_disk::SetDisks;
+    use crate::store_api::{
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
+    };
+    use http::HeaderMap;
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+    use rustfs_filemeta::FileInfo;
+    use rustfs_lock::client::LockClient;
+    use rustfs_lock::client::local::LocalClient;
+    use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serde_json::Value;
+    use serial_test::serial;
+    use std::collections::HashMap;
+    use std::fmt::{Debug, Formatter};
+    use std::io::Cursor;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use time::OffsetDateTime;
+    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug, Default)]
+    struct FailingClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for FailingClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("simulated offline client"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    struct GuardedCursor {
+        inner: Cursor<Vec<u8>>,
+        _guard: Option<rustfs_lock::NamespaceLockGuard>,
+    }
+
+    impl AsyncRead for GuardedCursor {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    struct LockingConfigStorage {
+        set_disks: Arc<SetDisks>,
+        data: Vec<u8>,
+    }
+
+    impl Debug for LockingConfigStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("LockingConfigStorage").finish()
+        }
+    }
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = current_setup_type().await;
+            update_erasure_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    update_erasure_type(previous).await;
+                });
+            });
+        }
+    }
+
+    async fn current_setup_type() -> SetupType {
+        if is_dist_erasure().await {
+            SetupType::DistErasure
+        } else if is_erasure_sd().await {
+            SetupType::ErasureSD
+        } else if is_erasure().await {
+            SetupType::Erasure
+        } else {
+            SetupType::Unknown
+        }
+    }
+
+    impl LockingConfigStorage {
+        async fn new(lockers: Vec<Arc<dyn LockClient>>, data: Vec<u8>) -> Self {
+            let endpoints = vec![
+                Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
+                Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
+            ];
+
+            let set_disks = SetDisks::new(
+                "config-test-owner".to_string(),
+                Arc::new(RwLock::new(vec![None, None])),
+                2,
+                1,
+                0,
+                0,
+                endpoints,
+                crate::disk::format::FormatV3::new(1, 2),
+                lockers,
+            )
+            .await;
+
+            Self { set_disks, data }
+        }
+
+        fn object_info(&self, bucket: &str, object: &str) -> ObjectInfo {
+            ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                storage_class: None,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                size: self.data.len() as i64,
+                actual_size: self.data.len() as i64,
+                is_dir: false,
+                user_defined: HashMap::new(),
+                parity_blocks: 0,
+                data_blocks: 0,
+                version_id: None,
+                delete_marker: false,
+                transitioned_object: Default::default(),
+                restore_ongoing: false,
+                restore_expires: None,
+                user_tags: String::new(),
+                parts: Vec::new(),
+                is_latest: true,
+                content_type: Some("application/json".to_string()),
+                content_encoding: None,
+                expires: None,
+                num_versions: 1,
+                successor_mod_time: None,
+                put_object_reader: None,
+                etag: None,
+                inlined: false,
+                metadata_only: false,
+                version_only: false,
+                replication_status_internal: None,
+                replication_status: Default::default(),
+                version_purge_status_internal: None,
+                version_purge_status: Default::default(),
+                replication_decision: String::new(),
+                checksum: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for LockingConfigStorage {
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            let guard = if opts.no_lock {
+                None
+            } else {
+                Some(
+                    self.set_disks
+                        .new_ns_lock(bucket, object)
+                        .await?
+                        .get_read_lock(std::time::Duration::from_millis(100))
+                        .await
+                        .map_err(|err| Error::other(format!("lock failed: {err}")))?,
+                )
+            };
+
+            Ok(GetObjectReader {
+                stream: Box::new(GuardedCursor {
+                    inner: Cursor::new(self.data.clone()),
+                    _guard: guard,
+                }),
+                object_info: self.object_info(bucket, object),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BucketOperations for LockingConfigStorage {
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            panic!("unused in test")
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+            panic!("unused in test")
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectOperations for LockingConfigStorage {
+        async fn get_object_info(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn copy_object(
+            &self,
+            _src_bucket: &str,
+            _src_object: &str,
+            _dst_bucket: &str,
+            _dst_object: &str,
+            _src_info: &mut ObjectInfo,
+            _src_opts: &ObjectOptions,
+            _dst_opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object_version(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _fi: &FileInfo,
+            _force_del_marker: bool,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_objects(
+            &self,
+            _bucket: &str,
+            _objects: Vec<ObjectToDelete>,
+            _opts: ObjectOptions,
+        ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+            panic!("unused in test")
+        }
+
+        async fn put_object_metadata(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn get_object_tags(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<String> {
+            panic!("unused in test")
+        }
+
+        async fn put_object_tags(&self, _bucket: &str, _object: &str, _tags: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn delete_object_tags(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+
+        async fn add_partial(&self, _bucket: &str, _object: &str, _version_id: &str) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn transition_object(&self, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn restore_transitioned_object(self: Arc<Self>, _bucket: &str, _object: &str, _opts: &ObjectOptions) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListOperations for LockingConfigStorage {
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<ListObjectsV2Info> {
+            panic!("unused in test")
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _marker: Option<String>,
+            _version_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+        ) -> Result<ListObjectVersionsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: CancellationToken,
+            _bucket: &str,
+            _prefix: &str,
+            _result: tokio::sync::mpsc::Sender<crate::store_api::ObjectInfoOrErr>,
+            _opts: WalkOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartOperations for LockingConfigStorage {
+        async fn list_multipart_uploads(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _key_marker: Option<String>,
+            _upload_id_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_uploads: usize,
+        ) -> Result<ListMultipartsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn new_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartUploadResult> {
+            panic!("unused in test")
+        }
+
+        async fn copy_object_part(
+            &self,
+            _src_bucket: &str,
+            _src_object: &str,
+            _dst_bucket: &str,
+            _dst_object: &str,
+            _upload_id: &str,
+            _part_id: usize,
+            _start_offset: i64,
+            _length: i64,
+            _src_info: &ObjectInfo,
+            _src_opts: &ObjectOptions,
+            _dst_opts: &ObjectOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn put_object_part(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _part_id: usize,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<PartInfo> {
+            panic!("unused in test")
+        }
+
+        async fn get_multipart_info(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<MultipartInfo> {
+            panic!("unused in test")
+        }
+
+        async fn list_object_parts(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _part_number_marker: Option<usize>,
+            _max_parts: usize,
+            _opts: &ObjectOptions,
+        ) -> Result<crate::store_api::ListPartsInfo> {
+            panic!("unused in test")
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _opts: &ObjectOptions,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn complete_multipart_upload(
+            self: Arc<Self>,
+            _bucket: &str,
+            _object: &str,
+            _upload_id: &str,
+            _uploaded_parts: Vec<CompletePart>,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HealOperations for LockingConfigStorage {
+        async fn heal_format(&self, _dry_run: bool) -> Result<(rustfs_madmin::heal_commands::HealResultItem, Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn heal_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<rustfs_madmin::heal_commands::HealResultItem> {
+            panic!("unused in test")
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<(rustfs_madmin::heal_commands::HealResultItem, Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+            panic!("unused in test")
+        }
+
+        async fn check_abandoned_parts(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAPI for LockingConfigStorage {
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<rustfs_lock::NamespaceLockWrapper> {
+            self.set_disks.new_ns_lock(bucket, object).await
+        }
+
+        async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+            panic!("unused in test")
+        }
+
+        async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+            panic!("unused in test")
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            panic!("unused in test")
+        }
+    }
 
     #[test]
     fn test_decode_server_config_accepts_legacy_hidden_if_empty_alias() {
@@ -1693,5 +2221,24 @@ mod tests {
         let lhs = decode_server_config_blob(external).expect("decode external");
         let rhs = decode_server_config_blob(legacy).expect("decode legacy");
         assert!(configs_semantically_equal(&lhs, &rhs));
+  }
+  
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_read_config_with_metadata_succeeds_with_one_healthy_locker_in_two_node_dist_setup() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let storage = Arc::new(LockingConfigStorage::new(vec![healthy_client, failing_client], br#"{"ok":true}"#.to_vec()).await);
+
+        let (data, object_info) = read_config_with_metadata(storage, "config/test.json", &ObjectOptions::default())
+            .await
+            .expect("config read should succeed with one healthy locker");
+
+        assert_eq!(data, br#"{"ok":true}"#.to_vec());
+        assert_eq!(object_info.bucket, crate::disk::RUSTFS_META_BUCKET);
+        assert_eq!(object_info.name, "config/test.json");
     }
 }
