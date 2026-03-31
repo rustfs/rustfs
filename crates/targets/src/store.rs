@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::error::StoreError;
-use rustfs_config::DEFAULT_LIMIT;
 use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
+use rustfs_config::{DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, ENV_TARGET_STORE_COMPRESS, EnableState};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};
@@ -26,6 +26,17 @@ use std::{
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+fn resolve_queue_store_compression_from_env_value(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.parse::<EnableState>().ok().map(|state| state.is_enabled()))
+        .unwrap_or(DEFAULT_TARGET_STORE_COMPRESS)
+}
+
+fn queue_store_compression_enabled() -> bool {
+    let value = std::env::var(ENV_TARGET_STORE_COMPRESS).ok();
+    resolve_queue_store_compression_from_env_value(value.as_deref())
+}
 
 /// Represents a key for an entry in the store
 #[derive(Debug, Clone)]
@@ -63,21 +74,7 @@ impl Key {
 
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name_part = if self.item_count > 1 {
-            format!("{}:{}", self.item_count, self.name)
-        } else {
-            self.name.clone()
-        };
-
-        let mut file_name = name_part;
-        if !self.extension.is_empty() {
-            file_name.push_str(&self.extension);
-        }
-
-        if self.compress {
-            file_name.push_str(COMPRESS_EXT);
-        }
-        write!(f, "{file_name}")
+        f.write_str(&self.to_key_string())
     }
 }
 
@@ -169,6 +166,7 @@ pub struct QueueStore<T> {
     entry_limit: u64,
     directory: PathBuf,
     file_ext: String,
+    compress: bool,
     entries: Arc<RwLock<HashMap<String, i64>>>, // key -> modtime as unix nano
     _phantom: PhantomData<T>,
 }
@@ -179,6 +177,7 @@ impl<T> Clone for QueueStore<T> {
             entry_limit: self.entry_limit,
             directory: self.directory.clone(),
             file_ext: self.file_ext.clone(),
+            compress: self.compress,
             entries: Arc::clone(&self.entries),
             _phantom: PhantomData,
         }
@@ -189,25 +188,49 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// Creates a new QueueStore
     pub fn new(directory: impl Into<PathBuf>, limit: u64, ext: &str) -> Self {
         let file_ext = if ext.is_empty() { DEFAULT_EXT } else { ext };
+        let entry_limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
 
         QueueStore {
             directory: directory.into(),
-            entry_limit: if limit == 0 { DEFAULT_LIMIT } else { limit },
+            entry_limit,
             file_ext: file_ext.to_string(),
-            entries: Arc::new(RwLock::new(HashMap::with_capacity(limit as usize))),
+            compress: queue_store_compression_enabled(),
+            entries: Arc::new(RwLock::new(HashMap::with_capacity(entry_limit as usize))),
             _phantom: PhantomData,
         }
     }
 
     /// Returns the full path for a key
     fn file_path(&self, key: &Key) -> PathBuf {
-        self.directory.join(key.to_string())
+        self.directory.join(key.to_key_string())
+    }
+
+    fn ensure_capacity(&self) -> Result<(), StoreError> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
+
+        if entries.len() as u64 >= self.entry_limit {
+            return Err(StoreError::LimitExceeded);
+        }
+
+        Ok(())
+    }
+
+    fn build_key(&self, item_count: usize) -> Key {
+        Key {
+            name: Uuid::new_v4().to_string(),
+            extension: self.file_ext.clone(),
+            item_count,
+            compress: self.compress,
+        }
     }
 
     /// Reads a file for the given key
     fn read_file(&self, key: &Key) -> Result<Vec<u8>, StoreError> {
         let path = self.file_path(key);
-        debug!("Reading file for key: {},path: {}", key.to_string(), path.display());
+        debug!("Reading file for key: {},path: {}", key, path.display());
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound
@@ -253,8 +276,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        entries.insert(key.to_string(), modified);
-        debug!("Wrote event to store: {}", key.to_string());
+        entries.insert(key.to_key_string(), modified);
+        debug!("Wrote event to store: {}", key);
         Ok(())
     }
 }
@@ -269,13 +292,13 @@ where
     fn open(&self) -> Result<(), Self::Error> {
         std::fs::create_dir_all(&self.directory).map_err(StoreError::Io)?;
 
-        let entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
-        // Get the write lock to update the internal state
+        let dir_entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
         let mut entries_map = self
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        for entry in entries {
+        entries_map.clear();
+        for entry in dir_entries {
             let entry = entry.map_err(StoreError::Io)?;
             let metadata = entry.metadata().map_err(StoreError::Io)?;
             if metadata.is_file() {
@@ -292,26 +315,8 @@ where
     }
 
     fn put(&self, item: Arc<T>) -> Result<Self::Key, Self::Error> {
-        // Check storage limits
-        {
-            let entries = self
-                .entries
-                .read()
-                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
-
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(StoreError::LimitExceeded);
-            }
-        }
-
-        let uuid = Uuid::new_v4();
-        let key = Key {
-            name: uuid.to_string(),
-            extension: self.file_ext.clone(),
-            item_count: 1,
-            compress: true,
-        };
-
+        self.ensure_capacity()?;
+        let key = self.build_key(1);
         let data = serde_json::to_vec(&*item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         self.write_file(&key, &data)?;
 
@@ -319,41 +324,15 @@ where
     }
 
     fn put_multiple(&self, items: Vec<T>) -> Result<Self::Key, Self::Error> {
-        // Check storage limits
-        {
-            let entries = self
-                .entries
-                .read()
-                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
-
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(StoreError::LimitExceeded);
-            }
-        }
         if items.is_empty() {
-            // Or return an error, or a special key?
             return Err(StoreError::Internal("Cannot put_multiple with empty items list".to_string()));
         }
-        let uuid = Uuid::new_v4();
-        let key = Key {
-            name: uuid.to_string(),
-            extension: self.file_ext.clone(),
-            item_count: items.len(),
-            compress: true,
-        };
+        self.ensure_capacity()?;
+        let key = self.build_key(items.len());
 
-        // Serialize all items into a single Vec<u8>
-        // This current approach for get_multiple/put_multiple assumes items are concatenated JSON objects.
-        // This might be problematic for deserialization if not handled carefully.
-        // A better approach for multiple items might be to store them as a JSON array `Vec<T>`.
-        // For now, sticking to current logic of concatenating.
         let mut buffer = Vec::new();
         for item in items {
-            // If items are Vec<Event>, and Event is large, this could be inefficient.
-            // The current get_multiple deserializes one by one.
-            let item_data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
-            buffer.extend_from_slice(&item_data);
-            // If using JSON array: buffer = serde_json::to_vec(&items)?
+            serde_json::to_writer(&mut buffer, &item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         }
 
         self.write_file(&key, &buffer)?;
@@ -373,7 +352,7 @@ where
     }
 
     fn get_multiple(&self, key: &Self::Key) -> Result<Vec<T>, Self::Error> {
-        debug!("Reading items from store for key: {}", key.to_string());
+        debug!("Reading items from store for key: {}", key);
         let data = self.read_file(key)?;
         if data.is_empty() {
             return Err(StoreError::Deserialization("Cannot deserialize empty data".to_string()));
@@ -404,7 +383,7 @@ where
                         warn!(
                             "Expected {} items for key {}, but only found {}. Possible data corruption or incorrect item_count.",
                             key.item_count,
-                            key.to_string(),
+                            key,
                             items.len()
                         );
                         // Depending on strictness, this could be an error.
@@ -431,10 +410,7 @@ where
         std::fs::remove_file(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 // If file not found, still try to remove from entries map in case of inconsistency
-                warn!(
-                    "File not found for key {} during del, but proceeding to remove from entries map.",
-                    key.to_string()
-                );
+                warn!("File not found for key {} during del, but proceeding to remove from entries map.", key);
                 StoreError::NotFound
             } else {
                 StoreError::Io(e)
@@ -447,7 +423,7 @@ where
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
-        if entries.remove(&key.to_string()).is_none() {
+        if entries.remove(&key.to_key_string()).is_none() {
             // Key was not in the map, could be an inconsistency or already deleted.
             // This is not necessarily an error if the file deletion succeeded or was NotFound.
             debug!("Key {} not found in entries map during del, might have been already removed.", key);
@@ -490,5 +466,63 @@ where
 
     fn boxed_clone(&self) -> Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync> {
         Box::new(self.clone()) as Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn resolve_queue_store_compression_defaults_to_true() {
+        assert!(resolve_queue_store_compression_from_env_value(None));
+    }
+
+    #[test]
+    fn resolve_queue_store_compression_respects_disabled_env_value() {
+        assert!(!resolve_queue_store_compression_from_env_value(Some("off")));
+        assert!(!resolve_queue_store_compression_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn put_uses_store_compression_setting_in_key() {
+        let dir = temp_store_dir("put-key");
+        let store = QueueStore::<String> {
+            entry_limit: 8,
+            directory: dir.clone(),
+            file_ext: ".test".to_string(),
+            compress: false,
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            _phantom: PhantomData,
+        };
+        store.open().unwrap();
+
+        let key = store.put(Arc::new("payload".to_string())).unwrap();
+
+        assert!(!key.compress);
+        assert!(store.file_path(&key).exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_key_round_trips_batch_and_compression_suffixes() {
+        let key = Key {
+            name: "event-id".to_string(),
+            extension: ".json".to_string(),
+            item_count: 3,
+            compress: true,
+        };
+
+        let parsed = parse_key(&key.to_key_string());
+
+        assert_eq!(parsed.name, key.name);
+        assert_eq!(parsed.extension, key.extension);
+        assert_eq!(parsed.item_count, key.item_count);
+        assert_eq!(parsed.compress, key.compress);
     }
 }
