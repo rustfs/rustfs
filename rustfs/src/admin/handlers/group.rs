@@ -15,6 +15,7 @@
 use crate::{
     admin::{
         auth::validate_admin_request,
+        handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::has_space_be,
     },
@@ -27,7 +28,7 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
-use rustfs_madmin::GroupAddRemove;
+use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -222,7 +223,7 @@ impl Operation for DeleteGroup {
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        iam_store.remove_users_from_group(group, vec![]).await.map_err(|e| {
+        let updated_at = iam_store.remove_users_from_group(group, vec![]).await.map_err(|e| {
             warn!("delete group failed, e: {:?}", e);
             match e {
                 rustfs_iam::error::Error::GroupNotEmpty => {
@@ -240,6 +241,26 @@ impl Operation for DeleteGroup {
                 }
             }
         })?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: GroupAddRemove {
+                    group: group.to_string(),
+                    members: vec![],
+                    status: GroupStatus::Enabled,
+                    is_remove: true,
+                },
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group delete hook failed, err: {err}");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -287,26 +308,46 @@ impl Operation for SetGroupStatus {
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        if let Some(status) = query.status {
-            match status.as_str() {
-                "enabled" => {
-                    iam_store.set_group_status(&query.group, true).await.map_err(|e| {
-                        warn!("enable group failed, e: {:?}", e);
-                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                    })?;
-                }
-                "disabled" => {
-                    iam_store.set_group_status(&query.group, false).await.map_err(|e| {
-                        warn!("enable group failed, e: {:?}", e);
-                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                    })?;
-                }
+        let updated_at = if let Some(status) = query.status.as_deref() {
+            match status {
+                "enabled" => iam_store.set_group_status(&query.group, true).await.map_err(|e| {
+                    warn!("enable group failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?,
+                "disabled" => iam_store.set_group_status(&query.group, false).await.map_err(|e| {
+                    warn!("enable group failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?,
                 _ => {
                     return Err(s3_error!(InvalidArgument, "invalid status"));
                 }
             }
         } else {
             return Err(s3_error!(InvalidArgument, "status is required"));
+        };
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: GroupAddRemove {
+                    group: query.group.clone(),
+                    members: vec![],
+                    status: if matches!(query.status.as_deref(), Some("disabled")) {
+                        GroupStatus::Disabled
+                    } else {
+                        GroupStatus::Enabled
+                    },
+                    is_remove: false,
+                },
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group status hook failed, err: {err}");
         }
 
         let mut header = HeaderMap::new();
@@ -387,15 +428,15 @@ impl Operation for UpdateGroupMembers {
             }
         }
 
-        if args.is_remove {
+        let updated_at = if args.is_remove {
             warn!("remove group members");
             iam_store
-                .remove_users_from_group(&args.group, args.members)
+                .remove_users_from_group(&args.group, args.members.clone())
                 .await
                 .map_err(|e| {
                     warn!("remove group members failed, e: {:?}", e);
                     S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                })?;
+                })?
         } else {
             warn!("add group members");
 
@@ -406,10 +447,28 @@ impl Operation for UpdateGroupMembers {
                 return Err(s3_error!(InvalidArgument, "not such group"));
             }
 
-            iam_store.add_users_to_group(&args.group, args.members).await.map_err(|e| {
-                warn!("add group members failed, e: {:?}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-            })?;
+            iam_store
+                .add_users_to_group(&args.group, args.members.clone())
+                .await
+                .map_err(|e| {
+                    warn!("add group members failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?
+        };
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: args,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group membership hook failed, err: {err}");
         }
 
         let mut header = HeaderMap::new();
