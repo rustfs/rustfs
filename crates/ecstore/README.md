@@ -50,6 +50,12 @@ To run only the end-to-end ECStore range-read benchmark:
 cargo bench -p rustfs-ecstore --bench direct_chunk_benchmark ecstore_get_object_chunks
 ```
 
+To run the reconstructed multi-disk range-read benchmark:
+
+```bash
+cargo bench -p rustfs-ecstore --bench reconstructed_chunk_benchmark
+```
+
 ### Saved Comparison Points
 
 Latest local measurements on this branch:
@@ -59,6 +65,7 @@ Latest local measurements on this branch:
 - `direct_chunk_path/slice_forwarding/multi_block_unaligned`: about `963 ns`
 - `direct_chunk_path/assembled_copy/multi_block_unaligned`: about `7.25 us`
 - `ecstore_get_object_chunks/drain/multi_disk_range`: about `644-654 us`, throughput about `2.86-2.90 GiB/s`
+- `reconstructed_chunk_path/drain/multi_disk_missing_shard`: about `1.292-1.304 ms`, throughput about `1.43-1.45 GiB/s`
 
 These numbers are intended as branch-local reference points. Re-run the benchmark on your target machine before treating them as a regression baseline.
 
