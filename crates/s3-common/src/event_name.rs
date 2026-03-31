@@ -164,7 +164,7 @@ impl EventName {
             "s3:ObjectRemoved:DeleteMarkerCreated" => Ok(EventName::ObjectRemovedDeleteMarkerCreated),
             "s3:ObjectRemoved:NoOP" => Ok(EventName::ObjectRemovedNoOP),
             "s3:ObjectRemoved:DeleteAllVersions" => Ok(EventName::ObjectRemovedDeleteAllVersions),
-            "s3:LifecycleDelMarkerExpiration:Delete" => Ok(EventName::LifecycleExpirationDeleteMarkerCreated),
+            "s3:LifecycleDelMarkerExpiration:Delete" => Ok(EventName::LifecycleDelMarkerExpirationDelete),
             "s3:LifecycleExpiration:*" => Ok(EventName::LifecycleExpirationAll),
             "s3:LifecycleExpiration:Delete" => Ok(EventName::LifecycleExpirationDelete),
             "s3:LifecycleExpiration:DeleteMarkerCreated" => Ok(EventName::LifecycleExpirationDeleteMarkerCreated),
@@ -178,7 +178,7 @@ impl EventName {
             "s3:ObjectRestore:Post" => Ok(EventName::ObjectRestorePost),
             "s3:ObjectRestore:Completed" => Ok(EventName::ObjectRestoreCompleted),
             "s3:ObjectTransition:Failed" => Ok(EventName::ObjectTransitionFailed),
-            "s3:ObjectTransition:Complete" => Ok(EventName::LifecycleTransition),
+            "s3:ObjectTransition:Complete" => Ok(EventName::ObjectTransitionComplete),
             "s3:ObjectTransition:*" => Ok(EventName::ObjectTransitionAll),
             "s3:LifecycleTransition" => Ok(EventName::LifecycleTransition),
             "s3:IntelligentTiering" => Ok(EventName::IntelligentTiering),
@@ -650,10 +650,13 @@ mod tests {
             EventName::parse("s3:ObjectCreated:DeleteTagging").unwrap(),
             EventName::ObjectTaggingDelete
         );
-        assert_eq!(EventName::parse("s3:ObjectTransition:Complete").unwrap(), EventName::LifecycleTransition);
+        assert_eq!(
+            EventName::parse("s3:ObjectTransition:Complete").unwrap(),
+            EventName::ObjectTransitionComplete
+        );
         assert_eq!(
             EventName::parse("s3:LifecycleDelMarkerExpiration:Delete").unwrap(),
-            EventName::LifecycleExpirationDeleteMarkerCreated
+            EventName::LifecycleDelMarkerExpirationDelete
         );
     }
 
