@@ -716,6 +716,12 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
+    if remote_delete_succeeded {
+        opts.skip_decommissioned = true;
+    }
+}
+
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
         enqueue_transition_with_lifecycle(oi, &lc, &src).await;
@@ -795,11 +801,10 @@ pub async fn expire_transitioned_object(
         &oi.transitioned_object.tier,
     )
     .await;
-    if ret.is_ok() {
-        opts.skip_decommissioned = true;
-    } else {
+    if ret.is_err() {
         //transitionLogIf(ctx, err);
     }
+    mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
@@ -812,12 +817,17 @@ pub async fn expire_transitioned_object(
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
+    let event_name = if oi.delete_marker {
+        EventName::LifecycleExpirationDelete
+    } else if dobj.delete_marker {
+        EventName::LifecycleExpirationDeleteMarkerCreated
+    } else {
+        EventName::LifecycleExpirationDelete
+    };
     let obj_info = ObjectInfo {
+        bucket: oi.bucket.clone(),
         name: oi.name.clone(),
+        size: oi.size,
         version_id: oi.version_id,
         delete_marker: oi.delete_marker,
         ..Default::default()
@@ -1225,15 +1235,12 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
-    match lc_event.action {
-        IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
-        IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::LifecycleDelMarkerExpirationDelete,
-        _ => (),
-    }
+    let event_name = match lc_event.action {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => EventName::LifecycleExpirationDelete,
+        _ if oi.delete_marker => EventName::LifecycleExpirationDelete,
+        _ if dobj.delete_marker => EventName::LifecycleExpirationDeleteMarkerCreated,
+        _ => EventName::LifecycleExpirationDelete,
+    };
     send_event(EventArgs {
         event_name: event_name.to_string(),
         bucket_name: dobj.bucket.clone(),
@@ -1277,4 +1284,40 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
         _ => (),
     }
     success
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_delete_opts_skip_decommissioned_on_remote_success;
+    use crate::store_api::ObjectOptions;
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_sets_flag_on_success() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
+
+        assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_false_on_failure() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(!opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_existing_true_on_failure() {
+        let mut opts = ObjectOptions {
+            skip_decommissioned: true,
+            ..ObjectOptions::default()
+        };
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(opts.skip_decommissioned);
+    }
 }

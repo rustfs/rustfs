@@ -15,13 +15,15 @@
 //! Multipart application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
+use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::error::ApiError;
+use crate::storage::access::has_bypass_governance_header;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, parse_copy_source_range,
-    put_opts,
+    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
+    parse_copy_source_range, put_opts,
 };
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
@@ -53,6 +55,7 @@ use rustfs_utils::http::{
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
 };
 use s3s::dto::*;
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -100,6 +103,13 @@ fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<
 
     validate_complete_multipart_parts(&deduped_reversed)?;
     Ok(deduped_reversed)
+}
+
+fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(X_AMZ_OBJECT_LOCK_MODE)
+        || headers.contains_key(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE)
+        || headers.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD)
+        || has_bypass_governance_header(headers)
 }
 
 fn encode_s3_path(path: &str) -> String {
@@ -285,11 +295,28 @@ impl DefaultMultipartUsecase {
 
         let uploaded_parts = normalize_complete_multipart_parts(uploaded_parts_vec)?;
 
-        // TODO: check object lock
+        if has_complete_multipart_object_lock_headers(&req.headers) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "CompleteMultipartUpload does not accept object lock or governance bypass headers.".to_string(),
+            ));
+        }
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        let current_opts = get_opts(&bucket, &key, None, None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         // TDD: Get multipart info to extract encryption configuration before completing
         info!(
@@ -490,7 +517,9 @@ impl DefaultMultipartUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::CreateMultipartUpload);
+        let helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
+                .suppress_event();
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -501,6 +530,9 @@ impl DefaultMultipartUsecase {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
             ..
         } = req.input.clone();
 
@@ -527,6 +559,17 @@ impl DefaultMultipartUsecase {
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
+        }
+
+        if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+            &bucket,
+            object_lock_legal_hold_status,
+            object_lock_mode,
+            object_lock_retain_until_date,
+        )
+        .await?
+        {
+            metadata.extend(object_lock_metadata);
         }
 
         let encryption_request = PrepareEncryptionRequest {
@@ -561,6 +604,18 @@ impl DefaultMultipartUsecase {
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+
+        let current_opts: ObjectOptions = get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
         if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
@@ -1340,6 +1395,36 @@ mod tests {
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].part_num, 1);
         assert_eq!(normalized[0].etag.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn execute_complete_multipart_upload_rejects_object_lock_headers() {
+        let multipart_upload = CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                ..Default::default()
+            }]),
+        };
+
+        for (header_name, header_value) in [
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
+            ("x-amz-object-lock-legal-hold", "ON"),
+            ("x-amz-bypass-governance-retention", "true"),
+        ] {
+            let input = CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .multipart_upload(Some(multipart_upload.clone()))
+                .build()
+                .unwrap();
+            let mut req = build_request(input, Method::POST);
+            req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
+
+            let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
+        }
     }
 
     #[tokio::test]

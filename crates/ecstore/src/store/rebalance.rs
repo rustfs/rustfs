@@ -13,7 +13,133 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::utils::is_meta_bucketname;
+
+struct LatestObjectInfoCandidate {
+    info: Option<ObjectInfo>,
+    idx: usize,
+    err: Option<Error>,
+}
+
+fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
+    let object = decode_dir_object(object);
+
+    if let Some(version_id) = &opts.version_id {
+        StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), version_id.clone())
+    } else {
+        StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())
+    }
+}
+
+fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
+}
+
+fn resolve_rebalance_delete_from_all_pools_result(result: Result<ObjectInfo>, bucket: &str, object: &str) -> Result<ObjectInfo> {
+    result.map_err(|err| Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}")))
+}
+
+fn rebalance_disk_set_lookup_error(pool_idx: usize, set_idx: usize, pool_count: usize) -> Error {
+    Error::other(format!(
+        "failed to resolve rebalance disk set: pool index {pool_idx}, set index {set_idx}, pool count {pool_count}",
+    ))
+}
+
+fn resolve_latest_object_info_candidates(
+    mut candidates: Vec<LatestObjectInfoCandidate>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    candidates.sort_by(|a, b| {
+        let a_mod = if let Some(info) = &a.info {
+            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+
+        let b_mod = if let Some(info) = &b.info {
+            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+
+        if a_mod == b_mod {
+            return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
+        }
+
+        b_mod.cmp(&a_mod)
+    });
+
+    for candidate in candidates {
+        if let Some(info) = candidate.info {
+            return Ok((info, candidate.idx));
+        }
+
+        if let Some(err) = candidate.err
+            && !is_err_object_not_found(&err)
+            && !is_err_version_not_found(&err)
+        {
+            return Err(err);
+        }
+    }
+
+    Err(pool_lookup_not_found_error(bucket, object, opts))
+}
+
+async fn build_server_pools_available_space(
+    bucket: &str,
+    size: i64,
+    n_sets: &[usize],
+    infos: &[Vec<Option<DiskInfo>>],
+) -> ServerPoolsAvailableSpace {
+    let mut server_pools = vec![PoolAvailableSpace::default(); infos.len()];
+
+    for (i, zinfo) in infos.iter().enumerate() {
+        if zinfo.is_empty() {
+            server_pools[i] = PoolAvailableSpace {
+                index: i,
+                ..Default::default()
+            };
+
+            continue;
+        }
+
+        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
+            server_pools[i] = PoolAvailableSpace {
+                index: i,
+                ..Default::default()
+            };
+
+            continue;
+        }
+
+        let mut available = 0;
+        let mut max_used_pct = 0;
+        for disk in zinfo.iter().flatten() {
+            if disk.total == 0 {
+                continue;
+            }
+
+            available += disk.total - disk.used;
+
+            let pct_used = disk.used * 100 / disk.total;
+
+            if pct_used > max_used_pct {
+                max_used_pct = pct_used;
+            }
+        }
+
+        available *= n_sets[i] as u64;
+
+        server_pools[i] = PoolAvailableSpace {
+            index: i,
+            available,
+            max_used_pct,
+        }
+    }
+
+    ServerPoolsAvailableSpace(server_pools)
+}
 
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
@@ -72,7 +198,7 @@ impl ECStore {
         Ok(())
     }
 
-    async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+    pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
         // // Return a random one first
 
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
@@ -102,67 +228,26 @@ impl ECStore {
     async fn get_server_pools_available_space(&self, bucket: &str, object: &str, size: i64) -> ServerPoolsAvailableSpace {
         let mut n_sets = vec![0; self.pools.len()];
         let mut infos = vec![Vec::new(); self.pools.len()];
-
-        // TODO: add concurrency
-        for (idx, pool) in self.pools.iter().enumerate() {
+        let pool_inputs = join_all(self.pools.iter().enumerate().map(|(idx, pool)| async move {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
-                continue;
+                return (idx, 0, Vec::new());
             }
 
-            n_sets[idx] = pool.set_count;
+            let disk_infos = match pool.get_disks_by_key(object).get_disks(0, 0).await {
+                Ok(disks) => get_disk_infos(&disks).await,
+                Err(_) => Vec::new(),
+            };
 
-            if let Ok(disks) = pool.get_disks_by_key(object).get_disks(0, 0).await {
-                let disk_infos = get_disk_infos(&disks).await;
-                infos[idx] = disk_infos;
-            }
+            (idx, pool.set_count, disk_infos)
+        }))
+        .await;
+
+        for (idx, set_count, disk_infos) in pool_inputs {
+            n_sets[idx] = set_count;
+            infos[idx] = disk_infos;
         }
 
-        let mut server_pools = vec![PoolAvailableSpace::default(); self.pools.len()];
-        for (i, zinfo) in infos.iter().enumerate() {
-            if zinfo.is_empty() {
-                server_pools[i] = PoolAvailableSpace {
-                    index: i,
-                    ..Default::default()
-                };
-
-                continue;
-            }
-
-            if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-                server_pools[i] = PoolAvailableSpace {
-                    index: i,
-                    ..Default::default()
-                };
-
-                continue;
-            }
-
-            let mut available = 0;
-            let mut max_used_pct = 0;
-            for disk in zinfo.iter().flatten() {
-                if disk.total == 0 {
-                    continue;
-                }
-
-                available += disk.total - disk.used;
-
-                let pct_used = disk.used * 100 / disk.total;
-
-                if pct_used > max_used_pct {
-                    max_used_pct = pct_used;
-                }
-            }
-
-            available *= n_sets[i] as u64;
-
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                available,
-                max_used_pct,
-            }
-        }
-
-        ServerPoolsAvailableSpace(server_pools)
+        build_server_pools_available_space(bucket, size, &n_sets, &infos).await
     }
 
     pub(super) async fn is_suspended(&self, idx: usize) -> bool {
@@ -349,7 +434,7 @@ impl ECStore {
             return Ok((def_pool, Vec::new()));
         }
 
-        Err(Error::ObjectNotFound(bucket.to_owned(), object.to_owned()))
+        Err(pool_lookup_not_found_error(bucket, object, opts))
     }
 
     async fn pools_with_object(&self, pools: &[PoolObjInfo], opts: &ObjectOptions) -> Vec<PoolErr> {
@@ -393,27 +478,20 @@ impl ECStore {
         }
 
         let results = join_all(futures).await;
-
-        struct IndexRes {
-            res: Option<ObjectInfo>,
-            idx: usize,
-            err: Option<Error>,
-        }
-
-        let mut idx_res = Vec::with_capacity(self.pools.len());
+        let mut candidates = Vec::with_capacity(self.pools.len());
 
         for (idx, result) in results.into_iter().enumerate() {
             match result {
                 Ok(res) => {
-                    idx_res.push(IndexRes {
-                        res: Some(res),
+                    candidates.push(LatestObjectInfoCandidate {
+                        info: Some(res),
                         idx,
                         err: None,
                     });
                 }
                 Err(e) => {
-                    idx_res.push(IndexRes {
-                        res: None,
+                    candidates.push(LatestObjectInfoCandidate {
+                        info: None,
                         idx,
                         err: Some(e),
                     });
@@ -421,53 +499,10 @@ impl ECStore {
             }
         }
 
-        // TODO: test order
-        idx_res.sort_by(|a, b| {
-            let a_mod = if let Some(o1) = &a.res {
-                o1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                OffsetDateTime::UNIX_EPOCH
-            };
-
-            let b_mod = if let Some(o2) = &b.res {
-                o2.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                OffsetDateTime::UNIX_EPOCH
-            };
-
-            if a_mod == b_mod {
-                return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
-            }
-
-            b_mod.cmp(&a_mod)
-        });
-
-        for res in idx_res.into_iter() {
-            if let Some(obj) = res.res {
-                return Ok((obj, res.idx));
-            }
-
-            if let Some(err) = res.err
-                && !is_err_object_not_found(&err)
-                && !is_err_version_not_found(&err)
-            {
-                return Err(err);
-            }
-
-            // TODO: delete marker
-        }
-
-        let object = decode_dir_object(object);
-
-        if opts.version_id.is_none() {
-            Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
-        } else {
-            Err(StorageError::VersionNotFound(
-                bucket.to_owned(),
-                object.to_owned(),
-                opts.version_id.clone().unwrap_or_default(),
-            ))
-        }
+        // Delete markers are returned as latest object infos here. Higher-level
+        // access paths are responsible for translating them into read/write
+        // semantics such as object-not-found or method-not-allowed.
+        resolve_latest_object_info_candidates(candidates, bucket, object, opts)
     }
 
     pub(super) async fn delete_object_from_all_pools(
@@ -505,15 +540,18 @@ impl ECStore {
         }
 
         if let Some(e) = &derrs[0] {
-            return Err(e.clone());
+            return resolve_rebalance_delete_from_all_pools_result(Err(e.clone()), bucket, object);
         }
 
-        Ok(objs[0].as_ref().unwrap().clone())
+        resolve_rebalance_delete_from_all_pools_result(Ok(objs[0].as_ref().unwrap().clone()), bucket, object)
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
         let mut meta = PoolMeta::default();
-        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
+        resolve_store_rebalance_pool_meta_reload_result(
+            meta.load(self.pools[0].clone(), self.pools.clone()).await,
+            "reload_pool_meta",
+        )?;
 
         let mut pool_meta = self.pool_meta.write().await;
         *pool_meta = meta;
@@ -670,7 +708,7 @@ impl ECStore {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
             self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
         } else {
-            Err(Error::other(format!("pool idx {pool_idx}, set idx {set_idx}, not found")))
+            Err(rebalance_disk_set_lookup_error(pool_idx, set_idx, self.pools.len()))
         }
     }
 
@@ -697,5 +735,218 @@ impl ECStore {
         }
 
         Err(Error::DiskNotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::DiskInfo;
+
+    fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
+        ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
+            delete_marker,
+            ..Default::default()
+        }
+    }
+
+    fn disk_info(total: u64, used: u64, free: u64) -> DiskInfo {
+        DiskInfo {
+            total,
+            used,
+            free,
+            free_inodes: 1_024,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_latest_delete_marker() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(20, true)),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let (info, idx) =
+            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_mod_time(10, false)),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_non_not_found_error() {
+        let err = resolve_latest_object_info_candidates(
+            vec![LatestObjectInfoCandidate {
+                info: None,
+                idx: 0,
+                err: Some(Error::ErasureReadQuorum),
+            }],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_returns_version_not_found_for_versioned_lookups() {
+        let err = resolve_latest_object_info_candidates(
+            vec![LatestObjectInfoCandidate {
+                info: None,
+                idx: 0,
+                err: Some(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+            }],
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
+    }
+
+    #[test]
+    fn pool_lookup_not_found_error_returns_object_not_found_for_latest_lookup() {
+        let err = pool_lookup_not_found_error("bucket", "object", &ObjectOptions::default());
+
+        assert_eq!(err, Error::ObjectNotFound("bucket".to_string(), "object".to_string()));
+    }
+
+    #[test]
+    fn pool_lookup_not_found_error_returns_version_not_found_for_versioned_lookup() {
+        let err = pool_lookup_not_found_error(
+            "bucket",
+            "object",
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_store_rebalance_pool_meta_reload_result_passthrough_ok() {
+        resolve_store_rebalance_pool_meta_reload_result(Ok(()), "reload_pool_meta")
+            .expect("successful pool meta reload should pass through");
+    }
+
+    #[test]
+    fn resolve_store_rebalance_pool_meta_reload_result_wraps_error_context() {
+        let err = resolve_store_rebalance_pool_meta_reload_result(Err(Error::SlowDown), "reload_pool_meta")
+            .expect_err("failed pool meta reload should be wrapped");
+        let err_message = err.to_string();
+        assert!(err_message.contains("store rebalance pool meta reload failed during reload_pool_meta"));
+        assert!(err_message.contains(&Error::SlowDown.to_string()));
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_result_passthrough_ok() {
+        let info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+
+        let resolved = resolve_rebalance_delete_from_all_pools_result(Ok(info.clone()), "bucket", "object")
+            .expect("successful rebalance delete should pass through");
+
+        assert_eq!(resolved.bucket, info.bucket);
+        assert_eq!(resolved.name, info.name);
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_result_wraps_object_context() {
+        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::SlowDown), "bucket", "object")
+            .expect_err("failed rebalance delete should be wrapped");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to delete rebalance source object bucket/object"), "{rendered}");
+        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn rebalance_disk_set_lookup_error_formats_pool_and_set_context() {
+        let err = rebalance_disk_set_lookup_error(2, 7, 3);
+
+        assert!(
+            err.to_string()
+                .contains("failed to resolve rebalance disk set: pool index 2, set index 7, pool count 3")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_returns_zero_for_empty_pool_info() {
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &[Vec::new()]).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].index, 0);
+        assert_eq!(spaces.0[0].available, 0);
+        assert_eq!(spaces.0[0].max_used_pct, 0);
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_computes_available_capacity_and_max_used_pct() {
+        let infos = vec![vec![Some(disk_info(1_000, 100, 900)), Some(disk_info(1_000, 200, 800))]];
+
+        let spaces = build_server_pools_available_space("bucket-a", 64, &[2], &infos).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].index, 0);
+        assert_eq!(spaces.0[0].available, 3_400);
+        assert_eq!(spaces.0[0].max_used_pct, 20);
+    }
+
+    #[tokio::test]
+    async fn build_server_pools_available_space_skips_capacity_guard_for_meta_bucket() {
+        let infos = vec![vec![Some(disk_info(10, 9, 1)), Some(disk_info(10, 9, 1))]];
+
+        let spaces = build_server_pools_available_space(crate::disk::RUSTFS_META_BUCKET, 1_024, &[1], &infos).await;
+
+        assert_eq!(spaces.0.len(), 1);
+        assert_eq!(spaces.0[0].available, 2);
+        assert_eq!(spaces.0[0].max_used_pct, 90);
     }
 }

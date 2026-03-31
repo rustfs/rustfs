@@ -28,10 +28,7 @@ static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::ne
 
 fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
     let cache = cache.get_or_init(Default::default);
-    let mut cache = match cache.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some(existing) = cache.get(value) {
         existing

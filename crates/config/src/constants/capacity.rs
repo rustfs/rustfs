@@ -62,32 +62,32 @@ pub const ENV_CAPACITY_STALL_TIMEOUT: &str = "RUSTFS_CAPACITY_STALL_TIMEOUT";
 // ============================================================================
 
 /// Scheduled update interval in seconds
-/// Default: 300 seconds (5 minutes)
-pub const DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS: u64 = 300;
+/// Default: 120 seconds (2 minutes)
+pub const DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS: u64 = 120;
 
 /// Write trigger delay in seconds
-/// Default: 10 seconds
-pub const DEFAULT_WRITE_TRIGGER_DELAY_SECS: u64 = 10;
+/// Default: 5 seconds
+pub const DEFAULT_WRITE_TRIGGER_DELAY_SECS: u64 = 5;
 
 /// Write frequency threshold (writes per minute)
-/// Default: 10 writes/minute
-pub const DEFAULT_WRITE_FREQUENCY_THRESHOLD: usize = 10;
+/// Default: 5 writes/minute
+pub const DEFAULT_WRITE_FREQUENCY_THRESHOLD: usize = 5;
 
 /// Fast update threshold in seconds
-/// Default: 60 seconds
-pub const DEFAULT_FAST_UPDATE_THRESHOLD_SECS: u64 = 60;
+/// Default: 30 seconds
+pub const DEFAULT_FAST_UPDATE_THRESHOLD_SECS: u64 = 30;
 
 /// Maximum files threshold for sampling
-/// Default: 1,000,000 files
-pub const DEFAULT_MAX_FILES_THRESHOLD: usize = 1_000_000;
+/// Default: 200,000 files
+pub const DEFAULT_MAX_FILES_THRESHOLD: usize = 200_000;
 
 /// Statistics timeout in seconds
-/// Default: 5 seconds
-pub const DEFAULT_STAT_TIMEOUT_SECS: u64 = 5;
+/// Default: 3 seconds
+pub const DEFAULT_STAT_TIMEOUT_SECS: u64 = 3;
 
 /// Sampling rate (1 in every N files)
-/// Default: 100
-pub const DEFAULT_SAMPLE_RATE: usize = 100;
+/// Default: 200
+pub const DEFAULT_SAMPLE_RATE: usize = 200;
 
 /// Follow symbolic links during capacity calculation
 /// Default: false (disabled for safety)
@@ -102,16 +102,16 @@ pub const DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH: u8 = 3;
 pub const DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT: bool = true;
 
 /// Minimum capacity calculation timeout in seconds
-/// Default: 5 seconds
-pub const DEFAULT_CAPACITY_MIN_TIMEOUT_SECS: u64 = 5;
+/// Default: 2 seconds
+pub const DEFAULT_CAPACITY_MIN_TIMEOUT_SECS: u64 = 2;
 
 /// Maximum capacity calculation timeout in seconds
-/// Default: 60 seconds
-pub const DEFAULT_CAPACITY_MAX_TIMEOUT_SECS: u64 = 60;
+/// Default: 15 seconds
+pub const DEFAULT_CAPACITY_MAX_TIMEOUT_SECS: u64 = 15;
 
 /// Progress stall detection timeout in seconds
-/// Default: 1 second (no progress for 1 second = stall)
-pub const DEFAULT_CAPACITY_STALL_TIMEOUT_SECS: u64 = 1;
+/// Default: 20 seconds
+pub const DEFAULT_CAPACITY_STALL_TIMEOUT_SECS: u64 = 20;
 
 // ============================================================================
 // Tests
@@ -140,16 +140,16 @@ mod tests {
 
     #[test]
     fn test_default_values() {
-        assert_eq!(DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, 300);
-        assert_eq!(DEFAULT_WRITE_TRIGGER_DELAY_SECS, 10);
-        assert_eq!(DEFAULT_WRITE_FREQUENCY_THRESHOLD, 10);
-        assert_eq!(DEFAULT_FAST_UPDATE_THRESHOLD_SECS, 60);
-        assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 1_000_000);
-        assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 5);
-        assert_eq!(DEFAULT_SAMPLE_RATE, 100);
+        assert_eq!(DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, 120);
+        assert_eq!(DEFAULT_WRITE_TRIGGER_DELAY_SECS, 5);
+        assert_eq!(DEFAULT_WRITE_FREQUENCY_THRESHOLD, 5);
+        assert_eq!(DEFAULT_FAST_UPDATE_THRESHOLD_SECS, 30);
+        assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 200_000);
+        assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 3);
+        assert_eq!(DEFAULT_SAMPLE_RATE, 200);
         assert_eq!(DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH, 3);
-        assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 5);
-        assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 60);
-        assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 1);
+        assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 2);
+        assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 15);
+        assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 20);
     }
 }

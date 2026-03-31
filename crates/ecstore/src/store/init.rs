@@ -13,7 +13,83 @@
 // limitations under the License.
 
 use super::*;
+use crate::error::is_err_decommission_running;
 use crate::global::is_first_cluster_node_local;
+
+fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
+    let pool = endpoints.as_ref().get(idx).ok_or_else(|| {
+        Error::other(format!(
+            "store init failed to resolve decommission resume pool index {idx} from current endpoints"
+        ))
+    })?;
+    let endpoint = pool.endpoints.as_ref().first().ok_or_else(|| {
+        Error::other(format!(
+            "store init failed to resolve decommission resume pool index {idx}: no endpoints available"
+        ))
+    })?;
+
+    Ok(endpoint.is_local)
+}
+
+const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
+const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
+const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
+    matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
+}
+
+async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = rx.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn resolve_store_init_stage_result(result: Result<()>, stage: &str) -> Result<()> {
+    result.map_err(|err| Error::other(format!("store init failed during {stage}: {err}")))
+}
+
+async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
+    for attempt in 0..=LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES {
+        if rx.is_cancelled() {
+            return;
+        }
+
+        match store.decommission(rx.clone(), pool_indices.clone()).await {
+            Ok(()) => return,
+            Err(err) if is_err_decommission_running(&err) => {
+                if let Err(spawn_err) = store
+                    .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
+                    .await
+                {
+                    error!(
+                        "store init failed to resume decommission workers for pools {:?}: {}",
+                        pool_indices, spawn_err
+                    );
+                }
+                return;
+            }
+            Err(err) if should_retry_local_decommission_resume(&err, attempt) => {
+                warn!(
+                    "store init decommission resume missing config for pools {:?}, retry {}/{}: {}",
+                    pool_indices,
+                    attempt + 1,
+                    LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES + 1,
+                    err
+                );
+                tokio::select! {
+                    _ = rx.cancelled() => return,
+                    _ = tokio::time::sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
+                }
+            }
+            Err(err) => {
+                error!("store init failed to resume decommission for pools {:?}: {}", pool_indices, err);
+                return;
+            }
+        }
+    }
+}
 
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
@@ -87,7 +163,7 @@ impl ECStore {
                         Ok(fm) => break Ok(fm),
                         // Wrap the final error if we are giving up
                         Err(e) if times >= 10 => {
-                            break Err(Error::other(format!("can not get formats after {} retries, last error: {e}", times)));
+                            break Err(Error::other(format!("store init failed to load formats after {times} retries: {e}")));
                         }
                         // Retrying so just drop the error
                         Err(_) => {}
@@ -118,10 +194,10 @@ impl ECStore {
             }
 
             if deployment_id != Some(fm.id) {
-                return Err(Error::other("deployment_id not same in one pool"));
+                return Err(Error::other("store init failed: deployment IDs do not match across pools"));
             }
 
-            if deployment_id.is_some() && deployment_id.unwrap().is_nil() {
+            if deployment_id.is_some_and(|id| id.is_nil()) {
                 deployment_id = Some(Uuid::new_v4());
             }
 
@@ -152,7 +228,7 @@ impl ECStore {
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
-            id: deployment_id.unwrap(),
+            id: deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?,
             disk_map,
             pools,
             peer_sys,
@@ -177,7 +253,7 @@ impl ECStore {
                 sleep(Duration::from_secs(wait_sec)).await;
 
                 if exit_count > 10 {
-                    return Err(Error::other("ec init failed"));
+                    return Err(Error::other("store init failed: init retry budget exhausted"));
                 }
 
                 exit_count += 1;
@@ -197,13 +273,25 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
-        if self.load_rebalance_meta().await.is_ok() {
-            self.start_rebalance().await;
+        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
+        if self.rebalance_meta.read().await.is_some() {
+            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
         }
 
         let mut meta = PoolMeta::default();
-        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
+        resolve_store_init_stage_result(
+            meta.load(
+                self.pools
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| Error::other("store init failed: no storage pools available"))?,
+                self.pools.clone(),
+            )
+            .await,
+            "load_pool_meta",
+        )?;
         let update = meta.validate(self.pools.clone())?;
+        let endpoints = get_global_endpoints();
         let should_persist_pool_meta = is_first_cluster_node_local().await;
 
         if !update {
@@ -213,8 +301,10 @@ impl ECStore {
             }
         } else {
             let new_meta = PoolMeta::new(&self.pools, &meta);
+            // Only one local node should persist validated pool metadata here; otherwise
+            // distributed startup can race on the same lock and replay the prior init bug.
             if should_persist_pool_meta {
-                new_meta.save(self.pools.clone()).await?;
+                resolve_store_init_stage_result(new_meta.save(self.pools.clone()).await, "save_validated_pool_meta")?;
             }
             {
                 let mut pool_meta = self.pool_meta.write().await;
@@ -225,14 +315,12 @@ impl ECStore {
         let pools = meta.return_resumable_pools();
         let mut pool_indices = Vec::with_capacity(pools.len());
 
-        let endpoints = get_global_endpoints();
-
         for p in pools.iter() {
             if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
                 pool_indices.push(idx);
             } else {
                 return Err(Error::other(format!(
-                    "unexpected state present for decommission status pool({}) not found",
+                    "store init failed to resolve resumable decommission pool `{}` from current endpoints",
                     p.cmd_line
                 )));
             }
@@ -240,25 +328,14 @@ impl ECStore {
 
         if !pool_indices.is_empty() {
             let idx = pool_indices[0];
-            if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
+            if should_resume_local_decommission(&endpoints, idx)? {
                 let store = self.clone();
 
                 tokio::spawn(async move {
-                    // wait  3 minutes for cluster init
-                    tokio::time::sleep(Duration::from_secs(60 * 3)).await;
-
-                    if let Err(err) = store.decommission(rx.clone(), pool_indices.clone()).await {
-                        if err == StorageError::DecommissionAlreadyRunning {
-                            for i in pool_indices.iter() {
-                                store.do_decommission_in_routine(rx.clone(), *i).await;
-                            }
-                            return;
-                        }
-
-                        error!("store init decommission err: {}", err);
-
-                        // TODO: check config err
+                    if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                        return;
                     }
+                    resume_local_decommission_after_init(store, rx, pool_indices).await;
                 });
             }
         }
@@ -282,5 +359,108 @@ impl ECStore {
 
     pub fn single_pool(&self) -> bool {
         self.pools.len() == 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, resolve_store_init_stage_result, should_resume_local_decommission,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+    };
+    use crate::{
+        disk::endpoint::Endpoint,
+        endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+        error::StorageError,
+    };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn test_should_resume_local_decommission_respects_local_flag() {
+        let mut local_endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("endpoint should parse");
+        local_endpoint.is_local = true;
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![local_endpoint]),
+            cmd_line: "pool-0".to_string(),
+            platform: String::new(),
+        }]);
+
+        assert!(should_resume_local_decommission(&endpoints, 0).expect("local endpoint should resume"));
+    }
+
+    #[test]
+    fn test_should_resume_local_decommission_rejects_unresolvable_pool() {
+        let endpoints = EndpointServerPools::default();
+        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing pool should error");
+        assert_eq!(
+            err.to_string(),
+            "Io error: store init failed to resolve decommission resume pool index 0 from current endpoints"
+        );
+    }
+
+    #[test]
+    fn test_should_resume_local_decommission_rejects_missing_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(Vec::<Endpoint>::new()),
+            cmd_line: "pool-0".to_string(),
+            platform: String::new(),
+        }]);
+        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing endpoint should error");
+        assert_eq!(
+            err.to_string(),
+            "Io error: store init failed to resolve decommission resume pool index 0: no endpoints available"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_accepts_config_not_found_before_retry_limit() {
+        assert!(should_retry_local_decommission_resume(&StorageError::ConfigNotFound, 0));
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_rejects_config_not_found_at_retry_limit() {
+        assert!(!should_retry_local_decommission_resume(
+            &StorageError::ConfigNotFound,
+            LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
+        ));
+    }
+
+    #[test]
+    fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
+        assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[test]
+    fn test_resolve_store_init_stage_result_passthrough_ok() {
+        resolve_store_init_stage_result(Ok(()), "load_rebalance_meta").expect("successful stage should pass through");
+    }
+
+    #[test]
+    fn test_resolve_store_init_stage_result_wraps_error_context() {
+        let err = resolve_store_init_stage_result(Err(StorageError::SlowDown), "start_rebalance")
+            .expect_err("failed stage should be wrapped");
+        let err_message = err.to_string();
+        assert!(err_message.contains("store init failed during start_rebalance"));
+        assert!(err_message.contains(&StorageError::SlowDown.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_local_decommission_resume_delay_returns_true_after_delay() {
+        let rx = CancellationToken::new();
+        assert!(wait_for_local_decommission_resume_delay(&rx, Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_local_decommission_resume_delay_returns_false_when_cancelled() {
+        let rx = CancellationToken::new();
+        rx.cancel();
+        assert!(!wait_for_local_decommission_resume_delay(&rx, Duration::from_secs(1)).await);
     }
 }

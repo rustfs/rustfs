@@ -16,10 +16,9 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::capacity_manager::{
-    DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
+    CapacityUpdate, DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
     get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout, get_stat_timeout,
 };
-use crate::capacity::capacity_metrics::get_capacity_metrics;
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
@@ -28,6 +27,10 @@ use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
+use rustfs_io_metrics::{
+    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected, record_capacity_symlink,
+    record_capacity_timeout_fallback,
+};
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::collections::HashSet;
@@ -42,6 +45,31 @@ pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
     pub include_pools: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CapacityScanResult {
+    pub used_bytes: u64,
+    pub file_count: usize,
+    pub sampled_count: usize,
+    pub is_estimated: bool,
+    pub scan_duration: Duration,
+    pub had_partial_errors: bool,
+}
+
+impl CapacityScanResult {
+    fn with_partial_errors(mut self) -> Self {
+        self.had_partial_errors = true;
+        self
+    }
+
+    pub(crate) fn to_capacity_update(self) -> CapacityUpdate {
+        if self.is_estimated {
+            CapacityUpdate::estimated(self.used_bytes, self.file_count)
+        } else {
+            CapacityUpdate::exact(self.used_bytes, self.file_count)
+        }
+    }
 }
 
 pub struct QueryServerInfoResponse {
@@ -69,47 +97,66 @@ pub struct QueryPoolStatusRequest {
 /// Calculate actual used capacity of all data directories
 pub(crate) async fn calculate_data_dir_used_capacity(
     disks: &[rustfs_madmin::Disk],
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<CapacityScanResult, Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
     let mut total_used = 0u64;
+    let mut total_files = 0usize;
+    let mut total_sampled = 0usize;
     let mut has_failure = false;
     let mut has_success = false;
+    let mut is_estimated = false;
 
     for disk in disks {
         let path = Path::new(&disk.drive_path);
 
-        // Check if path exists
         if !path.exists() {
             warn!("Data directory does not exist: {}", disk.drive_path);
             has_failure = true;
             continue;
         }
 
-        // Asynchronously calculate directory size
         match get_dir_size_async(path).await {
-            Ok(size) => {
-                debug!("Data directory {} size: {} bytes", disk.drive_path, size);
-                total_used += size;
+            Ok(scan) => {
+                debug!(
+                    "Data directory {} size: {} bytes, files={}, sampled={}, estimated={}",
+                    disk.drive_path, scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated
+                );
+                total_used += scan.used_bytes;
+                total_files += scan.file_count;
+                total_sampled += scan.sampled_count;
+                is_estimated |= scan.is_estimated;
+                has_failure |= scan.had_partial_errors;
                 has_success = true;
             }
             Err(e) => {
                 warn!("Failed to get size for directory {}: {:?}", disk.drive_path, e);
                 has_failure = true;
-                // Continue with other directories
             }
         }
     }
 
-    // If all directories failed, return error to trigger fallback
     if !has_success {
         return Err("All directories failed to calculate size".into());
     }
 
-    // Log warning if there were some failures
     if has_failure {
         warn!("Some directories failed to calculate size, result may be incomplete");
     }
 
-    Ok(total_used)
+    let mut result = CapacityScanResult {
+        used_bytes: total_used,
+        file_count: total_files,
+        sampled_count: total_sampled,
+        is_estimated,
+        scan_duration: start.elapsed(),
+        had_partial_errors: false,
+    };
+
+    if has_failure {
+        result = result.with_partial_errors();
+    }
+
+    Ok(result)
 }
 
 // ============================================================================
@@ -159,11 +206,7 @@ impl SymlinkTracker {
         self.visited.insert(path);
         self.symlink_count += 1;
         self.symlink_size += size;
-
-        // Record to metrics
-        if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
-            metrics.record_symlink(size);
-        }
+        record_capacity_symlink(size);
     }
 
     /// Get symlink statistics
@@ -269,11 +312,8 @@ impl ProgressMonitor {
                 files_processed, elapsed, dynamic_timeout
             );
 
-            // Record timeout to metrics
-            if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics))
-                && self.used_dynamic_timeout
-            {
-                metrics.record_dynamic_timeout();
+            if self.enable_dynamic_timeout {
+                record_capacity_dynamic_timeout(dynamic_timeout);
             }
 
             return Err(std::io::Error::new(
@@ -294,10 +334,7 @@ impl ProgressMonitor {
                     self.stall_timeout, files_processed
                 );
 
-                // Record stall to metrics
-                if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
-                    metrics.record_stall_detected();
-                }
+                record_capacity_stall_detected();
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -314,17 +351,14 @@ impl ProgressMonitor {
 
     /// Record timeout fallback to sampling
     fn record_timeout_fallback(&self) {
-        if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(get_capacity_metrics)) {
-            metrics.record_timeout_fallback();
-        }
+        record_capacity_timeout_fallback();
     }
 }
 
 /// Asynchronously get directory size with enhanced symlink handling and dynamic timeout
-async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
+async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::Error> {
     let path = path.to_path_buf();
 
-    // Get configuration values
     let max_files_threshold = get_max_files_threshold();
     let base_timeout = get_stat_timeout();
     let min_timeout = get_min_timeout();
@@ -335,7 +369,6 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
     let follow_symlinks = get_follow_symlinks();
     let max_symlink_depth = get_max_symlink_depth();
 
-    // Ensure sample_rate is never zero to avoid panics in is_multiple_of
     let effective_sample_rate = if sample_rate == 0 {
         warn!("Invalid sampling configuration: sample_rate=0. Clamping to 1 to avoid panic.");
         1
@@ -343,7 +376,6 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         sample_rate
     };
 
-    // Check if path exists before traversing
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -351,15 +383,14 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         ));
     }
 
-    // Use tokio::task::spawn_blocking to avoid blocking the async runtime
     tokio::task::spawn_blocking(move || {
         let start_time = Instant::now();
-        let mut total_size = 0u64;
+        let mut exact_prefix_bytes = 0u64;
+        let mut overflow_sampled_bytes = 0u64;
         let mut file_count = 0usize;
-        let mut sampled_size = 0u64;
         let mut sampled_count = 0usize;
+        let mut had_partial_errors = false;
 
-        // Initialize symlink tracker and progress monitor
         let mut symlink_tracker = if follow_symlinks {
             Some(SymlinkTracker::new(max_symlink_depth))
         } else {
@@ -369,7 +400,6 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         let mut progress_monitor =
             ProgressMonitor::new(base_timeout, min_timeout, max_timeout, stall_timeout, enable_dynamic_timeout);
 
-        // Build WalkDir with appropriate settings
         let mut walker_builder = WalkDir::new(&path);
         if !follow_symlinks {
             walker_builder = walker_builder.follow_links(false);
@@ -377,79 +407,87 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
         let walker = walker_builder.into_iter();
 
         for entry_result in walker {
-            // Propagate traversal errors instead of silently dropping them
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
                     warn!("Failed to traverse directory entry under {:?}: {}", path, err);
-                    return Err(std::io::Error::other(err.to_string()));
-                }
-            };
-
-            // Get file metadata
-            let metadata = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(err) => {
-                    warn!("Failed to get metadata for {:?}: {}", entry.path(), err);
+                    had_partial_errors = true;
                     continue;
                 }
             };
 
-            // Handle symlinks if enabled
+            let metadata = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    warn!("Failed to get metadata for {:?}: {}", entry.path(), err);
+                    had_partial_errors = true;
+                    continue;
+                }
+            };
+
             if metadata.is_symlink() {
                 if let Some(ref mut tracker) = symlink_tracker
                     && let Ok(target) = std::fs::read_link(entry.path())
                     && tracker.should_follow(&target, 0)
                 {
                     tracker.record_symlink(target, metadata.len());
-                    // Don't count symlink size itself, only target
-                    continue;
                 }
-                // If not following symlinks, skip
                 continue;
             }
 
-            // Only count file sizes, ignore directories
             if !metadata.is_file() {
                 continue;
             }
 
             file_count += 1;
+            let exact_count = file_count.min(max_files_threshold);
+            let avg_size = if exact_count > 0 {
+                exact_prefix_bytes / exact_count as u64
+            } else {
+                0
+            };
 
-            // Update progress and check for timeout/stall
-            let avg_size = if file_count > 0 { total_size / file_count as u64 } else { 0 };
             if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
-                // Timeout or stall detected
                 if sampled_count > 0 {
-                    info!("Timeout/stall at {} files, using sampled estimate", file_count);
+                    let overflow_count = file_count.saturating_sub(max_files_threshold);
+                    let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+                    let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
+                    info!(
+                        "Timeout/stall at {} files, using sampled estimate: exact_prefix={} overflow_estimate={} sampled={}",
+                        file_count, exact_prefix_bytes, estimated_overflow, sampled_count
+                    );
                     progress_monitor.record_timeout_fallback();
-                    return Ok(sampled_size * file_count as u64 / sampled_count as u64);
+                    record_capacity_scan_sampling(sampled_count, true);
+                    return Ok(CapacityScanResult {
+                        used_bytes: estimated_total,
+                        file_count,
+                        sampled_count,
+                        is_estimated: true,
+                        scan_duration: start_time.elapsed(),
+                        had_partial_errors,
+                    });
                 }
                 return Err(e);
             }
 
-            // When file count exceeds threshold, enable sampling
-            if file_count > max_files_threshold {
-                // Sampling: count 1 in every effective_sample_rate files
-                if file_count.is_multiple_of(effective_sample_rate) {
-                    sampled_size += metadata.len();
+            if file_count <= max_files_threshold {
+                exact_prefix_bytes += metadata.len();
+            } else {
+                let overflow_index = file_count - max_files_threshold;
+                if overflow_index.is_multiple_of(effective_sample_rate) {
+                    overflow_sampled_bytes += metadata.len();
                     sampled_count += 1;
                 }
 
-                // Log progress every 100k files
                 if file_count.is_multiple_of(100_000) {
                     debug!(
-                        "Processed {} files, sampled {} files, size: {} bytes",
-                        file_count, sampled_count, sampled_size
+                        "Processed {} files, exact_prefix_bytes={}, sampled_overflow={} files/{} bytes",
+                        file_count, exact_prefix_bytes, sampled_count, overflow_sampled_bytes
                     );
                 }
-            } else {
-                // Below threshold, full statistics
-                total_size += metadata.len();
             }
         }
 
-        // Report symlink statistics if tracking was enabled
         if let Some(tracker) = symlink_tracker {
             let (count, size) = tracker.get_stats();
             if count > 0 {
@@ -457,22 +495,68 @@ async fn get_dir_size_async(path: &Path) -> Result<u64, std::io::Error> {
             }
         }
 
-        // If sampling was enabled, return estimated value
         if file_count > max_files_threshold && sampled_count > 0 {
-            let estimated_size = sampled_size * file_count as u64 / sampled_count as u64;
+            let overflow_count = file_count - max_files_threshold;
+            let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+            let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
             info!(
-                "Large directory detected: {} files, estimated size: {} bytes (sampled {}/{} files)",
-                file_count, estimated_size, sampled_count, file_count
+                "Large directory detected: {} files, estimated size: {} bytes (exact prefix: {}, sampled overflow {}/{})",
+                file_count, estimated_size, exact_prefix_bytes, sampled_count, overflow_count
             );
-            Ok(estimated_size)
+            record_capacity_scan_sampling(sampled_count, true);
+            Ok(CapacityScanResult {
+                used_bytes: estimated_size,
+                file_count,
+                sampled_count,
+                is_estimated: true,
+                scan_duration: start_time.elapsed(),
+                had_partial_errors,
+            })
+        } else if file_count > max_files_threshold {
+            // sampled_count == 0: too few overflow files to reach the sample rate threshold.
+            // Fall back to estimating the overflow using the average file size from the exact
+            // prefix so that overflow files are not silently dropped from the total.
+            let overflow_count = file_count - max_files_threshold;
+            // Use the actual number of files counted in the exact prefix, not the threshold
+            // value, to avoid a divide-by-zero or incorrect average when fewer files were
+            // processed than max_files_threshold.
+            let exact_prefix_count = file_count.min(max_files_threshold) as u64;
+            let avg_prefix_size = if exact_prefix_count > 0 {
+                exact_prefix_bytes / exact_prefix_count
+            } else {
+                0
+            };
+            let estimated_overflow = avg_prefix_size.saturating_mul(overflow_count as u64);
+            let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
+            info!(
+                "Large directory detected: {} files, estimated size: {} bytes (no overflow samples, used prefix average {} bytes/file)",
+                file_count, estimated_size, avg_prefix_size
+            );
+            record_capacity_scan_sampling(0, true);
+            Ok(CapacityScanResult {
+                used_bytes: estimated_size,
+                file_count,
+                sampled_count: 0,
+                is_estimated: true,
+                scan_duration: start_time.elapsed(),
+                had_partial_errors,
+            })
         } else {
+            record_capacity_scan_sampling(0, false);
             debug!(
                 "Directory size calculation completed: {} files, {} bytes, took {:?}",
                 file_count,
-                total_size,
+                exact_prefix_bytes,
                 start_time.elapsed()
             );
-            Ok(total_size)
+            Ok(CapacityScanResult {
+                used_bytes: exact_prefix_bytes,
+                file_count,
+                sampled_count,
+                is_estimated: false,
+                scan_duration: start_time.elapsed(),
+                had_partial_errors,
+            })
         }
     })
     .await
@@ -616,47 +700,65 @@ impl DefaultAdminUsecase {
             if cache_age < fast_update_threshold {
                 info.total_used_capacity = cached.total_used;
                 debug!(
-                    "Using cached capacity: {} bytes (age: {:?}, source: {:?})",
-                    cached.total_used, cache_age, cached.source
+                    "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
+                    cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
                 );
             } else {
                 // Cache is stale, check if we need fast update
                 let needs_update = capacity_manager.needs_fast_update().await;
+                let should_block = capacity_manager.should_block_on_refresh(cache_age);
 
-                if needs_update {
-                    // Fast update needed (recent writes or high frequency)
+                if needs_update && should_block {
                     let start = Instant::now();
-                    match calculate_data_dir_used_capacity(&storage_info.disks).await {
-                        Ok(used_capacity) => {
-                            info.total_used_capacity = used_capacity;
-                            capacity_manager
-                                .update_capacity(used_capacity, DataSource::WriteTriggered)
-                                .await;
+                    match capacity_manager
+                        .refresh_or_join(DataSource::WriteTriggered, || async {
+                            calculate_data_dir_used_capacity(&storage_info.disks)
+                                .await
+                                .map(|scan| scan.to_capacity_update())
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        Ok(update) => {
+                            info.total_used_capacity = update.total_used;
 
                             let elapsed = start.elapsed();
-                            debug!("Fast capacity update completed in {:?}", elapsed);
+                            debug!(
+                                "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
+                                elapsed, update.file_count, update.is_estimated
+                            );
                         }
                         Err(e) => {
-                            warn!("Fast capacity update failed: {:?}, using cached value", e);
+                            warn!("Foreground capacity refresh failed: {}, using cached value", e);
                             info.total_used_capacity = cached.total_used;
                         }
                     }
                 } else {
-                    // Use stale cache and trigger background update (if not already in progress)
                     info.total_used_capacity = cached.total_used;
-                    debug!("Using stale cache, background update will be triggered if not already in progress");
+                    debug!(
+                        "Using stale cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, needs_update={}, blocking={})",
+                        cached.total_used,
+                        cache_age,
+                        cached.source,
+                        cached.file_count,
+                        cached.is_estimated,
+                        needs_update,
+                        should_block
+                    );
 
-                    // Trigger background update only if not already in progress (prevent thundering herd)
-                    if capacity_manager.try_start_background_update() {
-                        let disks = storage_info.disks.clone();
-                        let manager = capacity_manager.clone();
-                        tokio::spawn(async move {
-                            if let Ok(new_capacity) = calculate_data_dir_used_capacity(&disks).await {
-                                manager.update_capacity(new_capacity, DataSource::Scheduled).await;
-                                debug!("Background capacity update completed: {} bytes", new_capacity);
-                            }
-                            manager.complete_background_update();
-                        });
+                    let disks = storage_info.disks.clone();
+                    let manager = capacity_manager.clone();
+                    if manager
+                        .clone()
+                        .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                            calculate_data_dir_used_capacity(&disks)
+                                .await
+                                .map(|scan| scan.to_capacity_update())
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        debug!("Background capacity update started");
                     } else {
                         debug!("Background update already in progress, skipping spawn");
                     }
@@ -665,21 +767,33 @@ impl DefaultAdminUsecase {
         } else {
             // No cache, perform initial calculation
             let start = Instant::now();
-            match calculate_data_dir_used_capacity(&storage_info.disks).await {
-                Ok(used_capacity) => {
-                    info.total_used_capacity = used_capacity;
-                    capacity_manager.update_capacity(used_capacity, DataSource::RealTime).await;
+            match capacity_manager
+                .refresh_or_join(DataSource::RealTime, || async {
+                    calculate_data_dir_used_capacity(&storage_info.disks)
+                        .await
+                        .map(|scan| scan.to_capacity_update())
+                        .map_err(|e| e.to_string())
+                })
+                .await
+            {
+                Ok(update) => {
+                    info.total_used_capacity = update.total_used;
 
                     let elapsed = start.elapsed();
-                    info!("Initial capacity calculation completed: {} bytes in {:?}", used_capacity, elapsed);
+                    info!(
+                        "Initial capacity calculation completed: {} bytes in {:?} (files={}, estimated={})",
+                        update.total_used, elapsed, update.file_count, update.is_estimated
+                    );
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to calculate data directory used capacity: {:?}, falling back to disk used capacity",
+                        "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
                         e
                     );
-                    // Fallback: use disk used capacity
                     info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
+                    capacity_manager
+                        .update_capacity(CapacityUpdate::fallback(info.total_used_capacity), DataSource::Fallback)
+                        .await;
                 }
             }
         }
@@ -805,7 +919,8 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size, 0);
+        assert_eq!(size.used_bytes, 0);
+        assert_eq!(size.file_count, 0);
     }
 
     #[tokio::test]
@@ -820,7 +935,8 @@ mod tests {
         file.write_all(b"Hello, World!").unwrap();
 
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size, 13);
+        assert_eq!(size.used_bytes, 13);
+        assert_eq!(size.file_count, 1);
     }
 
     #[tokio::test]
@@ -839,7 +955,8 @@ mod tests {
         }
 
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size, 40); // 10 files * 4 bytes
+        assert_eq!(size.used_bytes, 40); // 10 files * 4 bytes
+        assert_eq!(size.file_count, 10);
     }
 
     #[tokio::test]
@@ -863,7 +980,8 @@ mod tests {
         f2.write_all(b"content2").unwrap();
 
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
-        assert_eq!(size, 16); // "content1" (8) + "content2" (8)
+        assert_eq!(size.used_bytes, 16); // "content1" (8) + "content2" (8)
+        assert_eq!(size.file_count, 2);
     }
 
     #[tokio::test]

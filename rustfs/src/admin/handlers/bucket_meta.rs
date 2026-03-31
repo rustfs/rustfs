@@ -82,8 +82,20 @@ pub fn register_bucket_meta_route(r: &mut S3Router<AdminOperation>) -> std::io::
     )?;
 
     r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/export-bucket-metadata").as_str(),
+        AdminOperation(&ExportBucketMetadata {}),
+    )?;
+
+    r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
+        AdminOperation(&ImportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/import-bucket-metadata").as_str(),
         AdminOperation(&ImportBucketMetadata {}),
     )?;
 

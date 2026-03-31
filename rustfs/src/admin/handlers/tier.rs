@@ -22,9 +22,11 @@ use crate::{
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
+use http::Uri;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_common::data_usage::TierStats;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
@@ -81,6 +83,27 @@ pub struct AddTierQuery {
 
 pub struct AddTier {}
 
+fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
+    if let Some(tier) = params.get("tier") {
+        let decoded = percent_decode_str(tier)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))?;
+        let trimmed = decoded.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let query = if let Some(query) = uri.query() {
+        let input: AddTierQuery = from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+        input
+    } else {
+        AddTierQuery::default()
+    };
+
+    Ok(require_tier_name(&query)?.to_string())
+}
+
 pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
@@ -92,6 +115,12 @@ pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
         AdminOperation(&GetTierInfo {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tier}").as_str(),
+        AdminOperation(&VerifyTier {}),
     )?;
 
     r.insert(
@@ -461,17 +490,7 @@ impl Operation for RemoveTier {
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
-                input
-            } else {
-                AddTierQuery::default()
-            }
-        };
-
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -489,10 +508,10 @@ impl Operation for VerifyTier {
         )
         .await?;
 
-        let tier_name = require_tier_name(&query)?;
+        let tier = resolve_tier_name(&req.uri, &params)?;
         let tier_config_mgr_handle = resolve_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-        tier_config_mgr.verify(tier_name).await.map_err(map_tier_verify_error)?;
+        tier_config_mgr.verify(&tier).await.map_err(map_tier_verify_error)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -672,7 +691,73 @@ impl Operation for ClearTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
+    use matchit::Router;
     use rustfs_ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+
+    #[test]
+    fn resolve_tier_name_prefers_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/HOT?tier=COLD".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/HOT").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "HOT");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_to_query_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier-stats?tier=WARM".parse().expect("uri should parse");
+        let mut router: Router<()> = Router::new();
+        router.insert("/", ()).expect("root route should insert");
+        let params = router.at("/").expect("root route should match").params;
+
+        let tier = resolve_tier_name(&uri, &params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_when_path_parameter_is_blank() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20?tier=WARM".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_preserves_plus_in_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/WARM+PLUS".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/WARM+PLUS").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "WARM+PLUS");
+    }
+
+    #[test]
+    fn resolve_tier_name_rejects_blank_path_without_query_fallback() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let err = resolve_tier_name(&uri, &matched.params).expect_err("blank path should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
 
     #[test]
     fn require_tier_name_rejects_missing_value() {

@@ -414,6 +414,52 @@ where
     shutdown_tx
 }
 
+/// Starts the auto-tuner for performance optimization if enabled via environment variable.
+///
+/// The auto-tuner reads `RUSTFS_AUTOTUNER_ENABLED` to decide whether to run.
+/// When enabled, it spawns a background task that tunes concurrency settings
+/// every 60 seconds.
+pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
+    use crate::storage::concurrency::get_concurrency_manager;
+    use rustfs_io_metrics::AutoTuner;
+    use rustfs_io_metrics::TunerConfig;
+    use tracing::{debug, error, info};
+
+    let autotuner_enabled = rustfs_utils::get_env_bool("RUSTFS_AUTOTUNER_ENABLED", false);
+
+    if autotuner_enabled {
+        info!(target: "rustfs::main::run", "Starting auto-tuner for performance optimization");
+
+        let config = TunerConfig::default();
+        let manager = get_concurrency_manager();
+        let performance_metrics = manager.performance_metrics();
+
+        tokio::spawn(async move {
+            let mut tuner = AutoTuner::with_config(config).with_metrics(performance_metrics);
+
+            loop {
+                tokio::select! {
+                    _ = ctx.cancelled() => {
+                        info!(target: "rustfs::autotuner", "Auto-tuner shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
+                        if let Err(e) = tuner.tune().await {
+                            error!(target: "rustfs::autotuner", "Auto-tuner iteration failed: {}", e);
+                        } else {
+                            debug!(target: "rustfs::autotuner", "Auto-tuner iteration completed");
+                        }
+                    }
+                }
+            }
+        });
+
+        info!(target: "rustfs::main::run", "Auto-tuner started successfully");
+    } else {
+        info!(target: "rustfs::main::run", "Auto-tuner disabled (set RUSTFS_AUTOTUNER_ENABLED=true to enable)");
+    }
+}
+
 /// Initialize the FTP system
 ///
 /// This function initializes the FTP server (non-encrypted) if enabled in the configuration.

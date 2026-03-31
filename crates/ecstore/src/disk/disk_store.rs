@@ -730,6 +730,14 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
+        self.track_disk_health(
+            || async { self.disk.read_file_zero_copy(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn append_file(&self, volume: &str, path: &str) -> Result<crate::disk::FileWriter> {
         self.track_disk_health(|| async { self.disk.append_file(volume, path).await }, Duration::ZERO)
             .await

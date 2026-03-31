@@ -17,6 +17,18 @@
 //! This module provides optimized lock management for read operations,
 //! reducing lock contention by releasing locks early (after metadata read)
 //! rather than holding them for the entire data transfer duration.
+//!
+//! # Migration Note
+//!
+//! For new code, consider using `rustfs_io_core::LockOptimizer` which provides
+//! the same core functionality with better separation of concerns. This module
+//! remains for backward compatibility and storage-specific configuration.
+//!
+//! ```ignore
+//! // Recommended: Use io-core directly
+//! use rustfs_io_core::LockOptimizer;
+//! let optimizer = LockOptimizer::with_defaults();
+//! ```
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
@@ -42,7 +54,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-#[cfg(feature = "metrics")]
 use metrics::histogram;
 
 /// Lock optimization configuration.
@@ -216,7 +227,6 @@ impl<G> OptimizedLockGuard<G> {
 
         self.stats.record_early_release(hold_time);
 
-        #[cfg(feature = "metrics")]
         histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
 
         debug!(
@@ -241,7 +251,6 @@ impl<G> Drop for OptimizedLockGuard<G> {
 
             self.stats.record_early_release(hold_time);
 
-            #[cfg(feature = "metrics")]
             histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
 
             debug!(

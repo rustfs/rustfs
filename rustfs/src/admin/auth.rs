@@ -135,9 +135,6 @@ pub async fn validate_admin_request_with_bucket(
 /// Unified authentication request handler for both UI and CLI
 ///
 /// This function provides a single entry point for authentication,
-/// Unified authentication request handler for both UI and CLI
-///
-/// This function provides a single entry point for authentication,
 /// ensuring consistent behavior between UI and CLI authentication flows.
 ///
 /// # Arguments
