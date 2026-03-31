@@ -68,6 +68,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use url::{Url, form_urlencoded};
@@ -80,12 +81,15 @@ const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from clus
 const SITE_REPL_RESYNC_START: &str = "start";
 const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
+const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
+static SITE_REPLICATION_PEER_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SiteReplicationState {
@@ -407,9 +411,15 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
     }
 }
 
-pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
-    let _ = load_site_replication_state().await?;
-    Ok(())
+fn site_replication_peer_client() -> &'static reqwest::Client {
+    SITE_REPLICATION_PEER_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
+            .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 fn query_pairs(uri: &Uri) -> HashMap<String, String> {
@@ -853,8 +863,7 @@ async fn send_peer_admin_request<T: Serialize>(
             .unwrap_or("us-east-1"),
     );
 
-    let client = reqwest::Client::new();
-    let mut req = client.request(reqwest::Method::PUT, &url);
+    let mut req = site_replication_peer_client().request(reqwest::Method::PUT, &url);
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }
@@ -2075,6 +2084,7 @@ pub struct SiteReplicationDevNullHandler {}
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let _ = read_plain_admin_body(req.input).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
@@ -2085,6 +2095,7 @@ pub struct SiteReplicationNetPerfHandler {}
 #[async_trait::async_trait]
 impl Operation for SiteReplicationNetPerfHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let duration = query_pairs(&req.uri)
             .get("duration")
             .and_then(|value| rustfs_madmin::utils::parse_duration(value).ok())
@@ -2202,11 +2213,13 @@ impl Operation for SRPeerBucketOpsHandler {
                 let created_at = queries
                     .get("createdAt")
                     .and_then(|value| OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok());
+                let lock_enabled = queries.get("lockEnabled").is_some_and(|value| value == "true");
                 store
                     .make_bucket(
                         &bucket,
                         &MakeBucketOptions {
                             versioning_enabled: true,
+                            lock_enabled,
                             created_at,
                             force_create: true,
                             ..Default::default()
@@ -2546,6 +2559,17 @@ mod tests {
         assert!(opts.ilm_expiry_rules);
         assert_eq!(opts.entity, SREntityType::Bucket);
         assert_eq!(opts.entity_value, "photos");
+    }
+
+    #[test]
+    fn test_query_flag_parses_lock_enabled() {
+        let uri: Uri =
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning&lockEnabled=true"
+                .parse()
+                .unwrap();
+
+        assert!(query_flag(&uri, "lockEnabled"));
+        assert!(!query_flag(&uri, "missing"));
     }
 
     #[test]

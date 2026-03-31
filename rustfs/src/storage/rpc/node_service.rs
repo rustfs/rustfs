@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::site_replication::reload_site_replication_runtime_state;
+use crate::admin::service::site_replication::reload_site_replication_runtime_state;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;

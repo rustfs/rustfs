@@ -16,6 +16,7 @@ mod auth;
 pub mod console;
 pub mod handlers;
 pub mod router;
+pub mod service;
 pub mod utils;
 
 #[cfg(test)]
