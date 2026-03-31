@@ -174,7 +174,7 @@ pub struct DistributedLock {
     clients: Vec<Arc<dyn LockClient>>,
     /// Namespace identifier
     namespace: String,
-    /// Quorum size for operations (majority for distributed)
+    /// Quorum size for exclusive/write operations
     quorum: usize,
 }
 
@@ -199,6 +199,22 @@ impl DistributedLock {
         &self.namespace
     }
 
+    fn read_quorum(&self) -> usize {
+        let client_count = self.clients.len();
+        if client_count <= 1 {
+            1
+        } else {
+            client_count - (client_count / 2)
+        }
+    }
+
+    fn required_quorum(&self, lock_type: LockType) -> usize {
+        match lock_type {
+            LockType::Shared => self.read_quorum(),
+            LockType::Exclusive => self.quorum,
+        }
+    }
+
     /// Get resource key for this namespace
     pub fn get_resource_key(&self, resource: &ObjectKey) -> String {
         format!("{}:{}", self.namespace, resource)
@@ -215,6 +231,7 @@ impl DistributedLock {
             return Err(LockError::internal("No lock clients available"));
         }
 
+        let required_quorum = self.required_quorum(request.lock_type);
         let (resp, individual_locks) = self.acquire_lock_quorum(request).await?;
         if resp.success {
             // Use aggregate lock_id from LockResponse's LockInfo
@@ -247,10 +264,9 @@ impl DistributedLock {
                 }
                 if error_msg.contains("quorum") {
                     // This is a quorum failure - return appropriate error
-                    // Extract achieved count from error message or use individual_locks.len()
                     let achieved = individual_locks.len();
                     Err(LockError::QuorumNotReached {
-                        required: self.quorum,
+                        required: required_quorum,
                         achieved,
                     })
                 } else if error_msg.contains("timeout") || resp.wait_time >= request.acquire_timeout {
@@ -309,10 +325,11 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
-    /// Quorum-based lock acquisition: success if at least `self.quorum` clients succeed.
+    /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
     async fn acquire_lock_quorum(&self, request: &LockRequest) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
+        let required_quorum = self.required_quorum(request.lock_type);
         let futs: Vec<_> = self
             .clients
             .iter()
@@ -321,6 +338,7 @@ impl DistributedLock {
             .collect();
 
         let results = futures::future::join_all(futs).await;
+
         // Store all individual lock_ids and their corresponding clients
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
 
@@ -362,7 +380,7 @@ impl DistributedLock {
             }
         }
 
-        if individual_locks.len() >= self.quorum {
+        if individual_locks.len() >= required_quorum {
             // Generate a new aggregate lock_id for multiple client locks
             let aggregate_lock_id = generate_aggregate_lock_id(&request.resource);
 
@@ -393,17 +411,17 @@ impl DistributedLock {
         } else {
             // Rollback: release all locks that were successfully acquired
             let rollback_count = individual_locks.len();
-            for (individual_lock_id, client) in individual_locks {
-                if let Err(e) = client.release(&individual_lock_id).await {
+            for (individual_lock_id, client) in &individual_locks {
+                if let Err(e) = client.release(individual_lock_id).await {
                     tracing::warn!("Failed to rollback lock {} on client: {}", individual_lock_id, e);
                 }
             }
 
             let resp = LockResponse::failure(
-                format!("Failed to acquire quorum: {}/{} required", rollback_count, self.quorum),
+                format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
                 Duration::ZERO,
             );
-            Ok((resp, Vec::new()))
+            Ok((resp, individual_locks))
         }
     }
 }
