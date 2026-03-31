@@ -16,6 +16,7 @@ use super::{account_info, group, service_account, user_iam, user_lifecycle, user
 use crate::{
     admin::{
         auth::validate_admin_request,
+        handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
@@ -31,7 +32,8 @@ use rustfs_iam::{
     sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
 };
 use rustfs_madmin::{
-    AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity,
+    AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity, SITE_REPL_API_VERSION,
+    SRIAMItem, SRIAMUser,
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -225,10 +227,27 @@ impl Operation for AddUser {
         )
         .await?;
 
-        iam_store
+        let updated_at = iam_store
             .create_user(ak, &args)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {e}")))?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: false,
+                user_req: Some(args.clone()),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %ak, error = ?err, "site replication create user hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -432,7 +451,22 @@ impl Operation for RemoveUser {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {e}")))?;
 
-        // TODO: IAMChangeHook
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: true,
+                user_req: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(time::OffsetDateTime::now_utc()),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %ak, error = ?err, "site replication delete user hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

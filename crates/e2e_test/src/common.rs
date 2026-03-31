@@ -463,18 +463,18 @@ impl Drop for RustFSTestEnvironment {
     }
 }
 
-/// Utility function to execute awscurl commands
-pub async fn execute_awscurl(
+async fn execute_awscurl_with_service(
     url: &str,
     method: &str,
     body: Option<&str>,
     access_key: &str,
     secret_key: &str,
+    service: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut args = vec![
         "--fail-with-body",
         "--service",
-        "s3",
+        service,
         "--region",
         "us-east-1",
         "--access_key",
@@ -490,7 +490,64 @@ pub async fn execute_awscurl(
         args.extend(&["-d", body_content]);
     }
 
-    info!("Executing awscurl: {} {}", method, url);
+    info!("Executing awscurl: {} {} (service={})", method, url, service);
+    let awscurl_path = awscurl_binary_path();
+    let output = Command::new(&awscurl_path).args(&args).output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("awscurl failed: stderr='{stderr}', stdout='{stdout}'").into());
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(response)
+}
+
+/// Utility function to execute awscurl commands (SigV4 service `s3` for admin APIs).
+pub async fn execute_awscurl(
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    execute_awscurl_with_service(url, method, body, access_key, secret_key, "s3").await
+}
+
+/// `POST` with SigV4 `--service sts` and explicit `Content-Type: application/x-www-form-urlencoded`.
+///
+/// RustFS `AssumeRole` is handled on `POST /` by the admin router; `is_match` requires this
+/// content type so s3s routes to the custom handler instead of `Unknown operation`.
+pub async fn awscurl_post_sts_form_urlencoded(
+    url: &str,
+    body: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let args = vec![
+        "--fail-with-body",
+        "--service",
+        "sts",
+        "--region",
+        "us-east-1",
+        "--access_key",
+        access_key,
+        "--secret_key",
+        secret_key,
+        "-H",
+        "Content-Type: application/x-www-form-urlencoded",
+        "-X",
+        "POST",
+        url,
+        "-d",
+        body,
+    ];
+
+    info!(
+        "Executing awscurl: POST {} (service=sts, Content-Type=application/x-www-form-urlencoded)",
+        url
+    );
     let awscurl_path = awscurl_binary_path();
     let output = Command::new(&awscurl_path).args(&args).output()?;
 

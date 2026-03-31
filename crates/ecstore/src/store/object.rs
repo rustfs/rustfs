@@ -40,7 +40,97 @@ fn select_data_movement_target_pool(
     }
 }
 
+fn latest_object_access_delete_marker_error(
+    bucket: &str,
+    object: &str,
+    info: &ObjectInfo,
+    opts: &ObjectOptions,
+) -> Option<Error> {
+    if !info.delete_marker {
+        return None;
+    }
+
+    Some(if opts.version_id.is_none() || opts.delete_marker {
+        to_object_err(StorageError::FileNotFound, vec![bucket, object])
+    } else {
+        to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])
+    })
+}
+
+fn resolve_latest_object_access(
+    bucket: &str,
+    object: &str,
+    info: ObjectInfo,
+    idx: usize,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    if let Some(err) = latest_object_access_delete_marker_error(bucket, object, &info, opts) {
+        return Err(err);
+    }
+
+    Ok((info, idx))
+}
+
+fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.no_lock = no_lock;
+    if lookup_opts.version_id.is_some() {
+        lookup_opts.metadata_chg = true;
+    }
+
+    lookup_opts
+}
+
+fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = version_aware_lookup_opts(opts, no_lock);
+    lookup_opts.skip_decommissioned = true;
+    lookup_opts.skip_rebalancing = true;
+
+    lookup_opts
+}
+
 impl ECStore {
+    async fn get_latest_accessible_object_info_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, usize)> {
+        let (info, idx) = self.get_latest_object_info_with_idx(bucket, object, opts).await?;
+        resolve_latest_object_access(bucket, object, info, idx, opts)
+    }
+
+    pub(super) async fn select_data_movement_pool_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        opts: &ObjectOptions,
+        no_lock: bool,
+    ) -> Result<usize> {
+        match self
+            .get_pool_info_existing_with_opts(bucket, object, &data_movement_pool_lookup_opts(opts, no_lock))
+            .await
+        {
+            Ok((pinfo, _)) => Ok(pinfo.index),
+            Err(err) => {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(err);
+                }
+
+                self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
+            }
+        }
+    }
+
+    fn resolve_decommission_target_pool_idx_result(result: Result<usize>, bucket: &str, object: &str) -> Result<usize> {
+        result.map_err(|err| Error::other(format!("failed to select decommission target pool for {bucket}/{object}: {err}")))
+    }
+
+    fn resolve_decommission_tiered_object_result(result: Result<()>, bucket: &str, object: &str) -> Result<()> {
+        result.map_err(|err| Error::other(format!("failed to decommission tiered object for {bucket}/{object}: {err}")))
+    }
+
     #[instrument(skip(self, fi, opts))]
     pub(crate) async fn decommission_tiered_object(
         &self,
@@ -54,10 +144,26 @@ impl ECStore {
         let object = encode_dir_object(object);
 
         if self.single_pool() {
-            return Err(Error::other(format!("error decommissioning {bucket}/{object}")));
+            return Self::resolve_decommission_tiered_object_result(
+                Err(Error::other("single pool deployments cannot decommission tiered objects")),
+                bucket,
+                &object,
+            );
         }
 
-        let idx = self.get_pool_idx_no_lock(bucket, &object, fi.size).await?;
+        let idx = if opts.data_movement && opts.version_id.is_some() {
+            Self::resolve_decommission_target_pool_idx_result(
+                self.select_data_movement_pool_idx(bucket, &object, fi.size, opts, true).await,
+                bucket,
+                &object,
+            )?
+        } else {
+            Self::resolve_decommission_target_pool_idx_result(
+                self.get_pool_idx_no_lock(bucket, &object, fi.size).await,
+                bucket,
+                &object,
+            )?
+        };
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
@@ -66,10 +172,14 @@ impl ECStore {
             ));
         }
 
-        self.pools[idx]
-            .get_disks_by_key(&object)
-            .decommission_tiered_object(bucket, &object, fi, opts)
-            .await
+        Self::resolve_decommission_tiered_object_result(
+            self.pools[idx]
+                .get_disks_by_key(&object)
+                .decommission_tiered_object(bucket, &object, fi, opts)
+                .await,
+            bucket,
+            &object,
+        )
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -95,9 +205,9 @@ impl ECStore {
 
         opts.no_lock = true;
 
-        // TODO: check if DeleteMarker
-        let (_oi, idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
-
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            .await?;
         self.pools[idx]
             .get_object_reader(bucket, object.as_str(), range, h, &opts)
             .await
@@ -119,7 +229,12 @@ impl ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(bucket, &object, data.size()).await?;
+        let idx = if opts.data_movement && opts.version_id.is_some() {
+            self.select_data_movement_pool_idx(bucket, &object, data.size(), opts, false)
+                .await?
+        } else {
+            self.get_pool_idx(bucket, &object, data.size()).await?
+        };
 
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -144,8 +259,9 @@ impl ECStore {
 
         // TODO: nslock
 
-        let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
-
+        let (info, _) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
         opts.precondition_check(&info)?;
         Ok(info)
     }
@@ -172,7 +288,11 @@ impl ECStore {
 
         // TODO: nslock
 
-        let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
+        let pool_idx = self
+            .get_pool_info_existing_with_opts(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+            .await?
+            .0
+            .index;
 
         if cp_src_dst_same {
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
@@ -233,8 +353,7 @@ impl ECStore {
         let object = encode_dir_object(object);
         let object = object.as_str();
 
-        let mut gopts = opts.clone();
-        gopts.no_lock = true;
+        let gopts = version_aware_lookup_opts(&opts, true);
 
         if opts.data_movement {
             let existing_pool_idx = self
@@ -505,8 +624,12 @@ impl ECStore {
             return Ok(());
         }
 
-        let idx = self
-            .get_pool_idx_existing_with_opts(bucket, object.as_str(), &ObjectOptions::default())
+        let opts = ObjectOptions {
+            version_id: Some(version_id.to_string()),
+            ..Default::default()
+        };
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
 
         let _ = self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
@@ -522,7 +645,7 @@ impl ECStore {
 
         //opts.skip_decommissioned = true;
         //opts.no_lock = true;
-        let idx = self.get_pool_idx_existing_with_opts(bucket, &object, opts).await?;
+        let (_, idx) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
 
         self.pools[idx].transition_object(bucket, &object, opts).await
     }
@@ -541,7 +664,9 @@ impl ECStore {
 
         //opts.skip_decommissioned = true;
         //opts.nolock = true;
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx]
             .clone()
@@ -564,7 +689,9 @@ impl ECStore {
         let mut opts = opts.clone();
         opts.metadata_chg = true;
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+            .await?;
 
         self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
     }
@@ -577,8 +704,7 @@ impl ECStore {
             return self.pools[0].get_object_tags(bucket, object.as_str(), opts).await;
         }
 
-        let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
-
+        let (oi, _) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
         Ok(oi.user_tags)
     }
 
@@ -596,7 +722,9 @@ impl ECStore {
             return self.pools[0].put_object_tags(bucket, object.as_str(), tags, opts).await;
         }
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
     }
@@ -629,7 +757,9 @@ impl ECStore {
             return self.pools[0].delete_object_tags(bucket, object.as_str(), opts).await;
         }
 
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .await?;
 
         self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
     }
@@ -664,5 +794,194 @@ mod tests {
     fn non_delete_marker_data_movement_keeps_existing_pool() {
         let target = select_data_movement_target_pool(Ok(0), 1, false).unwrap();
         assert_eq!(target, Some(0));
+    }
+
+    #[test]
+    fn latest_object_access_delete_marker_error_returns_none_for_live_object() {
+        let info = ObjectInfo::default();
+        let opts = ObjectOptions::default();
+
+        assert!(latest_object_access_delete_marker_error("bucket", "object", &info, &opts).is_none());
+    }
+
+    #[test]
+    fn latest_object_access_delete_marker_error_returns_not_found_without_version_id() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions::default();
+
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
+            .expect("delete marker should stop latest-object reads");
+
+        assert!(crate::error::is_err_object_not_found(&err));
+    }
+
+    #[test]
+    fn latest_object_access_delete_marker_error_returns_method_not_allowed_for_version_read() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
+            .expect("delete marker version reads should be rejected");
+
+        assert!(matches!(err, Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn latest_object_access_delete_marker_error_returns_not_found_for_delete_marker_lookup() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let err = latest_object_access_delete_marker_error("bucket", "object", &info, &opts)
+            .expect("delete marker lookup should keep not-found semantics");
+
+        assert!(crate::error::is_err_object_not_found(&err));
+    }
+
+    #[test]
+    fn resolve_latest_object_access_returns_live_object_and_pool_idx() {
+        let info = ObjectInfo::default();
+        let opts = ObjectOptions::default();
+
+        let (resolved, idx) = resolve_latest_object_access("bucket", "object", info, 7, &opts).unwrap();
+
+        assert_eq!(idx, 7);
+        assert!(!resolved.delete_marker);
+    }
+
+    #[test]
+    fn resolve_latest_object_access_rejects_delete_marker_without_version_id() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions::default();
+
+        let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
+
+        assert!(crate::error::is_err_object_not_found(&err));
+    }
+
+    #[test]
+    fn resolve_latest_object_access_rejects_delete_marker_version_read() {
+        let info = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_latest_object_access("bucket", "object", info, 2, &opts).unwrap_err();
+
+        assert!(matches!(err, Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn resolve_decommission_target_pool_idx_result_passthrough_ok() {
+        let idx = ECStore::resolve_decommission_target_pool_idx_result(Ok(3), "bucket", "object").unwrap();
+
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn resolve_decommission_target_pool_idx_result_wraps_error_context() {
+        let err = ECStore::resolve_decommission_target_pool_idx_result(Err(Error::other("boom")), "bucket", "object")
+            .expect_err("expected contextual error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to select decommission target pool"), "{rendered}");
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
+        assert!(rendered.contains("boom"), "{rendered}");
+    }
+
+    #[test]
+    fn resolve_decommission_tiered_object_result_passthrough_ok() {
+        ECStore::resolve_decommission_tiered_object_result(Ok(()), "bucket", "object")
+            .expect("successful decommission result should pass through");
+    }
+
+    #[test]
+    fn resolve_decommission_tiered_object_result_wraps_error_context() {
+        let err = ECStore::resolve_decommission_tiered_object_result(Err(Error::other("boom")), "bucket", "object")
+            .expect_err("expected contextual error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to decommission tiered object"), "{rendered}");
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
+        assert!(rendered.contains("boom"), "{rendered}");
+    }
+
+    #[test]
+    fn version_aware_lookup_opts_enables_version_aware_lookup() {
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let lookup_opts = version_aware_lookup_opts(&opts, true);
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn version_aware_lookup_opts_keeps_latest_lookup_for_unversioned_requests() {
+        let lookup_opts = version_aware_lookup_opts(&ObjectOptions::default(), true);
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.metadata_chg);
+        assert!(lookup_opts.version_id.is_none());
+    }
+
+    #[test]
+    fn data_movement_pool_lookup_opts_enables_version_aware_lookup_and_skip_flags() {
+        let opts = ObjectOptions {
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+
+        let lookup_opts = data_movement_pool_lookup_opts(&opts, false);
+
+        assert!(!lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+        assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn data_movement_pool_lookup_opts_keeps_no_lock_for_tiered_moves() {
+        let lookup_opts = data_movement_pool_lookup_opts(
+            &ObjectOptions {
+                version_id: Some("vid-1".to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
     }
 }

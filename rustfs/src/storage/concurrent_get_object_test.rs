@@ -367,9 +367,14 @@ mod tests {
     async fn test_moka_cache_eviction() {
         let manager = ConcurrencyManager::new();
 
+        // Clear cache for clean test state
+        manager.clear_cache().await;
+        manager.reset_cache_metrics();
+
         // Cache multiple objects to exceed the limit
-        let object_size = 6 * MI_B; // 6MB each
-        let num_objects = 20; // Total 120MB > 100MB limit
+        // Tiered cache has L1 (50MB) + L2 (200MB) = 250MB total
+        let object_size = 15 * MI_B; // 15MB each
+        let num_objects = 20; // Total 300MB > 250MB limit
 
         for i in 0..num_objects {
             let key = format!("test/object{i}");
@@ -383,6 +388,7 @@ mod tests {
 
         // Verify cache size is within limit (Moka manages this automatically)
         let stats = manager.cache_stats().await;
+        eprintln!("DEBUG: size={}, max_size={}, entries={}", stats.size, stats.max_size, stats.entries);
         assert!(
             stats.size <= stats.max_size,
             "Moka should keep cache size {} within max {}",
@@ -628,6 +634,10 @@ mod tests {
     async fn test_cache_hit_rate() {
         let manager = ConcurrencyManager::new();
 
+        // Reset metrics for clean test
+        manager.reset_cache_metrics();
+        manager.clear_cache().await;
+
         // Cache some objects
         for i in 0..5 {
             let key = format!("hitrate/object{i}");
@@ -636,6 +646,12 @@ mod tests {
         }
 
         sleep(Duration::from_millis(100)).await;
+
+        // Verify objects are cached
+        for i in 0..5 {
+            let key = format!("hitrate/object{i}");
+            assert!(manager.is_cached(&key).await, "Object {} should be cached", key);
+        }
 
         // Mix of hits and misses
         for i in 0..10 {
@@ -647,9 +663,9 @@ mod tests {
             let _ = manager.get_cached(&key).await;
         }
 
-        // Hit rate should be around 50%
+        // Hit rate should be around 50% (0.5 on 0.0-1.0 scale)
         let hit_rate = manager.cache_hit_rate();
-        assert!((40.0..=60.0).contains(&hit_rate), "Hit rate should be ~50%, got {hit_rate:.1}%");
+        assert!((0.4..=0.6).contains(&hit_rate), "Hit rate should be ~50% (0.5), got {hit_rate:.3}");
     }
 
     /// Test TTL expiration (Moka automatic cleanup)
@@ -1028,6 +1044,9 @@ mod tests {
     #[tokio::test]
     async fn test_cache_invalidation_versioned() {
         let manager = ConcurrencyManager::new();
+
+        // Clear cache for clean test state
+        manager.clear_cache().await;
 
         let bucket = "bucket";
         let key = "object";

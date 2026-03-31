@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::service::site_replication::reload_site_replication_runtime_state;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -51,6 +52,10 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+fn background_rebalance_start_error_message(result: rustfs_ecstore::error::Result<()>) -> Option<String> {
+    result.err().map(|err| format!("start_rebalance failed: {err}"))
+}
 
 #[path = "bucket.rs"]
 mod bucket;
@@ -753,7 +758,16 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+        match reload_site_replication_runtime_state().await {
+            Ok(()) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
@@ -850,7 +864,9 @@ impl Node for NodeService {
             warn!("start rebalance");
             let store = store.clone();
             spawn(async move {
-                store.start_rebalance().await;
+                if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
+                    error!("{message}");
+                }
             });
         }
 
@@ -1990,6 +2006,20 @@ mod tests {
         assert!(!load_response.success);
         assert!(load_response.error_info.is_some());
         assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
+    }
+
+    #[test]
+    fn test_background_rebalance_start_error_message_ignores_success() {
+        assert!(background_rebalance_start_error_message(Ok(())).is_none());
+    }
+
+    #[test]
+    fn test_background_rebalance_start_error_message_formats_error() {
+        let message = background_rebalance_start_error_message(Err(rustfs_ecstore::error::Error::other("boom")))
+            .expect("background rebalance start failure should be formatted");
+
+        assert!(message.contains("start_rebalance failed"));
+        assert!(message.contains("boom"));
     }
 
     #[tokio::test]

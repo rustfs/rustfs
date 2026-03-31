@@ -68,6 +68,8 @@ config:
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
+    ec:
+      storage_class_standard: "EC:4" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
     log_rotation: # Specify log rotation settings
       # size: 100 # Default value: 100 MB
       # time: hour # Default value: hour, eg: day,hour,minute,second
@@ -95,6 +97,11 @@ config:
       profiling:
         enabled: false
         endpoint: "" # If specified, rustfs will export profiling data to this endpoint. e.g. "http://localhost:6060/debug/pprof/profile"
+
+extraEnv: [] # This is for setting extra environment variables in the rustfs container. It should be a list of key value pairs. For example:
+# extraEnv:
+#   - name: RUSTFS_EXTRA_ENV
+#     value: "extra_value"
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -187,8 +194,8 @@ ingress:
 
 gatewayApi:
   enabled: false
-  gatewayClass: traefik
-  listeners: # Specify which listeners to create on the Gateway. Only support for traefik gatewayClass at the moment.
+  gatewayClass: traefik # Only support for traefik and contour gatewayClass at the moment.
+  listeners: # Specify which listeners to create on the Gateway. 
     http:
       name: web
       port: 8000

@@ -246,6 +246,19 @@ fn build_tiered_decommission_file_info(
     (updated, write_quorum)
 }
 
+fn resolve_tiered_decommission_write_quorum_result(
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+    bucket: &str,
+    object: &str,
+) -> Result<()> {
+    if let Some(err) = reduce_write_quorum_errs(errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+        return Err(to_object_err(err.into(), vec![bucket, object]));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct SetDisks {
     pub locker_owner: String,
@@ -1200,10 +1213,7 @@ impl ObjectOperations for SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(err.into());
-        }
-        Ok(())
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 
     #[tracing::instrument(skip(self))]
@@ -1872,12 +1882,19 @@ impl ObjectOperations for SetDisks {
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
         fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
-        let mut event_name = EventName::ObjectTransitionComplete.as_str();
+        let event_name = EventName::LifecycleTransition.as_str();
+        let mut should_notify_transition = true;
 
         let disks = self.get_disks(0, 0).await?;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
-            event_name = EventName::ObjectTransitionFailed.as_str();
+            should_notify_transition = false;
+            warn!(
+                bucket = bucket,
+                object = object,
+                error = ?err,
+                "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
+            );
         }
 
         for disk in disks.iter() {
@@ -1888,15 +1905,17 @@ impl ObjectOperations for SetDisks {
             break;
         }
 
-        let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        send_event(EventArgs {
-            event_name: event_name.to_string(),
-            bucket_name: bucket.to_string(),
-            object: obj_info,
-            user_agent: "Internal: [ILM-Transition]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
-            ..Default::default()
-        });
+        if should_notify_transition {
+            let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            send_event(EventArgs {
+                event_name: event_name.to_string(),
+                bucket_name: bucket.to_string(),
+                object: obj_info,
+                user_agent: "Internal: [ILM-Transition]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+        }
         //let tags = opts.lifecycle_audit_event.tags();
         //auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
         Ok(())
@@ -1951,10 +1970,19 @@ impl ObjectOperations for SetDisks {
                 false,
             )?;
             let mut p_reader = PutObjReader::new(hash_reader);
-            return if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await
-            } else {
-                Ok(())
+            return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
+                Ok(restored_info) => {
+                    send_event(EventArgs {
+                        event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                        bucket_name: bucket.to_string(),
+                        object: restored_info,
+                        user_agent: "Internal: [Restore-Completed]".to_string(),
+                        host: GLOBAL_LocalNodeName.to_string(),
+                        ..Default::default()
+                    });
+                    Ok(())
+                }
+                Err(err) => set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await,
             };
         }
 
@@ -2045,7 +2073,7 @@ impl ObjectOperations for SetDisks {
                 checksum_crc64nvme: None,
             });
         }
-        if let Err(err) = self_
+        let restored_info = match self_
             .clone()
             .complete_multipart_upload(
                 bucket,
@@ -2059,8 +2087,17 @@ impl ObjectOperations for SetDisks {
             )
             .await
         {
-            return set_restore_header_fn(&mut oi, Some(err)).await;
-        }
+            Ok(info) => info,
+            Err(err) => return set_restore_header_fn(&mut oi, Some(err)).await,
+        };
+        send_event(EventArgs {
+            event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+            bucket_name: bucket.to_string(),
+            object: restored_info,
+            user_agent: "Internal: [Restore-Completed]".to_string(),
+            host: GLOBAL_LocalNodeName.to_string(),
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -2158,11 +2195,7 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, object]));
-        }
-
-        Ok(())
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
     }
 }
 
@@ -4614,6 +4647,31 @@ mod tests {
         assert_eq!(updated.erasure.parity_blocks, 4);
         assert_eq!(write_quorum, 12);
         assert_ne!(updated.erasure.distribution, original.erasure.distribution);
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_allows_successful_quorum() {
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), None];
+
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object");
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_tiered_decommission_write_quorum_result_wraps_object_context() {
+        let errs = vec![
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = resolve_tiered_decommission_write_quorum_result(&errs, 3, "bucket", "object").expect_err("expected error");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("bucket"), "{rendered}");
+        assert!(rendered.contains("object"), "{rendered}");
     }
 
     #[test]
