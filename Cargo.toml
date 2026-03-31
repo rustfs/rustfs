@@ -39,6 +39,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
+    "crates/concurrency", # Rust I/O utilities and abstractions
     "crates/s3-common", # Common utilities and data structures for S3 compatibility
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
@@ -48,6 +49,8 @@ members = [
     "crates/trusted-proxies", # Trusted proxies management
     "crates/utils", # Utility functions and helpers
     "crates/workers", # Worker thread pools and task scheduling
+    "crates/io-metrics", # Zero-copy metrics collection for performance analysis
+    "crates/io-core", # Zero-copy core reader and writer implementations
     "crates/zip", # ZIP file handling and compression
 ]
 resolver = "3"
@@ -79,6 +82,7 @@ rustfs-audit = { path = "crates/audit", version = "0.0.5" }
 rustfs-checksums = { path = "crates/checksums", version = "0.0.5" }
 rustfs-common = { path = "crates/common", version = "0.0.5" }
 rustfs-config = { path = "./crates/config", version = "0.0.5" }
+rustfs-concurrency = { path = "./crates/concurrency", version = "0.0.5" }
 rustfs-credentials = { path = "crates/credentials", version = "0.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "0.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "0.0.5" }
@@ -91,6 +95,8 @@ rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
 rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
 rustfs-metrics = { path = "crates/metrics", version = "0.0.5" }
 rustfs-notify = { path = "crates/notify", version = "0.0.5" }
+rustfs-io-metrics = { path = "crates/io-metrics", version = "0.0.5" }
+rustfs-io-core = { path = "crates/io-core", version = "0.0.5" }
 rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
 rustfs-protos = { path = "crates/protos", version = "0.0.5" }
@@ -217,6 +223,7 @@ lazy_static = "1.5.0"
 libc = "0.2.183"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.10"
+memmap2 = "0.9.10"
 lz4 = "1.28.1"
 matchit = "0.9.1"
 md-5 = "0.11.0-rc.5"
@@ -242,8 +249,8 @@ regex = { version = "1.12.3" }
 rumqttc = { version = "0.25.1" }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
-rustc-hash = { version = "2.1.1" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "b296762bc9e7fa608f1bc44f5cd625d606e0dd31", features = ["minio"] }
+rustc-hash = { version = "2.1.2" }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "f1815ced732e180f71935feee6ae5ef44fe39b22", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"

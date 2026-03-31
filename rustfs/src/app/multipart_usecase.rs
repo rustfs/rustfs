@@ -517,7 +517,9 @@ impl DefaultMultipartUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::CreateMultipartUpload);
+        let helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
+                .suppress_event();
         let CreateMultipartUploadInput {
             bucket,
             key,

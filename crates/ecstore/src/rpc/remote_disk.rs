@@ -1053,6 +1053,24 @@ impl DiskAPI for RemoteDisk {
         Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
     }
 
+    /// Zero-copy read for remote disks falls back to efficient network read.
+    /// Note: True zero-copy is not possible over network, but we avoid extra copies
+    /// by reading directly into Bytes.
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        // For remote disks, use the regular reader and read into Bytes
+        let reader = self.read_file_stream(volume, path, offset, length).await?;
+
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+
+        // Read all data into Bytes (single allocation)
+        let mut buffer = Vec::with_capacity(length);
+        reader.read_to_end(&mut buffer).await?;
+
+        Ok(Bytes::from(buffer))
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file {}/{}", volume, path);

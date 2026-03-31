@@ -163,6 +163,36 @@ make help-docker                      # 显示所有 Docker 相关命令
 
 请按照 [Helm Chart README](https://charts.rustfs.com) 上的说明在 Kubernetes 集群上安装 RustFS。
 
+### 5\. Nix Flake (Option 5)
+
+如果你已经 启用了 [Nix Flakes 功能](https://nixos.wiki/wiki/Flakes#Enable_flakes):
+
+```bash
+# 直接运行，无需安装
+nix run github:rustfs/rustfs
+
+# 编译二进制文件
+nix build github:rustfs/rustfs
+./result/bin/rustfs --help
+
+# 或者从本地检出的代码库运行/编译
+nix build
+nix run
+```
+
+### 6\. X-CMD (Option 6)
+
+如果你是 [x-cmd](https://www.x-cmd.com/install/rustfs) 用户：
+
+```bash
+# 直接运行，无需安装
+x rustfs
+
+# 下载二进制文件并安装到全局环境中
+x env use rustfs
+rustfs --help
+```
+
 ---
 
 ### 访问 RustFS

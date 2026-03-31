@@ -3136,7 +3136,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3412,7 +3412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4667,7 +4667,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4744,7 +4744,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5620,7 +5620,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7547,9 +7547,9 @@ checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc-hash"
-version = "2.1.1"
+version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc_version"
@@ -7584,6 +7584,7 @@ dependencies = [
  "flatbuffers",
  "futures",
  "futures-util",
+ "hashbrown 0.16.1",
  "hex-simd",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -7601,6 +7602,7 @@ dependencies = [
  "mime_guess",
  "moka",
  "opentelemetry",
+ "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
  "rand 0.10.0",
@@ -7610,6 +7612,7 @@ dependencies = [
  "rustfs-appauth",
  "rustfs-audit",
  "rustfs-common",
+ "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-crypto",
@@ -7617,6 +7620,8 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-heal",
  "rustfs-iam",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
@@ -7738,6 +7743,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-concurrency"
+version = "0.0.5"
+dependencies = [
+ "rustfs-io-core",
+ "rustfs-io-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rustfs-config"
 version = "0.0.5"
 dependencies = [
@@ -7810,8 +7827,8 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0-rc.5",
+ "memmap2 0.9.10",
  "metrics",
- "moka",
  "num_cpus",
  "parking_lot 0.12.5",
  "path-absolutize",
@@ -7830,6 +7847,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-filemeta",
+ "rustfs-io-metrics",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-policy",
@@ -7943,6 +7961,28 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rustfs-io-core"
+version = "0.0.5"
+dependencies = [
+ "bytes",
+ "memmap2 0.9.10",
+ "rustfs-io-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-io-metrics"
+version = "0.0.5"
+dependencies = [
+ "metrics",
+ "num_cpus",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8089,6 +8129,7 @@ dependencies = [
  "serde_json",
  "starshard",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -8526,7 +8567,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8594,7 +8635,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8641,7 +8682,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=b296762bc9e7fa608f1bc44f5cd625d606e0dd31#b296762bc9e7fa608f1bc44f5cd625d606e0dd31"
+source = "git+https://github.com/rustfs/s3s?rev=f1815ced732e180f71935feee6ae5ef44fe39b22#f1815ced732e180f71935feee6ae5ef44fe39b22"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -9599,7 +9640,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10558,7 +10599,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

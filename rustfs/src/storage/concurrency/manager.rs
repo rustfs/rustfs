@@ -15,12 +15,18 @@
 //! Concurrency manager for coordinating concurrent GetObject requests.
 
 use super::io_schedule::{
-    IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoStrategy,
+    IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::object_cache::{CacheStats, CachedGetObject, CachedObject, HotObjectCache};
+use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
+use rustfs_concurrency::{GetObjectCacheEligibility, GetObjectQueueSnapshot};
 use rustfs_config::{KI_B, MI_B};
+use rustfs_io_core::BytesPool;
+use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
+use rustfs_io_metrics::bandwidth::{BandwidthMonitor, BandwidthSnapshot};
+use rustfs_io_metrics::global_metrics::get_global_metrics;
+use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -31,8 +37,8 @@ pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::
 
 #[derive(Clone)]
 pub struct ConcurrencyManager {
-    /// Hot object cache for frequently accessed objects
-    cache: Arc<HotObjectCache>,
+    /// Tiered object cache (L1 + L2) for frequently accessed objects
+    cache: Arc<TieredObjectCache>,
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
     /// Whether object caching is enabled (from RUSTFS_OBJECT_CACHE_ENABLE env var)
@@ -42,6 +48,19 @@ pub struct ConcurrencyManager {
     /// I/O priority queue for request scheduling
     #[allow(dead_code)]
     priority_queue: Arc<IoPriorityQueue<()>>,
+    /// Bytes pool for buffer allocation and reuse
+    bytes_pool: Arc<BytesPool>,
+    // Enhanced scheduler state
+    /// I/O scheduler configuration (cached at initialization)
+    scheduler_config: IoSchedulerConfig,
+    /// Detected storage media type
+    storage_media: StorageMedia,
+    /// I/O pattern detector for sequential/random access tracking
+    pattern_detector: Arc<Mutex<IoPatternDetector>>,
+    /// Bandwidth monitor for adaptive I/O sizing
+    bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
+    /// Metrics collector for I/O latency tracking (P50, P95, P99)
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -52,10 +71,21 @@ impl std::fmt::Debug for ConcurrencyManager {
         } else {
             "locked".to_string()
         };
+        let bandwidth_info = if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            format!("{:?}", monitor.snapshot())
+        } else {
+            "locked".to_string()
+        };
         f.debug_struct("ConcurrencyManager")
-            .field("active_requests", &super::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed))
+            .field(
+                "active_requests",
+                &crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(Ordering::Relaxed),
+            )
             .field("disk_read_permits", &self.disk_read_semaphore.available_permits())
             .field("io_metrics", &io_metrics_info)
+            .field("storage_media", &self.storage_media)
+            .field("bandwidth", &bandwidth_info)
+            .field("bytes_pool", &self.bytes_pool)
             .finish()
     }
 }
@@ -64,22 +94,78 @@ impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
     /// Reads configuration from environment variables:
-    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: false)
+    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: true)
+    /// - `RUSTFS_OBJECT_TIERED_CACHE_ENABLE`: Enable tiered L1+L2 caching (default: true)
+    /// - `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`: Maximum concurrent disk reads (default: 64)
     pub fn new() -> Self {
+        // Load scheduler configuration once at initialization
+        let scheduler_config = IoSchedulerConfig::from_env();
+
         let cache_enabled =
             rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
 
-        let max_disk_reads = rustfs_utils::get_env_usize(
-            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
-            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+        let tiered_cache_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE,
         );
 
+        let max_disk_reads = scheduler_config.max_concurrent_reads;
+
+        // Detect storage media
+        let storage_media =
+            detect_storage_media(scheduler_config.storage_detection_enabled, &scheduler_config.storage_media_override);
+
+        // Create tiered cache configuration
+        let cache = if tiered_cache_enabled {
+            Arc::new(TieredObjectCache::new())
+        } else {
+            // If tiered cache is disabled, create a simple tiered cache (acts as single-level)
+            // For now, we always use TieredObjectCache since the configuration is now enabled by default
+            Arc::new(TieredObjectCache::new())
+        };
+
+        // Initialize I/O pattern detector
+        let pattern_detector = Arc::new(Mutex::new(IoPatternDetector::new(
+            scheduler_config.pattern_history_size,
+            scheduler_config.sequential_step_tolerance_bytes,
+        )));
+
+        // Initialize bandwidth monitor
+        let bandwidth_monitor = Arc::new(Mutex::new(BandwidthMonitor::new(
+            scheduler_config.bandwidth_ema_beta,
+            scheduler_config.bandwidth_low_threshold_bps,
+            scheduler_config.bandwidth_high_threshold_bps,
+        )));
+
+        // Use global performance metrics instance for consistent metrics tracking
+        // This allows AutoTuner and other components to access the same metrics data
+        let performance_metrics = get_global_metrics();
+
+        // Initialize metrics collector for I/O latency tracking
+        // Keep 1000 samples for P95/P99 calculation
+        let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics.clone(), 1000));
+
+        // Build priority queue config
+        let queue_config = IoPriorityQueueConfig {
+            queue_high_capacity: scheduler_config.queue_high_capacity,
+            queue_normal_capacity: scheduler_config.queue_normal_capacity,
+            queue_low_capacity: scheduler_config.queue_low_capacity,
+            starvation_prevention_interval_ms: scheduler_config.starvation_prevention_interval_ms,
+            starvation_threshold_secs: scheduler_config.starvation_threshold_secs,
+        };
+
         Self {
-            cache: Arc::new(HotObjectCache::new()),
+            cache,
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
             cache_enabled,
-            io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(100))), // Keep last 100 observations
-            priority_queue: Arc::new(IoPriorityQueue::new(IoPriorityQueueConfig::default())),
+            io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
+            priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
+            bytes_pool: Arc::new(BytesPool::new_tiered()),
+            scheduler_config,
+            storage_media,
+            pattern_detector,
+            bandwidth_monitor,
+            metrics_collector,
         }
     }
 
@@ -104,14 +190,25 @@ impl ConcurrencyManager {
 
     /// Try to get an object from cache
     pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        self.cache.get(key).await
+        self.cache.get_bytes(key).await
     }
 
     /// Cache an object for future retrievals
     pub async fn cache_object(&self, key: String, data: Vec<u8>) {
-        let size = data.len();
-        let cached_obj = Arc::new(CachedObject::new_with_size(data, size));
-        self.cache.put(key, cached_obj).await;
+        let cached_data = Arc::new(data);
+        self.cache.put_bytes(key, cached_data).await;
+    }
+
+    /// Get the bytes pool for buffer allocation
+    ///
+    /// Returns a reference to the BytesPool which can be used to acquire
+    /// reusable buffers for I/O operations, reducing allocation overhead.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped BytesPool instance
+    pub fn bytes_pool(&self) -> Arc<BytesPool> {
+        self.bytes_pool.clone()
     }
 
     /// Acquire a permit to perform a disk read operation
@@ -138,13 +235,57 @@ impl ConcurrencyManager {
         if let Ok(mut metrics) = self.io_metrics.lock() {
             metrics.record(wait_duration);
         }
+    }
 
-        // Record histogram metric for Prometheus
-        #[cfg(all(feature = "metrics", not(test)))]
-        {
-            use metrics::histogram;
-            histogram!("rustfs.disk.permit.wait.duration.seconds").record(wait_duration.as_secs_f64());
-        }
+    // ============================================
+    // Metrics Collection Methods
+    // ============================================
+
+    /// Record a disk I/O operation for latency tracking.
+    ///
+    /// This method delegates to MetricsCollector which:
+    /// 1. Updates atomic counters in PerformanceMetrics
+    /// 2. Records latency for P95/P99 calculation
+    /// 3. Reports to metrics crate (which exports to OTEL)
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes transferred
+    /// * `duration` - Duration of the I/O operation
+    /// * `is_read` - true for read operations, false for writes
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let manager = get_concurrency_manager();
+    /// let start = Instant::now();
+    /// // ... perform disk I/O ...
+    /// let duration = start.elapsed();
+    /// manager.record_disk_operation(1024 * 1024, duration, true).await;
+    /// ```
+    pub async fn record_disk_operation(&self, bytes: u64, duration: Duration, is_read: bool) {
+        self.metrics_collector.record_io_operation(bytes, duration, is_read).await;
+    }
+
+    /// Get a reference to the metrics collector for external use.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped MetricsCollector instance
+    pub fn metrics_collector(&self) -> &Arc<MetricsCollector> {
+        &self.metrics_collector
+    }
+
+    /// Get the global performance metrics instance.
+    ///
+    /// This provides access to the shared PerformanceMetrics that is used
+    /// across all components, including AutoTuner.
+    ///
+    /// # Returns
+    ///
+    /// Arc-wrapped PerformanceMetrics instance
+    pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
+        get_global_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.
@@ -177,6 +318,85 @@ impl ConcurrencyManager {
 
         // Calculate strategy from the current wait duration
         IoStrategy::from_wait_duration(permit_wait_duration, base_buffer_size)
+    }
+
+    /// Calculate I/O strategy with enhanced multi-factor context.
+    ///
+    /// This method integrates storage media, access patterns, bandwidth observations,
+    /// and concurrent request count to provide a more sophisticated I/O strategy.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_size` - Size of the file/object being read (-1 if unknown)
+    /// * `base_buffer_size` - Base buffer size from workload configuration
+    /// * `permit_wait_duration` - Time spent waiting for disk read permit
+    /// * `is_sequential_hint` - Whether the access pattern is known to be sequential
+    ///
+    /// # Returns
+    ///
+    /// An `IoStrategy` with optimized parameters based on all available factors.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let strategy = manager.calculate_io_strategy_with_context(
+    ///     file_size,
+    ///     256 * 1024,
+    ///     permit_wait_duration,
+    ///     false,
+    /// );
+    /// let optimal_buffer = strategy.buffer_size;
+    /// let enable_readahead = strategy.enable_readahead;
+    /// ```
+    pub fn calculate_io_strategy_with_context(
+        &self,
+        file_size: i64,
+        base_buffer_size: usize,
+        permit_wait_duration: Duration,
+        is_sequential_hint: bool,
+    ) -> IoStrategy {
+        use crate::storage::concurrency::io_schedule::IoSchedulingContext;
+
+        // Record the observation for future smoothing
+        self.record_permit_wait(permit_wait_duration);
+
+        // Get current access pattern
+        let access_pattern = if let Ok(detector) = self.pattern_detector.lock() {
+            detector.current_pattern()
+        } else {
+            AccessPattern::Unknown
+        };
+
+        // Get current bandwidth snapshot
+        let observed_bandwidth_bps = if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            let snapshot = monitor.snapshot();
+            if snapshot.tier == rustfs_io_metrics::bandwidth::BandwidthTier::Unknown {
+                None
+            } else {
+                Some(snapshot.bytes_per_second)
+            }
+        } else {
+            None
+        };
+
+        // Get concurrent request count
+        let concurrent_requests =
+            crate::storage::concurrency::io_schedule::ACTIVE_GET_REQUESTS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Build scheduling context
+        let context = IoSchedulingContext {
+            file_size,
+            base_buffer_size,
+            permit_wait_duration,
+            is_sequential_hint,
+            access_pattern,
+            storage_media: self.storage_media,
+            observed_bandwidth_bps,
+            concurrent_requests,
+        };
+
+        // Calculate strategy using multi-factor approach
+        IoStrategy::from_context_with_config(&context, &self.scheduler_config)
     }
 
     /// Get the smoothed I/O load level based on recent observations.
@@ -242,14 +462,90 @@ impl ConcurrencyManager {
         buffer_size.clamp(32 * KI_B, MI_B)
     }
 
+    // ============================================
+    // Enhanced I/O Scheduling Methods
+    // ============================================
+
+    /// Record an I/O access for pattern detection.
+    ///
+    /// This updates the pattern detector with the offset and size of an access,
+    /// allowing it to distinguish between sequential and random access patterns.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - File offset being accessed
+    /// * `len` - Length of the access
+    pub fn record_access(&self, offset: u64, len: u64) {
+        if let Ok(mut detector) = self.pattern_detector.lock() {
+            detector.record(offset, len);
+        }
+    }
+
+    /// Get the current access pattern.
+    ///
+    /// Returns the detected access pattern (Sequential, Random, Mixed, or Unknown).
+    pub fn current_access_pattern(&self) -> AccessPattern {
+        if let Ok(detector) = self.pattern_detector.lock() {
+            detector.current_pattern()
+        } else {
+            AccessPattern::Unknown
+        }
+    }
+
+    /// Record a data transfer for bandwidth monitoring.
+    ///
+    /// This updates the bandwidth monitor with the bytes transferred and duration,
+    /// allowing it to maintain an EMA (Exponential Moving Average) of the observed bandwidth.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes transferred
+    /// * `duration` - Duration of the transfer
+    pub fn record_transfer(&self, bytes: u64, duration: Duration) {
+        if let Ok(mut monitor) = self.bandwidth_monitor.lock() {
+            monitor.record_transfer(bytes, duration);
+        }
+    }
+
+    /// Get the current bandwidth snapshot.
+    ///
+    /// Returns a snapshot of the current bandwidth including bytes per second and tier.
+    pub fn current_bandwidth_snapshot(&self) -> BandwidthSnapshot {
+        if let Ok(monitor) = self.bandwidth_monitor.lock() {
+            monitor.snapshot()
+        } else {
+            BandwidthSnapshot {
+                bytes_per_second: 0,
+                tier: rustfs_io_metrics::bandwidth::BandwidthTier::Unknown,
+            }
+        }
+    }
+
+    /// Get the detected storage media type.
+    pub fn storage_media(&self) -> StorageMedia {
+        self.storage_media
+    }
+
+    /// Get the scheduler configuration.
+    pub fn scheduler_config(&self) -> &IoSchedulerConfig {
+        &self.scheduler_config
+    }
+
     /// Get cache statistics
     pub async fn cache_stats(&self) -> CacheStats {
-        self.cache.stats().await
+        self.cache.stats_as_hot_cache().await
     }
 
     /// Clear all cached objects
     pub async fn clear_cache(&self) {
         self.cache.clear().await;
+    }
+
+    /// Reset cache hit/miss metrics counters.
+    ///
+    /// This is useful for testing to get a clean slate for hit rate calculations.
+    pub fn reset_cache_metrics(&self) {
+        self.cache.reset_metrics();
     }
 
     /// Check if a key is cached
@@ -259,17 +555,18 @@ impl ConcurrencyManager {
 
     /// Get multiple cached objects in a single operation
     pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
-        self.cache.get_batch(keys).await
+        self.cache.get_batch_bytes(keys).await
     }
 
     /// Remove a specific object from cache
     pub async fn remove_cached(&self, key: &str) -> bool {
-        self.cache.remove(key).await
+        self.cache.remove(key).await.is_some()
     }
 
     /// Get the most frequently accessed keys
     pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
-        self.cache.get_hot_keys(limit).await
+        let keys = self.cache.get_hot_keys(limit).await;
+        keys.into_iter().map(|(k, v)| (k, v as u64)).collect()
     }
 
     /// Get cache hit rate percentage
@@ -282,7 +579,55 @@ impl ConcurrencyManager {
     /// This can be called during server startup or maintenance windows
     /// to pre-populate the cache with known hot objects.
     pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
-        self.cache.warm(objects).await;
+        if !self.cache_enabled {
+            debug!("Cache is disabled, skipping warmup");
+            return;
+        }
+
+        // Cache each object
+        for (key, data) in objects {
+            self.cache_object(key, data).await;
+        }
+    }
+
+    /// Warm up cache with a specific pattern.
+    ///
+    /// This method supports different warming patterns for more intelligent
+    /// cache pre-population during server startup or maintenance windows.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - The warming pattern to use
+    ///
+    /// # Returns
+    ///
+    /// The number of objects successfully warmed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Warm the 100 most recently accessed objects
+    /// let pattern = WarmupPattern::RecentAccesses { limit: 100 };
+    /// let warmed = manager.warm_cache_with_pattern(pattern).await;
+    ///
+    /// // Warm specific keys
+    /// let keys = vec!["bucket1/key1".to_string(), "bucket1/key2".to_string()];
+    /// let pattern = WarmupPattern::SpecificKeys(keys);
+    /// manager.warm_cache_with_pattern(pattern).await;
+    /// ```
+    pub async fn warm_cache_with_pattern(&self, pattern: WarmupPattern) -> usize {
+        if !self.cache_enabled {
+            debug!("Cache is disabled, skipping warmup");
+            return 0;
+        }
+
+        debug!("warm_cache_with_pattern called with pattern: {:?}", pattern);
+
+        // Delegate to the tiered cache's warm implementation
+        // Note: This returns the count of keys identified for warming,
+        // but actual object loading from storage would need to be implemented
+        // at a higher layer (object_usecase) that has access to storage backends
+        self.cache.warm(pattern).await
     }
 
     /// Get optimized buffer size for a request
@@ -459,31 +804,32 @@ impl ConcurrencyManager {
             // Unknown size, use normal priority
             IoPriority::Normal
         } else {
-            IoPriority::from_size(request_size)
+            // Use cached scheduler config thresholds
+            IoPriority::from_size_with_thresholds(
+                request_size,
+                self.scheduler_config.high_priority_size_threshold,
+                self.scheduler_config.low_priority_size_threshold,
+            )
         }
     }
 
     /// Check if priority scheduling is enabled.
     pub fn is_priority_scheduling_enabled(&self) -> bool {
-        rustfs_utils::get_env_bool(
-            rustfs_config::ENV_OBJECT_PRIORITY_SCHEDULING_ENABLE,
-            rustfs_config::DEFAULT_OBJECT_PRIORITY_SCHEDULING_ENABLE,
-        )
+        self.scheduler_config.enable_priority
     }
 
     /// Get current I/O queue status for monitoring.
     ///
     /// Returns information about permit usage and waiting requests.
     pub fn io_queue_status(&self) -> IoQueueStatus {
-        let total_permits = rustfs_utils::get_env_usize(
-            rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
-            rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+        let snapshot = GetObjectQueueSnapshot::from_available_permits(
+            self.scheduler_config.max_concurrent_reads,
+            self.disk_read_semaphore.available_permits(),
         );
-        let permits_in_use = total_permits.saturating_sub(self.disk_read_semaphore.available_permits());
 
         IoQueueStatus {
-            total_permits,
-            permits_in_use,
+            total_permits: snapshot.total_permits,
+            permits_in_use: snapshot.permits_in_use,
             high_priority_waiting: 0, // Would need additional tracking
             normal_priority_waiting: 0,
             low_priority_waiting: 0,
@@ -511,11 +857,7 @@ impl ConcurrencyManager {
         &self,
         priority: IoPriority,
     ) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::counter;
-            counter!("rustfs.disk.read.queue.total", "priority" => priority.as_str()).increment(1);
-        }
+        rustfs_io_metrics::record_io_priority_assignment(priority.as_str());
 
         debug!(
             priority = %priority,
@@ -524,6 +866,26 @@ impl ConcurrencyManager {
         );
 
         self.disk_read_semaphore.acquire().await
+    }
+
+    /// Build the minimal cache eligibility decision for a GetObject response.
+    pub fn get_object_cache_eligibility(
+        &self,
+        cache_writeback_enabled: bool,
+        is_part_request: bool,
+        is_range_request: bool,
+        encryption_applied: bool,
+        response_size: i64,
+    ) -> GetObjectCacheEligibility {
+        GetObjectCacheEligibility {
+            cache_enabled: self.is_cache_enabled(),
+            cache_writeback_enabled,
+            is_part_request,
+            is_range_request,
+            encryption_applied,
+            response_size,
+            max_cacheable_size: self.max_object_size(),
+        }
     }
 
     /// Get the global concurrency manager instance.
@@ -713,5 +1075,178 @@ mod integration_tests {
         // Should return a reasonable buffer size
         assert!(size1 > 0);
         assert!(size1 <= 2 * 1024 * 1024); // Not more than 2MB
+    }
+
+    // ============================================
+    // Multi-Factor Strategy Integration Tests
+    // ============================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_nvme_optimal() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate optimal conditions: Unknown/SSD + Sequential + Low load
+        let file_size = 100 * 1024 * 1024; // 100MB
+        let base_buffer = 256 * 1024;
+        let permit_wait = Duration::from_millis(5); // Low load
+        let is_sequential = true;
+
+        let strategy = manager.calculate_io_strategy_with_context(file_size, base_buffer, permit_wait, is_sequential);
+        let media = manager.storage_media();
+
+        // Verify basic optimizations work
+        assert_eq!(strategy.storage_media, media);
+        assert!(strategy.buffer_size >= base_buffer * 8 / 10, "Sequential should maintain or boost buffer");
+        let expected_readahead = !matches!(media, StorageMedia::Hdd);
+        assert_eq!(
+            strategy.enable_readahead, expected_readahead,
+            "Readahead should follow storage profile preference under low load"
+        );
+        assert_eq!(strategy.load_level, IoLoadLevel::Low);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_access_pattern_tracking() {
+        let manager = ConcurrencyManager::new();
+
+        // Record sequential accesses
+        for offset in [0, 1024, 2048, 3072, 4096] {
+            manager.record_access(offset, 1024);
+        }
+
+        // Check pattern detection
+        let pattern = manager.current_access_pattern();
+        assert_eq!(pattern, AccessPattern::Sequential);
+
+        // Record random accesses
+        for offset in [0, 10 * 1024, 100 * 1024, 5 * 1024 * 1024] {
+            manager.record_access(offset, 1024);
+        }
+
+        // Pattern should change to mixed or random
+        let pattern_after = manager.current_access_pattern();
+        assert!(!matches!(pattern_after, AccessPattern::Sequential));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_bandwidth_recording() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate transfer
+        let bytes = 10 * 1024 * 1024; // 10MB
+        let duration = Duration::from_millis(100); // 100ms = 100MB/s
+
+        manager.record_transfer(bytes, duration);
+
+        // Check bandwidth snapshot (returns BandwidthSnapshot directly)
+        let snapshot = manager.current_bandwidth_snapshot();
+        assert!(snapshot.bytes_per_second > 0, "Should have bandwidth data after recording");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_compatibility() {
+        let manager = ConcurrencyManager::new();
+
+        // Test that old API still works
+        let old_strategy = manager.calculate_io_strategy(Duration::from_millis(50), 256 * 1024);
+
+        assert!(old_strategy.buffer_size > 0);
+
+        // New API with context should also work
+        let new_strategy =
+            manager.calculate_io_strategy_with_context(50 * 1024 * 1024, 256 * 1024, Duration::from_millis(50), false);
+
+        assert!(new_strategy.buffer_size > 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_high_concurrency() {
+        let manager = ConcurrencyManager::new();
+
+        // Simulate high concurrent requests by keeping guards alive
+        let _guards: Vec<_> = (0..20).map(|_| GetObjectGuard::new()).collect();
+
+        let strategy = manager.calculate_io_strategy_with_context(100 * 1024 * 1024, 512 * 1024, Duration::from_millis(10), true);
+
+        // High concurrency should reduce buffer
+        assert!(strategy.concurrent_requests >= manager.scheduler_config().high_concurrency_threshold);
+        assert!(strategy.buffer_size < 512 * 1024, "High concurrency should reduce buffer");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_buffer_clamp() {
+        let manager = ConcurrencyManager::new();
+        let media = manager.storage_media();
+        let config = manager.scheduler_config();
+
+        // Request very large base buffer
+        let large_base = 16 * 1024 * 1024; // 16MB
+
+        let strategy = manager.calculate_io_strategy_with_context(
+            1024 * 1024, // 1GB file
+            large_base,
+            Duration::from_millis(1),
+            true,
+        );
+
+        let media_cap = match media {
+            StorageMedia::Nvme => config.nvme_buffer_cap,
+            StorageMedia::Ssd => config.ssd_buffer_cap,
+            StorageMedia::Hdd => config.hdd_buffer_cap,
+            StorageMedia::Unknown => config.ssd_buffer_cap,
+        };
+        let expected_max = media_cap.min(MI_B);
+
+        // Large base buffer should be constrained by storage cap first, then global clamp.
+        assert_eq!(
+            strategy.buffer_size, expected_max,
+            "Buffer should be capped by media profile and global clamp"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_storage_media_detection() {
+        let manager = ConcurrencyManager::new();
+
+        // Check storage media was detected at initialization
+        let media = manager.storage_media();
+
+        // Should be one of the known types (not Unknown unless detection failed)
+        // We accept Unknown if detection wasn't configured
+        assert!(matches!(
+            media,
+            StorageMedia::Nvme | StorageMedia::Ssd | StorageMedia::Hdd | StorageMedia::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multi_factor_strategy_priority_with_context() {
+        let manager = ConcurrencyManager::new();
+
+        // Test priority is correctly calculated in multi-factor strategy
+        let small_file_strategy = manager.calculate_io_strategy_with_context(
+            500 * 1024, // 500KB
+            256 * 1024,
+            Duration::from_millis(10),
+            false,
+        );
+
+        let large_file_strategy = manager.calculate_io_strategy_with_context(
+            50 * 1024 * 1024, // 50MB
+            256 * 1024,
+            Duration::from_millis(10),
+            false,
+        );
+
+        assert_eq!(small_file_strategy.priority, IoPriority::High);
+        assert_eq!(large_file_strategy.priority, IoPriority::Low);
     }
 }

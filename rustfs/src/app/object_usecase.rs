@@ -42,6 +42,8 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
+// Performance metrics recording (with zero-copy-metrics integration)
+use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -81,6 +83,7 @@ use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
+use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, EtagReader, HashReader, Reader, WarpReader};
@@ -99,8 +102,8 @@ use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
         AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
-        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_EXTRACT_ALT,
-        AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS,
+        AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -119,6 +122,7 @@ use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
@@ -130,12 +134,12 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 struct DeadlockRequestGuard {
-    deadlock_detector: Arc<crate::storage::deadlock_detector::DeadlockDetector>,
+    deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
     request_id: String,
 }
 
 impl DeadlockRequestGuard {
-    fn new(deadlock_detector: Arc<crate::storage::deadlock_detector::DeadlockDetector>, request_id: String) -> Self {
+    fn new(deadlock_detector: Arc<deadlock_detector::DeadlockDetector>, request_id: String) -> Self {
         Self {
             deadlock_detector,
             request_id,
@@ -147,6 +151,70 @@ impl Drop for DeadlockRequestGuard {
     fn drop(&mut self) {
         self.deadlock_detector.unregister_request(&self.request_id);
     }
+}
+
+struct GetObjectBootstrap {
+    timeout_config: TimeoutConfig,
+    wrapper: RequestTimeoutWrapper,
+    request_start: std::time::Instant,
+    request_guard: GetObjectGuard,
+    _deadlock_request_guard: DeadlockRequestGuard,
+    concurrent_requests: usize,
+}
+
+struct GetObjectIoPlanning<'a> {
+    _disk_permit: tokio::sync::SemaphorePermit<'a>,
+    permit_wait_duration: Duration,
+    queue_status: concurrency::IoQueueStatus,
+    queue_utilization: f64,
+}
+
+struct GetObjectRequestContext {
+    bucket: String,
+    key: String,
+    cache_key: String,
+    version_id_for_event: String,
+    part_number: Option<usize>,
+    rs: Option<HTTPRangeSpec>,
+    opts: ObjectOptions,
+}
+
+struct GetObjectReadSetup {
+    info: ObjectInfo,
+    event_info: ObjectInfo,
+    final_stream: Box<dyn Reader>,
+    rs: Option<HTTPRangeSpec>,
+    content_type: Option<ContentType>,
+    last_modified: Option<Timestamp>,
+    response_content_length: i64,
+    content_range: Option<String>,
+    server_side_encryption: Option<ServerSideEncryption>,
+    sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    ssekms_key_id: Option<SSEKMSKeyId>,
+    encryption_applied: bool,
+}
+
+struct GetObjectPreparedRead<'a> {
+    io_planning: GetObjectIoPlanning<'a>,
+    read_setup: GetObjectReadSetup,
+}
+
+struct GetObjectStrategyContext {
+    io_strategy: concurrency::IoStrategy,
+    optimal_buffer_size: usize,
+}
+
+struct GetObjectCachedHit {
+    output: GetObjectOutput,
+    event_info: ObjectInfo,
+}
+
+struct GetObjectOutputContext {
+    output: GetObjectOutput,
+    event_info: ObjectInfo,
+    response_content_length: i64,
+    optimal_buffer_size: usize,
 }
 
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
@@ -233,6 +301,61 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     }
 }
 
+/// Determine if zero-copy write should be used for this PutObject operation.
+///
+/// Zero-copy is beneficial for large objects without encryption or compression.
+///
+/// # Arguments
+///
+/// * `size` - Object size in bytes
+/// * `headers` - HTTP headers (to check for encryption/compression)
+///
+/// # Returns
+///
+/// `true` if zero-copy should be used, `false` otherwise
+fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
+    // Only use zero-copy for large objects (> 1MB)
+    const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
+
+    if size < ZERO_COPY_MIN_SIZE {
+        return false;
+    }
+
+    // Don't use zero-copy if encryption is requested
+    if headers.get("x-amz-server-side-encryption").is_some()
+        || headers.get("x-amz-server-side-encryption-customer-algorithm").is_some()
+        || headers.get("x-amz-server-side-encryption-aws-kms-key-id").is_some()
+    {
+        return false;
+    }
+
+    // Don't use zero-copy if compression is likely (compressible content types)
+    // The compression check happens later in the flow
+    if let Some(content_type) = headers.get("content-type")
+        && let Ok(ct) = content_type.to_str()
+    {
+        // Skip zero-copy for easily compressible content types
+        // since compression will be applied
+        let compressible_types = [
+            "text/plain",
+            "text/html",
+            "text/css",
+            "text/javascript",
+            "application/javascript",
+            "application/json",
+            "application/xml",
+            "text/xml",
+        ];
+        for ct_type in compressible_types {
+            if ct.contains(ct_type) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
@@ -298,6 +421,16 @@ fn apply_trailing_checksums(
 }
 
 #[derive(Default)]
+struct GetObjectChecksums {
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    crc64nvme: Option<String>,
+    checksum_type: Option<ChecksumType>,
+}
+
+#[derive(Default)]
 struct PutObjectChecksums {
     crc32: Option<String>,
     crc32c: Option<String>,
@@ -336,10 +469,28 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
+const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
+#[cfg(test)]
+const AMZ_SNOWBALL_PREFIX_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+#[cfg(test)]
+const AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+#[cfg(test)]
+const AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 const AMZ_META_PREFIX_LOWER: &str = "x-amz-meta-";
 const SNOWBALL_PREFIX_SUFFIX_LOWER: &str = "snowball-prefix";
 const SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER: &str = "snowball-ignore-dirs";
 const SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER: &str = "snowball-ignore-errors";
+const SNOWBALL_PREFIX_HEADER_KEYS: &[&str] = &[AMZ_MINIO_SNOWBALL_PREFIX, AMZ_SNOWBALL_PREFIX, AMZ_RUSTFS_SNOWBALL_PREFIX];
+const SNOWBALL_IGNORE_DIRS_HEADER_KEYS: &[&str] = &[
+    AMZ_MINIO_SNOWBALL_IGNORE_DIRS,
+    AMZ_SNOWBALL_IGNORE_DIRS,
+    AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS,
+];
+const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
+    AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
+    AMZ_SNOWBALL_IGNORE_ERRORS,
+    AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
@@ -356,18 +507,26 @@ fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
 }
 
 fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
-    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_ALT)
+    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
 }
 
-fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> Option<String> {
-    if let Some(preferred) = headers.get(preferred_key).and_then(|value| value.to_str().ok()) {
-        return Some(preferred.trim().to_string());
-    }
+fn trimmed_header_value(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+}
 
+fn is_exact_snowball_meta_key(key: &str, exact_keys: &[&str]) -> bool {
+    exact_keys.iter().any(|exact_key| key.eq_ignore_ascii_case(exact_key))
+}
+
+fn snowball_meta_value_by_suffix(headers: &HeaderMap, suffix_lower: &str, exact_keys: &[&str]) -> Option<String> {
     for (name, value) in headers {
-        let key = name.as_str().to_ascii_lowercase();
+        let key = name.as_str();
         if key.starts_with(AMZ_META_PREFIX_LOWER)
             && key.ends_with(suffix_lower)
+            && !is_exact_snowball_meta_key(key, exact_keys)
             && let Ok(parsed) = value.to_str()
         {
             return Some(parsed.trim().to_string());
@@ -377,8 +536,18 @@ fn snowball_meta_value_by_suffix(headers: &HeaderMap, preferred_key: &str, suffi
     None
 }
 
-fn snowball_meta_flag_by_suffix(headers: &HeaderMap, preferred_key: &str, suffix_lower: &str) -> bool {
-    snowball_meta_value_by_suffix(headers, preferred_key, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+fn snowball_meta_value(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &str) -> Option<String> {
+    for key in exact_keys {
+        if let Some(value) = trimmed_header_value(headers, key) {
+            return Some(value);
+        }
+    }
+
+    snowball_meta_value_by_suffix(headers, suffix_lower, exact_keys)
+}
+
+fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &str) -> bool {
+    snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
@@ -391,7 +560,7 @@ fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
 }
 
 fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> String {
-    let path = path.trim_start_matches("./").trim_start_matches('/');
+    let path = path.trim_matches('/');
     let mut key = match prefix {
         Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
         Some(prefix) => prefix.to_string(),
@@ -661,14 +830,10 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
-    let prefix = snowball_meta_value_by_suffix(headers, AMZ_MINIO_SNOWBALL_PREFIX, SNOWBALL_PREFIX_SUFFIX_LOWER)
-        .or_else(|| snowball_meta_value_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_PREFIX, SNOWBALL_PREFIX_SUFFIX_LOWER))
+    let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .and_then(|value| normalize_snowball_prefix(&value));
-    let ignore_dirs = snowball_meta_flag_by_suffix(headers, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER)
-        || snowball_meta_flag_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
-    let ignore_errors =
-        snowball_meta_flag_by_suffix(headers, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER)
-            || snowball_meta_flag_by_suffix(headers, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
+    let ignore_dirs = snowball_meta_flag(headers, SNOWBALL_IGNORE_DIRS_HEADER_KEYS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
+    let ignore_errors = snowball_meta_flag(headers, SNOWBALL_IGNORE_ERRORS_HEADER_KEYS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
 
     PutObjectExtractOptions {
         prefix,
@@ -767,6 +932,693 @@ impl DefaultObjectUsecase {
         });
     }
 
+    fn build_cached_get_object_output(cached: &CachedGetObject) -> GetObjectOutput {
+        let body_data = cached.body.clone();
+        let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move {
+            Ok((*body_data).clone())
+        })));
+
+        let last_modified = cached
+            .last_modified
+            .as_ref()
+            .and_then(|s| match OffsetDateTime::parse(s, &Rfc3339) {
+                Ok(dt) => Some(Timestamp::from(dt)),
+                Err(e) => {
+                    warn!("Failed to parse cached last_modified '{}': {}", s, e);
+                    None
+                }
+            });
+
+        let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
+
+        GetObjectOutput {
+            body,
+            content_length: Some(cached.content_length),
+            accept_ranges: Some("bytes".to_string()),
+            e_tag: cached.e_tag.as_ref().map(|etag| to_s3s_etag(etag)),
+            last_modified,
+            content_type,
+            cache_control: cached.cache_control.clone(),
+            content_disposition: cached.content_disposition.clone(),
+            content_encoding: cached.content_encoding.clone(),
+            content_language: cached.content_language.clone(),
+            version_id: cached.version_id.clone(),
+            delete_marker: Some(cached.delete_marker),
+            tag_count: cached.tag_count,
+            metadata: if cached.user_metadata.is_empty() {
+                None
+            } else {
+                Some(cached.user_metadata.clone())
+            },
+            ..Default::default()
+        }
+    }
+
+    fn build_cached_get_object_event_info(bucket: &str, key: &str, cached: &CachedGetObject) -> ObjectInfo {
+        ObjectInfo {
+            bucket: bucket.to_string(),
+            name: key.to_string(),
+            storage_class: cached.storage_class.clone(),
+            mod_time: cached
+                .last_modified
+                .as_ref()
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
+            size: cached.content_length,
+            actual_size: cached.content_length,
+            is_dir: false,
+            user_defined: cached.user_metadata.clone(),
+            version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+            delete_marker: cached.delete_marker,
+            content_type: cached.content_type.clone(),
+            content_encoding: cached.content_encoding.clone(),
+            etag: cached.e_tag.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        let mem_reader = InMemoryAsyncReader::new(buf);
+        Some(StreamingBlob::wrap(bytes_stream(
+            ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
+            response_content_length as usize,
+        )))
+    }
+
+    fn build_reader_blob<R>(reader: R, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob>
+    where
+        R: AsyncRead + Send + Sync + 'static,
+    {
+        Some(StreamingBlob::wrap(bytes_stream(
+            ReaderStream::with_capacity(reader, optimal_buffer_size),
+            response_content_length as usize,
+        )))
+    }
+
+    fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
+        let timeout_config = TimeoutConfig::from_env();
+        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
+        let request_start = std::time::Instant::now();
+        let request_guard = ConcurrencyManager::track_request();
+        let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+        let deadlock_detector = deadlock_detector::get_deadlock_detector();
+        let request_id = wrapper.request_id().to_string();
+        deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
+        let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out before processing"
+            );
+            return Err(s3_error!(InternalError, "Request timeout before processing"));
+        }
+
+        rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
+
+        debug!(
+            "GetObject request started with {} concurrent requests, timeout={:?}",
+            concurrent_requests, timeout_config.get_object_timeout
+        );
+
+        Ok(GetObjectBootstrap {
+            timeout_config,
+            wrapper,
+            request_start,
+            request_guard,
+            _deadlock_request_guard: deadlock_request_guard,
+            concurrent_requests,
+        })
+    }
+
+    async fn acquire_get_object_io_planning<'a>(
+        manager: &'a ConcurrencyManager,
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &TimeoutConfig,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<GetObjectIoPlanning<'a>> {
+        let permit_wait_start = std::time::Instant::now();
+        let disk_permit = manager
+            .acquire_disk_read_permit()
+            .await
+            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
+        let permit_wait_duration = permit_wait_start.elapsed();
+
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                wait_ms = permit_wait_duration.as_millis(),
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out while waiting for disk permit"
+            );
+
+            rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
+            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
+        }
+
+        let queue_status = manager.io_queue_status();
+        let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
+            queue_status.total_permits,
+            queue_status.total_permits.saturating_sub(queue_status.permits_in_use),
+        );
+        let queue_utilization = queue_snapshot.utilization_percent();
+
+        if queue_snapshot.is_congested(80.0) {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                queue_utilization = format!("{:.1}%", queue_utilization),
+                permits_in_use = queue_status.permits_in_use,
+                total_permits = queue_status.total_permits,
+                "I/O queue congestion detected"
+            );
+
+            rustfs_io_metrics::record_io_queue_congestion();
+        }
+
+        if wrapper.is_timeout() {
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                elapsed_ms = wrapper.elapsed().as_millis(),
+                "GetObject request timed out before reading object"
+            );
+            rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
+            return Err(s3_error!(InternalError, "Request timeout before reading object"));
+        }
+
+        Ok(GetObjectIoPlanning {
+            _disk_permit: disk_permit,
+            permit_wait_duration,
+            queue_status,
+            queue_utilization,
+        })
+    }
+
+    async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
+        let GetObjectInput {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            range,
+            ..
+        } = req.input.clone();
+
+        validate_object_key(&key, "GET")?;
+
+        let part_number = part_number.map(|v| v as usize);
+
+        if let Some(part_num) = part_number
+            && part_num == 0
+        {
+            return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
+        }
+
+        let rs = range.map(|v| match v {
+            Range::Int { first, last } => HTTPRangeSpec {
+                is_suffix_length: false,
+                start: first as i64,
+                end: if let Some(last) = last { last as i64 } else { -1 },
+            },
+            Range::Suffix { length } => HTTPRangeSpec {
+                is_suffix_length: true,
+                start: length as i64,
+                end: -1,
+            },
+        });
+
+        if rs.is_some() && part_number.is_some() {
+            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+        }
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(GetObjectRequestContext {
+            cache_key: ConcurrencyManager::make_cache_key(&bucket, &key, version_id.as_deref()),
+            version_id_for_event: version_id.unwrap_or_default(),
+            bucket,
+            key,
+            part_number,
+            rs,
+            opts,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_get_object_read_execution<'a>(
+        req: &S3Request<GetObjectInput>,
+        manager: &'a ConcurrencyManager,
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &TimeoutConfig,
+        bucket: &str,
+        key: &str,
+        rs: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+        part_number: Option<usize>,
+    ) -> S3Result<GetObjectPreparedRead<'a>> {
+        let h = HeaderMap::new();
+        let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
+        let store = get_validated_store(bucket).await?;
+
+        let read_start = std::time::Instant::now();
+        let read_setup =
+            Self::prepare_get_object_read(req, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?;
+
+        Ok(GetObjectPreparedRead { io_planning, read_setup })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_get_object_read(
+        req: &S3Request<GetObjectInput>,
+        store: &rustfs_ecstore::store::ECStore,
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        mut rs: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+        part_number: Option<usize>,
+        read_start: std::time::Instant,
+    ) -> S3Result<GetObjectReadSetup> {
+        let reader = store
+            .get_object_reader(bucket, key, rs.clone(), h, opts)
+            .await
+            .map_err(ApiError::from)?;
+
+        let info = reader.object_info;
+
+        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
+        let read_duration = read_start.elapsed();
+        let estimated_saved = (info.size * 2) as usize;
+        record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
+        record_memory_copy_saved(estimated_saved);
+
+        manager.record_disk_operation(info.size as u64, read_duration, true).await;
+
+        check_preconditions(&req.headers, &info)?;
+
+        debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
+        for part in &info.parts {
+            debug!(
+                part_number = part.number,
+                part_size = part.size,
+                part_actual_size = part.actual_size,
+                "GET object part details"
+            );
+        }
+
+        let event_info = info.clone();
+        let content_type = if let Some(content_type) = &info.content_type {
+            match ContentType::from_str(content_type) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    error!("parse content-type err {} {:?}", content_type, err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let last_modified = info.mod_time.map(Timestamp::from);
+
+        if let Some(part_number) = part_number
+            && rs.is_none()
+        {
+            rs = HTTPRangeSpec::from_object_info(&info, part_number);
+        }
+
+        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+
+        let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
+        let content_range = if let Some(rs) = &rs {
+            let total_size = content_length;
+            let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
+            content_length = length;
+            Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
+        } else {
+            None
+        };
+
+        debug!(
+            "GET object metadata check: parts={}, provided_sse_key={:?}",
+            info.parts.len(),
+            req.input.sse_customer_key.is_some()
+        );
+
+        let decryption_request = DecryptionRequest {
+            bucket,
+            key,
+            metadata: &info.user_defined,
+            sse_customer_key: req.input.sse_customer_key.as_ref(),
+            sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
+            part_number: None,
+            parts: &info.parts,
+            etag: info.etag.as_deref(),
+        };
+
+        let mut response_content_length = content_length;
+        let encrypted_stream = reader.stream;
+
+        let (
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
+            encryption_applied,
+            final_stream,
+        ) = match sse_decryption(decryption_request).await? {
+            Some(material) => {
+                let server_side_encryption = Some(material.server_side_encryption.clone());
+                let sse_customer_algorithm = Some(material.algorithm.clone());
+                let sse_customer_key_md5 = material.customer_key_md5.clone();
+                let ssekms_key_id = material.kms_key_id.clone();
+
+                let (decrypted_stream, plaintext_size) = material
+                    .wrap_reader(encrypted_stream, content_length)
+                    .await
+                    .map_err(ApiError::from)?;
+
+                response_content_length = plaintext_size;
+
+                (
+                    server_side_encryption,
+                    sse_customer_algorithm,
+                    sse_customer_key_md5,
+                    ssekms_key_id,
+                    true,
+                    decrypted_stream,
+                )
+            }
+            None => (
+                None,
+                None,
+                None,
+                None,
+                false,
+                Box::new(WarpReader::new(encrypted_stream)) as Box<dyn Reader>,
+            ),
+        };
+
+        Ok(GetObjectReadSetup {
+            info,
+            event_info,
+            final_stream,
+            rs,
+            content_type,
+            last_modified,
+            response_content_length,
+            content_range,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
+            encryption_applied,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_get_object_strategy(
+        &self,
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        info: &ObjectInfo,
+        rs: Option<&HTTPRangeSpec>,
+        response_content_length: i64,
+        permit_wait_duration: Duration,
+        queue_utilization: f64,
+        queue_status: &concurrency::IoQueueStatus,
+        concurrent_requests: usize,
+    ) -> GetObjectStrategyContext {
+        let base_buffer_size = self.base_buffer_size();
+
+        let is_sequential_hint = if rs.is_none() {
+            true
+        } else if let Some(range_spec) = rs {
+            range_spec.start == 0 && !range_spec.is_suffix_length
+        } else {
+            false
+        };
+
+        if let Some(range_spec) = rs
+            && range_spec.start >= 0
+        {
+            manager.record_access(range_spec.start as u64, response_content_length as u64);
+        }
+
+        if response_content_length > 0 {
+            manager.record_transfer(response_content_length as u64, permit_wait_duration);
+        }
+
+        let io_strategy =
+            manager.calculate_io_strategy_with_context(info.size, base_buffer_size, permit_wait_duration, is_sequential_hint);
+
+        debug!(
+            wait_ms = permit_wait_duration.as_millis() as u64,
+            load_level = ?io_strategy.load_level,
+            buffer_size = io_strategy.buffer_size,
+            buffer_multiplier = io_strategy.buffer_multiplier,
+            readahead = io_strategy.enable_readahead,
+            cache_wb = io_strategy.cache_writeback_enabled,
+            storage_media = ?io_strategy.storage_media,
+            access_pattern = ?io_strategy.access_pattern,
+            bandwidth_tier = ?io_strategy.bandwidth_tier,
+            concurrent_requests = io_strategy.concurrent_requests,
+            file_size = info.size,
+            is_sequential = is_sequential_hint,
+            "Enhanced multi-factor I/O strategy calculated"
+        );
+
+        let io_priority = manager.get_io_priority(response_content_length);
+
+        if manager.is_priority_scheduling_enabled() {
+            debug!(
+                bucket = %bucket,
+                key = %key,
+                priority = %io_priority,
+                request_size = response_content_length,
+                "I/O priority assigned (based on actual request size)"
+            );
+
+            rustfs_io_metrics::record_io_priority_assignment(io_priority.as_str());
+        }
+
+        rustfs_io_metrics::record_get_object_io_state(
+            permit_wait_duration.as_secs_f64(),
+            queue_utilization,
+            queue_status.permits_in_use,
+            queue_status.total_permits.saturating_sub(queue_status.permits_in_use),
+            io_strategy.load_level.as_str(),
+            io_strategy.buffer_multiplier,
+        );
+        rustfs_io_metrics::record_io_priority_assignment(io_priority.as_str());
+
+        debug!(
+            actual_request_size = response_content_length,
+            priority = %io_priority.as_str(),
+            "I/O priority finalized with actual request size"
+        );
+
+        let base_buffer_size = get_buffer_size_opt_in(response_content_length);
+        let optimal_buffer_size = if io_strategy.buffer_size > 0 {
+            io_strategy.buffer_size.min(base_buffer_size)
+        } else {
+            get_concurrency_aware_buffer_size(response_content_length, base_buffer_size)
+        };
+
+        debug!(
+            "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}, io_strategy={:?}",
+            response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests, io_strategy.load_level
+        );
+
+        GetObjectStrategyContext {
+            io_strategy,
+            optimal_buffer_size,
+        }
+    }
+
+    fn build_get_object_checksums(
+        info: &ObjectInfo,
+        headers: &HeaderMap,
+        part_number: Option<usize>,
+        rs: Option<&HTTPRangeSpec>,
+    ) -> S3Result<GetObjectChecksums> {
+        let mut checksums = GetObjectChecksums::default();
+
+        if let Some(checksum_mode) = headers.get(AMZ_CHECKSUM_MODE)
+            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
+            && rs.is_none()
+        {
+            let (decrypted_checksums, _is_multipart) =
+                info.decrypt_checksums(part_number.unwrap_or(0), headers).map_err(|e| {
+                    error!("decrypt_checksums error: {}", e);
+                    ApiError::from(e)
+                })?;
+
+            for (key, checksum) in decrypted_checksums {
+                if key == AMZ_CHECKSUM_TYPE {
+                    checksums.checksum_type = Some(ChecksumType::from(checksum));
+                    continue;
+                }
+
+                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksums.crc32 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC32C => checksums.crc32c = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA1 => checksums.sha1 = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA256 => checksums.sha256 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksums.crc64nvme = Some(checksum),
+                    _ => (),
+                }
+            }
+        }
+
+        Ok(checksums)
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn build_get_object_body<R>(
+        mut final_stream: R,
+        info: &ObjectInfo,
+        cache_key: &str,
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        part_number: Option<usize>,
+        has_range: bool,
+        encryption_applied: bool,
+        cache_writeback_enabled: bool,
+    ) -> S3Result<Option<StreamingBlob>>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let manager = get_concurrency_manager();
+        let cache_eligibility = manager.get_object_cache_eligibility(
+            cache_writeback_enabled,
+            part_number.is_some(),
+            has_range,
+            encryption_applied,
+            response_content_length,
+        );
+        let should_cache = cache_eligibility.should_cache();
+
+        let body = if should_cache {
+            debug!(
+                "Reading object into memory for caching: key={} size={}",
+                cache_key, response_content_length
+            );
+
+            let mut buf = Vec::with_capacity(response_content_length as usize);
+            if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                error!("Failed to read object into memory for caching: {}", e);
+                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {e}"))).into());
+            }
+
+            if buf.len() != response_content_length as usize {
+                warn!(
+                    "Object size mismatch during cache read: expected={} actual={}",
+                    response_content_length,
+                    buf.len()
+                );
+            }
+
+            let last_modified_str = info.mod_time.and_then(|t| match t.format(&Rfc3339) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to format last_modified for cache writeback: {}", e);
+                    None
+                }
+            });
+
+            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
+                .with_content_type(info.content_type.clone().unwrap_or_default())
+                .with_e_tag(info.etag.clone().unwrap_or_default())
+                .with_last_modified(last_modified_str.unwrap_or_default());
+
+            let cache_key_clone = cache_key.to_string();
+            tokio::spawn(async move {
+                let manager = get_concurrency_manager();
+                manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
+                debug!("Object cached successfully with metadata: {}", cache_key_clone);
+            });
+
+            rustfs_io_metrics::record_object_cache_writeback();
+            Self::build_memory_blob(buf, response_content_length, optimal_buffer_size)
+        } else if encryption_applied {
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+            let should_buffer_encrypted_object = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && !has_range;
+
+            if should_buffer_encrypted_object {
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    error!("Failed to read decrypted object into memory: {}", e);
+                    return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
+                }
+
+                if buf.len() != response_content_length as usize {
+                    warn!(
+                        "Encrypted object size mismatch during read: expected={} actual={}",
+                        response_content_length,
+                        buf.len()
+                    );
+                }
+
+                Self::build_memory_blob(buf, response_content_length, optimal_buffer_size)
+            } else {
+                info!(
+                    "Encrypted object: Using unlimited stream for decryption with buffer size {}",
+                    optimal_buffer_size
+                );
+                Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size)
+            }
+        } else {
+            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+
+            let should_provide_seek_support = response_content_length > 0
+                && response_content_length <= seekable_object_size_threshold as i64
+                && part_number.is_none()
+                && !has_range;
+
+            if should_provide_seek_support {
+                debug!(
+                    "Reading small object into memory for seek support: key={} size={}",
+                    cache_key, response_content_length
+                );
+
+                let mut buf = Vec::with_capacity(response_content_length as usize);
+                match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                    Ok(_) => {
+                        if buf.len() != response_content_length as usize {
+                            warn!(
+                                "Object size mismatch during seek support read: expected={} actual={}",
+                                response_content_length,
+                                buf.len()
+                            );
+                        }
+
+                        Self::build_memory_blob(buf, response_content_length, optimal_buffer_size)
+                    }
+                    Err(e) => {
+                        error!("Failed to read object into memory for seek support: {}", e);
+                        Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size)
+                    }
+                }
+            } else {
+                Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size)
+            }
+        };
+
+        Ok(body)
+    }
+
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
         if req.extensions.get::<PostObjectRequestMarker>().is_some() {
             (EventName::ObjectCreatedPost, QuotaOperation::PostObject, "POST")
@@ -777,6 +1629,8 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let start_time = std::time::Instant::now();
+
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -866,6 +1720,18 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
+
+        // Detect zero-copy opportunity before encryption/compression decisions
+        // Zero-copy is beneficial for large unencrypted, uncompressed objects
+        let enable_zero_copy = should_use_zero_copy(size, &req.headers);
+
+        if enable_zero_copy {
+            // Record zero-copy write attempt
+            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
+            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
+        }
+
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
             StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
@@ -1121,9 +1987,21 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
+
+        // Record PutObject metrics via zero-copy-metrics
+        {
+            let duration_ms = start_time.elapsed().as_millis() as f64;
+            rustfs_io_metrics::record_put_object(
+                duration_ms,
+                size,
+                enable_zero_copy, // Track if zero-copy was enabled
+            );
+        }
+
         result
     }
 
@@ -1132,13 +2010,14 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let PutObjectAclInput {
             bucket,
             key,
             access_control_policy,
             version_id,
             ..
-        } = req.input;
+        } = req.input.clone();
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1147,7 +2026,7 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         if access_control_policy.is_some() {
             return Err(s3_error!(
@@ -1156,7 +2035,14 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        Ok(S3Response::new(PutObjectAclOutput::default()))
+        let event_version_id = version_id
+            .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
+            .unwrap_or_default();
+        helper = helper.object(object_info).version_id(event_version_id);
+
+        let result = Ok(S3Response::new(PutObjectAclOutput::default()));
+        let _ = helper.complete(&result);
+        result
     }
 
     pub async fn execute_put_object_legal_hold(
@@ -1167,7 +2053,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold).suppress_event();
         let PutObjectLegalHoldInput {
             bucket,
             key,
@@ -1298,7 +2185,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention).suppress_event();
         let PutObjectRetentionInput {
             bucket,
             key,
@@ -1391,7 +2279,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, S3Operation::PutObjectTagging);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
             bucket,
             key: object,
@@ -1451,20 +2339,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?req.input.version_id,
+                    error = %err,
+                    "failed to load object info for put-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id = req.input.version_id.clone();
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
             debug!("Cache invalidated for tagged object: {}", cache_key);
         });
 
         counter!("rustfs.put_object_tagging.success").increment(1);
 
-        let version_id_resp = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = req
+            .input
+            .version_id
+            .as_deref()
+            .filter(|version_id| !version_id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(PutObjectTaggingOutput {
             version_id: req.input.version_id.clone(),
@@ -1475,658 +2393,147 @@ impl DefaultObjectUsecase {
         result
     }
 
-    #[instrument(
-        level = "debug",
-        skip(self, req),
-        fields(start_time=?time::OffsetDateTime::now_utc())
-    )]
-    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
+    async fn maybe_get_cached_get_object(
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        cache_key: &str,
+        part_number: Option<usize>,
+        rs: Option<&HTTPRangeSpec>,
+        request_start: std::time::Instant,
+    ) -> Option<GetObjectCachedHit> {
+        if !manager.is_cache_enabled() || part_number.is_some() || rs.is_some() {
+            return None;
         }
 
-        // Create timeout wrapper for enhanced timeout tracking
-        let timeout_config = TimeoutConfig::from_env();
-        let wrapper =
-            RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{}-{}", req.input.bucket, req.input.key));
+        let cached = manager.get_cached_object(cache_key).await?;
+        let cache_serve_duration = request_start.elapsed();
 
-        // Get cancellation token for cooperative cancellation
-        let _cancel_token = wrapper.cancel_token();
-        let request_start = std::time::Instant::now();
+        debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
-        // Track this request for concurrency-aware optimizations
-        let _request_guard = ConcurrencyManager::track_request();
-        let concurrent_requests = GetObjectGuard::concurrent_requests();
+        rustfs_io_metrics::record_get_object_cache_served(cache_serve_duration.as_secs_f64(), cached.body.len());
 
-        // Register with deadlock detector if enabled
-        let deadlock_detector = crate::storage::deadlock_detector::get_deadlock_detector();
-        let request_id = wrapper.request_id().to_string();
-        deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
-        let _deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector.clone(), request_id);
+        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
+        record_zero_copy_read(cached.body.len(), cache_serve_duration.as_secs_f64() * 1000.0);
+        record_memory_copy_saved(cached.body.len());
 
-        // Check for request timeout before proceeding
+        manager.record_transfer(cached.content_length as u64, Duration::from_micros(1));
+
+        let output = Self::build_cached_get_object_output(&cached);
+        let event_info = Self::build_cached_get_object_event_info(bucket, key, &cached);
+
+        rustfs_io_metrics::record_get_object(request_start.elapsed().as_millis() as f64, cached.content_length, true);
+
+        Some(GetObjectCachedHit { output, event_info })
+    }
+
+    fn finalize_get_object_completion(
+        cache_key: &str,
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &TimeoutConfig,
+        total_duration: Duration,
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+    ) {
+        rustfs_io_metrics::record_get_object_completion(
+            total_duration.as_secs_f64(),
+            response_content_length,
+            optimal_buffer_size,
+        );
+
+        rustfs_io_metrics::record_get_object(total_duration.as_millis() as f64, response_content_length, false);
+
         if wrapper.is_timeout() {
             warn!(
-                bucket = %req.input.bucket,
-                key = %req.input.key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before processing"
+                "GetObject request exceeded timeout: key={} duration={:?} timeout={:?}",
+                cache_key,
+                wrapper.elapsed(),
+                timeout_config.get_object_timeout
             );
-            return Err(s3_error!(InternalError, "Request timeout before processing"));
-        }
-
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::{counter, gauge};
-            counter!("rustfs.get.object.requests.total").increment(1);
-            gauge!("rustfs.concurrent.get.object.requests").set(concurrent_requests as f64);
+            rustfs_io_metrics::record_get_object_timeout(None, Some(wrapper.elapsed().as_secs_f64()));
         }
 
         debug!(
-            "GetObject request started with {} concurrent requests, timeout={:?}",
-            concurrent_requests, timeout_config.get_object_timeout
+            "GetObject completed: key={} size={} duration={:?} buffer={}",
+            cache_key, response_content_length, total_duration, optimal_buffer_size
         );
+    }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-        // mc get 3
-
-        let GetObjectInput {
+    async fn finalize_get_object_response(
+        helper: OperationHelper,
+        bucket: &str,
+        method: &hyper::Method,
+        headers: &HeaderMap,
+        event_info: ObjectInfo,
+        version_id_for_event: String,
+        output: GetObjectOutput,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let helper = helper.object(event_info).version_id(version_id_for_event);
+        let response = wrap_response_with_cors(bucket, method, headers, output).await;
+        let result = Ok(response);
+        let _ = helper.complete(&result);
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn build_get_object_output_context(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        cache_key: &str,
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        info: ObjectInfo,
+        event_info: ObjectInfo,
+        final_stream: Box<dyn Reader>,
+        rs: Option<HTTPRangeSpec>,
+        content_type: Option<ContentType>,
+        last_modified: Option<Timestamp>,
+        response_content_length: i64,
+        content_range: Option<String>,
+        server_side_encryption: Option<ServerSideEncryption>,
+        sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+        sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+        ssekms_key_id: Option<SSEKMSKeyId>,
+        encryption_applied: bool,
+        permit_wait_duration: Duration,
+        queue_utilization: f64,
+        queue_status: &concurrency::IoQueueStatus,
+        concurrent_requests: usize,
+        part_number: Option<usize>,
+        versioned: bool,
+    ) -> S3Result<GetObjectOutputContext> {
+        let strategy = self.finalize_get_object_strategy(
+            manager,
             bucket,
             key,
-            version_id,
+            &info,
+            rs.as_ref(),
+            response_content_length,
+            permit_wait_duration,
+            queue_utilization,
+            queue_status,
+            concurrent_requests,
+        );
+        let GetObjectStrategyContext {
+            io_strategy,
+            optimal_buffer_size,
+        } = strategy;
+
+        let body = Self::build_get_object_body(
+            final_stream,
+            &info,
+            cache_key,
+            response_content_length,
+            optimal_buffer_size,
             part_number,
-            range,
-            ..
-        } = req.input.clone();
+            rs.is_some(),
+            encryption_applied,
+            io_strategy.cache_writeback_enabled,
+        )
+        .await?;
 
-        // Validate object key
-        validate_object_key(&key, "GET")?;
+        let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
 
-        // Try to get from cache for small, frequently accessed objects
-        let manager = get_concurrency_manager();
-        // Generate cache key with version support: "{bucket}/{key}" or "{bucket}/{key}?versionId={vid}"
-        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &key, version_id.as_deref());
-
-        // Only attempt cache lookup if caching is enabled and for objects without range/part requests
-        if manager.is_cache_enabled()
-            && part_number.is_none()
-            && range.is_none()
-            && let Some(cached) = manager.get_cached_object(&cache_key).await
-        {
-            let cache_serve_duration = request_start.elapsed();
-
-            debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::{counter, histogram};
-                counter!("rustfs.get.object.cache.served.total").increment(1);
-                histogram!("rustfs.get.object.cache.serve.duration.seconds").record(cache_serve_duration.as_secs_f64());
-                histogram!("rustfs.get.object.cache.size.bytes").record(cached.body.len() as f64);
-            }
-
-            // Build response from cached data with full metadata
-            let body_data = cached.body.clone();
-            let body = Some(StreamingBlob::wrap::<_, Infallible>(futures::stream::once(async move { Ok(body_data) })));
-
-            // Parse last_modified from RFC3339 string if available
-            let last_modified = cached
-                .last_modified
-                .as_ref()
-                .and_then(|s| match OffsetDateTime::parse(s, &Rfc3339) {
-                    Ok(dt) => Some(Timestamp::from(dt)),
-                    Err(e) => {
-                        warn!("Failed to parse cached last_modified '{}': {}", s, e);
-                        None
-                    }
-                });
-
-            // Parse content_type
-            let content_type = cached.content_type.as_ref().and_then(|ct| ContentType::from_str(ct).ok());
-
-            let output = GetObjectOutput {
-                body,
-                content_length: Some(cached.content_length),
-                accept_ranges: Some("bytes".to_string()),
-                e_tag: cached.e_tag.as_ref().map(|etag| to_s3s_etag(etag)),
-                last_modified,
-                content_type,
-                cache_control: cached.cache_control.clone(),
-                content_disposition: cached.content_disposition.clone(),
-                content_encoding: cached.content_encoding.clone(),
-                content_language: cached.content_language.clone(),
-                version_id: cached.version_id.clone(),
-                delete_marker: Some(cached.delete_marker),
-                tag_count: cached.tag_count,
-                metadata: if cached.user_metadata.is_empty() {
-                    None
-                } else {
-                    Some(cached.user_metadata.clone())
-                },
-                ..Default::default()
-            };
-
-            // CRITICAL: Build ObjectInfo for event notification before calling complete().
-            // This ensures S3 bucket notifications (s3:GetObject events) include proper
-            // object metadata for event-driven workflows (Lambda, SNS, SQS).
-            let event_info = ObjectInfo {
-                bucket: bucket.clone(),
-                name: key.clone(),
-                storage_class: cached.storage_class.clone(),
-                mod_time: cached
-                    .last_modified
-                    .as_ref()
-                    .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
-                size: cached.content_length,
-                actual_size: cached.content_length,
-                is_dir: false,
-                user_defined: cached.user_metadata.clone(),
-                version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
-                delete_marker: cached.delete_marker,
-                content_type: cached.content_type.clone(),
-                content_encoding: cached.content_encoding.clone(),
-                etag: cached.e_tag.clone(),
-                ..Default::default()
-            };
-
-            // Set object info and version_id on helper for proper event notification
-            let version_id_str = req.input.version_id.clone().unwrap_or_default();
-            helper = helper.object(event_info).version_id(version_id_str);
-
-            // Call helper.complete() for cache hits to ensure
-            // S3 bucket notifications (s3:GetObject events) are triggered.
-            // This ensures event-driven workflows (Lambda, SNS) work correctly
-            // for both cache hits and misses.
-            let result = Ok(S3Response::new(output));
-            let _ = helper.complete(&result);
-            return result;
-        }
-
-        // TODO: getObjectInArchiveFileHandler object = xxx.zip/xxx/xxx.xxx
-
-        // let range = HTTPRangeSpec::nil();
-
-        let h = HeaderMap::new();
-
-        let part_number = part_number.map(|v| v as usize);
-
-        if let Some(part_num) = part_number
-            && part_num == 0
-        {
-            return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
-        }
-
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
-
-        if rs.is_some() && part_number.is_some() {
-            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
-        }
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-
-        let store = get_validated_store(&bucket).await?;
-
-        // ============================================
-        // Adaptive I/O Strategy with Disk Permit
-        // ============================================
-        //
-        // Acquire disk read permit and calculate adaptive I/O strategy
-        // based on the wait time. Longer wait times indicate higher system
-        // load, which triggers more conservative I/O parameters.
-        let permit_wait_start = std::time::Instant::now();
-        let _disk_permit = manager
-            .acquire_disk_read_permit()
-            .await
-            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
-        let permit_wait_duration = permit_wait_start.elapsed();
-
-        // Check timeout after acquiring permit
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                wait_ms = permit_wait_duration.as_millis(),
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out while waiting for disk permit"
-            );
-            #[cfg(feature = "metrics")]
-            metrics::counter!("rustfs.get.object.timeout.total", "stage" => "disk_permit").increment(1);
-            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
-        }
-
-        // Monitor I/O queue status for congestion detection
-        let queue_status = manager.io_queue_status();
-        let queue_utilization = if queue_status.total_permits > 0 {
-            (queue_status.permits_in_use as f64 / queue_status.total_permits as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        // Log warning if queue is congested (> 80% utilization)
-        if queue_utilization > 80.0 {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                queue_utilization = format!("{:.1}%", queue_utilization),
-                permits_in_use = queue_status.permits_in_use,
-                total_permits = queue_status.total_permits,
-                "I/O queue congestion detected"
-            );
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::counter;
-                counter!("rustfs.io.queue.congestion.total").increment(1);
-            }
-        }
-
-        // Calculate adaptive I/O strategy from permit wait time
-        // This adjusts buffer sizes, read-ahead, and caching behavior based on load
-        // Use 256KB as the base buffer size for strategy calculation
-        let base_buffer_size = self.base_buffer_size();
-        let io_strategy = manager.calculate_io_strategy(permit_wait_duration, base_buffer_size);
-
-        // Determine I/O priority based on request size (for priority scheduling)
-        // Small requests (< 1MB) get high priority, large requests (> 10MB) get low priority
-        let io_priority = manager.get_io_priority(io_strategy.buffer_size as i64);
-
-        // Log priority information for observability
-        if manager.is_priority_scheduling_enabled() {
-            debug!(
-                bucket = %bucket,
-                key = %key,
-                priority = %io_priority,
-                request_size = io_strategy.buffer_size,
-                "I/O priority assigned"
-            );
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::counter;
-                counter!("rustfs.io.priority.assigned.total", "priority" => io_priority.as_str()).increment(1);
-            }
-        }
-
-        // Record detailed I/O metrics for monitoring
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::{counter, gauge, histogram};
-            // Record permit wait time histogram
-            histogram!("rustfs.disk.permit.wait.duration.seconds").record(permit_wait_duration.as_secs_f64());
-            // Record I/O queue utilization
-            gauge!("rustfs.io.queue.utilization").set(queue_utilization);
-            gauge!("rustfs.io.queue.permits_in_use").set(queue_status.permits_in_use as f64);
-            gauge!("rustfs.io.queue.permits_available")
-                .set(queue_status.total_permits.saturating_sub(queue_status.permits_in_use) as f64);
-            // Record current load level as gauge (0=Low, 1=Medium, 2=High, 3=Critical)
-            let load_level_value = match io_strategy.load_level {
-                crate::storage::concurrency::IoLoadLevel::Low => 0.0,
-                crate::storage::concurrency::IoLoadLevel::Medium => 1.0,
-                crate::storage::concurrency::IoLoadLevel::High => 2.0,
-                crate::storage::concurrency::IoLoadLevel::Critical => 3.0,
-            };
-            gauge!("rustfs.io.load.level").set(load_level_value);
-            // Record buffer multiplier as gauge
-            gauge!("rustfs.io.buffer.multiplier").set(io_strategy.buffer_multiplier);
-            // Count strategy selections by load level
-            counter!("rustfs.io.strategy.selected", "level" => format!("{:?}", io_strategy.load_level)).increment(1);
-            // Record I/O priority
-            counter!("rustfs.io.priority.assigned", "priority" => io_priority.as_str()).increment(1);
-        }
-
-        // Log strategy details at debug level for troubleshooting
-        debug!(
-            wait_ms = permit_wait_duration.as_millis() as u64,
-            load_level = ?io_strategy.load_level,
-            buffer_size = io_strategy.buffer_size,
-            readahead = io_strategy.enable_readahead,
-            cache_wb = io_strategy.cache_writeback_enabled,
-            priority = io_priority.as_str(),
-            "Adaptive I/O strategy calculated"
-        );
-
-        // Check timeout before reading object
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before reading object"
-            );
-            #[cfg(feature = "metrics")]
-            metrics::counter!("rustfs.get.object.timeout.total", "stage" => "before_read").increment(1);
-            return Err(s3_error!(InternalError, "Request timeout before reading object"));
-        }
-
-        let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), rs.clone(), h, &opts)
-            .await
-            .map_err(ApiError::from)?;
-
-        let info = reader.object_info;
-
-        check_preconditions(&req.headers, &info)?;
-
-        debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
-        for part in &info.parts {
-            debug!(
-                part_number = part.number,
-                part_size = part.size,
-                part_actual_size = part.actual_size,
-                "GET object part details"
-            );
-        }
-        let event_info = info.clone();
-        let content_type = {
-            if let Some(content_type) = &info.content_type {
-                match ContentType::from_str(content_type) {
-                    Ok(res) => Some(res),
-                    Err(err) => {
-                        error!("parse content-type err {} {:?}", content_type, err);
-                        //
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-        let last_modified = info.mod_time.map(Timestamp::from);
-
-        let mut rs = rs;
-
-        if let Some(part_number) = part_number
-            && rs.is_none()
-        {
-            rs = HTTPRangeSpec::from_object_info(&info, part_number);
-        }
-
-        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
-
-        let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
-
-        let content_range = if let Some(rs) = &rs {
-            let total_size = content_length;
-            let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
-            content_length = length;
-            Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
-        } else {
-            None
-        };
-
-        let mut final_stream = reader.stream;
-        let mut response_content_length = content_length;
-
-        debug!(
-            "GET object metadata check: parts={}, provided_sse_key={:?}",
-            info.parts.len(),
-            req.input.sse_customer_key.is_some()
-        );
-
-        let decryption_request = DecryptionRequest {
-            bucket: &bucket,
-            key: &key,
-            metadata: &info.user_defined,
-            sse_customer_key: req.input.sse_customer_key.as_ref(),
-            sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
-            part_number: None,
-            parts: &info.parts,
-            etag: info.etag.as_deref(),
-        };
-
-        let (server_side_encryption, sse_customer_algorithm, sse_customer_key_md5, ssekms_key_id, encryption_applied) =
-            match sse_decryption(decryption_request).await? {
-                Some(material) => {
-                    let server_side_encryption = Some(material.server_side_encryption.clone());
-                    let sse_customer_algorithm = Some(material.algorithm.clone());
-                    let sse_customer_key_md5 = material.customer_key_md5.clone();
-                    let ssekms_key_id = material.kms_key_id.clone();
-
-                    let (decrypted_stream, plaintext_size) = material
-                        .wrap_reader(final_stream, content_length)
-                        .await
-                        .map_err(ApiError::from)?;
-
-                    final_stream = decrypted_stream;
-                    response_content_length = plaintext_size;
-
-                    (server_side_encryption, sse_customer_algorithm, sse_customer_key_md5, ssekms_key_id, true)
-                }
-                None => (None, None, None, None, false),
-            };
-
-        // Calculate concurrency-aware buffer size for optimal performance
-        // This adapts based on the number of concurrent GetObject requests
-        // AND the adaptive I/O strategy from permit wait time
-        let base_buffer_size = get_buffer_size_opt_in(response_content_length);
-        let optimal_buffer_size = if io_strategy.buffer_size > 0 {
-            // Use adaptive I/O strategy buffer size (derived from permit wait time)
-            io_strategy.buffer_size.min(base_buffer_size)
-        } else {
-            // Fallback to concurrency-aware sizing
-            get_concurrency_aware_buffer_size(response_content_length, base_buffer_size)
-        };
-
-        debug!(
-            "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}, io_strategy={:?}",
-            response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests, io_strategy.load_level
-        );
-
-        // Cache writeback logic for small, non-encrypted, non-range objects
-        // Only cache when:
-        // 1. Cache is enabled (RUSTFS_OBJECT_CACHE_ENABLE=true)
-        // 2. No part/range request (full object)
-        // 3. Object size is known and within cache threshold (10MB)
-        // 4. Not encrypted (SSE-C or managed encryption)
-        // 5. I/O strategy allows cache writeback (disabled under critical load)
-        let should_cache = manager.is_cache_enabled()
-            && io_strategy.cache_writeback_enabled
-            && part_number.is_none()
-            && rs.is_none()
-            && !encryption_applied
-            && response_content_length > 0
-            && (response_content_length as usize) <= manager.max_object_size();
-
-        let body = if should_cache {
-            // Read entire object into memory for caching
-            debug!(
-                "Reading object into memory for caching: key={} size={}",
-                cache_key, response_content_length
-            );
-
-            // Read the stream into a Vec<u8>
-            let mut buf = Vec::with_capacity(response_content_length as usize);
-            if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                error!("Failed to read object into memory for caching: {}", e);
-                return Err(ApiError::from(StorageError::other(format!("Failed to read object for caching: {e}"))).into());
-            }
-
-            // Verify we read the expected amount
-            if buf.len() != response_content_length as usize {
-                warn!(
-                    "Object size mismatch during cache read: expected={} actual={}",
-                    response_content_length,
-                    buf.len()
-                );
-            }
-
-            // Build CachedGetObject with full metadata for cache writeback
-            let last_modified_str = info.mod_time.and_then(|t| match t.format(&Rfc3339) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn!("Failed to format last_modified for cache writeback: {}", e);
-                    None
-                }
-            });
-
-            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
-                .with_content_type(info.content_type.clone().unwrap_or_default())
-                .with_e_tag(info.etag.clone().unwrap_or_default())
-                .with_last_modified(last_modified_str.unwrap_or_default());
-
-            // Cache the object in background to avoid blocking the response
-            let cache_key_clone = cache_key.clone();
-            tokio::spawn(async move {
-                let manager = get_concurrency_manager();
-                manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
-                debug!("Object cached successfully with metadata: {}", cache_key_clone);
-            });
-
-            #[cfg(feature = "metrics")]
-            {
-                use metrics::counter;
-                counter!("rustfs.object.cache.writeback.total").increment(1);
-            }
-
-            // Create response from the in-memory data
-            let mem_reader = InMemoryAsyncReader::new(buf);
-            Some(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
-                response_content_length as usize,
-            )))
-        } else if encryption_applied {
-            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
-            let should_buffer_encrypted_object = response_content_length > 0
-                && response_content_length <= seekable_object_size_threshold as i64
-                && part_number.is_none()
-                && rs.is_none();
-
-            if should_buffer_encrypted_object {
-                let mut buf = Vec::with_capacity(response_content_length as usize);
-                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                    error!("Failed to read decrypted object into memory: {}", e);
-                    return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
-                }
-
-                if buf.len() != response_content_length as usize {
-                    warn!(
-                        "Encrypted object size mismatch during read: expected={} actual={}",
-                        response_content_length,
-                        buf.len()
-                    );
-                }
-
-                let mem_reader = InMemoryAsyncReader::new(buf);
-                Some(StreamingBlob::wrap(bytes_stream(
-                    ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
-                    response_content_length as usize,
-                )))
-            } else {
-                info!(
-                    "Encrypted object: Using unlimited stream for decryption with buffer size {}",
-                    optimal_buffer_size
-                );
-                Some(StreamingBlob::wrap(ReaderStream::with_capacity(final_stream, optimal_buffer_size)))
-            }
-        } else {
-            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
-
-            let should_provide_seek_support = response_content_length > 0
-                && response_content_length <= seekable_object_size_threshold as i64
-                && part_number.is_none()
-                && rs.is_none();
-
-            if should_provide_seek_support {
-                debug!(
-                    "Reading small object into memory for seek support: key={} size={}",
-                    cache_key, response_content_length
-                );
-
-                // Read the stream into memory
-                let mut buf = Vec::with_capacity(response_content_length as usize);
-                match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                    Ok(_) => {
-                        // Verify we read the expected amount
-                        if buf.len() != response_content_length as usize {
-                            warn!(
-                                "Object size mismatch during seek support read: expected={} actual={}",
-                                response_content_length,
-                                buf.len()
-                            );
-                        }
-
-                        // Create seekable in-memory reader (similar to common S3 SDK bytes readers)
-                        let mem_reader = InMemoryAsyncReader::new(buf);
-                        Some(StreamingBlob::wrap(bytes_stream(
-                            ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
-                            response_content_length as usize,
-                        )))
-                    }
-                    Err(e) => {
-                        error!("Failed to read object into memory for seek support: {}", e);
-                        // Fallback to streaming if read fails
-                        Some(StreamingBlob::wrap(bytes_stream(
-                            ReaderStream::with_capacity(final_stream, optimal_buffer_size),
-                            response_content_length as usize,
-                        )))
-                    }
-                }
-            } else {
-                // Standard streaming path for large objects or range/part requests
-                Some(StreamingBlob::wrap(bytes_stream(
-                    ReaderStream::with_capacity(final_stream, optimal_buffer_size),
-                    response_content_length as usize,
-                )))
-            }
-        };
-
-        let mut checksum_crc32 = None;
-        let mut checksum_crc32c = None;
-        let mut checksum_sha1 = None;
-        let mut checksum_sha256 = None;
-        let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
-
-        // checksum
-        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
-            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
-            && rs.is_none()
-        {
-            let (checksums, _is_multipart) =
-                info.decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-                    .map_err(|e| {
-                        error!("decrypt_checksums error: {}", e);
-                        ApiError::from(e)
-                    })?;
-
-            for (key, checksum) in checksums {
-                if key == AMZ_CHECKSUM_TYPE {
-                    checksum_type = Some(ChecksumType::from(checksum));
-                    continue;
-                }
-
-                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                    _ => (),
-                }
-            }
-        }
-
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-
-        // Get version_id from object info
-        // If versioning is enabled and version_id exists in object info, return it
-        // If version_id is Uuid::nil(), return "null" string (AWS S3 convention)
         let output_version_id = if versioned {
             info.version_id.map(|vid| {
                 if vid == Uuid::nil() {
@@ -2153,52 +2560,163 @@ impl DefaultObjectUsecase {
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
+            checksum_crc32: checksums.crc32,
+            checksum_crc32c: checksums.crc32c,
+            checksum_sha1: checksums.sha1,
+            checksum_sha256: checksums.sha256,
+            checksum_crc64nvme: checksums.crc64nvme,
+            checksum_type: checksums.checksum_type,
             version_id: output_version_id,
             ..Default::default()
         };
 
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(event_info).version_id(version_id);
+        Ok(GetObjectOutputContext {
+            output,
+            event_info,
+            response_content_length,
+            optimal_buffer_size,
+        })
+    }
+
+    #[instrument(
+        level = "debug",
+        skip(self, req),
+        fields(start_time=?time::OffsetDateTime::now_utc())
+    )]
+    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        if let Some(context) = &self.context {
+            let _ = context.object_store();
+        }
+
+        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key)?;
+        let timeout_config = bootstrap.timeout_config;
+        let wrapper = bootstrap.wrapper;
+        let request_start = bootstrap.request_start;
+        let concurrent_requests = bootstrap.concurrent_requests;
+        let mut request_guard = bootstrap.request_guard;
+
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        // mc get 3
+
+        let request_context = Self::prepare_get_object_request_context(&req).await?;
+        let GetObjectRequestContext {
+            bucket,
+            key,
+            cache_key,
+            version_id_for_event,
+            part_number,
+            rs,
+            opts,
+        } = request_context;
+
+        // Try to get from cache for small, frequently accessed objects
+        let manager = get_concurrency_manager();
+
+        if let Some(cached_hit) =
+            Self::maybe_get_cached_get_object(manager, &bucket, &key, &cache_key, part_number, rs.as_ref(), request_start).await
+        {
+            let GetObjectCachedHit { output, event_info } = cached_hit;
+            helper = helper.object(event_info).version_id(version_id_for_event.clone());
+
+            let result = Ok(S3Response::new(output));
+            let _ = helper.complete(&result);
+            return result;
+        }
+
+        let prepared_read = Self::prepare_get_object_read_execution(
+            &req,
+            manager,
+            &wrapper,
+            &timeout_config,
+            &bucket,
+            &key,
+            rs,
+            &opts,
+            part_number,
+        )
+        .await?;
+        let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
+        let permit_wait_duration = io_planning.permit_wait_duration;
+        let queue_status = io_planning.queue_status;
+        let queue_utilization = io_planning.queue_utilization;
+
+        let GetObjectReadSetup {
+            info,
+            event_info,
+            final_stream,
+            rs,
+            content_type,
+            last_modified,
+            response_content_length,
+            content_range,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
+            encryption_applied,
+        } = read_setup;
+
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        let output_context = self
+            .build_get_object_output_context(
+                &req,
+                &cache_key,
+                manager,
+                &bucket,
+                &key,
+                info,
+                event_info,
+                final_stream,
+                rs,
+                content_type,
+                last_modified,
+                response_content_length,
+                content_range,
+                server_side_encryption,
+                sse_customer_algorithm,
+                sse_customer_key_md5,
+                ssekms_key_id,
+                encryption_applied,
+                permit_wait_duration,
+                queue_utilization,
+                &queue_status,
+                concurrent_requests,
+                part_number,
+                versioned,
+            )
+            .await?;
+        let GetObjectOutputContext {
+            output,
+            event_info,
+            response_content_length,
+            optimal_buffer_size,
+        } = output_context;
 
         let total_duration = request_start.elapsed();
-
-        #[cfg(feature = "metrics")]
-        {
-            use metrics::{counter, histogram};
-            counter!("rustfs.get.object.requests.completed").increment(1);
-            histogram!("rustfs.get.object.total.duration.seconds").record(total_duration.as_secs_f64());
-            histogram!("rustfs.get.object.response.size.bytes").record(response_content_length as f64);
-
-            // Record buffer size that was used
-            histogram!("get.object.buffer.size.bytes").record(optimal_buffer_size as f64);
-        }
-
-        // Check for timeout before returning
-        if wrapper.is_timeout() {
-            warn!(
-                "GetObject request exceeded timeout: key={} duration={:?} timeout={:?}",
-                cache_key,
-                wrapper.elapsed(),
-                timeout_config.get_object_timeout
-            );
-            #[cfg(feature = "metrics")]
-            counter!("rustfs.get.object.timeout.total").increment(1);
-        }
-
-        debug!(
-            "GetObject completed: key={} size={} duration={:?} buffer={}",
-            cache_key, response_content_length, total_duration, optimal_buffer_size
+        Self::finalize_get_object_completion(
+            &cache_key,
+            &wrapper,
+            &timeout_config,
+            total_duration,
+            response_content_length,
+            optimal_buffer_size,
         );
 
-        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
-        let result = Ok(response);
-        let _ = helper.complete(&result);
+        let result = Self::finalize_get_object_response(
+            helper,
+            &bucket,
+            &req.method,
+            &req.headers,
+            event_info,
+            version_id_for_event,
+            output,
+        )
+        .await;
+        if result.is_ok() {
+            request_guard.finish_ok();
+        } else {
+            request_guard.finish_err();
+        }
         result
     }
 
@@ -2231,7 +2749,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes).suppress_event();
         let GetObjectAttributesInput {
             bucket,
             key,
@@ -2463,7 +2982,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold).suppress_event();
         let GetObjectLegalHoldInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -2554,7 +3074,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention);
+        let mut helper =
+            OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention).suppress_event();
         let GetObjectRetentionInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -3471,7 +3992,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, S3Operation::DeleteObjectTagging);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
             bucket,
             key: object,
@@ -3495,22 +4016,50 @@ impl DefaultObjectUsecase {
             ApiError::from(e)
         })?;
 
+        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(
+                    bucket = %bucket,
+                    object = %object,
+                    version_id = ?version_id,
+                    error = %err,
+                    "failed to load object info for delete-object-tagging notification; falling back to request context"
+                );
+                None
+            }
+        };
+
         let manager = get_concurrency_manager();
         let version_id_clone = version_id.clone();
+        let cache_bucket = bucket.clone();
+        let cache_object = object.clone();
         tokio::spawn(async move {
             manager
-                .invalidate_cache_versioned(&bucket, &object, version_id_clone.as_deref())
+                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
             debug!(
                 "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                bucket, object, version_id_clone
+                cache_bucket, cache_object, version_id_clone
             );
         });
 
         counter!("rustfs.delete_object_tagging.success").increment(1);
 
-        let version_id_resp = version_id.clone().unwrap_or_default();
-        helper = helper.version_id(version_id_resp);
+        let event_version_id = version_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                event_object_info
+                    .as_ref()
+                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
+            })
+            .unwrap_or_default();
+        if let Some(event_object_info) = event_object_info {
+            helper = helper.object(event_object_info);
+        }
+        helper = helper.version_id(event_version_id);
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
@@ -3525,7 +4074,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject);
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject).suppress_event();
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -3851,6 +4400,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        let mut helper = OperationHelper::new(&req, EventName::ObjectRestorePost, S3Operation::RestoreObject);
         let RestoreObjectInput {
             bucket,
             key: object,
@@ -3914,6 +4464,7 @@ impl DefaultObjectUsecase {
 
         let mut header = HeaderMap::new();
 
+        let event_object_info = obj_info.clone();
         let obj_info_ = obj_info.clone();
         if rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") {
             obj_info.metadata_only = true;
@@ -3967,7 +4518,13 @@ impl DefaultObjectUsecase {
             if already_restored {
                 let output =
                     restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
-                return Ok(S3Response::new(output));
+                helper = helper
+                    .object(event_object_info.clone())
+                    .version_id(version_id_str.clone())
+                    .suppress_event();
+                let result = Ok(S3Response::new(output));
+                let _ = helper.complete(&result);
+                return result;
             }
         }
 
@@ -4018,8 +4575,10 @@ impl DefaultObjectUsecase {
         });
 
         let output = restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
-
-        Ok(S3Response::with_headers(output, header))
+        helper = helper.object(event_object_info).version_id(version_id_str);
+        let result = Ok(S3Response::with_headers(output, header));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -4519,7 +5078,7 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+    use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4577,7 +5136,7 @@ mod tests {
     #[test]
     fn is_put_object_extract_requested_accepts_compat_header_case_insensitive() {
         let mut headers = HeaderMap::new();
-        headers.insert(AMZ_SNOWBALL_EXTRACT_ALT, HeaderValue::from_static(" TRUE "));
+        headers.insert(AMZ_SNOWBALL_EXTRACT_COMPAT, HeaderValue::from_static(" TRUE "));
 
         assert!(is_put_object_extract_requested(&headers));
     }
@@ -4600,7 +5159,7 @@ mod tests {
     #[test]
     fn normalize_extract_entry_key_applies_prefix_and_directory_suffix() {
         assert_eq!(
-            normalize_extract_entry_key("./nested/path.txt", Some("imports"), false),
+            normalize_extract_entry_key("nested/path.txt", Some("imports"), false),
             "imports/nested/path.txt"
         );
         assert_eq!(normalize_extract_entry_key("nested/dir/", Some("imports"), true), "imports/nested/dir/");
@@ -4624,9 +5183,9 @@ mod tests {
     #[test]
     fn resolve_put_object_extract_options_accepts_internal_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(AMZ_RUSTFS_SNOWBALL_PREFIX, HeaderValue::from_static("/internal/prefix/"));
-        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static("true"));
-        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
+        headers.insert(AMZ_SNOWBALL_PREFIX_INTERNAL, HeaderValue::from_static("/internal/prefix/"));
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, HeaderValue::from_static("true"));
+        headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, HeaderValue::from_static("TRUE"));
 
         let options = resolve_put_object_extract_options(&headers);
         assert_eq!(options.prefix.as_deref(), Some("internal/prefix"));
@@ -4635,17 +5194,65 @@ mod tests {
     }
 
     #[test]
+    fn resolve_put_object_extract_options_accepts_standard_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static(" /standard/prefix/ "));
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static(" true "));
+        headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("standard/prefix"));
+        assert!(options.ignore_dirs);
+        assert!(options.ignore_errors);
+    }
+
+    #[test]
     fn resolve_put_object_extract_options_accepts_suffix_compatible_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-amz-meta-acme-snowball-prefix", HeaderValue::from_static(" /partner/import "));
-        headers.insert("x-amz-meta-acme-snowball-ignore-dirs", HeaderValue::from_static(" true "));
-        headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("TRUE"));
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-prefix"),
+            HeaderValue::from_static(" /partner/import "),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-dirs"),
+            HeaderValue::from_static(" true "),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-acme-snowball-ignore-errors"),
+            HeaderValue::from_static("TRUE"),
+        );
 
         let options = resolve_put_object_extract_options(&headers);
         assert_eq!(options.prefix.as_deref(), Some("partner/import"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
     }
+
+    #[test]
+    fn resolve_put_object_extract_options_prefers_exact_headers_over_suffix_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-acme-snowball-prefix", HeaderValue::from_static("/fallback/prefix/"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_PREFIX, HeaderValue::from_static("/internal/prefix/"));
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("/standard/prefix/"));
+        headers.insert(AMZ_MINIO_SNOWBALL_PREFIX, HeaderValue::from_static("/minio/prefix/"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert_eq!(options.prefix.as_deref(), Some("minio/prefix"));
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_exact_flags_override_suffix_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static("false"));
+        headers.insert("x-amz-meta-acme-snowball-ignore-dirs", HeaderValue::from_static("true"));
+        headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("false"));
+        headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("true"));
+
+        let options = resolve_put_object_extract_options(&headers);
+        assert!(!options.ignore_dirs);
+        assert!(!options.ignore_errors);
+    }
+
     #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
         let input = PutObjectInput::builder()
@@ -5124,6 +5731,51 @@ mod tests {
 
         let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_missing_default_retention() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule { default_retention: None }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_zero_days() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(0),
+                    years: None,
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
+    #[test]
+    fn validate_object_lock_configuration_rejects_too_many_years() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: None,
+                    years: Some(MAXIMUM_RETENTION_YEARS + 1),
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
     }
 
     #[tokio::test]
