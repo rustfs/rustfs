@@ -32,6 +32,7 @@
 use hashbrown::HashMap;
 use moka::future::Cache;
 use rustfs_config::MI_B;
+use rustfs_object_io::get::GetObjectCacheWriteback;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1109,6 +1110,29 @@ impl CachedGetObject {
         }
     }
 
+    /// Consume a GET cache writeback payload into the cache-owned representation.
+    pub fn from_get_object_cache_writeback(writeback: GetObjectCacheWriteback) -> Self {
+        Self {
+            body: Arc::new(writeback.body),
+            content_length: writeback.content_length,
+            content_type: writeback.content_type,
+            e_tag: writeback.e_tag,
+            last_modified: writeback.last_modified,
+            expires: writeback.expires,
+            cache_control: writeback.cache_control,
+            content_disposition: writeback.content_disposition,
+            content_encoding: writeback.content_encoding,
+            content_language: writeback.content_language,
+            storage_class: writeback.storage_class,
+            version_id: writeback.version_id,
+            delete_marker: writeback.delete_marker,
+            user_metadata: writeback.user_metadata,
+            cached_at: Some(Instant::now()),
+            access_count: Arc::new(AtomicU64::new(0)),
+            ..Default::default()
+        }
+    }
+
     /// Builder method to set content_type
     pub fn with_content_type(mut self, content_type: String) -> Self {
         self.content_type = Some(content_type);
@@ -1879,6 +1903,44 @@ mod cached_object_tests {
 
         assert_eq!(obj.user_metadata.len(), 2);
         assert_eq!(obj.user_metadata.get("x-amz-meta-custom"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_cached_get_object_from_get_object_cache_writeback() {
+        let obj = CachedGetObject::from_get_object_cache_writeback(GetObjectCacheWriteback {
+            body: Bytes::from("test data"),
+            content_length: 9,
+            content_type: Some("text/plain".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("max-age=3600".to_string()),
+            content_disposition: Some("attachment".to_string()),
+            content_language: Some("en-US".to_string()),
+            expires: Some("2024-12-31T23:59:59Z".to_string()),
+            storage_class: Some("STANDARD".to_string()),
+            version_id: Some("null".to_string()),
+            delete_marker: false,
+            user_metadata: {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("custom-key".to_string(), "value".to_string());
+                metadata
+            },
+            e_tag: Some("\"abc123\"".to_string()),
+            last_modified: Some("2024-01-01T12:00:00Z".to_string()),
+        });
+
+        assert_eq!(obj.content_length, 9);
+        assert_eq!(obj.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(obj.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(obj.cache_control.as_deref(), Some("max-age=3600"));
+        assert_eq!(obj.content_disposition.as_deref(), Some("attachment"));
+        assert_eq!(obj.content_language.as_deref(), Some("en-US"));
+        assert_eq!(obj.expires.as_deref(), Some("2024-12-31T23:59:59Z"));
+        assert_eq!(obj.storage_class.as_deref(), Some("STANDARD"));
+        assert_eq!(obj.version_id.as_deref(), Some("null"));
+        assert!(!obj.delete_marker);
+        assert_eq!(obj.user_metadata.get("custom-key").map(String::as_str), Some("value"));
+        assert_eq!(obj.e_tag.as_deref(), Some("\"abc123\""));
+        assert_eq!(obj.last_modified.as_deref(), Some("2024-01-01T12:00:00Z"));
     }
 
     #[test]

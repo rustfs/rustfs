@@ -7628,6 +7628,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-metrics",
  "rustfs-notify",
+ "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
  "rustfs-protocols",
@@ -8140,6 +8141,31 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wildmatch",
+]
+
+[[package]]
+name = "rustfs-object-io"
+version = "0.0.5"
+dependencies = [
+ "astral-tokio-tar",
+ "atoi",
+ "bytes",
+ "futures-util",
+ "http 1.4.0",
+ "rustfs-concurrency",
+ "rustfs-ecstore",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
+ "rustfs-rio",
+ "rustfs-s3select-api",
+ "rustfs-utils",
+ "s3s",
+ "serial_test",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

@@ -148,5 +148,9 @@ harness = false
 name = "reconstructed_chunk_benchmark"
 harness = false
 
+[[bench]]
+name = "bitrot_chunk_benchmark"
+harness = false
+
 [lib]
 doctest = false

@@ -381,6 +381,16 @@ fn decode_bitrot_chunk_source(
     Ok((result, copied))
 }
 
+#[doc(hidden)]
+pub fn decode_bitrot_chunk_source_for_bench(
+    source_chunks: &[IoChunk],
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+) -> std::io::Result<(Vec<IoChunk>, bool)> {
+    decode_bitrot_chunk_source(source_chunks, shard_size, checksum_algo, skip_verify)
+}
+
 /// Create a new BitrotWriterWrapper based on the provided parameters
 ///
 /// # Parameters
