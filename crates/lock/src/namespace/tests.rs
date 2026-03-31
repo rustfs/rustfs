@@ -13,11 +13,53 @@
 // limitations under the License.
 
 use super::*;
-use crate::GlobalLockManager;
 use crate::client::{ClientFactory, local::LocalClient};
 use crate::types::LockType;
+use crate::{GlobalLockManager, LockError, LockInfo, LockResponse, LockStats};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Debug, Default)]
+struct FailingClient;
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FailingClient {
+    async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+        Err(LockError::internal("simulated offline client"))
+    }
+
+    async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        Ok(None)
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        Ok(LockStats::default())
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn is_online(&self) -> bool {
+        false
+    }
+
+    async fn is_local(&self) -> bool {
+        false
+    }
+}
 
 fn create_test_object_key(bucket: &str, object: &str) -> ObjectKey {
     ObjectKey {
@@ -367,4 +409,81 @@ async fn test_namespace_lock_distributed_with_clients_and_quorum() {
     assert_eq!(health.status, crate::types::HealthStatus::Healthy);
 
     drop(guard_b);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_read_lock_succeeds_with_two_nodes_one_offline() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_offline: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients_and_quorum("two-node".to_string(), vec![client_ok, client_offline], 2);
+    let resource = create_test_object_key("bucket", "object");
+
+    let guard = lock
+        .get_read_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect("read lock should succeed with one healthy node in a two-node cluster");
+
+    match guard {
+        NamespaceLockGuard::Standard(_) => {}
+        NamespaceLockGuard::Fast(_) => panic!("Expected Standard guard for distributed lock"),
+    }
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_offline() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_offline: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients_and_quorum("two-node".to_string(), vec![client_ok, client_offline], 2);
+    let resource = create_test_object_key("bucket", "object");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail with one healthy node in a two-node cluster");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_even_node_read_write_quorum_split() {
+    let manager1 = Arc::new(GlobalLockManager::new());
+    let manager2 = Arc::new(GlobalLockManager::new());
+
+    let client1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager1));
+    let client2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager2));
+    let client3: Arc<dyn LockClient> = Arc::new(FailingClient);
+    let client4: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients("four-node".to_string(), vec![client1, client2, client3, client4]);
+    let resource = create_test_object_key("bucket", "object");
+
+    let mut read_guard = lock
+        .get_read_lock(resource.clone(), "owner-a", Duration::from_millis(100))
+        .await
+        .expect("read lock should succeed with two healthy nodes in a four-node cluster");
+
+    match &read_guard {
+        NamespaceLockGuard::Standard(_) => {}
+        NamespaceLockGuard::Fast(_) => panic!("Expected Standard guard for distributed lock"),
+    }
+    assert!(read_guard.release(), "read guard should release cleanly");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail because four-node cluster requires quorum of 3");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::service::site_replication::reload_site_replication_runtime_state;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -757,7 +758,16 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        todo!()
+        match reload_site_replication_runtime_state().await {
+            Ok(()) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
