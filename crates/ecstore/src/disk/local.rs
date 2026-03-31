@@ -1809,7 +1809,8 @@ impl DiskAPI for LocalDisk {
         let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
 
         let meta = f.metadata().await?;
-        if meta.len() < (offset + length) as u64 {
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
             error!(
                 "read_file_stream: file size is less than offset + length {} + {} = {}",
                 offset,
@@ -1825,6 +1826,99 @@ impl DiskAPI for LocalDisk {
 
         Ok(Box::new(f))
     }
+
+    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// Returns Bytes that can be shared without copying.
+    #[allow(unsafe_code)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = self.get_object_path(volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        // Verify file exists and get metadata
+        let file_path_clone = file_path.clone();
+        let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+            .await
+            .map_err(DiskError::from)??;
+
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
+            error!(
+                "read_file_zero_copy: file size is less than offset + length {} + {} = {}",
+                offset,
+                length,
+                meta.len()
+            );
+            return Err(DiskError::FileCorrupt);
+        }
+
+        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
+        // Non-Unix: fall back to efficient read
+        #[cfg(unix)]
+        {
+            use memmap2::MmapOptions;
+            let file_path_clone = file_path.clone();
+            let offset_u64 = offset as u64;
+
+            let bytes = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+
+                // Create memory map for the specified region
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds.
+                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
+
+                // Copy the mapped region into a Bytes buffer. This avoids undefined
+                // behavior from treating OS-managed mmap memory as allocator-managed
+                // Vec storage, at the cost of an extra copy.
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+            })
+            .await
+            .map_err(DiskError::from)??;
+
+            // Log successful mmap read metrics
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Record mmap read metrics
+            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
+
+            debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
+
+            return Ok(bytes);
+        }
+
+        // Non-Unix fallback: efficient read into Bytes
+        #[cfg(not(unix))]
+        {
+            // Record zero-copy fallback
+            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
+
+            debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
+            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+
+            if offset > 0 {
+                f.seek(SeekFrom::Start(offset as u64)).await?;
+            }
+
+            let mut buffer = Vec::with_capacity(length);
+            buffer.resize(length, 0);
+            f.read_exact(&mut buffer).await?;
+
+            Ok(Bytes::from(buffer))
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
@@ -2830,6 +2924,40 @@ mod test {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_stream("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
     }
 
     #[test]

@@ -288,6 +288,14 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_file_zero_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_zero_copy(volume, path, offset, length).await,
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.append_file(volume, path).await,
@@ -490,6 +498,13 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
+
+    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// Returns Bytes that can be shared without copying.
+    /// On Unix, this uses mmap for true zero-copy access.
+    /// On other platforms, falls back to efficient read operations.
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream

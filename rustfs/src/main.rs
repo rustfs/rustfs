@@ -564,6 +564,9 @@ async fn run(config: config::Config) -> Result<()> {
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
         init_metrics_system(ctx.clone());
+
+        // Initialize auto-tuner for performance optimization (optional)
+        crate::init::init_auto_tuner(ctx.clone()).await;
     }
 
     info!(

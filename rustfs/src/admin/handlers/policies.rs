@@ -15,6 +15,7 @@
 use crate::{
     admin::{
         auth::validate_admin_request,
+        handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
@@ -28,7 +29,10 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;
-use rustfs_madmin::{GroupPolicyEntities, PolicyEntities, PolicyEntitiesResult, UserPolicyEntities};
+use rustfs_madmin::{
+    GroupPolicyEntities, PolicyEntities, PolicyEntitiesResult, SITE_REPL_API_VERSION, SRIAMItem, SRPolicyMapping,
+    UserPolicyEntities,
+};
 use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
@@ -223,10 +227,25 @@ impl Operation for AddCannedPolicy {
         }
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        iam_store.set_policy(&query.name, policy).await.map_err(|e| {
+        let updated_at = iam_store.set_policy(&query.name, policy.clone()).await.map_err(|e| {
             warn!("set policy failed, e: {:?}", e);
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "policy".to_string(),
+            name: query.name.clone(),
+            policy: Some(
+                serde_json::to_value(&policy).map_err(|e| s3_error!(InternalError, "marshal policy failed, e: {:?}", e))?,
+            ),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(policy = %query.name, error = ?err, "site replication policy add hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -337,6 +356,18 @@ impl Operation for RemoveCannedPolicy {
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
 
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "policy".to_string(),
+            name: query.name.clone(),
+            updated_at: Some(OffsetDateTime::now_utc()),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(policy = %query.name, error = ?err, "site replication policy delete hook failed");
+        }
+
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
@@ -428,13 +459,33 @@ impl Operation for SetPolicyForUserOrGroup {
             })?;
         }
 
-        iam_store
+        let updated_at = iam_store
             .policy_db_set(&query.user_or_group, rustfs_iam::store::UserType::Reg, query.is_group, &query.policy_name)
             .await
             .map_err(|e| {
                 warn!("policy db set failed, e: {:?}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
             })?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "policy-mapping".to_string(),
+            policy_mapping: Some(SRPolicyMapping {
+                user_or_group: query.user_or_group.clone(),
+                user_type: rustfs_iam::store::UserType::Reg.to_u64(),
+                is_group: query.is_group,
+                policy: query.policy_name.clone(),
+                updated_at: Some(updated_at),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(target = %query.user_or_group, error = ?err, "site replication policy mapping hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -840,6 +891,26 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
             warn!("policy db set failed, e: {:?}", e);
             S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
         })?;
+
+    if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+        r#type: "policy-mapping".to_string(),
+        policy_mapping: Some(SRPolicyMapping {
+            user_or_group: target_name.clone(),
+            user_type: rustfs_iam::store::UserType::Reg.to_u64(),
+            is_group,
+            policy: updated_policies.join(","),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    })
+    .await
+    {
+        warn!(target = %target_name, error = ?err, "site replication policy association hook failed");
+    }
 
     let policies_attached = if is_attach { changed_policies.clone() } else { Vec::new() };
     let policies_detached = if is_attach { Vec::new() } else { changed_policies };
