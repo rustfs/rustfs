@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -30,7 +31,8 @@ use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{
     ACCESS_KEY_LIST_ALL, ACCESS_KEY_LIST_STS_ONLY, ACCESS_KEY_LIST_SVCACC_ONLY, ACCESS_KEY_LIST_USERS_ONLY, AddServiceAccountReq,
     AddServiceAccountResp, Credentials, InfoAccessKeyResp, InfoServiceAccountResp, LDAPSpecificAccessKeyInfo, ListAccessKeysResp,
-    ListServiceAccountsResp, OpenIDSpecificAccessKeyInfo, ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
+    ListServiceAccountsResp, OpenIDSpecificAccessKeyInfo, SITE_REPL_API_VERSION, SRIAMItem, SRSessionPolicy, SRSvcAccChange,
+    SRSvcAccCreate, SRSvcAccDelete, SRSvcAccUpdate, ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_policy::policy::{Args, Policy};
@@ -43,6 +45,15 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
 use url::form_urlencoded;
+
+fn sr_session_policy_from_value(value: Option<&serde_json::Value>) -> S3Result<SRSessionPolicy> {
+    let Some(value) = value else {
+        return Ok(SRSessionPolicy::default());
+    };
+
+    let raw = serde_json::to_string(value).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+    SRSessionPolicy::from_json(&raw).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))
+}
 
 fn compat_time_sentinel() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH
@@ -294,6 +305,18 @@ impl Operation for AddServiceAccount {
             }
         }
 
+        let replication_claims = opts.claims.clone().unwrap_or_default();
+        let replication_policy = create_req
+            .policy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+        let replication_groups = target_groups.clone().unwrap_or_default();
+        let replication_name = opts.name.clone().unwrap_or_default();
+        let replication_description = opts.description.clone().unwrap_or_default();
+        let replication_expiration = opts.expiration;
+
         let (new_cred, _) = iam_store
             .new_service_account(&target_user, target_groups, opts)
             .await
@@ -301,6 +324,39 @@ impl Operation for AddServiceAccount {
                 debug!("create service account failed, e: {:?}", e);
                 s3_error!(InternalError, "create service account failed, e: {:?}", e)
             })?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                create: Some(SRSvcAccCreate {
+                    parent: target_user.clone(),
+                    access_key: new_cred.access_key.clone(),
+                    secret_key: new_cred.secret_key.clone(),
+                    groups: replication_groups,
+                    claims: replication_claims,
+                    session_policy: replication_policy
+                        .as_deref()
+                        .map(SRSessionPolicy::from_json)
+                        .transpose()
+                        .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?
+                        .unwrap_or_default(),
+                    status: String::new(),
+                    name: replication_name,
+                    description: replication_description,
+                    expiration: replication_expiration,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(OffsetDateTime::now_utc()),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %new_cred.access_key, error = ?err, "site replication add service account hook failed");
+        }
 
         let resp = AddServiceAccountResp {
             credentials: Credentials {
@@ -502,21 +558,53 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
-        let sp = parse_update_service_account_policy(update_req.new_policy)?;
+        let new_secret_key = update_req.new_secret_key.clone();
+        let new_status = update_req.new_status.clone();
+        let new_name = update_req.new_name.clone();
+        let new_description = update_req.new_description.clone();
+        let new_expiration = update_req.new_expiration;
+        let new_policy = update_req.new_policy.clone();
+
+        let sp = parse_update_service_account_policy(new_policy.clone())?;
 
         let opts = UpdateServiceAccountOpts {
-            secret_key: update_req.new_secret_key,
-            status: update_req.new_status,
-            name: update_req.new_name,
-            description: update_req.new_description,
-            expiration: update_req.new_expiration,
+            secret_key: new_secret_key.clone(),
+            status: new_status.clone(),
+            name: new_name.clone(),
+            description: new_description.clone(),
+            expiration: new_expiration,
             session_policy: sp,
         };
 
-        let _ = iam_store
+        let updated_at = iam_store
             .update_service_account(&access_key, opts)
             .await
             .map_err(|e| map_service_account_lookup_error(e, "update service account failed"))?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                update: Some(SRSvcAccUpdate {
+                    access_key: access_key.clone(),
+                    secret_key: new_secret_key.unwrap_or_default(),
+                    status: new_status.unwrap_or_default(),
+                    name: new_name.unwrap_or_default(),
+                    description: new_description.unwrap_or_default(),
+                    session_policy: sr_session_policy_from_value(new_policy.as_ref())?,
+                    expiration: new_expiration,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %access_key, error = ?err, "site replication update service account hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -1204,6 +1292,25 @@ impl Operation for DeleteServiceAccount {
             debug!("delete service account failed, e: {:?}", e);
             s3_error!(InternalError, "delete service account failed")
         })?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                delete: Some(SRSvcAccDelete {
+                    access_key: query.access_key.clone(),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(OffsetDateTime::now_utc()),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(access_key = %query.access_key, error = ?err, "site replication delete service account hook failed");
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
