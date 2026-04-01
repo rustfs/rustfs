@@ -16,7 +16,7 @@ use super::*;
 use rustfs_object_io::put::{
     PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectPlainBodyKind,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
-    build_put_object_plain_hash_stage, plan_put_object_body, resolve_put_effective_copy_mode,
+    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_effective_copy_mode,
 };
 
 impl DefaultObjectUsecase {
@@ -69,18 +69,9 @@ impl DefaultObjectUsecase {
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let mut size = resolved_size;
-
-        let body_plan = plan_put_object_body(size, &request_context.headers, &key, get_buffer_size_opt_in(size));
         let mut applied_compression = false;
         let mut applied_encryption = false;
         let mut plain_reduced_copy_stage = false;
-
-        if body_plan.plain_body_kind() == Some(PutObjectPlainBodyKind::ReducedCopyCandidate) {
-            rustfs_io_metrics::record_put_object_attempted_fast_path(size);
-            debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
-        }
-
-        let ingress_source = build_put_object_ingress_source(body, body_plan);
 
         let store = get_validated_store_adapter(&bucket).await?;
 
@@ -124,6 +115,29 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5.as_ref(),
             true,
         )?;
+
+        let encryption_enabled_for_put = effective_sse.is_some()
+            || effective_kms_key_id.is_some()
+            || sse_customer_algorithm.is_some()
+            || sse_customer_key.is_some()
+            || sse_customer_key_md5.is_some();
+
+        let body_plan = plan_put_object_body_with_transforms(
+            size,
+            &request_context.headers,
+            &key,
+            get_buffer_size_opt_in(size),
+            encryption_enabled_for_put,
+        );
+        if body_plan.plain_body_kind() == Some(PutObjectPlainBodyKind::ReducedCopyCandidate) {
+            rustfs_io_metrics::record_put_object_attempted_fast_path(size);
+            debug!(
+                encryption_enabled = encryption_enabled_for_put,
+                "Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key
+            );
+        }
+
+        let ingress_source = build_put_object_ingress_source(body, body_plan);
 
         let mut metadata = metadata.unwrap_or_default();
         apply_put_request_metadata(
@@ -361,7 +375,7 @@ impl DefaultObjectUsecase {
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
             rustfs_io_metrics::record_put_object(duration_ms, size, body_plan.ingress.enable_zero_copy);
-            let io_path = if plain_reduced_copy_stage && !applied_compression && !applied_encryption {
+            let io_path = if plain_reduced_copy_stage && !applied_compression {
                 rustfs_io_metrics::IoPath::Fast
             } else {
                 rustfs_io_metrics::IoPath::Legacy

@@ -485,13 +485,16 @@ pub fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
         return false;
     }
 
-    if headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
+    !has_put_encryption_headers(headers) && !put_request_is_compressible(headers)
+}
+
+fn has_put_encryption_headers(headers: &HeaderMap) -> bool {
+    headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
-    {
-        return false;
-    }
+}
 
+fn put_request_is_compressible(headers: &HeaderMap) -> bool {
     if let Some(content_type) = headers.get("content-type")
         && let Ok(ct) = content_type.to_str()
     {
@@ -505,14 +508,24 @@ pub fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
             "application/xml",
             "text/xml",
         ];
-        for ct_type in compressible_types {
-            if ct.contains(ct_type) {
-                return false;
-            }
-        }
+        return compressible_types.iter().any(|ty| ct.contains(ty));
     }
 
-    true
+    false
+}
+
+fn should_use_put_reduced_copy_candidate(size: i64, headers: &HeaderMap, encryption_enabled: bool) -> bool {
+    const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
+
+    if size <= ZERO_COPY_MIN_SIZE {
+        return false;
+    }
+
+    if !encryption_enabled && has_put_encryption_headers(headers) {
+        return false;
+    }
+
+    !put_request_is_compressible(headers)
 }
 
 fn map_put_object_ingress_error<B, E>(result: Result<B, E>) -> std::io::Result<B>
@@ -615,7 +628,16 @@ where
 }
 
 pub fn plan_put_object_ingress(size: i64, headers: &HeaderMap, buffer_size: usize) -> PutObjectIngressPlan {
-    let enable_zero_copy = should_use_zero_copy(size, headers);
+    plan_put_object_ingress_with_transforms(size, headers, buffer_size, false)
+}
+
+pub fn plan_put_object_ingress_with_transforms(
+    size: i64,
+    headers: &HeaderMap,
+    buffer_size: usize,
+    encryption_enabled: bool,
+) -> PutObjectIngressPlan {
+    let enable_zero_copy = should_use_put_reduced_copy_candidate(size, headers, encryption_enabled);
     PutObjectIngressPlan {
         kind: if enable_zero_copy {
             PutObjectIngressKind::ReducedCopyCandidate
@@ -631,7 +653,17 @@ pub fn plan_put_object_ingress(size: i64, headers: &HeaderMap, buffer_size: usiz
 }
 
 pub fn plan_put_object_body(size: i64, headers: &HeaderMap, key: &str, buffer_size: usize) -> PutObjectBodyPlan {
-    let ingress = plan_put_object_ingress(size, headers, buffer_size);
+    plan_put_object_body_with_transforms(size, headers, key, buffer_size, false)
+}
+
+pub fn plan_put_object_body_with_transforms(
+    size: i64,
+    headers: &HeaderMap,
+    key: &str,
+    buffer_size: usize,
+    encryption_enabled: bool,
+) -> PutObjectBodyPlan {
+    let ingress = plan_put_object_ingress_with_transforms(size, headers, buffer_size, encryption_enabled);
     let kind = if size > MIN_COMPRESSIBLE_SIZE as i64 && is_compressible(headers, key) {
         PutObjectBodyKind::Compressed
     } else {
@@ -938,6 +970,19 @@ mod tests {
         assert_eq!(plan.kind, PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate));
         assert_eq!(plan.plain_body_kind(), Some(PutObjectPlainBodyKind::ReducedCopyCandidate));
         assert!(!plan.should_compress());
+    }
+
+    #[test]
+    fn plan_put_object_body_with_transforms_allows_encrypted_large_binary_payloads() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
+
+        let plan = plan_put_object_body_with_transforms(2 * 1024 * 1024, &headers, "large.bin", 256 * 1024, true);
+
+        assert_eq!(plan.kind, PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate));
+        assert_eq!(plan.plain_body_kind(), Some(PutObjectPlainBodyKind::ReducedCopyCandidate));
+        assert!(plan.ingress.enable_zero_copy);
     }
 
     #[test]

@@ -17,8 +17,9 @@ use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
-use rustfs_io_core::IoChunk;
+use rustfs_io_core::{BoxChunkStream, IoChunk};
 use rustfs_utils::HashAlgorithm;
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::time::Instant;
 use tokio::io::AsyncRead;
@@ -38,6 +39,20 @@ struct ChunkSpan {
     bytes: Bytes,
     chunk: IoChunk,
     copied: bool,
+}
+
+struct BitrotChunkStreamState {
+    source_stream: BoxChunkStream,
+    source_chunks: VecDeque<IoChunk>,
+    source_chunk_offset: usize,
+    source_buffered_bytes: usize,
+    source_done: bool,
+    decoded_remaining: usize,
+    trim_prefix: usize,
+    output_remaining: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
 }
 
 struct ChunkCursor<'a> {
@@ -142,6 +157,190 @@ impl<'a> ChunkCursor<'a> {
             chunk: IoChunk::Shared(bytes),
             copied: true,
         })
+    }
+}
+
+impl BitrotChunkStreamState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source_stream: BoxChunkStream,
+        source_chunks: VecDeque<IoChunk>,
+        source_done: bool,
+        decoded_remaining: usize,
+        trim_prefix: usize,
+        output_remaining: usize,
+        shard_size: usize,
+        checksum_algo: HashAlgorithm,
+        skip_verify: bool,
+    ) -> Self {
+        let source_buffered_bytes = source_chunks.iter().map(IoChunk::len).sum();
+        Self {
+            source_stream,
+            source_chunks,
+            source_chunk_offset: 0,
+            source_buffered_bytes,
+            source_done,
+            decoded_remaining,
+            trim_prefix,
+            output_remaining,
+            shard_size,
+            checksum_algo,
+            skip_verify,
+        }
+    }
+
+    fn hash_size(&self) -> usize {
+        self.checksum_algo.size()
+    }
+
+    fn skip_empty_chunks(&mut self) {
+        while let Some(chunk) = self.source_chunks.front() {
+            if self.source_chunk_offset < chunk.len() {
+                break;
+            }
+            self.source_chunks.pop_front();
+            self.source_chunk_offset = 0;
+        }
+    }
+
+    async fn fill_source(&mut self, min_bytes: usize) -> std::io::Result<()> {
+        while self.source_buffered_bytes < min_bytes && !self.source_done {
+            match self.source_stream.next().await {
+                Some(Ok(chunk)) => {
+                    self.source_buffered_bytes += chunk.len();
+                    self.source_chunks.push_back(chunk);
+                }
+                Some(Err(err)) => return Err(err),
+                None => self.source_done = true,
+            }
+        }
+
+        if self.source_buffered_bytes < min_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
+        }
+
+        Ok(())
+    }
+
+    fn advance_source(&mut self, len: usize) {
+        self.source_buffered_bytes = self.source_buffered_bytes.saturating_sub(len);
+        self.source_chunk_offset += len;
+        self.skip_empty_chunks();
+    }
+
+    fn take_source_span(&mut self, len: usize) -> std::io::Result<ChunkSpan> {
+        self.skip_empty_chunks();
+        if self.source_buffered_bytes < len {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
+        }
+
+        let Some(chunk) = self.source_chunks.front() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "missing bitrot chunk source"));
+        };
+        let available = chunk.len().saturating_sub(self.source_chunk_offset);
+
+        if len <= available {
+            let span = match chunk {
+                IoChunk::Shared(bytes) => {
+                    let bytes = bytes.slice(self.source_chunk_offset..self.source_chunk_offset + len);
+                    ChunkSpan {
+                        bytes: bytes.clone(),
+                        chunk: IoChunk::Shared(bytes),
+                        copied: false,
+                    }
+                }
+                IoChunk::Mapped(mapped) => {
+                    let chunk = IoChunk::Mapped(mapped.slice(self.source_chunk_offset, len)?);
+                    let bytes = chunk.as_bytes();
+                    ChunkSpan {
+                        bytes,
+                        chunk,
+                        copied: false,
+                    }
+                }
+                IoChunk::Pooled(pooled) => {
+                    let chunk = IoChunk::Pooled(pooled.slice(self.source_chunk_offset, len)?);
+                    let bytes = chunk.as_bytes();
+                    ChunkSpan {
+                        bytes,
+                        chunk,
+                        copied: false,
+                    }
+                }
+            };
+            self.advance_source(len);
+            return Ok(span);
+        }
+
+        let mut aggregate = BytesMut::with_capacity(len);
+        let mut remaining = len;
+        while remaining > 0 {
+            self.skip_empty_chunks();
+            let Some(chunk) = self.source_chunks.front() else {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
+            };
+            let available = chunk.len().saturating_sub(self.source_chunk_offset);
+            let take = available.min(remaining);
+            aggregate.extend_from_slice(&chunk.as_bytes()[self.source_chunk_offset..self.source_chunk_offset + take]);
+            self.advance_source(take);
+            remaining -= take;
+        }
+
+        let bytes = aggregate.freeze();
+        Ok(ChunkSpan {
+            bytes: bytes.clone(),
+            chunk: IoChunk::Shared(bytes),
+            copied: true,
+        })
+    }
+
+    async fn next_verified_chunk(&mut self) -> std::io::Result<Option<IoChunk>> {
+        let hash_size = self.hash_size();
+
+        while self.output_remaining > 0 && self.decoded_remaining > 0 {
+            let data_len = self.shard_size.min(self.decoded_remaining);
+
+            let expected_hash = if hash_size > 0 {
+                self.fill_source(hash_size).await?;
+                Some(self.take_source_span(hash_size)?)
+            } else {
+                None
+            };
+
+            self.fill_source(data_len).await?;
+            let data_span = self.take_source_span(data_len)?;
+
+            if let Some(expected_hash) = expected_hash
+                && !self.skip_verify
+                && self.checksum_algo.hash_encode(data_span.bytes.as_ref()).as_ref() != expected_hash.bytes.as_ref()
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+            }
+
+            self.decoded_remaining -= data_len;
+
+            if self.trim_prefix >= data_len {
+                self.trim_prefix -= data_len;
+                continue;
+            }
+
+            let start = self.trim_prefix;
+            self.trim_prefix = 0;
+            let take = (data_len - start).min(self.output_remaining);
+            self.output_remaining -= take;
+
+            let chunk = if start == 0 && take == data_len {
+                data_span.chunk
+            } else {
+                data_span.chunk.slice(start, take)?
+            };
+
+            if !chunk.is_empty() {
+                return Ok(Some(chunk));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -280,41 +479,98 @@ pub async fn create_bitrot_chunk_stream(
     let encoded_length = fetch_length.div_ceil(shard_size) * hash_size + fetch_length;
     let encoded_offset = fetch_start.div_ceil(shard_size) * hash_size + fetch_start;
 
-    let (source_chunks, source_direct) = if let Some(data) = inline_data {
-        (
-            vec![IoChunk::Shared(
-                Bytes::copy_from_slice(data).slice(encoded_offset..encoded_offset + encoded_length),
-            )],
-            false,
-        )
+    let mut source_done = false;
+    let (source_stream, mut prefetched_chunks, source_direct) = if let Some(data) = inline_data {
+        source_done = true;
+        let mut chunks = VecDeque::new();
+        chunks.push_back(IoChunk::Shared(
+            Bytes::copy_from_slice(data).slice(encoded_offset..encoded_offset + encoded_length),
+        ));
+        let source_stream: BoxChunkStream = Box::pin(stream::empty::<std::io::Result<IoChunk>>());
+        (source_stream, chunks, false)
     } else if let Some(disk) = disk {
         if use_zero_copy {
-            let mut stream = disk.read_file_chunks(bucket, path, encoded_offset, encoded_length).await?;
-            let mut chunks = Vec::new();
+            let mut source_stream = disk.read_file_chunks(bucket, path, encoded_offset, encoded_length).await?;
+            let mut prefetched_chunks = VecDeque::new();
             let mut direct = true;
-            while let Some(chunk) = stream.next().await {
+            while prefetched_chunks.len() < 2 {
+                let Some(chunk) = source_stream.next().await else {
+                    source_done = true;
+                    break;
+                };
                 let chunk = chunk?;
                 direct &= matches!(chunk, IoChunk::Mapped(_));
-                chunks.push(chunk);
+                prefetched_chunks.push_back(chunk);
             }
-            (chunks, direct)
+            (source_stream, prefetched_chunks, direct)
         } else {
+            source_done = true;
             let bytes = disk.read_file_zero_copy(bucket, path, encoded_offset, encoded_length).await?;
-            (vec![IoChunk::Shared(bytes)], false)
+            let mut chunks = VecDeque::new();
+            chunks.push_back(IoChunk::Shared(bytes));
+            let source_stream: BoxChunkStream = Box::pin(stream::empty::<std::io::Result<IoChunk>>());
+            (source_stream, chunks, false)
         }
     } else {
         return Ok(None);
     };
 
-    let (data_chunks, copied) =
-        decode_bitrot_chunk_source(&source_chunks, shard_size, checksum_algo, skip_verify).map_err(DiskError::other)?;
-    let data_chunks = trim_chunk_vec(data_chunks, trim_prefix, length).map_err(DiskError::other)?;
-    let stream = stream::iter(data_chunks.into_iter().map(Ok::<IoChunk, std::io::Error>));
+    let copied = predicted_stream_copy(encoded_length, shard_size, checksum_algo.size(), &prefetched_chunks, source_done);
+    let state = BitrotChunkStreamState::new(
+        source_stream,
+        std::mem::take(&mut prefetched_chunks),
+        source_done,
+        fetch_length,
+        trim_prefix,
+        length,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+    );
+    let stream = stream::unfold(Some(state), |state| async move {
+        let mut state = match state {
+            Some(state) => state,
+            None => return None,
+        };
+
+        match state.next_verified_chunk().await {
+            Ok(Some(chunk)) => {
+                let next_state = if state.output_remaining == 0 { None } else { Some(state) };
+                Some((Ok::<IoChunk, std::io::Error>(chunk), next_state))
+            }
+            Ok(None) => None,
+            Err(err) => Some((Err(err), None)),
+        }
+    });
     Ok(Some(GetObjectChunkResult {
         stream: Box::pin(stream),
         path: GetObjectChunkPath::Direct,
         copy_mode: classify_chunk_copy_mode(source_direct, copied),
     }))
+}
+
+fn predicted_stream_copy(
+    encoded_length: usize,
+    shard_size: usize,
+    hash_size: usize,
+    prefetched_chunks: &VecDeque<IoChunk>,
+    source_done: bool,
+) -> bool {
+    if prefetched_chunks.is_empty() {
+        return false;
+    }
+
+    if source_done && prefetched_chunks.len() == 1 {
+        return false;
+    }
+
+    let full_frame_len = hash_size + shard_size;
+    if full_frame_len == 0 {
+        return false;
+    }
+
+    let first_window_len = prefetched_chunks.front().map(IoChunk::len).unwrap_or(encoded_length);
+    encoded_length > first_window_len && !first_window_len.is_multiple_of(full_frame_len)
 }
 
 fn trim_chunk_vec(chunks: Vec<IoChunk>, offset: usize, length: usize) -> std::io::Result<Vec<IoChunk>> {
@@ -552,7 +808,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        let mut stream = result.unwrap().unwrap().stream;
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bitrot hash mismatch"));
     }
 
     #[tokio::test]
@@ -647,6 +906,45 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
         assert_eq!(decoded[1].as_bytes(), Bytes::from_static(b"efgh"));
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_chunk_stream_state_yields_verified_prefix_before_later_truncation() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::Md5;
+        let shard1 = b"abcd";
+        let shard2 = b"efgh";
+
+        let mut first_frame = Vec::new();
+        first_frame.extend_from_slice(checksum_algo.hash_encode(shard1).as_ref());
+        first_frame.extend_from_slice(shard1);
+
+        let mut second_frame_prefix = Vec::new();
+        second_frame_prefix.extend_from_slice(checksum_algo.hash_encode(shard2).as_ref());
+        second_frame_prefix.extend_from_slice(&shard2[..2]);
+
+        let source_stream: BoxChunkStream = Box::pin(stream::iter(vec![
+            Ok(IoChunk::Shared(Bytes::from(first_frame))),
+            Ok(IoChunk::Shared(Bytes::from(second_frame_prefix))),
+        ]));
+        let mut state = BitrotChunkStreamState::new(
+            source_stream,
+            VecDeque::new(),
+            false,
+            shard1.len() + shard2.len(),
+            0,
+            shard1.len() + shard2.len(),
+            shard_size,
+            checksum_algo,
+            false,
+        );
+
+        let first = state.next_verified_chunk().await.unwrap().unwrap();
+        assert_eq!(first.as_bytes(), Bytes::from_static(b"abcd"));
+
+        let err = state.next_verified_chunk().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("truncated bitrot chunk source"));
     }
 
     #[tokio::test]
