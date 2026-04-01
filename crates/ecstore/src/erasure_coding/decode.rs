@@ -15,10 +15,9 @@
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_coding::{BitrotReader, Erasure};
-use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
-use rustfs_io_core::IoChunk;
+use rustfs_io_core::{IoChunk, PooledChunk};
 use std::io;
 use std::io::ErrorKind;
 use tokio::io::AsyncRead;
@@ -203,11 +202,10 @@ fn take_data_blocks_as_chunks(
         let start = offset;
         offset = 0;
         let take = (block.len() - start).min(remaining);
-        let bytes = Bytes::from(block);
-        let chunk = if start == 0 && take == bytes.len() {
-            IoChunk::Shared(bytes)
+        let chunk = if start == 0 && take == block.len() {
+            IoChunk::Pooled(PooledChunk::from_vec(block))
         } else {
-            IoChunk::Shared(bytes.slice(start..start + take))
+            IoChunk::Pooled(PooledChunk::from_vec(block).slice(start, take)?)
         };
         chunks.push(chunk);
         remaining -= take;
@@ -277,7 +275,7 @@ where
     Ok(total_written)
 }
 
-pub(crate) struct ReconstructedChunkDecoder<R> {
+pub(crate) struct ErasureChunkDecoder<R> {
     erasure: Erasure,
     reader: ParallelReader<R>,
     offset: usize,
@@ -290,7 +288,7 @@ pub(crate) struct ReconstructedChunkDecoder<R> {
     finished: bool,
 }
 
-impl<R> ReconstructedChunkDecoder<R>
+impl<R> ErasureChunkDecoder<R>
 where
     R: AsyncRead + Unpin + Send + Sync,
 {
@@ -395,6 +393,8 @@ where
         self.healable_error.take()
     }
 }
+
+pub(crate) type ReconstructedChunkDecoder<R> = ErasureChunkDecoder<R>;
 
 impl Erasure {
     pub async fn decode<W, R>(
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconstructed_chunk_decoder_reconstructs_missing_data_shard() {
+    async fn test_erasure_chunk_decoder_reconstructs_missing_data_shard_as_pooled_chunks() {
         let erasure = Erasure::new(2, 1, 4);
         let original = b"abcd";
         let encoded = erasure.encode_data(original).unwrap();
@@ -667,8 +667,12 @@ mod tests {
             Some(create_bitrot_reader_from_shard(encoded[2].clone(), shard_size, &hash_algo).await),
         ];
 
-        let mut decoder = ReconstructedChunkDecoder::new(erasure, readers, 0, original.len(), original.len()).unwrap();
+        let mut decoder = ErasureChunkDecoder::new(erasure, readers, 0, original.len(), original.len()).unwrap();
         let first_batch = decoder.next_chunks().await.unwrap().unwrap();
+        assert!(
+            first_batch.iter().all(|chunk| matches!(chunk, IoChunk::Pooled(_))),
+            "reconstructed decoder should produce pooled chunks"
+        );
         let collected = first_batch
             .into_iter()
             .flat_map(|chunk| chunk.as_bytes().to_vec())

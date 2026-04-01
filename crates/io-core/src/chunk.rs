@@ -142,6 +142,17 @@ impl AsRef<[u8]> for PooledChunkOwner {
     }
 }
 
+#[derive(Debug)]
+struct DetachedVecChunkOwner {
+    bytes: Vec<u8>,
+}
+
+impl AsRef<[u8]> for DetachedVecChunkOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl PooledChunk {
     pub fn new(buffer: PooledBuffer, len: usize) -> io::Result<Self> {
         validate_slice_bounds(buffer.len(), 0, len)?;
@@ -157,6 +168,14 @@ impl PooledChunk {
     pub fn from_bytes(bytes: Bytes) -> io::Result<Self> {
         let len = bytes.len();
         Self::new(PooledBuffer::from_bytes(bytes), len)
+    }
+
+    /// Detached constructor that takes ownership of an existing `Vec<u8>`
+    /// without introducing an additional copy.
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Bytes::from_owner(DetachedVecChunkOwner { bytes }),
+        }
     }
 
     /// Returns the visible length of this pooled chunk.

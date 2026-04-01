@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bitrot::create_bitrot_chunk_stream;
-use crate::erasure_coding::decode::ReconstructedChunkDecoder;
+use crate::erasure_coding::decode::ErasureChunkDecoder;
 use crate::erasure_coding::{calc_shard_size, calc_shard_size_legacy};
 use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::BytesMut;
@@ -445,7 +445,7 @@ async fn build_reconstructed_part_stream(
     let object = object.to_string();
     let erasure = erasure.clone();
     tokio::spawn(async move {
-        let mut decoder = match ReconstructedChunkDecoder::new(erasure, readers, part_offset, part_length, part_size) {
+        let mut decoder = match ErasureChunkDecoder::new(erasure, readers, part_offset, part_length, part_size) {
             Ok(decoder) => decoder,
             Err(err) => {
                 let _ = tx.send(Err(err));
