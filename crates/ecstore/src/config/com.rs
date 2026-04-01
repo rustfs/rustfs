@@ -1072,8 +1072,6 @@ mod tests {
         read_config_with_metadata, storage_class_kvs_mut,
     };
     use crate::config::{Config, audit, notify, oidc};
-    use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
@@ -1086,6 +1084,8 @@ mod tests {
         ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
+    use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
     use rustfs_filemeta::FileInfo;
@@ -2221,8 +2221,8 @@ mod tests {
         let lhs = decode_server_config_blob(external).expect("decode external");
         let rhs = decode_server_config_blob(legacy).expect("decode legacy");
         assert!(configs_semantically_equal(&lhs, &rhs));
-  }
-  
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_read_config_with_metadata_succeeds_with_one_healthy_locker_in_two_node_dist_setup() {

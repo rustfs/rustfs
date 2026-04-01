@@ -25,7 +25,7 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
-use rustfs_targets::target::EntityTarget;
+use rustfs_targets::target::QueuedPayload;
 use rustfs_targets::{StoreError, Target};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -464,7 +464,7 @@ impl NotificationSystem {
     /// Enhanced event stream startup function, including monitoring and concurrency control
     fn enhanced_start_event_stream(
         &self,
-        store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
+        store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
         target: Arc<dyn Target<Event> + Send + Sync>,
         metrics: Arc<NotificationMetrics>,
         semaphore: Arc<Semaphore>,

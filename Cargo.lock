@@ -8399,6 +8399,7 @@ name = "rustfs-targets"
 version = "0.0.5"
 dependencies = [
  "async-trait",
+ "criterion",
  "reqwest 0.13.2",
  "rumqttc",
  "rustfs-config",

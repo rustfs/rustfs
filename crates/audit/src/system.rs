@@ -17,7 +17,7 @@ use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     StoreError, Target, TargetError,
     store::{Key, Store},
-    target::EntityTarget,
+    target::{EntityTarget, QueuedPayload},
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -118,7 +118,7 @@ impl AuditSystem {
                         if target.is_enabled() {
                             if let Some(store) = target.store() {
                                 info!(target_id = %target_id, "Start audit stream processing for target");
-                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
+                                let store_clone: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send> =
                                     store.boxed_clone();
                                 let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
                                 self.start_audit_stream_with_batching(store_clone, target_arc);
@@ -427,7 +427,7 @@ impl AuditSystem {
     /// and attempts to send them to the specified target. It implements retry logic with exponential backoff
     fn start_audit_stream_with_batching(
         &self,
-        store: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send>,
+        store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
         target: Arc<dyn Target<AuditEntry> + Send + Sync>,
     ) {
         let state = self.state.clone();
@@ -652,7 +652,7 @@ impl AuditSystem {
                         if target.is_enabled() {
                             if let Some(store) = target.store() {
                                 info!(target_id = %target_id, "Start audit stream processing for target (reload)");
-                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
+                                let store_clone: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send> =
                                     store.boxed_clone();
                                 let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
                                 self.start_audit_stream_with_batching(store_clone, target_arc);

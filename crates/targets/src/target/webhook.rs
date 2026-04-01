@@ -17,7 +17,7 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
-    target::{ChannelTargetType, EntityTarget, TargetType},
+    target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
@@ -26,6 +26,7 @@ use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
+    marker::PhantomData,
     path::PathBuf,
     sync::{
         Arc,
@@ -105,10 +106,11 @@ where
     args: WebhookArgs,
     http_client: Arc<Client>,
     // Add Send + Sync constraints to ensure thread safety
-    store: Option<Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>>,
+    store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
     addr: String,
     cancel_sender: mpsc::Sender<()>,
+    _phantom: PhantomData<E>,
 }
 
 impl<E> WebhookTarget<E>
@@ -117,7 +119,7 @@ where
 {
     /// Clones the WebhookTarget, creating a new instance with the same configuration
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
-        Box::new(WebhookTarget {
+        Box::new(WebhookTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
             http_client: Arc::clone(&self.http_client),
@@ -125,6 +127,7 @@ where
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
             addr: self.addr.clone(),
             cancel_sender: self.cancel_sender.clone(),
+            _phantom: PhantomData,
         })
     }
 
@@ -149,7 +152,7 @@ where
                 TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
             };
 
-            let store = QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
+            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
@@ -157,7 +160,7 @@ where
             }
 
             // Make sure that the Store trait implemented by QueueStore matches the expected error type
-            Some(Box::new(store) as Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>)
+            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
@@ -175,7 +178,7 @@ where
         // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
         info!(target_id = %target_id.id, "Webhook target created");
-        Ok(WebhookTarget {
+        Ok(WebhookTarget::<E> {
             id: target_id,
             args,
             http_client,
@@ -183,6 +186,7 @@ where
             initialized: AtomicBool::new(false),
             addr,
             cancel_sender,
+            _phantom: PhantomData,
         })
     }
 
@@ -248,31 +252,40 @@ where
         Ok(())
     }
 
-    async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
-        info!("Webhook Sending event to webhook target: {}", self.id);
-        // Decode form-urlencoded object name
+    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
         let object_name = crate::target::decode_object_name(&event.object_name)?;
-
         let key = format!("{}/{}", event.bucket_name, object_name);
-
         let log = TargetLog {
             event_name: event.event_name,
             key,
             records: vec![event.data.clone()],
         };
+        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let meta = QueuedPayloadMeta::new(
+            event.event_name,
+            event.bucket_name.clone(),
+            event.object_name.clone(),
+            "application/json",
+            body.len(),
+        );
+        Ok(QueuedPayload::new(meta, body))
+    }
 
-        let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+    async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
+        info!("Webhook sending queued payload to target: {}", self.id);
+        debug!(
+            target = %self.id,
+            bucket = %meta.bucket_name,
+            object = %meta.object_name,
+            event = %meta.event_name,
+            preview = %meta.best_effort_preview(&body, 256),
+            "Sending webhook payload"
+        );
 
-        // Vec<u8> Convert to String
-        let data_string = String::from_utf8(data.clone())
-            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
-        debug!("Sending event to webhook target: {}, event log: {}", self.id, data_string);
-
-        // build request
         let mut req_builder = self
             .http_client
             .post(self.args.endpoint.as_str())
-            .header("Content-Type", "application/json");
+            .header("Content-Type", meta.content_type.as_str());
 
         if !self.args.auth_token.is_empty() {
             // Split auth_token string to check if the authentication type is included
@@ -293,7 +306,7 @@ where
         }
 
         // Send a request
-        let resp = req_builder.body(data).send().await.map_err(|e| {
+        let resp = req_builder.body(body).send().await.map_err(|e| {
             if e.is_timeout() || e.is_connect() {
                 TargetError::NotConnected
             } else {
@@ -353,28 +366,33 @@ where
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+        let queued = self.build_queued_payload(&event)?;
+
         if let Some(store) = &self.store {
-            // Call the store method directly, no longer need to acquire the lock
             store
-                .put(event)
+                .put_raw(
+                    &queued
+                        .encode()
+                        .map_err(|e| TargetError::Storage(format!("Failed to encode queued payload: {e}")))?,
+                )
                 .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {e}")))?;
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
         } else {
-            match self.init().await {
+            match WebhookTarget::<E>::init(self).await {
                 Ok(_) => (),
                 Err(e) => {
                     error!("Failed to initialize Webhook target {}: {}", self.id.id, e);
                     return Err(TargetError::NotConnected);
                 }
             }
-            self.send(&event).await
+            self.send_body(queued.body, &queued.meta).await
         }
     }
 
-    async fn send_from_store(&self, key: Key) -> Result<(), TargetError> {
-        debug!("Sending event from store for target: {}", self.id);
-        match self.init().await {
+    async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        debug!("Sending queued payload from store for target: {}, key: {}", self.id, key);
+        match WebhookTarget::<E>::init(self).await {
             Ok(_) => {
                 debug!("Event sent to store for target: {}", self.name());
             }
@@ -384,35 +402,11 @@ where
             }
         }
 
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| TargetError::Configuration("No store configured".to_string()))?;
-
-        // Get events directly from the store, no longer need to acquire locks
-        let event = match store.get(&key) {
-            Ok(event) => event,
-            Err(StoreError::NotFound) => return Ok(()),
-            Err(e) => {
-                return Err(TargetError::Storage(format!("Failed to get event from store: {e}")));
-            }
-        };
-
-        if let Err(e) = self.send(&event).await {
+        if let Err(e) = self.send_body(body, &meta).await {
             if let TargetError::NotConnected = e {
                 return Err(TargetError::NotConnected);
             }
             return Err(e);
-        }
-
-        // Use the immutable reference of the store to delete the event content corresponding to the key
-        debug!("Deleting event from store for target: {}, key:{}, start", self.id, key.to_string());
-        match store.del(&key) {
-            Ok(_) => debug!("Event deleted from store for target: {}, key:{}, end", self.id, key.to_string()),
-            Err(e) => {
-                error!("Failed to delete event from store: {}", e);
-                return Err(TargetError::Storage(format!("Failed to delete event from store: {e}")));
-            }
         }
 
         debug!("Event sent from store and deleted for target: {}", self.id);
@@ -426,7 +420,7 @@ where
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
         // Returns the reference to the internal store
         self.store.as_deref()
     }
@@ -443,7 +437,7 @@ where
         }
 
         // Use existing initialization logic
-        WebhookTarget::init(self).await
+        WebhookTarget::<E>::init(self).await
     }
 
     fn is_enabled(&self) -> bool {
