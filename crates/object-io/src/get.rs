@@ -137,20 +137,20 @@ pub fn get_object_sequential_hint(rs: Option<&HTTPRangeSpec>) -> bool {
 }
 
 pub trait CachedGetObjectSource {
-    fn body(&self) -> Arc<Bytes>;
+    fn body(&self) -> &Arc<Bytes>;
     fn content_length(&self) -> i64;
-    fn content_type(&self) -> Option<String>;
-    fn e_tag(&self) -> Option<String>;
-    fn last_modified(&self) -> Option<String>;
-    fn cache_control(&self) -> Option<String>;
-    fn content_disposition(&self) -> Option<String>;
-    fn content_encoding(&self) -> Option<String>;
-    fn content_language(&self) -> Option<String>;
-    fn storage_class(&self) -> Option<String>;
-    fn version_id(&self) -> Option<String>;
+    fn content_type(&self) -> Option<&str>;
+    fn e_tag(&self) -> Option<&str>;
+    fn last_modified(&self) -> Option<&str>;
+    fn cache_control(&self) -> Option<&str>;
+    fn content_disposition(&self) -> Option<&str>;
+    fn content_encoding(&self) -> Option<&str>;
+    fn content_language(&self) -> Option<&str>;
+    fn storage_class(&self) -> Option<&str>;
+    fn version_id(&self) -> Option<&str>;
     fn delete_marker(&self) -> bool;
     fn tag_count(&self) -> Option<i32>;
-    fn user_metadata(&self) -> HashMap<String, String>;
+    fn user_metadata(&self) -> &HashMap<String, String>;
 }
 
 pub struct GetObjectOutputContext {
@@ -315,34 +315,32 @@ pub fn build_cached_get_object_output_from_source<T>(cached: &T) -> GetObjectOut
 where
     T: CachedGetObjectSource,
 {
-    let body_data = cached.body();
+    let body_data = Arc::clone(cached.body());
     let body = Some(StreamingBlob::wrap::<_, std::convert::Infallible>(futures_util::stream::once(
         async move { Ok((*body_data).clone()) },
     )));
 
     let last_modified = cached
         .last_modified()
-        .as_ref()
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
         .map(Timestamp::from);
 
-    let content_type = cached.content_type().as_ref().and_then(|ct| ContentType::from_str(ct).ok());
+    let content_type = cached.content_type().and_then(|ct| ContentType::from_str(ct).ok());
 
-    let user_metadata = cached.user_metadata();
-    let metadata = if user_metadata.is_empty() { None } else { Some(user_metadata) };
+    let metadata = (!cached.user_metadata().is_empty()).then(|| cached.user_metadata().clone());
 
     GetObjectOutput {
         body,
         content_length: Some(cached.content_length()),
         accept_ranges: Some("bytes".to_string()),
-        e_tag: cached.e_tag().as_ref().map(|etag| to_s3s_etag(etag)),
+        e_tag: cached.e_tag().map(to_s3s_etag),
         last_modified,
         content_type,
-        cache_control: cached.cache_control(),
-        content_disposition: cached.content_disposition(),
-        content_encoding: cached.content_encoding(),
-        content_language: cached.content_language(),
-        version_id: cached.version_id(),
+        cache_control: cached.cache_control().map(str::to_string),
+        content_disposition: cached.content_disposition().map(str::to_string),
+        content_encoding: cached.content_encoding().map(str::to_string),
+        content_language: cached.content_language().map(str::to_string),
+        version_id: cached.version_id().map(str::to_string),
         delete_marker: Some(cached.delete_marker()),
         tag_count: cached.tag_count(),
         metadata,
@@ -353,23 +351,23 @@ pub fn build_cached_get_object_event_info_from_source<T>(bucket: &str, key: &str
 where
     T: CachedGetObjectSource,
 {
+    let last_modified = cached.last_modified().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+    let version_id = cached.version_id().and_then(|v| uuid::Uuid::parse_str(v).ok());
+
     ObjectInfo {
         bucket: bucket.to_string(),
         name: key.to_string(),
-        storage_class: cached.storage_class(),
-        mod_time: cached
-            .last_modified()
-            .as_ref()
-            .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()),
+        storage_class: cached.storage_class().map(str::to_string),
+        mod_time: last_modified,
         size: cached.content_length(),
         actual_size: cached.content_length(),
         is_dir: false,
-        user_defined: cached.user_metadata(),
-        version_id: cached.version_id().as_ref().and_then(|v| uuid::Uuid::parse_str(v).ok()),
+        user_defined: cached.user_metadata().clone(),
+        version_id,
         delete_marker: cached.delete_marker(),
-        content_type: cached.content_type(),
-        content_encoding: cached.content_encoding(),
-        etag: cached.e_tag(),
+        content_type: cached.content_type().map(str::to_string),
+        content_encoding: cached.content_encoding().map(str::to_string),
+        etag: cached.e_tag().map(str::to_string),
         ..Default::default()
     }
 }
@@ -898,48 +896,48 @@ mod tests {
     }
 
     impl CachedGetObjectSource for MockCachedSource {
-        fn body(&self) -> Arc<Bytes> {
-            self.body.clone()
+        fn body(&self) -> &Arc<Bytes> {
+            &self.body
         }
 
         fn content_length(&self) -> i64 {
             self.content_length
         }
 
-        fn content_type(&self) -> Option<String> {
-            self.content_type.clone()
+        fn content_type(&self) -> Option<&str> {
+            self.content_type.as_deref()
         }
 
-        fn e_tag(&self) -> Option<String> {
-            self.e_tag.clone()
+        fn e_tag(&self) -> Option<&str> {
+            self.e_tag.as_deref()
         }
 
-        fn last_modified(&self) -> Option<String> {
-            self.last_modified.clone()
+        fn last_modified(&self) -> Option<&str> {
+            self.last_modified.as_deref()
         }
 
-        fn cache_control(&self) -> Option<String> {
-            self.cache_control.clone()
+        fn cache_control(&self) -> Option<&str> {
+            self.cache_control.as_deref()
         }
 
-        fn content_disposition(&self) -> Option<String> {
-            self.content_disposition.clone()
+        fn content_disposition(&self) -> Option<&str> {
+            self.content_disposition.as_deref()
         }
 
-        fn content_encoding(&self) -> Option<String> {
-            self.content_encoding.clone()
+        fn content_encoding(&self) -> Option<&str> {
+            self.content_encoding.as_deref()
         }
 
-        fn content_language(&self) -> Option<String> {
-            self.content_language.clone()
+        fn content_language(&self) -> Option<&str> {
+            self.content_language.as_deref()
         }
 
-        fn storage_class(&self) -> Option<String> {
-            self.storage_class.clone()
+        fn storage_class(&self) -> Option<&str> {
+            self.storage_class.as_deref()
         }
 
-        fn version_id(&self) -> Option<String> {
-            self.version_id.clone()
+        fn version_id(&self) -> Option<&str> {
+            self.version_id.as_deref()
         }
 
         fn delete_marker(&self) -> bool {
@@ -950,8 +948,8 @@ mod tests {
             self.tag_count
         }
 
-        fn user_metadata(&self) -> HashMap<String, String> {
-            self.user_metadata.clone()
+        fn user_metadata(&self) -> &HashMap<String, String> {
+            &self.user_metadata
         }
     }
 

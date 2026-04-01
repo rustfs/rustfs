@@ -84,48 +84,48 @@ pub(super) async fn prepare_get_object_request_context(req: &S3Request<GetObject
 }
 
 impl ObjectIoCachedGetObjectSource for CachedGetObject {
-    fn body(&self) -> std::sync::Arc<bytes::Bytes> {
-        self.body.clone()
+    fn body(&self) -> &std::sync::Arc<bytes::Bytes> {
+        &self.body
     }
 
     fn content_length(&self) -> i64 {
         self.content_length
     }
 
-    fn content_type(&self) -> Option<String> {
-        self.content_type.clone()
+    fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
     }
 
-    fn e_tag(&self) -> Option<String> {
-        self.e_tag.clone()
+    fn e_tag(&self) -> Option<&str> {
+        self.e_tag.as_deref()
     }
 
-    fn last_modified(&self) -> Option<String> {
-        self.last_modified.clone()
+    fn last_modified(&self) -> Option<&str> {
+        self.last_modified.as_deref()
     }
 
-    fn cache_control(&self) -> Option<String> {
-        self.cache_control.clone()
+    fn cache_control(&self) -> Option<&str> {
+        self.cache_control.as_deref()
     }
 
-    fn content_disposition(&self) -> Option<String> {
-        self.content_disposition.clone()
+    fn content_disposition(&self) -> Option<&str> {
+        self.content_disposition.as_deref()
     }
 
-    fn content_encoding(&self) -> Option<String> {
-        self.content_encoding.clone()
+    fn content_encoding(&self) -> Option<&str> {
+        self.content_encoding.as_deref()
     }
 
-    fn content_language(&self) -> Option<String> {
-        self.content_language.clone()
+    fn content_language(&self) -> Option<&str> {
+        self.content_language.as_deref()
     }
 
-    fn storage_class(&self) -> Option<String> {
-        self.storage_class.clone()
+    fn storage_class(&self) -> Option<&str> {
+        self.storage_class.as_deref()
     }
 
-    fn version_id(&self) -> Option<String> {
-        self.version_id.clone()
+    fn version_id(&self) -> Option<&str> {
+        self.version_id.as_deref()
     }
 
     fn delete_marker(&self) -> bool {
@@ -136,8 +136,8 @@ impl ObjectIoCachedGetObjectSource for CachedGetObject {
         self.tag_count
     }
 
-    fn user_metadata(&self) -> std::collections::HashMap<String, String> {
-        self.user_metadata.clone()
+    fn user_metadata(&self) -> &std::collections::HashMap<String, String> {
+        &self.user_metadata
     }
 }
 
