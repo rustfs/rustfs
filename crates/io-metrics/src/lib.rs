@@ -118,7 +118,7 @@ pub use config::{
 
 // Re-exports for convenience
 pub use collector::MetricsCollector;
-pub use metric_names::{data_plane, zero_copy};
+pub use metric_names::data_plane;
 pub use performance::PerformanceMetrics;
 
 /// High-level request path selected for an I/O operation.
@@ -379,16 +379,6 @@ pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
     }
 }
 
-/// Record memory copies avoided by using zero-copy.
-///
-/// # Arguments
-///
-/// * `bytes_saved` - Number of bytes that would have been copied without zero-copy
-#[inline(always)]
-pub fn record_memory_copy_saved(bytes_saved: usize) {
-    counter!("rustfs.zero_copy.memory.saved.bytes").increment(bytes_saved as u64);
-}
-
 // ============================================================================
 // BytesPool Metrics
 // ============================================================================
@@ -442,16 +432,6 @@ pub fn record_bytes_pool_allocated(tier: &str, bytes: u64) {
 #[inline(always)]
 pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
     gauge!("rustfs.bytes.pool.hit.rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
-}
-
-/// Record bytes saved from zero-copy.
-///
-/// # Arguments
-///
-/// * `size_bytes` - Number of bytes saved from zero-copy
-#[inline(always)]
-pub fn record_bytes_saved(size_bytes: usize) {
-    counter!("rustfs.zero_copy.bytes.saved.total").increment(size_bytes as u64);
 }
 
 // ============================================================================
@@ -918,27 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_zero_copy_removal_policy_mentions_data_plane_replacement() {
-        assert!(metric_names::LEGACY_ZERO_COPY_REMOVAL_POLICY.contains("rustfs.io.*"));
-        assert!(metric_names::LEGACY_ZERO_COPY_REMOVAL_POLICY.contains("dashboards"));
-    }
-
-    #[test]
-    fn test_record_legacy_zero_copy_memory_saved_metrics() {
-        record_memory_copy_saved(1024);
-    }
-
-    #[test]
     fn test_record_bytes_pool_metrics() {
         record_bytes_pool_acquire("small", 4096, true);
         record_bytes_pool_return("small");
         record_bytes_pool_allocated("small", 4096);
         record_bytes_pool_hit_rate("small", 0.85);
-    }
-
-    #[test]
-    fn test_record_legacy_zero_copy_bytes_saved_metrics() {
-        record_bytes_saved(1024);
     }
 
     // S3 Operation Metrics Tests
@@ -1060,155 +1024,6 @@ mod tests {
     }
 }
 
-// ============================================================================
-// Zero-Copy Optimization Metrics (Phase 1 Extension)
-// ============================================================================
-
 pub mod bandwidth;
 pub mod global_metrics;
 pub mod metric_names;
-
-/// Record a zero-copy buffer operation.
-///
-/// This function records metrics for zero-copy buffer operations,
-/// including the operation type and size.
-#[inline(always)]
-pub fn record_zero_copy_buffer_operation(operation: &str, size: usize) {
-    counter!(
-        zero_copy::BUFFER_OPERATIONS_TOTAL,
-        "operation" => operation.to_string()
-    )
-    .increment(1);
-
-    counter!(
-        zero_copy::BUFFER_BYTES_TOTAL,
-        "operation" => operation.to_string()
-    )
-    .increment(size as u64);
-}
-
-/// Record memory copy operations.
-///
-/// This function tracks the number and size of memory copies,
-/// which should be minimized in zero-copy paths.
-#[inline(always)]
-pub fn record_memory_copy(count: u32, size: usize) {
-    counter!(zero_copy::MEMORY_COPY_TOTAL).increment(count as u64);
-
-    counter!(zero_copy::MEMORY_COPY_BYTES_TOTAL).increment(size as u64);
-
-    histogram!("rustfs_memory_copy_size_bytes").record(size as f64);
-}
-
-/// Record a shared reference operation.
-///
-/// This function tracks operations that create or use shared references
-/// for zero-copy data sharing.
-#[inline(always)]
-pub fn record_shared_ref_operation(operation: &str) {
-    counter!(
-        zero_copy::SHARED_REF_OPERATIONS_TOTAL,
-        "operation" => operation.to_string()
-    )
-    .increment(1);
-}
-
-/// Record BufReader optimization.
-///
-/// This function tracks BufReader layer elimination and buffer size
-/// adjustments.
-#[inline(always)]
-pub fn record_bufreader_optimization(layers_eliminated: u32, buffer_size: usize) {
-    counter!(zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL).increment(layers_eliminated as u64);
-
-    histogram!(zero_copy::BUFREADER_BUFFER_SIZE_BYTES).record(buffer_size as f64);
-}
-
-/// Record Direct I/O operation.
-///
-/// This function tracks Direct I/O operations and their success/fallback
-/// status.
-#[inline(always)]
-pub fn record_direct_io_operation(operation: &str, size: usize, success: bool) {
-    let status = if success { "success" } else { "fallback" };
-
-    counter!(
-        zero_copy::DIRECT_IO_OPERATIONS_TOTAL,
-        "operation" => operation.to_string(),
-        "status" => status.to_string()
-    )
-    .increment(1);
-
-    counter!(
-        zero_copy::DIRECT_IO_BYTES_TOTAL,
-        "operation" => operation.to_string(),
-        "status" => status.to_string()
-    )
-    .increment(size as u64);
-}
-
-/// Update zero-copy performance metrics.
-///
-/// This function updates gauge metrics for overall zero-copy performance.
-#[inline(always)]
-pub fn update_zero_copy_performance_metrics(copy_count: u32, throughput_mbps: f64, memory_saved: u64) {
-    gauge!(zero_copy::AVG_COPY_COUNT).set(copy_count as f64);
-
-    gauge!(zero_copy::THROUGHPUT_MBPS).set(throughput_mbps);
-
-    gauge!(zero_copy::MEMORY_SAVED_BYTES).set(memory_saved as f64);
-}
-
-// ============================================================================
-// Zero-Copy Metrics Tests
-// ============================================================================
-
-#[cfg(test)]
-mod zero_copy_tests {
-    use super::*;
-
-    #[test]
-    fn test_record_zero_copy_buffer_operation() {
-        // This test verifies the function compiles and runs
-        // Actual metric verification requires a metrics recorder
-        record_zero_copy_buffer_operation("read", 1024);
-        record_zero_copy_buffer_operation("write", 2048);
-    }
-
-    #[test]
-    fn test_record_memory_copy() {
-        record_memory_copy(1, 1024);
-        record_memory_copy(2, 2048);
-    }
-
-    #[test]
-    fn test_record_shared_ref_operation() {
-        record_shared_ref_operation("create");
-        record_shared_ref_operation("share");
-    }
-
-    #[test]
-    fn test_record_bufreader_optimization() {
-        record_bufreader_optimization(1, 8192);
-        record_bufreader_optimization(2, 65536);
-    }
-
-    #[test]
-    fn test_record_direct_io_operation() {
-        record_direct_io_operation("read", 4096, true);
-        record_direct_io_operation("write", 8192, false);
-    }
-
-    #[test]
-    fn test_update_zero_copy_performance_metrics() {
-        update_zero_copy_performance_metrics(2, 150.5, 1024 * 1024);
-    }
-
-    #[test]
-    fn test_metric_names() {
-        // Verify metric names are defined
-        assert!(!zero_copy::BUFFER_OPERATIONS_TOTAL.is_empty());
-        assert!(!zero_copy::MEMORY_COPY_TOTAL.is_empty());
-        assert!(!zero_copy::THROUGHPUT_MBPS.is_empty());
-    }
-}
