@@ -59,10 +59,10 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectChunkResult,
-        GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions,
-        MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
+        GetObjectChunkResult, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions,
+        ObjectToDelete, PartInfo, StorageAPI,
     },
     store_init,
 };
@@ -260,7 +260,13 @@ impl ObjectIO for ECStore {
         self.handle_get_object_reader(bucket, object, range, h, opts).await
     }
     #[instrument(level = "debug", skip(self, data))]
-    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut ChunkNativePutData,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
         enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
     }
 }
@@ -510,7 +516,7 @@ impl MultipartOperations for ECStore {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut PutObjReader,
+        data: &mut ChunkNativePutData,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         self.handle_put_object_part(bucket, object, upload_id, part_id, data, opts)

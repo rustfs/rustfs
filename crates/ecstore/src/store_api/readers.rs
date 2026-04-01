@@ -157,6 +157,20 @@ impl PutObjReader {
     }
 }
 
+impl std::ops::Deref for PutObjReader {
+    type Target = ChunkNativePutData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for PutObjReader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
 pub struct GetObjectReader {
     pub stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     pub object_info: ObjectInfo,

@@ -301,7 +301,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(encryption_metadata);
         }
 
-        let mut reader = PutObjReader::new(reader);
+        let mut reader = ChunkNativePutData::new(reader);
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);

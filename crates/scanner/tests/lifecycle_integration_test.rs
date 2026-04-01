@@ -24,7 +24,8 @@ use rustfs_ecstore::{
     pools::path2_bucket_object_with_base_path,
     store::ECStore,
     store_api::{
-        BucketOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
+        BucketOperations, ChunkNativePutData, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
+        PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
@@ -903,7 +904,9 @@ mod serial_tests {
             .get_object_info(src_bucket.as_str(), src_object, &ObjectOptions::default())
             .await
             .expect("Failed to load source object info");
-        src_info.put_object_reader = Some(PutObjReader::from_vec(payload.to_vec()));
+        src_info.put_object_reader = Some(ChunkNativePutData::new(
+            PutObjReader::from_vec(payload.to_vec()).take_stream().expect("take stream"),
+        ));
 
         ecstore
             .copy_object(

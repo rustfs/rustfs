@@ -719,10 +719,10 @@ mod tests {
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::set_disk::SetDisks;
     use crate::store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
+        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info,
+        ListOperations, MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
@@ -943,7 +943,7 @@ mod tests {
             &self,
             _bucket: &str,
             _object: &str,
-            _data: &mut PutObjReader,
+            _data: &mut ChunkNativePutData,
             _opts: &ObjectOptions,
         ) -> Result<ObjectInfo> {
             panic!("unused in test")
@@ -1130,7 +1130,7 @@ mod tests {
             _object: &str,
             _upload_id: &str,
             _part_id: usize,
-            _data: &mut PutObjReader,
+            _data: &mut ChunkNativePutData,
             _opts: &ObjectOptions,
         ) -> Result<PartInfo> {
             panic!("unused in test")

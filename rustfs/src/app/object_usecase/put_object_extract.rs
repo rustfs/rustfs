@@ -288,7 +288,7 @@ impl DefaultObjectUsecase {
                 opts.user_defined.extend(encryption_metadata);
             }
             opts.user_defined.extend(metadata);
-            let mut reader = PutObjReader::new(hrd);
+            let mut reader = rustfs_ecstore::store_api::ChunkNativePutData::new(hrd);
 
             let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,

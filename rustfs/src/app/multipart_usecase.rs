@@ -43,7 +43,9 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
-use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{
+    ChunkNativePutData, CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions,
+};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
@@ -823,7 +825,7 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = PutObjReader::new(reader);
+        let mut reader = ChunkNativePutData::new(reader);
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
@@ -1190,7 +1192,7 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = PutObjReader::new(reader);
+        let mut reader = ChunkNativePutData::new(reader);
 
         let dst_opts = ObjectOptions {
             user_defined: mp_info.user_defined.clone(),

@@ -52,9 +52,9 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
-        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions,
+        MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -695,8 +695,13 @@ impl ObjectIO for SetDisks {
     }
 
     #[tracing::instrument(skip(self, data,))]
-    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let data = data.chunk_native_data_mut();
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut ChunkNativePutData,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
@@ -1963,7 +1968,7 @@ impl ObjectOperations for SetDisks {
                 None,
                 false,
             )?;
-            let mut p_reader = PutObjReader::new(hash_reader);
+            let mut p_reader = ChunkNativePutData::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
                     send_event(EventArgs {
@@ -2038,7 +2043,7 @@ impl ObjectOperations for SetDisks {
                 None,
                 false,
             )?;
-            let mut p_reader = PutObjReader::new(hash_reader);
+            let mut p_reader = ChunkNativePutData::new(hash_reader);
             let p_info = self_
                 .clone()
                 .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
@@ -2262,10 +2267,9 @@ impl MultipartOperations for SetDisks {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut PutObjReader,
+        data: &mut ChunkNativePutData,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
-        let data = data.chunk_native_data_mut();
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
@@ -2274,7 +2278,9 @@ impl MultipartOperations for SetDisks {
 
         if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
             && !checksum.is_empty()
-            && data.content_crc_type().is_none_or(|v| v.to_string() != *checksum)
+            && data
+                .content_crc_type()
+                .is_none_or(|v: rustfs_rio::ChecksumType| v.to_string() != *checksum)
         {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }

@@ -647,6 +647,7 @@ impl SetDisks {
 mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+    use crate::store_api::PutObjReader;
 
     #[tokio::test]
     async fn write_chunk_native_put_data_restores_reader_state_after_encoding() {

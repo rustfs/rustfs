@@ -247,7 +247,7 @@ impl ECStore {
         &self,
         bucket: &str,
         object: &str,
-        data: &mut PutObjReader,
+        data: &mut ChunkNativePutData,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_put_object_args(bucket, object)?;
