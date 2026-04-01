@@ -200,58 +200,72 @@ impl NotificationSystem {
         }
     }
 
+    /// Initializes targets and starts event streams for those with stores.
+    /// Returns a map of (target_id -> cancel_sender) for streams that were started.
+    async fn init_targets_and_start_streams(
+        &self,
+        targets: &[Box<dyn Target<Event> + Send + Sync>],
+    ) -> HashMap<TargetID, mpsc::Sender<()>> {
+        let mut cancellers = HashMap::new();
+        for target in targets {
+            let target_id = target.id();
+            info!("Initializing target: {}", target_id);
+
+            if let Err(e) = target.init().await {
+                warn!("Target {} Initialization failed: {}", target_id, e);
+                continue;
+            }
+            debug!("Target {} initialized successfully, enabled: {}", target_id, target.is_enabled());
+
+            if !target.is_enabled() {
+                info!("Target {} is not enabled, event stream processing is skipped", target_id);
+                continue;
+            }
+
+            if let Some(store) = target.store() {
+                info!("Start event stream processing for target {}", target_id);
+
+                let store_clone = store.boxed_clone();
+                let target_arc = Arc::from(target.clone_dyn());
+
+                let cancel_tx = self.enhanced_start_event_stream(
+                    store_clone,
+                    target_arc,
+                    self.metrics.clone(),
+                    self.concurrency_limiter.clone(),
+                );
+
+                let target_id_clone = target_id.clone();
+                cancellers.insert(target_id, cancel_tx);
+                info!("Event stream processing for target {} is started successfully", target_id_clone);
+            } else {
+                info!("Target {} No storage is configured, event stream processing is skipped", target_id);
+            }
+        }
+        cancellers
+    }
+
     /// Initializes the notification system
     pub async fn init(&self) -> Result<(), NotificationError> {
         info!("Initialize notification system...");
 
-        let config = self.config.read().await;
-        debug!("Initializing notification system with config: {:?}", *config);
-        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
+        let config = {
+            let guard = self.config.read().await;
+            debug!("Initializing notification system with config: {:?}", *guard);
+            guard.clone()
+        };
+
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> =
+            self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
 
-        // Initiate event stream processing for each storage enabled target
-        let mut cancellers = HashMap::new();
-        for target in &targets {
-            let target_id = target.id();
-            info!("Initializing target: {}", target.id());
-            // Initialize the target
-            if let Err(e) = target.init().await {
-                warn!("Target {} Initialization failed:{}", target.id(), e);
-                continue;
-            }
-            debug!("Target {} initialized successfully,enabled:{}", target_id, target.is_enabled());
-            // Check if the target is enabled and has storage
-            if target.is_enabled() {
-                if let Some(store) = target.store() {
-                    info!("Start event stream processing for target {}", target.id());
+        // Initialize targets and start event streams
+        let cancellers = self.init_targets_and_start_streams(&targets).await;
 
-                    // The storage of the cloned target and the target itself
-                    let store_clone = store.boxed_clone();
-                    let target_box = target.clone_dyn();
-                    let target_arc = Arc::from(target_box);
-
-                    // Add a reference to the monitoring metrics
-                    let metrics = self.metrics.clone();
-                    let semaphore = self.concurrency_limiter.clone();
-
-                    // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(store_clone, target_arc, metrics, semaphore);
-
-                    // Start event stream processing and save cancel sender
-                    let target_id_clone = target_id.clone();
-                    cancellers.insert(target_id, cancel_tx);
-                    info!("Event stream processing for target {} is started successfully", target_id_clone);
-                } else {
-                    info!("Target {} No storage is configured, event stream processing is skipped", target_id);
-                }
-            } else {
-                info!("Target {} is not enabled, event stream processing is skipped", target_id);
-            }
-        }
-
-        // Update canceler collection
+        // Update canceller collection
         *self.stream_cancellers.write().await = cancellers;
+
         // Initialize the bucket target
         self.notifier.init_bucket_targets(targets).await?;
         info!("Notification system initialized");
@@ -489,14 +503,13 @@ impl NotificationSystem {
             let _ = cancel_tx.send(()).await;
         }
 
-        // Clear the target_list and ensure that reload is a replacement reconstruction (solve the target_list len unchanged/residual problem)
+        // Clear the target_list and ensure that reload is a replacement reconstruction
         self.notifier.remove_all_bucket_targets().await;
 
         // Update the config
         self.update_config(new_config.clone()).await;
 
-        // Create a new target from configuration
-        // This function will now be responsible for merging env, creating and persisting the final configuration.
+        // Create new targets from configuration
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self
             .registry
             .create_targets_from_config(&new_config)
@@ -505,46 +518,8 @@ impl NotificationSystem {
 
         info!("{} notification targets were created from the new configuration", targets.len());
 
-        // Start new event stream processing for each storage enabled target
-        let mut new_cancellers = HashMap::new();
-        for target in &targets {
-            let target_id = target.id();
-
-            // Initialize the target
-            if let Err(e) = target.init().await {
-                error!("Target {} Initialization failed:{}", target_id, e);
-                continue;
-            }
-            // Check if the target is enabled and has storage
-            if target.is_enabled() {
-                if let Some(store) = target.store() {
-                    info!("Start new event stream processing for target {}", target_id);
-
-                    // The storage of the cloned target and the target itself
-                    let store_clone = store.boxed_clone();
-                    // let target_box = target.clone_dyn();
-                    let target_arc = Arc::from(target.clone_dyn());
-
-                    // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(
-                        store_clone,
-                        target_arc,
-                        self.metrics.clone(),
-                        self.concurrency_limiter.clone(),
-                    );
-
-                    // Start event stream processing and save cancel sender
-                    // let cancel_tx = start_event_stream(store_clone, target_clone);
-                    let target_id_clone = target_id.clone();
-                    new_cancellers.insert(target_id, cancel_tx);
-                    info!("Event stream processing of target {} is restarted successfully", target_id_clone);
-                } else {
-                    info!("Target {} No storage is configured, event stream processing is skipped", target_id);
-                }
-            } else {
-                info!("Target {} disabled, event stream processing is skipped", target_id);
-            }
-        }
+        // Initialize targets and start event streams using shared helper
+        let new_cancellers = self.init_targets_and_start_streams(&targets).await;
 
         // Update canceler collection
         *cancellers = new_cancellers;

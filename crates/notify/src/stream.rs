@@ -278,28 +278,27 @@ async fn process_batch(
 
         // Retry logic
         while retry_count < max_retries && !success {
-            // After sending successfully, the event in the storage is deleted synchronously.
             match target.send_from_store(key.clone()).await {
                 Ok(_) => {
-                    info!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());
+                    debug!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());
                     success = true;
                     metrics.increment_processed();
                 }
                 Err(e) => {
-                    // Different retry strategies are adopted according to the error type
                     match &e {
                         TargetError::NotConnected => {
                             warn!("Target {} not connected, retrying...", target.name());
                             retry_count += 1;
-                            tokio::time::sleep(base_delay * (1 << retry_count)).await; // Exponential backoff
+                            let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                            tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
                         }
                         TargetError::Timeout(_) => {
                             warn!("Timeout for target {}, retrying...", target.name());
                             retry_count += 1;
-                            tokio::time::sleep(base_delay * (1 << retry_count)).await;
+                            let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                            tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
                         }
                         _ => {
-                            // Permanent error, skip this event
                             error!("Permanent error for target {}: {}", target.name(), e);
                             metrics.increment_failed();
                             break;
@@ -309,7 +308,6 @@ async fn process_batch(
             }
         }
 
-        // Handle the situation where the maximum number of retry exhaustion is exhausted
         if retry_count >= max_retries && !success {
             warn!("Max retries exceeded for event {}, target: {}, skipping", key.to_string(), target.name());
             metrics.increment_failed();

@@ -34,7 +34,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -108,7 +107,6 @@ where
     // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
-    addr: String,
     cancel_sender: mpsc::Sender<()>,
     _phantom: PhantomData<E>,
 }
@@ -125,7 +123,6 @@ where
             http_client: Arc::clone(&self.http_client),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
-            addr: self.addr.clone(),
             cancel_sender: self.cancel_sender.clone(),
             _phantom: PhantomData,
         })
@@ -165,16 +162,6 @@ where
             None
         };
 
-        // resolved address
-        let addr = {
-            let host = args.endpoint.host_str().unwrap_or("localhost");
-            let port = args
-                .endpoint
-                .port()
-                .unwrap_or_else(|| if args.endpoint.scheme() == "https" { 443 } else { 80 });
-            format!("{host}:{port}")
-        };
-
         // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
         info!(target_id = %target_id.id, "Webhook target created");
@@ -184,7 +171,6 @@ where
             http_client,
             store: queue_store,
             initialized: AtomicBool::new(false),
-            addr,
             cancel_sender,
             _phantom: PhantomData,
         })
@@ -230,25 +216,43 @@ where
             .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
     }
 
-    async fn init(&self) -> Result<(), TargetError> {
-        // Use CAS operations to ensure thread-safe initialization
-        if !self.initialized.load(Ordering::SeqCst) {
-            // Check the connection
-            match self.is_active().await {
-                Ok(true) => {
-                    info!("Webhook target {} is active", self.id);
-                }
-                Ok(false) => {
-                    return Err(TargetError::NotConnected);
-                }
-                Err(e) => {
-                    error!("Failed to check if Webhook target {} is active: {}", self.id, e);
-                    return Err(e);
+    async fn init_inner(&self) -> Result<(), TargetError> {
+        if self.initialized.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // HTTP HEAD probe: verifies the full request path (proxy, TLS, firewall)
+        // unlike TCP connect which can't detect proxy issues.
+        let probe_timeout = Duration::from_secs(5);
+        match tokio::time::timeout(probe_timeout, self.http_client.head(self.args.endpoint.as_str()).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() || status == StatusCode::NOT_FOUND {
+                    // NOT_FOUND is acceptable for HEAD probes — the endpoint may not
+                    // exist as a HEAD route, but the server is reachable.
+                    debug!("Webhook target {} HEAD probe returned {}", self.id, status);
+                } else if status == StatusCode::METHOD_NOT_ALLOWED {
+                    // Server is reachable but doesn't support HEAD — still valid.
+                    debug!("Webhook target {} HEAD probe: METHOD_NOT_ALLOWED (reachable)", self.id);
+                } else {
+                    warn!("Webhook target {} HEAD probe returned {}", self.id, status);
                 }
             }
-            self.initialized.store(true, Ordering::SeqCst);
-            info!("Webhook target {} initialized", self.id);
+            Ok(Err(e)) => {
+                // Connection-level error (DNS, TLS, refused, timeout)
+                return Err(if e.is_timeout() || e.is_connect() {
+                    TargetError::NotConnected
+                } else {
+                    TargetError::Network(format!("Webhook HEAD probe failed: {e}"))
+                });
+            }
+            Err(_) => {
+                return Err(TargetError::Timeout("Webhook HEAD probe timed out".to_string()));
+            }
         }
+
+        self.initialized.store(true, Ordering::SeqCst);
+        info!("Webhook target {} initialized", self.id);
         Ok(())
     }
 
@@ -342,26 +346,26 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        let socket_addr = lookup_host(&self.addr)
-            .await
-            .map_err(|e| TargetError::Network(format!("Failed to resolve host: {e}")))?
-            .next()
-            .ok_or_else(|| TargetError::Network("No address found".to_string()))?;
-        debug!("is_active socket addr: {},target id:{}", socket_addr, self.id.id);
-        match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(socket_addr)).await {
-            Ok(Ok(_)) => {
-                debug!("Connection to {} is active", self.addr);
-                Ok(true)
-            }
-            Ok(Err(e)) => {
-                debug!("Connection to {} failed: {}", self.addr, e);
-                if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                    Err(TargetError::NotConnected)
+        match tokio::time::timeout(Duration::from_secs(5), self.http_client.head(self.args.endpoint.as_str()).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_server_error() {
+                    debug!("Webhook {} server error: {}", self.id, status);
+                    Ok(false)
                 } else {
-                    Err(TargetError::Network(format!("Connection failed: {e}")))
+                    debug!("Webhook {} is reachable (status: {})", self.id, status);
+                    Ok(true)
                 }
             }
-            Err(_) => Err(TargetError::Timeout("Connection timed out".to_string())),
+            Ok(Err(e)) => {
+                debug!("Webhook {} request failed: {}", self.id, e);
+                if e.is_timeout() || e.is_connect() {
+                    Err(TargetError::NotConnected)
+                } else {
+                    Err(TargetError::Network(format!("Webhook health check failed: {e}")))
+                }
+            }
+            Err(_) => Err(TargetError::Timeout("Webhook health check timed out".to_string())),
         }
     }
 
@@ -430,14 +434,11 @@ where
     }
 
     async fn init(&self) -> Result<(), TargetError> {
-        // If the target is disabled, return to success directly
         if !self.is_enabled() {
             debug!("Webhook target {} is disabled, skipping initialization", self.id);
             return Ok(());
         }
-
-        // Use existing initialization logic
-        WebhookTarget::<E>::init(self).await
+        self.init_inner().await
     }
 
     fn is_enabled(&self) -> bool {
