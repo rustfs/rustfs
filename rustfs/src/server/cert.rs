@@ -97,7 +97,7 @@ async fn read_file(path: &PathBuf, desc: &str) -> Result<Vec<u8>, RustFSError> {
 /// - RUSTFS_TLS_PATH
 /// - RUSTFS_MTLS_CLIENT_CERT
 /// - RUSTFS_MTLS_CLIENT_KEY
-pub(crate) async fn init_cert(tls_path: &str) -> Result<(), RustFSError> {
+pub async fn init_cert(tls_path: &str) -> Result<(), RustFSError> {
     if tls_path.is_empty() {
         info!("No TLS path configured; skipping certificate initialization");
         return Ok(());
