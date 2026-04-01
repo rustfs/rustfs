@@ -255,8 +255,7 @@ impl NotificationSystem {
             guard.clone()
         };
 
-        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> =
-            self.registry.create_targets_from_config(&config).await?;
+        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
 

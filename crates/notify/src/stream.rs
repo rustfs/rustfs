@@ -284,27 +284,25 @@ async fn process_batch(
                     success = true;
                     metrics.increment_processed();
                 }
-                Err(e) => {
-                    match &e {
-                        TargetError::NotConnected => {
-                            warn!("Target {} not connected, retrying...", target.name());
-                            retry_count += 1;
-                            let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
-                            tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
-                        }
-                        TargetError::Timeout(_) => {
-                            warn!("Timeout for target {}, retrying...", target.name());
-                            retry_count += 1;
-                            let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
-                            tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
-                        }
-                        _ => {
-                            error!("Permanent error for target {}: {}", target.name(), e);
-                            metrics.increment_failed();
-                            break;
-                        }
+                Err(e) => match &e {
+                    TargetError::NotConnected => {
+                        warn!("Target {} not connected, retrying...", target.name());
+                        retry_count += 1;
+                        let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                        tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
                     }
-                }
+                    TargetError::Timeout(_) => {
+                        warn!("Timeout for target {}, retrying...", target.name());
+                        retry_count += 1;
+                        let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                        tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
+                    }
+                    _ => {
+                        error!("Permanent error for target {}: {}", target.name(), e);
+                        metrics.increment_failed();
+                        break;
+                    }
+                },
             }
         }
 
