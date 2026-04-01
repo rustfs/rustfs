@@ -431,7 +431,6 @@ fn build_list_objects_v2m_output(
     }
 }
 
-
 fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
     if is_owner {
         return Ok(S3Response::new(CreateBucketOutput::default()));

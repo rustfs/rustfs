@@ -5778,7 +5778,6 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
     }
 
-
     #[tokio::test]
     async fn execute_put_object_retention_returns_internal_error_when_store_uninitialized() {
         let input = PutObjectRetentionInput::builder()
