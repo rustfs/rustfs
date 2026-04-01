@@ -65,6 +65,42 @@ pub struct PutObjectChecksums {
     pub crc64nvme: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PutObjectTransformStage {
+    compression_applied: bool,
+    encryption_applied: bool,
+}
+
+impl PutObjectTransformStage {
+    pub fn mark_compression(&mut self) {
+        self.compression_applied = true;
+    }
+
+    pub fn mark_encryption(&mut self) {
+        self.encryption_applied = true;
+    }
+
+    #[must_use]
+    pub const fn compression_applied(self) -> bool {
+        self.compression_applied
+    }
+
+    #[must_use]
+    pub const fn encryption_applied(self) -> bool {
+        self.encryption_applied
+    }
+
+    #[must_use]
+    pub fn effective_copy_mode(self) -> rustfs_io_metrics::CopyMode {
+        resolve_put_effective_copy_mode(self.compression_applied, self.encryption_applied)
+    }
+
+    #[must_use]
+    pub fn metric_kind(self) -> Option<&'static str> {
+        resolve_put_transform_metric_kind(self.compression_applied, self.encryption_applied)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutObjectCompatIngressKind {
     BufferedStreamCompat,
@@ -1093,6 +1129,22 @@ mod tests {
         assert_eq!(resolve_put_effective_copy_mode(false, false), rustfs_io_metrics::CopyMode::SingleCopy);
         assert_eq!(resolve_put_effective_copy_mode(true, false), rustfs_io_metrics::CopyMode::Transformed);
         assert_eq!(resolve_put_effective_copy_mode(false, true), rustfs_io_metrics::CopyMode::Transformed);
+    }
+
+    #[test]
+    fn put_object_transform_stage_tracks_transform_shape() {
+        let mut stage = PutObjectTransformStage::default();
+        assert_eq!(stage.effective_copy_mode(), rustfs_io_metrics::CopyMode::SingleCopy);
+        assert_eq!(stage.metric_kind(), None);
+
+        stage.mark_compression();
+        assert!(stage.compression_applied());
+        assert_eq!(stage.effective_copy_mode(), rustfs_io_metrics::CopyMode::Transformed);
+        assert_eq!(stage.metric_kind(), Some("compression"));
+
+        stage.mark_encryption();
+        assert!(stage.encryption_applied());
+        assert_eq!(stage.metric_kind(), Some("compression_encryption"));
     }
 
     #[test]

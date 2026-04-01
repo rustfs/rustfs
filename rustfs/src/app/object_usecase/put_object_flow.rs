@@ -14,10 +14,9 @@
 
 use super::*;
 use rustfs_object_io::put::{
-    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, apply_trailing_checksums,
-    build_put_object_ingress_source, build_put_object_legacy_hash_stage, build_put_object_plain_hash_stage,
-    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode, resolve_put_transform_metric_kind,
-    resolve_put_transformed_fallback_reason,
+    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
+    apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
+    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
 
 impl DefaultObjectUsecase {
@@ -70,8 +69,7 @@ impl DefaultObjectUsecase {
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let mut size = resolved_size;
-        let mut applied_compression = false;
-        let mut applied_encryption = false;
+        let mut transform_stage = PutObjectTransformStage::default();
         let mut plain_reduced_copy_stage = false;
 
         let store = get_validated_store_adapter(&bucket).await?;
@@ -204,7 +202,7 @@ impl DefaultObjectUsecase {
         };
 
         let stage = if body_plan.should_compress() {
-            applied_compression = true;
+            transform_stage.mark_compression();
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
@@ -291,7 +289,7 @@ impl DefaultObjectUsecase {
         };
 
         if let Some(material) = sse_encryption(encryption_request).await? {
-            applied_encryption = true;
+            transform_stage.mark_encryption();
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
@@ -395,9 +393,9 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::IoPath::Legacy
             };
             rustfs_io_metrics::record_io_path_selected("put", io_path);
-            let effective_copy_mode = resolve_put_effective_copy_mode(applied_compression, applied_encryption);
+            let effective_copy_mode = transform_stage.effective_copy_mode();
             rustfs_io_metrics::record_io_copy_mode("put", effective_copy_mode, actual_size.max(0) as usize);
-            if let Some(transform_kind) = resolve_put_transform_metric_kind(applied_compression, applied_encryption) {
+            if let Some(transform_kind) = transform_stage.metric_kind() {
                 rustfs_io_metrics::record_put_transform_selected(transform_kind, io_path, actual_size.max(0) as usize);
             }
         }

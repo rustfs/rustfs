@@ -43,12 +43,16 @@ struct ChunkSpan {
     copied: bool,
 }
 
-struct BitrotChunkStreamState {
+struct BitrotChunkSource {
     source_stream: BoxChunkStream,
     source_chunks: VecDeque<IoChunk>,
     source_chunk_offset: usize,
     source_buffered_bytes: usize,
     source_done: bool,
+}
+
+struct BitrotChunkStreamState {
+    source: BitrotChunkSource,
     decoded_remaining: usize,
     trim_prefix: usize,
     output_remaining: usize,
@@ -162,19 +166,8 @@ impl<'a> ChunkCursor<'a> {
     }
 }
 
-impl BitrotChunkStreamState {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        source_stream: BoxChunkStream,
-        source_chunks: VecDeque<IoChunk>,
-        source_done: bool,
-        decoded_remaining: usize,
-        trim_prefix: usize,
-        output_remaining: usize,
-        shard_size: usize,
-        checksum_algo: HashAlgorithm,
-        skip_verify: bool,
-    ) -> Self {
+impl BitrotChunkSource {
+    fn new(source_stream: BoxChunkStream, source_chunks: VecDeque<IoChunk>, source_done: bool) -> Self {
         let source_buffered_bytes = source_chunks.iter().map(IoChunk::len).sum();
         Self {
             source_stream,
@@ -182,17 +175,7 @@ impl BitrotChunkStreamState {
             source_chunk_offset: 0,
             source_buffered_bytes,
             source_done,
-            decoded_remaining,
-            trim_prefix,
-            output_remaining,
-            shard_size,
-            checksum_algo,
-            skip_verify,
         }
-    }
-
-    fn hash_size(&self) -> usize {
-        self.checksum_algo.size()
     }
 
     fn skip_empty_chunks(&mut self) {
@@ -205,7 +188,7 @@ impl BitrotChunkStreamState {
         }
     }
 
-    async fn fill_source(&mut self, min_bytes: usize) -> std::io::Result<()> {
+    async fn fill(&mut self, min_bytes: usize) -> std::io::Result<()> {
         while self.source_buffered_bytes < min_bytes && !self.source_done {
             match self.source_stream.next().await {
                 Some(Ok(chunk)) => {
@@ -224,13 +207,13 @@ impl BitrotChunkStreamState {
         Ok(())
     }
 
-    fn advance_source(&mut self, len: usize) {
+    fn advance(&mut self, len: usize) {
         self.source_buffered_bytes = self.source_buffered_bytes.saturating_sub(len);
         self.source_chunk_offset += len;
         self.skip_empty_chunks();
     }
 
-    fn take_source_span(&mut self, len: usize) -> std::io::Result<ChunkSpan> {
+    fn take_span(&mut self, len: usize) -> std::io::Result<ChunkSpan> {
         self.skip_empty_chunks();
         if self.source_buffered_bytes < len {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated bitrot chunk source"));
@@ -270,7 +253,7 @@ impl BitrotChunkStreamState {
                     }
                 }
             };
-            self.advance_source(len);
+            self.advance(len);
             return Ok(span);
         }
 
@@ -284,7 +267,7 @@ impl BitrotChunkStreamState {
             let available = chunk.len().saturating_sub(self.source_chunk_offset);
             let take = available.min(remaining);
             aggregate.extend_from_slice(&chunk.as_bytes()[self.source_chunk_offset..self.source_chunk_offset + take]);
-            self.advance_source(take);
+            self.advance(take);
             remaining -= take;
         }
 
@@ -295,6 +278,35 @@ impl BitrotChunkStreamState {
             copied: true,
         })
     }
+}
+
+impl BitrotChunkStreamState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source_stream: BoxChunkStream,
+        source_chunks: VecDeque<IoChunk>,
+        source_done: bool,
+        decoded_remaining: usize,
+        trim_prefix: usize,
+        output_remaining: usize,
+        shard_size: usize,
+        checksum_algo: HashAlgorithm,
+        skip_verify: bool,
+    ) -> Self {
+        Self {
+            source: BitrotChunkSource::new(source_stream, source_chunks, source_done),
+            decoded_remaining,
+            trim_prefix,
+            output_remaining,
+            shard_size,
+            checksum_algo,
+            skip_verify,
+        }
+    }
+
+    fn hash_size(&self) -> usize {
+        self.checksum_algo.size()
+    }
 
     async fn next_verified_chunk(&mut self) -> std::io::Result<Option<IoChunk>> {
         let hash_size = self.hash_size();
@@ -303,14 +315,14 @@ impl BitrotChunkStreamState {
             let data_len = self.shard_size.min(self.decoded_remaining);
 
             let expected_hash = if hash_size > 0 {
-                self.fill_source(hash_size).await?;
-                Some(self.take_source_span(hash_size)?)
+                self.source.fill(hash_size).await?;
+                Some(self.source.take_span(hash_size)?)
             } else {
                 None
             };
 
-            self.fill_source(data_len).await?;
-            let data_span = self.take_source_span(data_len)?;
+            self.source.fill(data_len).await?;
+            let data_span = self.source.take_span(data_len)?;
 
             if let Some(expected_hash) = expected_hash
                 && !self.skip_verify
@@ -930,6 +942,22 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
         assert_eq!(decoded[1].as_bytes(), Bytes::from_static(b"efgh"));
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_chunk_source_marks_cross_chunk_take_as_copied() {
+        let source_stream: BoxChunkStream = Box::pin(stream::iter(vec![
+            Ok(IoChunk::Shared(Bytes::from_static(b"ab"))),
+            Ok(IoChunk::Shared(Bytes::from_static(b"cd"))),
+        ]));
+        let mut source = BitrotChunkSource::new(source_stream, VecDeque::new(), false);
+
+        source.fill(4).await.expect("source fill should succeed");
+        let span = source.take_span(4).expect("cross-chunk take should succeed");
+
+        assert!(span.copied, "cross-chunk take should be classified as copied");
+        assert_eq!(span.bytes, Bytes::from_static(b"abcd"));
+        assert_eq!(span.chunk.as_bytes(), Bytes::from_static(b"abcd"));
     }
 
     #[tokio::test]
