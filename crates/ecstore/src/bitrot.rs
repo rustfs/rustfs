@@ -43,6 +43,37 @@ struct ChunkSpan {
     copied: bool,
 }
 
+fn take_contiguous_chunk_span(chunk: &IoChunk, offset: usize, len: usize) -> std::io::Result<ChunkSpan> {
+    match chunk {
+        IoChunk::Shared(bytes) => {
+            let bytes = bytes.slice(offset..offset + len);
+            Ok(ChunkSpan {
+                bytes: bytes.clone(),
+                chunk: IoChunk::Shared(bytes),
+                copied: false,
+            })
+        }
+        IoChunk::Mapped(mapped) => {
+            let chunk = IoChunk::Mapped(mapped.slice(offset, len)?);
+            let bytes = chunk.as_bytes();
+            Ok(ChunkSpan {
+                bytes,
+                chunk,
+                copied: false,
+            })
+        }
+        IoChunk::Pooled(pooled) => {
+            let chunk = IoChunk::Pooled(pooled.slice(offset, len)?);
+            let bytes = chunk.as_bytes();
+            Ok(ChunkSpan {
+                bytes,
+                chunk,
+                copied: false,
+            })
+        }
+    }
+}
+
 struct BitrotChunkSource {
     source_stream: BoxChunkStream,
     source_chunks: VecDeque<IoChunk>,
@@ -112,33 +143,7 @@ impl<'a> ChunkCursor<'a> {
         let available = chunk.len().saturating_sub(self.chunk_offset);
 
         if len <= available {
-            let span = match chunk {
-                IoChunk::Shared(bytes) => {
-                    let bytes = bytes.slice(self.chunk_offset..self.chunk_offset + len);
-                    ChunkSpan {
-                        bytes: bytes.clone(),
-                        chunk: IoChunk::Shared(bytes),
-                        copied: false,
-                    }
-                }
-                IoChunk::Mapped(mapped) => {
-                    let chunk = IoChunk::Mapped(mapped.slice(self.chunk_offset, len)?);
-                    let bytes = chunk.as_bytes();
-                    ChunkSpan {
-                        bytes,
-                        chunk,
-                        copied: false,
-                    }
-                }
-                IoChunk::Pooled(pooled) => {
-                    let bytes = pooled.as_bytes().slice(self.chunk_offset..self.chunk_offset + len);
-                    ChunkSpan {
-                        bytes: bytes.clone(),
-                        chunk: IoChunk::Shared(bytes),
-                        copied: true,
-                    }
-                }
-            };
+            let span = take_contiguous_chunk_span(chunk, self.chunk_offset, len)?;
             self.advance(len);
             return Ok(span);
         }
@@ -225,34 +230,7 @@ impl BitrotChunkSource {
         let available = chunk.len().saturating_sub(self.source_chunk_offset);
 
         if len <= available {
-            let span = match chunk {
-                IoChunk::Shared(bytes) => {
-                    let bytes = bytes.slice(self.source_chunk_offset..self.source_chunk_offset + len);
-                    ChunkSpan {
-                        bytes: bytes.clone(),
-                        chunk: IoChunk::Shared(bytes),
-                        copied: false,
-                    }
-                }
-                IoChunk::Mapped(mapped) => {
-                    let chunk = IoChunk::Mapped(mapped.slice(self.source_chunk_offset, len)?);
-                    let bytes = chunk.as_bytes();
-                    ChunkSpan {
-                        bytes,
-                        chunk,
-                        copied: false,
-                    }
-                }
-                IoChunk::Pooled(pooled) => {
-                    let chunk = IoChunk::Pooled(pooled.slice(self.source_chunk_offset, len)?);
-                    let bytes = chunk.as_bytes();
-                    ChunkSpan {
-                        bytes,
-                        chunk,
-                        copied: false,
-                    }
-                }
-            };
+            let span = take_contiguous_chunk_span(chunk, self.source_chunk_offset, len)?;
             self.advance(len);
             return Ok(span);
         }
@@ -942,6 +920,25 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
         assert_eq!(decoded[1].as_bytes(), Bytes::from_static(b"efgh"));
+    }
+
+    #[test]
+    fn test_decode_bitrot_chunk_source_preserves_pooled_single_chunk_slice() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::Md5;
+        let shard = b"abcd";
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(checksum_algo.hash_encode(shard).as_ref());
+        encoded.extend_from_slice(shard);
+
+        let source_chunks = vec![IoChunk::Pooled(rustfs_io_core::PooledChunk::from_vec(encoded))];
+        let (decoded, copied) = decode_bitrot_chunk_source(&source_chunks, shard_size, checksum_algo, false).unwrap();
+
+        assert!(!copied, "single pooled chunk slice should preserve provenance without copy");
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(&decoded[0], IoChunk::Pooled(_)));
+        assert_eq!(decoded[0].as_bytes(), Bytes::from_static(b"abcd"));
     }
 
     #[tokio::test]

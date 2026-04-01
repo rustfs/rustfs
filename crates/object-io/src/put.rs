@@ -136,40 +136,46 @@ where
     Box::pin(body)
 }
 
-pub struct PutObjectReducedCopyIngress<S> {
-    body: S,
+pub struct PutObjectReducedCopyIngress<B, E> {
+    body: BoxIngressStream<B, E>,
     compat: PutObjectCompatIngressPlan,
 }
 
-impl<S> PutObjectReducedCopyIngress<S> {
-    pub const fn new(body: S, compat: PutObjectCompatIngressPlan) -> Self {
+impl<B, E> PutObjectReducedCopyIngress<B, E> {
+    pub const fn new(body: BoxIngressStream<B, E>, compat: PutObjectCompatIngressPlan) -> Self {
         Self { body, compat }
+    }
+
+    pub fn from_stream<S>(body: S, compat: PutObjectCompatIngressPlan) -> Self
+    where
+        S: Stream<Item = Result<B, E>> + Send + Sync + 'static,
+    {
+        Self::new(box_put_object_ingress_stream(body), compat)
     }
 
     pub const fn compat_plan(&self) -> PutObjectCompatIngressPlan {
         self.compat
     }
 
-    pub fn into_body(self) -> S {
+    pub fn into_body(self) -> BoxIngressStream<B, E> {
         self.body
     }
 }
 
-impl<S, B, E> PutObjectReducedCopyIngress<S>
+impl<B, E> PutObjectReducedCopyIngress<B, E>
 where
-    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
-    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+    PutObjectCompatIngress<BoxIngressStream<B, E>, B, E>: Send + Sync + Unpin + 'static,
 {
     pub fn into_compat_reader(self) -> Box<dyn Reader> {
         build_put_object_compat_reader(self.body, self.compat)
     }
 }
 
-pub enum PutObjectIngressSource<S> {
+pub enum PutObjectIngressSource<B, E> {
     LegacyCompat(Box<dyn Reader>),
-    ReducedCopyCandidate(PutObjectReducedCopyIngress<S>),
+    ReducedCopyCandidate(PutObjectReducedCopyIngress<B, E>),
 }
 
 struct PutObjectReducedCopyReader<S, B> {
@@ -374,21 +380,19 @@ where
 {
 }
 
-fn build_put_object_reduced_copy_reader<S, B, E>(candidate: PutObjectReducedCopyIngress<S>) -> Box<dyn Reader>
+fn build_put_object_reduced_copy_reader<B, E>(candidate: PutObjectReducedCopyIngress<B, E>) -> Box<dyn Reader>
 where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
     B: Buf + Send + Sync + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
     Box::new(PutObjectReducedCopyReader::new(candidate.into_body()))
 }
 
-impl<S, B, E> PutObjectIngressSource<S>
+impl<B, E> PutObjectIngressSource<B, E>
 where
-    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
-    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+    PutObjectCompatIngress<BoxIngressStream<B, E>, B, E>: Send + Sync + Unpin + 'static,
 {
     pub fn into_compat_reader(self) -> Box<dyn Reader> {
         match self {
@@ -399,7 +403,6 @@ where
 
     pub fn into_reader(self) -> Box<dyn Reader>
     where
-        S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
         B: Buf + Send + Sync + Unpin + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
@@ -640,26 +643,25 @@ where
     Box::new(WarpReader::new(build_put_object_compat_ingress(body, plan)))
 }
 
-pub fn build_put_object_ingress_source<S, B, E>(
-    body: S,
-    plan: PutObjectBodyPlan,
-) -> PutObjectIngressSource<BoxIngressStream<B, E>>
+pub fn build_put_object_ingress_source<S, B, E>(body: S, plan: PutObjectBodyPlan) -> PutObjectIngressSource<B, E>
 where
     S: Stream<Item = Result<B, E>> + Send + Sync + 'static,
     B: Buf + 'static,
     E: std::fmt::Display + 'static,
     PutObjectCompatIngress<BoxIngressStream<B, E>, B, E>: Send + Sync + Unpin + 'static,
 {
-    let body = box_put_object_ingress_stream(body);
     match (plan.kind, plan.ingress.kind) {
         (PutObjectBodyKind::Compressed, PutObjectIngressKind::ReducedCopyCandidate)
         | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate), PutObjectIngressKind::ReducedCopyCandidate) => {
-            PutObjectIngressSource::ReducedCopyCandidate(PutObjectReducedCopyIngress::new(body, plan.ingress.compat))
+            PutObjectIngressSource::ReducedCopyCandidate(PutObjectReducedCopyIngress::from_stream(body, plan.ingress.compat))
         }
         (PutObjectBodyKind::Compressed, _)
         | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::LegacyCompat), _)
         | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate), PutObjectIngressKind::LegacyCompat) => {
-            PutObjectIngressSource::LegacyCompat(build_put_object_compat_reader(body, plan.ingress.compat))
+            PutObjectIngressSource::LegacyCompat(build_put_object_compat_reader(
+                box_put_object_ingress_stream(body),
+                plan.ingress.compat,
+            ))
         }
     }
 }
@@ -674,15 +676,14 @@ pub fn build_put_object_legacy_hash_stage(
     build_put_object_hash_stage(reader, PutObjectIngressKind::LegacyCompat, hash_values, plan, headers, trailing_headers)
 }
 
-pub fn build_put_object_plain_hash_stage<S, B, E>(
-    ingress: PutObjectIngressSource<S>,
+pub fn build_put_object_plain_hash_stage<B, E>(
+    ingress: PutObjectIngressSource<B, E>,
     hash_values: PutObjectLegacyHashValues,
     plan: PutObjectLegacyHashStagePlan,
     headers: &HeaderMap,
     trailing_headers: Option<s3s::TrailingHeaders>,
 ) -> std::io::Result<PutObjectHashStage>
 where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
     B: Buf + Send + Sync + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
@@ -1398,7 +1399,7 @@ mod tests {
             Ok::<Bytes, &'static str>(Bytes::from_static(b"ef")),
         ]);
 
-        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::from_stream(
             stream,
             PutObjectCompatIngressPlan {
                 kind: PutObjectCompatIngressKind::BufferedStreamCompat,
@@ -1415,7 +1416,7 @@ mod tests {
     async fn build_put_object_reduced_copy_reader_defers_stream_error_until_next_read() {
         let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"ab")), Err::<Bytes, _>("boom")]);
 
-        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::from_stream(
             stream,
             PutObjectCompatIngressPlan {
                 kind: PutObjectCompatIngressKind::BufferedStreamCompat,
@@ -1441,7 +1442,7 @@ mod tests {
             Ok::<Bytes, &'static str>(Bytes::from_static(b"ef")),
         ]);
 
-        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::from_stream(
             stream,
             PutObjectCompatIngressPlan {
                 kind: PutObjectCompatIngressKind::BufferedStreamCompat,
