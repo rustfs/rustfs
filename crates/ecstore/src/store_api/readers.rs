@@ -16,6 +16,28 @@ impl ChunkNativePutData {
         Self { stream: Some(stream) }
     }
 
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+        Self::new(
+            HashReader::new(
+                Box::new(WarpReader::new(Cursor::new(data))),
+                content_length,
+                content_length,
+                None,
+                sha256hex,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
     pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
         self.stream
             .take()
@@ -128,24 +150,9 @@ impl PutObjReader {
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
-        use sha2::{Digest, Sha256};
-        let content_length = data.len() as i64;
-        let sha256hex = if content_length > 0 {
-            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
-        } else {
-            None
-        };
-        Self::new(
-            HashReader::new(
-                Box::new(WarpReader::new(Cursor::new(data))),
-                content_length,
-                content_length,
-                None,
-                sha256hex,
-                false,
-            )
-            .unwrap(),
-        )
+        Self {
+            data: ChunkNativePutData::from_vec(data),
+        }
     }
 
     pub fn size(&self) -> i64 {

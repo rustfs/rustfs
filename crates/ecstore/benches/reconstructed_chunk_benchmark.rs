@@ -21,8 +21,8 @@ use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_ecstore::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
 use rustfs_ecstore::store::{ECStore, init_local_disks};
 use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, CompletePart, GetObjectChunkCopyMode, HTTPRangeSpec, MakeBucketOptions, MultipartOperations,
-    ObjectOperations, ObjectOptions, PutObjReader,
+    BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, GetObjectChunkCopyMode, HTTPRangeSpec, MakeBucketOptions,
+    MultipartOperations, ObjectOperations, ObjectOptions,
 };
 use std::hint::black_box;
 use std::net::SocketAddr;
@@ -219,7 +219,7 @@ async fn create_multipart_object(store: &Arc<ECStore>, bucket: &str, key: &str, 
 
     let mut completed_parts = Vec::with_capacity(parts.len());
     for (idx, part) in parts.iter().enumerate() {
-        let mut reader = PutObjReader::from_vec(part.clone());
+        let mut reader = ChunkNativePutData::from_vec(part.clone());
         let part_info = store
             .put_object_part(bucket, key, &upload.upload_id, idx + 1, &mut reader, &ObjectOptions::default())
             .await

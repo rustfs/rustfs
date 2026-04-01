@@ -25,7 +25,6 @@ use rustfs_ecstore::{
     store::ECStore,
     store_api::{
         BucketOperations, ChunkNativePutData, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
-        PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierMinIO, TierType},
@@ -236,7 +235,7 @@ async fn create_test_lock_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 
 /// Test helper: Upload test object
 async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
-    let mut reader = PutObjReader::from_vec(data.to_vec());
+    let mut reader = ChunkNativePutData::from_vec(data.to_vec());
     let object_info = (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
@@ -782,7 +781,7 @@ mod serial_tests {
             .await
             .expect("Failed to set lifecycle configuration");
 
-        let mut reader = PutObjReader::from_vec(put_payload.to_vec());
+        let mut reader = ChunkNativePutData::from_vec(put_payload.to_vec());
         let mut metadata = HashMap::new();
         metadata.insert("content-type".to_string(), "text/plain".to_string());
         ecstore
@@ -839,7 +838,7 @@ mod serial_tests {
             .expect("Failed to create multipart upload");
 
         let part_data = b"multipart immediate transition";
-        let mut reader = PutObjReader::from_vec(part_data.to_vec());
+        let mut reader = ChunkNativePutData::from_vec(part_data.to_vec());
         let part = ecstore
             .put_object_part(
                 multipart_bucket.as_str(),
@@ -904,9 +903,7 @@ mod serial_tests {
             .get_object_info(src_bucket.as_str(), src_object, &ObjectOptions::default())
             .await
             .expect("Failed to load source object info");
-        src_info.put_object_reader = Some(ChunkNativePutData::new(
-            PutObjReader::from_vec(payload.to_vec()).take_stream().expect("take stream"),
-        ));
+        src_info.put_object_reader = Some(ChunkNativePutData::from_vec(payload.to_vec()));
 
         ecstore
             .copy_object(
@@ -972,7 +969,7 @@ mod serial_tests {
             .await
             .expect("Failed to create multipart upload");
 
-        let mut part1_reader = PutObjReader::from_vec(part1);
+        let mut part1_reader = ChunkNativePutData::from_vec(part1);
         let uploaded_part1 = ecstore
             .put_object_part(
                 bucket_name.as_str(),
@@ -985,7 +982,7 @@ mod serial_tests {
             .await
             .expect("Failed to upload first multipart part");
 
-        let mut part2_reader = PutObjReader::from_vec(part2);
+        let mut part2_reader = ChunkNativePutData::from_vec(part2);
         let uploaded_part2 = ecstore
             .put_object_part(
                 bucket_name.as_str(),

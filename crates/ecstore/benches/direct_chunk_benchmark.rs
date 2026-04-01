@@ -24,8 +24,8 @@ use rustfs_ecstore::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GL
 use rustfs_ecstore::set_disk::collect_direct_data_shard_chunks_for_benchmark;
 use rustfs_ecstore::store::{ECStore, init_local_disks};
 use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, GetObjectChunkCopyMode, HTTPRangeSpec, MakeBucketOptions, ObjectIO, ObjectOptions,
-    PutObjReader,
+    BucketOperations, BucketOptions, ChunkNativePutData, GetObjectChunkCopyMode, HTTPRangeSpec, MakeBucketOptions, ObjectIO,
+    ObjectOptions,
 };
 use rustfs_io_core::{BoxChunkStream, IoChunk, MappedChunk};
 use std::hint::black_box;
@@ -191,7 +191,7 @@ async fn build_ecstore_bench_env(case: &EcstoreBenchCase) -> EcstoreBenchEnv {
         .expect("make bucket");
 
     let payload: Vec<u8> = (0..case.payload_len).map(|idx| (idx % 251) as u8).collect();
-    let mut reader = PutObjReader::from_vec(payload);
+    let mut reader = ChunkNativePutData::from_vec(payload);
     let put_info = store
         .put_object(&bucket, &key, &mut reader, &ObjectOptions::default())
         .await

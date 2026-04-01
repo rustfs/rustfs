@@ -647,13 +647,13 @@ impl SetDisks {
 mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
-    use crate::store_api::PutObjReader;
+    use crate::store_api::ChunkNativePutData;
 
     #[tokio::test]
     async fn write_chunk_native_put_data_restores_reader_state_after_encoding() {
         let payload = b"chunk-native-put-payload".repeat(8);
         let erasure = Arc::new(erasure_coding::Erasure::new(2, 1, 8));
-        let mut reader = PutObjReader::from_vec(payload.clone());
+        let mut reader = ChunkNativePutData::from_vec(payload.clone());
         let mut writers: Vec<Option<BitrotWriterWrapper>> = (0..erasure.total_shard_count())
             .map(|_| {
                 Some(BitrotWriterWrapper::new(
@@ -664,7 +664,7 @@ mod tests {
             })
             .collect();
 
-        let written = SetDisks::write_chunk_native_put_data(reader.chunk_native_data_mut(), erasure.clone(), &mut writers, 2)
+        let written = SetDisks::write_chunk_native_put_data(&mut reader, erasure.clone(), &mut writers, 2)
             .await
             .unwrap();
 

@@ -21,7 +21,9 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{BucketOperations, CompletePart, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOptions, PutObjReader},
+    store_api::{
+        BucketOperations, ChunkNativePutData, CompletePart, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOptions,
+    },
 };
 use rustfs_object_io::get::{GetObjectBodySource, GetObjectReadSetup};
 use serial_test::serial;
@@ -188,7 +190,7 @@ async fn create_direct_chunk_test_multipart_object(
 
     let mut completed_parts = Vec::new();
     for (idx, part) in parts.iter().enumerate() {
-        let mut reader = PutObjReader::from_vec(part.clone());
+        let mut reader = ChunkNativePutData::from_vec(part.clone());
         let part_info = ecstore
             .put_object_part(bucket, key, &upload.upload_id, idx + 1, &mut reader, &ObjectOptions::default())
             .await
@@ -358,7 +360,7 @@ async fn prepare_get_object_chunk_read_marks_direct_path_for_single_disk_store()
 
     create_direct_chunk_test_bucket(&ecstore, &bucket).await;
 
-    let mut reader = PutObjReader::from_vec(payload.clone());
+    let mut reader = ChunkNativePutData::from_vec(payload.clone());
     ecstore
         .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
         .await
@@ -419,7 +421,7 @@ async fn execute_get_object_range_marks_direct_path_for_single_disk_store() {
 
     create_direct_chunk_test_bucket(&ecstore, &bucket).await;
 
-    let mut reader = PutObjReader::from_vec(payload.clone());
+    let mut reader = ChunkNativePutData::from_vec(payload.clone());
     ecstore
         .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
         .await
@@ -484,7 +486,7 @@ async fn execute_get_object_range_marks_direct_path_for_multi_disk_store_without
 
     create_direct_chunk_test_bucket(&ecstore, &bucket).await;
 
-    let mut reader = PutObjReader::from_vec(payload.clone());
+    let mut reader = ChunkNativePutData::from_vec(payload.clone());
     let put_info = ecstore
         .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
         .await
@@ -569,7 +571,7 @@ async fn execute_get_object_range_marks_reconstructed_path_for_multi_disk_store_
 
     create_direct_chunk_test_bucket(&ecstore, &bucket).await;
 
-    let mut reader = PutObjReader::from_vec(payload.clone());
+    let mut reader = ChunkNativePutData::from_vec(payload.clone());
     let put_info = ecstore
         .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
         .await

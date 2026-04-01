@@ -16,7 +16,7 @@ use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{ChunkNativePutData, ObjectInfo, ObjectOptions, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -126,10 +126,8 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    if let Err(err) = api
-        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
-        .await
-    {
+    let mut put_data = ChunkNativePutData::from_vec(data);
+    if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
         return Err(err);
     }
