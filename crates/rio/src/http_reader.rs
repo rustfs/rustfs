@@ -23,7 +23,6 @@ use rustfs_utils::get_env_opt_str;
 use std::io::IoSlice;
 use std::io::{self, Error};
 use std::net::IpAddr;
-use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
@@ -137,6 +136,70 @@ fn get_http_client(url: &str) -> Client {
     CLIENT.clone()
 }
 
+type HttpByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
+
+async fn request_http_byte_stream(
+    url: String,
+    method: Method,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+) -> io::Result<(bool, HttpByteStream)> {
+    let track_internode_metrics = is_internode_rpc_url(&url);
+    let client = get_http_client(&url);
+    let mut request: RequestBuilder = client.request(method, url.clone()).headers(headers);
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let resp = request.send().await.map_err(|e| {
+        if track_internode_metrics {
+            global_internode_metrics().record_error();
+        }
+        Error::other(format!("HttpReader HTTP request error: {e}"))
+    })?;
+
+    if !resp.status().is_success() {
+        if track_internode_metrics {
+            global_internode_metrics().record_error();
+        }
+        return Err(Error::other(format!(
+            "HttpReader HTTP request failed with non-200 status {}",
+            resp.status()
+        )));
+    }
+
+    if track_internode_metrics {
+        global_internode_metrics().record_outgoing_request();
+    }
+
+    let stream = resp
+        .bytes_stream()
+        .map_ok(move |bytes| {
+            if track_internode_metrics {
+                global_internode_metrics().record_recv_bytes(bytes.len());
+            }
+            bytes
+        })
+        .map_err(move |e| {
+            if track_internode_metrics {
+                global_internode_metrics().record_error();
+            }
+            Error::other(format!("HttpReader stream error: {e}"))
+        });
+
+    Ok((track_internode_metrics, Box::pin(stream)))
+}
+
+pub async fn open_http_byte_stream(
+    url: String,
+    method: Method,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+) -> io::Result<HttpByteStream> {
+    let (_track_internode_metrics, stream) = request_http_byte_stream(url, method, headers, body).await?;
+    Ok(stream)
+}
+
 pin_project! {
     pub struct HttpReader {
         url:String,
@@ -161,43 +224,11 @@ impl HttpReader {
         body: Option<Vec<u8>>,
         _read_buf_size: usize,
     ) -> io::Result<Self> {
-        let track_internode_metrics = is_internode_rpc_url(&url);
-        let client = get_http_client(&url);
-        let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
-        if let Some(body) = body {
-            request = request.body(body);
-        }
-
-        let resp = request.send().await.map_err(|e| {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
-            Error::other(format!("HttpReader HTTP request error: {e}"))
-        })?;
-
-        if resp.status().is_success().not() {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
-            return Err(Error::other(format!(
-                "HttpReader HTTP request failed with non-200 status {}",
-                resp.status()
-            )));
-        }
-
-        if track_internode_metrics {
-            global_internode_metrics().record_outgoing_request();
-        }
-
-        let stream = resp.bytes_stream().map_err(move |e| {
-            if track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
-            Error::other(format!("HttpReader stream error: {e}"))
-        });
+        let (track_internode_metrics, stream) =
+            request_http_byte_stream(url.clone(), method.clone(), headers.clone(), body).await?;
 
         Ok(Self {
-            inner: StreamReader::new(Box::pin(stream)),
+            inner: StreamReader::new(stream),
             url,
             method,
             headers,

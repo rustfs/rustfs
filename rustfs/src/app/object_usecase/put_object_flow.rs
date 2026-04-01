@@ -14,9 +14,9 @@
 
 use super::*;
 use rustfs_object_io::put::{
-    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectPlainBodyKind,
-    apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
-    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_effective_copy_mode,
+    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, apply_trailing_checksums,
+    build_put_object_ingress_source, build_put_object_legacy_hash_stage, build_put_object_plain_hash_stage,
+    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode,
 };
 
 impl DefaultObjectUsecase {
@@ -129,11 +129,15 @@ impl DefaultObjectUsecase {
             get_buffer_size_opt_in(size),
             encryption_enabled_for_put,
         );
-        if body_plan.plain_body_kind() == Some(PutObjectPlainBodyKind::ReducedCopyCandidate) {
+        if body_plan.ingress.kind == PutObjectIngressKind::ReducedCopyCandidate {
             rustfs_io_metrics::record_put_object_attempted_fast_path(size);
             debug!(
                 encryption_enabled = encryption_enabled_for_put,
-                "Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key
+                compressed = body_plan.should_compress(),
+                "Zero-copy write enabled for {} byte object (bucket={}, key={})",
+                size,
+                bucket,
+                key
             );
         }
 
@@ -199,7 +203,7 @@ impl DefaultObjectUsecase {
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let stage = build_put_object_legacy_hash_stage(
-                ingress_source.into_compat_reader(),
+                ingress_source.into_reader(),
                 std::mem::take(&mut hash_values),
                 PutObjectLegacyHashStagePlan {
                     size,
@@ -217,6 +221,7 @@ impl DefaultObjectUsecase {
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
+            plain_reduced_copy_stage = body_plan.ingress.kind == PutObjectIngressKind::ReducedCopyCandidate;
             size = HashReader::SIZE_PRESERVE_LAYER;
             hash_values.clear_for_transformed_body();
             build_put_object_legacy_hash_stage(
@@ -375,7 +380,7 @@ impl DefaultObjectUsecase {
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
             rustfs_io_metrics::record_put_object(duration_ms, size, body_plan.ingress.enable_zero_copy);
-            let io_path = if plain_reduced_copy_stage && !applied_compression {
+            let io_path = if plain_reduced_copy_stage {
                 rustfs_io_metrics::IoPath::Fast
             } else {
                 rustfs_io_metrics::IoPath::Legacy

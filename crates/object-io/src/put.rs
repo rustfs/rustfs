@@ -351,6 +351,18 @@ where
             Self::ReducedCopyCandidate(candidate) => candidate.into_compat_reader(),
         }
     }
+
+    pub fn into_reader(self) -> Box<dyn Reader>
+    where
+        S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
+        B: Buf + Send + Sync + Unpin + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self {
+            Self::LegacyCompat(reader) => reader,
+            Self::ReducedCopyCandidate(candidate) => build_put_object_reduced_copy_reader(candidate),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,7 +526,12 @@ fn put_request_is_compressible(headers: &HeaderMap) -> bool {
     false
 }
 
-fn should_use_put_reduced_copy_candidate(size: i64, headers: &HeaderMap, encryption_enabled: bool) -> bool {
+fn should_use_put_reduced_copy_candidate(
+    size: i64,
+    headers: &HeaderMap,
+    encryption_enabled: bool,
+    compression_enabled: bool,
+) -> bool {
     const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
 
     if size <= ZERO_COPY_MIN_SIZE {
@@ -525,7 +542,7 @@ fn should_use_put_reduced_copy_candidate(size: i64, headers: &HeaderMap, encrypt
         return false;
     }
 
-    !put_request_is_compressible(headers)
+    compression_enabled || !put_request_is_compressible(headers)
 }
 
 fn map_put_object_ingress_error<B, E>(result: Result<B, E>) -> std::io::Result<B>
@@ -566,12 +583,15 @@ where
     E: std::fmt::Display,
     PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
 {
-    match plan.kind {
-        PutObjectBodyKind::Compressed | PutObjectBodyKind::Plain(PutObjectPlainBodyKind::LegacyCompat) => {
-            PutObjectIngressSource::LegacyCompat(build_put_object_compat_reader(body, plan.ingress.compat))
-        }
-        PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate) => {
+    match (plan.kind, plan.ingress.kind) {
+        (PutObjectBodyKind::Compressed, PutObjectIngressKind::ReducedCopyCandidate)
+        | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate), PutObjectIngressKind::ReducedCopyCandidate) => {
             PutObjectIngressSource::ReducedCopyCandidate(PutObjectReducedCopyIngress::new(body, plan.ingress.compat))
+        }
+        (PutObjectBodyKind::Compressed, _)
+        | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::LegacyCompat), _)
+        | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate), PutObjectIngressKind::LegacyCompat) => {
+            PutObjectIngressSource::LegacyCompat(build_put_object_compat_reader(body, plan.ingress.compat))
         }
     }
 }
@@ -628,7 +648,7 @@ where
 }
 
 pub fn plan_put_object_ingress(size: i64, headers: &HeaderMap, buffer_size: usize) -> PutObjectIngressPlan {
-    plan_put_object_ingress_with_transforms(size, headers, buffer_size, false)
+    plan_put_object_ingress_with_transforms(size, headers, buffer_size, false, false)
 }
 
 pub fn plan_put_object_ingress_with_transforms(
@@ -636,8 +656,9 @@ pub fn plan_put_object_ingress_with_transforms(
     headers: &HeaderMap,
     buffer_size: usize,
     encryption_enabled: bool,
+    compression_enabled: bool,
 ) -> PutObjectIngressPlan {
-    let enable_zero_copy = should_use_put_reduced_copy_candidate(size, headers, encryption_enabled);
+    let enable_zero_copy = should_use_put_reduced_copy_candidate(size, headers, encryption_enabled, compression_enabled);
     PutObjectIngressPlan {
         kind: if enable_zero_copy {
             PutObjectIngressKind::ReducedCopyCandidate
@@ -663,8 +684,9 @@ pub fn plan_put_object_body_with_transforms(
     buffer_size: usize,
     encryption_enabled: bool,
 ) -> PutObjectBodyPlan {
-    let ingress = plan_put_object_ingress_with_transforms(size, headers, buffer_size, encryption_enabled);
-    let kind = if size > MIN_COMPRESSIBLE_SIZE as i64 && is_compressible(headers, key) {
+    let compression_enabled = size > MIN_COMPRESSIBLE_SIZE as i64 && is_compressible(headers, key);
+    let ingress = plan_put_object_ingress_with_transforms(size, headers, buffer_size, encryption_enabled, compression_enabled);
+    let kind = if compression_enabled {
         PutObjectBodyKind::Compressed
     } else {
         PutObjectBodyKind::Plain(match ingress.kind {
@@ -983,6 +1005,25 @@ mod tests {
         assert_eq!(plan.kind, PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate));
         assert_eq!(plan.plain_body_kind(), Some(PutObjectPlainBodyKind::ReducedCopyCandidate));
         assert!(plan.ingress.enable_zero_copy);
+    }
+
+    #[test]
+    fn build_put_object_ingress_source_preserves_reduced_copy_candidate_for_compressed_body() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"compressed"))]);
+        let plan = PutObjectBodyPlan {
+            ingress: PutObjectIngressPlan {
+                kind: PutObjectIngressKind::ReducedCopyCandidate,
+                compat: PutObjectCompatIngressPlan {
+                    kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+                    buffer_size: 256 * 1024,
+                },
+                enable_zero_copy: true,
+            },
+            kind: PutObjectBodyKind::Compressed,
+        };
+
+        let source = build_put_object_ingress_source(stream, plan);
+        assert!(matches!(source, PutObjectIngressSource::ReducedCopyCandidate(_)));
     }
 
     #[test]

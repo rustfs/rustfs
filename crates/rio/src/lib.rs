@@ -137,15 +137,6 @@ where
     }
 }
 
-impl<R> BlockReadable for crate::CompressReader<R>
-where
-    R: Reader,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        read_block_via_async_read(self, buf)
-    }
-}
-
 impl<R> BlockReadable for crate::DecryptReader<R>
 where
     R: Reader,
