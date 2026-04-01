@@ -1,25 +1,25 @@
 use super::*;
 use rustfs_rio::{EtagResolvable, HashReaderMut, TryGetIndex};
 
-pub struct PutObjReader {
+pub struct ChunkNativePutData {
     stream: Option<HashReader>,
 }
 
-impl Debug for PutObjReader {
+impl Debug for ChunkNativePutData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PutObjReader").finish()
+        f.debug_struct("ChunkNativePutData").finish()
     }
 }
 
-impl PutObjReader {
+impl ChunkNativePutData {
     pub fn new(stream: HashReader) -> Self {
-        PutObjReader { stream: Some(stream) }
+        Self { stream: Some(stream) }
     }
 
     pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
         self.stream
             .take()
-            .ok_or_else(|| std::io::Error::other("PutObjReader stream already taken"))
+            .ok_or_else(|| std::io::Error::other("ChunkNativePutData stream already taken"))
     }
 
     pub fn restore_stream(&mut self, stream: HashReader) {
@@ -27,11 +27,11 @@ impl PutObjReader {
     }
 
     pub fn as_hash_reader(&self) -> &HashReader {
-        self.stream.as_ref().expect("PutObjReader stream already taken")
+        self.stream.as_ref().expect("ChunkNativePutData stream already taken")
     }
 
     pub fn as_hash_reader_mut(&mut self) -> &mut HashReader {
-        self.stream.as_mut().expect("PutObjReader stream already taken")
+        self.stream.as_mut().expect("ChunkNativePutData stream already taken")
     }
 
     pub fn index_bytes(&self) -> Option<Bytes> {
@@ -57,6 +57,76 @@ impl PutObjReader {
         self.as_hash_reader().content_crc()
     }
 
+    pub fn size(&self) -> i64 {
+        self.as_hash_reader().size()
+    }
+
+    pub fn actual_size(&self) -> i64 {
+        self.as_hash_reader().actual_size()
+    }
+}
+
+pub struct PutObjReader {
+    data: ChunkNativePutData,
+}
+
+impl Debug for PutObjReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutObjReader").finish()
+    }
+}
+
+impl PutObjReader {
+    pub fn new(stream: HashReader) -> Self {
+        Self {
+            data: ChunkNativePutData::new(stream),
+        }
+    }
+
+    pub fn chunk_native_data(&self) -> &ChunkNativePutData {
+        &self.data
+    }
+
+    pub fn chunk_native_data_mut(&mut self) -> &mut ChunkNativePutData {
+        &mut self.data
+    }
+
+    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
+        self.data.take_stream()
+    }
+
+    pub fn restore_stream(&mut self, stream: HashReader) {
+        self.data.restore_stream(stream);
+    }
+
+    pub fn as_hash_reader(&self) -> &HashReader {
+        self.data.as_hash_reader()
+    }
+
+    pub fn as_hash_reader_mut(&mut self) -> &mut HashReader {
+        self.data.as_hash_reader_mut()
+    }
+
+    pub fn index_bytes(&self) -> Option<Bytes> {
+        self.data.index_bytes()
+    }
+
+    pub fn resolve_etag(&mut self) -> Option<String> {
+        self.data.resolve_etag()
+    }
+
+    pub fn content_hash_bytes(&self) -> Option<Bytes> {
+        self.data.content_hash_bytes()
+    }
+
+    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
+        self.data.content_crc_type()
+    }
+
+    pub fn content_crc(&self) -> HashMap<String, String> {
+        self.data.content_crc()
+    }
+
     pub fn from_vec(data: Vec<u8>) -> Self {
         use sha2::{Digest, Sha256};
         let content_length = data.len() as i64;
@@ -65,27 +135,25 @@ impl PutObjReader {
         } else {
             None
         };
-        PutObjReader {
-            stream: Some(
-                HashReader::new(
-                    Box::new(WarpReader::new(Cursor::new(data))),
-                    content_length,
-                    content_length,
-                    None,
-                    sha256hex,
-                    false,
-                )
-                .unwrap(),
-            ),
-        }
+        Self::new(
+            HashReader::new(
+                Box::new(WarpReader::new(Cursor::new(data))),
+                content_length,
+                content_length,
+                None,
+                sha256hex,
+                false,
+            )
+            .unwrap(),
+        )
     }
 
     pub fn size(&self) -> i64 {
-        self.as_hash_reader().size()
+        self.data.size()
     }
 
     pub fn actual_size(&self) -> i64 {
-        self.as_hash_reader().actual_size()
+        self.data.actual_size()
     }
 }
 

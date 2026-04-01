@@ -696,6 +696,7 @@ impl ObjectIO for SetDisks {
 
     #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let data = data.chunk_native_data_mut();
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
@@ -2264,6 +2265,7 @@ impl MultipartOperations for SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
+        let data = data.chunk_native_data_mut();
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;

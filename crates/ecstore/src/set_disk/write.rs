@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::store_api::ChunkNativePutData;
 
 impl SetDisks {
     pub(super) fn default_read_quorum(&self) -> usize {
@@ -20,7 +21,7 @@ impl SetDisks {
     }
 
     pub(super) async fn write_chunk_native_put_data(
-        data: &mut PutObjReader,
+        data: &mut ChunkNativePutData,
         erasure: Arc<erasure_coding::Erasure>,
         writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
         write_quorum: usize,
@@ -662,7 +663,7 @@ mod tests {
             })
             .collect();
 
-        let written = SetDisks::write_chunk_native_put_data(&mut reader, erasure.clone(), &mut writers, 2)
+        let written = SetDisks::write_chunk_native_put_data(reader.chunk_native_data_mut(), erasure.clone(), &mut writers, 2)
             .await
             .unwrap();
 
