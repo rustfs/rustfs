@@ -15,8 +15,10 @@
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_coding::{BitrotReader, Erasure};
+use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
+use rustfs_io_core::IoChunk;
 use std::io;
 use std::io::ErrorKind;
 use tokio::io::AsyncRead;
@@ -155,6 +157,68 @@ fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
     size
 }
 
+fn block_window(
+    offset: usize,
+    length: usize,
+    block_size: usize,
+    block_index: usize,
+    start_block: usize,
+    end_block: usize,
+) -> (usize, usize) {
+    if start_block == end_block {
+        (offset % block_size, length)
+    } else if block_index == start_block {
+        (offset % block_size, block_size - (offset % block_size))
+    } else if block_index == end_block {
+        (0, (offset + length) % block_size)
+    } else {
+        (0, block_size)
+    }
+}
+
+fn take_data_blocks_as_chunks(
+    shards: &mut [Option<Vec<u8>>],
+    data_blocks: usize,
+    mut offset: usize,
+    length: usize,
+) -> io::Result<Vec<IoChunk>> {
+    if get_data_block_len(shards, data_blocks) < length {
+        error!("take_data_blocks_as_chunks get_data_block_len < length");
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = length;
+    for block_op in shards.iter_mut().take(data_blocks) {
+        let Some(block) = block_op.take() else {
+            error!("take_data_blocks_as_chunks block_op.is_none()");
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
+        };
+
+        if offset >= block.len() {
+            offset -= block.len();
+            continue;
+        }
+
+        let start = offset;
+        offset = 0;
+        let take = (block.len() - start).min(remaining);
+        let bytes = Bytes::from(block);
+        let chunk = if start == 0 && take == bytes.len() {
+            IoChunk::Shared(bytes)
+        } else {
+            IoChunk::Shared(bytes.slice(start..start + take))
+        };
+        chunks.push(chunk);
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    Ok(chunks)
+}
+
 /// Write data blocks from encoded blocks to target, supporting offset and length
 async fn write_data_blocks<W>(
     writer: &mut W,
@@ -211,6 +275,125 @@ where
     }
 
     Ok(total_written)
+}
+
+pub(crate) struct ReconstructedChunkDecoder<R> {
+    erasure: Erasure,
+    reader: ParallelReader<R>,
+    offset: usize,
+    length: usize,
+    start_block: usize,
+    end_block: usize,
+    current_block: usize,
+    written: usize,
+    healable_error: Option<Error>,
+    finished: bool,
+}
+
+impl<R> ReconstructedChunkDecoder<R>
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
+    pub(crate) fn new(
+        erasure: Erasure,
+        readers: Vec<Option<BitrotReader<R>>>,
+        offset: usize,
+        length: usize,
+        total_length: usize,
+    ) -> io::Result<Self> {
+        if readers.len() != erasure.data_shards + erasure.parity_shards {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
+        }
+
+        if offset + length > total_length {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length"));
+        }
+
+        let start_block = offset / erasure.block_size;
+        let end_block = (offset + length) / erasure.block_size;
+        let reader = ParallelReader::new(readers, erasure.clone(), offset, total_length);
+
+        Ok(Self {
+            erasure,
+            reader,
+            offset,
+            length,
+            start_block,
+            end_block,
+            current_block: start_block,
+            written: 0,
+            healable_error: None,
+            finished: length == 0,
+        })
+    }
+
+    pub(crate) async fn next_chunks(&mut self) -> io::Result<Option<Vec<IoChunk>>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        if self.current_block > self.end_block {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        let block_index = self.current_block;
+        self.current_block += 1;
+
+        let (block_offset, block_length) = block_window(
+            self.offset,
+            self.length,
+            self.erasure.block_size,
+            block_index,
+            self.start_block,
+            self.end_block,
+        );
+        if block_length == 0 {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        let (mut shards, errs) = self.reader.read().await;
+
+        if self.healable_error.is_none()
+            && let (_, Some(err)) = reduce_errs(&errs, &[])
+            && (err == Error::FileNotFound || err == Error::FileCorrupt)
+        {
+            self.healable_error = Some(err);
+        }
+
+        if !self.reader.can_decode(&shards) {
+            self.finished = true;
+            error!("reconstructed chunk decoder can_decode errs: {:?}", &errs);
+            return Err(Error::ErasureReadQuorum.into());
+        }
+
+        if let Err(err) = self.erasure.decode_data(&mut shards) {
+            self.finished = true;
+            error!("reconstructed chunk decoder decode_data err: {:?}", err);
+            return Err(err);
+        }
+
+        let chunks = take_data_blocks_as_chunks(&mut shards, self.erasure.data_shards, block_offset, block_length)?;
+        self.written += chunks.iter().map(IoChunk::len).sum::<usize>();
+        Ok(Some(chunks))
+    }
+
+    pub(crate) fn written(&self) -> usize {
+        self.written
+    }
+
+    pub(crate) fn finish_error(&self) -> Option<io::Error> {
+        if self.written < self.length {
+            Some(Error::LessData.into())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn take_healable_error(&mut self) -> Option<Error> {
+        self.healable_error.take()
+    }
 }
 
 impl Erasure {
@@ -316,6 +499,7 @@ mod tests {
         disk::error::DiskError,
         erasure_coding::{BitrotReader, BitrotWriter},
     };
+    use bytes::Bytes;
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
 
@@ -455,5 +639,44 @@ mod tests {
 
         let reader_cursor = Cursor::new(buf);
         BitrotReader::new(reader_cursor, shard_size, hash_algo.clone(), false)
+    }
+
+    async fn create_bitrot_reader_from_shard(
+        shard: Bytes,
+        shard_size: usize,
+        hash_algo: &HashAlgorithm,
+    ) -> BitrotReader<Cursor<Vec<u8>>> {
+        let writer = Cursor::new(Vec::new());
+        let mut writer = BitrotWriter::new(writer, shard_size, hash_algo.clone());
+        writer.write(shard.as_ref()).await.unwrap();
+        let reader_cursor = Cursor::new(writer.into_inner().into_inner());
+        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone(), false)
+    }
+
+    #[tokio::test]
+    async fn test_reconstructed_chunk_decoder_reconstructs_missing_data_shard() {
+        let erasure = Erasure::new(2, 1, 4);
+        let original = b"abcd";
+        let encoded = erasure.encode_data(original).unwrap();
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::None;
+
+        let readers = vec![
+            None,
+            Some(create_bitrot_reader_from_shard(encoded[1].clone(), shard_size, &hash_algo).await),
+            Some(create_bitrot_reader_from_shard(encoded[2].clone(), shard_size, &hash_algo).await),
+        ];
+
+        let mut decoder = ReconstructedChunkDecoder::new(erasure, readers, 0, original.len(), original.len()).unwrap();
+        let first_batch = decoder.next_chunks().await.unwrap().unwrap();
+        let collected = first_batch
+            .into_iter()
+            .flat_map(|chunk| chunk.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(collected, original);
+        assert!(decoder.next_chunks().await.unwrap().is_none());
+        assert_eq!(decoder.written(), original.len());
+        assert!(decoder.finish_error().is_none());
     }
 }

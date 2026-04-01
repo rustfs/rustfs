@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::bitrot::create_bitrot_chunk_stream;
+use crate::erasure_coding::decode::ReconstructedChunkDecoder;
 use crate::erasure_coding::{calc_shard_size, calc_shard_size_legacy};
 use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::BytesMut;
@@ -444,15 +445,41 @@ async fn build_reconstructed_part_stream(
     let object = object.to_string();
     let erasure = erasure.clone();
     tokio::spawn(async move {
-        let mut writer = ChannelChunkWriter::new(tx, get_duplex_buffer_size());
-        let (written, err) = erasure
-            .decode(&mut writer, readers, part_offset, part_length, part_size)
-            .await;
-        if let Some(err) = err {
-            let disk_err: DiskError = err.into();
-            let allow_heal_only = written == part_length && matches!(disk_err, DiskError::FileNotFound | DiskError::FileCorrupt);
+        let mut decoder = match ReconstructedChunkDecoder::new(erasure, readers, part_offset, part_length, part_size) {
+            Ok(decoder) => decoder,
+            Err(err) => {
+                let _ = tx.send(Err(err));
+                return;
+            }
+        };
+
+        loop {
+            match decoder.next_chunks().await {
+                Ok(Some(chunks)) => {
+                    for chunk in chunks {
+                        if tx.send(Ok(chunk)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    return;
+                }
+            }
+        }
+
+        if let Some(err) = decoder.finish_error() {
+            let _ = tx.send(Err(err));
+            return;
+        }
+
+        if let Some(disk_err) = decoder.take_healable_error() {
+            let allow_heal_only =
+                decoder.written() == part_length && matches!(disk_err, DiskError::FileNotFound | DiskError::FileCorrupt);
             if !allow_heal_only {
-                writer.send_error(io::Error::other(disk_err.to_string()));
+                let _ = tx.send(Err(io::Error::other(disk_err.to_string())));
                 return;
             }
 
@@ -460,14 +487,10 @@ async fn build_reconstructed_part_stream(
                 bucket,
                 object,
                 part_number,
-                bytes_written = written,
+                bytes_written = decoder.written(),
                 error = %disk_err,
                 "reconstructed part completed with healable shard error"
             );
-        }
-
-        if let Err(err) = writer.finish() {
-            debug!(bucket, object, part_number, error = %err, "failed to flush reconstructed chunk writer");
         }
     });
 
