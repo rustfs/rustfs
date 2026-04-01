@@ -26,7 +26,7 @@ fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
 /// If configured, it initializes and starts the audit system.
 /// If not configured, it skips the initialization.
 /// It also handles cases where the audit system is already running or if the global configuration is not loaded.
-pub(crate) async fn start_audit_system() -> AuditResult<()> {
+pub async fn start_audit_system() -> AuditResult<()> {
     info!(
         target: "rustfs::main::start_audit_system",
         "Initializing the audit system..."
@@ -108,7 +108,7 @@ pub(crate) async fn start_audit_system() -> AuditResult<()> {
 /// This function checks if the audit system is initialized and running.
 /// If it is running, it prepares to stop the system, stops it, and records the stop time.
 /// If the system is already stopped or not initialized, it logs a warning and returns.
-pub(crate) async fn stop_audit_system() -> AuditResult<()> {
+pub async fn stop_audit_system() -> AuditResult<()> {
     if let Some(system) = audit_system() {
         let state = system.get_state().await;
         if state == AuditSystemState::Stopped {

@@ -82,6 +82,12 @@ impl AsyncSeek for InMemoryAsyncReader {
     }
 }
 
+impl Default for FS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FS {
     pub fn new() -> Self {
         rustfs_s3_common::init_s3_metrics();
