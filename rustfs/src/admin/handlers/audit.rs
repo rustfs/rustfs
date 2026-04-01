@@ -346,6 +346,11 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
     audit_endpoints
 }
 
+fn retain_online_audit_endpoints(mut audit_endpoints: Vec<AuditEndpoint>) -> Vec<AuditEndpoint> {
+    audit_endpoints.retain(|endpoint| endpoint.status == "online");
+    audit_endpoints
+}
+
 fn collect_validated_key_values(
     key_values: &[KeyValue],
     allowed_keys: &HashSet<&str>,
@@ -594,7 +599,7 @@ impl Operation for ListAuditTargets {
         }
 
         let config = load_server_config_from_store().await?;
-        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses);
+        let audit_endpoints = retain_online_audit_endpoints(merge_audit_endpoints(&config, runtime_statuses));
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints })
             .map_err(|e| s3_error!(InternalError, "failed to serialize audit targets: {}", e))?;
 
@@ -808,6 +813,28 @@ mod tests {
                 assert_eq!(mixed.source, AuditEndpointSource::Mixed);
             },
         );
+    }
+
+    #[test]
+    fn retain_online_audit_endpoints_filters_offline_targets() {
+        let filtered = retain_online_audit_endpoints(vec![
+            AuditEndpoint {
+                account_id: "online-target".to_string(),
+                service: "webhook".to_string(),
+                status: "online".to_string(),
+                source: AuditEndpointSource::Runtime,
+            },
+            AuditEndpoint {
+                account_id: "offline-target".to_string(),
+                service: "mqtt".to_string(),
+                status: "offline".to_string(),
+                source: AuditEndpointSource::Config,
+            },
+        ]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].account_id, "online-target");
+        assert_eq!(filtered[0].status, "online");
     }
 
     #[test]
