@@ -189,8 +189,8 @@ pub(super) async fn run_get_object_flow(
     let prepared_read = prepare_get_object_read_execution(
         &request_context,
         manager,
-        &wrapper,
-        &timeout_config,
+        wrapper,
+        timeout_config,
         &bucket,
         &key,
         rs,
@@ -255,8 +255,8 @@ pub(super) async fn run_get_object_flow(
     let total_duration = request_start.elapsed();
     finalize_get_object_completion(
         &cache_key,
-        &wrapper,
-        &timeout_config,
+        wrapper,
+        timeout_config,
         total_duration,
         response_content_length,
         optimal_buffer_size,

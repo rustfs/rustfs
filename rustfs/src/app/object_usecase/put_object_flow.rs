@@ -13,7 +13,11 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_object_io::put::{apply_trailing_checksums, plan_put_object_body, resolve_put_effective_copy_mode};
+use rustfs_object_io::put::{
+    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectPlainBodyKind,
+    apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
+    build_put_object_plain_hash_stage, plan_put_object_body, resolve_put_effective_copy_mode,
+};
 
 impl DefaultObjectUsecase {
     pub(super) async fn run_put_object_flow(
@@ -70,15 +74,12 @@ impl DefaultObjectUsecase {
         let mut applied_compression = false;
         let mut applied_encryption = false;
 
-        if body_plan.ingress.enable_zero_copy {
+        if body_plan.plain_body_kind() == Some(PutObjectPlainBodyKind::ReducedCopyCandidate) {
             rustfs_io_metrics::record_put_object_attempted_fast_path(size);
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let body = tokio::io::BufReader::with_capacity(
-            body_plan.ingress.buffer_size,
-            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-        );
+        let ingress_source = build_put_object_ingress_source(body, body_plan);
 
         let store = get_validated_store_adapter(&bucket).await?;
 
@@ -163,54 +164,86 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
         let actual_size = size;
-
-        let mut md5hex = if let Some(base64_md5) = content_md5 {
-            let md5 = base64_simd::STANDARD
-                .decode_to_vec(base64_md5.as_bytes())
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
-            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
-        } else {
-            None
+        let mut hash_values = PutObjectLegacyHashValues {
+            md5hex: if let Some(base64_md5) = content_md5 {
+                let md5 = base64_simd::STANDARD
+                    .decode_to_vec(base64_md5.as_bytes())
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+                Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+            } else {
+                None
+            },
+            sha256hex: get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref()),
         };
 
-        let mut sha256hex = get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref());
-
-        if body_plan.should_compress {
+        let stage = if body_plan.should_compress() {
             applied_compression = true;
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            let stage = build_put_object_legacy_hash_stage(
+                ingress_source.into_compat_reader(),
+                std::mem::take(&mut hash_values),
+                PutObjectLegacyHashStagePlan {
+                    size,
+                    actual_size: size,
+                    apply_s3_checksum: true,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(&request_context.headers, request_context.trailing_headers.clone(), false)
-            {
-                return Err(ApiError::from(err).into());
-            }
-
-            opts.want_checksum = hrd.checksum();
+            opts.want_checksum = stage.want_checksum;
             insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            reader = Box::new(CompressReader::new(hrd, algorithm));
+            let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
+            hash_values.clear_for_transformed_body();
+            build_put_object_legacy_hash_stage(
+                reader,
+                hash_values,
+                PutObjectLegacyHashStagePlan {
+                    size,
+                    actual_size,
+                    apply_s3_checksum: size >= 0,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?
+        } else {
+            let stage = build_put_object_plain_hash_stage(
+                ingress_source,
+                hash_values,
+                PutObjectLegacyHashStagePlan {
+                    size,
+                    actual_size,
+                    apply_s3_checksum: size >= 0,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?;
 
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
-
-        if size >= 0 {
-            if let Err(err) =
-                reader.add_checksum_from_s3s(&request_context.headers, request_context.trailing_headers.clone(), false)
-            {
-                return Err(ApiError::from(err).into());
+            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                debug!(
+                    "Plain PUT reduced-copy ingress candidate reached the chunk-native plain hash-stage boundary for the current Phase 6 slice (bucket={}, key={})",
+                    bucket, key
+                );
             }
 
-            opts.want_checksum = reader.checksum();
+            stage.stage
+        };
+        let mut reader = stage.reader;
+        if stage.want_checksum.is_some() {
+            opts.want_checksum = stage.want_checksum;
         }
 
         let encryption_request = EncryptionRequest {

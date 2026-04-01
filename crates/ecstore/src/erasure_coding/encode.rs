@@ -17,11 +17,12 @@ use crate::disk::error_reduce::count_errs;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
+use crate::erasure_coding::erasure::{EncodeBlockBuffer, EncodedShardBlock, EncodedShardBufferPool};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use rustfs_rio::BlockReadable;
 use std::sync::Arc;
-use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tracing::error;
@@ -30,6 +31,31 @@ pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
     errs: Vec<Option<Error>>,
+}
+
+pub(crate) trait ShardSource {
+    fn shard_count(&self) -> usize;
+    fn shard(&self, idx: usize) -> Bytes;
+}
+
+impl ShardSource for EncodedShardBlock {
+    fn shard_count(&self) -> usize {
+        self.shard_count()
+    }
+
+    fn shard(&self, idx: usize) -> Bytes {
+        self.shard(idx)
+    }
+}
+
+impl ShardSource for Vec<Bytes> {
+    fn shard_count(&self) -> usize {
+        self.len()
+    }
+
+    fn shard(&self, idx: usize) -> Bytes {
+        self[idx].clone()
+    }
 }
 
 impl<'a> MultiWriter<'a> {
@@ -42,10 +68,10 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: &Bytes) {
+    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: Bytes) {
         match writer_opt {
             Some(writer) => {
-                match writer.write(shard).await {
+                match writer.write(&shard).await {
                     Ok(n) => {
                         if n < shard.len() {
                             *err = Some(Error::ShortWrite);
@@ -65,16 +91,19 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    pub async fn write(&mut self, data: Vec<Bytes>) -> std::io::Result<()> {
-        assert_eq!(data.len(), self.writers.len());
+    pub async fn write<T>(&mut self, data: &T) -> std::io::Result<()>
+    where
+        T: ShardSource,
+    {
+        assert_eq!(data.shard_count(), self.writers.len());
 
         {
             let mut futures = FuturesUnordered::new();
-            for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(data.iter()) {
+            for (idx, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter_mut()).enumerate() {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
-                futures.push(Self::write_shard(writer_opt, err, shard));
+                futures.push(Self::write_shard(writer_opt, err, data.shard(idx)));
             }
             while let Some(()) = futures.next().await {}
         }
@@ -183,19 +212,23 @@ impl Erasure {
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
-        R: AsyncRead + Send + Sync + Unpin + 'static,
+        R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
+        let (tx, mut rx) = mpsc::channel::<EncodedShardBlock>(8);
+        let reusable_capacity = self.shard_size() * self.total_shard_count();
+        let buffer_pool = EncodedShardBufferPool::with_prefill(reusable_capacity, 2).await;
+        let producer_pool = buffer_pool.clone();
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
-            let mut buf = vec![0u8; block_size];
+            let mut block_buffer = EncodeBlockBuffer::new(block_size);
             loop {
-                match rustfs_utils::read_full(&mut reader, &mut buf).await {
+                match block_buffer.read_from_block(&mut reader).await {
                     Ok(n) if n > 0 => {
                         total += n;
-                        let res = self.encode_data(&buf[..n])?;
+                        let reusable_buffer = producer_pool.acquire().await;
+                        let res = self.encode_data_block_with_buffer(block_buffer.filled(n), reusable_buffer)?;
                         if let Err(err) = tx.send(res).await {
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
@@ -227,7 +260,8 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
-            writers.write(block).await?;
+            writers.write(&block).await?;
+            buffer_pool.release(block).await;
         }
 
         let (reader, total) = task.await??;

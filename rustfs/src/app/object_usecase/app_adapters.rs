@@ -181,6 +181,7 @@ pub(super) fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<Get
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_get_cached_get_object_flow_result(
     manager: &ConcurrencyManager,
     bucket: &str,

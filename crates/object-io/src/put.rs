@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Buf;
+use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::store_api::ObjectOptions;
+use rustfs_rio::{Checksum, HashReader, Reader, WarpReader};
 use rustfs_utils::http::headers::{
     AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
     AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
@@ -26,6 +29,7 @@ use s3s::{S3Error, s3_error};
 use std::collections::HashMap;
 use tokio::io::AsyncRead;
 use tokio_tar::Archive;
+use tokio_util::io::StreamReader;
 
 pub const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
 pub const AMZ_SNOWBALL_PREFIX_INTERNAL: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
@@ -58,15 +62,233 @@ pub struct PutObjectChecksums {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PutObjectIngressPlan {
+pub enum PutObjectCompatIngressKind {
+    BufferedStreamCompat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutObjectCompatIngressPlan {
+    pub kind: PutObjectCompatIngressKind,
     pub buffer_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutObjectIngressKind {
+    LegacyCompat,
+    ReducedCopyCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutObjectIngressPlan {
+    pub kind: PutObjectIngressKind,
+    pub compat: PutObjectCompatIngressPlan,
     pub enable_zero_copy: bool,
+}
+
+pub type PutObjectCompatIngressStream<S, B, E> = futures_util::stream::Map<S, fn(Result<B, E>) -> std::io::Result<B>>;
+pub type PutObjectCompatIngress<S, B, E> = tokio::io::BufReader<StreamReader<PutObjectCompatIngressStream<S, B, E>, B>>;
+
+pub struct PutObjectReducedCopyIngress<S> {
+    body: S,
+    compat: PutObjectCompatIngressPlan,
+}
+
+impl<S> PutObjectReducedCopyIngress<S> {
+    pub const fn new(body: S, compat: PutObjectCompatIngressPlan) -> Self {
+        Self { body, compat }
+    }
+
+    pub const fn compat_plan(&self) -> PutObjectCompatIngressPlan {
+        self.compat
+    }
+
+    pub fn into_body(self) -> S {
+        self.body
+    }
+}
+
+impl<S, B, E> PutObjectReducedCopyIngress<S>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+{
+    pub fn into_compat_reader(self) -> Box<dyn Reader> {
+        build_put_object_compat_reader(self.body, self.compat)
+    }
+}
+
+pub enum PutObjectIngressSource<S> {
+    LegacyCompat(Box<dyn Reader>),
+    ReducedCopyCandidate(PutObjectReducedCopyIngress<S>),
+}
+
+struct PutObjectChunkedIngressReader<S, B> {
+    body: S,
+    current_chunk: Option<B>,
+    pending_error: Option<std::io::Error>,
+}
+
+impl<S, B> PutObjectChunkedIngressReader<S, B> {
+    fn new(body: S) -> Self {
+        Self {
+            body,
+            current_chunk: None,
+            pending_error: None,
+        }
+    }
+
+    fn copy_chunk_into_read_buf(chunk: &mut B, buf: &mut tokio::io::ReadBuf<'_>) -> usize
+    where
+        B: Buf,
+    {
+        let mut copied = 0;
+        let to_copy = chunk.remaining().min(buf.remaining());
+
+        while copied < to_copy {
+            let slice = chunk.chunk();
+            if !slice.is_empty() {
+                let len = (to_copy - copied).min(slice.len());
+                buf.put_slice(&slice[..len]);
+                chunk.advance(len);
+                copied += len;
+                continue;
+            }
+
+            let len = to_copy - copied;
+            let dest = &mut buf.initialize_unfilled()[..len];
+            chunk.copy_to_slice(dest);
+            buf.advance(len);
+            copied += len;
+        }
+
+        copied
+    }
+}
+
+impl<S, B, E> tokio::io::AsyncRead for PutObjectChunkedIngressReader<S, B>
+where
+    S: Stream<Item = Result<B, E>> + Unpin,
+    B: Buf + Unpin,
+    E: std::fmt::Display,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        if let Some(err) = this.pending_error.take() {
+            return std::task::Poll::Ready(Err(err));
+        }
+
+        let mut read_any = false;
+
+        loop {
+            if buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+
+            if let Some(chunk) = this.current_chunk.as_mut() {
+                if !chunk.has_remaining() {
+                    this.current_chunk = None;
+                    continue;
+                }
+
+                if Self::copy_chunk_into_read_buf(chunk, buf) > 0 {
+                    read_any = true;
+                }
+
+                if chunk.has_remaining() || buf.remaining() == 0 {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+
+                this.current_chunk = None;
+                continue;
+            }
+
+            match std::pin::Pin::new(&mut this.body).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    if chunk.remaining() == 0 {
+                        continue;
+                    }
+                    this.current_chunk = Some(chunk);
+                }
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    let err = std::io::Error::other(err.to_string());
+                    if read_any {
+                        this.pending_error = Some(err);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    return std::task::Poll::Ready(Err(err));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => {
+                    if read_any {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+fn build_put_object_reduced_copy_reader<S, B, E>(candidate: PutObjectReducedCopyIngress<S>) -> Box<dyn Reader>
+where
+    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
+    B: Buf + Send + Sync + Unpin + 'static,
+    E: std::fmt::Display + 'static,
+{
+    Box::new(WarpReader::new(PutObjectChunkedIngressReader::new(candidate.into_body())))
+}
+
+impl<S, B, E> PutObjectIngressSource<S>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+{
+    pub fn into_compat_reader(self) -> Box<dyn Reader> {
+        match self {
+            Self::LegacyCompat(reader) => reader,
+            Self::ReducedCopyCandidate(candidate) => candidate.into_compat_reader(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutObjectPlainBodyKind {
+    LegacyCompat,
+    ReducedCopyCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutObjectBodyKind {
+    Plain(PutObjectPlainBodyKind),
+    Compressed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutObjectBodyPlan {
     pub ingress: PutObjectIngressPlan,
-    pub should_compress: bool,
+    pub kind: PutObjectBodyKind,
+}
+
+impl PutObjectBodyPlan {
+    pub const fn should_compress(&self) -> bool {
+        matches!(self.kind, PutObjectBodyKind::Compressed)
+    }
+
+    pub const fn plain_body_kind(&self) -> Option<PutObjectPlainBodyKind> {
+        match self.kind {
+            PutObjectBodyKind::Plain(kind) => Some(kind),
+            PutObjectBodyKind::Compressed => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,6 +296,37 @@ pub struct PutObjectExtractOptions {
     pub prefix: Option<String>,
     pub ignore_dirs: bool,
     pub ignore_errors: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PutObjectLegacyHashValues {
+    pub md5hex: Option<String>,
+    pub sha256hex: Option<String>,
+}
+
+impl PutObjectLegacyHashValues {
+    pub fn clear_for_transformed_body(&mut self) {
+        self.md5hex = None;
+        self.sha256hex = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutObjectLegacyHashStagePlan {
+    pub size: i64,
+    pub actual_size: i64,
+    pub apply_s3_checksum: bool,
+    pub ignore_s3_checksum_value: bool,
+}
+
+pub struct PutObjectLegacyHashStage {
+    pub reader: HashReader,
+    pub want_checksum: Option<Checksum>,
+}
+
+pub struct PutObjectPlainHashStage {
+    pub stage: PutObjectLegacyHashStage,
+    pub ingress_kind: PutObjectIngressKind,
 }
 
 pub fn apply_trailing_checksums(
@@ -169,18 +422,133 @@ pub fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     true
 }
 
+fn map_put_object_ingress_error<B, E>(result: Result<B, E>) -> std::io::Result<B>
+where
+    E: std::fmt::Display,
+{
+    result.map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+pub fn build_put_object_compat_ingress<S, B, E>(body: S, plan: PutObjectCompatIngressPlan) -> PutObjectCompatIngress<S, B, E>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+{
+    match plan.kind {
+        PutObjectCompatIngressKind::BufferedStreamCompat => tokio::io::BufReader::with_capacity(
+            plan.buffer_size,
+            StreamReader::new(body.map(map_put_object_ingress_error::<B, E> as fn(Result<B, E>) -> std::io::Result<B>)),
+        ),
+    }
+}
+
+pub fn build_put_object_compat_reader<S, B, E>(body: S, plan: PutObjectCompatIngressPlan) -> Box<dyn Reader>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+{
+    Box::new(WarpReader::new(build_put_object_compat_ingress(body, plan)))
+}
+
+pub fn build_put_object_ingress_source<S, B, E>(body: S, plan: PutObjectBodyPlan) -> PutObjectIngressSource<S>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+{
+    match plan.kind {
+        PutObjectBodyKind::Compressed | PutObjectBodyKind::Plain(PutObjectPlainBodyKind::LegacyCompat) => {
+            PutObjectIngressSource::LegacyCompat(build_put_object_compat_reader(body, plan.ingress.compat))
+        }
+        PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate) => {
+            PutObjectIngressSource::ReducedCopyCandidate(PutObjectReducedCopyIngress::new(body, plan.ingress.compat))
+        }
+    }
+}
+
+pub fn build_put_object_legacy_hash_stage(
+    reader: Box<dyn Reader>,
+    hash_values: PutObjectLegacyHashValues,
+    plan: PutObjectLegacyHashStagePlan,
+    headers: &HeaderMap,
+    trailing_headers: Option<s3s::TrailingHeaders>,
+) -> std::io::Result<PutObjectLegacyHashStage> {
+    let mut reader = HashReader::new(reader, plan.size, plan.actual_size, hash_values.md5hex, hash_values.sha256hex, false)?;
+    let want_checksum = if plan.apply_s3_checksum {
+        reader.add_checksum_from_s3s(headers, trailing_headers, plan.ignore_s3_checksum_value)?;
+        reader.checksum()
+    } else {
+        None
+    };
+
+    Ok(PutObjectLegacyHashStage { reader, want_checksum })
+}
+
+pub fn build_put_object_plain_hash_stage<S, B, E>(
+    ingress: PutObjectIngressSource<S>,
+    hash_values: PutObjectLegacyHashValues,
+    plan: PutObjectLegacyHashStagePlan,
+    headers: &HeaderMap,
+    trailing_headers: Option<s3s::TrailingHeaders>,
+) -> std::io::Result<PutObjectPlainHashStage>
+where
+    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
+    B: Buf + Send + Sync + Unpin + 'static,
+    E: std::fmt::Display + 'static,
+{
+    match ingress {
+        PutObjectIngressSource::LegacyCompat(reader) => Ok(PutObjectPlainHashStage {
+            stage: build_put_object_legacy_hash_stage(reader, hash_values, plan, headers, trailing_headers)?,
+            ingress_kind: PutObjectIngressKind::LegacyCompat,
+        }),
+        PutObjectIngressSource::ReducedCopyCandidate(candidate) => {
+            let stage = build_put_object_legacy_hash_stage(
+                build_put_object_reduced_copy_reader(candidate),
+                hash_values,
+                plan,
+                headers,
+                trailing_headers,
+            )?;
+            Ok(PutObjectPlainHashStage {
+                stage,
+                ingress_kind: PutObjectIngressKind::ReducedCopyCandidate,
+            })
+        }
+    }
+}
+
 pub fn plan_put_object_ingress(size: i64, headers: &HeaderMap, buffer_size: usize) -> PutObjectIngressPlan {
+    let enable_zero_copy = should_use_zero_copy(size, headers);
     PutObjectIngressPlan {
-        buffer_size,
-        enable_zero_copy: should_use_zero_copy(size, headers),
+        kind: if enable_zero_copy {
+            PutObjectIngressKind::ReducedCopyCandidate
+        } else {
+            PutObjectIngressKind::LegacyCompat
+        },
+        compat: PutObjectCompatIngressPlan {
+            kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+            buffer_size,
+        },
+        enable_zero_copy,
     }
 }
 
 pub fn plan_put_object_body(size: i64, headers: &HeaderMap, key: &str, buffer_size: usize) -> PutObjectBodyPlan {
-    PutObjectBodyPlan {
-        ingress: plan_put_object_ingress(size, headers, buffer_size),
-        should_compress: size > MIN_COMPRESSIBLE_SIZE as i64 && is_compressible(headers, key),
-    }
+    let ingress = plan_put_object_ingress(size, headers, buffer_size);
+    let kind = if size > MIN_COMPRESSIBLE_SIZE as i64 && is_compressible(headers, key) {
+        PutObjectBodyKind::Compressed
+    } else {
+        PutObjectBodyKind::Plain(match ingress.kind {
+            PutObjectIngressKind::LegacyCompat => PutObjectPlainBodyKind::LegacyCompat,
+            PutObjectIngressKind::ReducedCopyCandidate => PutObjectPlainBodyKind::ReducedCopyCandidate,
+        })
+    };
+
+    PutObjectBodyPlan { ingress, kind }
 }
 
 pub fn resolve_put_effective_copy_mode(applied_compression: bool, applied_encryption: bool) -> rustfs_io_metrics::CopyMode {
@@ -336,7 +704,10 @@ pub fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &Header
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http::{HeaderMap, HeaderName, HeaderValue};
+    use std::io::Cursor;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn should_use_zero_copy_accepts_large_unencrypted_binary_payload() {
@@ -383,7 +754,9 @@ mod tests {
 
         let plan = plan_put_object_ingress(2 * 1024 * 1024, &headers, 256 * 1024);
 
-        assert_eq!(plan.buffer_size, 256 * 1024);
+        assert_eq!(plan.kind, PutObjectIngressKind::ReducedCopyCandidate);
+        assert_eq!(plan.compat.kind, PutObjectCompatIngressKind::BufferedStreamCompat);
+        assert_eq!(plan.compat.buffer_size, 256 * 1024);
         assert!(plan.enable_zero_copy);
     }
 
@@ -391,9 +764,41 @@ mod tests {
     fn plan_put_object_body_disables_compression_for_small_payloads() {
         let plan = plan_put_object_body(1024, &HeaderMap::new(), "small.bin", 64 * 1024);
 
-        assert_eq!(plan.ingress.buffer_size, 64 * 1024);
+        assert_eq!(plan.ingress.kind, PutObjectIngressKind::LegacyCompat);
+        assert_eq!(plan.ingress.compat.buffer_size, 64 * 1024);
         assert!(!plan.ingress.enable_zero_copy);
-        assert!(!plan.should_compress);
+        assert_eq!(plan.kind, PutObjectBodyKind::Plain(PutObjectPlainBodyKind::LegacyCompat));
+        assert!(!plan.should_compress());
+    }
+
+    #[test]
+    fn plan_put_object_body_marks_large_plain_payload_as_reduced_copy_candidate() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+
+        let plan = plan_put_object_body(2 * 1024 * 1024, &headers, "large.bin", 256 * 1024);
+
+        assert_eq!(plan.kind, PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate));
+        assert_eq!(plan.plain_body_kind(), Some(PutObjectPlainBodyKind::ReducedCopyCandidate));
+        assert!(!plan.should_compress());
+    }
+
+    #[test]
+    fn put_object_body_plan_reports_compressed_kind() {
+        let plan = PutObjectBodyPlan {
+            ingress: PutObjectIngressPlan {
+                kind: PutObjectIngressKind::LegacyCompat,
+                compat: PutObjectCompatIngressPlan {
+                    kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+                    buffer_size: 256 * 1024,
+                },
+                enable_zero_copy: false,
+            },
+            kind: PutObjectBodyKind::Compressed,
+        };
+
+        assert_eq!(plan.plain_body_kind(), None);
+        assert!(plan.should_compress());
     }
 
     #[test]
@@ -526,5 +931,230 @@ mod tests {
         let options = resolve_put_object_extract_options(&headers);
         assert!(!options.ignore_dirs);
         assert!(!options.ignore_errors);
+    }
+
+    #[tokio::test]
+    async fn build_put_object_compat_ingress_reads_buffered_stream() {
+        let stream = futures_util::stream::iter([
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"abc")),
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"def")),
+        ]);
+        let plan = PutObjectCompatIngressPlan {
+            kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+            buffer_size: 8,
+        };
+
+        let mut reader = build_put_object_compat_ingress(stream, plan);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_compat_ingress_maps_stream_errors() {
+        let stream = futures_util::stream::iter([Err::<Bytes, _>("boom")]);
+        let plan = PutObjectCompatIngressPlan {
+            kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+            buffer_size: 8,
+        };
+
+        let mut reader = build_put_object_compat_ingress(stream, plan);
+        let err = reader.read_to_end(&mut Vec::new()).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn build_put_object_compat_reader_wraps_ingress_as_reader() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"reader"))]);
+        let plan = PutObjectCompatIngressPlan {
+            kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+            buffer_size: 16,
+        };
+
+        let mut reader = build_put_object_compat_reader(stream, plan);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"reader");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_ingress_source_keeps_plain_candidate_as_reduced_copy_source() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"candidate"))]);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        let plan = plan_put_object_body(2 * 1024 * 1024, &headers, "large.bin", 16);
+
+        let source = build_put_object_ingress_source(stream, plan);
+        let candidate = match source {
+            PutObjectIngressSource::ReducedCopyCandidate(candidate) => candidate,
+            PutObjectIngressSource::LegacyCompat(_) => panic!("expected reduced-copy candidate"),
+        };
+
+        assert_eq!(candidate.compat_plan().kind, PutObjectCompatIngressKind::BufferedStreamCompat);
+        assert_eq!(candidate.compat_plan().buffer_size, 16);
+
+        let mut reader = candidate.into_compat_reader();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"candidate");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_ingress_source_routes_compressed_body_to_legacy_compat_reader() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"compressed"))]);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let plan = plan_put_object_body(2 * 1024 * 1024, &headers, "large.json", 32);
+
+        let source = build_put_object_ingress_source(stream, plan);
+        let mut reader = match source {
+            PutObjectIngressSource::LegacyCompat(reader) => reader,
+            PutObjectIngressSource::ReducedCopyCandidate(_) => panic!("expected legacy compat reader"),
+        };
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"compressed");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_reduced_copy_reader_reads_across_multiple_chunks() {
+        let stream = futures_util::stream::iter([
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"ab")),
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"cd")),
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"ef")),
+        ]);
+
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+            stream,
+            PutObjectCompatIngressPlan {
+                kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+                buffer_size: 16,
+            },
+        ));
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_reduced_copy_reader_defers_stream_error_until_next_read() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"ab")), Err::<Bytes, _>("boom")]);
+
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+            stream,
+            PutObjectCompatIngressPlan {
+                kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+                buffer_size: 16,
+            },
+        ));
+
+        let mut buf = [0_u8; 8];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..n], b"ab");
+
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn build_put_object_plain_hash_stage_reports_reduced_copy_candidate_boundary() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"plain"))]);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        let plan = plan_put_object_body(2 * 1024 * 1024, &headers, "large.bin", 32);
+
+        let stage = build_put_object_plain_hash_stage(
+            build_put_object_ingress_source(stream, plan),
+            PutObjectLegacyHashValues::default(),
+            PutObjectLegacyHashStagePlan {
+                size: 5,
+                actual_size: 5,
+                apply_s3_checksum: false,
+                ignore_s3_checksum_value: false,
+            },
+            &headers,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(stage.ingress_kind, PutObjectIngressKind::ReducedCopyCandidate);
+
+        let mut reader = stage.stage.reader;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"plain");
+    }
+
+    #[tokio::test]
+    async fn build_put_object_plain_hash_stage_preserves_legacy_compat_boundary() {
+        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"legacy"))]);
+        let plan = plan_put_object_body(1024, &HeaderMap::new(), "small.bin", 32);
+
+        let stage = build_put_object_plain_hash_stage(
+            build_put_object_ingress_source(stream, plan),
+            PutObjectLegacyHashValues::default(),
+            PutObjectLegacyHashStagePlan {
+                size: 6,
+                actual_size: 6,
+                apply_s3_checksum: false,
+                ignore_s3_checksum_value: false,
+            },
+            &HeaderMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(stage.ingress_kind, PutObjectIngressKind::LegacyCompat);
+
+        let mut reader = stage.stage.reader;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+
+        assert_eq!(buf, b"legacy");
+    }
+
+    #[test]
+    fn put_object_legacy_hash_values_clear_for_transformed_body_resets_hashes() {
+        let mut hash_values = PutObjectLegacyHashValues {
+            md5hex: Some("md5".to_string()),
+            sha256hex: Some("sha256".to_string()),
+        };
+
+        hash_values.clear_for_transformed_body();
+
+        assert_eq!(hash_values, PutObjectLegacyHashValues::default());
+    }
+
+    #[test]
+    fn build_put_object_legacy_hash_stage_preserves_legacy_compat_boundary() {
+        let reader: Box<dyn Reader> = Box::new(WarpReader::new(Cursor::new(Vec::from(&b"abc"[..]))));
+        let stage = build_put_object_legacy_hash_stage(
+            reader,
+            PutObjectLegacyHashValues::default(),
+            PutObjectLegacyHashStagePlan {
+                size: 3,
+                actual_size: 3,
+                apply_s3_checksum: false,
+                ignore_s3_checksum_value: false,
+            },
+            &HeaderMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(stage.reader.size(), 3);
+        assert_eq!(stage.reader.actual_size(), 3);
+        assert!(stage.want_checksum.is_none());
     }
 }
