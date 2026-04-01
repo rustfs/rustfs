@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::compress_index::TryGetIndex;
-use crate::{EtagResolvable, HashReaderDetector, Reader};
+use crate::{EtagResolvable, HashReaderDetector};
 
 pub struct WarpReader<R> {
     inner: R,
@@ -40,5 +40,3 @@ impl<R: AsyncRead + Unpin + Send + Sync> HashReaderDetector for WarpReader<R> {}
 impl<R: AsyncRead + Unpin + Send + Sync> EtagResolvable for WarpReader<R> {}
 
 impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for WarpReader<R> {}
-
-impl<R: AsyncRead + Unpin + Send + Sync> Reader for WarpReader<R> {}

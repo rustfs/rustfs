@@ -23,8 +23,8 @@
 //!
 //! ### Unified API
 //! The module provides two core functions that automatically route to the correct encryption method:
-//! - `apply_encryption()` - Unified encryption entry point
-//! - `apply_decryption()` - Unified decryption entry point
+//! - `sse_encryption()` - Unified encryption entry point
+//! - `sse_decryption()` - Unified decryption entry point
 //!
 //! ### Managed SSE (SSE-S3 / SSE-KMS)
 //! - Keys are managed by the server-side KMS service
@@ -52,8 +52,8 @@
 //!     part_number: None,
 //! };
 //!
-//! if let Some(material) = apply_encryption(request).await? {
-//!     reader = material.wrap_reader(reader)?;
+//! if let Some(material) = sse_encryption(request).await? {
+//!     reader = material.wrap_reader(reader);
 //!     metadata.extend(material.metadata);
 //! }
 //!
@@ -67,8 +67,10 @@
 //!     part_number: None,
 //! };
 //!
-//! if let Some(material) = apply_decryption(request).await? {
-//!     reader = material.wrap_reader(reader)?;
+//! if let Some(material) = sse_decryption(request).await? {
+//!     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
+//!     reader = decrypted_reader;
+//!     content_size = plaintext_size;
 //! }
 //! ```
 
@@ -87,13 +89,12 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, WarpReader};
+use rustfs_rio::{DecryptReader, DynReader, EncryptReader, HardLimitReader, ReadStream, wrap_reader};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::io::AsyncRead;
 use tracing::{debug, error};
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
@@ -619,7 +620,7 @@ impl EncryptionMaterial {
     /// Wrap a reader with encryption
     pub fn wrap_reader<R>(&self, reader: R) -> Box<EncryptReader<R>>
     where
-        R: Reader + 'static,
+        R: rustfs_rio::ReadStream + 'static,
     {
         Box::new(EncryptReader::new(reader, self.key_bytes, self.nonce))
     }
@@ -630,42 +631,40 @@ impl DecryptionMaterial {
     /// For multipart objects, use `wrap_multipart_stream` instead
     pub fn wrap_single_reader<R>(&self, reader: R) -> Box<DecryptReader<R>>
     where
-        R: Reader + 'static,
+        R: rustfs_rio::ReadStream + 'static,
     {
         Box::new(DecryptReader::new(reader, self.key_bytes, self.nonce))
     }
 
     /// Wrap a stream with multipart decryption
     /// Returns the decrypted reader and the total plaintext size
-    pub async fn wrap_multipart_stream(
-        &self,
-        encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
+    pub async fn wrap_multipart_stream<R>(&self, encrypted_stream: R) -> Result<(DynReader, i64), StorageError>
+    where
+        R: ReadStream + 'static,
+    {
         decrypt_multipart_managed_stream(encrypted_stream, &self.parts, self.key_bytes, self.nonce).await
     }
 
     /// Unified method to wrap stream with decryption and hard limit
     /// Handles both single-part and multipart objects, applies decryption and size limiting
-    /// Accepts AsyncRead stream (from object storage) and returns (decrypted_reader, plaintext_size)
-    pub async fn wrap_reader(
-        self,
-        stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        actual_size: i64,
-    ) -> Result<(Box<dyn Reader>, i64), StorageError> {
-        let (mut final_stream, response_content_length): (Box<dyn Reader>, i64) = if self.is_multipart {
+    /// Accepts a readable stream (from object storage) and returns (decrypted_reader, plaintext_size)
+    pub async fn wrap_reader<R>(self, stream: R, actual_size: i64) -> Result<(DynReader, i64), StorageError>
+    where
+        R: ReadStream + 'static,
+    {
+        let (mut final_stream, response_content_length): (DynReader, i64) = if self.is_multipart {
             // Multipart decryption
             let (decrypted_reader, plain_size) = self.wrap_multipart_stream(stream).await?;
             (decrypted_reader, plain_size)
         } else {
-            // Single-part decryption - wrap AsyncRead into Reader first
-            let warp_reader = WarpReader::new(stream);
-            let decrypt_reader = self.wrap_single_reader(warp_reader);
+            // Single-part decryption keeps Reader capabilities via the generic wrapper helper.
+            let decrypt_reader = self.wrap_single_reader(wrap_reader(stream));
             let plain_size = self.original_size.unwrap_or(actual_size);
             (decrypt_reader, plain_size)
         };
 
         // Add hard limit reader to prevent over-reading
-        // final_stream is already Box<dyn Reader>, no need to wrap with WarpReader
+        // final_stream is already a DynReader, no need to wrap with WarpReader
         let limit_reader = HardLimitReader::new(final_stream, response_content_length);
         final_stream = Box::new(limit_reader);
 
@@ -711,8 +710,8 @@ impl DecryptionMaterial {
 ///     part_number: None,
 /// };
 ///
-/// if let Some(material) = apply_encryption(request).await? {
-///     reader = material.wrap_reader(reader)?;
+/// if let Some(material) = sse_encryption(request).await? {
+///     reader = material.wrap_reader(reader);
 ///     metadata.extend(material.metadata);
 /// }
 /// ```
@@ -846,8 +845,10 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 ///     part_number: None,
 /// };
 ///
-/// if let Some(material) = apply_decryption(request).await? {
-///     reader = material.wrap_reader(reader)?;
+/// if let Some(material) = sse_decryption(request).await? {
+///     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
+///     reader = decrypted_reader;
+///     content_size = plaintext_size;
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
@@ -1654,12 +1655,15 @@ pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     nonce
 }
 
-pub(crate) async fn decrypt_multipart_managed_stream(
-    mut encrypted_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
+pub(crate) async fn decrypt_multipart_managed_stream<R>(
+    mut encrypted_stream: R,
     parts: &[ObjectPartInfo],
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
-) -> Result<(Box<dyn Reader>, i64), StorageError> {
+) -> Result<(DynReader, i64), StorageError>
+where
+    R: ReadStream + 'static,
+{
     let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
 
     let mut plaintext = Vec::with_capacity(total_plain_capacity);
@@ -1676,7 +1680,7 @@ pub(crate) async fn decrypt_multipart_managed_stream(
 
         let part_nonce = derive_part_nonce(base_nonce, part.number);
         let cursor = std::io::Cursor::new(encrypted_part);
-        let mut decrypt_reader = DecryptReader::new(WarpReader::new(cursor), key_bytes, part_nonce);
+        let mut decrypt_reader = DecryptReader::new(cursor, key_bytes, part_nonce);
 
         tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
             .await
@@ -1684,7 +1688,7 @@ pub(crate) async fn decrypt_multipart_managed_stream(
     }
 
     let total_plain_size = plaintext.len() as i64;
-    let reader = Box::new(WarpReader::new(InMemoryAsyncReader::new(plaintext))) as Box<dyn Reader>;
+    let reader = wrap_reader(InMemoryAsyncReader::new(plaintext));
 
     Ok((reader, total_plain_size))
 }
@@ -2436,8 +2440,8 @@ mod tests {
         println!("Original plaintext: {:?}", String::from_utf8_lossy(plaintext));
         println!("Plaintext length: {} bytes", plaintext.len());
 
-        // 4. Encrypt with EncryptReader (wrap Cursor with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // 4. Encrypt with EncryptReader.
+        let plaintext_reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read encrypted data
@@ -2460,8 +2464,8 @@ mod tests {
             "Encrypted data should be different from plaintext"
         );
 
-        // 5. Decrypt with DecryptReader (wrap Cursor with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // 5. Decrypt with DecryptReader.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         // Read decrypted data
@@ -2502,8 +2506,8 @@ mod tests {
         let plaintext: Vec<u8> = (0..plaintext_size).map(|i| (i % 256) as u8).collect();
         println!("Testing with {} bytes of data", plaintext.len());
 
-        // Encrypt (wrap with WarpReader)
-        let plaintext_reader = WarpReader::new(Cursor::new(plaintext.clone()));
+        // Encrypt.
+        let plaintext_reader = Cursor::new(plaintext.clone());
         let mut encrypt_reader = EncryptReader::new(plaintext_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut encrypted_data = Vec::new();
@@ -2514,8 +2518,8 @@ mod tests {
 
         println!("Encrypted {} bytes to {} bytes", plaintext.len(), encrypted_data.len());
 
-        // Decrypt (wrap with WarpReader)
-        let encrypted_reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt.
+        let encrypted_reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(encrypted_reader, data_key.plaintext_key, data_key.nonce);
 
         let mut decrypted_data = Vec::new();
@@ -2560,14 +2564,14 @@ mod tests {
         // Same plaintext
         let plaintext = b"Same plaintext";
 
-        // Encrypt with first key (wrap with WarpReader)
-        let reader1 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with first key.
+        let reader1 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader1 = EncryptReader::new(reader1, data_key1.plaintext_key, data_key1.nonce);
         let mut encrypted1 = Vec::new();
         encrypt_reader1.read_to_end(&mut encrypted1).await.unwrap();
 
-        // Encrypt with second key (wrap with WarpReader)
-        let reader2 = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with second key.
+        let reader2 = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader2 = EncryptReader::new(reader2, data_key2.plaintext_key, data_key2.nonce);
         let mut encrypted2 = Vec::new();
         encrypt_reader2.read_to_end(&mut encrypted2).await.unwrap();
@@ -2620,14 +2624,14 @@ mod tests {
         // 5. Use decrypted key to encrypt/decrypt data
         let plaintext = b"Test data with decrypted DEK";
 
-        // Encrypt with original key (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(plaintext.to_vec()));
+        // Encrypt with original key.
+        let reader = Cursor::new(plaintext.to_vec());
         let mut encrypt_reader = EncryptReader::new(reader, original_plaintext_key, original_nonce);
         let mut encrypted_data = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
 
-        // Decrypt with recovered key (simulating GET operation) (wrap with WarpReader)
-        let reader = WarpReader::new(Cursor::new(encrypted_data));
+        // Decrypt with recovered key (simulating GET operation).
+        let reader = Cursor::new(encrypted_data);
         let mut decrypt_reader = DecryptReader::new(
             reader,
             decrypted_plaintext_key,
