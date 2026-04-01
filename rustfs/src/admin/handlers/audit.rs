@@ -30,10 +30,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{Error, ErrorKind};
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::lookup_host;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{Span, warn};
@@ -495,16 +493,20 @@ impl Operation for AuditTargetConfig {
                 .get("endpoint")
                 .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let url = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
-            let host = url
-                .host_str()
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing host"))?;
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint missing port"))?;
-            let addr = format!("{host}:{port}");
-            if addr.parse::<SocketAddr>().is_err() && lookup_host(&addr).await.is_err() {
-                return Err(s3_error!(InvalidArgument, "invalid or unresolvable endpoint address"));
+            let _ = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            // HTTP HEAD probe: validates the full request path (DNS, TLS, proxy, firewall)
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| s3_error!(InvalidArgument, "failed to build HTTP client: {}", e))?;
+            match tokio::time::timeout(std::time::Duration::from_secs(5), client.head(endpoint).send()).await {
+                Ok(Ok(_)) => {} // endpoint is reachable
+                Ok(Err(e)) => {
+                    return Err(s3_error!(InvalidArgument, "endpoint unreachable: {}", e));
+                }
+                Err(_) => {
+                    return Err(s3_error!(InvalidArgument, "endpoint probe timed out after 5s"));
+                }
             }
             if let Some(queue_dir) = kv_map.get("queue_dir") {
                 validate_queue_dir(queue_dir.as_str()).await?;
