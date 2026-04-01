@@ -849,6 +849,86 @@ async fn execute_get_object_part_number_marks_reconstructed_path_for_final_multi
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn execute_get_object_whole_multipart_marks_reconstructed_path_for_missing_middle_part_shard() {
+    let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
+    let bucket = format!("direct-whole-multipart-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let key = "test/multipart-whole-reconstructed.bin";
+    let part_one: Vec<u8> = (0..(5 * 1024 * 1024)).map(|idx| (idx % 251) as u8).collect();
+    let part_two: Vec<u8> = (0..(5 * 1024 * 1024 + 257)).map(|idx| ((idx + 17) % 251) as u8).collect();
+    let part_three: Vec<u8> = (0..(1024 * 1024 + 211)).map(|idx| ((idx + 33) % 251) as u8).collect();
+
+    create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+    let parts = create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one, part_two, part_three]).await;
+    let input = GetObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(key.to_string())
+        .build()
+        .unwrap();
+    let req = build_request(input, Method::GET);
+
+    let request_context = prepare_get_object_request_context(&req).await.unwrap();
+    let manager = get_concurrency_manager();
+    let read_setup =
+        select_reconstructed_chunk_read(&disk_paths, &bucket, key, "part.2", &ecstore, manager, &request_context).await;
+
+    let mut direct_stream = match read_setup.body_source {
+        GetObjectBodySource::Chunk { path, copy_mode, stream } => {
+            assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+            assert_eq!(
+                copy_mode,
+                rustfs_io_metrics::CopyMode::Reconstructed,
+                "whole multipart GET should keep the reconstructed chunk fast path when a middle part is missing a shard"
+            );
+            stream
+        }
+        GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+    };
+
+    let mut expected = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in &parts {
+        expected.extend_from_slice(part);
+    }
+
+    let mut direct_collected = Vec::new();
+    while let Some(chunk) = direct_stream.next().await {
+        direct_collected.extend_from_slice(chunk.unwrap().as_bytes().as_ref());
+    }
+    assert_eq!(
+        direct_collected.len(),
+        expected.len(),
+        "prepared chunk stream reconstructed whole multipart length mismatch"
+    );
+    let direct_first_diff = direct_collected
+        .iter()
+        .zip(expected.iter())
+        .position(|(left, right)| left != right);
+    assert_eq!(
+        direct_first_diff, None,
+        "prepared chunk stream reconstructed whole multipart first diff at {:?}",
+        direct_first_diff
+    );
+    assert_eq!(
+        direct_collected, expected,
+        "prepared chunk stream should cover the whole reconstructed multipart object"
+    );
+
+    let usecase = DefaultObjectUsecase::without_context();
+    let response = usecase.execute_get_object(req).await.unwrap();
+    assert_eq!(response.output.content_length, Some(expected.len() as i64));
+    let mut body = response.output.body.expect("expected body");
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(collected.len(), expected.len(), "whole multipart reconstructed GET length mismatch");
+    let first_diff = collected.iter().zip(expected.iter()).position(|(left, right)| left != right);
+    assert_eq!(first_diff, None, "whole multipart reconstructed GET first diff at {:?}", first_diff);
+    assert_eq!(collected, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn execute_get_object_multipart_range_marks_reconstructed_path_for_missing_shard_part() {
     let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
     let bucket = format!("direct-multipart-range-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);

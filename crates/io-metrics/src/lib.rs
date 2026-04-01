@@ -190,6 +190,7 @@ impl IoStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     Unknown,
+    MmapDisabled,
     MmapUnavailable,
     SmallObject,
     WindowLimitExceeded,
@@ -206,6 +207,7 @@ impl FallbackReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
+            Self::MmapDisabled => "mmap_disabled",
             Self::MmapUnavailable => "mmap_unavailable",
             Self::SmallObject => "small_object",
             Self::WindowLimitExceeded => "window_limit_exceeded",
@@ -336,6 +338,12 @@ pub fn record_io_fallback(stage: IoStage, reason: FallbackReason) {
         "reason" => reason.as_str()
     )
     .increment(1);
+}
+
+/// Record the currently active mmap bytes held by LocalDisk chunk streams.
+#[inline(always)]
+pub fn record_local_disk_active_mmap_bytes(active_bytes: usize) {
+    gauge!(metric_names::data_plane::LOCAL_DISK_ACTIVE_MMAP_BYTES).set(active_bytes as f64);
 }
 
 /// Record an attempted PUT fast path.
@@ -888,6 +896,7 @@ mod tests {
     #[test]
     fn test_fallback_reason_as_str_values_stable() {
         assert_eq!(FallbackReason::Unknown.as_str(), "unknown");
+        assert_eq!(FallbackReason::MmapDisabled.as_str(), "mmap_disabled");
         assert_eq!(FallbackReason::MmapUnavailable.as_str(), "mmap_unavailable");
         assert_eq!(FallbackReason::SmallObject.as_str(), "small_object");
         assert_eq!(FallbackReason::WindowLimitExceeded.as_str(), "window_limit_exceeded");
@@ -915,6 +924,12 @@ mod tests {
     fn test_record_io_fallback() {
         record_io_fallback(IoStage::ReadSetup, FallbackReason::MmapUnavailable);
         record_io_fallback(IoStage::HttpBridge, FallbackReason::ChunkBridgeUnavailable);
+    }
+
+    #[test]
+    fn test_record_local_disk_active_mmap_bytes() {
+        record_local_disk_active_mmap_bytes(4096);
+        record_local_disk_active_mmap_bytes(0);
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub mod data_plane {
     /// Total number of data plane fallbacks.
     pub const FALLBACK_TOTAL: &str = "rustfs.io.zero_copy.fallback_total";
 
+    /// Current active local-disk mmap bytes held by chunk fast paths.
+    pub const LOCAL_DISK_ACTIVE_MMAP_BYTES: &str = "rustfs.io.local_disk.active_mmap.bytes";
+
     /// Total number of attempted PUT fast paths.
     pub const PUT_FAST_PATH_ATTEMPTS_TOTAL: &str = "rustfs.io.put.fast_path.attempts_total";
 

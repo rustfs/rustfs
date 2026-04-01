@@ -73,6 +73,7 @@ impl DefaultObjectUsecase {
         let body_plan = plan_put_object_body(size, &request_context.headers, &key, get_buffer_size_opt_in(size));
         let mut applied_compression = false;
         let mut applied_encryption = false;
+        let mut plain_reduced_copy_stage = false;
 
         if body_plan.plain_body_kind() == Some(PutObjectPlainBodyKind::ReducedCopyCandidate) {
             rustfs_io_metrics::record_put_object_attempted_fast_path(size);
@@ -233,8 +234,9 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
             if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                plain_reduced_copy_stage = true;
                 debug!(
-                    "Plain PUT reduced-copy ingress candidate reached the chunk-native plain hash-stage boundary for the current Phase 6 slice (bucket={}, key={})",
+                    "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
                     bucket, key
                 );
             }
@@ -359,7 +361,12 @@ impl DefaultObjectUsecase {
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
             rustfs_io_metrics::record_put_object(duration_ms, size, body_plan.ingress.enable_zero_copy);
-            rustfs_io_metrics::record_io_path_selected("put", rustfs_io_metrics::IoPath::Legacy);
+            let io_path = if plain_reduced_copy_stage && !applied_compression && !applied_encryption {
+                rustfs_io_metrics::IoPath::Fast
+            } else {
+                rustfs_io_metrics::IoPath::Legacy
+            };
+            rustfs_io_metrics::record_io_path_selected("put", io_path);
             let effective_copy_mode = resolve_put_effective_copy_mode(applied_compression, applied_encryption);
             rustfs_io_metrics::record_io_copy_mode("put", effective_copy_mode, actual_size.max(0) as usize);
         }

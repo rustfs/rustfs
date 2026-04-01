@@ -342,6 +342,8 @@ fn bench_direct_chunk_path(c: &mut Criterion) {
                         streams,
                         case.data_shards,
                         case.block_size,
+                        case.blocks * case.block_size,
+                        false,
                         case.offset,
                         case.length,
                     ))

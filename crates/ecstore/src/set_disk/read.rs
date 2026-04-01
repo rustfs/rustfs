@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::bitrot::create_bitrot_chunk_stream;
+use crate::erasure_coding::{calc_shard_size, calc_shard_size_legacy};
 use crate::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult};
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt, stream};
@@ -34,6 +35,56 @@ impl ChannelChunkStream {
     fn new(receiver: UnboundedReceiver<io::Result<IoChunk>>) -> Self {
         Self {
             receiver: Mutex::new(receiver),
+        }
+    }
+}
+
+struct DirectShardCursor {
+    stream: BoxChunkStream,
+    current_chunk: Option<IoChunk>,
+    current_offset: usize,
+}
+
+impl DirectShardCursor {
+    fn new(stream: BoxChunkStream) -> Self {
+        Self {
+            stream,
+            current_chunk: None,
+            current_offset: 0,
+        }
+    }
+
+    fn current_remaining(&self) -> usize {
+        self.current_chunk
+            .as_ref()
+            .map(|chunk| chunk.len().saturating_sub(self.current_offset))
+            .unwrap_or(0)
+    }
+
+    fn consume_current(&mut self, len: usize) {
+        self.current_offset += len;
+        if self.current_remaining() == 0 {
+            self.current_chunk = None;
+            self.current_offset = 0;
+        }
+    }
+
+    async fn ensure_chunk(&mut self, shard_index: usize) -> io::Result<bool> {
+        if self.current_chunk.is_some() && self.current_remaining() > 0 {
+            return Ok(true);
+        }
+
+        match self.stream.next().await {
+            Some(Ok(chunk)) => {
+                self.current_chunk = Some(chunk);
+                self.current_offset = 0;
+                Ok(true)
+            }
+            Some(Err(err)) => Err(err),
+            None => {
+                debug!(shard_index, "direct shard cursor reached EOF");
+                Ok(false)
+            }
         }
     }
 }
@@ -116,6 +167,50 @@ fn merge_chunk_copy_mode(current: GetObjectChunkCopyMode, next: GetObjectChunkCo
     }
 }
 
+fn multipart_logical_part_size(fi: &FileInfo, part_index: usize) -> usize {
+    let part = &fi.parts[part_index];
+    if part.actual_size > 0 {
+        part.actual_size as usize
+    } else {
+        part.size
+    }
+}
+
+fn multipart_logical_total_size(fi: &FileInfo) -> usize {
+    if fi.parts.is_empty() {
+        return fi.size.max(0) as usize;
+    }
+
+    fi.parts
+        .iter()
+        .map(|part| {
+            if part.actual_size > 0 {
+                part.actual_size as usize
+            } else {
+                part.size
+            }
+        })
+        .sum()
+}
+
+fn multipart_to_logical_part_offset(fi: &FileInfo, offset: usize) -> Result<(usize, usize)> {
+    if offset == 0 {
+        return Ok((0, 0));
+    }
+
+    let mut part_offset = offset;
+    for (i, _) in fi.parts.iter().enumerate() {
+        let logical_part_size = multipart_logical_part_size(fi, i);
+        if part_offset < logical_part_size {
+            return Ok((i, part_offset));
+        }
+
+        part_offset -= logical_part_size;
+    }
+
+    Err(Error::other("part not found"))
+}
+
 fn block_window(
     offset: usize,
     length: usize,
@@ -135,11 +230,30 @@ fn block_window(
     }
 }
 
+fn direct_block_shard_size(
+    total_size: usize,
+    block_size: usize,
+    data_shards: usize,
+    block_index: usize,
+    uses_legacy: bool,
+) -> usize {
+    let block_start = block_index.saturating_mul(block_size);
+    let logical_block_size = total_size.saturating_sub(block_start).min(block_size);
+    if uses_legacy {
+        calc_shard_size_legacy(logical_block_size, data_shards)
+    } else {
+        calc_shard_size(logical_block_size, data_shards)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_direct_data_shard_chunks(
     sender: UnboundedSender<io::Result<IoChunk>>,
-    mut shard_streams: Vec<BoxChunkStream>,
+    shard_streams: Vec<BoxChunkStream>,
     data_shards: usize,
     block_size: usize,
+    total_size: usize,
+    uses_legacy: bool,
     offset: usize,
     length: usize,
 ) {
@@ -148,7 +262,8 @@ async fn send_direct_data_shard_chunks(
     }
 
     let start_block = offset / block_size;
-    let end_block = offset.saturating_add(length - 1) / block_size;
+    let end_block = offset.saturating_add(length) / block_size;
+    let mut shard_cursors = shard_streams.into_iter().map(DirectShardCursor::new).collect::<Vec<_>>();
 
     for block_index in start_block..=end_block {
         let (block_offset, block_length) = block_window(offset, length, block_size, block_index, start_block, end_block);
@@ -156,51 +271,68 @@ async fn send_direct_data_shard_chunks(
             break;
         }
 
+        let shard_block_size = direct_block_shard_size(total_size, block_size, data_shards, block_index, uses_legacy);
         let mut write_left = block_length;
         let mut skip = block_offset;
 
-        for (shard_index, shard_stream) in shard_streams.iter_mut().enumerate().take(data_shards) {
-            let Some(chunk) = shard_stream.next().await else {
-                let _ = sender.send(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("missing chunk for data shard {shard_index}"),
-                )));
-                return;
-            };
+        for (shard_index, shard_cursor) in shard_cursors.iter_mut().enumerate().take(data_shards) {
+            let mut shard_block_left = shard_block_size;
 
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    let _ = sender.send(Err(err));
-                    return;
-                }
-            };
-
-            let chunk_len = chunk.len();
-            if skip >= chunk_len {
-                skip -= chunk_len;
-                continue;
-            }
-
-            let start = skip;
-            skip = 0;
-            let take = (chunk_len - start).min(write_left);
-            let chunk = if start == 0 && take == chunk_len {
-                chunk
-            } else {
-                match chunk.slice(start, take) {
-                    Ok(chunk) => chunk,
+            while shard_block_left > 0 {
+                let has_chunk = match shard_cursor.ensure_chunk(shard_index).await {
+                    Ok(has_chunk) => has_chunk,
                     Err(err) => {
                         let _ = sender.send(Err(err));
                         return;
                     }
-                }
-            };
+                };
 
-            if sender.send(Ok(chunk)).is_err() {
-                return;
+                if !has_chunk {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("missing chunk for data shard {shard_index}"),
+                    )));
+                    return;
+                }
+
+                let chunk = shard_cursor.current_chunk.as_ref().expect("chunk should exist after ensure");
+                let chunk_remaining = chunk.len().saturating_sub(shard_cursor.current_offset);
+                let take_from_chunk = chunk_remaining.min(shard_block_left);
+                if skip >= take_from_chunk {
+                    skip -= take_from_chunk;
+                    shard_cursor.consume_current(take_from_chunk);
+                    shard_block_left -= take_from_chunk;
+                    continue;
+                }
+
+                let start = shard_cursor.current_offset + skip;
+                let available = take_from_chunk.saturating_sub(skip);
+                let take = available.min(write_left);
+                let out_chunk = if start == shard_cursor.current_offset && take == take_from_chunk {
+                    chunk.slice(start, take).expect("full remaining slice should succeed")
+                } else {
+                    match chunk.slice(start, take) {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            let _ = sender.send(Err(err));
+                            return;
+                        }
+                    }
+                };
+
+                let consumed = skip + take;
+                skip = 0;
+                shard_cursor.consume_current(consumed);
+                shard_block_left -= consumed;
+                if sender.send(Ok(out_chunk)).is_err() {
+                    return;
+                }
+                write_left -= take;
+
+                if write_left == 0 {
+                    break;
+                }
             }
-            write_left -= take;
 
             if write_left == 0 {
                 break;
@@ -222,11 +354,13 @@ pub async fn collect_direct_data_shard_chunks_for_benchmark(
     shard_streams: Vec<BoxChunkStream>,
     data_shards: usize,
     block_size: usize,
+    total_size: usize,
+    uses_legacy: bool,
     offset: usize,
     length: usize,
 ) -> io::Result<Vec<IoChunk>> {
     let (tx, rx) = unbounded_channel();
-    send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, offset, length).await;
+    send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, total_size, uses_legacy, offset, length).await;
 
     let mut stream = ChannelChunkStream::new(rx);
     let mut chunks = Vec::new();
@@ -422,22 +556,22 @@ impl SetDisks {
 
         if fi.erasure.data_blocks > 0 {
             let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
-            let total_size = fi.size as usize;
+            let total_size = multipart_logical_total_size(&fi);
             let requested_length = if let Some(range) = &range {
                 let (offset, length) = range
-                    .get_offset_length(fi.size)
+                    .get_offset_length(total_size as i64)
                     .map_err(|err| to_object_err(err, vec![bucket, object]))?;
                 (offset, length as usize)
             } else {
                 (0, total_size)
             };
 
-            let (part_index, mut part_offset) = fi.to_part_offset(requested_length.0)?;
+            let (part_index, mut part_offset) = multipart_to_logical_part_offset(&fi, requested_length.0)?;
             let mut end_offset = requested_length.0;
             if requested_length.1 > 0 {
                 end_offset += requested_length.1 - 1;
             }
-            let (last_part_index, _) = fi.to_part_offset(end_offset)?;
+            let (last_part_index, _) = multipart_to_logical_part_offset(&fi, end_offset)?;
 
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
             let mut part_streams = Vec::new();
@@ -446,12 +580,11 @@ impl SetDisks {
 
             for current_part in part_index..=last_part_index {
                 let part_number = fi.parts[current_part].number;
-                let part_size = fi.parts[current_part].size;
+                let part_size = multipart_logical_part_size(&fi, current_part);
                 let mut part_length = part_size - part_offset;
                 if part_length > (requested_length.1 - part_total_read) {
                     part_length = requested_length.1 - part_total_read;
                 }
-
                 let checksum_info = fi.erasure.get_checksum_info(part_number);
                 let checksum_algo =
                     if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
@@ -585,6 +718,8 @@ impl SetDisks {
                         shard_streams,
                         erasure.data_shards,
                         erasure.block_size,
+                        part_size,
+                        fi.uses_legacy_checksum,
                         part_offset,
                         part_length,
                     ));
@@ -1227,27 +1362,23 @@ impl SetDisks {
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
-        let total_size = fi.size as usize;
+        let total_size = multipart_logical_total_size(&fi);
 
-        let length = if length < 0 {
-            fi.size as usize - offset
-        } else {
-            length as usize
-        };
+        let length = if length < 0 { total_size - offset } else { length as usize };
 
         if offset > total_size || offset + length > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
 
-        let (part_index, mut part_offset) = fi.to_part_offset(offset)?;
+        let (part_index, mut part_offset) = multipart_to_logical_part_offset(&fi, offset)?;
 
         let mut end_offset = offset;
         if length > 0 {
             end_offset += length - 1
         }
 
-        let (last_part_index, last_part_relative_offset) = fi.to_part_offset(end_offset)?;
+        let (last_part_index, last_part_relative_offset) = multipart_to_logical_part_offset(&fi, end_offset)?;
 
         debug!(
             bucket,
@@ -1279,7 +1410,7 @@ impl SetDisks {
             }
 
             let part_number = fi.parts[current_part].number;
-            let part_size = fi.parts[current_part].size;
+            let part_size = multipart_logical_part_size(&fi, current_part);
             let mut part_length = part_size - part_offset;
             if part_length > (length - total_read) {
                 part_length = length - total_read
@@ -1508,7 +1639,7 @@ mod tests {
         ];
         let (tx, rx) = unbounded_channel();
 
-        send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, 3, 18).await;
+        send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, 32, false, 3, 18).await;
 
         let mut stream = ChannelChunkStream::new(rx);
         let mut collected = Vec::new();
@@ -1517,5 +1648,63 @@ mod tests {
         }
 
         assert_eq!(collected, (3u8..21).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn send_direct_data_shard_chunks_keeps_block_boundaries_with_cross_block_chunks() {
+        let data_shards = 4;
+        let block_size = 16;
+        let shard_streams: Vec<BoxChunkStream> = vec![
+            Box::pin(stream::iter(vec![Ok(IoChunk::Shared(Bytes::copy_from_slice(&[
+                0, 1, 2, 3, 16, 17, 18, 19,
+            ])))])),
+            Box::pin(stream::iter(vec![Ok(IoChunk::Shared(Bytes::copy_from_slice(&[
+                4, 5, 6, 7, 20, 21, 22, 23,
+            ])))])),
+            Box::pin(stream::iter(vec![Ok(IoChunk::Shared(Bytes::copy_from_slice(&[
+                8, 9, 10, 11, 24, 25, 26, 27,
+            ])))])),
+            Box::pin(stream::iter(vec![Ok(IoChunk::Shared(Bytes::copy_from_slice(&[
+                12, 13, 14, 15, 28, 29, 30, 31,
+            ])))])),
+        ];
+        let (tx, rx) = unbounded_channel();
+
+        send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, 32, false, 3, 18).await;
+
+        let mut stream = ChannelChunkStream::new(rx);
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap().as_bytes());
+        }
+
+        assert_eq!(collected, (3u8..21).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn send_direct_data_shard_chunks_keeps_final_full_block_when_length_is_block_aligned() {
+        let data_shards = 2;
+        let block_size = 16;
+        let shard_streams: Vec<BoxChunkStream> = vec![
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[16, 17, 18, 19, 20, 21, 22, 23]))),
+            ])),
+            Box::pin(stream::iter(vec![
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[8, 9, 10, 11, 12, 13, 14, 15]))),
+                Ok(IoChunk::Shared(Bytes::copy_from_slice(&[24, 25, 26, 27, 28, 29, 30, 31]))),
+            ])),
+        ];
+        let (tx, rx) = unbounded_channel();
+
+        send_direct_data_shard_chunks(tx, shard_streams, data_shards, block_size, 32, false, 0, 32).await;
+
+        let mut stream = ChannelChunkStream::new(rx);
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap().as_bytes());
+        }
+
+        assert_eq!(collected, (0u8..32).collect::<Vec<_>>());
     }
 }

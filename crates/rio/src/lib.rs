@@ -128,18 +128,6 @@ where
     }
 }
 
-impl BlockReadable for crate::HardLimitReader {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        read_block_via_async_read(self, buf)
-    }
-}
-
-impl BlockReadable for crate::EtagReader {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        read_block_via_async_read(self, buf)
-    }
-}
-
 impl<R> BlockReadable for crate::LimitReader<R>
 where
     R: Reader,

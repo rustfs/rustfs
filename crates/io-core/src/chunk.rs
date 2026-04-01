@@ -127,14 +127,30 @@ impl MappedChunk {
 /// This is backed by a `PooledBuffer` and exposes a visible read-only window.
 #[derive(Debug)]
 pub struct PooledChunk {
+    bytes: Bytes,
+}
+
+#[derive(Debug)]
+struct PooledChunkOwner {
     buffer: PooledBuffer,
-    len: usize,
+    visible_len: usize,
+}
+
+impl AsRef<[u8]> for PooledChunkOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer[..self.visible_len]
+    }
 }
 
 impl PooledChunk {
     pub fn new(buffer: PooledBuffer, len: usize) -> io::Result<Self> {
         validate_slice_bounds(buffer.len(), 0, len)?;
-        Ok(Self { buffer, len })
+        Ok(Self {
+            bytes: Bytes::from_owner(PooledChunkOwner {
+                buffer,
+                visible_len: len,
+            }),
+        })
     }
 
     /// Convenience constructor for detached test and compatibility values.
@@ -145,26 +161,28 @@ impl PooledChunk {
 
     /// Returns the visible length of this pooled chunk.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
+    pub fn len(&self) -> usize {
+        self.bytes.len()
     }
 
     /// Returns true when the chunk has no visible data.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     /// Returns the visible bytes for this pooled chunk.
     #[must_use]
     pub fn as_bytes(&self) -> Bytes {
-        Bytes::copy_from_slice(&self.buffer[..self.len])
+        self.bytes.clone()
     }
 
     /// Returns a sliced pooled chunk relative to the current visible view.
     pub fn slice(&self, offset: usize, len: usize) -> io::Result<Self> {
-        validate_slice_bounds(self.len, offset, len)?;
-        Self::from_bytes(Bytes::copy_from_slice(&self.buffer[offset..offset + len]))
+        validate_slice_bounds(self.bytes.len(), offset, len)?;
+        Ok(Self {
+            bytes: self.bytes.slice(offset..offset + len),
+        })
     }
 }
 
@@ -181,6 +199,7 @@ fn validate_slice_bounds(visible_len: usize, offset: usize, len: usize) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::BytesPool;
 
     #[test]
     fn test_shared_chunk_len_and_slice() {
@@ -216,5 +235,23 @@ mod tests {
         assert_eq!(shared.as_bytes(), Bytes::from_static(b"s"));
         assert_eq!(mapped.as_bytes(), Bytes::from_static(b"mapped"));
         assert_eq!(pooled.as_bytes(), Bytes::from_static(b"p"));
+    }
+
+    #[tokio::test]
+    async fn test_pooled_chunk_keeps_owner_alive_until_last_view_drops() {
+        let pool = BytesPool::new_tiered();
+        let mut buffer = pool.acquire_buffer(16).await;
+        buffer.extend_from_slice(b"pooled-bytes");
+
+        let chunk = PooledChunk::new(buffer, "pooled-bytes".len()).unwrap();
+        let bytes = chunk.as_bytes();
+
+        assert_eq!(pool.available_buffers(), 0);
+        drop(chunk);
+        assert_eq!(pool.available_buffers(), 0);
+        assert_eq!(bytes, Bytes::from_static(b"pooled-bytes"));
+
+        drop(bytes);
+        assert_eq!(pool.available_buffers(), 1);
     }
 }

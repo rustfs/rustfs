@@ -17,7 +17,9 @@ use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::store_api::ObjectOptions;
-use rustfs_rio::{Checksum, HashReader, Reader, WarpReader};
+use rustfs_rio::{
+    BlockReadable, BoxReadBlockFuture, Checksum, EtagResolvable, HashReader, HashReaderDetector, Reader, TryGetIndex, WarpReader,
+};
 use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM;
 use rustfs_utils::http::headers::{
     AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
@@ -125,13 +127,13 @@ pub enum PutObjectIngressSource<S> {
     ReducedCopyCandidate(PutObjectReducedCopyIngress<S>),
 }
 
-struct PutObjectChunkedIngressReader<S, B> {
+struct PutObjectReducedCopyReader<S, B> {
     body: S,
     current_chunk: Option<B>,
     pending_error: Option<std::io::Error>,
 }
 
-impl<S, B> PutObjectChunkedIngressReader<S, B> {
+impl<S, B> PutObjectReducedCopyReader<S, B> {
     fn new(body: S) -> Self {
         Self {
             body,
@@ -140,35 +142,100 @@ impl<S, B> PutObjectChunkedIngressReader<S, B> {
         }
     }
 
-    fn copy_chunk_into_read_buf(chunk: &mut B, buf: &mut tokio::io::ReadBuf<'_>) -> usize
+    fn copy_chunk_into_slice(chunk: &mut B, buf: &mut [u8]) -> usize
     where
         B: Buf,
     {
         let mut copied = 0;
-        let to_copy = chunk.remaining().min(buf.remaining());
+        let to_copy = chunk.remaining().min(buf.len());
 
         while copied < to_copy {
             let slice = chunk.chunk();
             if !slice.is_empty() {
                 let len = (to_copy - copied).min(slice.len());
-                buf.put_slice(&slice[..len]);
+                buf[copied..copied + len].copy_from_slice(&slice[..len]);
                 chunk.advance(len);
                 copied += len;
                 continue;
             }
 
-            let len = to_copy - copied;
-            let dest = &mut buf.initialize_unfilled()[..len];
+            let dest = &mut buf[copied..to_copy];
             chunk.copy_to_slice(dest);
-            buf.advance(len);
-            copied += len;
+            copied = to_copy;
         }
 
         copied
     }
+
+    fn copy_chunk_into_read_buf(chunk: &mut B, buf: &mut tokio::io::ReadBuf<'_>) -> usize
+    where
+        B: Buf,
+    {
+        let to_copy = chunk.remaining().min(buf.remaining());
+        let dest = &mut buf.initialize_unfilled()[..to_copy];
+        let copied = Self::copy_chunk_into_slice(chunk, dest);
+        buf.advance(copied);
+        copied
+    }
+
+    async fn read_into_slice<E>(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
+    where
+        S: Stream<Item = Result<B, E>> + Unpin,
+        B: Buf + Unpin,
+        E: std::fmt::Display,
+    {
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut copied = 0;
+
+        loop {
+            if copied == buf.len() {
+                return Ok(copied);
+            }
+
+            if let Some(chunk) = self.current_chunk.as_mut() {
+                if !chunk.has_remaining() {
+                    self.current_chunk = None;
+                    continue;
+                }
+
+                copied += Self::copy_chunk_into_slice(chunk, &mut buf[copied..]);
+                if chunk.has_remaining() || copied == buf.len() {
+                    return Ok(copied);
+                }
+
+                self.current_chunk = None;
+                continue;
+            }
+
+            match self.body.next().await {
+                Some(Ok(chunk)) => {
+                    if chunk.remaining() == 0 {
+                        continue;
+                    }
+                    self.current_chunk = Some(chunk);
+                }
+                Some(Err(err)) => {
+                    let err = std::io::Error::other(err.to_string());
+                    if copied > 0 {
+                        self.pending_error = Some(err);
+                        return Ok(copied);
+                    }
+                    return Err(err);
+                }
+                None => return Ok(copied),
+            }
+        }
+    }
 }
 
-impl<S, B, E> AsyncRead for PutObjectChunkedIngressReader<S, B>
+impl<S, B, E> AsyncRead for PutObjectReducedCopyReader<S, B>
 where
     S: Stream<Item = Result<B, E>> + Unpin,
     B: Buf + Unpin,
@@ -237,13 +304,38 @@ where
     }
 }
 
+impl<S, B, E> BlockReadable for PutObjectReducedCopyReader<S, B>
+where
+    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync,
+    B: Buf + Unpin + Send + Sync,
+    E: std::fmt::Display + Send + Sync,
+{
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        Box::pin(async move { self.read_into_slice(buf).await })
+    }
+}
+
+impl<S, B> EtagResolvable for PutObjectReducedCopyReader<S, B> {}
+
+impl<S, B> HashReaderDetector for PutObjectReducedCopyReader<S, B> {}
+
+impl<S, B> TryGetIndex for PutObjectReducedCopyReader<S, B> {}
+
+impl<S, B, E> Reader for PutObjectReducedCopyReader<S, B>
+where
+    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync,
+    B: Buf + Unpin + Send + Sync,
+    E: std::fmt::Display + Send + Sync,
+{
+}
+
 fn build_put_object_reduced_copy_reader<S, B, E>(candidate: PutObjectReducedCopyIngress<S>) -> Box<dyn Reader>
 where
     S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
     B: Buf + Send + Sync + Unpin + 'static,
-    E: std::fmt::Display + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
 {
-    Box::new(WarpReader::new(PutObjectChunkedIngressReader::new(candidate.into_body())))
+    Box::new(PutObjectReducedCopyReader::new(candidate.into_body()))
 }
 
 impl<S, B, E> PutObjectIngressSource<S>
@@ -499,7 +591,7 @@ pub fn build_put_object_plain_hash_stage<S, B, E>(
 where
     S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
     B: Buf + Send + Sync + Unpin + 'static,
-    E: std::fmt::Display + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
 {
     match ingress {
         PutObjectIngressSource::LegacyCompat(reader) => Ok(PutObjectPlainHashStage {
@@ -1132,6 +1224,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_put_object_reduced_copy_reader_supports_direct_block_reads() {
+        let stream = futures_util::stream::iter([
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"ab")),
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"cd")),
+            Ok::<Bytes, &'static str>(Bytes::from_static(b"ef")),
+        ]);
+
+        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::new(
+            stream,
+            PutObjectCompatIngressPlan {
+                kind: PutObjectCompatIngressKind::BufferedStreamCompat,
+                buffer_size: 16,
+            },
+        ));
+
+        let mut first = [0_u8; 4];
+        let mut second = [0_u8; 4];
+        assert_eq!(reader.read_block(&mut first).await.unwrap(), 4);
+        assert_eq!(&first, b"abcd");
+        assert_eq!(reader.read_block(&mut second).await.unwrap(), 2);
+        assert_eq!(&second[..2], b"ef");
+        assert_eq!(reader.read_block(&mut second).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn build_put_object_plain_hash_stage_reports_reduced_copy_candidate_boundary() {
         let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"plain"))]);
         let mut headers = HeaderMap::new();
@@ -1155,10 +1272,11 @@ mod tests {
         assert_eq!(stage.ingress_kind, PutObjectIngressKind::ReducedCopyCandidate);
 
         let mut reader = stage.stage.reader;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
-
-        assert_eq!(buf, b"plain");
+        let mut buf = [0_u8; 8];
+        let n = reader.read_block(&mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"plain");
+        assert_eq!(reader.read_block(&mut buf).await.unwrap(), 0);
     }
 
     #[tokio::test]
