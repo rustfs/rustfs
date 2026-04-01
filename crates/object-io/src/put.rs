@@ -18,6 +18,7 @@ use http::HeaderMap;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::store_api::ObjectOptions;
 use rustfs_rio::{Checksum, HashReader, Reader, WarpReader};
+use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM;
 use rustfs_utils::http::headers::{
     AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
     AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
@@ -109,7 +110,7 @@ impl<S> PutObjectReducedCopyIngress<S> {
 
 impl<S, B, E> PutObjectReducedCopyIngress<S>
 where
-    S: futures_util::Stream<Item = Result<B, E>>,
+    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
     PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
@@ -167,7 +168,7 @@ impl<S, B> PutObjectChunkedIngressReader<S, B> {
     }
 }
 
-impl<S, B, E> tokio::io::AsyncRead for PutObjectChunkedIngressReader<S, B>
+impl<S, B, E> AsyncRead for PutObjectChunkedIngressReader<S, B>
 where
     S: Stream<Item = Result<B, E>> + Unpin,
     B: Buf + Unpin,
@@ -247,7 +248,7 @@ where
 
 impl<S, B, E> PutObjectIngressSource<S>
 where
-    S: futures_util::Stream<Item = Result<B, E>>,
+    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
     PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
@@ -392,9 +393,9 @@ pub fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
         return false;
     }
 
-    if headers.get("x-amz-server-side-encryption").is_some()
-        || headers.get("x-amz-server-side-encryption-customer-algorithm").is_some()
-        || headers.get("x-amz-server-side-encryption-aws-kms-key-id").is_some()
+    if headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
+        || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).is_some()
+        || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
     {
         return false;
     }
@@ -431,7 +432,7 @@ where
 
 pub fn build_put_object_compat_ingress<S, B, E>(body: S, plan: PutObjectCompatIngressPlan) -> PutObjectCompatIngress<S, B, E>
 where
-    S: futures_util::Stream<Item = Result<B, E>>,
+    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
 {
@@ -445,7 +446,7 @@ where
 
 pub fn build_put_object_compat_reader<S, B, E>(body: S, plan: PutObjectCompatIngressPlan) -> Box<dyn Reader>
 where
-    S: futures_util::Stream<Item = Result<B, E>>,
+    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
     PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
@@ -455,7 +456,7 @@ where
 
 pub fn build_put_object_ingress_source<S, B, E>(body: S, plan: PutObjectBodyPlan) -> PutObjectIngressSource<S>
 where
-    S: futures_util::Stream<Item = Result<B, E>>,
+    S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
     PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
@@ -745,6 +746,70 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_boundary_at_1mb() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy(1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_small_objects() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy(1024 * 1024 - 1, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_one_megabyte() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy(1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_encrypted_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_encrypted_requests_with_sse_customer_algorithm() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, HeaderValue::from_static("AES256"));
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_encrypted_requests_with_kms_key_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_rejects_compressible_content_types() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            rustfs_utils::http::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+
+        assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_use_zero_copy_allows_large_unencrypted_binary_objects() {
+        let mut headers = HeaderMap::new();
+        headers.insert(rustfs_utils::http::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+
+        assert!(should_use_zero_copy(2 * 1024 * 1024, &headers));
     }
 
     #[test]

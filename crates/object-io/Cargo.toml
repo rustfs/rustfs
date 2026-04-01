@@ -23,7 +23,7 @@ rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3select-api = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true ,features = ["http"]}
 http = { workspace = true }
 s3s.workspace = true
 thiserror = { workspace = true }

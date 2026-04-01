@@ -103,8 +103,8 @@ use rustfs_s3select_api::query::{Context, Query};
 use rustfs_s3select_query::get_global_db;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
+    SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
@@ -330,7 +330,7 @@ fn apply_put_request_metadata(
         metadata.insert("content-language".to_string(), content_language.to_string());
     }
     if let Some(content_type) = content_type {
-        metadata.insert("content-type".to_string(), content_type.to_string());
+        metadata.insert(CONTENT_TYPE.to_string(), content_type.to_string());
     }
     if let Some(expires) = expires {
         let mut formatted = Vec::new();
@@ -1706,7 +1706,7 @@ impl DefaultObjectUsecase {
             }
             if let Some(ct) = content_type {
                 src_info.content_type = Some(ct.clone());
-                src_info.user_defined.insert("content-type".to_string(), ct);
+                src_info.user_defined.insert(CONTENT_TYPE.to_string(), ct);
             }
         }
 
