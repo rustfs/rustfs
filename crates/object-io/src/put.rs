@@ -389,7 +389,7 @@ pub fn resolve_put_body_size(content_length: Option<i64>, headers: &HeaderMap) -
 pub fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
 
-    if size < ZERO_COPY_MIN_SIZE {
+    if size <= ZERO_COPY_MIN_SIZE {
         return false;
     }
 
