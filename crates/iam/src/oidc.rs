@@ -1192,7 +1192,7 @@ mod tests {
 
     fn start_mock_oidc_discovery_server<F>(
         build_discovery_issuer: F,
-        request_limit: usize,
+        max_requests: usize,
     ) -> (String, std::thread::JoinHandle<()>)
     where
         F: Fn(&str) -> String + Send + 'static,
@@ -1201,6 +1201,10 @@ mod tests {
         use std::io::Write;
         use std::net::{Shutdown, TcpListener};
         use std::time::{Duration, Instant};
+
+        // After the last completed response, exit if no new connection arrives within this window.
+        const IDLE_SHUTDOWN: Duration = Duration::from_millis(100);
+        const ABSOLUTE_CAP: Duration = Duration::from_millis(500);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1225,12 +1229,13 @@ mod tests {
 
             let mut seen = 0usize;
             let start = Instant::now();
+            let mut last_completed = Instant::now();
 
             loop {
-                if seen >= request_limit && start.elapsed() > Duration::from_millis(10) {
+                if seen > 0 && last_completed.elapsed() >= IDLE_SHUTDOWN {
                     break;
                 }
-                if start.elapsed() > Duration::from_millis(500) {
+                if start.elapsed() >= ABSOLUTE_CAP {
                     break;
                 }
 
@@ -1245,9 +1250,22 @@ mod tests {
 
                 seen += 1;
 
+                let mut request_bytes = Vec::new();
                 let mut buffer = [0u8; 4096];
-                let n = stream.read(&mut buffer).unwrap_or_default();
-                let request = String::from_utf8_lossy(&buffer[..n]);
+                loop {
+                    let n = stream.read(&mut buffer).unwrap_or_default();
+                    if n == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..n]);
+                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if request_bytes.len() >= 8192 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request_bytes);
                 let path = request.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
 
                 let (status, body) = if path.contains("/.well-known/openid-configuration") {
@@ -1267,6 +1285,11 @@ mod tests {
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
                 let _ = stream.shutdown(Shutdown::Both);
+                last_completed = Instant::now();
+
+                if seen >= max_requests {
+                    break;
+                }
             }
         });
 
