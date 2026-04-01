@@ -381,9 +381,9 @@ pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
 
 /// Record a legacy low-level zero-copy read operation.
 ///
-/// This helper is kept for backward compatibility with existing low-level
-/// instrumentation. It must not be treated as a high-level signal that a
-/// request selected the fast path or avoided all intermediate copies.
+/// This helper is kept only for backward compatibility with legacy dashboards.
+/// Prefer `record_io_path_selected()` and `record_io_copy_mode()` for all new
+/// instrumentation.
 ///
 /// # Arguments
 ///
@@ -408,9 +408,8 @@ pub fn record_memory_copy_saved(bytes_saved: usize) {
 
 /// Record a legacy low-level zero-copy read fallback.
 ///
-/// This helper is kept for backward compatibility with existing low-level
-/// instrumentation. It does not capture the full request-level copy-mode
-/// semantics introduced by ADR 0001.
+/// This helper is kept only for backward compatibility with legacy dashboards.
+/// Prefer `record_io_fallback()` for all new instrumentation.
 ///
 /// # Arguments
 ///
@@ -475,12 +474,11 @@ pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
     gauge!("rustfs.bytes.pool.hit.rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
 }
 
-/// Record zero-copy write operation.
+/// Record a legacy low-level zero-copy write operation.
 ///
-/// # Arguments
-///
-/// * `size_bytes` - Size of the data written in bytes
-/// * `duration_ms` - Time taken for the write operation in milliseconds
+/// This helper is kept only for backward compatibility with legacy dashboards.
+/// Prefer `record_io_path_selected()` and `record_io_copy_mode()` for all new
+/// instrumentation.
 #[inline(always)]
 pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
     counter!("rustfs.zero_copy.write.total").increment(1);
@@ -488,13 +486,10 @@ pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
     histogram!("rustfs.zero_copy.write.duration.ms").record(duration_ms);
 }
 
-/// Record zero-copy write fallback.
+/// Record a legacy low-level zero-copy write fallback.
 ///
-/// This happens when zero-copy write fails and the system falls back to regular I/O.
-///
-/// # Arguments
-///
-/// * `reason` - Reason for the fallback
+/// This helper is kept only for backward compatibility with legacy dashboards.
+/// Prefer `record_io_fallback()` for all new instrumentation.
 #[inline(always)]
 pub fn record_zero_copy_write_fallback(reason: &str) {
     counter!("rustfs.zero_copy.write.fallback.total", "reason" => reason.to_string()).increment(1);
@@ -974,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_zero_copy_read() {
+    fn test_record_legacy_zero_copy_read_metrics() {
         record_zero_copy_read(1024, 10.5);
         record_memory_copy_saved(1024);
         record_zero_copy_fallback("test");
@@ -989,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_zero_copy_write() {
+    fn test_record_legacy_zero_copy_write_metrics() {
         record_zero_copy_write(1024, 10.5);
         record_zero_copy_write_fallback("test");
         record_bytes_saved(1024);
