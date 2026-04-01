@@ -1113,7 +1113,7 @@ impl CachedGetObject {
     /// Consume a GET cache writeback payload into the cache-owned representation.
     pub fn from_get_object_cache_writeback(writeback: GetObjectCacheWriteback) -> Self {
         Self {
-            body: Arc::new(writeback.body),
+            body: writeback.body,
             content_length: writeback.content_length,
             content_type: writeback.content_type,
             e_tag: writeback.e_tag,
@@ -1907,8 +1907,9 @@ mod cached_object_tests {
 
     #[test]
     fn test_cached_get_object_from_get_object_cache_writeback() {
+        let body = Arc::new(Bytes::from("test data"));
         let obj = CachedGetObject::from_get_object_cache_writeback(GetObjectCacheWriteback {
-            body: Bytes::from("test data"),
+            body: Arc::clone(&body),
             content_length: 9,
             content_type: Some("text/plain".to_string()),
             content_encoding: Some("gzip".to_string()),
@@ -1941,6 +1942,7 @@ mod cached_object_tests {
         assert_eq!(obj.user_metadata.get("custom-key").map(String::as_str), Some("value"));
         assert_eq!(obj.e_tag.as_deref(), Some("\"abc123\""));
         assert_eq!(obj.last_modified.as_deref(), Some("2024-01-01T12:00:00Z"));
+        assert!(Arc::ptr_eq(&obj.body, &body));
     }
 
     #[test]

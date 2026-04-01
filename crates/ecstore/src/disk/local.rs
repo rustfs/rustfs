@@ -295,6 +295,7 @@ async fn read_file_pooled_chunk_from_path(file_path: PathBuf, offset: usize, len
     let mut buffer = local_chunk_fallback_pool().acquire_buffer(length).await;
     buffer.resize(length, 0);
     file.read_exact(&mut buffer[..length]).await?;
+    rustfs_io_metrics::record_local_disk_pooled_chunk("fallback", length);
     Ok(IoChunk::Pooled(PooledChunk::new(buffer, length).map_err(std::io::Error::other)?))
 }
 
@@ -406,7 +407,7 @@ async fn read_file_pooled_chunk_fallback(
     let mut buffer = local_chunk_fallback_pool().acquire_buffer(length).await;
     buffer.resize(length, 0);
     f.read_exact(&mut buffer[..length]).await?;
-
+    rustfs_io_metrics::record_local_disk_pooled_chunk("fallback", length);
     Ok(IoChunk::Pooled(PooledChunk::new(buffer, length).map_err(DiskError::other)?))
 }
 
@@ -415,17 +416,28 @@ async fn collect_chunk_stream_bytes(mut stream: BoxChunkStream, expected_len: us
         return Ok(Bytes::new());
     };
     let first = first.map_err(DiskError::from)?;
+    if matches!(first, IoChunk::Pooled(_)) {
+        rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", first.len());
+    }
     let first_bytes = first.as_bytes();
 
     let Some(second) = stream.next().await else {
         return Ok(first_bytes);
     };
+    let second = second.map_err(DiskError::from)?;
+    if matches!(second, IoChunk::Pooled(_)) {
+        rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", second.len());
+    }
     let mut buffer = BytesMut::with_capacity(expected_len);
     buffer.extend_from_slice(first_bytes.as_ref());
-    buffer.extend_from_slice(second.map_err(DiskError::from)?.as_bytes().as_ref());
+    buffer.extend_from_slice(second.as_bytes().as_ref());
 
     while let Some(chunk) = stream.next().await {
-        buffer.extend_from_slice(chunk.map_err(DiskError::from)?.as_bytes().as_ref());
+        let chunk = chunk.map_err(DiskError::from)?;
+        if matches!(chunk, IoChunk::Pooled(_)) {
+            rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", chunk.len());
+        }
+        buffer.extend_from_slice(chunk.as_bytes().as_ref());
     }
 
     Ok(buffer.freeze())

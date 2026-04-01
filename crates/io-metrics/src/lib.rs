@@ -354,6 +354,21 @@ pub fn record_local_disk_active_mmap_bytes(active_bytes: usize) {
     gauge!(metric_names::data_plane::LOCAL_DISK_ACTIVE_MMAP_BYTES).set(active_bytes as f64);
 }
 
+/// Record pooled chunk usage in LocalDisk compatibility paths.
+#[inline(always)]
+pub fn record_local_disk_pooled_chunk(source: &'static str, size_bytes: usize) {
+    counter!(
+        metric_names::data_plane::LOCAL_DISK_POOLED_CHUNKS_TOTAL,
+        "source" => source
+    )
+    .increment(1);
+    counter!(
+        metric_names::data_plane::LOCAL_DISK_POOLED_BYTES_TOTAL,
+        "source" => source
+    )
+    .increment(size_bytes as u64);
+}
+
 /// Record an attempted PUT fast path.
 #[inline(always)]
 pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
@@ -944,6 +959,12 @@ mod tests {
     fn test_record_local_disk_active_mmap_bytes() {
         record_local_disk_active_mmap_bytes(4096);
         record_local_disk_active_mmap_bytes(0);
+    }
+
+    #[test]
+    fn test_record_local_disk_pooled_chunk() {
+        record_local_disk_pooled_chunk("fallback", 4096);
+        record_local_disk_pooled_chunk("compat_collect", 8192);
     }
 
     #[test]

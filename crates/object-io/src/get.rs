@@ -80,6 +80,29 @@ pub fn build_memory_blob(buf: Bytes, response_content_length: i64, optimal_buffe
     )))
 }
 
+#[derive(Clone)]
+pub struct FrozenGetObjectBody {
+    body: Arc<Bytes>,
+}
+
+impl FrozenGetObjectBody {
+    pub fn new(body: Bytes) -> Self {
+        Self { body: Arc::new(body) }
+    }
+
+    pub fn shared_body(&self) -> &Arc<Bytes> {
+        &self.body
+    }
+
+    pub fn into_shared_body(self) -> Arc<Bytes> {
+        self.body
+    }
+
+    pub fn build_blob(&self, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        build_memory_blob((*self.body).clone(), response_content_length, optimal_buffer_size)
+    }
+}
+
 pub fn build_reader_blob<R>(reader: R, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob>
 where
     R: AsyncRead + Send + Sync + 'static,
@@ -209,7 +232,7 @@ pub enum GetObjectBodyPlan {
 }
 
 pub struct GetObjectCacheWriteback {
-    pub body: Bytes,
+    pub body: Arc<Bytes>,
     pub content_length: i64,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
@@ -474,8 +497,9 @@ pub fn plan_get_object_body(
 }
 
 pub fn build_get_object_cache_writeback(info: &ObjectInfo, body: Bytes, content_length: i64) -> GetObjectCacheWriteback {
+    let body = FrozenGetObjectBody::new(body);
     GetObjectCacheWriteback {
-        body,
+        body: body.into_shared_body(),
         content_length,
         content_type: info.content_type.clone(),
         content_encoding: info.content_encoding.clone(),
@@ -529,11 +553,15 @@ where
             tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf)
                 .await
                 .map_err(MaterializeGetObjectBodyError::CacheRead)?;
-            let body = Bytes::from(buf);
+            let body = FrozenGetObjectBody::new(Bytes::from(buf));
 
             Ok(GetObjectBodyMaterialization {
-                body: build_memory_blob(body.clone(), response_content_length, optimal_buffer_size),
-                cache_writeback: Some(build_get_object_cache_writeback(info, body, response_content_length)),
+                body: body.build_blob(response_content_length, optimal_buffer_size),
+                cache_writeback: Some(build_get_object_cache_writeback(
+                    info,
+                    body.shared_body().as_ref().clone(),
+                    response_content_length,
+                )),
                 plan,
             })
         }
@@ -542,10 +570,10 @@ where
             tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf)
                 .await
                 .map_err(MaterializeGetObjectBodyError::EncryptedRead)?;
-            let body = Bytes::from(buf);
+            let body = FrozenGetObjectBody::new(Bytes::from(buf));
 
             Ok(GetObjectBodyMaterialization {
-                body: build_memory_blob(body, response_content_length, optimal_buffer_size),
+                body: body.build_blob(response_content_length, optimal_buffer_size),
                 cache_writeback: None,
                 plan,
             })
@@ -553,7 +581,7 @@ where
         GetObjectBodyPlan::BufferSeekable => {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             let body = match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
-                Ok(_) => build_memory_blob(Bytes::from(buf), response_content_length, optimal_buffer_size),
+                Ok(_) => FrozenGetObjectBody::new(Bytes::from(buf)).build_blob(response_content_length, optimal_buffer_size),
                 Err(_) => build_reader_blob(final_stream, response_content_length, optimal_buffer_size),
             };
 
@@ -1198,7 +1226,7 @@ mod tests {
 
         let writeback = build_get_object_cache_writeback(&info, Bytes::from_static(b"abc"), 3);
 
-        assert_eq!(writeback.body, Bytes::from_static(b"abc"));
+        assert_eq!(*writeback.body, Bytes::from_static(b"abc"));
         assert_eq!(writeback.content_length, 3);
         assert_eq!(writeback.content_type.as_deref(), Some("application/octet-stream"));
         assert_eq!(writeback.e_tag.as_deref(), Some("abc123"));
@@ -1220,7 +1248,7 @@ mod tests {
         let writeback = finalize_get_object_cache_writeback(
             &info,
             GetObjectCacheWriteback {
-                body: Bytes::from_static(b"abc"),
+                body: Arc::new(Bytes::from_static(b"abc")),
                 content_length: 3,
                 content_type: None,
                 content_encoding: None,
@@ -1243,6 +1271,14 @@ mod tests {
         assert_eq!(writeback.content_language.as_deref(), Some("en-US"));
         assert_eq!(writeback.expires.as_deref(), Some("1970-01-01T00:00:00Z"));
         assert_eq!(writeback.user_metadata.get("custom").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn frozen_get_object_body_reuses_same_shared_bytes_for_cache_writeback() {
+        let frozen = FrozenGetObjectBody::new(Bytes::from_static(b"abc"));
+        let shared = Arc::clone(frozen.shared_body());
+        assert_eq!(*shared, Bytes::from_static(b"abc"));
+        assert!(Arc::ptr_eq(&shared, frozen.shared_body()));
     }
 
     #[test]
