@@ -369,6 +369,14 @@ pub fn record_local_disk_pooled_chunk(source: &'static str, size_bytes: usize) {
     .increment(size_bytes as u64);
 }
 
+/// Record a compatibility chunk-stream aggregation performed by `read_file_zero_copy()`.
+#[inline(always)]
+pub fn record_local_disk_compat_collect(chunk_count: usize, total_bytes: usize) {
+    counter!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_TOTAL).increment(1);
+    histogram!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_CHUNKS).record(chunk_count as f64);
+    histogram!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_BYTES).record(total_bytes as f64);
+}
+
 /// Record an attempted PUT fast path.
 #[inline(always)]
 pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
@@ -377,6 +385,24 @@ pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
     if size_bytes > 0 {
         histogram!(metric_names::data_plane::PUT_FAST_PATH_ATTEMPT_SIZE_BYTES).record(size_bytes as f64);
     }
+}
+
+/// Record which transformed PUT pipeline was selected.
+#[inline(always)]
+pub fn record_put_transform_selected(kind: &'static str, io_path: IoPath, size_bytes: usize) {
+    counter!(
+        metric_names::data_plane::PUT_TRANSFORM_SELECTED_TOTAL,
+        "kind" => kind,
+        "mode" => io_path.as_str()
+    )
+    .increment(1);
+
+    histogram!(
+        metric_names::data_plane::PUT_TRANSFORM_SIZE_BYTES,
+        "kind" => kind,
+        "mode" => io_path.as_str()
+    )
+    .record(size_bytes as f64);
 }
 
 // ============================================================================
@@ -892,9 +918,20 @@ mod tests {
     }
 
     #[test]
+    fn test_record_local_disk_compat_collect() {
+        record_local_disk_compat_collect(3, 16384);
+    }
+
+    #[test]
     fn test_record_put_object_attempted_fast_path() {
         record_put_object_attempted_fast_path(1024 * 1024);
         record_put_object_attempted_fast_path(0);
+    }
+
+    #[test]
+    fn test_record_put_transform_selected() {
+        record_put_transform_selected("compression", IoPath::Fast, 2048);
+        record_put_transform_selected("compression_encryption", IoPath::Legacy, 4096);
     }
 
     #[test]

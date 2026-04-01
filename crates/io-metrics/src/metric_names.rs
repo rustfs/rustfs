@@ -34,9 +34,24 @@ pub mod data_plane {
     /// Total pooled bytes produced or consumed by LocalDisk compatibility paths.
     pub const LOCAL_DISK_POOLED_BYTES_TOTAL: &str = "rustfs.io.local_disk.pooled_bytes.total";
 
+    /// Total number of compatibility chunk-stream aggregations performed for LocalDisk reads.
+    pub const LOCAL_DISK_COMPAT_COLLECT_TOTAL: &str = "rustfs.io.local_disk.compat_collect.total";
+
+    /// Chunk count distribution for LocalDisk compatibility chunk aggregation.
+    pub const LOCAL_DISK_COMPAT_COLLECT_CHUNKS: &str = "rustfs.io.local_disk.compat_collect.chunks";
+
+    /// Byte distribution for LocalDisk compatibility chunk aggregation.
+    pub const LOCAL_DISK_COMPAT_COLLECT_BYTES: &str = "rustfs.io.local_disk.compat_collect.bytes";
+
     /// Total number of attempted PUT fast paths.
     pub const PUT_FAST_PATH_ATTEMPTS_TOTAL: &str = "rustfs.io.put.fast_path.attempts_total";
 
     /// Size distribution for attempted PUT fast paths.
     pub const PUT_FAST_PATH_ATTEMPT_SIZE_BYTES: &str = "rustfs.io.put.fast_path.attempt.size.bytes";
+
+    /// Total number of transformed PUT selections grouped by transform kind and ingress path.
+    pub const PUT_TRANSFORM_SELECTED_TOTAL: &str = "rustfs.io.put.transform.selected_total";
+
+    /// Size distribution for transformed PUT selections.
+    pub const PUT_TRANSFORM_SIZE_BYTES: &str = "rustfs.io.put.transform.size.bytes";
 }

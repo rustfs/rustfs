@@ -19,8 +19,8 @@ use crate::storage::concurrency::{self, get_buffer_size_opt_in};
 use hashbrown::HashMap;
 use rustfs_object_io::get::{
     CachedGetObjectSource as ObjectIoCachedGetObjectSource, GetObjectBodyPlan as ObjectIoGetObjectBodyPlan,
-    GetObjectCacheWriteback, GetObjectFlowResult, GetObjectResponseMode,
-    MaterializeGetObjectBodyError as ObjectIoMaterializeGetObjectBodyError,
+    GetObjectCacheWriteback, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
+    GetObjectResponseMode, MaterializeGetObjectBodyError as ObjectIoMaterializeGetObjectBodyError,
     build_cached_get_object_flow_result_from_source as object_io_build_cached_get_object_flow_result_from_source,
     finalize_get_object_cache_writeback as object_io_finalize_get_object_cache_writeback,
     materialize_get_object_body as object_io_materialize_get_object_body, plan_get_object_body as object_io_plan_get_object_body,
@@ -198,12 +198,15 @@ pub(super) async fn maybe_get_cached_get_object_flow_result(
 
     let cached = manager.get_cached_object(cache_key).await?;
     let cache_serve_duration = request_start.elapsed();
+    let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::cache_served();
 
     debug!("Serving object from response cache: {} (latency: {:?})", cache_key, cache_serve_duration);
 
-    rustfs_io_metrics::record_get_object_cache_served(cache_serve_duration.as_secs_f64(), cached.body.len());
-    rustfs_io_metrics::record_io_path_selected("get", rustfs_io_metrics::IoPath::Fast);
-    rustfs_io_metrics::record_io_copy_mode("get", rustfs_io_metrics::CopyMode::SharedBytes, cached.body.len());
+    if metric_contract.record_cache_served_metric {
+        rustfs_io_metrics::record_get_object_cache_served(cache_serve_duration.as_secs_f64(), cached.body.len());
+    }
+    rustfs_io_metrics::record_io_path_selected("get", metric_contract.io_path);
+    rustfs_io_metrics::record_io_copy_mode("get", metric_contract.copy_mode, cached.body.len());
 
     manager.record_transfer(cached.content_length as u64, Duration::from_micros(1));
 
@@ -217,7 +220,24 @@ pub(super) async fn maybe_get_cached_get_object_flow_result(
     ))
 }
 
-pub(super) fn spawn_get_object_cache_writeback(cache_key: &str, writeback: GetObjectCacheWriteback) {
+pub(super) struct GetObjectBodyAdapterOutput {
+    pub(super) body: Option<StreamingBlob>,
+    pub(super) body_plan: ObjectIoGetObjectBodyPlan,
+    pub(super) cache_writeback: Option<GetObjectCacheWriteback>,
+}
+
+pub(super) fn spawn_get_object_cache_writeback(
+    cache_key: &str,
+    writeback: GetObjectCacheWriteback,
+    metric_contract: ObjectIoGetObjectDataPlaneMetricContract,
+) {
+    debug_assert_eq!(
+        metric_contract.request_source,
+        rustfs_object_io::get::GetObjectDataPlaneRequestSource::Disk
+    );
+    debug_assert!(!metric_contract.record_cache_served_metric);
+    debug_assert!(metric_contract.record_cache_writeback_metric);
+
     let cached_response = CachedGetObject::from_get_object_cache_writeback(writeback);
 
     let cache_key_clone = cache_key.to_string();
@@ -227,7 +247,9 @@ pub(super) fn spawn_get_object_cache_writeback(cache_key: &str, writeback: GetOb
         debug!("Object cached successfully with metadata: {}", cache_key_clone);
     });
 
-    rustfs_io_metrics::record_object_cache_writeback();
+    if metric_contract.record_cache_writeback_metric {
+        rustfs_io_metrics::record_object_cache_writeback();
+    }
 }
 
 pub(super) async fn build_get_object_body_adapter<R>(
@@ -237,7 +259,7 @@ pub(super) async fn build_get_object_body_adapter<R>(
     response_content_length: i64,
     optimal_buffer_size: usize,
     cache_eligibility: rustfs_concurrency::GetObjectCacheEligibility,
-) -> S3Result<Option<StreamingBlob>>
+) -> S3Result<GetObjectBodyAdapterOutput>
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
@@ -279,16 +301,17 @@ where
                 }
             })?;
 
-    if let Some(writeback) = materialized.cache_writeback {
-        let writeback = object_io_finalize_get_object_cache_writeback(
-            info,
-            writeback,
-            filter_object_metadata(&info.user_defined).unwrap_or_default(),
-        );
-        spawn_get_object_cache_writeback(cache_key, writeback);
-    }
-
-    Ok(materialized.body)
+    Ok(GetObjectBodyAdapterOutput {
+        body: materialized.body,
+        body_plan: materialized.plan,
+        cache_writeback: materialized.cache_writeback.map(|writeback| {
+            object_io_finalize_get_object_cache_writeback(
+                info,
+                writeback,
+                filter_object_metadata(&info.user_defined).unwrap_or_default(),
+            )
+        }),
+    })
 }
 
 pub(super) fn finalize_get_object_completion(
@@ -298,16 +321,12 @@ pub(super) fn finalize_get_object_completion(
     total_duration: Duration,
     response_content_length: i64,
     optimal_buffer_size: usize,
-    copy_mode_override: Option<rustfs_io_metrics::CopyMode>,
+    metric_contract: ObjectIoGetObjectDataPlaneMetricContract,
 ) {
     rustfs_io_metrics::record_get_object_completion(total_duration.as_secs_f64(), response_content_length, optimal_buffer_size);
 
     rustfs_io_metrics::record_get_object(total_duration.as_millis() as f64, response_content_length, false);
-    rustfs_io_metrics::record_io_copy_mode(
-        "get",
-        copy_mode_override.unwrap_or(rustfs_io_metrics::CopyMode::SingleCopy),
-        response_content_length.max(0) as usize,
-    );
+    rustfs_io_metrics::record_io_copy_mode("get", metric_contract.copy_mode, response_content_length.max(0) as usize);
 
     if wrapper.is_timeout() {
         warn!(

@@ -15,7 +15,7 @@
 use super::DeadlockRequestGuard;
 use super::app_adapters::{
     bucket_prefix_versioning_enabled, build_get_object_body_adapter, finalize_get_object_completion,
-    finalize_get_object_strategy_runtime, maybe_get_cached_get_object_flow_result,
+    finalize_get_object_strategy_runtime, maybe_get_cached_get_object_flow_result, spawn_get_object_cache_writeback,
 };
 use super::get_object_zero_copy::{GetObjectPreparedRead, prepare_get_object_read_execution};
 use super::types::GetObjectRequestContext;
@@ -25,8 +25,9 @@ use crate::storage::options::filter_object_metadata;
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
 use rustfs_object_io::get::{
-    GetObjectBodySource, GetObjectFlowResult, GetObjectOutputContext, GetObjectReadSetup,
-    build_chunk_blob as object_io_build_chunk_blob,
+    GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodySource,
+    GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult, GetObjectOutputContext,
+    GetObjectReadSetup, build_chunk_blob as object_io_build_chunk_blob,
     build_cors_wrapped_get_object_flow_result as object_io_build_cors_wrapped_get_object_flow_result,
     build_get_object_checksums as object_io_build_get_object_checksums,
     build_get_object_output_context as object_io_build_get_object_output_context,
@@ -79,7 +80,7 @@ pub(super) async fn build_get_object_output_context(
     base_buffer_size: usize,
     part_number: Option<usize>,
     versioned: bool,
-) -> S3Result<GetObjectOutputContext> {
+) -> S3Result<(GetObjectOutputContext, ObjectIoGetObjectDataPlaneMetricContract)> {
     let (io_strategy, optimal_buffer_size) = finalize_get_object_strategy_runtime(
         base_buffer_size,
         manager,
@@ -94,7 +95,7 @@ pub(super) async fn build_get_object_output_context(
         concurrent_requests,
     );
 
-    let (body, copy_mode_override) = match body_source {
+    let (body, metric_contract) = match body_source {
         GetObjectBodySource::Reader(final_stream) => {
             let cache_eligibility = manager.get_object_cache_eligibility(
                 io_strategy.cache_writeback_enabled,
@@ -103,50 +104,63 @@ pub(super) async fn build_get_object_output_context(
                 encryption_applied,
                 response_content_length,
             );
-            (
-                build_get_object_body_adapter(
-                    final_stream,
-                    &info,
-                    cache_key,
-                    response_content_length,
-                    optimal_buffer_size,
-                    cache_eligibility,
-                )
-                .await?,
-                None,
+            let adapter_output = build_get_object_body_adapter(
+                final_stream,
+                &info,
+                cache_key,
+                response_content_length,
+                optimal_buffer_size,
+                cache_eligibility,
             )
+            .await?;
+            let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::disk(
+                rustfs_io_metrics::IoPath::Legacy,
+                rustfs_io_metrics::CopyMode::SingleCopy,
+                adapter_output.body_plan,
+            );
+            if let Some(writeback) = adapter_output.cache_writeback {
+                spawn_get_object_cache_writeback(cache_key, writeback, metric_contract);
+            }
+
+            (adapter_output.body, metric_contract)
         }
         GetObjectBodySource::Chunk {
             stream: chunk_stream,
             path,
             copy_mode,
-        } => (
-            object_io_build_chunk_blob(chunk_stream),
-            Some(object_io_chunk_body_data_plane_labels(path, copy_mode).1),
-        ),
+        } => {
+            let (io_path, copy_mode) = object_io_chunk_body_data_plane_labels(path, copy_mode);
+            (
+                object_io_build_chunk_blob(chunk_stream),
+                ObjectIoGetObjectDataPlaneMetricContract::disk(io_path, copy_mode, ObjectIoGetObjectBodyPlan::Stream),
+            )
+        }
     };
 
     let checksums = object_io_build_get_object_checksums(&info, &request_context.headers, part_number, rs.as_ref())
         .map_err(ApiError::from)?;
     let filtered_metadata = filter_object_metadata(&info.user_defined);
 
-    Ok(object_io_build_get_object_output_context(
-        body,
-        info,
-        event_info,
-        content_type,
-        last_modified,
-        response_content_length,
-        content_range,
-        server_side_encryption,
-        sse_customer_algorithm,
-        sse_customer_key_md5,
-        ssekms_key_id,
-        &checksums,
-        filtered_metadata,
-        versioned,
-        optimal_buffer_size,
-        copy_mode_override,
+    Ok((
+        object_io_build_get_object_output_context(
+            body,
+            info,
+            event_info,
+            content_type,
+            last_modified,
+            response_content_length,
+            content_range,
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            ssekms_key_id,
+            &checksums,
+            filtered_metadata,
+            versioned,
+            optimal_buffer_size,
+            Some(metric_contract.copy_mode),
+        ),
+        metric_contract,
     ))
 }
 
@@ -220,7 +234,7 @@ pub(super) async fn run_get_object_flow(
     } = read_setup;
 
     let versioned = bucket_prefix_versioning_enabled(&bucket, &key).await;
-    let output_context = build_get_object_output_context(
+    let (output_context, metric_contract) = build_get_object_output_context(
         &request_context,
         &cache_key,
         manager,
@@ -250,7 +264,6 @@ pub(super) async fn run_get_object_flow(
     .await?;
     let response_content_length = output_context.response_content_length;
     let optimal_buffer_size = output_context.optimal_buffer_size;
-    let copy_mode_override = output_context.copy_mode_override;
 
     let total_duration = request_start.elapsed();
     finalize_get_object_completion(
@@ -260,7 +273,7 @@ pub(super) async fn run_get_object_flow(
         total_duration,
         response_content_length,
         optimal_buffer_size,
-        copy_mode_override,
+        metric_contract,
     );
 
     Ok(object_io_build_cors_wrapped_get_object_flow_result(output_context, version_id_for_event))

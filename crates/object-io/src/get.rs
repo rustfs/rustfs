@@ -141,9 +141,9 @@ pub fn chunk_body_data_plane_labels(
 pub fn get_object_chunk_fast_path_guard(
     has_sse_customer_key: bool,
     has_sse_customer_key_md5: bool,
-) -> Result<(), rustfs_io_metrics::FallbackReason> {
+) -> Result<(), ChunkReadFallback> {
     if has_sse_customer_key || has_sse_customer_key_md5 {
-        return Err(rustfs_io_metrics::FallbackReason::EncryptionEnabled);
+        return Err(ChunkReadFallback::read_setup(rustfs_io_metrics::FallbackReason::EncryptionEnabled));
     }
 
     Ok(())
@@ -229,6 +229,47 @@ pub enum GetObjectBodyPlan {
     BufferEncrypted,
     BufferSeekable,
     Stream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetObjectDataPlaneRequestSource {
+    CacheServed,
+    Disk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetObjectDataPlaneMetricContract {
+    pub request_source: GetObjectDataPlaneRequestSource,
+    pub io_path: rustfs_io_metrics::IoPath,
+    pub copy_mode: rustfs_io_metrics::CopyMode,
+    pub record_cache_served_metric: bool,
+    pub record_cache_writeback_metric: bool,
+}
+
+impl GetObjectDataPlaneMetricContract {
+    pub fn cache_served() -> Self {
+        Self {
+            request_source: GetObjectDataPlaneRequestSource::CacheServed,
+            io_path: rustfs_io_metrics::IoPath::Fast,
+            copy_mode: rustfs_io_metrics::CopyMode::SharedBytes,
+            record_cache_served_metric: true,
+            record_cache_writeback_metric: false,
+        }
+    }
+
+    pub fn disk(
+        io_path: rustfs_io_metrics::IoPath,
+        copy_mode: rustfs_io_metrics::CopyMode,
+        body_plan: GetObjectBodyPlan,
+    ) -> Self {
+        Self {
+            request_source: GetObjectDataPlaneRequestSource::Disk,
+            io_path,
+            copy_mode,
+            record_cache_served_metric: false,
+            record_cache_writeback_metric: matches!(body_plan, GetObjectBodyPlan::CacheWriteback),
+        }
+    }
 }
 
 pub struct GetObjectCacheWriteback {
@@ -599,9 +640,37 @@ where
     }
 }
 
-pub fn plan_legacy_read(
+fn resolve_requested_range(
     info: &ObjectInfo,
     mut rs: Option<HTTPRangeSpec>,
+    part_number: Option<usize>,
+) -> Option<HTTPRangeSpec> {
+    if let Some(part_number) = part_number
+        && rs.is_none()
+    {
+        rs = HTTPRangeSpec::from_object_info(info, part_number);
+    }
+
+    rs
+}
+
+fn resolve_response_range(
+    total_size: i64,
+    rs: Option<HTTPRangeSpec>,
+) -> std::io::Result<(Option<HTTPRangeSpec>, i64, Option<String>)> {
+    let Some(range_spec) = rs else {
+        return Ok((None, total_size, None));
+    };
+
+    let (start, length) = range_spec.get_offset_length(total_size)?;
+    let content_range = Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size));
+
+    Ok((Some(range_spec), length, content_range))
+}
+
+pub fn plan_legacy_read(
+    info: &ObjectInfo,
+    rs: Option<HTTPRangeSpec>,
     part_number: Option<usize>,
 ) -> std::io::Result<LegacyReadPlan> {
     let content_type = info
@@ -609,20 +678,9 @@ pub fn plan_legacy_read(
         .as_ref()
         .and_then(|content_type| ContentType::from_str(content_type).ok());
     let last_modified = info.mod_time.map(Timestamp::from);
-
-    if let Some(part_number) = part_number
-        && rs.is_none()
-    {
-        rs = HTTPRangeSpec::from_object_info(info, part_number);
-    }
-
+    let rs = resolve_requested_range(info, rs, part_number);
     let total_size = info.get_actual_size()?;
-    let (response_content_length, content_range) = if let Some(range_spec) = &rs {
-        let (start, length) = range_spec.get_offset_length(total_size)?;
-        (length, Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size)))
-    } else {
-        (total_size, None)
-    };
+    let (rs, response_content_length, content_range) = resolve_response_range(total_size, rs)?;
 
     Ok(LegacyReadPlan {
         rs,
@@ -818,10 +876,30 @@ pub struct ChunkReadPlan {
     pub content_range: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkReadFallback {
+    pub stage: rustfs_io_metrics::IoStage,
+    pub reason: rustfs_io_metrics::FallbackReason,
+}
+
+impl ChunkReadFallback {
+    pub const fn new(stage: rustfs_io_metrics::IoStage, reason: rustfs_io_metrics::FallbackReason) -> Self {
+        Self { stage, reason }
+    }
+
+    pub const fn read_setup(reason: rustfs_io_metrics::FallbackReason) -> Self {
+        Self::new(rustfs_io_metrics::IoStage::ReadSetup, reason)
+    }
+
+    pub const fn range_guard(reason: rustfs_io_metrics::FallbackReason) -> Self {
+        Self::new(rustfs_io_metrics::IoStage::RangeGuard, reason)
+    }
+}
+
 #[derive(Debug)]
 pub enum ChunkReadDecision {
     Eligible(ChunkReadPlan),
-    Fallback(rustfs_io_metrics::FallbackReason),
+    Fallback(ChunkReadFallback),
 }
 
 #[derive(Debug)]
@@ -843,10 +921,28 @@ impl From<StorageError> for ChunkReadPlanError {
     }
 }
 
+pub fn get_object_chunk_range_guard(rs: Option<&HTTPRangeSpec>) -> Result<(), ChunkReadFallback> {
+    let Some(range_spec) = rs else {
+        return Ok(());
+    };
+
+    let unsupported = if range_spec.is_suffix_length {
+        range_spec.end != -1
+    } else {
+        range_spec.start < 0 || range_spec.end < -1 || (range_spec.end != -1 && range_spec.end < range_spec.start)
+    };
+
+    if unsupported {
+        return Err(ChunkReadFallback::range_guard(rustfs_io_metrics::FallbackReason::RangeNotSupported));
+    }
+
+    Ok(())
+}
+
 pub fn plan_chunk_read(
     info: &ObjectInfo,
     version_id_missing: bool,
-    mut rs: Option<HTTPRangeSpec>,
+    rs: Option<HTTPRangeSpec>,
     part_number: Option<usize>,
 ) -> Result<ChunkReadDecision, ChunkReadPlanError> {
     if info.delete_marker {
@@ -858,11 +954,15 @@ pub fn plan_chunk_read(
 
     let (_, is_compressed) = info.is_compressed_ok()?;
     if is_compressed {
-        return Ok(ChunkReadDecision::Fallback(rustfs_io_metrics::FallbackReason::CompressionEnabled));
+        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
+            rustfs_io_metrics::FallbackReason::CompressionEnabled,
+        )));
     }
 
     if info.transitioned_object.status == TRANSITION_COMPLETE {
-        return Ok(ChunkReadDecision::Fallback(rustfs_io_metrics::FallbackReason::NonLocalBackend));
+        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
+            rustfs_io_metrics::FallbackReason::NonLocalBackend,
+        )));
     }
 
     let has_encryption_metadata = info.user_defined.contains_key("x-rustfs-encryption-key")
@@ -871,13 +971,14 @@ pub fn plan_chunk_read(
             .user_defined
             .contains_key("x-amz-server-side-encryption-customer-algorithm");
     if has_encryption_metadata {
-        return Ok(ChunkReadDecision::Fallback(rustfs_io_metrics::FallbackReason::EncryptionEnabled));
+        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
+            rustfs_io_metrics::FallbackReason::EncryptionEnabled,
+        )));
     }
 
-    if let Some(part_number) = part_number
-        && rs.is_none()
-    {
-        rs = HTTPRangeSpec::from_object_info(info, part_number);
+    let rs = resolve_requested_range(info, rs, part_number);
+    if let Err(fallback) = get_object_chunk_range_guard(rs.as_ref()) {
+        return Ok(ChunkReadDecision::Fallback(fallback));
     }
 
     let content_type = info
@@ -886,12 +987,7 @@ pub fn plan_chunk_read(
         .and_then(|content_type| ContentType::from_str(content_type).ok());
     let last_modified = info.mod_time.map(Timestamp::from);
     let total_size = info.get_actual_size()?;
-    let (response_content_length, content_range) = if let Some(range_spec) = &rs {
-        let (start, length) = range_spec.get_offset_length(total_size)?;
-        (length, Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size)))
-    } else {
-        (total_size, None)
-    };
+    let (rs, response_content_length, content_range) = resolve_response_range(total_size, rs)?;
 
     Ok(ChunkReadDecision::Eligible(ChunkReadPlan {
         rs,
@@ -1011,12 +1107,36 @@ mod tests {
     #[test]
     fn get_object_chunk_fast_path_guard_rejects_ssec_requests() {
         let err = get_object_chunk_fast_path_guard(true, false).unwrap_err();
-        assert_eq!(err, rustfs_io_metrics::FallbackReason::EncryptionEnabled);
+        assert_eq!(
+            err,
+            ChunkReadFallback {
+                stage: rustfs_io_metrics::IoStage::ReadSetup,
+                reason: rustfs_io_metrics::FallbackReason::EncryptionEnabled,
+            }
+        );
     }
 
     #[test]
     fn get_object_chunk_fast_path_guard_allows_plain_request() {
         assert!(get_object_chunk_fast_path_guard(false, false).is_ok());
+    }
+
+    #[test]
+    fn get_object_chunk_range_guard_rejects_invalid_suffix_range() {
+        let err = get_object_chunk_range_guard(Some(&HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 4,
+            end: 0,
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ChunkReadFallback {
+                stage: rustfs_io_metrics::IoStage::RangeGuard,
+                reason: rustfs_io_metrics::FallbackReason::RangeNotSupported,
+            }
+        );
     }
 
     #[test]
@@ -1038,7 +1158,10 @@ mod tests {
         assert!(
             matches!(
                 decision,
-                ChunkReadDecision::Fallback(rustfs_io_metrics::FallbackReason::CompressionEnabled)
+                ChunkReadDecision::Fallback(ChunkReadFallback {
+                    stage: rustfs_io_metrics::IoStage::ReadSetup,
+                    reason: rustfs_io_metrics::FallbackReason::CompressionEnabled,
+                })
             ),
             "unexpected decision: {:?}",
             decision
@@ -1053,8 +1176,70 @@ mod tests {
         let decision = plan_chunk_read(&info, true, None, None).unwrap();
         assert!(matches!(
             decision,
-            ChunkReadDecision::Fallback(rustfs_io_metrics::FallbackReason::NonLocalBackend)
+            ChunkReadDecision::Fallback(ChunkReadFallback {
+                stage: rustfs_io_metrics::IoStage::ReadSetup,
+                reason: rustfs_io_metrics::FallbackReason::NonLocalBackend,
+            })
         ));
+    }
+
+    #[test]
+    fn plan_chunk_read_returns_range_guard_fallback_for_invalid_range() {
+        let info = ObjectInfo {
+            size: 16,
+            actual_size: 16,
+            ..Default::default()
+        };
+
+        let decision = plan_chunk_read(
+            &info,
+            true,
+            Some(HTTPRangeSpec {
+                is_suffix_length: false,
+                start: -1,
+                end: 4,
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decision,
+            ChunkReadDecision::Fallback(ChunkReadFallback {
+                stage: rustfs_io_metrics::IoStage::RangeGuard,
+                reason: rustfs_io_metrics::FallbackReason::RangeNotSupported,
+            })
+        ));
+    }
+
+    #[test]
+    fn plan_chunk_read_allows_suffix_range() {
+        let info = ObjectInfo {
+            size: 16,
+            actual_size: 16,
+            ..Default::default()
+        };
+
+        let decision = plan_chunk_read(
+            &info,
+            true,
+            Some(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: 4,
+                end: -1,
+            }),
+            None,
+        )
+        .unwrap();
+
+        let ChunkReadDecision::Eligible(plan) = decision else {
+            panic!("expected eligible plan");
+        };
+        let rs = plan.rs.expect("suffix range should be preserved");
+        assert!(rs.is_suffix_length);
+        assert_eq!(rs.start, 4);
+        assert_eq!(plan.response_content_length, 4);
+        assert_eq!(plan.content_range.as_deref(), Some("bytes 12-15/16"));
     }
 
     #[test]
@@ -1167,6 +1352,32 @@ mod tests {
         );
 
         assert_eq!(plan, GetObjectBodyPlan::CacheWriteback);
+    }
+
+    #[test]
+    fn cache_served_metric_contract_is_mutually_exclusive_with_cache_writeback() {
+        let contract = GetObjectDataPlaneMetricContract::cache_served();
+
+        assert_eq!(contract.request_source, GetObjectDataPlaneRequestSource::CacheServed);
+        assert_eq!(contract.io_path, rustfs_io_metrics::IoPath::Fast);
+        assert_eq!(contract.copy_mode, rustfs_io_metrics::CopyMode::SharedBytes);
+        assert!(contract.record_cache_served_metric);
+        assert!(!contract.record_cache_writeback_metric);
+    }
+
+    #[test]
+    fn disk_metric_contract_can_mark_cache_writeback_without_reclassifying_request_source() {
+        let contract = GetObjectDataPlaneMetricContract::disk(
+            rustfs_io_metrics::IoPath::Legacy,
+            rustfs_io_metrics::CopyMode::SingleCopy,
+            GetObjectBodyPlan::CacheWriteback,
+        );
+
+        assert_eq!(contract.request_source, GetObjectDataPlaneRequestSource::Disk);
+        assert_eq!(contract.io_path, rustfs_io_metrics::IoPath::Legacy);
+        assert_eq!(contract.copy_mode, rustfs_io_metrics::CopyMode::SingleCopy);
+        assert!(!contract.record_cache_served_metric);
+        assert!(contract.record_cache_writeback_metric);
     }
 
     #[test]

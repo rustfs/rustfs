@@ -253,8 +253,8 @@ pub(super) async fn prepare_get_object_read_execution<'a>(
                     .await?
             }
         },
-        Err(reason) => {
-            rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::ReadSetup, reason);
+        Err(fallback) => {
+            rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
             prepare_get_object_read(request_context, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?
         }
     };
@@ -286,8 +286,8 @@ pub(super) async fn prepare_get_object_chunk_read(
 
     let plan = match object_io_plan_chunk_read(&info, opts.version_id.is_none(), rs.clone(), part_number) {
         Ok(ChunkReadDecision::Eligible(plan)) => plan,
-        Ok(ChunkReadDecision::Fallback(reason)) => {
-            rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::ReadSetup, reason);
+        Ok(ChunkReadDecision::Fallback(fallback)) => {
+            rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
             return Ok(None);
         }
         Err(ChunkReadPlanError::NoSuchKey) => return Err(S3Error::new(S3ErrorCode::NoSuchKey)),
