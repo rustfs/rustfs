@@ -117,6 +117,11 @@ pub fn build_chunk_blob(chunk_stream: BoxChunkStream) -> Option<StreamingBlob> {
     Some(StreamingBlob::wrap(chunk_stream.map(|result| result.map(|chunk| chunk.as_bytes()))))
 }
 
+/// ADR-facing alias for the chunk-stream to HTTP body bridge.
+pub fn build_chunk_http_body(chunk_stream: BoxChunkStream) -> Option<StreamingBlob> {
+    build_chunk_blob(chunk_stream)
+}
+
 pub fn map_chunk_copy_mode(copy_mode: GetObjectChunkCopyMode) -> rustfs_io_metrics::CopyMode {
     match copy_mode {
         GetObjectChunkCopyMode::TrueZeroCopy => rustfs_io_metrics::CopyMode::TrueZeroCopy,

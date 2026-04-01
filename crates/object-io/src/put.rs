@@ -30,6 +30,7 @@ use rustfs_utils::http::headers::{
 use s3s::dto::{ChecksumAlgorithm, PutObjectInput, ServerSideEncryption};
 use s3s::{S3Error, s3_error};
 use std::collections::HashMap;
+use std::pin::Pin;
 use tokio::io::AsyncRead;
 use tokio_tar::Archive;
 use tokio_util::io::StreamReader;
@@ -88,8 +89,16 @@ pub struct PutObjectIngressPlan {
     pub enable_zero_copy: bool,
 }
 
+pub type BoxIngressStream<B, E> = Pin<Box<dyn Stream<Item = Result<B, E>> + Send + Sync + 'static>>;
 pub type PutObjectCompatIngressStream<S, B, E> = futures_util::stream::Map<S, fn(Result<B, E>) -> std::io::Result<B>>;
 pub type PutObjectCompatIngress<S, B, E> = tokio::io::BufReader<StreamReader<PutObjectCompatIngressStream<S, B, E>, B>>;
+
+pub fn box_put_object_ingress_stream<S, B, E>(body: S) -> BoxIngressStream<B, E>
+where
+    S: Stream<Item = Result<B, E>> + Send + Sync + 'static,
+{
+    Box::pin(body)
+}
 
 pub struct PutObjectReducedCopyIngress<S> {
     body: S,
@@ -424,14 +433,33 @@ pub struct PutObjectLegacyHashStagePlan {
     pub ignore_s3_checksum_value: bool,
 }
 
-pub struct PutObjectLegacyHashStage {
+pub struct PutObjectHashStage {
     pub reader: HashReader,
     pub want_checksum: Option<Checksum>,
+    pub ingress_kind: PutObjectIngressKind,
 }
 
-pub struct PutObjectPlainHashStage {
-    pub stage: PutObjectLegacyHashStage,
-    pub ingress_kind: PutObjectIngressKind,
+fn build_put_object_hash_stage(
+    reader: Box<dyn Reader>,
+    ingress_kind: PutObjectIngressKind,
+    hash_values: PutObjectLegacyHashValues,
+    plan: PutObjectLegacyHashStagePlan,
+    headers: &HeaderMap,
+    trailing_headers: Option<s3s::TrailingHeaders>,
+) -> std::io::Result<PutObjectHashStage> {
+    let mut reader = HashReader::new(reader, plan.size, plan.actual_size, hash_values.md5hex, hash_values.sha256hex, false)?;
+    let want_checksum = if plan.apply_s3_checksum {
+        reader.add_checksum_from_s3s(headers, trailing_headers, plan.ignore_s3_checksum_value)?;
+        reader.checksum()
+    } else {
+        None
+    };
+
+    Ok(PutObjectHashStage {
+        reader,
+        want_checksum,
+        ingress_kind,
+    })
 }
 
 pub fn apply_trailing_checksums(
@@ -576,13 +604,17 @@ where
     Box::new(WarpReader::new(build_put_object_compat_ingress(body, plan)))
 }
 
-pub fn build_put_object_ingress_source<S, B, E>(body: S, plan: PutObjectBodyPlan) -> PutObjectIngressSource<S>
+pub fn build_put_object_ingress_source<S, B, E>(
+    body: S,
+    plan: PutObjectBodyPlan,
+) -> PutObjectIngressSource<BoxIngressStream<B, E>>
 where
-    S: Stream<Item = Result<B, E>>,
-    B: Buf,
-    E: std::fmt::Display,
-    PutObjectCompatIngress<S, B, E>: Send + Sync + Unpin + 'static,
+    S: Stream<Item = Result<B, E>> + Send + Sync + 'static,
+    B: Buf + 'static,
+    E: std::fmt::Display + 'static,
+    PutObjectCompatIngress<BoxIngressStream<B, E>, B, E>: Send + Sync + Unpin + 'static,
 {
+    let body = box_put_object_ingress_stream(body);
     match (plan.kind, plan.ingress.kind) {
         (PutObjectBodyKind::Compressed, PutObjectIngressKind::ReducedCopyCandidate)
         | (PutObjectBodyKind::Plain(PutObjectPlainBodyKind::ReducedCopyCandidate), PutObjectIngressKind::ReducedCopyCandidate) => {
@@ -602,16 +634,8 @@ pub fn build_put_object_legacy_hash_stage(
     plan: PutObjectLegacyHashStagePlan,
     headers: &HeaderMap,
     trailing_headers: Option<s3s::TrailingHeaders>,
-) -> std::io::Result<PutObjectLegacyHashStage> {
-    let mut reader = HashReader::new(reader, plan.size, plan.actual_size, hash_values.md5hex, hash_values.sha256hex, false)?;
-    let want_checksum = if plan.apply_s3_checksum {
-        reader.add_checksum_from_s3s(headers, trailing_headers, plan.ignore_s3_checksum_value)?;
-        reader.checksum()
-    } else {
-        None
-    };
-
-    Ok(PutObjectLegacyHashStage { reader, want_checksum })
+) -> std::io::Result<PutObjectHashStage> {
+    build_put_object_hash_stage(reader, PutObjectIngressKind::LegacyCompat, hash_values, plan, headers, trailing_headers)
 }
 
 pub fn build_put_object_plain_hash_stage<S, B, E>(
@@ -620,30 +644,24 @@ pub fn build_put_object_plain_hash_stage<S, B, E>(
     plan: PutObjectLegacyHashStagePlan,
     headers: &HeaderMap,
     trailing_headers: Option<s3s::TrailingHeaders>,
-) -> std::io::Result<PutObjectPlainHashStage>
+) -> std::io::Result<PutObjectHashStage>
 where
     S: Stream<Item = Result<B, E>> + Unpin + Send + Sync + 'static,
     B: Buf + Send + Sync + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
     match ingress {
-        PutObjectIngressSource::LegacyCompat(reader) => Ok(PutObjectPlainHashStage {
-            stage: build_put_object_legacy_hash_stage(reader, hash_values, plan, headers, trailing_headers)?,
-            ingress_kind: PutObjectIngressKind::LegacyCompat,
-        }),
-        PutObjectIngressSource::ReducedCopyCandidate(candidate) => {
-            let stage = build_put_object_legacy_hash_stage(
-                build_put_object_reduced_copy_reader(candidate),
-                hash_values,
-                plan,
-                headers,
-                trailing_headers,
-            )?;
-            Ok(PutObjectPlainHashStage {
-                stage,
-                ingress_kind: PutObjectIngressKind::ReducedCopyCandidate,
-            })
+        PutObjectIngressSource::LegacyCompat(reader) => {
+            build_put_object_hash_stage(reader, PutObjectIngressKind::LegacyCompat, hash_values, plan, headers, trailing_headers)
         }
+        PutObjectIngressSource::ReducedCopyCandidate(candidate) => build_put_object_hash_stage(
+            build_put_object_reduced_copy_reader(candidate),
+            PutObjectIngressKind::ReducedCopyCandidate,
+            hash_values,
+            plan,
+            headers,
+            trailing_headers,
+        ),
     }
 }
 
@@ -703,6 +721,15 @@ pub fn resolve_put_effective_copy_mode(applied_compression: bool, applied_encryp
         rustfs_io_metrics::CopyMode::Transformed
     } else {
         rustfs_io_metrics::CopyMode::SingleCopy
+    }
+}
+
+pub fn resolve_put_transform_metric_kind(applied_compression: bool, applied_encryption: bool) -> Option<&'static str> {
+    match (applied_compression, applied_encryption) {
+        (true, true) => Some("compression_encryption"),
+        (true, false) => Some("compression"),
+        (false, true) => Some("encryption"),
+        (false, false) => None,
     }
 }
 
@@ -1069,6 +1096,14 @@ mod tests {
     }
 
     #[test]
+    fn resolve_put_transform_metric_kind_reports_transform_shape() {
+        assert_eq!(resolve_put_transform_metric_kind(false, false), None);
+        assert_eq!(resolve_put_transform_metric_kind(true, false), Some("compression"));
+        assert_eq!(resolve_put_transform_metric_kind(false, true), Some("encryption"));
+        assert_eq!(resolve_put_transform_metric_kind(true, true), Some("compression_encryption"));
+    }
+
+    #[test]
     fn resolve_put_transformed_fallback_reason_isolated_from_plain_path() {
         assert_eq!(
             resolve_put_transformed_fallback_reason(PutObjectIngressKind::LegacyCompat, true, false),
@@ -1394,7 +1429,7 @@ mod tests {
 
         assert_eq!(stage.ingress_kind, PutObjectIngressKind::ReducedCopyCandidate);
 
-        let mut reader = stage.stage.reader;
+        let mut reader = stage.reader;
         let mut buf = [0_u8; 8];
         let n = reader.read_block(&mut buf).await.unwrap();
         assert_eq!(n, 5);
@@ -1423,7 +1458,7 @@ mod tests {
 
         assert_eq!(stage.ingress_kind, PutObjectIngressKind::LegacyCompat);
 
-        let mut reader = stage.stage.reader;
+        let mut reader = stage.reader;
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
 

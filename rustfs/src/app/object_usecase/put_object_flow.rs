@@ -16,7 +16,8 @@ use super::*;
 use rustfs_object_io::put::{
     PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, apply_trailing_checksums,
     build_put_object_ingress_source, build_put_object_legacy_hash_stage, build_put_object_plain_hash_stage,
-    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode, resolve_put_transformed_fallback_reason,
+    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode, resolve_put_transform_metric_kind,
+    resolve_put_transformed_fallback_reason,
 };
 
 impl DefaultObjectUsecase {
@@ -208,8 +209,8 @@ impl DefaultObjectUsecase {
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            let stage = build_put_object_legacy_hash_stage(
-                ingress_source.into_reader(),
+            let stage = build_put_object_plain_hash_stage(
+                ingress_source,
                 std::mem::take(&mut hash_values),
                 PutObjectLegacyHashStagePlan {
                     size,
@@ -222,12 +223,14 @@ impl DefaultObjectUsecase {
             )
             .map_err(ApiError::from)?;
 
+            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                plain_reduced_copy_stage = true;
+            }
             opts.want_checksum = stage.want_checksum;
             insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
-            plain_reduced_copy_stage = body_plan.ingress.kind == PutObjectIngressKind::ReducedCopyCandidate;
             size = HashReader::SIZE_PRESERVE_LAYER;
             hash_values.clear_for_transformed_body();
             build_put_object_legacy_hash_stage(
@@ -266,7 +269,7 @@ impl DefaultObjectUsecase {
                 );
             }
 
-            stage.stage
+            stage
         };
         let mut reader = stage.reader;
         if stage.want_checksum.is_some() {
@@ -394,6 +397,9 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_path_selected("put", io_path);
             let effective_copy_mode = resolve_put_effective_copy_mode(applied_compression, applied_encryption);
             rustfs_io_metrics::record_io_copy_mode("put", effective_copy_mode, actual_size.max(0) as usize);
+            if let Some(transform_kind) = resolve_put_transform_metric_kind(applied_compression, applied_encryption) {
+                rustfs_io_metrics::record_put_transform_selected(transform_kind, io_path, actual_size.max(0) as usize);
+            }
         }
 
         Ok(PutObjectFlowResult {

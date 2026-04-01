@@ -110,6 +110,14 @@ pub struct LocalDisk {
 }
 
 const LOCAL_CHUNK_FAST_PATH_MIN_BYTES: usize = 64 * 1024;
+const LOCAL_DISK_POOLED_SOURCE_FALLBACK: &str = "fallback";
+const LOCAL_DISK_POOLED_SOURCE_COMPAT_COLLECT: &str = "compat_collect";
+const LOCAL_DISK_POOLED_SOURCE_COMPAT_DIRECT: &str = "compat_direct";
+const ACTIVE_MMAP_WINDOW_BUDGET_EXCEEDED_MESSAGE: &str = "active mmap window budget exceeded";
+
+#[cfg(unix)]
+const LOCAL_CHUNK_COMPAT_MAX_MAPPED_WINDOWS: usize = 1;
+
 static LOCAL_CHUNK_FALLBACK_POOL: OnceLock<BytesPool> = OnceLock::new();
 
 fn local_chunk_fallback_pool() -> &'static BytesPool {
@@ -216,6 +224,24 @@ fn configured_local_chunk_max_active_mmap_bytes() -> usize {
 }
 
 #[cfg(unix)]
+fn should_prefer_pooled_zero_copy_compat(mode: LocalChunkZeroCopyMode, length: usize, window_bytes: usize) -> bool {
+    if mode.is_disabled() || !mode.allows_multi_window() || length < mode.fast_path_min_bytes() || window_bytes == 0 {
+        return false;
+    }
+
+    length.div_ceil(window_bytes) > LOCAL_CHUNK_COMPAT_MAX_MAPPED_WINDOWS
+}
+
+fn fallback_reason_for_local_mmap_error(err: &DiskError) -> rustfs_io_metrics::FallbackReason {
+    match err {
+        DiskError::Io(io_error) if io_error.to_string().contains(ACTIVE_MMAP_WINDOW_BUDGET_EXCEEDED_MESSAGE) => {
+            rustfs_io_metrics::FallbackReason::WindowLimitExceeded
+        }
+        _ => rustfs_io_metrics::FallbackReason::MmapUnavailable,
+    }
+}
+
+#[cfg(unix)]
 fn try_reserve_active_mmap_bytes(accounted_len: usize, max_active_bytes: usize) -> bool {
     loop {
         let current = ACTIVE_LOCAL_MMAP_BYTES.load(Ordering::Acquire);
@@ -246,7 +272,7 @@ fn map_file_region_bytes(file_path: &Path, offset: usize, length: usize, max_act
     let map_length = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
     let visible_end = logical_offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
     if !try_reserve_active_mmap_bytes(map_length, max_active_bytes) {
-        return Err(DiskError::other("active mmap window budget exceeded"));
+        return Err(DiskError::other(ACTIVE_MMAP_WINDOW_BUDGET_EXCEEDED_MESSAGE));
     }
     let file = std::fs::File::open(file_path).map_err(DiskError::from)?;
 
@@ -287,6 +313,15 @@ struct LocalMappedChunkStreamState {
 }
 
 async fn read_file_pooled_chunk_from_path(file_path: PathBuf, offset: usize, length: usize) -> std::io::Result<IoChunk> {
+    read_file_pooled_chunk_from_path_with_source(file_path, offset, length, LOCAL_DISK_POOLED_SOURCE_FALLBACK).await
+}
+
+async fn read_file_pooled_chunk_from_path_with_source(
+    file_path: PathBuf,
+    offset: usize,
+    length: usize,
+    metric_source: &'static str,
+) -> std::io::Result<IoChunk> {
     let mut file = File::open(file_path).await?;
     if offset > 0 {
         file.seek(SeekFrom::Start(offset as u64)).await?;
@@ -295,7 +330,7 @@ async fn read_file_pooled_chunk_from_path(file_path: PathBuf, offset: usize, len
     let mut buffer = local_chunk_fallback_pool().acquire_buffer(length).await;
     buffer.resize(length, 0);
     file.read_exact(&mut buffer[..length]).await?;
-    rustfs_io_metrics::record_local_disk_pooled_chunk("fallback", length);
+    rustfs_io_metrics::record_local_disk_pooled_chunk(metric_source, length);
     Ok(IoChunk::Pooled(PooledChunk::new(buffer, length).map_err(std::io::Error::other)?))
 }
 
@@ -316,6 +351,21 @@ async fn prepare_read_file_request(disk: &LocalDisk, volume: &str, path: &str) -
         .map_err(DiskError::from)??;
 
     Ok((volume_dir, file_path, meta))
+}
+
+fn validate_read_file_bounds(meta: &Metadata, offset: usize, length: usize) -> Result<()> {
+    let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+    if meta.len() < end_offset as u64 {
+        error!(
+            "read_file: file size is less than offset + length {} + {} = {}",
+            offset,
+            length,
+            meta.len()
+        );
+        return Err(DiskError::FileCorrupt);
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -360,7 +410,7 @@ fn build_lazy_mapped_chunk_stream(
             Ok(Err(err)) => {
                 rustfs_io_metrics::record_io_fallback(
                     rustfs_io_metrics::IoStage::LocalDiskChunk,
-                    rustfs_io_metrics::FallbackReason::MmapUnavailable,
+                    fallback_reason_for_local_mmap_error(&err),
                 );
                 debug!(
                     error = %err,
@@ -398,6 +448,18 @@ async fn read_file_pooled_chunk_fallback(
     offset: usize,
     length: usize,
 ) -> Result<IoChunk> {
+    read_file_pooled_chunk_fallback_with_source(disk, volume_dir, file_path, offset, length, LOCAL_DISK_POOLED_SOURCE_FALLBACK)
+        .await
+}
+
+async fn read_file_pooled_chunk_fallback_with_source(
+    disk: &LocalDisk,
+    volume_dir: &Path,
+    file_path: PathBuf,
+    offset: usize,
+    length: usize,
+    metric_source: &'static str,
+) -> Result<IoChunk> {
     let mut f = disk.open_file(file_path, O_RDONLY, volume_dir).await?;
 
     if offset > 0 {
@@ -407,7 +469,7 @@ async fn read_file_pooled_chunk_fallback(
     let mut buffer = local_chunk_fallback_pool().acquire_buffer(length).await;
     buffer.resize(length, 0);
     f.read_exact(&mut buffer[..length]).await?;
-    rustfs_io_metrics::record_local_disk_pooled_chunk("fallback", length);
+    rustfs_io_metrics::record_local_disk_pooled_chunk(metric_source, length);
     Ok(IoChunk::Pooled(PooledChunk::new(buffer, length).map_err(DiskError::other)?))
 }
 
@@ -416,8 +478,9 @@ async fn collect_chunk_stream_bytes(mut stream: BoxChunkStream, expected_len: us
         return Ok(Bytes::new());
     };
     let first = first.map_err(DiskError::from)?;
+    let first_len = first.len();
     if matches!(first, IoChunk::Pooled(_)) {
-        rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", first.len());
+        rustfs_io_metrics::record_local_disk_pooled_chunk(LOCAL_DISK_POOLED_SOURCE_COMPAT_COLLECT, first_len);
     }
     let first_bytes = first.as_bytes();
 
@@ -425,21 +488,28 @@ async fn collect_chunk_stream_bytes(mut stream: BoxChunkStream, expected_len: us
         return Ok(first_bytes);
     };
     let second = second.map_err(DiskError::from)?;
+    let second_len = second.len();
     if matches!(second, IoChunk::Pooled(_)) {
-        rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", second.len());
+        rustfs_io_metrics::record_local_disk_pooled_chunk(LOCAL_DISK_POOLED_SOURCE_COMPAT_COLLECT, second_len);
     }
+    let mut chunk_count = 2usize;
+    let mut total_bytes = first_len + second_len;
     let mut buffer = BytesMut::with_capacity(expected_len);
     buffer.extend_from_slice(first_bytes.as_ref());
     buffer.extend_from_slice(second.as_bytes().as_ref());
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(DiskError::from)?;
+        let chunk_len = chunk.len();
         if matches!(chunk, IoChunk::Pooled(_)) {
-            rustfs_io_metrics::record_local_disk_pooled_chunk("compat_collect", chunk.len());
+            rustfs_io_metrics::record_local_disk_pooled_chunk(LOCAL_DISK_POOLED_SOURCE_COMPAT_COLLECT, chunk_len);
         }
+        chunk_count += 1;
+        total_bytes += chunk_len;
         buffer.extend_from_slice(chunk.as_bytes().as_ref());
     }
 
+    rustfs_io_metrics::record_local_disk_compat_collect(chunk_count, total_bytes);
     Ok(buffer.freeze())
 }
 
@@ -2181,6 +2251,32 @@ impl DiskAPI for LocalDisk {
         use std::time::Instant;
 
         let start = Instant::now();
+        #[cfg(unix)]
+        {
+            let zero_copy_mode = LocalChunkZeroCopyMode::effective();
+            let window_bytes = configured_local_chunk_window_bytes();
+            if should_prefer_pooled_zero_copy_compat(zero_copy_mode, length, window_bytes) {
+                let (volume_dir, file_path, meta) = prepare_read_file_request(self, volume, path).await?;
+                validate_read_file_bounds(&meta, offset, length)?;
+                let chunk = read_file_pooled_chunk_fallback_with_source(
+                    self,
+                    &volume_dir,
+                    file_path,
+                    offset,
+                    length,
+                    LOCAL_DISK_POOLED_SOURCE_COMPAT_DIRECT,
+                )
+                .await?;
+                let bytes = collect_chunk_stream_bytes(Box::pin(stream::iter(vec![Ok(chunk)])), length).await?;
+                debug!(
+                    size = bytes.len(),
+                    duration_ms = start.elapsed().as_secs_f64() * 1000.0,
+                    "chunk_compat_read_pooled_success"
+                );
+                return Ok(bytes);
+            }
+        }
+
         let bytes = collect_chunk_stream_bytes(self.read_file_chunks(volume, path, offset, length).await?, length).await?;
         debug!(
             size = bytes.len(),
@@ -2194,16 +2290,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
         let (volume_dir, file_path, meta) = prepare_read_file_request(self, volume, path).await?;
-        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-        if meta.len() < end_offset as u64 {
-            error!(
-                "read_file_chunks: file size is less than offset + length {} + {} = {}",
-                offset,
-                length,
-                meta.len()
-            );
-            return Err(DiskError::FileCorrupt);
-        }
+        validate_read_file_bounds(&meta, offset, length)?;
 
         let zero_copy_mode = LocalChunkZeroCopyMode::effective();
         if zero_copy_mode.is_disabled() {
@@ -3413,6 +3500,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_read_file_chunks_returns_pooled_chunk_for_local_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3433,6 +3521,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_read_file_chunks_prefers_mapped_chunk_when_eligible() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3456,6 +3545,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_read_file_chunks_falls_back_to_pooled_for_small_object() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3476,6 +3566,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_read_file_chunks_supports_non_zero_offset() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3503,6 +3594,7 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial]
     async fn test_read_file_chunks_splits_large_reads_into_multiple_windows() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3530,6 +3622,7 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial]
     async fn test_read_file_zero_copy_collects_multi_window_chunk_stream() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = "chunk-bucket";
@@ -3611,6 +3704,55 @@ mod test {
                 assert_eq!(LocalChunkZeroCopyMode::effective(), LocalChunkZeroCopyMode::Aggressive);
             });
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_should_prefer_pooled_zero_copy_compat_for_multi_window_requests() {
+        let window_bytes = 1024;
+        let balanced_multi_window_len = LOCAL_CHUNK_FAST_PATH_MIN_BYTES.max(window_bytes * 2);
+
+        assert!(!should_prefer_pooled_zero_copy_compat(
+            LocalChunkZeroCopyMode::Off,
+            window_bytes * 2,
+            window_bytes
+        ));
+        assert!(!should_prefer_pooled_zero_copy_compat(
+            LocalChunkZeroCopyMode::Conservative,
+            window_bytes * 2,
+            window_bytes
+        ));
+        assert!(!should_prefer_pooled_zero_copy_compat(
+            LocalChunkZeroCopyMode::Balanced,
+            window_bytes,
+            window_bytes
+        ));
+        assert!(should_prefer_pooled_zero_copy_compat(
+            LocalChunkZeroCopyMode::Balanced,
+            balanced_multi_window_len,
+            window_bytes
+        ));
+        assert!(should_prefer_pooled_zero_copy_compat(
+            LocalChunkZeroCopyMode::Aggressive,
+            window_bytes * 2,
+            window_bytes
+        ));
+    }
+
+    #[test]
+    fn test_fallback_reason_for_local_mmap_error_distinguishes_budget_limit() {
+        let budget_err = DiskError::other(ACTIVE_MMAP_WINDOW_BUDGET_EXCEEDED_MESSAGE);
+        let generic_err = DiskError::other("mmap failed");
+
+        assert_eq!(
+            fallback_reason_for_local_mmap_error(&budget_err),
+            rustfs_io_metrics::FallbackReason::WindowLimitExceeded
+        );
+        assert_eq!(
+            fallback_reason_for_local_mmap_error(&generic_err),
+            rustfs_io_metrics::FallbackReason::MmapUnavailable
+        );
     }
 
     #[cfg(unix)]

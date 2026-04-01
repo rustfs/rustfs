@@ -306,12 +306,12 @@ pub(super) async fn prepare_get_object_chunk_read(
         .map_err(ApiError::from)
     {
         Ok(result) => result,
-        Err(err) => {
+        Err(_err) => {
             rustfs_io_metrics::record_io_fallback(
                 rustfs_io_metrics::IoStage::HttpBridge,
                 rustfs_io_metrics::FallbackReason::ChunkBridgeUnavailable,
             );
-            return Err(err.into());
+            return Ok(None);
         }
     };
     let setup_result = object_io_finalize_chunk_read_setup(info, event_info, chunk_result, plan);

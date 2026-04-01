@@ -413,6 +413,53 @@ async fn prepare_get_object_chunk_read_marks_direct_path_for_single_disk_store()
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn prepare_get_object_chunk_read_falls_back_to_legacy_when_chunk_bridge_fails() {
+    let (disk_paths, ecstore) = setup_direct_chunk_test_env().await;
+    let bucket = format!("direct-chunk-fallback-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let key = "test/fallback.bin";
+    let payload = vec![3u8; 128 * 1024];
+
+    create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+
+    let mut reader = ChunkNativePutData::from_vec(payload);
+    ecstore
+        .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
+        .await
+        .unwrap();
+
+    let object_root = disk_paths[0].join(&bucket).join("test").join("fallback.bin");
+    let missing_part = find_part_file(&object_root, "part.1").expect("part file on disk");
+    fs::remove_file(&missing_part).await.expect("remove single-disk part file");
+
+    let input = GetObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(key.to_string())
+        .build()
+        .unwrap();
+    let req = build_request(input, Method::GET);
+    let request_context = prepare_get_object_request_context(&req).await.unwrap();
+    let manager = get_concurrency_manager();
+
+    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
+        &request_context,
+        &ecstore,
+        manager,
+        &request_context.bucket,
+        &request_context.key,
+        request_context.rs.clone(),
+        request_context.part_number,
+        &request_context.opts,
+        std::time::Instant::now(),
+    )
+    .await
+    .unwrap();
+
+    assert!(read_setup.is_none(), "chunk bridge failure should fall back to legacy reader");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn execute_get_object_range_marks_direct_path_for_single_disk_store() {
     let (_disk_paths, ecstore) = setup_direct_chunk_test_env().await;
     let bucket = format!("direct-range-{}", &Uuid::new_v4().simple().to_string()[..8]);
