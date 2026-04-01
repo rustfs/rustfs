@@ -14,11 +14,17 @@
 
 //! Metric name constants for consistent naming across the codebase.
 
+/// Legacy zero-copy metrics remain export-only until dashboards migrate to the
+/// ADR 0001 `rustfs.io.*` request-level metrics.
+pub const LEGACY_ZERO_COPY_REMOVAL_POLICY: &str =
+    "Remove legacy zero-copy metrics after dashboards migrate to rustfs.io.* and no production callers remain.";
+
 /// Legacy low-level zero-copy operation metric names.
 ///
 /// These names are kept for backward compatibility with existing low-level
 /// instrumentation. They do not represent high-level request copy-mode
-/// semantics introduced by ADR 0001.
+/// semantics introduced by ADR 0001. New code must use the `data_plane`
+/// metrics instead.
 pub mod zero_copy {
     /// Total number of zero-copy buffer operations
     pub const BUFFER_OPERATIONS_TOTAL: &str = "rustfs_zero_copy_buffer_operations_total";

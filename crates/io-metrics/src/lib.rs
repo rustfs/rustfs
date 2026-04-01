@@ -379,23 +379,6 @@ pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
     }
 }
 
-/// Record a legacy low-level zero-copy read operation.
-///
-/// This helper is kept only for backward compatibility with legacy dashboards.
-/// Prefer `record_io_path_selected()` and `record_io_copy_mode()` for all new
-/// instrumentation.
-///
-/// # Arguments
-///
-/// * `size_bytes` - Size of the data read in bytes
-/// * `duration_ms` - Time taken for the read operation in milliseconds
-#[inline(always)]
-pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
-    counter!("rustfs.zero_copy.reads.total").increment(1);
-    histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
-    histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
-}
-
 /// Record memory copies avoided by using zero-copy.
 ///
 /// # Arguments
@@ -404,19 +387,6 @@ pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
 #[inline(always)]
 pub fn record_memory_copy_saved(bytes_saved: usize) {
     counter!("rustfs.zero_copy.memory.saved.bytes").increment(bytes_saved as u64);
-}
-
-/// Record a legacy low-level zero-copy read fallback.
-///
-/// This helper is kept only for backward compatibility with legacy dashboards.
-/// Prefer `record_io_fallback()` for all new instrumentation.
-///
-/// # Arguments
-///
-/// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
-#[inline(always)]
-pub fn record_zero_copy_fallback(reason: &str) {
-    counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
 }
 
 // ============================================================================
@@ -472,27 +442,6 @@ pub fn record_bytes_pool_allocated(tier: &str, bytes: u64) {
 #[inline(always)]
 pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
     gauge!("rustfs.bytes.pool.hit.rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
-}
-
-/// Record a legacy low-level zero-copy write operation.
-///
-/// This helper is kept only for backward compatibility with legacy dashboards.
-/// Prefer `record_io_path_selected()` and `record_io_copy_mode()` for all new
-/// instrumentation.
-#[inline(always)]
-pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
-    counter!("rustfs.zero_copy.write.total").increment(1);
-    histogram!("rustfs.zero_copy.write.size.bytes").record(size_bytes as f64);
-    histogram!("rustfs.zero_copy.write.duration.ms").record(duration_ms);
-}
-
-/// Record a legacy low-level zero-copy write fallback.
-///
-/// This helper is kept only for backward compatibility with legacy dashboards.
-/// Prefer `record_io_fallback()` for all new instrumentation.
-#[inline(always)]
-pub fn record_zero_copy_write_fallback(reason: &str) {
-    counter!("rustfs.zero_copy.write.fallback.total", "reason" => reason.to_string()).increment(1);
 }
 
 /// Record bytes saved from zero-copy.
@@ -969,10 +918,14 @@ mod tests {
     }
 
     #[test]
-    fn test_record_legacy_zero_copy_read_metrics() {
-        record_zero_copy_read(1024, 10.5);
+    fn test_legacy_zero_copy_removal_policy_mentions_data_plane_replacement() {
+        assert!(metric_names::LEGACY_ZERO_COPY_REMOVAL_POLICY.contains("rustfs.io.*"));
+        assert!(metric_names::LEGACY_ZERO_COPY_REMOVAL_POLICY.contains("dashboards"));
+    }
+
+    #[test]
+    fn test_record_legacy_zero_copy_memory_saved_metrics() {
         record_memory_copy_saved(1024);
-        record_zero_copy_fallback("test");
     }
 
     #[test]
@@ -984,9 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_legacy_zero_copy_write_metrics() {
-        record_zero_copy_write(1024, 10.5);
-        record_zero_copy_write_fallback("test");
+    fn test_record_legacy_zero_copy_bytes_saved_metrics() {
         record_bytes_saved(1024);
     }
 
