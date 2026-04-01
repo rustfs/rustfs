@@ -33,6 +33,77 @@ pub(crate) struct MultiWriter<'a> {
     errs: Vec<Option<Error>>,
 }
 
+pub(crate) struct BlockAssembler<R> {
+    reader: R,
+    block_buffer: EncodeBlockBuffer,
+    total_bytes: usize,
+}
+
+impl<R> BlockAssembler<R>
+where
+    R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
+{
+    pub(crate) fn new(reader: R, block_size: usize) -> Self {
+        Self {
+            reader,
+            block_buffer: EncodeBlockBuffer::new(block_size),
+            total_bytes: 0,
+        }
+    }
+
+    pub(crate) async fn next_block(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        match self.block_buffer.read_from_block(&mut self.reader).await {
+            Ok(n) if n > 0 => {
+                self.total_bytes += n;
+                Ok(Some(self.block_buffer.filled(n).to_vec()))
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                if let Some(inner) = e.get_ref()
+                    && rustfs_rio::is_checksum_mismatch(inner)
+                {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ErasureChunkEncoder {
+    erasure: Arc<Erasure>,
+    buffer_pool: EncodedShardBufferPool,
+}
+
+impl ErasureChunkEncoder {
+    pub(crate) async fn new(erasure: Arc<Erasure>) -> Self {
+        let reusable_capacity = erasure.shard_size() * erasure.total_shard_count();
+        Self {
+            erasure,
+            buffer_pool: EncodedShardBufferPool::with_prefill(reusable_capacity, 2).await,
+        }
+    }
+
+    pub(crate) async fn encode_block(&self, block: &[u8]) -> std::io::Result<EncodedShardBlock> {
+        let reusable_buffer = self.buffer_pool.acquire().await;
+        self.erasure.encode_data_block_with_buffer(block, reusable_buffer)
+    }
+
+    pub(crate) async fn release(&self, block: EncodedShardBlock) {
+        self.buffer_pool.release(block).await;
+    }
+}
+
 pub(crate) trait ShardSource {
     fn shard_count(&self) -> usize;
     fn shard(&self, idx: usize) -> Bytes;
@@ -207,7 +278,7 @@ impl<'a> MultiWriter<'a> {
 impl Erasure {
     pub async fn encode<R>(
         self: Arc<Self>,
-        mut reader: R,
+        reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
@@ -215,43 +286,20 @@ impl Erasure {
         R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
     {
         let (tx, mut rx) = mpsc::channel::<EncodedShardBlock>(8);
-        let reusable_capacity = self.shard_size() * self.total_shard_count();
-        let buffer_pool = EncodedShardBufferPool::with_prefill(reusable_capacity, 2).await;
-        let producer_pool = buffer_pool.clone();
+        let producer = ErasureChunkEncoder::new(self.clone()).await;
+        let writer_pool = producer.clone();
 
         let task = tokio::spawn(async move {
-            let block_size = self.block_size;
-            let mut total = 0;
-            let mut block_buffer = EncodeBlockBuffer::new(block_size);
-            loop {
-                match block_buffer.read_from_block(&mut reader).await {
-                    Ok(n) if n > 0 => {
-                        total += n;
-                        let reusable_buffer = producer_pool.acquire().await;
-                        let res = self.encode_data_block_with_buffer(block_buffer.filled(n), reusable_buffer)?;
-                        if let Err(err) = tx.send(res).await {
-                            return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
-                        }
-                    }
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // Check if the inner error is a checksum mismatch - if so, propagate it
-                        if let Some(inner) = e.get_ref()
-                            && rustfs_rio::is_checksum_mismatch(inner)
-                        {
-                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
+            let mut assembler = BlockAssembler::new(reader, self.block_size);
+            while let Some(block) = assembler.next_block().await? {
+                let res = producer.encode_block(&block).await?;
+                if let Err(err) = tx.send(res).await {
+                    return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                 }
             }
 
-            Ok((reader, total))
+            let total = assembler.total_bytes();
+            Ok((assembler.into_inner(), total))
         });
 
         let mut writers = MultiWriter::new(writers, quorum);
@@ -261,7 +309,7 @@ impl Erasure {
                 break;
             }
             writers.write(&block).await?;
-            buffer_pool.release(block).await;
+            writer_pool.release(block).await;
         }
 
         let (reader, total) = task.await??;
@@ -275,6 +323,7 @@ mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
     use rustfs_utils::HashAlgorithm;
+    use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -329,5 +378,29 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_assembler_splits_input_into_erasure_blocks() {
+        let reader = tokio::io::BufReader::new(Cursor::new(b"abcdefghijkl".to_vec()));
+        let mut assembler = BlockAssembler::new(reader, 4);
+
+        assert_eq!(assembler.next_block().await.unwrap(), Some(b"abcd".to_vec()));
+        assert_eq!(assembler.next_block().await.unwrap(), Some(b"efgh".to_vec()));
+        assert_eq!(assembler.next_block().await.unwrap(), Some(b"ijkl".to_vec()));
+        assert_eq!(assembler.next_block().await.unwrap(), None);
+        assert_eq!(assembler.total_bytes(), 12);
+    }
+
+    #[tokio::test]
+    async fn erasure_chunk_encoder_produces_full_shard_block() {
+        let erasure = Arc::new(Erasure::new(2, 1, 4));
+        let encoder = ErasureChunkEncoder::new(erasure.clone()).await;
+        let block = encoder.encode_block(b"abcd").await.unwrap();
+
+        assert_eq!(block.shard_count(), 3);
+        assert_eq!(block.shard(0).len(), erasure.shard_size());
+
+        encoder.release(block).await;
     }
 }

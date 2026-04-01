@@ -170,6 +170,7 @@ pub enum IoStage {
     CacheWriteback,
     LocalDiskChunk,
     RangeGuard,
+    PutTransform,
 }
 
 impl IoStage {
@@ -182,6 +183,7 @@ impl IoStage {
             Self::CacheWriteback => "cache_writeback",
             Self::LocalDiskChunk => "local_disk_chunk",
             Self::RangeGuard => "range_guard",
+            Self::PutTransform => "put_transform",
         }
     }
 }
@@ -198,6 +200,9 @@ pub enum FallbackReason {
     RangeNotSupported,
     EncryptionEnabled,
     CompressionEnabled,
+    TransformEncryptionLegacy,
+    TransformCompressionLegacy,
+    TransformCompressionEncryptionLegacy,
     ChunkBridgeUnavailable,
     NonLocalBackend,
 }
@@ -215,6 +220,9 @@ impl FallbackReason {
             Self::RangeNotSupported => "range_not_supported",
             Self::EncryptionEnabled => "encryption_enabled",
             Self::CompressionEnabled => "compression_enabled",
+            Self::TransformEncryptionLegacy => "transform_encryption_legacy",
+            Self::TransformCompressionLegacy => "transform_compression_legacy",
+            Self::TransformCompressionEncryptionLegacy => "transform_compression_encryption_legacy",
             Self::ChunkBridgeUnavailable => "chunk_bridge_unavailable",
             Self::NonLocalBackend => "non_local_backend",
         }
@@ -904,6 +912,12 @@ mod tests {
         assert_eq!(FallbackReason::RangeNotSupported.as_str(), "range_not_supported");
         assert_eq!(FallbackReason::EncryptionEnabled.as_str(), "encryption_enabled");
         assert_eq!(FallbackReason::CompressionEnabled.as_str(), "compression_enabled");
+        assert_eq!(FallbackReason::TransformEncryptionLegacy.as_str(), "transform_encryption_legacy");
+        assert_eq!(FallbackReason::TransformCompressionLegacy.as_str(), "transform_compression_legacy");
+        assert_eq!(
+            FallbackReason::TransformCompressionEncryptionLegacy.as_str(),
+            "transform_compression_encryption_legacy"
+        );
         assert_eq!(FallbackReason::ChunkBridgeUnavailable.as_str(), "chunk_bridge_unavailable");
         assert_eq!(FallbackReason::NonLocalBackend.as_str(), "non_local_backend");
     }

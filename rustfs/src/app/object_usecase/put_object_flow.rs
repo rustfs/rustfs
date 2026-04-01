@@ -16,7 +16,7 @@ use super::*;
 use rustfs_object_io::put::{
     PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, apply_trailing_checksums,
     build_put_object_ingress_source, build_put_object_legacy_hash_stage, build_put_object_plain_hash_stage,
-    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode,
+    plan_put_object_body_with_transforms, resolve_put_effective_copy_mode, resolve_put_transformed_fallback_reason,
 };
 
 impl DefaultObjectUsecase {
@@ -139,6 +139,12 @@ impl DefaultObjectUsecase {
                 bucket,
                 key
             );
+        } else if let Some(reason) = resolve_put_transformed_fallback_reason(
+            body_plan.ingress.kind,
+            body_plan.should_compress(),
+            encryption_enabled_for_put,
+        ) {
+            rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::PutTransform, reason);
         }
 
         let ingress_source = build_put_object_ingress_source(body, body_plan);

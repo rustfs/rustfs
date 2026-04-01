@@ -706,6 +706,23 @@ pub fn resolve_put_effective_copy_mode(applied_compression: bool, applied_encryp
     }
 }
 
+pub fn resolve_put_transformed_fallback_reason(
+    ingress_kind: PutObjectIngressKind,
+    compressed: bool,
+    encryption_enabled: bool,
+) -> Option<rustfs_io_metrics::FallbackReason> {
+    if ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+        return None;
+    }
+
+    match (compressed, encryption_enabled) {
+        (true, true) => Some(rustfs_io_metrics::FallbackReason::TransformCompressionEncryptionLegacy),
+        (true, false) => Some(rustfs_io_metrics::FallbackReason::TransformCompressionLegacy),
+        (false, true) => Some(rustfs_io_metrics::FallbackReason::TransformEncryptionLegacy),
+        (false, false) => None,
+    }
+}
+
 pub fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
     headers
         .get(key)
@@ -1049,6 +1066,26 @@ mod tests {
         assert_eq!(resolve_put_effective_copy_mode(false, false), rustfs_io_metrics::CopyMode::SingleCopy);
         assert_eq!(resolve_put_effective_copy_mode(true, false), rustfs_io_metrics::CopyMode::Transformed);
         assert_eq!(resolve_put_effective_copy_mode(false, true), rustfs_io_metrics::CopyMode::Transformed);
+    }
+
+    #[test]
+    fn resolve_put_transformed_fallback_reason_isolated_from_plain_path() {
+        assert_eq!(
+            resolve_put_transformed_fallback_reason(PutObjectIngressKind::LegacyCompat, true, false),
+            Some(rustfs_io_metrics::FallbackReason::TransformCompressionLegacy)
+        );
+        assert_eq!(
+            resolve_put_transformed_fallback_reason(PutObjectIngressKind::LegacyCompat, false, true),
+            Some(rustfs_io_metrics::FallbackReason::TransformEncryptionLegacy)
+        );
+        assert_eq!(
+            resolve_put_transformed_fallback_reason(PutObjectIngressKind::LegacyCompat, true, true),
+            Some(rustfs_io_metrics::FallbackReason::TransformCompressionEncryptionLegacy)
+        );
+        assert_eq!(
+            resolve_put_transformed_fallback_reason(PutObjectIngressKind::ReducedCopyCandidate, true, true),
+            None
+        );
     }
 
     #[test]
