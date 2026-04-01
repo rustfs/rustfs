@@ -1,7 +1,8 @@
 use super::*;
+use rustfs_rio::{EtagResolvable, HashReaderMut, TryGetIndex};
 
 pub struct PutObjReader {
-    pub stream: HashReader,
+    stream: Option<HashReader>,
 }
 
 impl Debug for PutObjReader {
@@ -12,11 +13,48 @@ impl Debug for PutObjReader {
 
 impl PutObjReader {
     pub fn new(stream: HashReader) -> Self {
-        PutObjReader { stream }
+        PutObjReader { stream: Some(stream) }
+    }
+
+    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
+        self.stream
+            .take()
+            .ok_or_else(|| std::io::Error::other("PutObjReader stream already taken"))
+    }
+
+    pub fn restore_stream(&mut self, stream: HashReader) {
+        self.stream = Some(stream);
     }
 
     pub fn as_hash_reader(&self) -> &HashReader {
-        &self.stream
+        self.stream.as_ref().expect("PutObjReader stream already taken")
+    }
+
+    pub fn as_hash_reader_mut(&mut self) -> &mut HashReader {
+        self.stream.as_mut().expect("PutObjReader stream already taken")
+    }
+
+    pub fn index_bytes(&self) -> Option<Bytes> {
+        self.as_hash_reader().try_get_index().map(|index| index.clone().into_vec())
+    }
+
+    pub fn resolve_etag(&mut self) -> Option<String> {
+        self.as_hash_reader_mut().try_resolve_etag()
+    }
+
+    pub fn content_hash_bytes(&self) -> Option<Bytes> {
+        self.as_hash_reader()
+            .content_hash()
+            .as_ref()
+            .map(|checksum| checksum.to_bytes(&[]))
+    }
+
+    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
+        self.as_hash_reader().content_crc_type()
+    }
+
+    pub fn content_crc(&self) -> HashMap<String, String> {
+        self.as_hash_reader().content_crc()
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
@@ -28,24 +66,26 @@ impl PutObjReader {
             None
         };
         PutObjReader {
-            stream: HashReader::new(
-                Box::new(WarpReader::new(Cursor::new(data))),
-                content_length,
-                content_length,
-                None,
-                sha256hex,
-                false,
-            )
-            .unwrap(),
+            stream: Some(
+                HashReader::new(
+                    Box::new(WarpReader::new(Cursor::new(data))),
+                    content_length,
+                    content_length,
+                    None,
+                    sha256hex,
+                    false,
+                )
+                .unwrap(),
+            ),
         }
     }
 
     pub fn size(&self) -> i64 {
-        self.stream.size()
+        self.as_hash_reader().size()
     }
 
     pub fn actual_size(&self) -> i64 {
-        self.stream.actual_size()
+        self.as_hash_reader().actual_size()
     }
 }
 

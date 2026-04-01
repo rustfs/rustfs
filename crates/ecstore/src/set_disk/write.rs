@@ -19,6 +19,20 @@ impl SetDisks {
         self.set_drive_count - self.default_parity_count
     }
 
+    pub(super) async fn write_chunk_native_put_data(
+        data: &mut PutObjReader,
+        erasure: Arc<erasure_coding::Erasure>,
+        writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
+        write_quorum: usize,
+    ) -> std::io::Result<usize> {
+        let stream = data.take_stream()?;
+        let (stream, written) = erasure_coding::encode::ErasureWritePipeline::new(erasure, write_quorum)
+            .run(stream, writers)
+            .await?;
+        data.restore_stream(stream);
+        Ok(written)
+    }
+
     pub(super) fn default_write_quorum(&self) -> usize {
         let mut data_count = self.set_drive_count - self.default_parity_count;
         if data_count == self.default_parity_count {
@@ -625,5 +639,45 @@ impl SetDisks {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+
+    #[tokio::test]
+    async fn write_chunk_native_put_data_restores_reader_state_after_encoding() {
+        let payload = b"chunk-native-put-payload".repeat(8);
+        let erasure = Arc::new(erasure_coding::Erasure::new(2, 1, 8));
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = (0..erasure.total_shard_count())
+            .map(|_| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_inline_buffer(),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let written = SetDisks::write_chunk_native_put_data(&mut reader, erasure.clone(), &mut writers, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(written, payload.len());
+        assert_eq!(reader.size(), payload.len() as i64);
+        assert_eq!(reader.actual_size(), payload.len() as i64);
+        assert!(
+            reader.resolve_etag().is_some(),
+            "restored reader should preserve computed etag state after chunk-native encode"
+        );
+
+        let inline_lengths: Vec<usize> = writers
+            .into_iter()
+            .map(|writer| writer.expect("writer").into_inline_data().expect("inline data").len())
+            .collect();
+        assert!(inline_lengths.iter().all(|len| *len > 0));
     }
 }

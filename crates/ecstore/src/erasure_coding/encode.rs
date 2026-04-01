@@ -104,6 +104,55 @@ impl ErasureChunkEncoder {
     }
 }
 
+pub(crate) struct ErasureWritePipeline {
+    erasure: Arc<Erasure>,
+    write_quorum: usize,
+}
+
+impl ErasureWritePipeline {
+    pub(crate) fn new(erasure: Arc<Erasure>, write_quorum: usize) -> Self {
+        Self { erasure, write_quorum }
+    }
+
+    pub(crate) async fn run<R>(&self, reader: R, writers: &mut [Option<BitrotWriterWrapper>]) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
+    {
+        let (tx, mut rx) = mpsc::channel::<EncodedShardBlock>(8);
+        let producer = ErasureChunkEncoder::new(self.erasure.clone()).await;
+        let writer_pool = producer.clone();
+        let block_size = self.erasure.block_size;
+
+        let task = tokio::spawn(async move {
+            let mut assembler = BlockAssembler::new(reader, block_size);
+            while let Some(block) = assembler.next_block().await? {
+                let res = producer.encode_block(&block).await?;
+                if let Err(err) = tx.send(res).await {
+                    return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                }
+            }
+
+            let total = assembler.total_bytes();
+            Ok((assembler.into_inner(), total))
+        });
+
+        let mut writers = MultiWriter::new(writers, self.write_quorum);
+
+        while let Some(block) = rx.recv().await {
+            if block.is_empty() {
+                break;
+            }
+            let write_result = writers.write(&block).await;
+            writer_pool.release(block).await;
+            write_result?;
+        }
+
+        let (reader, total) = task.await??;
+        writers.shutdown().await?;
+        Ok((reader, total))
+    }
+}
+
 pub(crate) trait ShardSource {
     fn shard_count(&self) -> usize;
     fn shard(&self, idx: usize) -> Bytes;
@@ -285,36 +334,7 @@ impl Erasure {
     where
         R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<EncodedShardBlock>(8);
-        let producer = ErasureChunkEncoder::new(self.clone()).await;
-        let writer_pool = producer.clone();
-
-        let task = tokio::spawn(async move {
-            let mut assembler = BlockAssembler::new(reader, self.block_size);
-            while let Some(block) = assembler.next_block().await? {
-                let res = producer.encode_block(&block).await?;
-                if let Err(err) = tx.send(res).await {
-                    return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
-                }
-            }
-
-            let total = assembler.total_bytes();
-            Ok((assembler.into_inner(), total))
-        });
-
-        let mut writers = MultiWriter::new(writers, quorum);
-
-        while let Some(block) = rx.recv().await {
-            if block.is_empty() {
-                break;
-            }
-            writers.write(&block).await?;
-            writer_pool.release(block).await;
-        }
-
-        let (reader, total) = task.await??;
-        writers.shutdown().await?;
-        Ok((reader, total))
+        ErasureWritePipeline::new(self, quorum).run(reader, writers).await
     }
 }
 

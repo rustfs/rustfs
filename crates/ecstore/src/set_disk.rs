@@ -828,23 +828,13 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
-        let stream = mem::replace(
-            &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
-        );
-
-        let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
-            Ok((r, w)) => (r, w),
+        let w_size = match Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await {
+            Ok(written) => written,
             Err(e) => {
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
         }; // TODO: delete temporary directory on error
-
-        let _ = mem::replace(&mut data.stream, reader);
-        // if let Err(err) = close_bitrot_writers(&mut writers).await {
-        //     error!("close_bitrot_writers err {:?}", err);
-        // }
 
         if (w_size as i64) < data.size() {
             warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
@@ -859,11 +849,11 @@ impl ObjectIO for SetDisks {
             insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.index_bytes();
 
         //TODO: userDefined
 
-        let etag = data.stream.try_resolve_etag().unwrap_or_default();
+        let etag = data.resolve_etag().unwrap_or_default();
 
         user_defined.insert("etag".to_owned(), etag.clone());
 
@@ -880,9 +870,9 @@ impl ObjectIO for SetDisks {
         }
 
         if fi.checksum.is_none()
-            && let Some(content_hash) = data.as_hash_reader().content_hash()
+            && let Some(content_hash) = data.content_hash_bytes()
         {
-            fi.checksum = Some(content_hash.to_bytes(&[]));
+            fi.checksum = Some(content_hash);
         }
 
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
@@ -2282,10 +2272,7 @@ impl MultipartOperations for SetDisks {
 
         if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
             && !checksum.is_empty()
-            && data
-                .as_hash_reader()
-                .content_crc_type()
-                .is_none_or(|v| v.to_string() != *checksum)
+            && data.content_crc_type().is_none_or(|v| v.to_string() != *checksum)
         {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
@@ -2350,14 +2337,7 @@ impl MultipartOperations for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
-        let stream = mem::replace(
-            &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
-        );
-
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
-
-        let _ = mem::replace(&mut data.stream, reader);
+        let w_size = Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
 
         if (w_size as i64) < data.size() {
             warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
@@ -2368,9 +2348,9 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.index_bytes();
 
-        let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+        let mut etag = data.resolve_etag().unwrap_or_default();
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
@@ -2384,7 +2364,7 @@ impl MultipartOperations for SetDisks {
             }
         }
 
-        let checksums = data.as_hash_reader().content_crc();
+        let checksums = data.content_crc();
 
         let part_info = ObjectPartInfo {
             etag: etag.clone(),
