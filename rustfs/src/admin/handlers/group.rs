@@ -180,7 +180,7 @@ impl Operation for GetGroup {
 /// - `500 Internal Server Error` - Server-side error
 ///
 /// # Example
-/// ```
+/// ```text
 /// DELETE /rustfs/admin/v3/group/developers
 /// ```
 pub struct DeleteGroup {}
