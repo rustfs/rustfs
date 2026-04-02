@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system,
-        tier, user,
+        bucket_meta, config_admin, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication,
+        site_replication, sts, system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -50,6 +50,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tier::register_tier_route(router).expect("register tier route");
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    config_admin::register_config_route(router).expect("register config route");
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
@@ -92,6 +93,15 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/idp/builtin/policy-entities"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+    assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/del-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/help-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-config-history-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/clear-config-history-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/restore-config-history-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/config"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
@@ -180,6 +190,15 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/set-policy")),
         (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
+        (Method::GET, compat_admin_alias_path("/v3/get-config-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-config-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/del-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/help-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/list-config-history-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/clear-config-history-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/restore-config-history-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/config")),
         (Method::POST, compat_admin_alias_path("/v3/heal/")),
         (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket")),
         (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket/prefix")),
@@ -269,5 +288,69 @@ fn test_replication_set_remote_target_compat_contract() {
     assert!(
         !handler_block.contains("encode_compatible_admin_payload("),
         "set-remote-target should not re-encrypt ARN success responses"
+    );
+}
+
+#[test]
+fn test_config_admin_contracts_use_auth_and_compat_payloads() {
+    let config_admin_src = include_str!("handlers/config_admin.rs");
+
+    for handler in [
+        "impl Operation for GetConfigKVHandler",
+        "impl Operation for SetConfigKVHandler",
+        "impl Operation for DelConfigKVHandler",
+        "impl Operation for HelpConfigKVHandler",
+        "impl Operation for GetConfigHandler",
+        "impl Operation for SetConfigHandler",
+    ] {
+        let handler_block = &config_admin_src[config_admin_src
+            .find(handler)
+            .unwrap_or_else(|| panic!("Expected handler block `{handler}` in handlers/config_admin.rs"))..];
+        assert!(
+            handler_block.contains("validate_config_admin_request(&req).await?"),
+            "{handler} must validate admin authorization"
+        );
+    }
+
+    for handler in [
+        "impl Operation for SetConfigKVHandler",
+        "impl Operation for DelConfigKVHandler",
+        "impl Operation for SetConfigHandler",
+    ] {
+        let handler_block = &config_admin_src[config_admin_src
+            .find(handler)
+            .unwrap_or_else(|| panic!("Expected handler block `{handler}` in handlers/config_admin.rs"))..];
+        assert!(
+            handler_block.contains("read_compatible_admin_body("),
+            "{handler} must accept MinIO-compatible encrypted admin payloads"
+        );
+    }
+
+    let list_history_block = &config_admin_src[config_admin_src
+        .find("impl Operation for ListConfigHistoryKVHandler")
+        .expect("Expected ListConfigHistoryKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        list_history_block.contains("list_server_config_history(true, Some(count)).await?"),
+        "ListConfigHistoryKVHandler must read persisted history entries"
+    );
+
+    let clear_history_block = &config_admin_src[config_admin_src
+        .find("impl Operation for ClearConfigHistoryKVHandler")
+        .expect("Expected ClearConfigHistoryKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        clear_history_block.contains("delete_server_config_history("),
+        "ClearConfigHistoryKVHandler must delete persisted history entries"
+    );
+
+    let restore_history_block = &config_admin_src[config_admin_src
+        .find("impl Operation for RestoreConfigHistoryKVHandler")
+        .expect("Expected RestoreConfigHistoryKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        restore_history_block.contains("read_server_config_history(restore_id).await?"),
+        "RestoreConfigHistoryKVHandler must read persisted history entries"
+    );
+    assert!(
+        restore_history_block.contains("apply_set_directives(&mut config, &directives);"),
+        "RestoreConfigHistoryKVHandler must replay stored config directives"
     );
 }
