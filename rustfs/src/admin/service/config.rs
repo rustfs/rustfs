@@ -24,7 +24,9 @@ use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::config::{Config as ServerConfig, KVS, set_global_storage_class, update_global_server_config_subsystem};
+use rustfs_ecstore::config::{
+    Config as ServerConfig, KVS, set_global_server_config, set_global_storage_class, update_global_server_config_subsystem,
+};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
@@ -36,7 +38,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 use tracing::warn;
 use url::Url;
 
-pub use rustfs_ecstore::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
+pub use rustfs_ecstore::rpc::{SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC};
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     matches!(sub_system, STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
@@ -276,6 +278,18 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
     Ok(())
 }
 
+pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
+    let Some(store) = new_object_layer_fn() else {
+        return Err(internal_error("storage layer not initialized"));
+    };
+
+    let config = read_config_without_migrate(store)
+        .await
+        .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
+    set_global_server_config(config);
+    Ok(())
+}
+
 pub async fn signal_dynamic_config_reload(sub_system: &str) {
     if !is_dynamic_config_subsystem(sub_system) {
         return;
@@ -288,6 +302,18 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
     for failure in notification_sys.reload_dynamic_config(sub_system).await {
         if let Some(err) = failure.err {
             warn!("peer {} dynamic config reload for {} failed: {}", failure.host, sub_system, err);
+        }
+    }
+}
+
+pub async fn signal_config_snapshot_reload() {
+    let Some(notification_sys) = get_global_notification_sys() else {
+        return;
+    };
+
+    for failure in notification_sys.refresh_config_snapshot().await {
+        if let Some(err) = failure.err {
+            warn!("peer config snapshot refresh failed for {}: {}", failure.host, err);
         }
     }
 }

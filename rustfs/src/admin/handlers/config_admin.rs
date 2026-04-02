@@ -15,7 +15,8 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::service::config::{
-    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_dynamic_config_reload, validate_server_config,
+    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
+    validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
@@ -834,6 +835,8 @@ impl Operation for SetConfigKVHandler {
             if config_applied {
                 signal_dynamic_config_reload(sub_system).await;
             }
+        } else {
+            signal_config_snapshot_reload().await;
         }
 
         success_response(config_applied)
@@ -866,6 +869,8 @@ impl Operation for DelConfigKVHandler {
             if config_applied {
                 signal_dynamic_config_reload(sub_system).await;
             }
+        } else {
+            signal_config_snapshot_reload().await;
         }
 
         success_response(config_applied)
@@ -956,6 +961,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         delete_server_config_history(restore_id).await?;
+        signal_config_snapshot_reload().await;
 
         success_response(false)
     }
@@ -992,6 +998,7 @@ impl Operation for SetConfigHandler {
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
+        signal_config_snapshot_reload().await;
 
         success_response(false)
     }

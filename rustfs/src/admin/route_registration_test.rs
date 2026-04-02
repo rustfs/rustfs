@@ -369,6 +369,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         set_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
         "SetConfigKVHandler must propagate dynamic config reloads to peers"
     );
+    assert!(
+        set_kv_block.contains("signal_config_snapshot_reload().await;"),
+        "SetConfigKVHandler must refresh peer config snapshots for non-dynamic updates"
+    );
 
     let del_kv_block = &config_admin_src[config_admin_src
         .find("impl Operation for DelConfigKVHandler")
@@ -388,6 +392,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
     assert!(
         del_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
         "DelConfigKVHandler must propagate dynamic config reloads to peers"
+    );
+    assert!(
+        del_kv_block.contains("signal_config_snapshot_reload().await;"),
+        "DelConfigKVHandler must refresh peer config snapshots for non-dynamic updates"
     );
 
     let list_history_block = &config_admin_src[config_admin_src
@@ -422,6 +430,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         "RestoreConfigHistoryKVHandler must validate restored config before persisting"
     );
     assert!(
+        restore_history_block.contains("signal_config_snapshot_reload().await;"),
+        "RestoreConfigHistoryKVHandler must refresh peer config snapshots after restore"
+    );
+    assert!(
         !restore_history_block.contains("apply_dynamic_config_for_subsystem("),
         "RestoreConfigHistoryKVHandler must not dynamically apply config changes"
     );
@@ -432,6 +444,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
     assert!(
         set_full_config_block.contains("validate_server_config(&config, None).await?;"),
         "SetConfigHandler must validate full-config imports before persisting"
+    );
+    assert!(
+        set_full_config_block.contains("signal_config_snapshot_reload().await;"),
+        "SetConfigHandler must refresh peer config snapshots after full-config import"
     );
     assert!(
         !set_full_config_block.contains("apply_dynamic_config_for_subsystem("),

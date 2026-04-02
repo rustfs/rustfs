@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::admin::service::{
-    config::{SERVICE_SIGNAL_RELOAD_DYNAMIC, reload_dynamic_config_runtime_state},
+    config::{
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, reload_dynamic_config_runtime_state,
+        reload_runtime_config_snapshot,
+    },
     site_replication::reload_site_replication_runtime_state,
 };
 use bytes::Bytes;
@@ -783,6 +786,16 @@ impl Node for NodeService {
         let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
 
         match signal {
+            Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
+                Ok(()) => Ok(Response::new(SignalServiceResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(SignalServiceResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
             Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => match reload_dynamic_config_runtime_state(sub_system).await {
                 Ok(()) => Ok(Response::new(SignalServiceResponse {
                     success: true,
@@ -2300,6 +2313,26 @@ mod tests {
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
         assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_refresh_config_requires_object_layer() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_REFRESH_CONFIG.to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("storage layer not initialized"));
     }
 
     #[tokio::test]
