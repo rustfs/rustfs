@@ -25,8 +25,21 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::oidc::{
+    IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
+    OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY,
+    OIDC_SCOPES, OIDC_USERNAME_CLAIM,
+};
+use rustfs_config::{
+    COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL,
+    MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT,
+    WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+};
 use rustfs_credentials::Credentials;
+use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
 use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -69,25 +82,42 @@ struct ConfigSelector {
     target: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelpSubSystemMetadata {
+    key: &'static str,
+    description: &'static str,
+    multiple_targets: bool,
+    keys: &'static [HelpKeyMetadata],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelpKeyMetadata {
+    key: &'static str,
+    type_name: &'static str,
+    description: &'static str,
+    optional: bool,
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ConfigHelpResponse {
-    #[serde(rename = "subSystems")]
-    sub_systems: Vec<String>,
-    #[serde(rename = "subSys", skip_serializing_if = "Option::is_none")]
-    sub_sys: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key: Option<String>,
-    #[serde(rename = "envOnly")]
-    env_only: bool,
-    entries: Vec<ConfigHelpEntry>,
+    #[serde(rename = "subSys")]
+    sub_sys: String,
+    description: String,
+    #[serde(rename = "multipleTargets")]
+    multiple_targets: bool,
+    #[serde(rename = "keysHelp")]
+    keys_help: Vec<ConfigHelpEntry>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ConfigHelpEntry {
     key: String,
-    sensitive: bool,
-    configured: bool,
-    value: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    description: String,
+    optional: bool,
+    #[serde(rename = "multipleTargets")]
+    multiple_targets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -99,6 +129,312 @@ struct ConfigHistoryEntry {
     #[serde(rename = "Data", skip_serializing_if = "Option::is_none")]
     data: Option<String>,
 }
+
+const STORAGE_CLASS_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: "standard",
+        type_name: "string",
+        description: "set the standard storage class parity, e.g. EC:2",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: "rrs",
+        type_name: "string",
+        description: "set the reduced redundancy storage class parity, e.g. EC:1",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: "optimize",
+        type_name: "string",
+        description: "optimize storage class behavior for availability or capacity",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: "inline_block",
+        type_name: "string",
+        description: "configure the shard size threshold considered for inline blocks",
+        optional: true,
+    },
+];
+
+const OIDC_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: OIDC_CONFIG_URL,
+        type_name: "url",
+        description: "openid discovery document URL",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: OIDC_CLIENT_ID,
+        type_name: "string",
+        description: "client identifier for the provider",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: OIDC_CLIENT_SECRET,
+        type_name: "string",
+        description: "client secret for the provider",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_SCOPES,
+        type_name: "csv",
+        description: "comma-separated OpenID scopes",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_REDIRECT_URI,
+        type_name: "url",
+        description: "static redirect URI when dynamic redirects are disabled",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_REDIRECT_URI_DYNAMIC,
+        type_name: "on|off",
+        description: "enable or disable automatic redirect URI generation",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_CLAIM_NAME,
+        type_name: "string",
+        description: "claim used for policy mapping",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_CLAIM_PREFIX,
+        type_name: "string",
+        description: "prefix added to mapped claims",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_ROLE_POLICY,
+        type_name: "string",
+        description: "role policy mapped from provider claims",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_DISPLAY_NAME,
+        type_name: "string",
+        description: "display name for the provider",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_GROUPS_CLAIM,
+        type_name: "string",
+        description: "claim name containing group memberships",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_EMAIL_CLAIM,
+        type_name: "string",
+        description: "claim name containing the user email",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: OIDC_USERNAME_CLAIM,
+        type_name: "string",
+        description: "claim name containing the username",
+        optional: true,
+    },
+];
+
+const WEBHOOK_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: WEBHOOK_ENDPOINT,
+        type_name: "url",
+        description: "webhook endpoint URL",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_AUTH_TOKEN,
+        type_name: "string",
+        description: "bearer token or shared secret for webhook delivery",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_QUEUE_DIR,
+        type_name: "path",
+        description: "absolute path for the webhook retry queue",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_QUEUE_LIMIT,
+        type_name: "number",
+        description: "maximum number of queued webhook events",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_CLIENT_CERT,
+        type_name: "string",
+        description: "client certificate presented to the webhook endpoint",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_CLIENT_KEY,
+        type_name: "string",
+        description: "client private key presented to the webhook endpoint",
+        optional: true,
+    },
+];
+
+const AUDIT_WEBHOOK_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: WEBHOOK_ENDPOINT,
+        type_name: "url",
+        description: "webhook endpoint URL",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_AUTH_TOKEN,
+        type_name: "string",
+        description: "bearer token or shared secret for webhook delivery",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_CLIENT_CERT,
+        type_name: "string",
+        description: "client certificate presented to the webhook endpoint",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_CLIENT_KEY,
+        type_name: "string",
+        description: "client private key presented to the webhook endpoint",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_BATCH_SIZE,
+        type_name: "number",
+        description: "number of audit events to batch per request",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_QUEUE_LIMIT,
+        type_name: "number",
+        description: "maximum number of queued audit events",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_QUEUE_DIR,
+        type_name: "path",
+        description: "absolute path for the audit retry queue",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_MAX_RETRY,
+        type_name: "number",
+        description: "maximum number of retry attempts",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_RETRY_INTERVAL,
+        type_name: "duration",
+        description: "delay between retry attempts",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: WEBHOOK_HTTP_TIMEOUT,
+        type_name: "duration",
+        description: "HTTP timeout for webhook delivery",
+        optional: true,
+    },
+];
+
+const MQTT_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: MQTT_BROKER,
+        type_name: "url",
+        description: "MQTT broker URL",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: MQTT_TOPIC,
+        type_name: "string",
+        description: "MQTT topic used for published events",
+        optional: false,
+    },
+    HelpKeyMetadata {
+        key: MQTT_USERNAME,
+        type_name: "string",
+        description: "username used when connecting to the broker",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_PASSWORD,
+        type_name: "string",
+        description: "password used when connecting to the broker",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_QOS,
+        type_name: "0|1|2",
+        description: "MQTT QoS level",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_KEEP_ALIVE_INTERVAL,
+        type_name: "duration",
+        description: "keep-alive interval for the broker connection",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_RECONNECT_INTERVAL,
+        type_name: "duration",
+        description: "delay before reconnecting to the broker",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_QUEUE_DIR,
+        type_name: "path",
+        description: "absolute path for the MQTT retry queue",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: MQTT_QUEUE_LIMIT,
+        type_name: "number",
+        description: "maximum number of queued MQTT events",
+        optional: true,
+    },
+];
+
+const HELP_SUBSYSTEMS: &[HelpSubSystemMetadata] = &[
+    HelpSubSystemMetadata {
+        key: STORAGE_CLASS_SUB_SYS,
+        description: "define object level redundancy",
+        multiple_targets: false,
+        keys: STORAGE_CLASS_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: IDENTITY_OPENID_SUB_SYS,
+        description: "enable OpenID SSO support",
+        multiple_targets: true,
+        keys: OIDC_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: AUDIT_WEBHOOK_SUB_SYS,
+        description: "send audit logs to webhook endpoints",
+        multiple_targets: true,
+        keys: AUDIT_WEBHOOK_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: AUDIT_MQTT_SUB_SYS,
+        description: "send audit logs to MQTT endpoints",
+        multiple_targets: true,
+        keys: MQTT_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: NOTIFY_WEBHOOK_SUB_SYS,
+        description: "publish bucket notifications to webhook endpoints",
+        multiple_targets: true,
+        keys: WEBHOOK_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: NOTIFY_MQTT_SUB_SYS,
+        description: "publish bucket notifications to MQTT endpoints",
+        multiple_targets: true,
+        keys: MQTT_HELP_KEYS,
+    },
+];
 
 pub fn register_config_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -696,96 +1032,98 @@ fn render_full_config(config: &ServerConfig) -> Vec<u8> {
     lines.join("\n").into_bytes()
 }
 
-fn collect_help_entries(config: &ServerConfig, sub_system: &str, key_filter: Option<&str>) -> S3Result<Vec<ConfigHelpEntry>> {
-    let defaults = ServerConfig::new();
-    let default_kvs = defaults
-        .0
-        .get(sub_system)
-        .and_then(|targets| targets.get(DEFAULT_DELIMITER))
-        .cloned()
-        .unwrap_or_default();
-    let configured_kvs = config
-        .0
-        .get(sub_system)
-        .and_then(|targets| targets.get(DEFAULT_DELIMITER))
-        .cloned()
-        .unwrap_or_default();
+fn lookup_help_subsystem(sub_system: &str) -> Option<&'static HelpSubSystemMetadata> {
+    HELP_SUBSYSTEMS.iter().find(|metadata| metadata.key == sub_system)
+}
 
-    let mut keys = default_kvs
-        .0
+fn env_help_key(sub_system: &str, key: &str) -> String {
+    format!("{ENV_PREFIX}{}_{}", sub_system.to_ascii_uppercase(), key.to_ascii_uppercase())
+}
+
+fn build_top_level_help_response() -> ConfigHelpResponse {
+    ConfigHelpResponse {
+        sub_sys: String::new(),
+        description: String::new(),
+        multiple_targets: false,
+        keys_help: HELP_SUBSYSTEMS
+            .iter()
+            .map(|metadata| ConfigHelpEntry {
+                key: metadata.key.to_string(),
+                type_name: "string".to_string(),
+                description: metadata.description.to_string(),
+                optional: false,
+                multiple_targets: metadata.multiple_targets,
+            })
+            .collect(),
+    }
+}
+
+fn build_help_entries(
+    metadata: &HelpSubSystemMetadata,
+    key_filter: Option<&str>,
+    env_only: bool,
+) -> S3Result<Vec<ConfigHelpEntry>> {
+    let enable_entry = metadata.multiple_targets.then(|| ConfigHelpEntry {
+        key: if env_only {
+            env_help_key(metadata.key, ENABLE_KEY)
+        } else {
+            ENABLE_KEY.to_string()
+        },
+        type_name: "on|off".to_string(),
+        description: format!("enable {} target, default is 'off'", metadata.key),
+        optional: false,
+        multiple_targets: false,
+    });
+
+    let mut entries = metadata
+        .keys
         .iter()
-        .chain(configured_kvs.0.iter())
-        .filter(|entry| entry.key != COMMENT_KEY)
-        .map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>();
-
-    if let Some(key_filter) = key_filter {
-        keys.retain(|key| key == key_filter);
-    }
-
-    if keys.is_empty() {
-        return Err(s3_error!(InvalidRequest, "config subsystem '{}' has no help entries", sub_system));
-    }
-
-    let entries = keys
-        .into_iter()
-        .map(|key| {
-            let default_entry = default_kvs.0.iter().find(|entry| entry.key == key);
-            let configured_entry = configured_kvs.0.iter().find(|entry| entry.key == key);
-            let sensitive =
-                configured_entry.or(default_entry).is_some_and(|entry| entry.hidden_if_empty) || is_sensitive_key_name(&key);
-            let configured = configured_entry.is_some_and(|entry| !entry.value.trim().is_empty());
-            let value = configured_entry
-                .map(|entry| render_entry_value(entry, true))
-                .or_else(|| default_entry.map(|entry| render_entry_value(entry, true)))
-                .unwrap_or_default();
-
-            ConfigHelpEntry {
-                key,
-                sensitive,
-                configured,
-                value,
-            }
+        .map(|entry| ConfigHelpEntry {
+            key: if env_only {
+                env_help_key(metadata.key, entry.key)
+            } else {
+                entry.key.to_string()
+            },
+            type_name: entry.type_name.to_string(),
+            description: entry.description.to_string(),
+            optional: entry.optional,
+            multiple_targets: false,
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    if let Some(enable_entry) = enable_entry {
+        entries.insert(0, enable_entry);
+    }
+
+    if let Some(key_filter) = key_filter.filter(|value| !value.trim().is_empty()) {
+        let expected = if env_only {
+            env_help_key(metadata.key, key_filter)
+        } else {
+            key_filter.to_string()
+        };
+        entries.retain(|entry| entry.key == expected);
+        if entries.is_empty() {
+            return Err(s3_error!(InvalidRequest, "unknown key {} for sub-system {}", key_filter, metadata.key));
+        }
+    }
 
     Ok(entries)
 }
 
-fn build_help_response(
-    config: &ServerConfig,
-    sub_system: Option<&str>,
-    key: Option<&str>,
-    env_only: bool,
-) -> S3Result<ConfigHelpResponse> {
-    let defaults = ServerConfig::new();
-    let mut sub_systems = defaults
-        .0
-        .keys()
-        .chain(config.0.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    sub_systems.sort();
+fn build_help_response(sub_system: Option<&str>, key: Option<&str>, env_only: bool) -> S3Result<ConfigHelpResponse> {
+    let Some(sub_system) = sub_system.filter(|value| !value.trim().is_empty()) else {
+        return Ok(build_top_level_help_response());
+    };
 
-    if let Some(sub_system) = sub_system.filter(|value| !value.trim().is_empty()) {
-        let entries = collect_help_entries(config, sub_system, key.filter(|value| !value.trim().is_empty()))?;
-        return Ok(ConfigHelpResponse {
-            sub_systems,
-            sub_sys: Some(sub_system.to_string()),
-            key: key.filter(|value| !value.trim().is_empty()).map(ToString::to_string),
-            env_only,
-            entries,
-        });
-    }
+    let metadata =
+        lookup_help_subsystem(sub_system).ok_or_else(|| s3_error!(InvalidRequest, "unknown sub-system {}", sub_system))?;
+    let entries = build_help_entries(metadata, key, env_only)?;
 
     Ok(ConfigHelpResponse {
-        sub_systems,
-        sub_sys: None,
-        key: None,
-        env_only,
-        entries: Vec::new(),
+        sub_sys: metadata.key.to_string(),
+        description: metadata.description.to_string(),
+        multiple_targets: metadata.multiple_targets,
+        keys_help: entries,
     })
 }
 
@@ -884,9 +1222,7 @@ impl Operation for HelpConfigKVHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_config_admin_request(&req).await?;
         let queries = extract_query_params(&req.uri);
-        let config = load_active_server_config()?;
         let response = build_help_response(
-            &config,
             queries.get("subSys").map(String::as_str),
             queries.get("key").map(String::as_str),
             queries.contains_key("env"),
@@ -1124,25 +1460,23 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
     #[test]
     fn build_help_response_reports_known_keys() {
-        let mut config = ServerConfig::new();
-        apply_set_directives(
-            &mut config,
-            &parse_config_directives(
-                r#"identity_openid config_url="https://issuer.example" client_id="console" client_secret="secret-value""#,
-                false,
-            )
-            .expect("parse directives"),
-        );
+        let response = build_help_response(Some("identity_openid"), Some("client_secret"), false).expect("help response");
 
-        let response =
-            build_help_response(&config, Some("identity_openid"), Some("client_secret"), false).expect("help response");
+        assert_eq!(response.sub_sys, "identity_openid");
+        assert_eq!(response.description, "enable OpenID SSO support");
+        assert!(response.multiple_targets);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, "client_secret");
+        assert_eq!(response.keys_help[0].type_name, "string");
+    }
 
-        assert_eq!(response.sub_sys.as_deref(), Some("identity_openid"));
-        assert_eq!(response.entries.len(), 1);
-        assert_eq!(response.entries[0].key, "client_secret");
-        assert!(response.entries[0].sensitive);
-        assert!(response.entries[0].configured);
-        assert_eq!(response.entries[0].value, REDACTED_VALUE);
+    #[test]
+    fn build_help_response_supports_env_only_keys() {
+        let response = build_help_response(Some("notify_webhook"), Some("endpoint"), true).expect("env help response");
+
+        assert_eq!(response.sub_sys, "notify_webhook");
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT");
     }
 
     #[test]

@@ -338,8 +338,8 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         .find("impl Operation for HelpConfigKVHandler")
         .expect("Expected HelpConfigKVHandler block in handlers/config_admin.rs")..];
     assert!(
-        help_config_block.contains("load_active_server_config()?"),
-        "HelpConfigKVHandler must read the active runtime config snapshot"
+        help_config_block.contains("build_help_response("),
+        "HelpConfigKVHandler must build MinIO-compatible help metadata responses"
     );
 
     let get_full_config_block = &config_admin_src[config_admin_src
