@@ -42,16 +42,17 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 Avoid duplicating long crate lists or command matrices in instruction files.
 Reference the source files above instead.
 
-## Mandatory Before Commit
+## Verification Before PR
 
-Run and pass:
+For code changes, run and pass the following before opening a PR:
 
 ```bash
 make pre-commit
 ```
 
 If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
-Do not commit when required checks fail.
+Documentation-only or instruction-only changes do not require `make pre-commit`.
+Do not open a PR with code changes when the required checks fail.
 
 ## Git and PR Baseline
 
