@@ -22,16 +22,37 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
-  issues: write
-  checks: write
 
 jobs:
   cla:
     if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
-      - name: Run CLA Bot
-        uses: overtrue/cla-bot@v0.0.1
+      - name: Create token for rustfs/rustfs
+        id: target-token
+        uses: actions/create-github-app-token@v3
         with:
-          github-token: ${{ github.token }}
+          app-id: ${{ vars.CLA_BOT_APP_ID }}
+          private-key: ${{ secrets.CLA_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: write
+          permission-checks: write
+
+      - name: Create token for rustfs/cla
+        id: registry-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CLA_BOT_APP_ID }}
+          private-key: ${{ secrets.CLA_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: cla
+          permission-contents: write
+
+      - name: Run CLA Bot
+        uses: overtrue/cla-bot@7616514cd5d28caafcabcdd96c91466d312bb1fb
+        with:
+          github-token: ${{ steps.target-token.outputs.token }}
+          registry-token: ${{ steps.registry-token.outputs.token }}
