@@ -581,7 +581,7 @@ impl KmsClient for VaultKmsClient {
     }
 
     fn backend_info(&self) -> BackendInfo {
-        BackendInfo::new("vault".to_string(), "0.1.0".to_string(), self.config.address.clone(), true)
+        BackendInfo::new("vault-kv2".to_string(), "0.1.0".to_string(), self.config.address.clone(), true)
             .with_metadata("kv_mount".to_string(), self.kv_mount.clone())
             .with_metadata("key_prefix".to_string(), self.key_path_prefix.clone())
     }
@@ -596,9 +596,9 @@ impl VaultKmsBackend {
     /// Create a new VaultKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let vault_config = match &config.backend_config {
-            crate::config::BackendConfig::Vault(vault_config) => (**vault_config).clone(),
+            crate::config::BackendConfig::VaultKv2(vault_config) => (**vault_config).clone(),
             crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::VaultTransit(_) => {
-                return Err(KmsError::configuration_error("Expected Vault backend configuration"));
+                return Err(KmsError::configuration_error("Expected Vault KV2 backend configuration"));
             }
         };
 

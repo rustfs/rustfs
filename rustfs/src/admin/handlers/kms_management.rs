@@ -47,7 +47,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
 fn backend_name(backend: &KmsBackend) -> &'static str {
     match backend {
         KmsBackend::Local => "local",
-        KmsBackend::Vault => "vault",
+        KmsBackend::VaultKv2 => "vault-kv2",
         KmsBackend::VaultTransit => "vault-transit",
     }
 }

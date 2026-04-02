@@ -47,7 +47,7 @@ pub struct ConfigureLocalKmsRequest {
     pub cache_ttl_seconds: Option<u64>,
 }
 
-/// Request to configure KMS with Vault backend
+/// Request to configure KMS with Vault KV v2 + Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureVaultKmsRequest {
     /// Vault server URL
@@ -111,8 +111,15 @@ pub struct ConfigureVaultTransitKmsRequest {
 pub enum ConfigureKmsRequest {
     /// Configure with Local backend
     Local(ConfigureLocalKmsRequest),
-    /// Configure with Vault backend
-    Vault(ConfigureVaultKmsRequest),
+    /// Configure with Vault KV v2 + Transit backend
+    #[serde(
+        rename = "VaultKV2",
+        alias = "Vault",
+        alias = "vault",
+        alias = "vault-kv2",
+        alias = "vault_kv2"
+    )]
+    VaultKv2(ConfigureVaultKmsRequest),
     /// Configure with Vault Transit backend
     VaultTransit(ConfigureVaultTransitKmsRequest),
 }
@@ -217,8 +224,9 @@ pub enum BackendSummary {
         /// File permissions (octal)
         file_permissions: Option<u32>,
     },
-    /// Vault backend summary  
-    Vault {
+    /// Vault KV v2 + Transit backend summary
+    #[serde(alias = "vault")]
+    VaultKv2 {
         /// Vault server address
         address: String,
         /// Authentication method type
@@ -271,7 +279,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 has_master_key: local_config.master_key.is_some(),
                 file_permissions: local_config.file_permissions,
             },
-            BackendConfig::Vault(vault_config) => BackendSummary::Vault {
+            BackendConfig::VaultKv2(vault_config) => BackendSummary::VaultKv2 {
                 address: vault_config.address.clone(),
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
@@ -338,9 +346,9 @@ impl ConfigureVaultKmsRequest {
     /// Convert to KmsConfig
     pub fn to_kms_config(&self) -> KmsConfig {
         KmsConfig {
-            backend: KmsBackend::Vault,
+            backend: KmsBackend::VaultKv2,
             default_key_id: self.default_key_id.clone(),
-            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
                 address: self.address.clone(),
                 auth_method: self.auth_method.clone(),
                 namespace: self.namespace.clone(),
@@ -409,7 +417,7 @@ impl ConfigureKmsRequest {
     pub fn to_kms_config(&self) -> KmsConfig {
         match self {
             ConfigureKmsRequest::Local(req) => req.to_kms_config(),
-            ConfigureKmsRequest::Vault(req) => req.to_kms_config(),
+            ConfigureKmsRequest::VaultKv2(req) => req.to_kms_config(),
             ConfigureKmsRequest::VaultTransit(req) => req.to_kms_config(),
         }
     }
@@ -418,6 +426,30 @@ impl ConfigureKmsRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deserialize_vault_kv2_configure_request_accepts_type_aliases() {
+        let bases = ["VaultKV2", "Vault", "vault", "vault-kv2", "vault_kv2"];
+        for backend_type in bases {
+            let raw = serde_json::json!({
+                "backend_type": backend_type,
+                "address": "http://127.0.0.1:8200",
+                "auth_method": {
+                    "Token": {
+                        "token": "dev-root-token"
+                    }
+                },
+                "mount_path": "transit",
+                "default_key_id": "rustfs-master-key"
+            });
+
+            let request: ConfigureKmsRequest = serde_json::from_value(raw).unwrap_or_else(|e| panic!("{backend_type}: {e}"));
+            let config = request.to_kms_config();
+            assert_eq!(config.backend, KmsBackend::VaultKv2, "backend_type={backend_type}");
+            let vault = config.vault_config().expect("vault-kv2 config");
+            assert_eq!(vault.mount_path, "transit");
+        }
+    }
 
     #[test]
     fn test_deserialize_vault_transit_configure_request() {

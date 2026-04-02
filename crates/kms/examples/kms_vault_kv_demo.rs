@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut tags = HashMap::new();
                     tags.insert("environment".to_string(), "demo".to_string());
                     tags.insert("purpose".to_string(), "testing".to_string());
-                    tags.insert("backend".to_string(), "vault".to_string());
+                    tags.insert("backend".to_string(), "vault-kv2".to_string());
                     tags
                 },
                 origin: Some("demo2.rs".to_string()),

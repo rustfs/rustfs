@@ -319,8 +319,8 @@ impl KmsServiceManager {
                 let backend = LocalKmsBackend::new(config.clone()).await?;
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }
-            BackendConfig::Vault(_) => {
-                info!("Creating Vault KMS backend for version {}", version);
+            BackendConfig::VaultKv2(_) => {
+                info!("Creating Vault KV2 KMS backend for version {}", version);
                 let backend = crate::backends::vault::VaultKmsBackend::new(config.clone()).await?;
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }

@@ -20,7 +20,7 @@
 //!
 //! ## Features
 //!
-//! - **Multiple Backends**: Local file storage and Vault (optional)
+//! - **Multiple Backends**: Local file storage, Vault KV2+Transit, and Vault Transit (optional)
 //! - **Object Encryption**: Transparent S3-compatible object encryption
 //! - **Streaming Encryption**: Memory-efficient encryption for large files
 //! - **Key Management**: Full lifecycle management of encryption keys
@@ -29,7 +29,7 @@
 //! ## Architecture
 //!
 //! The KMS follows a three-layer key hierarchy:
-//! - **Master Keys**: Managed by KMS backends (Local/Vault)
+//! - **Master Keys**: Managed by KMS backends (Local / Vault KV2 / Vault Transit)
 //! - **Data Encryption Keys (DEK)**: Generated per object, encrypted by master keys
 //! - **Object Data**: Encrypted using DEKs with AES-256-GCM or ChaCha20-Poly1305
 //!

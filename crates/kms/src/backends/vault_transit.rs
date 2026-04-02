@@ -485,7 +485,7 @@ impl VaultTransitKmsBackend {
     pub async fn new(config: KmsConfig) -> Result<Self> {
         let vault_config = match &config.backend_config {
             crate::config::BackendConfig::VaultTransit(vault_config) => (**vault_config).clone(),
-            crate::config::BackendConfig::Vault(vault_config) => VaultTransitConfig {
+            crate::config::BackendConfig::VaultKv2(vault_config) => VaultTransitConfig {
                 address: vault_config.address.clone(),
                 auth_method: vault_config.auth_method.clone(),
                 namespace: vault_config.namespace.clone(),

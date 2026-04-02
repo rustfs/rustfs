@@ -51,7 +51,7 @@ fn token_is_blank(auth_method: &rustfs_kms::config::VaultAuthMethod) -> bool {
 
 fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAuthMethod> {
     match &config.backend_config {
-        rustfs_kms::config::BackendConfig::Vault(vault) => Some(vault.auth_method.clone()),
+        rustfs_kms::config::BackendConfig::VaultKv2(vault) => Some(vault.auth_method.clone()),
         rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
         rustfs_kms::config::BackendConfig::Local(_) => None,
     }
@@ -62,7 +62,7 @@ fn normalize_configure_request_auth(
     existing_config: Option<&KmsConfig>,
 ) -> Result<(), String> {
     let needs_existing_auth = match request {
-        ConfigureKmsRequest::Vault(req) => token_is_blank(&req.auth_method),
+        ConfigureKmsRequest::VaultKv2(req) => token_is_blank(&req.auth_method),
         ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
         ConfigureKmsRequest::Local(_) => false,
     };
@@ -76,7 +76,7 @@ fn normalize_configure_request_auth(
         .ok_or_else(|| "Vault token is required when no existing KMS credentials are available".to_string())?;
 
     match request {
-        ConfigureKmsRequest::Vault(req) => req.auth_method = existing_auth,
+        ConfigureKmsRequest::VaultKv2(req) => req.auth_method = existing_auth,
         ConfigureKmsRequest::VaultTransit(req) => req.auth_method = existing_auth,
         ConfigureKmsRequest::Local(_) => {}
     }

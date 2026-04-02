@@ -196,8 +196,8 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
 
     Ok(rustfs_kms::config::KmsConfig {
-        backend: rustfs_kms::config::KmsBackend::Vault,
-        backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
+        backend: rustfs_kms::config::KmsBackend::VaultKv2,
+        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(rustfs_kms::config::VaultConfig {
             address: vault_address.clone(),
             auth_method: rustfs_kms::config::VaultAuthMethod::Token {
                 token: vault_token.clone(),
@@ -288,7 +288,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
         // Create KMS configuration from command line options
         let kms_config = match config.kms_backend.as_str() {
             "local" => build_local_kms_config(config)?,
-            "vault" => build_vault_kms_config(config)?,
+            "vault" | "vault-kv2" | "vault_kv2" => build_vault_kms_config(config)?,
             "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
