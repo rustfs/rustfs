@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, KVS, oidc, set_global_storage_class, storageclass};
+use crate::config::{Config, KVS, oidc, set_global_server_config, set_global_storage_class, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
@@ -652,17 +652,21 @@ pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Res
         && let Ok(decoded_current) = decode_server_config_blob(current)
         && configs_semantically_equal(&decoded_current, cfg)
     {
+        set_global_server_config(cfg.clone());
         debug!("server config unchanged and already in standard object shape, skip write");
         return Ok(());
     }
 
     let data = encode_server_config_blob(cfg, existing.as_deref())?;
     if existing.as_deref().is_some_and(|current| current == data.as_slice()) {
+        set_global_server_config(cfg.clone());
         debug!("server config bytes unchanged after encode, skip write");
         return Ok(());
     }
 
-    save_config(api, &config_file, data).await
+    save_config(api, &config_file, data).await?;
+    set_global_server_config(cfg.clone());
+    Ok(())
 }
 
 pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
@@ -709,7 +713,7 @@ mod tests {
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
         read_config_with_metadata, storage_class_kvs_mut,
     };
-    use crate::config::{Config, oidc};
+    use crate::config::{Config, get_global_server_config, oidc};
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
@@ -1455,5 +1459,26 @@ mod tests {
         assert_eq!(data, br#"{"ok":true}"#.to_vec());
         assert_eq!(object_info.bucket, crate::disk::RUSTFS_META_BUCKET);
         assert_eq!(object_info.name, "config/test.json");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_save_server_config_refreshes_global_snapshot_when_config_is_unchanged() {
+        crate::config::init();
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+
+        let mut cfg = Config::new();
+        storage_class_kvs_mut(&mut cfg).insert("standard".to_string(), "EC:2".to_string());
+        let data = encode_server_config_blob(&cfg, None).expect("encode current config");
+        let storage = Arc::new(LockingConfigStorage::new(vec![healthy_client], data).await);
+
+        super::save_server_config(storage, &cfg)
+            .await
+            .expect("save config should succeed");
+
+        assert_eq!(get_global_server_config(), Some(cfg));
     }
 }
