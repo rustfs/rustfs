@@ -1,0 +1,17 @@
+enabled: true
+
+document:
+  version: v1
+  url: https://github.com/rustfs/cla/blob/main/cla/v1.md
+
+signing:
+  mode: comment
+  comment_pattern: I have read and agree to the CLA.
+
+registry:
+  type: json-repo
+  repository: rustfs/cla
+  path_prefix: signatures
+
+status:
+  check_name: CLA Check
