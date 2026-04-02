@@ -1648,10 +1648,7 @@ mod tests {
         assert_eq!(result.event_info.bucket, "bucket");
         assert_eq!(result.event_info.name, "key");
         assert_eq!(result.output.checksum_crc32.as_deref(), Some("crc32"));
-        assert_eq!(
-            result.output.checksum_type,
-            Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT))
-        );
+        assert_eq!(result.output.checksum_type, Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)));
     }
 
     #[test]

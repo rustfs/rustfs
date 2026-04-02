@@ -18,12 +18,12 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
-    use bytes::Bytes;
-    use futures::StreamExt;
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::{ByteStream, SdkBody};
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
     use base64::Engine;
+    use bytes::Bytes;
+    use futures::StreamExt;
     use http_body::Frame;
     use http_body_util::StreamBody;
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
@@ -290,7 +290,11 @@ mod tests {
             .expect("collect body")
             .into_bytes();
 
-        assert_eq!(body_bytes.as_ref(), expected_content.as_slice(), "GetObject body must match uploaded content");
+        assert_eq!(
+            body_bytes.as_ref(),
+            expected_content.as_slice(),
+            "GetObject body must match uploaded content"
+        );
         assert_eq!(
             get_resp.checksum_crc32().map(str::to_string),
             Some(put_checksum),
