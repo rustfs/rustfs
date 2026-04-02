@@ -135,25 +135,25 @@ const STORAGE_CLASS_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: "standard",
         type_name: "string",
-        description: "set the standard storage class parity, e.g. EC:2",
+        description: "set the parity count for default standard storage class",
         optional: true,
     },
     HelpKeyMetadata {
         key: "rrs",
         type_name: "string",
-        description: "set the reduced redundancy storage class parity, e.g. EC:1",
+        description: "set the parity count for reduced redundancy storage class",
         optional: true,
     },
     HelpKeyMetadata {
         key: "optimize",
         type_name: "string",
-        description: "optimize storage class behavior for availability or capacity",
+        description: "optimize parity calculation for standard storage class, set 'capacity' for capacity optimized",
         optional: true,
     },
     HelpKeyMetadata {
         key: "inline_block",
         type_name: "string",
-        description: "configure the shard size threshold considered for inline blocks",
+        description: "set the shard size threshold considered for inline blocks",
         optional: true,
     },
 ];
@@ -162,61 +162,61 @@ const OIDC_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: OIDC_CONFIG_URL,
         type_name: "url",
-        description: "openid discovery document URL",
+        description: "openid discovery document URL e.g. \"https://accounts.google.com/.well-known/openid-configuration\"",
         optional: false,
     },
     HelpKeyMetadata {
         key: OIDC_CLIENT_ID,
         type_name: "string",
-        description: "client identifier for the provider",
+        description: "unique public identifier for the client application",
         optional: false,
     },
     HelpKeyMetadata {
         key: OIDC_CLIENT_SECRET,
         type_name: "string",
-        description: "client secret for the provider",
+        description: "secret for the client application identifier",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_SCOPES,
         type_name: "csv",
-        description: "comma-separated OpenID scopes",
+        description: "comma-separated list of OpenID scopes for the server",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_REDIRECT_URI,
         type_name: "url",
-        description: "static redirect URI when dynamic redirects are disabled",
+        description: "static redirect URI used when dynamic redirects are disabled",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_REDIRECT_URI_DYNAMIC,
         type_name: "on|off",
-        description: "enable or disable automatic redirect URI generation",
+        description: "enable Host header based dynamic redirect URI",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_CLAIM_NAME,
         type_name: "string",
-        description: "claim used for policy mapping",
+        description: "JWT canned policy claim name",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_CLAIM_PREFIX,
         type_name: "string",
-        description: "prefix added to mapped claims",
+        description: "prefix added to claims before policy mapping",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_ROLE_POLICY,
         type_name: "string",
-        description: "role policy mapped from provider claims",
+        description: "IAM access policies mapped to this client application and identity provider",
         optional: true,
     },
     HelpKeyMetadata {
         key: OIDC_DISPLAY_NAME,
         type_name: "string",
-        description: "display name for the provider",
+        description: "friendly display name for this provider",
         optional: true,
     },
     HelpKeyMetadata {
@@ -243,37 +243,37 @@ const WEBHOOK_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: WEBHOOK_ENDPOINT,
         type_name: "url",
-        description: "webhook endpoint URL",
+        description: "webhook server endpoint e.g. \"http://localhost:8080/rustfs/events\"",
         optional: false,
     },
     HelpKeyMetadata {
         key: WEBHOOK_AUTH_TOKEN,
         type_name: "string",
-        description: "bearer token or shared secret for webhook delivery",
+        description: "opaque string or JWT authorization token",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_QUEUE_DIR,
         type_name: "path",
-        description: "absolute path for the webhook retry queue",
+        description: "staging dir for undelivered messages e.g. '/home/events'",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_QUEUE_LIMIT,
         type_name: "number",
-        description: "maximum number of queued webhook events",
+        description: "maximum limit for undelivered messages",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_CLIENT_CERT,
         type_name: "string",
-        description: "client certificate presented to the webhook endpoint",
+        description: "client cert for webhook mTLS authentication",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_CLIENT_KEY,
         type_name: "string",
-        description: "client private key presented to the webhook endpoint",
+        description: "client cert key for webhook mTLS authentication",
         optional: true,
     },
 ];
@@ -282,61 +282,61 @@ const AUDIT_WEBHOOK_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: WEBHOOK_ENDPOINT,
         type_name: "url",
-        description: "webhook endpoint URL",
+        description: "HTTP(s) endpoint e.g. \"http://localhost:8080/rustfs/logs/audit\"",
         optional: false,
     },
     HelpKeyMetadata {
         key: WEBHOOK_AUTH_TOKEN,
         type_name: "string",
-        description: "bearer token or shared secret for webhook delivery",
+        description: "opaque string or JWT authorization token",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_CLIENT_CERT,
         type_name: "string",
-        description: "client certificate presented to the webhook endpoint",
+        description: "mTLS certificate for webhook authentication",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_CLIENT_KEY,
         type_name: "string",
-        description: "client private key presented to the webhook endpoint",
+        description: "mTLS certificate key for webhook authentication",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_BATCH_SIZE,
         type_name: "number",
-        description: "number of audit events to batch per request",
+        description: "number of events per HTTP send to the webhook target",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_QUEUE_LIMIT,
         type_name: "number",
-        description: "maximum number of queued audit events",
+        description: "channel queue size for webhook targets",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_QUEUE_DIR,
         type_name: "path",
-        description: "absolute path for the audit retry queue",
+        description: "staging dir for undelivered audit messages e.g. '/home/audit-events'",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_MAX_RETRY,
         type_name: "number",
-        description: "maximum number of retry attempts",
+        description: "maximum retry count before audit events are dropped",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_RETRY_INTERVAL,
         type_name: "duration",
-        description: "delay between retry attempts",
+        description: "sleep between retries e.g. '10s'",
         optional: true,
     },
     HelpKeyMetadata {
         key: WEBHOOK_HTTP_TIMEOUT,
         type_name: "duration",
-        description: "HTTP timeout for webhook delivery",
+        description: "maximum duration for each HTTP request",
         optional: true,
     },
 ];
@@ -344,56 +344,56 @@ const AUDIT_WEBHOOK_HELP_KEYS: &[HelpKeyMetadata] = &[
 const MQTT_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: MQTT_BROKER,
-        type_name: "url",
-        description: "MQTT broker URL",
+        type_name: "uri",
+        description: "MQTT server endpoint e.g. `tcp://localhost:1883`",
         optional: false,
     },
     HelpKeyMetadata {
         key: MQTT_TOPIC,
         type_name: "string",
-        description: "MQTT topic used for published events",
+        description: "name of the MQTT topic to publish",
         optional: false,
     },
     HelpKeyMetadata {
         key: MQTT_USERNAME,
         type_name: "string",
-        description: "username used when connecting to the broker",
+        description: "MQTT username",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_PASSWORD,
         type_name: "string",
-        description: "password used when connecting to the broker",
+        description: "MQTT password",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_QOS,
-        type_name: "0|1|2",
-        description: "MQTT QoS level",
+        type_name: "number",
+        description: "quality of service priority for MQTT delivery",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_KEEP_ALIVE_INTERVAL,
         type_name: "duration",
-        description: "keep-alive interval for the broker connection",
+        description: "keep-alive interval for MQTT connections in s,m,h,d",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_RECONNECT_INTERVAL,
         type_name: "duration",
-        description: "delay before reconnecting to the broker",
+        description: "reconnect interval for MQTT connections in s,m,h,d",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_QUEUE_DIR,
         type_name: "path",
-        description: "absolute path for the MQTT retry queue",
+        description: "staging dir for undelivered messages e.g. '/home/events'",
         optional: true,
     },
     HelpKeyMetadata {
         key: MQTT_QUEUE_LIMIT,
         type_name: "number",
-        description: "maximum number of queued MQTT events",
+        description: "maximum limit for undelivered messages",
         optional: true,
     },
 ];
@@ -1532,6 +1532,17 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help[0].key, "comment");
         assert_eq!(response.keys_help[0].type_name, "sentence");
         assert_eq!(response.keys_help[0].description, DEFAULT_COMMENT_DESCRIPTION);
+    }
+
+    #[test]
+    fn build_help_response_uses_target_specific_descriptions() {
+        let response = build_help_response(Some("notify_webhook"), Some("endpoint"), false).expect("webhook help response");
+
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(
+            response.keys_help[0].description,
+            "webhook server endpoint e.g. \"http://localhost:8080/rustfs/events\""
+        );
     }
 
     #[test]
