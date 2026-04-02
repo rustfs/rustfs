@@ -194,6 +194,18 @@ fn multipart_logical_total_size(fi: &FileInfo) -> usize {
         .sum()
 }
 
+fn multipart_stored_part_size(fi: &FileInfo, part_index: usize) -> usize {
+    fi.parts[part_index].size
+}
+
+fn multipart_stored_total_size(fi: &FileInfo) -> usize {
+    if fi.parts.is_empty() {
+        return fi.size.max(0) as usize;
+    }
+
+    fi.parts.iter().map(|part| part.size).sum()
+}
+
 fn multipart_to_logical_part_offset(fi: &FileInfo, offset: usize) -> Result<(usize, usize)> {
     if offset == 0 {
         return Ok((0, 0));
@@ -207,6 +219,23 @@ fn multipart_to_logical_part_offset(fi: &FileInfo, offset: usize) -> Result<(usi
         }
 
         part_offset -= logical_part_size;
+    }
+
+    Err(Error::other("part not found"))
+}
+
+fn multipart_to_stored_part_offset(fi: &FileInfo, offset: usize) -> Result<(usize, usize)> {
+    if offset == 0 {
+        return Ok((0, 0));
+    }
+
+    let mut part_offset = offset;
+    for (i, part) in fi.parts.iter().enumerate() {
+        if part_offset < part.size {
+            return Ok((i, part_offset));
+        }
+
+        part_offset -= part.size;
     }
 
     Err(Error::other("part not found"))
@@ -563,6 +592,20 @@ impl SetDisks {
             });
         }
 
+        let (bridge_offset, bridge_length) = if fi.parts.is_empty() {
+            (0, fi.size)
+        } else {
+            let total_size = multipart_logical_total_size(&fi);
+            if let Some(range) = &range {
+                let (offset, length) = range
+                    .get_offset_length(total_size as i64)
+                    .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+                (offset, length)
+            } else {
+                (0, total_size as i64)
+            }
+        };
+
         if object_info.is_remote() {
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
@@ -814,8 +857,8 @@ impl SetDisks {
             if let Err(err) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
-                0,
-                fi.size,
+                bridge_offset,
+                bridge_length,
                 &mut writer,
                 fi,
                 files,
@@ -1409,7 +1452,13 @@ impl SetDisks {
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
-        let total_size = multipart_logical_total_size(&fi);
+        let logical_total_size = multipart_logical_total_size(&fi);
+        let use_stored_part_sizes = length > logical_total_size as i64;
+        let total_size = if use_stored_part_sizes {
+            multipart_stored_total_size(&fi)
+        } else {
+            logical_total_size
+        };
 
         let length = if length < 0 { total_size - offset } else { length as usize };
 
@@ -1418,14 +1467,22 @@ impl SetDisks {
             return Err(Error::other("offset out of range"));
         }
 
-        let (part_index, mut part_offset) = multipart_to_logical_part_offset(&fi, offset)?;
+        let (part_index, mut part_offset) = if use_stored_part_sizes {
+            multipart_to_stored_part_offset(&fi, offset)?
+        } else {
+            multipart_to_logical_part_offset(&fi, offset)?
+        };
 
         let mut end_offset = offset;
         if length > 0 {
             end_offset += length - 1
         }
 
-        let (last_part_index, last_part_relative_offset) = multipart_to_logical_part_offset(&fi, end_offset)?;
+        let (last_part_index, last_part_relative_offset) = if use_stored_part_sizes {
+            multipart_to_stored_part_offset(&fi, end_offset)?
+        } else {
+            multipart_to_logical_part_offset(&fi, end_offset)?
+        };
 
         debug!(
             bucket,
@@ -1457,7 +1514,11 @@ impl SetDisks {
             }
 
             let part_number = fi.parts[current_part].number;
-            let part_size = multipart_logical_part_size(&fi, current_part);
+            let part_size = if use_stored_part_sizes {
+                multipart_stored_part_size(&fi, current_part)
+            } else {
+                multipart_logical_part_size(&fi, current_part)
+            };
             let mut part_length = part_size - part_offset;
             if part_length > (length - total_read) {
                 part_length = length - total_read

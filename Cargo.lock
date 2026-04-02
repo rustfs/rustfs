@@ -3186,6 +3186,8 @@ dependencies = [
  "flate2",
  "futures",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "md5",
  "rand 0.10.0",
  "rcgen",

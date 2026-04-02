@@ -179,6 +179,12 @@ pub trait CachedGetObjectSource {
     fn delete_marker(&self) -> bool;
     fn tag_count(&self) -> Option<i32>;
     fn user_metadata(&self) -> &HashMap<String, String>;
+    fn checksum_crc32(&self) -> Option<&str>;
+    fn checksum_crc32c(&self) -> Option<&str>;
+    fn checksum_sha1(&self) -> Option<&str>;
+    fn checksum_sha256(&self) -> Option<&str>;
+    fn checksum_crc64nvme(&self) -> Option<&str>;
+    fn checksum_type(&self) -> Option<&ChecksumType>;
 }
 
 pub struct GetObjectOutputContext {
@@ -292,6 +298,12 @@ pub struct GetObjectCacheWriteback {
     pub user_metadata: HashMap<String, String>,
     pub e_tag: Option<String>,
     pub last_modified: Option<String>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 pub struct GetObjectBodyMaterialization {
@@ -413,6 +425,12 @@ where
         delete_marker: Some(cached.delete_marker()),
         tag_count: cached.tag_count(),
         metadata,
+        checksum_crc32: cached.checksum_crc32().map(str::to_string),
+        checksum_crc32c: cached.checksum_crc32c().map(str::to_string),
+        checksum_sha1: cached.checksum_sha1().map(str::to_string),
+        checksum_sha256: cached.checksum_sha256().map(str::to_string),
+        checksum_crc64nvme: cached.checksum_crc64nvme().map(str::to_string),
+        checksum_type: cached.checksum_type().cloned(),
         ..Default::default()
     }
 }
@@ -451,40 +469,54 @@ pub struct GetObjectChecksums {
     pub checksum_type: Option<ChecksumType>,
 }
 
+fn decode_get_object_checksums(decrypted_checksums: HashMap<String, String>) -> GetObjectChecksums {
+    let mut checksums = GetObjectChecksums::default();
+
+    for (key, checksum) in decrypted_checksums {
+        if key == AMZ_CHECKSUM_TYPE {
+            checksums.checksum_type = Some(ChecksumType::from(checksum));
+            continue;
+        }
+
+        match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+            rustfs_rio::ChecksumType::CRC32 => checksums.crc32 = Some(checksum),
+            rustfs_rio::ChecksumType::CRC32C => checksums.crc32c = Some(checksum),
+            rustfs_rio::ChecksumType::SHA1 => checksums.sha1 = Some(checksum),
+            rustfs_rio::ChecksumType::SHA256 => checksums.sha256 = Some(checksum),
+            rustfs_rio::ChecksumType::CRC64_NVME => checksums.crc64nvme = Some(checksum),
+            _ => (),
+        }
+    }
+
+    checksums
+}
+
+fn read_object_checksums(
+    info: &ObjectInfo,
+    headers: &HeaderMap,
+    part_number: Option<usize>,
+) -> std::io::Result<GetObjectChecksums> {
+    let (decrypted_checksums, _is_multipart) = info
+        .decrypt_checksums(part_number.unwrap_or(0), headers)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    Ok(decode_get_object_checksums(decrypted_checksums))
+}
+
 pub fn build_get_object_checksums(
     info: &ObjectInfo,
     headers: &HeaderMap,
     part_number: Option<usize>,
     rs: Option<&HTTPRangeSpec>,
 ) -> std::io::Result<GetObjectChecksums> {
-    let mut checksums = GetObjectChecksums::default();
-
     if let Some(checksum_mode) = headers.get(AMZ_CHECKSUM_MODE)
         && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
         && rs.is_none()
     {
-        let (decrypted_checksums, _is_multipart) = info
-            .decrypt_checksums(part_number.unwrap_or(0), headers)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        for (key, checksum) in decrypted_checksums {
-            if key == AMZ_CHECKSUM_TYPE {
-                checksums.checksum_type = Some(ChecksumType::from(checksum));
-                continue;
-            }
-
-            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                rustfs_rio::ChecksumType::CRC32 => checksums.crc32 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC32C => checksums.crc32c = Some(checksum),
-                rustfs_rio::ChecksumType::SHA1 => checksums.sha1 = Some(checksum),
-                rustfs_rio::ChecksumType::SHA256 => checksums.sha256 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC64_NVME => checksums.crc64nvme = Some(checksum),
-                _ => (),
-            }
-        }
+        return read_object_checksums(info, headers, part_number);
     }
 
-    Ok(checksums)
+    Ok(GetObjectChecksums::default())
 }
 
 pub fn build_output_version_id(versioned: bool, version_id: Option<&uuid::Uuid>) -> Option<String> {
@@ -543,6 +575,7 @@ pub fn plan_get_object_body(
 }
 
 pub fn build_get_object_cache_writeback(info: &ObjectInfo, body: Bytes, content_length: i64) -> GetObjectCacheWriteback {
+    let checksums = read_object_checksums(info, &HeaderMap::new(), None).unwrap_or_default();
     let body = FrozenGetObjectBody::new(body);
     GetObjectCacheWriteback {
         body: body.into_shared_body(),
@@ -565,6 +598,12 @@ pub fn build_get_object_cache_writeback(info: &ObjectInfo, body: Bytes, content_
         user_metadata: HashMap::new(),
         e_tag: info.etag.clone(),
         last_modified: info.mod_time.and_then(|t| t.format(&Rfc3339).ok()),
+        checksum_crc32: checksums.crc32,
+        checksum_crc32c: checksums.crc32c,
+        checksum_sha1: checksums.sha1,
+        checksum_sha256: checksums.sha256,
+        checksum_crc64nvme: checksums.crc64nvme,
+        checksum_type: checksums.checksum_type,
     }
 }
 
@@ -1022,6 +1061,12 @@ mod tests {
         delete_marker: bool,
         tag_count: Option<i32>,
         user_metadata: HashMap<String, String>,
+        checksum_crc32: Option<String>,
+        checksum_crc32c: Option<String>,
+        checksum_sha1: Option<String>,
+        checksum_sha256: Option<String>,
+        checksum_crc64nvme: Option<String>,
+        checksum_type: Option<ChecksumType>,
     }
 
     impl CachedGetObjectSource for MockCachedSource {
@@ -1079,6 +1124,30 @@ mod tests {
 
         fn user_metadata(&self) -> &HashMap<String, String> {
             &self.user_metadata
+        }
+
+        fn checksum_crc32(&self) -> Option<&str> {
+            self.checksum_crc32.as_deref()
+        }
+
+        fn checksum_crc32c(&self) -> Option<&str> {
+            self.checksum_crc32c.as_deref()
+        }
+
+        fn checksum_sha1(&self) -> Option<&str> {
+            self.checksum_sha1.as_deref()
+        }
+
+        fn checksum_sha256(&self) -> Option<&str> {
+            self.checksum_sha256.as_deref()
+        }
+
+        fn checksum_crc64nvme(&self) -> Option<&str> {
+            self.checksum_crc64nvme.as_deref()
+        }
+
+        fn checksum_type(&self) -> Option<&ChecksumType> {
+            self.checksum_type.as_ref()
         }
     }
 
@@ -1437,6 +1506,8 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             etag: Some("abc123".to_string()),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            checksum: rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"abc")
+                .map(|checksum| checksum.to_bytes(&[])),
             ..Default::default()
         };
 
@@ -1447,6 +1518,7 @@ mod tests {
         assert_eq!(writeback.content_type.as_deref(), Some("application/octet-stream"));
         assert_eq!(writeback.e_tag.as_deref(), Some("abc123"));
         assert_eq!(writeback.last_modified.as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(writeback.checksum_crc32.as_deref(), Some("NSRBwg=="));
     }
 
     #[test]
@@ -1478,6 +1550,12 @@ mod tests {
                 user_metadata: HashMap::new(),
                 e_tag: None,
                 last_modified: None,
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
+                checksum_type: None,
             },
             HashMap::from([(String::from("custom"), String::from("value"))]),
         );
@@ -1555,6 +1633,12 @@ mod tests {
                 delete_marker: false,
                 tag_count: None,
                 user_metadata: HashMap::new(),
+                checksum_crc32: Some("crc32".to_string()),
+                checksum_crc32c: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                checksum_crc64nvme: None,
+                checksum_type: Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
             },
             "vid".to_string(),
         );
@@ -1563,6 +1647,11 @@ mod tests {
         assert_eq!(result.version_id_for_event, "vid");
         assert_eq!(result.event_info.bucket, "bucket");
         assert_eq!(result.event_info.name, "key");
+        assert_eq!(result.output.checksum_crc32.as_deref(), Some("crc32"));
+        assert_eq!(
+            result.output.checksum_type,
+            Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT))
+        );
     }
 
     #[test]

@@ -404,6 +404,11 @@ impl HashReader {
         map
     }
 
+    pub fn finalize_content_hash(&mut self) -> std::io::Result<Option<Checksum>> {
+        self.finish_checksum_validation()?;
+        Ok(self.content_hash.clone())
+    }
+
     fn update_read_state(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.bytes_read += data.len() as u64;
 

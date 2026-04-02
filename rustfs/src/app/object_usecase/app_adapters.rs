@@ -139,6 +139,30 @@ impl ObjectIoCachedGetObjectSource for CachedGetObject {
     fn user_metadata(&self) -> &std::collections::HashMap<String, String> {
         &self.user_metadata
     }
+
+    fn checksum_crc32(&self) -> Option<&str> {
+        self.checksum_crc32.as_deref()
+    }
+
+    fn checksum_crc32c(&self) -> Option<&str> {
+        self.checksum_crc32c.as_deref()
+    }
+
+    fn checksum_sha1(&self) -> Option<&str> {
+        self.checksum_sha1.as_deref()
+    }
+
+    fn checksum_sha256(&self) -> Option<&str> {
+        self.checksum_sha256.as_deref()
+    }
+
+    fn checksum_crc64nvme(&self) -> Option<&str> {
+        self.checksum_crc64nvme.as_deref()
+    }
+
+    fn checksum_type(&self) -> Option<&ChecksumType> {
+        self.checksum_type.as_ref()
+    }
 }
 
 pub(super) fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {

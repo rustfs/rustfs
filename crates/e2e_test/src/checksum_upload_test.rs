@@ -18,10 +18,14 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
+    use bytes::Bytes;
+    use futures::StreamExt;
     use aws_sdk_s3::Client;
-    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::primitives::{ByteStream, SdkBody};
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
     use base64::Engine;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
@@ -62,6 +66,53 @@ mod tests {
         Checksum::new_from_data(RioChecksumType::CRC64_NVME, body)
             .expect("crc64nvme checksum")
             .encoded
+    }
+
+    fn streamed_body_70kib_of_a() -> ByteStream {
+        let bytes = Bytes::from_static(&[b'a'; 1024]);
+        let stream = futures::stream::repeat_with(move || {
+            let frame = Frame::data(bytes.clone());
+            Ok::<_, std::io::Error>(frame)
+        });
+        let body = WithSizeHint::new(StreamBody::new(stream.take(70)), 70 * 1024);
+        ByteStream::new(SdkBody::from_body_1_x(body))
+    }
+
+    struct WithSizeHint<T> {
+        inner: T,
+        size_hint: usize,
+    }
+
+    impl<T> WithSizeHint<T> {
+        fn new(inner: T, size_hint: usize) -> Self {
+            Self { inner, size_hint }
+        }
+    }
+
+    impl<T> http_body::Body for WithSizeHint<T>
+    where
+        T: http_body::Body + Unpin,
+    {
+        type Data = T::Data;
+        type Error = T::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.inner.is_end_stream()
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            let mut hint = self.inner.size_hint();
+            hint.set_exact(self.size_hint as u64);
+            hint
+        }
     }
 
     /// PutObject with Content-MD5: upload succeeds and GetObject returns same content.
@@ -189,6 +240,61 @@ mod tests {
             get_resp.checksum_crc32().map(str::to_string),
             Some(put_checksum),
             "GetObject(checksum_mode=enabled) should expose the stored CRC32 checksum"
+        );
+    }
+
+    /// Matches the `s3s-e2e` streaming upload shape more closely than `ByteStream::from(Vec<u8>)`.
+    #[tokio::test]
+    #[serial]
+    async fn test_put_object_with_checksum_algorithm_only_streaming_body() {
+        init_logging();
+        info!("TEST: PutObject with checksum_algorithm only using streaming body");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-algorithm-streaming";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "obj-with-checksum-algorithm-streaming.txt";
+        let expected_content = vec![b'a'; 70 * 1024];
+
+        let put_resp = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(streamed_body_70kib_of_a())
+            .send()
+            .await
+            .expect("PutObject with streaming checksum_algorithm should succeed");
+
+        let put_checksum = put_resp
+            .checksum_crc32()
+            .expect("PutObject should return checksum_crc32 for streaming checksum_algorithm uploads")
+            .to_string();
+
+        let mut get_resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("GetObject should succeed");
+
+        let body_bytes = std::mem::replace(&mut get_resp.body, ByteStream::new(SdkBody::empty()))
+            .collect()
+            .await
+            .expect("collect body")
+            .into_bytes();
+
+        assert_eq!(body_bytes.as_ref(), expected_content.as_slice(), "GetObject body must match uploaded content");
+        assert_eq!(
+            get_resp.checksum_crc32().map(str::to_string),
+            Some(put_checksum),
+            "GetObject(checksum_mode=enabled) should expose the stored CRC32 checksum for streaming uploads"
         );
     }
 

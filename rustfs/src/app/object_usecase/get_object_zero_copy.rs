@@ -154,6 +154,11 @@ pub(super) async fn prepare_get_object_read(
 
     let event_info = info.clone();
     validate_sse_headers_for_read(&info.user_defined, &request_context.headers)?;
+    validate_ssec_for_read(
+        &info.user_defined,
+        request_context.sse_customer_key.as_ref(),
+        request_context.sse_customer_key_md5.as_ref(),
+    )?;
     let read_plan = object_io_plan_legacy_read(&info, rs, part_number).map_err(ApiError::from)?;
 
     debug!(
@@ -283,6 +288,18 @@ pub(super) async fn prepare_get_object_chunk_read(
         request_context.sse_customer_key_md5.as_ref(),
     )?;
     check_preconditions(&request_context.headers, &info)?;
+
+    let encrypted_object = info.user_defined.contains_key("x-rustfs-encryption-key")
+        || info
+            .user_defined
+            .contains_key("x-amz-server-side-encryption-customer-algorithm");
+    if encrypted_object {
+        rustfs_io_metrics::record_io_fallback(
+            rustfs_io_metrics::IoStage::ReadSetup,
+            rustfs_io_metrics::FallbackReason::EncryptionEnabled,
+        );
+        return Ok(None);
+    }
 
     let plan = match object_io_plan_chunk_read(&info, opts.version_id.is_none(), rs.clone(), part_number) {
         Ok(ChunkReadDecision::Eligible(plan)) => plan,

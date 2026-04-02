@@ -19,6 +19,20 @@ use rustfs_object_io::put::{
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
 
+fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
+    [
+        (rustfs_rio::ChecksumType::CRC32, checksums.crc32.as_deref()),
+        (rustfs_rio::ChecksumType::CRC32C, checksums.crc32c.as_deref()),
+        (rustfs_rio::ChecksumType::SHA1, checksums.sha1.as_deref()),
+        (rustfs_rio::ChecksumType::SHA256, checksums.sha256.as_deref()),
+        (rustfs_rio::ChecksumType::CRC64_NVME, checksums.crc64nvme.as_deref()),
+    ]
+    .into_iter()
+    .find_map(|(checksum_type, value)| {
+        value.and_then(|value| rustfs_rio::Checksum::new_with_type(checksum_type, value).map(|checksum| checksum.to_bytes(&[])))
+    })
+}
+
 impl DefaultObjectUsecase {
     pub(super) async fn run_put_object_flow(
         input: PutObjectInput,
@@ -343,7 +357,7 @@ impl DefaultObjectUsecase {
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
         if dsc.replicate_any() {
-            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
+            schedule_replication(obj_info.clone(), store.clone(), dsc, ReplicationType::Object).await;
         }
 
         let mut checksums = PutObjectChecksums {
@@ -359,6 +373,22 @@ impl DefaultObjectUsecase {
             &mut checksums,
         );
         checksums.merge_from_map(&reader.content_crc());
+        if let Some(checksum_bytes) = resolved_checksum_bytes(&checksums)
+            && obj_info
+                .checksum
+                .as_ref()
+                .is_none_or(|stored| rustfs_rio::read_checksums(stored.as_ref(), 0).0.is_empty())
+        {
+            let checksum_update_opts = ObjectOptions {
+                version_id: raw_version.clone(),
+                resolved_checksum: Some(checksum_bytes),
+                ..Default::default()
+            };
+            let _ = store
+                .put_object_metadata(&bucket, &key, &checksum_update_opts)
+                .await
+                .map_err(ApiError::from)?;
+        }
 
         let output = PutObjectOutput {
             e_tag,

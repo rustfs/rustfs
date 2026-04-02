@@ -876,7 +876,7 @@ impl ObjectIO for SetDisks {
         }
 
         if fi.checksum.is_none()
-            && let Some(content_hash) = data.content_hash_bytes()
+            && let Some(content_hash) = data.content_hash_bytes()?
         {
             fi.checksum = Some(content_hash);
         }
@@ -1734,6 +1734,9 @@ impl ObjectOperations for SetDisks {
         }
         if let Some(ref version_id) = opts.version_id {
             fi.version_id = Uuid::parse_str(version_id).ok();
+        }
+        if let Some(checksum) = &opts.resolved_checksum {
+            fi.checksum = Some(checksum.clone());
         }
 
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)

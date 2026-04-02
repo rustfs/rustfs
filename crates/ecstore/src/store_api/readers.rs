@@ -1,5 +1,5 @@
 use super::*;
-use rustfs_rio::{EtagResolvable, HashReaderMut, TryGetIndex};
+use rustfs_rio::{EtagResolvable, TryGetIndex};
 
 pub struct ChunkNativePutData {
     stream: Option<HashReader>,
@@ -64,11 +64,12 @@ impl ChunkNativePutData {
         self.as_hash_reader_mut().try_resolve_etag()
     }
 
-    pub fn content_hash_bytes(&self) -> Option<Bytes> {
-        self.as_hash_reader()
-            .content_hash()
+    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
+        Ok(self
+            .as_hash_reader_mut()
+            .finalize_content_hash()?
             .as_ref()
-            .map(|checksum| checksum.to_bytes(&[]))
+            .map(|checksum| checksum.to_bytes(&[])))
     }
 
     pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
@@ -137,7 +138,7 @@ impl PutObjReader {
         self.data.resolve_etag()
     }
 
-    pub fn content_hash_bytes(&self) -> Option<Bytes> {
+    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
         self.data.content_hash_bytes()
     }
 
@@ -220,31 +221,34 @@ impl GetObjectReader {
             rs = HTTPRangeSpec::from_object_info(oi, part_number);
         }
 
-        // TODO:Encrypted
+        let logical_size = oi.get_actual_size()?;
+        let encrypted_object = oi.user_defined.contains_key("x-rustfs-encryption-key")
+            || oi
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-algorithm");
 
         let (algo, is_compressed) = oi.is_compressed_ok()?;
 
         // TODO: check TRANSITION
 
         if is_compressed {
-            let actual_size = oi.get_actual_size()?;
             let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
                 // Support range requests for compressed objects
-                let (dec_off, dec_length) = rs.get_offset_length(actual_size)?;
+                let (dec_off, dec_length) = rs.get_offset_length(logical_size)?;
                 (0, oi.size, dec_off, dec_length)
             } else {
-                (0, oi.size, 0, actual_size)
+                (0, oi.size, 0, logical_size)
             };
 
             let dec_reader = DecompressReader::new(reader, algo);
 
-            let actual_size_usize = if actual_size > 0 {
-                actual_size as usize
+            let actual_size_usize = if logical_size > 0 {
+                logical_size as usize
             } else {
-                return Err(Error::other(format!("invalid decompressed size {actual_size}")));
+                return Err(Error::other(format!("invalid decompressed size {logical_size}")));
             };
 
-            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != actual_size {
+            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != logical_size {
                 // Use RangedDecompressReader for streaming range processing
                 // The new implementation supports any offset size by streaming and skipping data
                 match RangedDecompressReader::new(dec_reader, dec_off, dec_length, actual_size_usize) {
@@ -279,8 +283,19 @@ impl GetObjectReader {
             ));
         }
 
+        if encrypted_object && rs.is_none() {
+            return Ok((
+                GetObjectReader {
+                    stream: reader,
+                    object_info: oi.clone(),
+                },
+                0,
+                oi.size,
+            ));
+        }
+
         if let Some(rs) = rs {
-            let (off, length) = rs.get_offset_length(oi.size)?;
+            let (off, length) = rs.get_offset_length(logical_size)?;
 
             Ok((
                 GetObjectReader {
@@ -297,7 +312,7 @@ impl GetObjectReader {
                     object_info: oi.clone(),
                 },
                 0,
-                oi.size,
+                logical_size,
             ))
         }
     }

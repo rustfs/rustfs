@@ -1064,6 +1064,13 @@ pub struct CachedGetObject {
     pub replication_status: Option<String>,
     /// User-defined metadata (x-amz-meta-*)
     pub user_metadata: std::collections::HashMap<String, String>,
+    /// Additional checksum metadata persisted with cached GET responses
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
+    pub checksum_type: Option<s3s::dto::ChecksumType>,
     /// When this object was cached (for internal use, automatically set)
     #[allow(dead_code)]
     cached_at: Option<Instant>,
@@ -1090,6 +1097,12 @@ impl Default for CachedGetObject {
             tag_count: None,
             replication_status: None,
             user_metadata: std::collections::HashMap::new(),
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
+            checksum_type: None,
             cached_at: None,
             access_count: Arc::new(AtomicU64::new(0)),
         }
@@ -1127,6 +1140,12 @@ impl CachedGetObject {
             version_id: writeback.version_id,
             delete_marker: writeback.delete_marker,
             user_metadata: writeback.user_metadata,
+            checksum_crc32: writeback.checksum_crc32,
+            checksum_crc32c: writeback.checksum_crc32c,
+            checksum_sha1: writeback.checksum_sha1,
+            checksum_sha256: writeback.checksum_sha256,
+            checksum_crc64nvme: writeback.checksum_crc64nvme,
+            checksum_type: writeback.checksum_type,
             cached_at: Some(Instant::now()),
             access_count: Arc::new(AtomicU64::new(0)),
             ..Default::default()
@@ -1927,6 +1946,12 @@ mod cached_object_tests {
             },
             e_tag: Some("\"abc123\"".to_string()),
             last_modified: Some("2024-01-01T12:00:00Z".to_string()),
+            checksum_crc32: Some("crc32".to_string()),
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
+            checksum_type: Some(s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT)),
         });
 
         assert_eq!(obj.content_length, 9);
@@ -1942,6 +1967,11 @@ mod cached_object_tests {
         assert_eq!(obj.user_metadata.get("custom-key").map(String::as_str), Some("value"));
         assert_eq!(obj.e_tag.as_deref(), Some("\"abc123\""));
         assert_eq!(obj.last_modified.as_deref(), Some("2024-01-01T12:00:00Z"));
+        assert_eq!(obj.checksum_crc32.as_deref(), Some("crc32"));
+        assert_eq!(
+            obj.checksum_type,
+            Some(s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT))
+        );
         assert!(Arc::ptr_eq(&obj.body, &body));
     }
 
