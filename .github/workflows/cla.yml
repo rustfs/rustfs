@@ -44,5 +44,5 @@ jobs:
       - name: Run CLA Bot
         uses: overtrue/cla-bot@7616514cd5d28caafcabcdd96c91466d312bb1fb
         with:
-          github-token: ${{ steps.target-token.outputs.token }}
+          github-token: ${{ github.token }}
           registry-token: ${{ steps.registry-token.outputs.token }}
