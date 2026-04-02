@@ -51,7 +51,7 @@ make pre-commit
 ```
 
 If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
-Documentation-only or instruction-only changes do not require `make pre-commit`.
+Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any installed git pre-commit hooks (for example, from `make setup-hooks`) may still run on commit unless explicitly skipped.
 Do not open a PR with code changes when the required checks fail.
 
 ## Git and PR Baseline
