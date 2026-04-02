@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
-use crate::rpc::PeerRestClient;
+use crate::rpc::{PeerRestClient, SERVICE_SIGNAL_RELOAD_DYNAMIC};
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;
@@ -740,6 +740,36 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     match client.load_transition_tier_config().await {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let sub_sys = sub_sys.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client
+                        .signal_service(SERVICE_SIGNAL_RELOAD_DYNAMIC, &sub_sys, false, SystemTime::UNIX_EPOCH)
+                        .await
+                    {
                         Ok(_) => NotificationPeerErr {
                             host: client.host.to_string(),
                             err: None,

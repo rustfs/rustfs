@@ -47,6 +47,7 @@ use tracing::warn;
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
+pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {

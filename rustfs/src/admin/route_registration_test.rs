@@ -326,6 +326,54 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         );
     }
 
+    let get_config_block = &config_admin_src[config_admin_src
+        .find("impl Operation for GetConfigKVHandler")
+        .expect("Expected GetConfigKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        get_config_block.contains("load_active_server_config()?"),
+        "GetConfigKVHandler must read the active runtime config snapshot"
+    );
+
+    let help_config_block = &config_admin_src[config_admin_src
+        .find("impl Operation for HelpConfigKVHandler")
+        .expect("Expected HelpConfigKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        help_config_block.contains("load_active_server_config()?"),
+        "HelpConfigKVHandler must read the active runtime config snapshot"
+    );
+
+    let get_full_config_block = &config_admin_src[config_admin_src
+        .find("impl Operation for GetConfigHandler")
+        .expect("Expected GetConfigHandler block in handlers/config_admin.rs")..];
+    assert!(
+        get_full_config_block.contains("load_active_server_config()?"),
+        "GetConfigHandler must export the active runtime config snapshot"
+    );
+
+    let set_kv_block = &config_admin_src[config_admin_src
+        .find("impl Operation for SetConfigKVHandler")
+        .expect("Expected SetConfigKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        set_kv_block.contains("apply_dynamic_config_for_subsystem(&config, sub_system).await?"),
+        "SetConfigKVHandler must dynamically apply supported subsystems"
+    );
+    assert!(
+        set_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
+        "SetConfigKVHandler must propagate dynamic config reloads to peers"
+    );
+
+    let del_kv_block = &config_admin_src[config_admin_src
+        .find("impl Operation for DelConfigKVHandler")
+        .expect("Expected DelConfigKVHandler block in handlers/config_admin.rs")..];
+    assert!(
+        del_kv_block.contains("apply_dynamic_config_for_subsystem(&config, sub_system).await?"),
+        "DelConfigKVHandler must dynamically apply supported subsystems"
+    );
+    assert!(
+        del_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
+        "DelConfigKVHandler must propagate dynamic config reloads to peers"
+    );
+
     let list_history_block = &config_admin_src[config_admin_src
         .find("impl Operation for ListConfigHistoryKVHandler")
         .expect("Expected ListConfigHistoryKVHandler block in handlers/config_admin.rs")..];
@@ -352,5 +400,17 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
     assert!(
         restore_history_block.contains("apply_set_directives(&mut config, &directives);"),
         "RestoreConfigHistoryKVHandler must replay stored config directives"
+    );
+    assert!(
+        !restore_history_block.contains("apply_dynamic_config_for_subsystem("),
+        "RestoreConfigHistoryKVHandler must not dynamically apply config changes"
+    );
+
+    let set_full_config_block = &config_admin_src[config_admin_src
+        .find("impl Operation for SetConfigHandler")
+        .expect("Expected SetConfigHandler block in handlers/config_admin.rs")..];
+    assert!(
+        !set_full_config_block.contains("apply_dynamic_config_for_subsystem("),
+        "SetConfigHandler must not dynamically apply full-config imports"
     );
 }

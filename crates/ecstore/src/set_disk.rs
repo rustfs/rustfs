@@ -41,7 +41,7 @@ use crate::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{GLOBAL_STORAGE_CLASS, storageclass},
+    config::{get_global_storage_class, storageclass},
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -230,8 +230,8 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = GLOBAL_STORAGE_CLASS
-        .get()
+    let parity_drives = get_global_storage_class()
+        .as_ref()
         .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
         .unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
@@ -721,7 +721,7 @@ impl ObjectIO for SetDisks {
         }
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
@@ -774,7 +774,7 @@ impl ObjectIO for SetDisks {
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
                 false
@@ -2732,7 +2732,7 @@ impl MultipartOperations for SetDisks {
         }
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None

@@ -31,11 +31,11 @@ use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<Option<storageclass::Config>>> = LazyLock::new(|| RwLock::new(None));
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
-pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_SERVER_CONFIG: LazyLock<RwLock<Option<Config>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
 pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
@@ -61,14 +61,45 @@ impl ConfigSys {
 
         lookup_configs(&mut cfg, api).await;
 
-        let _ = GLOBAL_SERVER_CONFIG.set(cfg);
+        set_global_server_config(cfg);
 
         Ok(())
     }
 }
 
 pub fn get_global_server_config() -> Option<Config> {
-    GLOBAL_SERVER_CONFIG.get().cloned()
+    GLOBAL_SERVER_CONFIG.read().ok().and_then(|guard| guard.clone())
+}
+
+pub fn set_global_server_config(config: Config) {
+    if let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() {
+        *guard = Some(config);
+    }
+}
+
+pub fn update_global_server_config_subsystem(sub_system: &str, values: Option<HashMap<String, KVS>>) {
+    let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() else {
+        return;
+    };
+    let Some(config) = guard.as_mut() else {
+        return;
+    };
+
+    if let Some(values) = values {
+        config.0.insert(sub_system.to_string(), values);
+    } else {
+        config.0.remove(sub_system);
+    }
+}
+
+pub fn get_global_storage_class() -> Option<storageclass::Config> {
+    GLOBAL_STORAGE_CLASS.read().ok().and_then(|guard| guard.clone())
+}
+
+pub fn set_global_storage_class(config: storageclass::Config) {
+    if let Ok(mut guard) = GLOBAL_STORAGE_CLASS.write() {
+        *guard = Some(config);
+    }
 }
 
 pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {

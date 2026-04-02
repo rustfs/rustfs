@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, oidc, storageclass};
+use crate::config::{Config, KVS, oidc, set_global_storage_class, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
@@ -688,11 +688,8 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {
                 Ok(res) => {
-                    if i == 0
-                        && GLOBAL_STORAGE_CLASS.get().is_none()
-                        && let Err(r) = GLOBAL_STORAGE_CLASS.set(res)
-                    {
-                        error!("GLOBAL_STORAGE_CLASS.set failed {:?}", r);
+                    if i == 0 {
+                        set_global_storage_class(res);
                     }
                 }
                 Err(err) => {

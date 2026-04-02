@@ -14,6 +14,9 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::service::config::{
+    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_dynamic_config_reload,
+};
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -24,7 +27,7 @@ use matchit::Params;
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
-use rustfs_ecstore::config::{Config as ServerConfig, KV, KVS};
+use rustfs_ecstore::config::{Config as ServerConfig, KV, KVS, get_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;
@@ -42,6 +45,9 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const CONFIG_HISTORY_PREFIX: &str = "config/history";
 const CONFIG_HISTORY_SUFFIX: &str = ".kv";
+const CONFIG_APPLIED_HEADER: &str = "x-rustfs-config-applied";
+const CONFIG_APPLIED_COMPAT_HEADER: &str = "x-minio-config-applied";
+const CONFIG_APPLIED_TRUE: &str = "true";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigEntry {
@@ -200,8 +206,15 @@ fn encode_config_payload(path: &str, secret_key: &str, data: Vec<u8>, plain_cont
     }
 }
 
-fn success_response() -> S3Response<(StatusCode, Body)> {
-    S3Response::new((StatusCode::OK, Body::default()))
+fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
+    if !config_applied {
+        return Ok(S3Response::new((StatusCode::OK, Body::default())));
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONFIG_APPLIED_HEADER, header_value(CONFIG_APPLIED_TRUE)?);
+    headers.insert(CONFIG_APPLIED_COMPAT_HEADER, header_value(CONFIG_APPLIED_TRUE)?);
+    Ok(S3Response::with_headers((StatusCode::OK, Body::default()), headers))
 }
 
 fn object_store() -> S3Result<std::sync::Arc<rustfs_ecstore::store::ECStore>> {
@@ -216,6 +229,10 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
         .map_err(Into::into)
 }
 
+fn load_active_server_config() -> S3Result<ServerConfig> {
+    get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))
+}
+
 async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
     let store = object_store()?;
     save_server_config(store, config)
@@ -226,6 +243,17 @@ async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
 
 fn history_object_name(restore_id: &str) -> String {
     format!("{CONFIG_HISTORY_PREFIX}/{restore_id}{CONFIG_HISTORY_SUFFIX}")
+}
+
+fn config_update_sub_system(directives: &[ConfigDirective]) -> S3Result<Option<&str>> {
+    let sub_systems = directives
+        .iter()
+        .map(|directive| directive.sub_system.as_str())
+        .collect::<BTreeSet<_>>();
+    if sub_systems.len() > 1 {
+        return Err(s3_error!(InvalidRequest, "config update must target a single subsystem"));
+    }
+    Ok(sub_systems.iter().next().copied())
 }
 
 fn history_restore_id_from_name(name: &str) -> Option<String> {
@@ -743,7 +771,7 @@ impl Operation for GetConfigKVHandler {
                 .get("key")
                 .ok_or_else(|| s3_error!(InvalidRequest, "missing config key selector"))?,
         )?;
-        let config = load_server_config_from_store().await?;
+        let config = load_active_server_config()?;
         let payload = render_selected_config(&config, &selector, true)?;
         let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
@@ -762,12 +790,22 @@ impl Operation for SetConfigKVHandler {
             return Err(s3_error!(InvalidRequest, "config update body is empty"));
         }
 
+        let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_set_directives(&mut config, &directives);
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
+        let mut config_applied = false;
+        if let Some(sub_system) = sub_system
+            && is_dynamic_config_subsystem(sub_system)
+        {
+            config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
+            if config_applied {
+                signal_dynamic_config_reload(sub_system).await;
+            }
+        }
 
-        Ok(success_response())
+        success_response(config_applied)
     }
 }
 
@@ -783,11 +821,21 @@ impl Operation for DelConfigKVHandler {
             return Err(s3_error!(InvalidRequest, "config delete body is empty"));
         }
 
+        let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_delete_directives(&mut config, &directives);
         save_server_config_to_store(&config).await?;
+        let mut config_applied = false;
+        if let Some(sub_system) = sub_system
+            && is_dynamic_config_subsystem(sub_system)
+        {
+            config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
+            if config_applied {
+                signal_dynamic_config_reload(sub_system).await;
+            }
+        }
 
-        Ok(success_response())
+        success_response(config_applied)
     }
 }
 
@@ -798,7 +846,7 @@ impl Operation for HelpConfigKVHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_config_admin_request(&req).await?;
         let queries = extract_query_params(&req.uri);
-        let config = load_server_config_from_store().await?;
+        let config = load_active_server_config()?;
         let response = build_help_response(
             &config,
             queries.get("subSys").map(String::as_str),
@@ -849,7 +897,7 @@ impl Operation for ClearConfigHistoryKVHandler {
             delete_server_config_history(restore_id).await?;
         }
 
-        Ok(success_response())
+        success_response(false)
     }
 }
 
@@ -874,7 +922,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         save_server_config_to_store(&config).await?;
         delete_server_config_history(restore_id).await?;
 
-        Ok(success_response())
+        success_response(false)
     }
 }
 
@@ -884,7 +932,7 @@ pub struct GetConfigHandler {}
 impl Operation for GetConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_config_admin_request(&req).await?;
-        let config = load_server_config_from_store().await?;
+        let config = load_active_server_config()?;
         let payload = render_full_config(&config);
         let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
@@ -908,7 +956,7 @@ impl Operation for SetConfigHandler {
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
 
-        Ok(success_response())
+        success_response(false)
     }
 }
 
