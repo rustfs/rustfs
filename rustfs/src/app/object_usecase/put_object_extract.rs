@@ -341,11 +341,6 @@ impl DefaultObjectUsecase {
             &mut checksums,
         );
 
-        warn!(
-            "put object extract checksum_crc32={:?}, checksum_crc32c={:?}, checksum_sha1={:?}, checksum_sha256={:?}, checksum_crc64nvme={:?}",
-            checksums.crc32, checksums.crc32c, checksums.sha1, checksums.sha256, checksums.crc64nvme,
-        );
-
         drop(entries);
         let mut decoder = match ar.into_inner() {
             Ok(decoder) => decoder,

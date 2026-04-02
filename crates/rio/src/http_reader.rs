@@ -143,6 +143,7 @@ async fn request_http_byte_stream(
     method: Method,
     headers: HeaderMap,
     body: Option<Vec<u8>>,
+    meter_stream_recv_bytes: bool,
 ) -> io::Result<(bool, HttpByteStream)> {
     let track_internode_metrics = is_internode_rpc_url(&url);
     let client = get_http_client(&url);
@@ -175,7 +176,7 @@ async fn request_http_byte_stream(
     let stream = resp
         .bytes_stream()
         .map_ok(move |bytes| {
-            if track_internode_metrics {
+            if track_internode_metrics && meter_stream_recv_bytes {
                 global_internode_metrics().record_recv_bytes(bytes.len());
             }
             bytes
@@ -196,7 +197,7 @@ pub async fn open_http_byte_stream(
     headers: HeaderMap,
     body: Option<Vec<u8>>,
 ) -> io::Result<HttpByteStream> {
-    let (_track_internode_metrics, stream) = request_http_byte_stream(url, method, headers, body).await?;
+    let (_track_internode_metrics, stream) = request_http_byte_stream(url, method, headers, body, true).await?;
     Ok(stream)
 }
 
@@ -225,7 +226,7 @@ impl HttpReader {
         _read_buf_size: usize,
     ) -> io::Result<Self> {
         let (track_internode_metrics, stream) =
-            request_http_byte_stream(url.clone(), method.clone(), headers.clone(), body).await?;
+            request_http_byte_stream(url.clone(), method.clone(), headers.clone(), body, false).await?;
 
         Ok(Self {
             inner: StreamReader::new(stream),

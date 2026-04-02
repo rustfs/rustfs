@@ -137,6 +137,7 @@ impl ErasureWritePipeline {
         });
 
         let mut writers = MultiWriter::new(writers, self.write_quorum);
+        let mut write_err = None;
 
         while let Some(block) = rx.recv().await {
             if block.is_empty() {
@@ -144,7 +145,19 @@ impl ErasureWritePipeline {
             }
             let write_result = writers.write(&block).await;
             writer_pool.release(block).await;
-            write_result?;
+            if let Err(err) = write_result {
+                write_err = Some(err);
+                break;
+            }
+        }
+
+        if let Some(err) = write_err {
+            task.abort();
+            let _ = task.await;
+            if let Err(shutdown_err) = writers.shutdown().await {
+                error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
+            }
+            return Err(err);
         }
 
         let (reader, total) = task.await??;
