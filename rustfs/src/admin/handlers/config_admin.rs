@@ -15,7 +15,7 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::service::config::{
-    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_dynamic_config_reload,
+    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_dynamic_config_reload, validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
@@ -27,7 +27,7 @@ use matchit::Params;
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
-use rustfs_ecstore::config::{Config as ServerConfig, KV, KVS, get_global_server_config};
+use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;
@@ -254,6 +254,35 @@ fn config_update_sub_system(directives: &[ConfigDirective]) -> S3Result<Option<&
         return Err(s3_error!(InvalidRequest, "config update must target a single subsystem"));
     }
     Ok(sub_systems.iter().next().copied())
+}
+
+fn validate_config_directives(directives: &[ConfigDirective]) -> S3Result<()> {
+    if DEFAULT_KVS.get().is_none() {
+        rustfs_ecstore::config::init();
+    }
+    let Some(defaults) = DEFAULT_KVS.get() else {
+        return Err(s3_error!(InternalError, "config defaults are not initialized"));
+    };
+
+    for directive in directives {
+        let Some(default_kvs) = defaults.get(&directive.sub_system) else {
+            return Err(s3_error!(InvalidRequest, "unsupported config subsystem '{}'", directive.sub_system));
+        };
+
+        let valid_keys = default_kvs.keys().into_iter().collect::<BTreeSet<_>>();
+        for entry in &directive.entries {
+            if !valid_keys.contains(&entry.key) {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "unsupported config key '{}' for subsystem '{}'",
+                    entry.key,
+                    directive.sub_system
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn history_restore_id_from_name(name: &str) -> Option<String> {
@@ -789,10 +818,12 @@ impl Operation for SetConfigKVHandler {
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "config update body is empty"));
         }
+        validate_config_directives(&directives)?;
 
         let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_set_directives(&mut config, &directives);
+        validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
         let mut config_applied = false;
@@ -820,10 +851,12 @@ impl Operation for DelConfigKVHandler {
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "config delete body is empty"));
         }
+        validate_config_directives(&directives)?;
 
         let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_delete_directives(&mut config, &directives);
+        validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
@@ -916,9 +949,11 @@ impl Operation for RestoreConfigHistoryKVHandler {
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "history entry is empty"));
         }
+        validate_config_directives(&directives)?;
 
         let mut config = load_server_config_from_store().await?;
         apply_set_directives(&mut config, &directives);
+        validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         delete_server_config_history(restore_id).await?;
 
@@ -950,9 +985,11 @@ impl Operation for SetConfigHandler {
         if directives.is_empty() {
             return Err(s3_error!(InvalidRequest, "full config body is empty"));
         }
+        validate_config_directives(&directives)?;
 
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives);
+        validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
 
@@ -1002,6 +1039,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_directives_rejects_unknown_subsystem_and_key() {
+        let unsupported_subsystem =
+            parse_config_directives(r#"not_real key="value""#, false).expect("parse unsupported subsystem directive");
+        let err = validate_config_directives(&unsupported_subsystem).expect_err("unknown subsystem should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let unsupported_key =
+            parse_config_directives(r#"identity_openid not_real="value""#, false).expect("parse unsupported key directive");
+        let err = validate_config_directives(&unsupported_key).expect_err("unknown key should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
     fn set_get_and_delete_config_kv_round_trip() {
         let mut config = ServerConfig::new();
         let directives = parse_config_directives(
@@ -1046,6 +1096,7 @@ mod tests {
 
     #[test]
     fn full_config_export_can_be_reapplied() {
+        rustfs_ecstore::config::init();
         let mut original = ServerConfig::new();
         apply_set_directives(
             &mut original,

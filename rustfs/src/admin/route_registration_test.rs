@@ -358,6 +358,14 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         "SetConfigKVHandler must dynamically apply supported subsystems"
     );
     assert!(
+        set_kv_block.contains("validate_config_directives(&directives)?;"),
+        "SetConfigKVHandler must reject unsupported subsystems and keys"
+    );
+    assert!(
+        set_kv_block.contains("validate_server_config(&config, sub_system).await?;"),
+        "SetConfigKVHandler must validate config before persisting"
+    );
+    assert!(
         set_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
         "SetConfigKVHandler must propagate dynamic config reloads to peers"
     );
@@ -368,6 +376,14 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
     assert!(
         del_kv_block.contains("apply_dynamic_config_for_subsystem(&config, sub_system).await?"),
         "DelConfigKVHandler must dynamically apply supported subsystems"
+    );
+    assert!(
+        del_kv_block.contains("validate_config_directives(&directives)?;"),
+        "DelConfigKVHandler must reject unsupported subsystems and keys"
+    );
+    assert!(
+        del_kv_block.contains("validate_server_config(&config, sub_system).await?;"),
+        "DelConfigKVHandler must validate config before persisting"
     );
     assert!(
         del_kv_block.contains("signal_dynamic_config_reload(sub_system).await;"),
@@ -402,6 +418,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
         "RestoreConfigHistoryKVHandler must replay stored config directives"
     );
     assert!(
+        restore_history_block.contains("validate_server_config(&config, None).await?;"),
+        "RestoreConfigHistoryKVHandler must validate restored config before persisting"
+    );
+    assert!(
         !restore_history_block.contains("apply_dynamic_config_for_subsystem("),
         "RestoreConfigHistoryKVHandler must not dynamically apply config changes"
     );
@@ -409,6 +429,10 @@ fn test_config_admin_contracts_use_auth_and_compat_payloads() {
     let set_full_config_block = &config_admin_src[config_admin_src
         .find("impl Operation for SetConfigHandler")
         .expect("Expected SetConfigHandler block in handlers/config_admin.rs")..];
+    assert!(
+        set_full_config_block.contains("validate_server_config(&config, None).await?;"),
+        "SetConfigHandler must validate full-config imports before persisting"
+    );
     assert!(
         !set_full_config_block.contains("apply_dynamic_config_for_subsystem("),
         "SetConfigHandler must not dynamically apply full-config imports"
