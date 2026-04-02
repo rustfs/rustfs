@@ -62,6 +62,7 @@ const CONFIG_HISTORY_SUFFIX: &str = ".kv";
 const CONFIG_APPLIED_HEADER: &str = "x-rustfs-config-applied";
 const CONFIG_APPLIED_COMPAT_HEADER: &str = "x-minio-config-applied";
 const CONFIG_APPLIED_TRUE: &str = "true";
+const DEFAULT_COMMENT_DESCRIPTION: &str = "optionally add a comment to this setting";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigEntry {
@@ -1040,6 +1041,24 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
     format!("{ENV_PREFIX}{}_{}", sub_system.to_ascii_uppercase(), key.to_ascii_uppercase())
 }
 
+fn default_help_postfix(sub_system: &str, key: &str) -> String {
+    if DEFAULT_KVS.get().is_none() {
+        rustfs_ecstore::config::init();
+    }
+
+    DEFAULT_KVS
+        .get()
+        .and_then(|defaults| defaults.get(sub_system))
+        .and_then(|kvs| kvs.lookup(key))
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(" (default: '{}')", value))
+        .unwrap_or_default()
+}
+
+fn help_description(sub_system: &str, key: &str, description: &str) -> String {
+    format!("{description}{}", default_help_postfix(sub_system, key))
+}
+
 fn build_top_level_help_response() -> ConfigHelpResponse {
     ConfigHelpResponse {
         sub_sys: String::new(),
@@ -1070,7 +1089,7 @@ fn build_help_entries(
             ENABLE_KEY.to_string()
         },
         type_name: "on|off".to_string(),
-        description: format!("enable {} target, default is 'off'", metadata.key),
+        description: help_description(metadata.key, ENABLE_KEY, &format!("enable {} target", metadata.key)),
         optional: false,
         multiple_targets: false,
     });
@@ -1085,11 +1104,23 @@ fn build_help_entries(
                 entry.key.to_string()
             },
             type_name: entry.type_name.to_string(),
-            description: entry.description.to_string(),
+            description: help_description(metadata.key, entry.key, entry.description),
             optional: entry.optional,
             multiple_targets: false,
         })
         .collect::<Vec<_>>();
+
+    entries.push(ConfigHelpEntry {
+        key: if env_only {
+            env_help_key(metadata.key, COMMENT_KEY)
+        } else {
+            COMMENT_KEY.to_string()
+        },
+        type_name: "sentence".to_string(),
+        description: DEFAULT_COMMENT_DESCRIPTION.to_string(),
+        optional: true,
+        multiple_targets: false,
+    });
 
     if let Some(enable_entry) = enable_entry {
         entries.insert(0, enable_entry);
@@ -1477,6 +1508,30 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.sub_sys, "notify_webhook");
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT");
+    }
+
+    #[test]
+    fn build_help_response_appends_default_value_postfix() {
+        rustfs_ecstore::config::init();
+        let response = build_help_response(Some("identity_openid"), Some("scopes"), false).expect("help response");
+
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].type_name, "csv");
+        assert!(
+            response.keys_help[0]
+                .description
+                .contains("(default: 'openid,profile,email')")
+        );
+    }
+
+    #[test]
+    fn build_help_response_exposes_comment_key() {
+        let response = build_help_response(Some("notify_webhook"), Some("comment"), false).expect("comment help response");
+
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, "comment");
+        assert_eq!(response.keys_help[0].type_name, "sentence");
+        assert_eq!(response.keys_help[0].description, DEFAULT_COMMENT_DESCRIPTION);
     }
 
     #[test]
