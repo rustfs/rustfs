@@ -19,6 +19,7 @@ use rustfs_audit::factory::{
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
@@ -26,12 +27,14 @@ use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, set_global_storage_class, update_global_server_config_subsystem};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
+use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
 use rustfs_notify::factory::{
     MQTTTargetFactory as NotifyMQTTTargetFactory, TargetFactory as NotifyTargetFactory,
     WebhookTargetFactory as NotifyWebhookTargetFactory,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use tracing::warn;
+use url::Url;
 
 pub use rustfs_ecstore::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 
@@ -154,6 +157,71 @@ fn validate_audit_subsystem_config(config: &ServerConfig, sub_system: &str) -> S
     Ok(())
 }
 
+fn is_valid_provider_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_valid_scheme(scheme: &str) -> bool {
+    scheme == "http" || scheme == "https"
+}
+
+fn validate_absolute_http_url(value: &str, field_name: &str) -> S3Result<()> {
+    let parsed = Url::parse(value).map_err(|_| invalid_request(format!("{field_name} must be an absolute http/https URL")))?;
+    if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
+        return Err(invalid_request(format!("{field_name} must be an absolute http/https URL")));
+    }
+
+    Ok(())
+}
+
+fn validate_identity_openid_config(config: &ServerConfig) -> S3Result<()> {
+    if let Some(targets) = config.0.get(IDENTITY_OPENID_SUB_SYS) {
+        for target in targets.keys() {
+            if target == DEFAULT_DELIMITER {
+                continue;
+            }
+            if !is_valid_provider_id(target) {
+                return Err(invalid_request(format!("invalid provider_id '{target}'")));
+            }
+        }
+    }
+
+    for provider in load_oidc_provider_configs_from_server_config(config) {
+        if !is_valid_provider_id(&provider.id) {
+            return Err(invalid_request(format!("invalid provider_id '{}'", provider.id)));
+        }
+        if provider.config_url.trim().is_empty() {
+            return Err(invalid_request(format!("identity_openid provider '{}' requires config_url", provider.id)));
+        }
+        validate_absolute_http_url(&provider.config_url, "config_url")?;
+
+        if provider.client_id.trim().is_empty() {
+            return Err(invalid_request(format!("identity_openid provider '{}' requires client_id", provider.id)));
+        }
+
+        if !provider.redirect_uri_dynamic {
+            let Some(redirect_uri) = provider.redirect_uri.as_deref() else {
+                return Err(invalid_request(format!(
+                    "identity_openid provider '{}' requires redirect_uri when redirect_uri_dynamic is off",
+                    provider.id
+                )));
+            };
+            validate_absolute_http_url(redirect_uri, "redirect_uri")?;
+        } else if let Some(redirect_uri) = provider.redirect_uri.as_deref() {
+            validate_absolute_http_url(redirect_uri, "redirect_uri")?;
+        }
+
+        if !provider.scopes.iter().any(|scope| scope == "openid") {
+            return Err(invalid_request(format!(
+                "identity_openid provider '{}' scopes must include openid",
+                provider.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
     match sub_system {
         Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config(config).await,
@@ -161,6 +229,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
         Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS),
         Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS),
         Some(AUDIT_MQTT_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS),
+        Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config),
         Some(_) => Ok(()),
         None => {
             validate_storage_class_config(config).await?;
@@ -168,6 +237,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
             validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS)?;
+            validate_identity_openid_config(config)?;
             Ok(())
         }
     }
@@ -226,6 +296,7 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
 mod tests {
     use super::*;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
+    use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
 
     #[test]
@@ -270,6 +341,41 @@ mod tests {
         kvs.insert(MQTT_QUEUE_DIR.to_string(), "relative/dir".to_string());
 
         let err = validate_audit_subsystem_config(&config, AUDIT_MQTT_SUB_SYS).expect_err("relative queue dir should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn validate_identity_openid_config_rejects_missing_openid_scope() {
+        rustfs_ecstore::config::init();
+        let mut config = ServerConfig::new();
+        let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
+        let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
+        kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://issuer.example/.well-known/openid-configuration".to_string(),
+        );
+        kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        kvs.insert(OIDC_SCOPES.to_string(), "profile,email".to_string());
+
+        let err = validate_identity_openid_config(&config).expect_err("openid scope should be required");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
+        rustfs_ecstore::config::init();
+        let mut config = ServerConfig::new();
+        let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
+        let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");
+        let mut named_kvs = default_kvs;
+        named_kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://issuer.example/.well-known/openid-configuration".to_string(),
+        );
+        named_kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        targets.insert("bad$id".to_string(), named_kvs);
+
+        let err = validate_identity_openid_config(&config).expect_err("provider id should be validated");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 }
