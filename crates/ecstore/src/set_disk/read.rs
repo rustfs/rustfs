@@ -597,6 +597,24 @@ impl SetDisks {
             let (last_part_index, _) = multipart_to_logical_part_offset(&fi, end_offset)?;
 
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+            let single_shard_file = if fi.erasure.data_blocks == 1 {
+                Some(
+                    files
+                        .first()
+                        .ok_or_else(|| Error::other("single-shard multipart metadata missing"))?,
+                )
+            } else {
+                None
+            };
+            let single_shard_disk = if fi.erasure.data_blocks == 1 {
+                Some(
+                    disks
+                        .first()
+                        .ok_or_else(|| Error::other("single-shard multipart disk slot missing"))?,
+                )
+            } else {
+                None
+            };
             let mut part_streams = Vec::new();
             let mut part_total_read = 0usize;
             let mut merged_copy_mode = GetObjectChunkCopyMode::TrueZeroCopy;
@@ -617,11 +635,17 @@ impl SetDisks {
                     };
 
                 if fi.erasure.data_blocks == 1 {
-                    let data_path =
-                        format!("{}/{}/part.{}", object, files[current_part].data_dir.unwrap_or_default(), part_number);
+                    let single_shard_file = single_shard_file.expect("single-shard multipart metadata must exist");
+                    let single_shard_disk = single_shard_disk.expect("single-shard multipart disk slot must exist");
+                    let data_dir = single_shard_file
+                        .data_dir
+                        .as_ref()
+                        .map(uuid::Uuid::to_string)
+                        .unwrap_or_default();
+                    let data_path = format!("{}/{}/part.{}", object, data_dir, part_number);
                     let chunk_result = create_bitrot_chunk_stream(
-                        files[current_part].data.as_deref(),
-                        disks[current_part].as_ref(),
+                        single_shard_file.data.as_deref(),
+                        single_shard_disk.as_ref(),
                         bucket,
                         &data_path,
                         part_offset,

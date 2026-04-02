@@ -65,6 +65,21 @@ pub struct PutObjectChecksums {
     pub crc64nvme: Option<String>,
 }
 
+impl PutObjectChecksums {
+    pub fn merge_from_map(&mut self, checksums: &HashMap<String, String>) {
+        for (key, checksum) in checksums {
+            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                rustfs_rio::ChecksumType::CRC32 => self.crc32 = Some(checksum.clone()),
+                rustfs_rio::ChecksumType::CRC32C => self.crc32c = Some(checksum.clone()),
+                rustfs_rio::ChecksumType::SHA1 => self.sha1 = Some(checksum.clone()),
+                rustfs_rio::ChecksumType::SHA256 => self.sha256 = Some(checksum.clone()),
+                rustfs_rio::ChecksumType::CRC64_NVME => self.crc64nvme = Some(checksum.clone()),
+                _ => {}
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PutObjectTransformStage {
     compression_applied: bool,
@@ -487,8 +502,12 @@ fn build_put_object_hash_stage(
     trailing_headers: Option<s3s::TrailingHeaders>,
 ) -> std::io::Result<PutObjectHashStage> {
     let mut reader = HashReader::new(reader, plan.size, plan.actual_size, hash_values.md5hex, hash_values.sha256hex, false)?;
+    let requested_checksum_type = rustfs_rio::ChecksumType::from_header(headers);
     let want_checksum = if plan.apply_s3_checksum {
         reader.add_checksum_from_s3s(headers, trailing_headers, plan.ignore_s3_checksum_value)?;
+        if requested_checksum_type.is_set() && reader.checksum().is_none() {
+            reader.enable_auto_checksum(requested_checksum_type)?;
+        }
         reader.checksum()
     } else {
         None

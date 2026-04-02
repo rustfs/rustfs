@@ -14,7 +14,7 @@
 
 use super::*;
 use rustfs_object_io::put::{
-    PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
+    PutObjectChecksums, PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
@@ -364,6 +364,7 @@ impl DefaultObjectUsecase {
             &request_context.trailing_headers,
             &mut checksums,
         );
+        checksums.merge_from_map(&reader.content_crc());
 
         let output = PutObjectOutput {
             e_tag,

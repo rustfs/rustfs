@@ -345,6 +345,23 @@ impl HashReader {
         Ok(())
     }
 
+    pub fn enable_auto_checksum(&mut self, checksum_type: ChecksumType) -> Result<(), std::io::Error> {
+        if !checksum_type.is_set() {
+            return Ok(());
+        }
+
+        let Some(hasher) = checksum_type.hasher() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
+        };
+
+        self.content_hash = Some(Checksum {
+            checksum_type,
+            ..Default::default()
+        });
+        self.content_hasher = Some(hasher);
+        Ok(())
+    }
+
     pub fn checksum(&self) -> Option<Checksum> {
         if self
             .content_hash
@@ -441,7 +458,11 @@ impl HashReader {
             }
 
             let content_hash = hasher.finalize();
-            if content_hash != expected_content_hash.raw {
+            if expected_content_hash.encoded.is_empty() {
+                expected_content_hash.raw = content_hash.clone();
+                expected_content_hash.encoded = general_purpose::STANDARD.encode(&content_hash);
+                self.content_hash = Some(expected_content_hash);
+            } else if content_hash != expected_content_hash.raw {
                 let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                 let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
                 error!(

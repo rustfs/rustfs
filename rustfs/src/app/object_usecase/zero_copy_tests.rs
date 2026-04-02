@@ -744,6 +744,68 @@ async fn execute_get_object_part_number_marks_direct_path_for_single_disk_store(
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn execute_get_object_whole_multipart_marks_direct_path_for_single_disk_store() {
+    let (_disk_paths, ecstore) = setup_direct_chunk_test_env().await;
+    let bucket = format!("direct-whole-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let key = "test/multipart-whole.bin";
+    let part_one = vec![11u8; 5 * 1024 * 1024];
+    let part_two = vec![22u8; 5 * 1024 * 1024 + 321];
+
+    create_direct_chunk_test_bucket(&ecstore, &bucket).await;
+    let parts = create_direct_chunk_test_multipart_object(&ecstore, &bucket, key, vec![part_one.clone(), part_two.clone()]).await;
+
+    let input = GetObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(key.to_string())
+        .build()
+        .unwrap();
+    let req = build_request(input, Method::GET);
+
+    let request_context = prepare_get_object_request_context(&req).await.unwrap();
+    let manager = get_concurrency_manager();
+
+    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
+        &request_context,
+        &ecstore,
+        manager,
+        &request_context.bucket,
+        &request_context.key,
+        request_context.rs.clone(),
+        request_context.part_number,
+        &request_context.opts,
+        std::time::Instant::now(),
+    )
+    .await
+    .unwrap()
+    .expect("expected chunk fast path");
+
+    match read_setup.body_source {
+        GetObjectBodySource::Chunk { path, copy_mode, .. } => {
+            assert!(matches!(path, GetObjectChunkPath::Direct), "expected direct chunk path");
+            assert_eq!(copy_mode, rustfs_io_metrics::CopyMode::TrueZeroCopy);
+        }
+        GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
+    }
+
+    let usecase = DefaultObjectUsecase::without_context();
+    let response = usecase.execute_get_object(req).await.unwrap();
+    assert_eq!(response.output.content_length, Some(parts.iter().map(|part| part.len() as i64).sum()));
+    let mut body = response.output.body.expect("expected body");
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+
+    let mut expected = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in &parts {
+        expected.extend_from_slice(part);
+    }
+    assert_eq!(collected, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn execute_get_object_part_number_marks_reconstructed_path_for_multi_disk_store_with_missing_shard() {
     let (disk_paths, ecstore) = setup_direct_chunk_multi_disk_test_env().await;
     let bucket = format!("direct-part-reconstructed-{}", &Uuid::new_v4().simple().to_string()[..8]);
