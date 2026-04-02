@@ -1135,7 +1135,28 @@ impl DefaultMultipartUsecase {
                     src_info.actual_size = original;
                 }
 
-                if is_compressible {
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(src_stream, size).await.map_err(ApiError::from)?;
+                    size = plaintext_size;
+
+                    if is_compressible {
+                        let hrd = HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        size = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            size,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                    }
+                } else if is_compressible {
                     let hrd =
                         HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
                             .map_err(ApiError::from)?;

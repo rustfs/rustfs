@@ -381,16 +381,30 @@ where
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
             let block_nonce = derive_block_nonce(this.current_nonce_base, *this.block_index);
             let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+            let legacy_part_nonce = if *this.multipart_mode {
+                derive_legacy_part_nonce(this.base_nonce, *this.current_part)
+            } else {
+                *this.base_nonce
+            };
+            let legacy_block_nonce = derive_block_nonce(&legacy_part_nonce, *this.block_index);
             let plaintext = match this.cipher.decrypt(&nonce, ciphertext) {
                 Ok(plaintext) => plaintext,
                 Err(primary_err) => {
-                    // Accept previously written streams that reused the base nonce for
-                    // every block inside a part. New writes always derive a unique nonce.
                     let legacy_nonce =
-                        Nonce::try_from(this.current_nonce_base.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
-                    this.cipher
-                        .decrypt(&legacy_nonce, ciphertext)
-                        .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
+                        Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+
+                    match this.cipher.decrypt(&legacy_nonce, ciphertext) {
+                        Ok(plaintext) => plaintext,
+                        Err(_) => {
+                            // Accept previously written streams that reused the part nonce
+                            // for every block inside a segment.
+                            let legacy_part_nonce = Nonce::try_from(legacy_part_nonce.as_slice())
+                                .map_err(|_| Error::other("invalid nonce length"))?;
+                            this.cipher
+                                .decrypt(&legacy_part_nonce, ciphertext)
+                                .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
+                        }
+                    }
                 }
             };
 
@@ -443,20 +457,24 @@ where
 }
 
 fn derive_block_nonce(base: &[u8; 12], block_index: usize) -> [u8; 12] {
-    derive_nonce_offset(base, block_index)
+    derive_nonce_offset(base, 8, block_index)
 }
 
 fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
-    derive_nonce_offset(base, part_number)
+    derive_nonce_offset(base, 4, part_number)
 }
 
-fn derive_nonce_offset(base: &[u8; 12], offset: usize) -> [u8; 12] {
+fn derive_legacy_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, part_number)
+}
+
+fn derive_nonce_offset(base: &[u8; 12], start: usize, offset: usize) -> [u8; 12] {
     let mut nonce = *base;
     let mut suffix = [0u8; 4];
-    suffix.copy_from_slice(&nonce[8..12]);
+    suffix.copy_from_slice(&nonce[start..start + 4]);
     let current = u32::from_be_bytes(suffix);
     let next = current.wrapping_add(offset as u32);
-    nonce[8..12].copy_from_slice(&next.to_be_bytes());
+    nonce[start..start + 4].copy_from_slice(&next.to_be_bytes());
     nonce
 }
 
@@ -540,6 +558,20 @@ mod tests {
         }
 
         encrypted.extend_from_slice(&[0xFF, 0, 0, 0, 0, 0, 0, 0]);
+        encrypted
+    }
+
+    async fn encrypt_part_with_legacy_nonce_layout(
+        data: &[u8],
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        part_number: usize,
+    ) -> Vec<u8> {
+        let nonce = derive_legacy_part_nonce(&base_nonce, part_number);
+        let reader = BufReader::new(Cursor::new(data.to_vec()));
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
         encrypted
     }
 
@@ -778,6 +810,15 @@ mod tests {
         assert_ne!(payloads[0], payloads[1]);
     }
 
+    #[test]
+    fn test_part_and_block_nonces_do_not_collide_across_parts() {
+        let base_nonce = [0u8; 12];
+        let part_one_block_one = derive_block_nonce(&derive_part_nonce(&base_nonce, 1), 1);
+        let part_two_block_zero = derive_block_nonce(&derive_part_nonce(&base_nonce, 2), 0);
+
+        assert_ne!(part_one_block_one, part_two_block_zero);
+    }
+
     #[tokio::test]
     async fn test_decrypt_reader_accepts_legacy_single_nonce_streams() {
         let mut data = vec![0u8; ENCRYPTION_BLOCK_SIZE * 3 + 17];
@@ -794,5 +835,34 @@ mod tests {
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 
         assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_accepts_legacy_multipart_nonce_layout() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let part_one = vec![0x11; ENCRYPTION_BLOCK_SIZE + 97];
+        let part_two = vec![0x22; ENCRYPTION_BLOCK_SIZE + 33];
+
+        let encrypted_one = encrypt_part_with_legacy_nonce_layout(&part_one, key, base_nonce, 1).await;
+        let encrypted_two = encrypt_part_with_legacy_nonce_layout(&part_two, key, base_nonce, 2).await;
+
+        let mut combined = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        combined.extend_from_slice(&encrypted_one);
+        combined.extend_from_slice(&encrypted_two);
+
+        let reader = BufReader::new(Cursor::new(combined));
+        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
+        expected.extend_from_slice(&part_one);
+        expected.extend_from_slice(&part_two);
+
+        assert_eq!(decrypted, expected);
     }
 }

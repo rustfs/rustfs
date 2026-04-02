@@ -3395,7 +3395,29 @@ impl DefaultObjectUsecase {
 
         let mut reader = match decryption_material {
             Some(material) => {
-                if should_compress {
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(gr.stream, length).await.map_err(ApiError::from)?;
+                    length = plaintext_size;
+
+                    if should_compress {
+                        let hrd = HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        length = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            length,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
+                            .map_err(ApiError::from)?
+                    }
+                } else if should_compress {
                     let hrd =
                         HashReader::from_stream(material.wrap_single_reader(gr.stream), length, actual_size, None, None, false)
                             .map_err(ApiError::from)?;

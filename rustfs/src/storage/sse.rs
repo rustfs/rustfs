@@ -1643,16 +1643,31 @@ pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>)
 // Multipart Encryption Support
 // ============================================================================
 
-/// Derive a unique nonce for each part in a multipart upload
-///
-/// Uses the base nonce and increments the counter portion by part number.
-/// This ensures each part has a unique nonce while maintaining determinism.
 pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
-    let mut nonce = base;
-    let current = u32::from_be_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]);
-    let incremented = current.wrapping_add(part_number as u32);
-    nonce[8..12].copy_from_slice(&incremented.to_be_bytes());
-    nonce
+    derive_nonce_offset(base, 4, part_number)
+}
+
+fn derive_legacy_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, part_number)
+}
+
+fn derive_nonce_offset(mut base: [u8; 12], start: usize, offset: usize) -> [u8; 12] {
+    let current = u32::from_be_bytes([base[start], base[start + 1], base[start + 2], base[start + 3]]);
+    let incremented = current.wrapping_add(offset as u32);
+    base[start..start + 4].copy_from_slice(&incremented.to_be_bytes());
+    base
+}
+
+async fn decrypt_multipart_part(
+    encrypted_part: &[u8],
+    key_bytes: [u8; 32],
+    part_nonce: [u8; 12],
+) -> Result<Vec<u8>, std::io::Error> {
+    let cursor = std::io::Cursor::new(encrypted_part);
+    let mut decrypt_reader = DecryptReader::new(cursor, key_bytes, part_nonce);
+    let mut plaintext = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext).await?;
+    Ok(plaintext)
 }
 
 pub(crate) async fn decrypt_multipart_managed_stream<R>(
@@ -1679,12 +1694,18 @@ where
             .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
 
         let part_nonce = derive_part_nonce(base_nonce, part.number);
-        let cursor = std::io::Cursor::new(encrypted_part);
-        let mut decrypt_reader = DecryptReader::new(cursor, key_bytes, part_nonce);
-
-        tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, e)))?;
+        match decrypt_multipart_part(&encrypted_part, key_bytes, part_nonce).await {
+            Ok(mut decrypted_part) => plaintext.append(&mut decrypted_part),
+            Err(primary_err) => {
+                let legacy_part_nonce = derive_legacy_part_nonce(base_nonce, part.number);
+                let mut decrypted_part = decrypt_multipart_part(&encrypted_part, key_bytes, legacy_part_nonce)
+                    .await
+                    .map_err(|_| {
+                        StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, primary_err))
+                    })?;
+                plaintext.append(&mut decrypted_part);
+            }
+        }
     }
 
     let total_plain_size = plaintext.len() as i64;
@@ -1955,13 +1976,75 @@ mod tests {
         let part1 = derive_part_nonce(base, 1);
         let part2 = derive_part_nonce(base, 2);
 
-        // First 8 bytes should be unchanged
-        assert_eq!(&base[..8], &part1[..8]);
-        assert_eq!(&base[..8], &part2[..8]);
+        assert_eq!(&base[..4], &part1[..4]);
+        assert_eq!(&base[8..], &part1[8..]);
+        assert_ne!(&base[4..8], &part1[4..8]);
+        assert_ne!(&part1[4..8], &part2[4..8]);
+    }
 
-        // Last 4 bytes should be incremented
-        assert_ne!(&base[8..], &part1[8..]);
-        assert_ne!(&part1[8..], &part2[8..]);
+    #[tokio::test]
+    async fn test_decrypt_multipart_managed_stream_accepts_legacy_part_nonce_layout() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        let key_bytes = [7u8; 32];
+        let base_nonce = [3u8; 12];
+
+        let part_one_plaintext = vec![0x11; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 19];
+        let part_two_plaintext = vec![0x22; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 37];
+
+        let part_one_nonce = derive_legacy_part_nonce(base_nonce, 1);
+        let part_two_nonce = derive_legacy_part_nonce(base_nonce, 2);
+
+        let first_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+        let second_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+
+        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
+        encrypted_stream.extend_from_slice(&first_part);
+        encrypted_stream.extend_from_slice(&second_part);
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: first_part.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: second_part.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let (mut decrypted_reader, plaintext_size) =
+            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
+                .await
+                .unwrap();
+
+        let mut decrypted = Vec::new();
+        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
     }
 
     #[test]
