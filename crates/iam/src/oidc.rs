@@ -980,13 +980,16 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
 }
 
 fn issuer_candidates(base: &str) -> Vec<String> {
-    let trimmed = base.trim_end_matches('/');
-    let mut variants = vec![trimmed.to_string()];
-    let with_trailing_slash = format!("{trimmed}/");
+    let original = base.trim();
+    let mut variants = Vec::with_capacity(2);
+    variants.push(original.to_string());
 
-    if trimmed != with_trailing_slash {
-        variants.push(with_trailing_slash);
-    }
+    let toggled = if original.ends_with('/') {
+        original.trim_end_matches('/').to_string()
+    } else {
+        format!("{original}/")
+    };
+    variants.push(toggled);
 
     variants
 }
@@ -1160,8 +1163,8 @@ mod tests {
         assert_eq!(
             issuer_candidates("https://idp.example.com/realm/"),
             vec![
-                "https://idp.example.com/realm".to_string(),
-                "https://idp.example.com/realm/".to_string()
+                "https://idp.example.com/realm/".to_string(),
+                "https://idp.example.com/realm".to_string()
             ]
         );
         assert_eq!(
