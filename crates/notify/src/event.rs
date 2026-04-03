@@ -336,13 +336,14 @@ pub struct EventArgs {
 }
 
 impl EventArgs {
-    /// True only when a replication header is explicitly set to `true` or `1` (RustFS or MinIO name).
-    /// Mere presence or empty values do not count — avoids wrongly suppressing notifications.
-    /// Storage `ObjectOptions` still parses the typed `HeaderMap` with lowercase `true` in `put_opts_from_headers`;
-    /// this path uses `req_params` and may not match byte-for-byte until parsing is centralized.
+    /// True when the RustFS replication header is explicitly enabled (`true` or `1`).
+    ///
+    /// Only `x-rustfs-source-replication-request` is considered here. Many clients (including the
+    /// console) send `x-minio-source-replication-request` for MinIO compatibility; treating that
+    /// as replication would suppress webhooks on normal browser deletes. Storage still honors both
+    /// prefixes when parsing the typed HTTP headers for `ObjectOptions`.
     pub fn is_replication_request(&self) -> bool {
         self.replication_header_value_true("x-rustfs-source-replication-request")
-            || self.replication_header_value_true("x-minio-source-replication-request")
     }
 
     fn replication_header_value_true(&self, key: &str) -> bool {
@@ -567,6 +568,6 @@ mod event_args_tests {
         assert!(!args_with_headers(&[("x-rustfs-source-replication-request", "false")]).is_replication_request());
         assert!(args_with_headers(&[("x-rustfs-source-replication-request", "true")]).is_replication_request());
         assert!(args_with_headers(&[("x-rustfs-source-replication-request", "True")]).is_replication_request());
-        assert!(args_with_headers(&[("x-minio-source-replication-request", "true")]).is_replication_request());
+        assert!(!args_with_headers(&[("x-minio-source-replication-request", "true")]).is_replication_request());
     }
 }
