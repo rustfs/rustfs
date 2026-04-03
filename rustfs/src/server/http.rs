@@ -162,7 +162,10 @@ pub async fn start_http_server(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     tls_snapshot.apply_outbound().await;
 
-    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| std::io::Error::other(e.to_string()))?;
+    let tls_acceptor = tls_snapshot
+        .build_tls_acceptor(tls_path)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 

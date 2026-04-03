@@ -31,11 +31,11 @@ pub(crate) use http::start_http_server;
 pub(crate) use prefix::*;
 pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use runtime::build_tokio_runtime;
-pub(crate) use service_state::wait_for_shutdown;
+pub(crate) use service_state::SHUTDOWN_TIMEOUT;
 pub(crate) use service_state::ServiceState;
 pub(crate) use service_state::ServiceStateManager;
 pub(crate) use service_state::ShutdownSignal;
-pub(crate) use service_state::SHUTDOWN_TIMEOUT;
+pub(crate) use service_state::wait_for_shutdown;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);

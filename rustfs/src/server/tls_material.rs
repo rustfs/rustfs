@@ -22,7 +22,7 @@
 //! 2. Call `snapshot.apply_outbound()` to set global root CAs and mTLS identity.
 //! 3. Call `snapshot.build_tls_acceptor(tls_path)` to build the server TLS acceptor.
 
-use rustfs_common::{set_global_mtls_identity, set_global_root_cert, MtlsIdentityPem};
+use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{
     DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA,
     ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA,
@@ -30,7 +30,7 @@ use rustfs_config::{
     RUSTFS_TLS_CERT, RUSTFS_TLS_KEY,
 };
 use rustfs_utils::get_env_bool;
-use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -88,7 +88,10 @@ impl TlsMaterialSnapshot {
         // Check if server certs exist (actual loading happens in build_tls_acceptor)
         let has_server_certs = has_server_certificates(tls_path).await;
 
-        Ok(Self { outbound, has_server_certs })
+        Ok(Self {
+            outbound,
+            has_server_certs,
+        })
     }
 
     /// Apply outbound material to global state (root CAs, mTLS identity).
@@ -115,20 +118,15 @@ impl TlsMaterialSnapshot {
 
         // Try multi-cert (SNI) first
         match rustfs_utils::load_all_certs_from_directory(tls_path) {
-            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => {
-                match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
-                    Ok(resolver) => {
-                        let config = build_server_config(
-                            ServerCertSource::Resolver(Arc::new(resolver)),
-                            mtls_verifier,
-                        )?;
-                        info!("Created TLS acceptor with SNI resolver");
-                        let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
-                        return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
-                    }
-                    Err(e) => warn!("Failed to build multi-cert resolver: {}, falling back to single-cert", e),
+            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
+                Ok(resolver) => {
+                    let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
+                    info!("Created TLS acceptor with SNI resolver");
+                    let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
+                    return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
                 }
-            }
+                Err(e) => warn!("Failed to build multi-cert resolver: {}, falling back to single-cert", e),
+            },
             Ok(_) => debug!("No valid multi-cert directory structure found"),
             Err(_) => debug!("load_all_certs_from_directory failed, trying single-cert fallback"),
         }
@@ -137,15 +135,10 @@ impl TlsMaterialSnapshot {
         let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
         let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
         if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
-            let certs =
-                rustfs_utils::load_certs(&cert_path).map_err(|e| TlsMaterialError::Io(format!("load certs: {e}")))?;
-            let key =
-                rustfs_utils::load_private_key(&key_path).map_err(|e| TlsMaterialError::Io(format!("load key: {e}")))?;
+            let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| TlsMaterialError::Io(format!("load certs: {e}")))?;
+            let key = rustfs_utils::load_private_key(&key_path).map_err(|e| TlsMaterialError::Io(format!("load key: {e}")))?;
 
-            let config = build_server_config(
-                ServerCertSource::SingleCert { certs, key },
-                mtls_verifier,
-            )?;
+            let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
             info!("Created TLS acceptor with single certificate");
             let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
             return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
@@ -194,7 +187,9 @@ fn build_server_config(
                     .with_client_cert_verifier(verifier)
                     .with_cert_resolver(resolver)
             } else {
-                rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver)
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(resolver)
             }
         }
         ServerCertSource::SingleCert { certs, key } => {
@@ -258,7 +253,10 @@ async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, T
     // 4. Load optional mTLS identity
     let mtls_identity = load_mtls_identity(tls_dir).await?;
 
-    Ok(OutboundTlsMaterial { root_ca_pem, mtls_identity })
+    Ok(OutboundTlsMaterial {
+        root_ca_pem,
+        mtls_identity,
+    })
 }
 
 /// Quick check whether server certificate files exist in the TLS directory.
@@ -486,16 +484,14 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
             interval.tick().await;
 
             match TlsMaterialSnapshot::load(&tls_path).await {
-                Ok(snapshot) => {
-                    match snapshot.build_tls_acceptor(&tls_path).await {
-                        Ok(Some(new_holder)) => {
-                            info!("TLS certificates reloaded successfully");
-                            holder.swap(&new_holder);
-                        }
-                        Ok(None) => debug!("TLS reload: no certificates found in directory, skipping"),
-                        Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
+                Ok(snapshot) => match snapshot.build_tls_acceptor(&tls_path).await {
+                    Ok(Some(new_holder)) => {
+                        info!("TLS certificates reloaded successfully");
+                        holder.swap(&new_holder);
                     }
-                }
+                    Ok(None) => debug!("TLS reload: no certificates found in directory, skipping"),
+                    Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
+                },
                 Err(e) => {
                     warn!("TLS material reload failed (will retry): {}", e);
                 }
