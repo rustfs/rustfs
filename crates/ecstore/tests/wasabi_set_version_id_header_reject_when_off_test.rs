@@ -23,19 +23,13 @@ use temp_env::with_var;
 fn rejects_non_empty_wasabi_set_version_id_when_mode_off() {
     with_var("RUSTFS_WASABI_VERSION_IDS", Some("false"), || {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            WASABI_SET_VERSION_ID_HEADER,
-            HeaderValue::from_static("01234567890123456789012345678901"),
-        );
+        headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("01234567890123456789012345678901"));
         let err = ensure_wasabi_set_version_id_header_allowed(&headers, "b", "k").unwrap_err();
         match err {
             StorageError::InvalidArgument(bucket, object, msg) => {
                 assert_eq!(bucket, "b");
                 assert_eq!(object, "k");
-                assert!(
-                    msg.contains("X-Wasabi-Set-Version-Id"),
-                    "message should mention header: {msg}"
-                );
+                assert!(msg.contains("X-Wasabi-Set-Version-Id"), "message should mention header: {msg}");
             }
             _ => panic!("expected InvalidArgument, got {err:?}"),
         }

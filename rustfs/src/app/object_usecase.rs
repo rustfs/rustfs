@@ -39,7 +39,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
-use rustfs_ecstore::ensure_wasabi_set_version_id_header_allowed;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -63,6 +62,7 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
+use rustfs_ecstore::ensure_wasabi_set_version_id_header_allowed;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
