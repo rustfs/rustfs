@@ -1054,6 +1054,13 @@ fn lookup_help_subsystem(sub_system: &str) -> Option<&'static HelpSubSystemMetad
     HELP_SUBSYSTEMS.iter().find(|metadata| metadata.key == sub_system)
 }
 
+fn normalize_help_subsystem(sub_system: &str) -> &str {
+    sub_system
+        .split_once(':')
+        .map(|(base, _)| base.trim())
+        .unwrap_or_else(|| sub_system.trim())
+}
+
 fn env_help_key(sub_system: &str, key: &str) -> String {
     match (sub_system, key) {
         (STORAGE_CLASS_SUB_SYS, "standard") => STANDARD_ENV.to_string(),
@@ -1165,23 +1172,7 @@ fn build_help_entries(
         multiple_targets: false,
     });
 
-    let mut entries = metadata
-        .keys
-        .iter()
-        .map(|entry| ConfigHelpEntry {
-            key: if env_only {
-                env_help_key(metadata.key, entry.key)
-            } else {
-                entry.key.to_string()
-            },
-            type_name: entry.type_name.to_string(),
-            description: help_description(metadata.key, entry.key, entry.description),
-            optional: entry.optional,
-            multiple_targets: false,
-        })
-        .collect::<Vec<_>>();
-
-    entries.push(ConfigHelpEntry {
+    let comment_entry = ConfigHelpEntry {
         key: if env_only {
             env_help_key(metadata.key, COMMENT_KEY)
         } else {
@@ -1191,22 +1182,51 @@ fn build_help_entries(
         description: DEFAULT_COMMENT_DESCRIPTION.to_string(),
         optional: true,
         multiple_targets: false,
-    });
+    };
+
+    let mut entries = if let Some(key_filter) = key_filter.filter(|value| !value.trim().is_empty()) {
+        if key_filter == COMMENT_KEY {
+            vec![comment_entry]
+        } else {
+            let entry = metadata
+                .keys
+                .iter()
+                .find(|entry| entry.key == key_filter)
+                .ok_or_else(|| s3_error!(InvalidRequest, "unknown key {} for sub-system {}", key_filter, metadata.key))?;
+            vec![ConfigHelpEntry {
+                key: if env_only {
+                    env_help_key(metadata.key, entry.key)
+                } else {
+                    entry.key.to_string()
+                },
+                type_name: entry.type_name.to_string(),
+                description: help_description(metadata.key, entry.key, entry.description),
+                optional: entry.optional,
+                multiple_targets: false,
+            }]
+        }
+    } else {
+        let mut entries = metadata
+            .keys
+            .iter()
+            .map(|entry| ConfigHelpEntry {
+                key: if env_only {
+                    env_help_key(metadata.key, entry.key)
+                } else {
+                    entry.key.to_string()
+                },
+                type_name: entry.type_name.to_string(),
+                description: help_description(metadata.key, entry.key, entry.description),
+                optional: entry.optional,
+                multiple_targets: false,
+            })
+            .collect::<Vec<_>>();
+        entries.push(comment_entry);
+        entries
+    };
 
     if let Some(enable_entry) = enable_entry {
         entries.insert(0, enable_entry);
-    }
-
-    if let Some(key_filter) = key_filter.filter(|value| !value.trim().is_empty()) {
-        let expected = if env_only {
-            env_help_key(metadata.key, key_filter)
-        } else {
-            key_filter.to_string()
-        };
-        entries.retain(|entry| entry.key == expected);
-        if entries.is_empty() {
-            return Err(s3_error!(InvalidRequest, "unknown key {} for sub-system {}", key_filter, metadata.key));
-        }
     }
 
     Ok(entries)
@@ -1216,6 +1236,7 @@ fn build_help_response(sub_system: Option<&str>, key: Option<&str>, env_only: bo
     let Some(sub_system) = sub_system.filter(|value| !value.trim().is_empty()) else {
         return Ok(build_top_level_help_response());
     };
+    let sub_system = normalize_help_subsystem(sub_system);
 
     let metadata =
         lookup_help_subsystem(sub_system).ok_or_else(|| s3_error!(InvalidRequest, "unknown sub-system {}", sub_system))?;
@@ -1567,9 +1588,10 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.sub_sys, "identity_openid");
         assert_eq!(response.description, "enable OpenID SSO support");
         assert!(response.multiple_targets);
-        assert_eq!(response.keys_help.len(), 1);
-        assert_eq!(response.keys_help[0].key, "client_secret");
-        assert_eq!(response.keys_help[0].type_name, "string");
+        assert_eq!(response.keys_help.len(), 2);
+        assert_eq!(response.keys_help[0].key, "enable");
+        assert_eq!(response.keys_help[1].key, "client_secret");
+        assert_eq!(response.keys_help[1].type_name, "string");
     }
 
     #[test]
@@ -1577,8 +1599,9 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         let response = build_help_response(Some("notify_webhook"), Some("endpoint"), true).expect("env help response");
 
         assert_eq!(response.sub_sys, "notify_webhook");
-        assert_eq!(response.keys_help.len(), 1);
-        assert_eq!(response.keys_help[0].key, "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT");
+        assert_eq!(response.keys_help.len(), 2);
+        assert_eq!(response.keys_help[0].key, "RUSTFS_NOTIFY_WEBHOOK_ENABLE");
+        assert_eq!(response.keys_help[1].key, "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT");
     }
 
     #[test]
@@ -1586,10 +1609,10 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         rustfs_ecstore::config::init();
         let response = build_help_response(Some("identity_openid"), Some("scopes"), false).expect("help response");
 
-        assert_eq!(response.keys_help.len(), 1);
-        assert_eq!(response.keys_help[0].type_name, "csv");
+        assert_eq!(response.keys_help.len(), 2);
+        assert_eq!(response.keys_help[1].type_name, "csv");
         assert!(
-            response.keys_help[0]
+            response.keys_help[1]
                 .description
                 .contains("(default: 'openid,profile,email')")
         );
@@ -1599,21 +1622,32 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
     fn build_help_response_exposes_comment_key() {
         let response = build_help_response(Some("notify_webhook"), Some("comment"), false).expect("comment help response");
 
-        assert_eq!(response.keys_help.len(), 1);
-        assert_eq!(response.keys_help[0].key, "comment");
-        assert_eq!(response.keys_help[0].type_name, "sentence");
-        assert_eq!(response.keys_help[0].description, DEFAULT_COMMENT_DESCRIPTION);
+        assert_eq!(response.keys_help.len(), 2);
+        assert_eq!(response.keys_help[0].key, "enable");
+        assert_eq!(response.keys_help[1].key, "comment");
+        assert_eq!(response.keys_help[1].type_name, "sentence");
+        assert_eq!(response.keys_help[1].description, DEFAULT_COMMENT_DESCRIPTION);
     }
 
     #[test]
     fn build_help_response_uses_target_specific_descriptions() {
         let response = build_help_response(Some("notify_webhook"), Some("endpoint"), false).expect("webhook help response");
 
-        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help.len(), 2);
         assert_eq!(
-            response.keys_help[0].description,
+            response.keys_help[1].description,
             "webhook server endpoint e.g. \"http://localhost:8080/rustfs/events\""
         );
+    }
+
+    #[test]
+    fn build_help_response_ignores_target_suffix_in_subsystem_query() {
+        let response =
+            build_help_response(Some("notify_webhook:primary"), Some("endpoint"), false).expect("targeted help response");
+
+        assert_eq!(response.sub_sys, "notify_webhook");
+        assert_eq!(response.keys_help.len(), 2);
+        assert_eq!(response.keys_help[1].key, "endpoint");
     }
 
     #[test]
