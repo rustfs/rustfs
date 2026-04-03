@@ -346,11 +346,6 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
     audit_endpoints
 }
 
-fn retain_online_audit_endpoints(mut audit_endpoints: Vec<AuditEndpoint>) -> Vec<AuditEndpoint> {
-    audit_endpoints.retain(|endpoint| endpoint.status == "online");
-    audit_endpoints
-}
-
 fn collect_validated_key_values(
     key_values: &[KeyValue],
     allowed_keys: &HashSet<&str>,
@@ -498,20 +493,15 @@ impl Operation for AuditTargetConfig {
                 .get("endpoint")
                 .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let _ = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
-            // HTTP HEAD probe: validates the full request path (DNS, TLS, proxy, firewall)
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| s3_error!(InvalidArgument, "failed to build HTTP client: {}", e))?;
-            match tokio::time::timeout(std::time::Duration::from_secs(5), client.head(endpoint).send()).await {
-                Ok(Ok(_)) => {} // endpoint is reachable
-                Ok(Err(e)) => {
-                    return Err(s3_error!(InvalidArgument, "endpoint unreachable: {}", e));
-                }
-                Err(_) => {
-                    return Err(s3_error!(InvalidArgument, "endpoint probe timed out after 5s"));
+            let parsed_endpoint = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            match parsed_endpoint.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(s3_error!(
+                        InvalidArgument,
+                        "unsupported endpoint scheme: {} (only http and https are allowed)",
+                        other
+                    ));
                 }
             }
             if let Some(queue_dir) = kv_map.get("queue_dir") {
@@ -600,7 +590,7 @@ impl Operation for ListAuditTargets {
         }
 
         let config = load_server_config_from_store().await?;
-        let audit_endpoints = retain_online_audit_endpoints(merge_audit_endpoints(&config, runtime_statuses));
+        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses);
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints })
             .map_err(|e| s3_error!(InternalError, "failed to serialize audit targets: {}", e))?;
 
@@ -814,28 +804,6 @@ mod tests {
                 assert_eq!(mixed.source, AuditEndpointSource::Mixed);
             },
         );
-    }
-
-    #[test]
-    fn retain_online_audit_endpoints_filters_offline_targets() {
-        let filtered = retain_online_audit_endpoints(vec![
-            AuditEndpoint {
-                account_id: "online-target".to_string(),
-                service: "webhook".to_string(),
-                status: "online".to_string(),
-                source: AuditEndpointSource::Runtime,
-            },
-            AuditEndpoint {
-                account_id: "offline-target".to_string(),
-                service: "mqtt".to_string(),
-                status: "offline".to_string(),
-                source: AuditEndpointSource::Config,
-            },
-        ]);
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].account_id, "online-target");
-        assert_eq!(filtered[0].status, "online");
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use crate::{Event, integration::NotificationMetrics};
 use rustfs_targets::{
     StoreError, Target, TargetError,
-    store::{Key, Store},
+    store::{Key, Store, ensure_store_entry_raw_readable},
     target::QueuedPayload,
 };
 use rustfs_utils::get_env_usize;
@@ -221,6 +221,16 @@ pub async fn stream_events_with_batching(
                     process_batch(&mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
                 }
                 return;
+            }
+
+            // Skip unreadable entries so a single corrupt file cannot stall the stream.
+            match ensure_store_entry_raw_readable(&*store, &key) {
+                Ok(true) => {}         // entry is readable, proceed
+                Ok(false) => continue, // entry not found (already removed), skip
+                Err(err) => {
+                    warn!("Skipping unreadable store entry {} for target {}: {}", key, target.name(), err);
+                    continue; // ensure_store_entry_raw_readable already deleted the corrupt entry
+                }
             }
 
             batch_keys.push(key);

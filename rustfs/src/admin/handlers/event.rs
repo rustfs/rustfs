@@ -422,21 +422,15 @@ impl Operation for NotificationTarget {
                 .get("endpoint")
                 .map(String::as_str)
                 .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let _ = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
-            // HTTP HEAD probe: validates the full request path (DNS, TLS, proxy, firewall)
-            // unlike TCP connect which can't detect proxy or TLS issues.
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| s3_error!(InvalidArgument, "failed to build HTTP client: {}", e))?;
-            match tokio::time::timeout(std::time::Duration::from_secs(5), client.head(endpoint).send()).await {
-                Ok(Ok(_)) => {} // endpoint is reachable
-                Ok(Err(e)) => {
-                    return Err(s3_error!(InvalidArgument, "endpoint unreachable: {}", e));
-                }
-                Err(_) => {
-                    return Err(s3_error!(InvalidArgument, "endpoint probe timed out after 5s"));
+            let parsed_endpoint = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
+            match parsed_endpoint.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(s3_error!(
+                        InvalidArgument,
+                        "unsupported endpoint scheme: {} (only http and https are allowed)",
+                        other
+                    ));
                 }
             }
             if let Some(queue_dir) = kv_map.get("queue_dir") {
@@ -877,6 +871,14 @@ mod tests {
             HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
         )]));
 
-        assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primarycase").is_none());
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARYCASE", None::<&str>),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARYCASE", None::<&str>),
+            ],
+            || {
+                assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primarycase").is_none());
+            },
+        );
     }
 }
