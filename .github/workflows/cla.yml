@@ -42,7 +42,7 @@ jobs:
           permission-contents: write
 
       - name: Run CLA Bot
-        uses: overtrue/cla-bot@7616514cd5d28caafcabcdd96c91466d312bb1fb
+        uses: overtrue/cla-bot@3fc26b411bf72abef1251ac11bd90420ebc708a2
         with:
           github-token: ${{ github.token }}
           registry-token: ${{ steps.registry-token.outputs.token }}
