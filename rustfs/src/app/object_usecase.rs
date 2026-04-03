@@ -24,7 +24,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::OperationHelper;
+use crate::storage::helper::{OperationHelper, spawn_background};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -3824,7 +3824,7 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        tokio::spawn(async move {
+        spawn_background(async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -3996,7 +3996,21 @@ impl DefaultObjectUsecase {
                 })
                 .await;
             }
-            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
+            helper = helper
+                .event_name(EventName::ObjectRemovedDelete)
+                .object(ObjectInfo {
+                    name: key.clone(),
+                    bucket: bucket.clone(),
+                    ..Default::default()
+                })
+                .version_id(String::new());
+            let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            // Match non-empty delete path: capacity manager write-op telemetry.
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+            let _ = helper.complete(&result);
+            return result;
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica

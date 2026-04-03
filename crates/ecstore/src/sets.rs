@@ -35,7 +35,10 @@ use crate::{
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
@@ -336,6 +339,26 @@ struct DelObj {
     obj: ObjectToDelete,
 }
 
+fn apply_delete_objects_results(
+    del_objects: &mut [DeletedObject],
+    del_errs: &mut [Option<Error>],
+    set_objects: &[DelObj],
+    dobjects: &[DeletedObject],
+    errs: Vec<Option<Error>>,
+) {
+    for (i, err) in errs.into_iter().enumerate() {
+        let obj = set_objects
+            .get(i)
+            .expect("delete_objects should return errors aligned with input objects");
+
+        del_errs[obj.orig_idx] = err;
+        del_objects[obj.orig_idx] = dobjects
+            .get(i)
+            .expect("delete_objects should return objects aligned with input objects")
+            .clone();
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for Sets {
     #[tracing::instrument(level = "debug", skip(self, object, h, opts))]
@@ -508,19 +531,30 @@ impl ObjectOperations for Sets {
             }
         }
 
-        // TODO: concurrency
+        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut futures = FuturesUnordered::new();
+        let bucket = bucket.to_string();
+
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await;
+            let bucket = bucket.clone();
+            let opts = opts.clone();
+            let semaphore = semaphore.clone();
 
-            for (i, err) in errs.into_iter().enumerate() {
-                let obj = v.get(i).unwrap();
+            futures.push(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("delete_objects semaphore should remain open");
+                let (dobjects, errs) = disks.delete_objects(&bucket, objs, opts).await;
+                (v, dobjects, errs)
+            });
+        }
 
-                del_errs[obj.orig_idx] = err;
-
-                del_objects[obj.orig_idx] = dobjects.get(i).unwrap().clone();
-            }
+        while let Some((v, dobjects, errs)) = futures.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &v, &dobjects, errs);
         }
 
         (del_objects, del_errs)
@@ -1014,4 +1048,77 @@ fn new_heal_format_sets(
     }
 
     (new_formats, current_disks_info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {
+        let mut del_objects = vec![DeletedObject::default(); 3];
+        let mut del_errs = vec![None, None, None];
+
+        let early_batch = vec![DelObj {
+            orig_idx: 1,
+            obj: ObjectToDelete {
+                object_name: "second".to_string(),
+                ..Default::default()
+            },
+        }];
+        let early_objects = vec![DeletedObject {
+            object_name: "second".to_string(),
+            found: true,
+            ..Default::default()
+        }];
+
+        let late_batch = vec![
+            DelObj {
+                orig_idx: 2,
+                obj: ObjectToDelete {
+                    object_name: "third".to_string(),
+                    ..Default::default()
+                },
+            },
+            DelObj {
+                orig_idx: 0,
+                obj: ObjectToDelete {
+                    object_name: "first".to_string(),
+                    ..Default::default()
+                },
+            },
+        ];
+        let late_objects = vec![
+            DeletedObject {
+                object_name: "third".to_string(),
+                found: true,
+                ..Default::default()
+            },
+            DeletedObject {
+                object_name: "first".to_string(),
+                found: true,
+                ..Default::default()
+            },
+        ];
+
+        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_batch, &early_objects, vec![None]);
+        apply_delete_objects_results(
+            &mut del_objects,
+            &mut del_errs,
+            &late_batch,
+            &late_objects,
+            vec![Some(Error::other("third failed")), None],
+        );
+
+        assert_eq!(del_objects[0].object_name, "first");
+        assert_eq!(del_objects[1].object_name, "second");
+        assert_eq!(del_objects[2].object_name, "third");
+
+        assert!(del_errs[0].is_none());
+        assert!(del_errs[1].is_none());
+        assert_eq!(
+            del_errs[2].as_ref().map(ToString::to_string),
+            Some(Error::other("third failed").to_string())
+        );
+    }
 }

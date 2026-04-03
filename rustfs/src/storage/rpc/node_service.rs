@@ -392,6 +392,20 @@ impl Node for NodeService {
         self.handle_refresh(request).await
     }
 
+    async fn lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        self.handle_lock_batch(request).await
+    }
+
+    async fn un_lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        self.handle_un_lock_batch(request).await
+    }
+
     async fn local_storage_info(
         &self,
         _request: Request<LocalStorageInfoRequest>,
