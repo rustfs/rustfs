@@ -21,7 +21,6 @@ pub(crate) mod entity;
 pub(crate) mod helper;
 pub mod lock_optimizer;
 pub mod options;
-pub(crate) mod readers;
 pub mod rpc;
 pub(crate) mod s3_api;
 mod sse;

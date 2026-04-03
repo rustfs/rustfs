@@ -78,7 +78,7 @@ use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -827,7 +827,7 @@ impl ObjectIO for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
@@ -2089,14 +2089,7 @@ impl ObjectOperations for SetDisks {
             }
             let gr = gr.unwrap();
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                gr.object_info.size,
-                gr.object_info.size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
@@ -2164,14 +2157,7 @@ impl ObjectOperations for SetDisks {
                 }
             };
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                part_info.actual_size,
-                part_info.actual_size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
             let p_info = self_
                 .clone()
@@ -2477,7 +2463,7 @@ impl MultipartOperations for SetDisks {
 
         let stream = mem::replace(
             &mut data.stream,
-            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, None, false)?,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
