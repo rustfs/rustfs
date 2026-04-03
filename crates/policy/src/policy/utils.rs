@@ -26,16 +26,21 @@ pub enum ClaimLookup<'a> {
     Ambiguous,
 }
 
+fn case_insensitive_eq(left: &str, right: &str) -> bool {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
+}
+
 pub fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, Value>, claim_name: &str) -> ClaimLookup<'a> {
     if let Some(value) = claims.get(claim_name) {
         return ClaimLookup::Found(value);
     }
 
-    let claim_name_lower = claim_name.to_lowercase();
     let mut matched = None;
 
     for (candidate, value) in claims {
-        if candidate.to_lowercase() == claim_name_lower {
+        if case_insensitive_eq(candidate, claim_name) {
             if matched.is_some() {
                 return ClaimLookup::Ambiguous;
             }
@@ -107,7 +112,9 @@ pub fn _split_path(path: &str, second_index: bool) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::_split_path;
+    use super::{_split_path, ClaimLookup, get_claim_case_insensitive};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
 
     #[test_case::test_case("format.json", false => ("format.json", ""))]
     #[test_case::test_case("users/tester.json", false => ("users/", "tester.json"))]
@@ -127,5 +134,37 @@ mod tests {
     ]
     fn test_split_path(path: &str, second_index: bool) -> (&str, &str) {
         _split_path(path, second_index)
+    }
+
+    #[test]
+    fn test_get_claim_case_insensitive_prefers_exact_match() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), json!("exact_match"));
+        claims.insert("policy".to_string(), json!("lowercase"));
+
+        assert_eq!(
+            get_claim_case_insensitive(&claims, "Policy"),
+            ClaimLookup::Found(&Value::String("exact_match".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_get_claim_case_insensitive_returns_ambiguous_for_multiple_folded_matches() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), json!("exact_match"));
+        claims.insert("policy".to_string(), json!("lowercase"));
+
+        assert_eq!(get_claim_case_insensitive(&claims, "POLICY"), ClaimLookup::Ambiguous);
+    }
+
+    #[test]
+    fn test_get_claim_case_insensitive_matches_unicode_without_allocation() {
+        let mut claims = HashMap::new();
+        claims.insert("Straße".to_string(), json!("value"));
+
+        assert_eq!(
+            get_claim_case_insensitive(&claims, "straße"),
+            ClaimLookup::Found(&Value::String("value".to_string()))
+        );
     }
 }
