@@ -39,6 +39,7 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::{counter, histogram};
+use rustfs_ecstore::ensure_wasabi_set_version_id_header_allowed;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
     lifecycle::{
@@ -3484,6 +3485,8 @@ impl DefaultObjectUsecase {
             content_md5,
             ..
         } = input;
+
+        ensure_wasabi_set_version_id_header_allowed(&req.headers, &bucket, &key).map_err(ApiError::from)?;
 
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };

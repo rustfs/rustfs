@@ -14,6 +14,7 @@
 
 use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::ensure_wasabi_set_version_id_header_allowed;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
@@ -203,6 +204,8 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
+    ensure_wasabi_set_version_id_header_allowed(headers, bucket, object)?;
+
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
