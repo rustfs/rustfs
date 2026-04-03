@@ -28,15 +28,7 @@ impl PutObjReader {
             None
         };
         PutObjReader {
-            stream: HashReader::new(
-                Box::new(WarpReader::new(Cursor::new(data))),
-                content_length,
-                content_length,
-                None,
-                sha256hex,
-                false,
-            )
-            .unwrap(),
+            stream: HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap(),
         }
     }
 
