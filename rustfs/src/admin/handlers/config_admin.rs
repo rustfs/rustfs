@@ -1146,7 +1146,7 @@ fn build_top_level_help_response() -> ConfigHelpResponse {
             .iter()
             .map(|metadata| ConfigHelpEntry {
                 key: metadata.key.to_string(),
-                type_name: "string".to_string(),
+                type_name: String::new(),
                 description: metadata.description.to_string(),
                 optional: false,
                 multiple_targets: metadata.multiple_targets,
@@ -1648,6 +1648,14 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.sub_sys, "notify_webhook");
         assert_eq!(response.keys_help.len(), 2);
         assert_eq!(response.keys_help[1].key, "endpoint");
+    }
+
+    #[test]
+    fn build_top_level_help_response_uses_empty_type_names() {
+        let response = build_help_response(None, None, false).expect("top level help response");
+
+        assert!(!response.keys_help.is_empty());
+        assert!(response.keys_help.iter().all(|entry| entry.type_name.is_empty()));
     }
 
     #[test]
