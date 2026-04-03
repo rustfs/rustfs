@@ -89,7 +89,7 @@ use rustfs_kms::{
     service_manager::get_global_encryption_service,
     types::{EncryptionMetadata, ObjectEncryptionContext},
 };
-use rustfs_rio::{DecryptReader, DynReader, EncryptReader, HardLimitReader, ReadStream, wrap_reader};
+use rustfs_rio::{DecryptReader, DynReader, EncryptReader, HardLimitReader, ReadStream, boxed_reader, wrap_reader};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
@@ -100,7 +100,6 @@ use tracing::{debug, error};
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 
 use crate::error::ApiError;
-use crate::storage::readers::InMemoryAsyncReader;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::error::Error;
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
@@ -1647,6 +1646,7 @@ pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     derive_nonce_offset(base, 4, part_number)
 }
 
+#[cfg(test)]
 fn derive_legacy_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
     derive_nonce_offset(base, 8, part_number)
 }
@@ -1658,20 +1658,8 @@ fn derive_nonce_offset(mut base: [u8; 12], start: usize, offset: usize) -> [u8; 
     base
 }
 
-async fn decrypt_multipart_part(
-    encrypted_part: &[u8],
-    key_bytes: [u8; 32],
-    part_nonce: [u8; 12],
-) -> Result<Vec<u8>, std::io::Error> {
-    let cursor = std::io::Cursor::new(encrypted_part);
-    let mut decrypt_reader = DecryptReader::new(cursor, key_bytes, part_nonce);
-    let mut plaintext = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut decrypt_reader, &mut plaintext).await?;
-    Ok(plaintext)
-}
-
 pub(crate) async fn decrypt_multipart_managed_stream<R>(
-    mut encrypted_stream: R,
+    encrypted_stream: R,
     parts: &[ObjectPartInfo],
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
@@ -1679,37 +1667,18 @@ pub(crate) async fn decrypt_multipart_managed_stream<R>(
 where
     R: ReadStream + 'static,
 {
-    let total_plain_capacity: usize = parts.iter().map(|part| part.actual_size.max(0) as usize).sum();
-
-    let mut plaintext = Vec::with_capacity(total_plain_capacity);
-
-    for part in parts {
-        if part.size == 0 {
-            continue;
-        }
-
-        let mut encrypted_part = vec![0u8; part.size];
-        tokio::io::AsyncReadExt::read_exact(&mut encrypted_stream, &mut encrypted_part)
-            .await
-            .map_err(|e| StorageError::other(format!("failed to read encrypted multipart segment {}: {}", part.number, e)))?;
-
-        let part_nonce = derive_part_nonce(base_nonce, part.number);
-        match decrypt_multipart_part(&encrypted_part, key_bytes, part_nonce).await {
-            Ok(mut decrypted_part) => plaintext.append(&mut decrypted_part),
-            Err(primary_err) => {
-                let legacy_part_nonce = derive_legacy_part_nonce(base_nonce, part.number);
-                let mut decrypted_part = decrypt_multipart_part(&encrypted_part, key_bytes, legacy_part_nonce)
-                    .await
-                    .map_err(|_| {
-                        StorageError::other(format!("failed to decrypt multipart segment {}: {}", part.number, primary_err))
-                    })?;
-                plaintext.append(&mut decrypted_part);
+    let total_plain_size = parts
+        .iter()
+        .map(|part| {
+            if part.actual_size > 0 {
+                part.actual_size
+            } else {
+                part.size as i64
             }
-        }
-    }
+        })
+        .sum();
 
-    let total_plain_size = plaintext.len() as i64;
-    let reader = wrap_reader(InMemoryAsyncReader::new(plaintext));
+    let reader = boxed_reader(DecryptReader::new_multipart(wrap_reader(encrypted_stream), key_bytes, base_nonce));
 
     Ok((reader, total_plain_size))
 }
@@ -1995,6 +1964,70 @@ mod tests {
 
         let part_one_nonce = derive_legacy_part_nonce(base_nonce, 1);
         let part_two_nonce = derive_legacy_part_nonce(base_nonce, 2);
+
+        let first_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+        let second_part = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+
+        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
+        encrypted_stream.extend_from_slice(&first_part);
+        encrypted_stream.extend_from_slice(&second_part);
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: first_part.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: second_part.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let (mut decrypted_reader, plaintext_size) =
+            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
+                .await
+                .unwrap();
+
+        let mut decrypted = Vec::new();
+        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_multipart_managed_stream_supports_current_nonce_layout() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        let key_bytes = [9u8; 32];
+        let base_nonce = [5u8; 12];
+
+        let part_one_plaintext = vec![0x33; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 11];
+        let part_two_plaintext = vec![0x44; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+        let part_one_nonce = derive_part_nonce(base_nonce, 1);
+        let part_two_nonce = derive_part_nonce(base_nonce, 2);
 
         let first_part = {
             let mut buf = Vec::new();
