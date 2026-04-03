@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{EtagResolvable, HashReaderDetector};
-use crate::{HashReaderMut, Reader};
 use pin_project_lite::pin_project;
 use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block};
 use rustfs_utils::{put_uvarint, uvarint};
@@ -47,13 +45,13 @@ pin_project! {
         written: usize,
         uncomp_written: usize,
         temp_buffer: Vec<u8>,
-        temp_pos: usize,
+        read_buffer: Vec<u8>,
     }
 }
 
 impl<R> CompressReader<R>
 where
-    R: Reader,
+    R: AsyncRead + Unpin + Send + Sync,
 {
     pub fn new(inner: R, compression_algorithm: CompressionAlgorithm) -> Self {
         Self {
@@ -66,8 +64,8 @@ where
             index: Index::new(),
             written: 0,
             uncomp_written: 0,
-            temp_buffer: Vec::with_capacity(DEFAULT_BLOCK_SIZE), // Pre-allocate capacity
-            temp_pos: 0,
+            temp_buffer: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
+            read_buffer: vec![0u8; DEFAULT_BLOCK_SIZE],
         }
     }
 
@@ -84,15 +82,12 @@ where
             written: 0,
             uncomp_written: 0,
             temp_buffer: Vec::with_capacity(block_size),
-            temp_pos: 0,
+            read_buffer: vec![0u8; block_size],
         }
     }
 }
 
-impl<R> TryGetIndex for CompressReader<R>
-where
-    R: Reader,
-{
+impl<R> TryGetIndex for CompressReader<R> {
     fn try_get_index(&self) -> Option<&Index> {
         Some(&self.index)
     }
@@ -121,8 +116,7 @@ where
         // Fill temporary buffer
         while this.temp_buffer.len() < *this.block_size {
             let remaining = *this.block_size - this.temp_buffer.len();
-            let mut temp = vec![0u8; remaining];
-            let mut temp_buf = ReadBuf::new(&mut temp);
+            let mut temp_buf = ReadBuf::new(&mut this.read_buffer[..remaining]);
             match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
                 Poll::Pending => {
                     if this.temp_buffer.is_empty() {
@@ -134,11 +128,12 @@ where
                     let n = temp_buf.filled().len();
                     if n == 0 {
                         if this.temp_buffer.is_empty() {
+                            *this.done = true;
                             return Poll::Ready(Ok(()));
                         }
                         break;
                     }
-                    this.temp_buffer.extend_from_slice(&temp[..n]);
+                    this.temp_buffer.extend_from_slice(&temp_buf.filled()[..n]);
                 }
                 Poll::Ready(Err(e)) => {
                     // error!("CompressReader poll_read: read inner error: {e}");
@@ -173,27 +168,7 @@ where
     }
 }
 
-impl<R> EtagResolvable for CompressReader<R>
-where
-    R: EtagResolvable,
-{
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
-
-impl<R> HashReaderDetector for CompressReader<R>
-where
-    R: HashReaderDetector,
-{
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
+delegate_reader_capabilities_generic_no_index!(CompressReader<R>, inner);
 
 pin_project! {
     /// A reader wrapper that decompresses data on the fly using DEFLATE algorithm.
@@ -213,7 +188,7 @@ pin_project! {
         header_read: usize,
         header_done: bool,
         // Fields for saving compressed block read progress across polls
-        compressed_buf: Option<Vec<u8>>,
+        compressed_buf: Vec<u8>,
         compressed_read: usize,
         compressed_len: usize,
         compression_algorithm: CompressionAlgorithm,
@@ -233,7 +208,7 @@ where
             header_buf: [0u8; 8],
             header_read: 0,
             header_done: false,
-            compressed_buf: None,
+            compressed_buf: Vec::new(),
             compressed_read: 0,
             compressed_len: 0,
             compression_algorithm,
@@ -295,14 +270,22 @@ where
             | ((this.header_buf[7] as u32) << 24);
         *this.header_read = 0;
         *this.header_done = true;
-        if this.compressed_buf.is_none() {
-            *this.compressed_len = len;
-            *this.compressed_buf = Some(vec![0u8; *this.compressed_len]);
+
+        if typ == COMPRESS_TYPE_END {
             *this.compressed_read = 0;
+            *this.compressed_len = 0;
+            *this.finished = true;
+            return Poll::Ready(Ok(()));
         }
-        let compressed_buf = this.compressed_buf.as_mut().unwrap();
+
+        if this.compressed_buf.len() < len {
+            this.compressed_buf.resize(len, 0);
+        }
+        *this.compressed_len = len;
+        *this.compressed_read = 0;
+
         while *this.compressed_read < *this.compressed_len {
-            let mut temp_buf = ReadBuf::new(&mut compressed_buf[*this.compressed_read..]);
+            let mut temp_buf = ReadBuf::new(&mut this.compressed_buf[*this.compressed_read..*this.compressed_len]);
             match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
@@ -314,13 +297,13 @@ where
                 }
                 Poll::Ready(Err(e)) => {
                     // error!("DecompressReader poll_read: read compressed block error: {e}");
-                    this.compressed_buf.take();
                     *this.compressed_read = 0;
                     *this.compressed_len = 0;
                     return Poll::Ready(Err(e));
                 }
             }
         }
+        let compressed_buf = &this.compressed_buf[..*this.compressed_len];
         let (uncompress_len, uvarint) = uvarint(&compressed_buf[0..16]);
         let compressed_data = &compressed_buf[uvarint as usize..];
         let decompressed = if typ == COMPRESS_TYPE_COMPRESSED {
@@ -328,7 +311,6 @@ where
                 Ok(out) => out,
                 Err(e) => {
                     // error!("DecompressReader decompress_block error: {e}");
-                    this.compressed_buf.take();
                     *this.compressed_read = 0;
                     *this.compressed_len = 0;
                     return Poll::Ready(Err(e));
@@ -336,22 +318,14 @@ where
             }
         } else if typ == COMPRESS_TYPE_UNCOMPRESSED {
             compressed_data.to_vec()
-        } else if typ == COMPRESS_TYPE_END {
-            this.compressed_buf.take();
-            *this.compressed_read = 0;
-            *this.compressed_len = 0;
-            *this.finished = true;
-            return Poll::Ready(Ok(()));
         } else {
             // error!("DecompressReader unknown compression type: {typ}");
-            this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown compression type")));
         };
         if decompressed.len() != uncompress_len as usize {
             // error!("DecompressReader decompressed length mismatch: {} != {}", decompressed.len(), uncompress_len);
-            this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Decompressed length mismatch")));
@@ -363,14 +337,12 @@ where
         };
         if actual_crc != crc {
             // error!("DecompressReader CRC32 mismatch: actual {actual_crc} != expected {crc}");
-            this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "CRC32 mismatch")));
         }
         *this.buffer = decompressed;
         *this.buffer_pos = 0;
-        this.compressed_buf.take();
         *this.compressed_read = 0;
         *this.compressed_len = 0;
         *this.header_done = false;
@@ -385,26 +357,7 @@ where
     }
 }
 
-impl<R> EtagResolvable for DecompressReader<R>
-where
-    R: EtagResolvable,
-{
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
-
-impl<R> HashReaderDetector for DecompressReader<R>
-where
-    R: HashReaderDetector,
-{
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
+delegate_reader_capabilities_generic_no_index!(DecompressReader<R>, inner);
 
 /// Build compressed block with header + uvarint + compressed data
 fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: CompressionAlgorithm) -> Vec<u8> {
@@ -436,8 +389,6 @@ fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: Compr
 
 #[cfg(test)]
 mod tests {
-    use crate::WarpReader;
-
     use super::*;
     use rand::RngExt;
     use std::io::Cursor;
@@ -447,7 +398,7 @@ mod tests {
     async fn test_compress_reader_basic() {
         let data = b"hello world, hello world, hello world!";
         let reader = Cursor::new(&data[..]);
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Gzip);
+        let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Gzip);
 
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
@@ -464,7 +415,7 @@ mod tests {
     async fn test_compress_reader_basic_deflate() {
         let data = b"hello world, hello world, hello world!";
         let reader = BufReader::new(&data[..]);
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Deflate);
+        let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Deflate);
 
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
@@ -481,7 +432,7 @@ mod tests {
     async fn test_compress_reader_empty() {
         let data = b"";
         let reader = BufReader::new(&data[..]);
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Gzip);
+        let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Gzip);
 
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
@@ -499,7 +450,7 @@ mod tests {
         let mut data = vec![0u8; 1024 * 1024 * 32];
         rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Gzip);
+        let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Gzip);
 
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
@@ -517,7 +468,7 @@ mod tests {
         let mut data = vec![0u8; 1024 * 1024 * 3 + 512];
         rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::default());
+        let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::default());
 
         let mut compressed = Vec::new();
         compress_reader.read_to_end(&mut compressed).await.unwrap();
