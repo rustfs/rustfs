@@ -31,7 +31,7 @@ use tokio::runtime::{Builder, Handle};
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
-fn spawn_background<F>(fut: F)
+pub(crate) fn spawn_background<F>(fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
