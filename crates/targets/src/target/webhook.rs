@@ -383,7 +383,7 @@ where
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
         } else {
-            match WebhookTarget::<E>::init(self).await {
+            match self.init().await {
                 Ok(_) => (),
                 Err(e) => {
                     error!("Failed to initialize Webhook target {}: {}", self.id.id, e);
@@ -396,7 +396,7 @@ where
 
     async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
         debug!("Sending queued payload from store for target: {}, key: {}", self.id, key);
-        match WebhookTarget::<E>::init(self).await {
+        match self.init().await {
             Ok(_) => {
                 debug!("Event sent to store for target: {}", self.name());
             }

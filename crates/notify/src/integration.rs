@@ -211,11 +211,24 @@ impl NotificationSystem {
             let target_id = target.id();
             info!("Initializing target: {}", target_id);
 
+            let has_store = target.store().is_some();
+
             if let Err(e) = target.init().await {
                 warn!("Target {} Initialization failed: {}", target_id, e);
-                continue;
+                // For targets without a store, init failure is fatal — skip.
+                // For store-backed targets, still start the stream so queued events
+                // can be drained when connectivity recovers (send_from_store retries).
+                if !has_store {
+                    continue;
+                }
+                warn!(
+                    "Target {} has a store, starting stream despite init failure — \
+                     connectivity will be retried by send_from_store",
+                    target_id
+                );
+            } else {
+                debug!("Target {} initialized successfully, enabled: {}", target_id, target.is_enabled());
             }
-            debug!("Target {} initialized successfully, enabled: {}", target_id, target.is_enabled());
 
             if !target.is_enabled() {
                 info!("Target {} is not enabled, event stream processing is skipped", target_id);

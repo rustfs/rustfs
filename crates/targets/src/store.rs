@@ -17,11 +17,14 @@ use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
 use rustfs_config::{DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, ENV_TARGET_STORE_COMPRESS, EnableState};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
-use std::sync::{Arc, RwLock};
 use std::{
     collections::HashMap,
     marker::PhantomData,
     path::PathBuf,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
@@ -199,6 +202,8 @@ pub struct QueueStore<T> {
     file_ext: String,
     compress: bool,
     entries: Arc<RwLock<HashMap<String, i64>>>, // key -> modtime as unix nano
+    pending_entries: Arc<AtomicU64>,
+    fs_guard: Arc<RwLock<()>>,
     _phantom: PhantomData<T>,
 }
 
@@ -210,8 +215,20 @@ impl<T> Clone for QueueStore<T> {
             file_ext: self.file_ext.clone(),
             compress: self.compress,
             entries: Arc::clone(&self.entries),
+            pending_entries: Arc::clone(&self.pending_entries),
+            fs_guard: Arc::clone(&self.fs_guard),
             _phantom: PhantomData,
         }
+    }
+}
+
+struct EntryReservation<'a> {
+    pending_entries: &'a AtomicU64,
+}
+
+impl Drop for EntryReservation<'_> {
+    fn drop(&mut self) {
+        self.pending_entries.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -232,6 +249,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             file_ext: file_ext.to_string(),
             compress,
             entries: Arc::new(RwLock::new(HashMap::with_capacity(entry_limit as usize))),
+            pending_entries: Arc::new(AtomicU64::new(0)),
+            fs_guard: Arc::new(RwLock::new(())),
             _phantom: PhantomData,
         }
     }
@@ -252,6 +271,10 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
 
     /// Reads a file for the given key
     fn read_file(&self, key: &Key) -> Result<Vec<u8>, StoreError> {
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
         let path = self.file_path(key);
         debug!("Reading file for key: {},path: {}", key, path.display());
         let data = std::fs::read(&path).map_err(|e| {
@@ -276,8 +299,33 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             .map_err(|e| StoreError::Compression(e.to_string()))
     }
 
-    /// Writes data to a file for the given key and records it in the in-memory index.
-    fn write_file_with_entries(&self, key: &Key, data: &[u8], entries: &mut HashMap<String, i64>) -> Result<(), StoreError> {
+    fn reserve_entry_slot(&self) -> Result<EntryReservation<'_>, StoreError> {
+        loop {
+            let entries = self
+                .entries
+                .read()
+                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
+            let entries_len = entries.len() as u64;
+            let pending = self.pending_entries.load(Ordering::SeqCst);
+
+            if entries_len + pending >= self.entry_limit {
+                return Err(StoreError::LimitExceeded);
+            }
+
+            if self
+                .pending_entries
+                .compare_exchange(pending, pending + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(EntryReservation {
+                    pending_entries: self.pending_entries.as_ref(),
+                });
+            }
+        }
+    }
+
+    /// Writes data to a file for the given key.
+    fn write_file(&self, key: &Key, data: &[u8]) -> Result<i64, StoreError> {
         let path = self.file_path(key);
         // Create directory if it doesn't exist
         if let Some(parent) = path.parent() {
@@ -294,8 +342,36 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             std::fs::write(&path, data).map_err(StoreError::Io)?;
         }
         let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-        entries.insert(key.to_key_string(), modified);
         debug!("Wrote event to store: {}", key);
+        Ok(modified)
+    }
+
+    fn insert_entry(&self, key: &Key, modified: i64) -> Result<(), StoreError> {
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
+        entries.insert(key.to_key_string(), modified);
+        Ok(())
+    }
+
+    fn remove_file_if_present(&self, key: &Key) -> Result<(), StoreError> {
+        let path = self.file_path(key);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StoreError::Io(err)),
+        }
+    }
+
+    fn write_and_index(&self, key: &Key, data: &[u8]) -> Result<(), StoreError> {
+        let modified = self.write_file(key, data)?;
+        if let Err(err) = self.insert_entry(key, modified) {
+            self.remove_file_if_present(key).map_err(|cleanup_err| {
+                StoreError::Internal(format!("Failed to index store entry {key}: {err}; cleanup failed: {cleanup_err}"))
+            })?;
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -308,6 +384,10 @@ where
     type Key = Key;
 
     fn open(&self) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on store filesystem".to_string()))?;
         std::fs::create_dir_all(&self.directory).map_err(StoreError::Io)?;
 
         let dir_entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
@@ -315,6 +395,7 @@ where
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
+        self.pending_entries.store(0, Ordering::SeqCst);
         entries_map.clear();
         for entry in dir_entries {
             let entry = entry.map_err(StoreError::Io)?;
@@ -333,16 +414,14 @@ where
     }
 
     fn put(&self, item: Arc<T>) -> Result<Self::Key, Self::Error> {
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        if entries.len() as u64 >= self.entry_limit {
-            return Err(StoreError::LimitExceeded);
-        }
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
         let key = self.build_key(1);
         let data = serde_json::to_vec(&*item).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        self.write_file_with_entries(&key, &data, &mut entries)?;
+        self.write_and_index(&key, &data)?;
 
         Ok(key)
     }
@@ -351,13 +430,11 @@ where
         if items.is_empty() {
             return Err(StoreError::Internal("Cannot put_multiple with empty items list".to_string()));
         }
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        if entries.len() as u64 >= self.entry_limit {
-            return Err(StoreError::LimitExceeded);
-        }
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
         let key = self.build_key(items.len());
 
         let mut buffer = Vec::new();
@@ -365,21 +442,19 @@ where
             serde_json::to_writer(&mut buffer, &item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         }
 
-        self.write_file_with_entries(&key, &buffer, &mut entries)?;
+        self.write_and_index(&key, &buffer)?;
 
         Ok(key)
     }
 
     fn put_raw(&self, data: &[u8]) -> Result<Self::Key, Self::Error> {
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        if entries.len() as u64 >= self.entry_limit {
-            return Err(StoreError::LimitExceeded);
-        }
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
         let key = self.build_key(1);
-        self.write_file_with_entries(&key, data, &mut entries)?;
+        self.write_and_index(&key, data)?;
 
         Ok(key)
     }
@@ -454,16 +529,19 @@ where
     }
 
     fn del(&self, key: &Self::Key) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
         let path = self.file_path(key);
-        std::fs::remove_file(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // If file not found, still try to remove from entries map in case of inconsistency
-                warn!("File not found for key {} during del, but proceeding to remove from entries map.", key);
-                StoreError::NotFound
-            } else {
-                StoreError::Io(e)
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already gone — still clean up the entries map to avoid stale keys.
+                warn!("File not found for key {} during del, cleaning up entries map.", key);
             }
-        })?;
+            Err(e) => return Err(StoreError::Io(e)),
+        }
 
         // Get the write lock to update the internal state
         let mut entries = self
@@ -472,8 +550,6 @@ where
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
         if entries.remove(&key.to_key_string()).is_none() {
-            // Key was not in the map, could be an inconsistency or already deleted.
-            // This is not necessarily an error if the file deletion succeeded or was NotFound.
             debug!("Key {} not found in entries map during del, might have been already removed.", key);
         }
         debug!("Deleted event from store: {}", key.to_string());
@@ -481,11 +557,16 @@ where
     }
 
     fn delete(&self) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on store filesystem".to_string()))?;
         let mut entries = self
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
         entries.clear();
+        self.pending_entries.store(0, Ordering::SeqCst);
 
         match std::fs::remove_dir_all(&self.directory) {
             Ok(()) => Ok(()),
@@ -534,6 +615,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     fn temp_store_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
@@ -619,6 +704,42 @@ mod tests {
         let err = store.put(Arc::new("second".to_string())).unwrap_err();
 
         assert!(matches!(err, StoreError::LimitExceeded));
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn concurrent_put_raw_respects_entry_limit() {
+        let dir = temp_store_dir("concurrent-limit");
+        let store = Arc::new(QueueStore::<String>::new_with_compression(&dir, 1, ".test", true));
+        store.open().unwrap();
+
+        let start = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for idx in 0..4 {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                let payload = vec![b'x'; 32 * 1024 + idx];
+                start.wait();
+                store.put_raw(&payload)
+            }));
+        }
+
+        let mut successes = 0;
+        let mut limit_errors = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(_) => successes += 1,
+                Err(StoreError::LimitExceeded) => limit_errors += 1,
+                Err(err) => panic!("unexpected error: {err}"),
+            }
+        }
+
+        assert_eq!(successes, 1);
+        assert_eq!(limit_errors, 3);
+        assert_eq!(store.len(), 1);
 
         let _ = store.delete();
     }

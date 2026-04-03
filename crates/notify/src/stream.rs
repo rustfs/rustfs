@@ -289,13 +289,15 @@ async fn process_batch(
                         warn!("Target {} not connected, retrying...", target.name());
                         retry_count += 1;
                         let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
-                        tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
+                        let backoff = 1u32 << retry_count as u32;
+                        tokio::time::sleep(base_delay * backoff + jitter).await;
                     }
                     TargetError::Timeout(_) => {
                         warn!("Timeout for target {}, retrying...", target.name());
                         retry_count += 1;
                         let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
-                        tokio::time::sleep(base_delay * (1 << retry_count) + jitter).await;
+                        let backoff = 1u32 << retry_count as u32;
+                        tokio::time::sleep(base_delay * backoff + jitter).await;
                     }
                     _ => {
                         error!("Permanent error for target {}: {}", target.name(), e);

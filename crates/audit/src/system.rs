@@ -417,16 +417,28 @@ impl AuditSystem {
     }
 
     /// Initializes a single target: runs init(), starts stream if store is present,
-    /// and adds it to the registry. Returns the target_id on success.
+    /// and adds it to the registry. For store-backed targets, registration and stream
+    /// startup proceed even if init() fails so queued entries can be drained later.
     async fn init_and_register_target(
         &self,
         target: Box<dyn Target<AuditEntry> + Send + Sync>,
         registry: &mut AuditRegistry,
     ) -> Option<String> {
         let target_id = target.id().to_string();
+        let has_store = target.store().is_some();
+
         if let Err(e) = target.init().await {
             error!(target_id = %target_id, error = %e, "Failed to initialize audit target");
-            return None;
+            // Non-store targets: init failure is fatal.
+            if !has_store {
+                return None;
+            }
+            // Store-backed targets: still register and start the stream so queued
+            // entries can be drained when connectivity recovers.
+            warn!(
+                target_id = %target_id,
+                "Proceeding with store-backed audit target despite init failure"
+            );
         }
 
         if target.is_enabled() {
