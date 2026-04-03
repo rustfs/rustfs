@@ -1167,7 +1167,7 @@ fn build_help_entries(
             ENABLE_KEY.to_string()
         },
         type_name: "on|off".to_string(),
-        description: help_description(metadata.key, ENABLE_KEY, &format!("enable {} target", metadata.key)),
+        description: format!("enable {} target, default is 'off'", metadata.key),
         optional: false,
         multiple_targets: false,
     });
@@ -1601,6 +1601,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.sub_sys, "notify_webhook");
         assert_eq!(response.keys_help.len(), 2);
         assert_eq!(response.keys_help[0].key, "RUSTFS_NOTIFY_WEBHOOK_ENABLE");
+        assert_eq!(response.keys_help[0].description, "enable notify_webhook target, default is 'off'");
         assert_eq!(response.keys_help[1].key, "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT");
     }
 
