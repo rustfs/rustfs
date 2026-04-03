@@ -1822,6 +1822,65 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
     }
 
     #[test]
+    fn render_selected_config_supports_specific_env_only_target_queries() {
+        rustfs_ecstore::config::init();
+        temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example"))], || {
+            let config = ServerConfig::new();
+            let rendered = String::from_utf8(
+                render_selected_config(
+                    &config,
+                    &ConfigSelector {
+                        sub_system: "notify_webhook".to_string(),
+                        target: Some("primary".to_string()),
+                    },
+                    true,
+                )
+                .expect("render config"),
+            )
+            .expect("utf8");
+
+            assert!(rendered.contains("# RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://env.example"));
+            assert!(rendered.contains("notify_webhook:primary"));
+        });
+    }
+
+    #[test]
+    fn render_selected_config_orders_default_before_named_targets() {
+        rustfs_ecstore::config::init();
+        temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ALPHA", Some("http://alpha.example"))], || {
+            let mut config = ServerConfig::new();
+            apply_set_directives(
+                &mut config,
+                &parse_config_directives(
+                    r#"notify_webhook endpoint="http://default.example"
+notify_webhook:beta endpoint="http://beta.example""#,
+                    false,
+                )
+                .expect("parse directives"),
+            );
+
+            let rendered = String::from_utf8(
+                render_selected_config(
+                    &config,
+                    &ConfigSelector {
+                        sub_system: "notify_webhook".to_string(),
+                        target: None,
+                    },
+                    true,
+                )
+                .expect("render config"),
+            )
+            .expect("utf8");
+
+            let default_index = rendered.find("notify_webhook ").expect("default target");
+            let alpha_index = rendered.find("notify_webhook:alpha").expect("alpha target");
+            let beta_index = rendered.find("notify_webhook:beta").expect("beta target");
+            assert!(default_index < alpha_index);
+            assert!(alpha_index < beta_index);
+        });
+    }
+
+    #[test]
     fn render_scope_line_omits_enable_on_and_hidden_empty_values() {
         let kvs = KVS(vec![
             KV {
