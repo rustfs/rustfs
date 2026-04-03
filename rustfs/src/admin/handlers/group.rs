@@ -264,10 +264,10 @@ fn decode_delete_group_name<'a>(params: &'a Params<'_, '_>) -> S3Result<std::bor
         .trim();
 
     // Path segments stay percent-encoded in `req.uri.path()` / matchit; IAM uses decoded names (same as GET query).
-    let group = percent_decode_str(group_raw)
+    let decoded = percent_decode_str(group_raw)
         .decode_utf8()
         .map_err(|_| s3_error!(InvalidArgument, "invalid group name encoding"))?;
-    let group = group.trim();
+    let group = decoded.trim();
 
     if group.is_empty() || group.len() > 256 {
         return Err(s3_error!(InvalidArgument, "invalid group name"));
@@ -277,7 +277,11 @@ fn decode_delete_group_name<'a>(params: &'a Params<'_, '_>) -> S3Result<std::bor
         return Err(s3_error!(InvalidArgument, "group name contains invalid characters"));
     }
 
-    Ok(std::borrow::Cow::Owned(group.to_string()))
+    if group.len() == decoded.len() {
+        Ok(decoded)
+    } else {
+        Ok(std::borrow::Cow::Owned(group.to_string()))
+    }
 }
 
 pub struct SetGroupStatus {}
@@ -494,30 +498,32 @@ mod tests {
     use super::*;
     use matchit::Router;
 
-    fn delete_group_params(path: &str) -> Params<'static, 'static> {
-        let router = Box::leak(Box::new(Router::new()));
+    fn with_delete_group_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
+        let mut router = Router::new();
         router
             .insert("/rustfs/admin/v3/group/{group}", ())
             .expect("route should insert");
 
-        let leaked = Box::leak(path.to_string().into_boxed_str());
-        router.at(leaked).expect("route should match").params
+        let matched = router.at(path).expect("route should match");
+        f(&matched.params)
     }
 
     #[test]
     fn decode_delete_group_name_percent_decodes_path_segment() {
-        let params = delete_group_params("/rustfs/admin/v3/group/dev%2Bops%20team");
-
-        let group = decode_delete_group_name(&params).expect("encoded group name should decode");
+        let group = with_delete_group_params("/rustfs/admin/v3/group/dev%2Bops%20team", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect("encoded group name should decode");
 
         assert_eq!(group, "dev+ops team");
     }
 
     #[test]
     fn decode_delete_group_name_rejects_invalid_utf8() {
-        let params = delete_group_params("/rustfs/admin/v3/group/%FF");
-
-        let err = decode_delete_group_name(&params).expect_err("invalid utf-8 should fail");
+        let err = with_delete_group_params("/rustfs/admin/v3/group/%FF", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("invalid utf-8 should fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("invalid group name encoding"));
@@ -525,9 +531,10 @@ mod tests {
 
     #[test]
     fn decode_delete_group_name_rejects_blank_name_after_decoding() {
-        let params = delete_group_params("/rustfs/admin/v3/group/%20");
-
-        let err = decode_delete_group_name(&params).expect_err("blank group should fail");
+        let err = with_delete_group_params("/rustfs/admin/v3/group/%20", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("blank group should fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("invalid group name"));
@@ -535,9 +542,10 @@ mod tests {
 
     #[test]
     fn decode_delete_group_name_rejects_path_separator_after_decoding() {
-        let params = delete_group_params("/rustfs/admin/v3/group/team%2Fops");
-
-        let err = decode_delete_group_name(&params).expect_err("decoded slash should fail");
+        let err = with_delete_group_params("/rustfs/admin/v3/group/team%2Fops", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("decoded slash should fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("group name contains invalid characters"));
