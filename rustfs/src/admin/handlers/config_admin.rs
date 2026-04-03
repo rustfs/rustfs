@@ -979,6 +979,22 @@ fn render_entry_value(entry: &KV, redact_secrets: bool) -> String {
     }
 }
 
+fn should_render_config_entry(entry: &KV) -> bool {
+    if entry.hidden_if_empty && entry.value.trim().is_empty() {
+        return false;
+    }
+    if entry.key == ENABLE_KEY
+        && entry
+            .value
+            .parse::<rustfs_config::EnableState>()
+            .map(|state| state.is_enabled())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    true
+}
+
 fn sorted_kv_entries(kvs: &KVS) -> Vec<&KV> {
     let mut entries = kvs.0.iter().filter(|entry| entry.key != COMMENT_KEY).collect::<Vec<_>>();
     entries.sort_by(|lhs, rhs| lhs.key.cmp(&rhs.key));
@@ -986,7 +1002,10 @@ fn sorted_kv_entries(kvs: &KVS) -> Vec<&KV> {
 }
 
 fn render_scope_line(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: bool) -> Option<String> {
-    let entries = sorted_kv_entries(kvs);
+    let entries = sorted_kv_entries(kvs)
+        .into_iter()
+        .filter(|entry| should_render_config_entry(entry))
+        .collect::<Vec<_>>();
     if entries.is_empty() {
         return None;
     }
@@ -1800,6 +1819,32 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
             assert!(rendered.contains("# RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://env.example"));
             assert!(rendered.contains("notify_webhook:primary"));
         });
+    }
+
+    #[test]
+    fn render_scope_line_omits_enable_on_and_hidden_empty_values() {
+        let kvs = KVS(vec![
+            KV {
+                key: ENABLE_KEY.to_string(),
+                value: "on".to_string(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: WEBHOOK_ENDPOINT.to_string(),
+                value: "http://file.example".to_string(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: WEBHOOK_AUTH_TOKEN.to_string(),
+                value: String::new(),
+                hidden_if_empty: true,
+            },
+        ]);
+
+        let rendered = render_scope_line("notify_webhook", "primary", &kvs, true).expect("render scope");
+        assert!(rendered.contains(r#"endpoint="http://file.example""#));
+        assert!(!rendered.contains("enable="));
+        assert!(!rendered.contains("auth_token="));
     }
 
     #[test]
