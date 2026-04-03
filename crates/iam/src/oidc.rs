@@ -1007,14 +1007,27 @@ pub(crate) fn decode_jwt_payload(token: &str) -> HashMap<String, serde_json::Val
     }
 }
 
-/// Extract a string claim from raw claims.
-fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> String {
-    claims.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+/// Get a claim value from raw claims with case-insensitive fallback.
+/// First tries exact match, then falls back to case-insensitive match if not found.
+fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, serde_json::Value>, key: &str) -> Option<&'a serde_json::Value> {
+    if let Some(v) = claims.get(key) {
+        return Some(v);
+    }
+    let key_lower = key.to_lowercase();
+    claims.iter().find(|(k, _)| k.to_lowercase() == key_lower).map(|(_, v)| v)
 }
 
-/// Extract a groups/array claim from raw claims. Handles both string arrays and single strings.
+/// Extract a string claim from raw claims with case-insensitive fallback.
+fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> String {
+    get_claim_case_insensitive(claims, key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Extract a groups/array claim from raw claims with case-insensitive fallback. Handles both string arrays and single strings.
 fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
-    match claims.get(key) {
+    match get_claim_case_insensitive(claims, key) {
         Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
         Some(serde_json::Value::String(s)) => s.split(',').map(|s| s.trim().to_string()).collect(),
         _ => vec![],
@@ -1067,6 +1080,41 @@ mod tests {
         claims.insert("groups".to_string(), serde_json::json!(42));
         let groups = extract_groups_claim(&claims, "groups");
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_string_claim_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), serde_json::json!("consoleAdmin"));
+
+        assert_eq!(extract_string_claim(&claims, "policyMinio"), "consoleAdmin");
+        assert_eq!(extract_string_claim(&claims, "POLICYMINIO"), "consoleAdmin");
+        assert_eq!(extract_string_claim(&claims, "policyminio"), "consoleAdmin");
+    }
+
+    #[test]
+    fn test_extract_groups_claim_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), serde_json::json!(["consoleAdmin", "readwrite"]));
+
+        let groups = extract_groups_claim(&claims, "policyMinio");
+        assert_eq!(groups, vec!["consoleAdmin", "readwrite"]);
+
+        let groups = extract_groups_claim(&claims, "POLICYMINIO");
+        assert_eq!(groups, vec!["consoleAdmin", "readwrite"]);
+
+        let groups = extract_groups_claim(&claims, "policyminio");
+        assert_eq!(groups, vec!["consoleAdmin", "readwrite"]);
+    }
+
+    #[test]
+    fn test_extract_groups_claim_exact_match_preferred() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), serde_json::json!(["exact_match"]));
+        claims.insert("policy".to_string(), serde_json::json!(["lowercase"]));
+
+        let groups = extract_groups_claim(&claims, "Policy");
+        assert_eq!(groups, vec!["exact_match"]);
     }
 
     #[test]

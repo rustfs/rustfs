@@ -138,7 +138,7 @@ impl FastObjectLockManager {
             shard_a.cmp(&shard_b).then_with(|| a.key.cmp(&b.key))
         });
 
-        // Try to use stack-allocated vectors for small batches, fallback to heap if needed
+        // Preserve shard order so every concurrent batch acquires locks in the same global order.
         let shard_groups = self.group_requests_by_shard(sorted_requests);
 
         // Choose strategy based on request type
@@ -150,31 +150,28 @@ impl FastObjectLockManager {
     }
 
     /// Group requests by shard with proper fallback handling
-    fn group_requests_by_shard(
-        &self,
-        requests: Vec<ObjectLockRequest>,
-    ) -> std::collections::HashMap<usize, Vec<ObjectLockRequest>> {
-        let mut shard_groups = std::collections::HashMap::new();
+    fn group_requests_by_shard(&self, requests: Vec<ObjectLockRequest>) -> Vec<(usize, Vec<ObjectLockRequest>)> {
+        let mut shard_groups: Vec<(usize, Vec<ObjectLockRequest>)> = Vec::new();
 
         for request in requests {
             let shard_id = request.key.shard_index(self.shard_mask);
-            shard_groups.entry(shard_id).or_insert_with(Vec::new).push(request);
+            match shard_groups.last_mut() {
+                Some((last_shard_id, grouped_requests)) if *last_shard_id == shard_id => grouped_requests.push(request),
+                _ => shard_groups.push((shard_id, vec![request])),
+            }
         }
 
         shard_groups
     }
 
     /// Best effort acquisition (allows partial success)
-    async fn acquire_locks_best_effort(
-        &self,
-        shard_groups: &std::collections::HashMap<usize, Vec<ObjectLockRequest>>,
-    ) -> BatchLockResult {
+    async fn acquire_locks_best_effort(&self, shard_groups: &[(usize, Vec<ObjectLockRequest>)]) -> BatchLockResult {
         let mut all_successful = Vec::new();
         let mut all_failed = Vec::new();
         let mut guards = Vec::new();
 
-        for (&shard_id, requests) in shard_groups {
-            let shard = self.shards[shard_id].clone();
+        for (shard_id, requests) in shard_groups {
+            let shard = self.shards[*shard_id].clone();
 
             for request in requests {
                 let key = request.key.clone();
@@ -212,16 +209,13 @@ impl FastObjectLockManager {
     }
 
     /// Two-phase commit for atomic acquisition
-    async fn acquire_locks_two_phase_commit(
-        &self,
-        shard_groups: &std::collections::HashMap<usize, Vec<ObjectLockRequest>>,
-    ) -> BatchLockResult {
+    async fn acquire_locks_two_phase_commit(&self, shard_groups: &[(usize, Vec<ObjectLockRequest>)]) -> BatchLockResult {
         // Phase 1: Try to acquire all locks
         let mut acquired_guards = Vec::new();
         let mut failed_locks = Vec::new();
 
-        'outer: for (&shard_id, requests) in shard_groups {
-            let shard = self.shards[shard_id].clone();
+        'outer: for (shard_id, requests) in shard_groups {
+            let shard = self.shards[*shard_id].clone();
 
             for request in requests {
                 match shard.acquire_lock(request).await {
@@ -436,5 +430,50 @@ impl LockManager for FastObjectLockManager {
 
     fn is_disabled(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_request(manager: &FastObjectLockManager, shard_id: usize, suffix: usize) -> ObjectLockRequest {
+        let mut candidate = 0usize;
+        loop {
+            let object = format!("object-{shard_id}-{suffix}-{candidate}");
+            let key = ObjectKey::new("bucket", object);
+            if key.shard_index(manager.shard_mask) == shard_id {
+                return ObjectLockRequest::new_write(key, "owner");
+            }
+            candidate += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_requests_by_shard_preserves_sorted_shard_order() {
+        let manager = FastObjectLockManager::new();
+        let mut requests = vec![
+            make_request(&manager, 3, 0),
+            make_request(&manager, 1, 0),
+            make_request(&manager, 2, 0),
+            make_request(&manager, 1, 1),
+            make_request(&manager, 3, 1),
+        ];
+
+        requests.sort_unstable_by(|a, b| {
+            let shard_a = a.key.shard_index(manager.shard_mask);
+            let shard_b = b.key.shard_index(manager.shard_mask);
+            shard_a.cmp(&shard_b).then_with(|| a.key.cmp(&b.key))
+        });
+
+        let shard_groups = manager.group_requests_by_shard(requests);
+        let shard_ids: Vec<_> = shard_groups.iter().map(|(shard_id, _)| *shard_id).collect();
+
+        assert_eq!(shard_ids, vec![1, 2, 3]);
+        assert_eq!(shard_groups[0].1.len(), 2);
+        assert_eq!(shard_groups[1].1.len(), 1);
+        assert_eq!(shard_groups[2].1.len(), 2);
+
+        manager.shutdown().await;
     }
 }

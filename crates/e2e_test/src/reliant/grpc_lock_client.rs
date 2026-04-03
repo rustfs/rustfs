@@ -21,7 +21,7 @@ use rustfs_lock::{
     LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockMetadata, LockPriority},
 };
-use rustfs_protos::proto_gen::node_service::{GenerallyLockRequest, PingRequest};
+use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
 use tonic::Request;
 use tracing::{info, warn};
 
@@ -64,6 +64,44 @@ impl GrpcLockClient {
             suppress_contention_logs: false,
         }
     }
+
+    fn build_lock_info(request: &LockRequest, lock_info_json: Option<String>) -> LockInfo {
+        if let Some(lock_info_json) = lock_info_json {
+            match serde_json::from_str::<LockInfo>(&lock_info_json) {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to deserialize lock_info from response: {}, using request data", e);
+                    LockInfo {
+                        id: request.lock_id.clone(),
+                        resource: request.resource.clone(),
+                        lock_type: request.lock_type,
+                        status: LockStatus::Acquired,
+                        owner: request.owner.clone(),
+                        acquired_at: std::time::SystemTime::now(),
+                        expires_at: std::time::SystemTime::now() + request.ttl,
+                        last_refreshed: std::time::SystemTime::now(),
+                        metadata: request.metadata.clone(),
+                        priority: request.priority,
+                        wait_start_time: None,
+                    }
+                }
+            }
+        } else {
+            LockInfo {
+                id: request.lock_id.clone(),
+                resource: request.resource.clone(),
+                lock_type: request.lock_type,
+                status: LockStatus::Acquired,
+                owner: request.owner.clone(),
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + request.ttl,
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: request.metadata.clone(),
+                priority: request.priority,
+                wait_start_time: None,
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -89,46 +127,10 @@ impl LockClient for GrpcLockClient {
 
         // Check if the lock acquisition was successful
         if resp.success {
-            // Try to deserialize lock_info from response
-            let lock_info = if let Some(lock_info_json) = resp.lock_info {
-                match serde_json::from_str::<LockInfo>(&lock_info_json) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        // If deserialization fails, fall back to constructing from request
-                        warn!("Failed to deserialize lock_info from response: {}, using request data", e);
-                        LockInfo {
-                            id: request.lock_id.clone(),
-                            resource: request.resource.clone(),
-                            lock_type: request.lock_type,
-                            status: LockStatus::Acquired,
-                            owner: request.owner.clone(),
-                            acquired_at: std::time::SystemTime::now(),
-                            expires_at: std::time::SystemTime::now() + request.ttl,
-                            last_refreshed: std::time::SystemTime::now(),
-                            metadata: request.metadata.clone(),
-                            priority: request.priority,
-                            wait_start_time: None,
-                        }
-                    }
-                }
-            } else {
-                // If lock_info is not provided, construct from request
-                LockInfo {
-                    id: request.lock_id.clone(),
-                    resource: request.resource.clone(),
-                    lock_type: request.lock_type,
-                    status: LockStatus::Acquired,
-                    owner: request.owner.clone(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + request.ttl,
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: request.metadata.clone(),
-                    priority: request.priority,
-                    wait_start_time: None,
-                }
-            };
-
-            Ok(LockResponse::success(lock_info, std::time::Duration::ZERO))
+            Ok(LockResponse::success(
+                Self::build_lock_info(request, resp.lock_info),
+                std::time::Duration::ZERO,
+            ))
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
@@ -136,6 +138,45 @@ impl LockClient for GrpcLockClient {
                 std::time::Duration::ZERO,
             ))
         }
+    }
+
+    async fn acquire_locks_batch(&self, requests: &[LockRequest]) -> Result<Vec<LockResponse>> {
+        let mut client = self.get_client().await?;
+        let req = Request::new(BatchGenerallyLockRequest {
+            args: requests
+                .iter()
+                .map(|request| {
+                    serde_json::to_string(request).map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
+
+        let resp = client
+            .lock_batch(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
+
+        Ok(requests
+            .iter()
+            .enumerate()
+            .map(|(idx, request)| match resp.results.get(idx) {
+                Some(result) if result.success => {
+                    LockResponse::success(Self::build_lock_info(request, result.lock_info.clone()), std::time::Duration::ZERO)
+                }
+                Some(result) => LockResponse::failure(
+                    result
+                        .error_info
+                        .clone()
+                        .unwrap_or_else(|| "Lock acquisition failed on remote server".to_string()),
+                    std::time::Duration::ZERO,
+                ),
+                None => LockResponse::failure(
+                    format!("Lock batch response missing entry for request index {idx}"),
+                    std::time::Duration::ZERO,
+                ),
+            })
+            .collect())
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
@@ -159,6 +200,31 @@ impl LockClient for GrpcLockClient {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
+    }
+
+    async fn release_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        let mut client = self.get_client().await?;
+        let req = Request::new(BatchGenerallyLockRequest {
+            args: lock_ids
+                .iter()
+                .map(|lock_id| {
+                    serde_json::to_string(&Self::create_unlock_request(lock_id))
+                        .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
+
+        let resp = client
+            .un_lock_batch(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner();
+
+        Ok(lock_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| resp.results.get(idx).map(|result| result.success).unwrap_or(false))
+            .collect())
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
