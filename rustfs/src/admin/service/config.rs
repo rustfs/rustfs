@@ -345,6 +345,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
+        rustfs_ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -358,6 +359,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
+        rustfs_ecstore::config::init();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
