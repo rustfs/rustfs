@@ -27,6 +27,7 @@ use openidconnect::{
 use rustfs_config::oidc::*;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1004,37 +1005,6 @@ pub(crate) fn decode_jwt_payload(token: &str) -> HashMap<String, serde_json::Val
     match payload_bytes {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => HashMap::new(),
-    }
-}
-
-/// Get a claim value from raw claims with case-insensitive fallback.
-/// First tries exact match, then falls back to case-insensitive match if not found.
-enum ClaimLookup<'a> {
-    Missing,
-    Found(&'a serde_json::Value),
-    Ambiguous,
-}
-
-fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, serde_json::Value>, key: &str) -> ClaimLookup<'a> {
-    if let Some(v) = claims.get(key) {
-        return ClaimLookup::Found(v);
-    }
-
-    let key_lower = key.to_lowercase();
-    let mut matched = None;
-
-    for (candidate, value) in claims {
-        if candidate.to_lowercase() == key_lower {
-            if matched.is_some() {
-                return ClaimLookup::Ambiguous;
-            }
-            matched = Some(value);
-        }
-    }
-
-    match matched {
-        Some(value) => ClaimLookup::Found(value),
-        None => ClaimLookup::Missing,
     }
 }
 

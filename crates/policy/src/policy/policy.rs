@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::{
-    Effect, Error as IamError, Functions, ID, Statement, action::Action, statement::BPStatement,
-    statement::variable_resolver_for_policy_args,
+    ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
+    statement::BPStatement, statement::variable_resolver_for_policy_args,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -236,35 +236,6 @@ impl Validator for BucketPolicy {
         }
 
         Ok(())
-    }
-}
-
-enum ClaimLookup<'a> {
-    Missing,
-    Found(&'a Value),
-    Ambiguous,
-}
-
-fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, Value>, claim_name: &str) -> ClaimLookup<'a> {
-    if let Some(v) = claims.get(claim_name) {
-        return ClaimLookup::Found(v);
-    }
-
-    let claim_name_lower = claim_name.to_lowercase();
-    let mut matched = None;
-
-    for (candidate, value) in claims {
-        if candidate.to_lowercase() == claim_name_lower {
-            if matched.is_some() {
-                return ClaimLookup::Ambiguous;
-            }
-            matched = Some(value);
-        }
-    }
-
-    match matched {
-        Some(value) => ClaimLookup::Found(value),
-        None => ClaimLookup::Missing,
     }
 }
 
