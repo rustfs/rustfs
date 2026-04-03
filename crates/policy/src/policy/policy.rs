@@ -239,42 +239,66 @@ impl Validator for BucketPolicy {
     }
 }
 
-fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, Value>, claim_name: &str) -> Option<&'a Value> {
+enum ClaimLookup<'a> {
+    Missing,
+    Found(&'a Value),
+    Ambiguous,
+}
+
+fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, Value>, claim_name: &str) -> ClaimLookup<'a> {
     if let Some(v) = claims.get(claim_name) {
-        return Some(v);
+        return ClaimLookup::Found(v);
     }
+
     let claim_name_lower = claim_name.to_lowercase();
-    claims
-        .iter()
-        .find(|(k, _)| k.to_lowercase() == claim_name_lower)
-        .map(|(_, v)| v)
+    let mut matched = None;
+
+    for (candidate, value) in claims {
+        if candidate.to_lowercase() == claim_name_lower {
+            if matched.is_some() {
+                return ClaimLookup::Ambiguous;
+            }
+            matched = Some(value);
+        }
+    }
+
+    match matched {
+        Some(value) => ClaimLookup::Found(value),
+        None => ClaimLookup::Missing,
+    }
 }
 
 fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
     let mut s = HashSet::new();
-    if let Some(pname) = get_claim_case_insensitive(claims, claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(pname) => {
+            if let Some(pnames) = pname.as_array() {
+                for pname in pnames {
+                    if let Some(pname_str) = pname.as_str() {
+                        for pname in pname_str.split(',') {
+                            let pname = pname.trim();
+                            if !pname.is_empty() {
+                                s.insert(pname.to_string());
+                            }
                         }
                     }
                 }
+                return (s, true);
             }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
+
+            if let Some(pname_str) = pname.as_str() {
+                for pname in pname_str.split(',') {
+                    let pname = pname.trim();
+                    if !pname.is_empty() {
+                        s.insert(pname.to_string());
+                    }
                 }
+                return (s, true);
             }
-            return (s, true);
         }
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => {}
     }
+
     (s, false)
 }
 
@@ -1743,5 +1767,27 @@ mod test {
         assert!(found);
         assert!(policies.contains("consoleAdmin"));
         assert!(policies.contains("readwrite"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::String("consoleAdmin".to_string()));
+        claims.insert("policy".to_string(), Value::String("readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
     }
 }
