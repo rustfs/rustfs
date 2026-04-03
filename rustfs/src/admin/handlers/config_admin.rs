@@ -1008,7 +1008,7 @@ fn env_var_name_for_target(sub_system: &str, target: &str, key: &str) -> String 
     }
 }
 
-fn render_env_override_lines(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: bool) -> Vec<String> {
+fn config_target_keys(kvs: &KVS) -> Vec<&str> {
     let mut keys = sorted_kv_entries(kvs)
         .into_iter()
         .map(|entry| entry.key.as_str())
@@ -1016,9 +1016,35 @@ fn render_env_override_lines(sub_system: &str, target: &str, kvs: &KVS, redact_s
     if !keys.contains(&COMMENT_KEY) {
         keys.push(COMMENT_KEY);
     }
+    keys
+}
 
+fn discover_env_targets(sub_system: &str, kvs: &KVS) -> Vec<String> {
+    if !lookup_help_subsystem(sub_system).is_some_and(|metadata| metadata.multiple_targets) {
+        return Vec::new();
+    }
+
+    let mut targets = BTreeSet::new();
+    for key in config_target_keys(kvs) {
+        let prefix = format!("{}_", env_var_name_for_target(sub_system, DEFAULT_DELIMITER, key));
+        for (name, value) in env::vars() {
+            if value.is_empty() {
+                continue;
+            }
+            if let Some(target) = name.strip_prefix(&prefix)
+                && !target.is_empty()
+            {
+                targets.insert(target.to_ascii_lowercase());
+            }
+        }
+    }
+
+    targets.into_iter().collect()
+}
+
+fn render_env_override_lines(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: bool) -> Vec<String> {
     let mut lines = Vec::new();
-    for key in keys {
+    for key in config_target_keys(kvs) {
         let env_name = env_var_name_for_target(sub_system, target, key);
         let Ok(value) = env::var(&env_name) else {
             continue;
@@ -1045,7 +1071,13 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
     sorted_targets.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
 
     if let Some(target) = selector.target.as_ref() {
-        let Some(kvs) = targets.get(target) else {
+        let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().unwrap_or_else(KVS::new);
+        let discovered_targets = discover_env_targets(&selector.sub_system, &default_kvs);
+        let kvs = if let Some(kvs) = targets.get(target) {
+            kvs
+        } else if discovered_targets.iter().any(|name| name == target) {
+            &default_kvs
+        } else {
             return Err(s3_error!(
                 InvalidRequest,
                 "config target '{}' not found for subsystem '{}'",
@@ -1057,12 +1089,26 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
         lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets));
         if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
             lines.push(line);
+        } else if !lines.is_empty() {
+            lines.push(format_scope(&selector.sub_system, target));
         }
     } else {
-        for (target, kvs) in sorted_targets {
-            lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets));
-            if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
+        let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().unwrap_or_else(KVS::new);
+        let mut target_names = sorted_targets
+            .iter()
+            .map(|(target, _)| (*target).clone())
+            .collect::<BTreeSet<_>>();
+        for target in discover_env_targets(&selector.sub_system, &default_kvs) {
+            target_names.insert(target);
+        }
+
+        for target in target_names {
+            let kvs = targets.get(&target).unwrap_or(&default_kvs);
+            lines.extend(render_env_override_lines(&selector.sub_system, &target, kvs, redact_secrets));
+            if let Some(line) = render_scope_line(&selector.sub_system, &target, kvs, redact_secrets) {
                 lines.push(line);
+            } else if !lines.is_empty() {
+                lines.push(format_scope(&selector.sub_system, &target));
             }
         }
     }
@@ -1731,6 +1777,29 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
                 assert!(!rendered.contains("RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY"));
             },
         );
+    }
+
+    #[test]
+    fn render_selected_config_lists_env_only_targets() {
+        rustfs_ecstore::config::init();
+        temp_env::with_vars([("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example"))], || {
+            let config = ServerConfig::new();
+            let rendered = String::from_utf8(
+                render_selected_config(
+                    &config,
+                    &ConfigSelector {
+                        sub_system: "notify_webhook".to_string(),
+                        target: None,
+                    },
+                    true,
+                )
+                .expect("render config"),
+            )
+            .expect("utf8");
+
+            assert!(rendered.contains("# RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://env.example"));
+            assert!(rendered.contains("notify_webhook:primary"));
+        });
     }
 
     #[test]
