@@ -502,6 +502,7 @@ impl Operation for AuditTargetConfig {
             // HTTP HEAD probe: validates the full request path (DNS, TLS, proxy, firewall)
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| s3_error!(InvalidArgument, "failed to build HTTP client: {}", e))?;
             match tokio::time::timeout(std::time::Duration::from_secs(5), client.head(endpoint).send()).await {
