@@ -224,12 +224,14 @@ pub async fn stream_events_with_batching(
             }
 
             // Skip unreadable entries so a single corrupt file cannot stall the stream.
+            // ensure_store_entry_raw_readable attempts get_raw; on I/O error it calls del() to
+            // remove the corrupt entry before returning Err, so no cleanup is needed here.
             match ensure_store_entry_raw_readable(&*store, &key) {
                 Ok(true) => {}         // entry is readable, proceed
                 Ok(false) => continue, // entry not found (already removed), skip
                 Err(err) => {
                     warn!("Skipping unreadable store entry {} for target {}: {}", key, target.name(), err);
-                    continue; // ensure_store_entry_raw_readable already deleted the corrupt entry
+                    continue; // corrupt entry was already deleted by ensure_store_entry_raw_readable
                 }
             }
 
