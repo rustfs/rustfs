@@ -43,7 +43,7 @@ use crate::init::init_webdav_system;
 
 use crate::capacity::capacity_integration::init_capacity_management;
 use crate::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use license::{current_license, init_license, license_status};
@@ -229,15 +229,18 @@ async fn async_main() -> Result<()> {
         // A crypto provider is already installed (e.g. by the host process); this is fine.
         debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
     }
-    // Initialize TLS if a certificate path is provided
+    // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
+    // Server-side TLS acceptor is built separately inside start_http_server()
+    // using the same TlsMaterialSnapshot loading logic.
     if let Some(tls_path) = &config.tls_path {
-        match init_cert(tls_path).await {
-            Ok(_) => {
-                info!(target: "rustfs::main", "TLS initialized successfully with certs from {}", tls_path);
+        match crate::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+            Ok(snapshot) => {
+                snapshot.apply_outbound().await;
+                info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
             }
             Err(e) => {
                 error!("Failed to initialize TLS from {}: {}", tls_path, e);
-                return Err(Error::other(e));
+                return Err(Error::other(e.to_string()));
             }
         }
     }

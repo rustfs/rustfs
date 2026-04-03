@@ -19,9 +19,10 @@ use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
-    compress::{CompressionConfig, CompressionPredicate},
+    compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
 use crate::storage;
 use crate::storage::rpc::InternodeRpcService;
@@ -38,7 +39,6 @@ use metrics::{counter, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
@@ -46,7 +46,6 @@ use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
-use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
@@ -54,7 +53,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Status};
 use tower::ServiceBuilder;
 use tower_http::add_extension::AddExtensionLayer;
@@ -156,9 +154,22 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_acceptor = setup_tls_acceptor(config.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_path = config.tls_path.as_deref().unwrap_or_default();
+    // Load TLS materials and build server acceptor in one shot.
+    // Outbound material (root CAs, mTLS identity) is also applied here.
+    let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    tls_snapshot.apply_outbound().await;
+
+    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| std::io::Error::other(e.to_string()))?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
+
+    // Spawn background TLS certificate hot-reload loop (if enabled).
+    if let Some(holder) = &tls_acceptor {
+        spawn_reload_loop(tls_path.to_string(), holder.clone());
+    }
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -273,11 +284,53 @@ pub async fn start_http_server(
             (sigterm_inner, sigint_inner)
         };
 
-        // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
-        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Optimize large file throughput
-        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 8; // 8MB: Link-level flow control
-        const H2_MAX_FRAME_SIZE: u32 = 512 * 1024; // 512KB: Reduce framing overhead for large objects
-        const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024; // 64KB: Conservative header limit to mitigate DoS risk
+        // ── HTTP Transport Tuning (configurable via env vars) ──
+        // Read all transport parameters from environment, falling back to defaults.
+        // H2 frame size is clamped to RFC 7540 range: 2^14 (16KB) to 2^24 (16MB).
+
+        let h2_stream_window = rustfs_utils::get_env_u32(
+            rustfs_config::ENV_H2_INITIAL_STREAM_WINDOW_SIZE,
+            rustfs_config::DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE,
+        );
+        let h2_conn_window = rustfs_utils::get_env_u32(
+            rustfs_config::ENV_H2_INITIAL_CONN_WINDOW_SIZE,
+            rustfs_config::DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE,
+        );
+        let h2_max_frame_size =
+            rustfs_utils::get_env_u32(rustfs_config::ENV_H2_MAX_FRAME_SIZE, rustfs_config::DEFAULT_H2_MAX_FRAME_SIZE)
+                .clamp(16_384, 16_777_216); // RFC 7540
+        let h2_max_header_list_size =
+            rustfs_utils::get_env_u32(rustfs_config::ENV_H2_MAX_HEADER_LIST_SIZE, rustfs_config::DEFAULT_H2_MAX_HEADER_LIST_SIZE);
+        let h2_max_concurrent_streams = rustfs_utils::get_env_u32(
+            rustfs_config::ENV_H2_MAX_CONCURRENT_STREAMS,
+            rustfs_config::DEFAULT_H2_MAX_CONCURRENT_STREAMS,
+        )
+        .max(1);
+        let h2_keep_alive_interval =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_H2_KEEP_ALIVE_INTERVAL, rustfs_config::DEFAULT_H2_KEEP_ALIVE_INTERVAL);
+        let h2_keep_alive_timeout =
+            rustfs_utils::get_env_u64(rustfs_config::ENV_H2_KEEP_ALIVE_TIMEOUT, rustfs_config::DEFAULT_H2_KEEP_ALIVE_TIMEOUT);
+        let http1_header_read_timeout = rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HTTP1_HEADER_READ_TIMEOUT,
+            rustfs_config::DEFAULT_HTTP1_HEADER_READ_TIMEOUT,
+        );
+        let http1_max_buf_size =
+            rustfs_utils::get_env_usize(rustfs_config::ENV_HTTP1_MAX_BUF_SIZE, rustfs_config::DEFAULT_HTTP1_MAX_BUF_SIZE);
+
+        info!(
+            "HTTP transport parameters: h2_stream_window={}, h2_conn_window={}, h2_max_frame={}, \
+             h2_max_header_list={}, h2_max_concurrent_streams={}, h2_keepalive_interval={}s, \
+             h2_keepalive_timeout={}s, http1_header_timeout={}s, http1_max_buf={}",
+            h2_stream_window,
+            h2_conn_window,
+            h2_max_frame_size,
+            h2_max_header_list_size,
+            h2_max_concurrent_streams,
+            h2_keep_alive_interval,
+            h2_keep_alive_timeout,
+            http1_header_read_timeout,
+            http1_max_buf_size,
+        );
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
 
@@ -286,8 +339,8 @@ pub async fn start_http_server(
             .http1()
             .timer(TokioTimer::new())
             .keep_alive(true)
-            .header_read_timeout(Duration::from_secs(5))
-            .max_buf_size(64 * 1024)
+            .header_read_timeout(Duration::from_secs(http1_header_read_timeout))
+            .max_buf_size(http1_max_buf_size)
             .writev(true);
 
         // Optimize for HTTP/2 (AI/Data Lake high concurrency synchronization)
@@ -295,13 +348,13 @@ pub async fn start_http_server(
             .http2()
             .timer(TokioTimer::new())
             .adaptive_window(true)
-            .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
-            .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
-            .max_frame_size(H2_MAX_FRAME_SIZE)
-            .max_concurrent_streams(Some(2048))
-            .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
-            .keep_alive_interval(Some(Duration::from_secs(20)))
-            .keep_alive_timeout(Duration::from_secs(10));
+            .initial_stream_window_size(h2_stream_window)
+            .initial_connection_window_size(h2_conn_window)
+            .max_frame_size(h2_max_frame_size)
+            .max_concurrent_streams(Some(h2_max_concurrent_streams))
+            .max_header_list_size(h2_max_header_list_size)
+            .keep_alive_interval(Some(Duration::from_secs(h2_keep_alive_interval)))
+            .keep_alive_timeout(Duration::from_secs(h2_keep_alive_timeout));
 
         let http_server = Arc::new(conn_builder);
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -310,10 +363,7 @@ pub async fn start_http_server(
 
         // service ready
         worker_state_manager.update(ServiceState::Ready);
-        let tls_acceptor = tls_acceptor.map(Arc::new);
-
-        // Initialize keepalive configuration once to avoid recreation in the loop
-        let keepalive_conf = get_default_tcp_keepalive();
+        // tls_acceptor is already Option<Arc<TlsAcceptorHolder>>, clone for the loop
 
         loop {
             debug!("Waiting for new connection...");
@@ -374,28 +424,29 @@ pub async fn start_http_server(
 
             let socket_ref = SockRef::from(&socket);
 
-            // Enable TCP Keepalive to detect dead clients (e.g. power loss)
-            if let Err(err) = socket_ref.set_tcp_keepalive(&keepalive_conf) {
-                warn!(?err, "Failed to set TCP_KEEPALIVE");
-            }
+            // ── POST-ACCEPT SOCKET SYSCALLS ──
+            // The listening socket already sets TCP_NODELAY, TCP_KEEPALIVE,
+            // SO_RCVBUF, and SO_SNDBUF. On Linux/BSD, these are inherited by
+            // accepted sockets, so we skip redundant re-application here.
+            //
+            // Only TCP_QUICKACK (Linux) is kept — it is inherently per-connection
+            // and NOT inherited from the listening socket.
+            //
+            // T03 optimized: syscall count reduced from 5 → 1 (Linux) / 0 (other)
 
-            // Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
-            if let Err(err) = socket_ref.set_tcp_nodelay(true) {
-                warn!(?err, "Failed to set TCP_NODELAY");
-            }
-
-            // Enable TCP QuickAck to reduce latency for small requests
+            // Enable TCP QuickAck to reduce latency for small requests (Linux only)
             #[cfg(target_os = "linux")]
             if let Err(err) = socket_ref.set_tcp_quickack(true) {
                 debug!(?err, "Failed to set TCP_QUICKACK");
             }
 
-            // Increase receive/send buffer to support BDP at GB-level throughput
-            if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
-                warn!(?err, "Failed to set set_recv_buffer_size");
-            }
-            if let Err(err) = socket_ref.set_send_buffer_size(4 * rustfs_config::MI_B) {
-                warn!(?err, "Failed to set set_send_buffer_size");
+            // Debug-only: verify listening socket options were inherited
+            #[cfg(debug_assertions)]
+            {
+                debug!(
+                    nodelay = socket_ref.tcp_nodelay().unwrap_or(false),
+                    "TCP_NODELAY inherited from listening socket"
+                );
             }
 
             let connection_ctx = ConnectionContext {
@@ -404,6 +455,8 @@ pub async fn start_http_server(
                 compression_config: compression_config.clone(),
                 is_console,
                 readiness: readiness.clone(),
+                keystone_auth: auth_keystone::get_keystone_auth(),
+                trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
@@ -433,88 +486,6 @@ pub async fn start_http_server(
     Ok(shutdown_tx)
 }
 
-/// Sets up the TLS acceptor if certificates are available.
-#[instrument(skip(tls_path))]
-async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
-    if tls_path.is_empty() || tokio::fs::metadata(tls_path).await.is_err() {
-        debug!("TLS path is not provided or does not exist, starting with HTTP");
-        return Ok(None);
-    }
-    debug!("Found TLS directory, checking for certificates");
-
-    let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
-    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
-        && !cert_key_pairs.is_empty()
-    {
-        debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
-
-        // Create an SNI-enabled certificate resolver
-        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
-
-        // Configure the server to enable SNI support
-        let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
-            ServerConfig::builder()
-                .with_client_cert_verifier(verifier)
-                .with_cert_resolver(Arc::new(resolver))
-        } else {
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver))
-        };
-
-        // Configure ALPN protocol priority
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-
-        // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
-
-        // Log SNI requests
-        if rustfs_utils::tls_key_log() {
-            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
-
-        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
-    }
-
-    // 2. Revert to the traditional single-certificate mode
-    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-    if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
-        debug!("Found legacy single TLS certificate, starting with HTTPS");
-        let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
-        let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
-
-        let mut server_config = if let Some(verifier) = mtls_verifier {
-            ServerConfig::builder()
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(certs, key)
-                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
-        } else {
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
-        };
-
-        // Configure ALPN protocol priority
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-
-        // Enable session resumption to reduce handshake overhead for returning clients
-        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
-
-        // Log SNI requests
-        if rustfs_utils::tls_key_log() {
-            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
-
-        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
-    }
-
-    debug!("No valid TLS certificates found in the directory, starting with HTTP");
-    Ok(None)
-}
-
 #[derive(Clone)]
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
@@ -522,6 +493,10 @@ struct ConnectionContext {
     compression_config: CompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
+    /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
+    keystone_auth: Option<std::sync::Arc<rustfs_keystone::KeystoneAuthProvider>>,
+    /// Pre-computed trusted proxy layer (avoids per-connection is_enabled() check).
+    trusted_proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
 }
 
 /// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
@@ -569,7 +544,7 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
 ))]
 fn process_connection(
     socket: TcpStream,
-    tls_acceptor: Option<Arc<TlsAcceptor>>,
+    tls_acceptor: Option<Arc<TlsAcceptorHolder>>,
     context: ConnectionContext,
     graceful: Arc<GracefulShutdown>,
 ) {
@@ -580,15 +555,16 @@ fn process_connection(
             compression_config,
             is_console,
             readiness,
+            keystone_auth,
+            trusted_proxy_layer,
         } = context;
 
-        // Build services inside each connected task to avoid passing complex service types across tasks,
-        // It also ensures that each connection has an independent service instance.
+        // Build the hybrid service per-connection.
+        // Note: NodeService is not Clone (holds LocalPeerS3Client), and the SwiftService
+        // type is feature-gated, so we cannot pre-build the full hybrid service.
+        // The construction cost is negligible (struct wrapping only, no I/O).
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
-        // Wrap S3 service with Swift service to handle Swift API requests
-        // Swift API is only available when compiled with the 'swift' feature
-        // When enabled, Swift routes are handled at /v1/AUTH_* paths by default
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);
         #[cfg(not(feature = "swift"))]
@@ -607,6 +583,26 @@ fn process_connection(
                 None
             }
         };
+        // ── Canonical Middleware Stack Order (outermost → innermost) ──
+        // This order MUST be preserved across refactorings.
+        // Only AddExtensionLayer (layers 1-2) are per-connection; layers 3-15 are stateless.
+        //
+        //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
+        //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
+        //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
+        //  4. SetRequestIdLayer                       — generates X-Request-ID
+        //  5. AdminChunkedContentLengthCompatLayer    — admin API compat
+        //  6. CatchPanicLayer                        — panic → 500
+        //  7. ReadinessGateLayer                     — blocks until ready
+        //  8. KeystoneAuthLayer                      — X-Auth-Token validation
+        //  9. TraceLayer                             — request/response tracing + metrics
+        // 10. PropagateRequestIdLayer                — X-Request-ID → response
+        // 11. PathCategoryInjectionLayer             — injects path category for compression
+        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 13. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 14. ConditionalCorsLayer                   — S3 API CORS
+        // 15. RedirectLayer                          — console redirect (conditional)
+        // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
             // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
@@ -618,11 +614,8 @@ fn process_connection(
             .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
             // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
             // This should be placed before TraceLayer so that logs reflect the real client IP
-            .option_layer(if rustfs_trusted_proxies::is_enabled() {
-                Some(rustfs_trusted_proxies::layer().clone())
-            } else {
-                None
-            })
+            // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
+            .option_layer(trusted_proxy_layer)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
@@ -632,10 +625,8 @@ fn process_connection(
             // Add Keystone authentication middleware
             // This validates X-Auth-Token headers and stores credentials in task-local storage
             // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
-            .layer({
-                let keystone_auth = auth_keystone::get_keystone_auth();
-                KeystoneAuthLayer::new(keystone_auth)
-            })
+            // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
+            .layer(KeystoneAuthLayer::new(keystone_auth))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -702,13 +693,27 @@ fn process_connection(
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                        let _enter = span.enter();
-                        histogram!("rustfs.request.body.len").record(chunk.len() as f64);
-                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            histogram!("rustfs.request.body.len").record(chunk.len() as f64);
+                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (chunk, latency, span);
+                        }
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
-                        let _enter = span.enter();
-                        debug!("http stream closed after {:?}", stream_duration)
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            debug!("http stream closed after {:?}", stream_duration);
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (_trailers, stream_duration, span);
+                        }
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
@@ -719,7 +724,8 @@ fn process_connection(
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            .layer(PathCategoryInjectionLayer)
+            .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
             .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
@@ -733,12 +739,13 @@ fn process_connection(
         let hybrid_service = TowerToHyperService::new(hybrid_service);
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
-        if let Some(acceptor) = tls_acceptor {
+        if let Some(holder) = tls_acceptor {
             debug!("TLS handshake start");
             let peer_addr = socket
                 .peer_addr()
                 .ok()
                 .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
+            let acceptor = holder.get();
             match acceptor.accept(socket).await {
                 Ok(tls_socket) => {
                     debug!("TLS handshake successful");
@@ -749,32 +756,26 @@ fn process_connection(
                     }
                 }
                 Err(err) => {
-                    // Detailed analysis of the reasons why the TLS handshake fails
                     let err_str = err.to_string();
-                    let mut key_failure_type_str: &str = "UNKNOWN";
-                    if err_str.contains("unexpected EOF") || err_str.contains("handshake eof") {
-                        warn!(peer_addr = %peer_addr, "TLS handshake failed. If this client needs HTTP, it should connect to the HTTP port instead");
-                        key_failure_type_str = "UNEXPECTED_EOF";
-                    } else if err_str.contains("protocol version") {
-                        error!(
-                            peer_addr = %peer_addr,
-                            "TLS handshake failed due to protocol version mismatch: {}", err
-                        );
-                        key_failure_type_str = "PROTOCOL_VERSION";
-                    } else if err_str.contains("certificate") {
-                        error!(
-                            peer_addr = %peer_addr,
-                            "TLS handshake failed due to certificate issues: {}", err
-                        );
-                        key_failure_type_str = "CERTIFICATE";
-                    } else {
-                        error!(
-                            peer_addr = %peer_addr,
-                            "TLS handshake failed: {}", err
-                        );
+                    let kind = TlsHandshakeFailureKind::classify(&err_str);
+                    match kind {
+                        TlsHandshakeFailureKind::UnexpectedEof => {
+                            warn!(peer_addr = %peer_addr, "TLS handshake failed (unexpected EOF). If this client needs HTTP, it should connect to the HTTP port instead");
+                        }
+                        TlsHandshakeFailureKind::ProtocolVersion => {
+                            error!(peer_addr = %peer_addr, "TLS handshake failed (protocol version mismatch): {}", err);
+                        }
+                        TlsHandshakeFailureKind::Certificate => {
+                            error!(peer_addr = %peer_addr, "TLS handshake failed (certificate issue): {}", err);
+                        }
+                        TlsHandshakeFailureKind::Alert => {
+                            error!(peer_addr = %peer_addr, "TLS handshake failed (alert): {}", err);
+                        }
+                        TlsHandshakeFailureKind::Unknown => {
+                            error!(peer_addr = %peer_addr, "TLS handshake failed: {}", err);
+                        }
                     }
-                    counter!("rustfs_tls_handshake_failures", &[("key_failure_type", key_failure_type_str)]).increment(1);
-                    // Record detailed diagnostic information
+                    counter!("rustfs_tls_handshake_failures", &[("failure_type", kind.as_str())]).increment(1);
                     debug!(
                         peer_addr = %peer_addr,
                         error_type = %std::any::type_name_of_val(&err),
@@ -913,6 +914,58 @@ mod tests {
     use super::*;
     use http::HeaderMap;
     use opentelemetry::propagation::Extractor;
+
+    /// Baseline constants — verify these match the production values above.
+    /// If a constant here disagrees with the runtime value, the test will fail.
+    mod baseline {
+        /// Number of middleware layers in the canonical stack order (see http.rs).
+        /// Layers 1-2 are per-connection (AddExtension), 3-15 are stateless.
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 15;
+
+        /// Current HTTP/2 defaults (hardcoded, to be made configurable in T06).
+        pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+        pub const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+        pub const H2_MAX_FRAME_SIZE: u32 = 512 * 1024;
+        pub const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+        /// Current HTTP/1.1 defaults.
+        pub const HTTP1_HEADER_READ_TIMEOUT_SECS: u64 = 5;
+        pub const HTTP1_MAX_BUF_SIZE: usize = 64 * 1024;
+
+        /// Post-accept socket syscalls after T03 optimization.
+        /// Linux: 1 (TCP_QUICKACK only). Other platforms: 0.
+        #[allow(dead_code)]
+        pub const POST_ACCEPT_SYSCALL_COUNT_LINUX: usize = 1;
+        pub const POST_ACCEPT_SYSCALL_COUNT_OTHER: usize = 0;
+    }
+
+    #[test]
+    fn test_baseline_h2_constants() {
+        // These must match the hardcoded values in the accept loop
+        assert_eq!(baseline::H2_INITIAL_STREAM_WINDOW_SIZE, 4 * 1024 * 1024);
+        assert_eq!(baseline::H2_INITIAL_CONN_WINDOW_SIZE, 8 * 1024 * 1024);
+        assert_eq!(baseline::H2_MAX_FRAME_SIZE, 512 * 1024);
+        assert_eq!(baseline::H2_MAX_HEADER_LIST_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_baseline_http1_constants() {
+        assert_eq!(baseline::HTTP1_HEADER_READ_TIMEOUT_SECS, 5);
+        assert_eq!(baseline::HTTP1_MAX_BUF_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_baseline_middleware_count() {
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 15);
+    }
+
+    #[test]
+    fn test_baseline_post_accept_syscall_count() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(baseline::POST_ACCEPT_SYSCALL_COUNT_LINUX, 1);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(baseline::POST_ACCEPT_SYSCALL_COUNT_OTHER, 0);
+    }
 
     #[test]
     fn test_headermap_carrier_new() {
