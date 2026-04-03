@@ -32,6 +32,7 @@
 use hashbrown::HashMap;
 use moka::future::Cache;
 use rustfs_config::MI_B;
+use rustfs_object_io::get::GetObjectCacheWriteback;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1063,6 +1064,13 @@ pub struct CachedGetObject {
     pub replication_status: Option<String>,
     /// User-defined metadata (x-amz-meta-*)
     pub user_metadata: std::collections::HashMap<String, String>,
+    /// Additional checksum metadata persisted with cached GET responses
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
+    pub checksum_type: Option<s3s::dto::ChecksumType>,
     /// When this object was cached (for internal use, automatically set)
     #[allow(dead_code)]
     cached_at: Option<Instant>,
@@ -1089,6 +1097,12 @@ impl Default for CachedGetObject {
             tag_count: None,
             replication_status: None,
             user_metadata: std::collections::HashMap::new(),
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
+            checksum_type: None,
             cached_at: None,
             access_count: Arc::new(AtomicU64::new(0)),
         }
@@ -1103,6 +1117,35 @@ impl CachedGetObject {
         Self {
             body,
             content_length,
+            cached_at: Some(Instant::now()),
+            access_count: Arc::new(AtomicU64::new(0)),
+            ..Default::default()
+        }
+    }
+
+    /// Consume a GET cache writeback payload into the cache-owned representation.
+    pub fn from_get_object_cache_writeback(writeback: GetObjectCacheWriteback) -> Self {
+        Self {
+            body: writeback.body,
+            content_length: writeback.content_length,
+            content_type: writeback.content_type,
+            e_tag: writeback.e_tag,
+            last_modified: writeback.last_modified,
+            expires: writeback.expires,
+            cache_control: writeback.cache_control,
+            content_disposition: writeback.content_disposition,
+            content_encoding: writeback.content_encoding,
+            content_language: writeback.content_language,
+            storage_class: writeback.storage_class,
+            version_id: writeback.version_id,
+            delete_marker: writeback.delete_marker,
+            user_metadata: writeback.user_metadata,
+            checksum_crc32: writeback.checksum_crc32,
+            checksum_crc32c: writeback.checksum_crc32c,
+            checksum_sha1: writeback.checksum_sha1,
+            checksum_sha256: writeback.checksum_sha256,
+            checksum_crc64nvme: writeback.checksum_crc64nvme,
+            checksum_type: writeback.checksum_type,
             cached_at: Some(Instant::now()),
             access_count: Arc::new(AtomicU64::new(0)),
             ..Default::default()
@@ -1879,6 +1922,57 @@ mod cached_object_tests {
 
         assert_eq!(obj.user_metadata.len(), 2);
         assert_eq!(obj.user_metadata.get("x-amz-meta-custom"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_cached_get_object_from_get_object_cache_writeback() {
+        let body = Arc::new(Bytes::from("test data"));
+        let obj = CachedGetObject::from_get_object_cache_writeback(GetObjectCacheWriteback {
+            body: Arc::clone(&body),
+            content_length: 9,
+            content_type: Some("text/plain".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("max-age=3600".to_string()),
+            content_disposition: Some("attachment".to_string()),
+            content_language: Some("en-US".to_string()),
+            expires: Some("2024-12-31T23:59:59Z".to_string()),
+            storage_class: Some("STANDARD".to_string()),
+            version_id: Some("null".to_string()),
+            delete_marker: false,
+            user_metadata: {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("custom-key".to_string(), "value".to_string());
+                metadata
+            },
+            e_tag: Some("\"abc123\"".to_string()),
+            last_modified: Some("2024-01-01T12:00:00Z".to_string()),
+            checksum_crc32: Some("crc32".to_string()),
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            checksum_crc64nvme: None,
+            checksum_type: Some(s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT)),
+        });
+
+        assert_eq!(obj.content_length, 9);
+        assert_eq!(obj.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(obj.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(obj.cache_control.as_deref(), Some("max-age=3600"));
+        assert_eq!(obj.content_disposition.as_deref(), Some("attachment"));
+        assert_eq!(obj.content_language.as_deref(), Some("en-US"));
+        assert_eq!(obj.expires.as_deref(), Some("2024-12-31T23:59:59Z"));
+        assert_eq!(obj.storage_class.as_deref(), Some("STANDARD"));
+        assert_eq!(obj.version_id.as_deref(), Some("null"));
+        assert!(!obj.delete_marker);
+        assert_eq!(obj.user_metadata.get("custom-key").map(String::as_str), Some("value"));
+        assert_eq!(obj.e_tag.as_deref(), Some("\"abc123\""));
+        assert_eq!(obj.last_modified.as_deref(), Some("2024-01-01T12:00:00Z"));
+        assert_eq!(obj.checksum_crc32.as_deref(), Some("crc32"));
+        assert_eq!(
+            obj.checksum_type,
+            Some(s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT))
+        );
+        assert!(Arc::ptr_eq(&obj.body, &body));
     }
 
     #[test]

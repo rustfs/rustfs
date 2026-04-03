@@ -3186,6 +3186,8 @@ dependencies = [
  "flate2",
  "futures",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "md5",
  "rand 0.10.0",
  "rcgen",
@@ -7627,6 +7629,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-metrics",
  "rustfs-notify",
+ "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
  "rustfs-protocols",
@@ -7826,6 +7829,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "lazy_static",
+ "libc",
  "md-5 0.11.0",
  "memmap2 0.9.10",
  "metrics",
@@ -7847,6 +7851,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-filemeta",
+ "rustfs-io-core",
  "rustfs-io-metrics",
  "rustfs-lock",
  "rustfs-madmin",
@@ -7968,6 +7973,8 @@ name = "rustfs-io-core"
 version = "0.0.5"
 dependencies = [
  "bytes",
+ "futures-core",
+ "futures-util",
  "memmap2 0.9.10",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
@@ -8135,6 +8142,31 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wildmatch",
+]
+
+[[package]]
+name = "rustfs-object-io"
+version = "0.0.5"
+dependencies = [
+ "astral-tokio-tar",
+ "atoi",
+ "bytes",
+ "futures-util",
+ "http 1.4.0",
+ "rustfs-concurrency",
+ "rustfs-ecstore",
+ "rustfs-io-core",
+ "rustfs-io-metrics",
+ "rustfs-rio",
+ "rustfs-s3select-api",
+ "rustfs-utils",
+ "s3s",
+ "serial_test",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

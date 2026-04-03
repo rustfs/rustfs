@@ -15,7 +15,7 @@
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
+use crate::store_api::{GetObjectChunkResult, ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -28,10 +28,10 @@ use crate::{
     global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info,
+        ListOperations, MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -284,6 +284,19 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
+    pub async fn get_object_chunks(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectChunkResult> {
+        self.get_disks_by_key(object)
+            .get_object_chunks(bucket, object, range, h, opts)
+            .await
+    }
+
     fn get_hashed_set_index(&self, input: &str) -> usize {
         match self.distribution_algo {
             DistributionAlgoVersion::V1 => crc_hash(input, self.disk_set.len()),
@@ -352,7 +365,13 @@ impl ObjectIO for Sets {
             .await
     }
     #[tracing::instrument(level = "debug", skip(self, data))]
-    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut ChunkNativePutData,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
 }
@@ -654,7 +673,7 @@ impl MultipartOperations for Sets {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut PutObjReader,
+        data: &mut ChunkNativePutData,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         self.get_disks_by_key(object)

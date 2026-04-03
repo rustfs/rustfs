@@ -15,6 +15,9 @@
 // Default encryption block size - aligned with system default read buffer size (1MB)
 pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
 
+use std::future::Future;
+use std::pin::Pin;
+
 mod limit_reader;
 
 pub use limit_reader::LimitReader;
@@ -53,7 +56,23 @@ pub use compress_index::{Index, TryGetIndex};
 
 mod etag;
 
-pub trait Reader: tokio::io::AsyncRead + Unpin + Send + Sync + EtagResolvable + HashReaderDetector + TryGetIndex {}
+pub type BoxReadBlockFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>;
+
+pub trait BlockReadable {
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a>;
+}
+
+fn read_block_via_async_read<'a, R>(reader: &'a mut R, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'a,
+{
+    Box::pin(rustfs_utils::read_full(reader, buf))
+}
+
+pub trait Reader:
+    tokio::io::AsyncRead + Unpin + Send + Sync + EtagResolvable + HashReaderDetector + TryGetIndex + BlockReadable
+{
+}
 
 // Trait for types that can be recursively searched for etag capability
 pub trait EtagResolvable {
@@ -91,6 +110,42 @@ impl<R> Reader for crate::LimitReader<R> where R: Reader {}
 impl<R> Reader for crate::CompressReader<R> where R: Reader {}
 impl<R> Reader for crate::EncryptReader<R> where R: Reader {}
 impl<R> Reader for crate::DecryptReader<R> where R: Reader {}
+impl<R> BlockReadable for crate::WarpReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync,
+{
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        read_block_via_async_read(self, buf)
+    }
+}
+
+impl<R> BlockReadable for tokio::io::BufReader<R>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync,
+{
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        read_block_via_async_read(self, buf)
+    }
+}
+
+impl<R> BlockReadable for crate::LimitReader<R>
+where
+    R: Reader,
+{
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        read_block_via_async_read(self, buf)
+    }
+}
+
+impl<R> BlockReadable for crate::DecryptReader<R>
+where
+    R: Reader,
+{
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        read_block_via_async_read(self, buf)
+    }
+}
+
 impl EtagResolvable for Box<dyn Reader> {
     fn try_resolve_etag(&mut self) -> Option<String> {
         self.as_mut().try_resolve_etag()
@@ -110,6 +165,12 @@ impl HashReaderDetector for Box<dyn Reader> {
 impl TryGetIndex for Box<dyn Reader> {
     fn try_get_index(&self) -> Option<&compress_index::Index> {
         self.as_ref().try_get_index()
+    }
+}
+
+impl BlockReadable for Box<dyn Reader> {
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        self.as_mut().read_block(buf)
     }
 }
 
