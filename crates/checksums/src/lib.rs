@@ -349,7 +349,7 @@ mod tests {
     fn base64_encoded_checksum_to_hex_string(header_value: &HeaderValue) -> String {
         let decoded_checksum = base64::decode(header_value.to_str().unwrap()).unwrap();
         let decoded_checksum = decoded_checksum.into_iter().fold(String::new(), |mut acc, byte| {
-            write!(acc, "{byte:02X?}").expect("string will always be writeable");
+            write!(acc, "{byte:02X?}").expect("string will always be writable");
             acc
         });
 
