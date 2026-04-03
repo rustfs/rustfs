@@ -17,6 +17,7 @@ pub mod local;
 
 use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
+use futures::future::join_all;
 use std::sync::Arc;
 
 /// Lock client trait
@@ -25,8 +26,24 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Acquire lock (generic method)
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse>;
 
+    /// Acquire multiple locks. Default implementation fans out to single-lock requests.
+    async fn acquire_locks_batch(&self, requests: &[LockRequest]) -> Result<Vec<LockResponse>> {
+        Ok(join_all(requests.iter().map(|request| self.acquire_lock(request)))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?)
+    }
+
     /// Release lock
     async fn release(&self, lock_id: &LockId) -> Result<bool>;
+
+    /// Release multiple locks. Default implementation fans out to single-lock releases.
+    async fn release_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        Ok(join_all(lock_ids.iter().map(|lock_id| self.release(lock_id)))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?)
+    }
 
     /// Refresh lock
     async fn refresh(&self, lock_id: &LockId) -> Result<bool>;
