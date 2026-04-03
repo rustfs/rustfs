@@ -29,7 +29,7 @@ use rustfs_config::{
     ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT,
     RUSTFS_TLS_CERT, RUSTFS_TLS_KEY,
 };
-use rustfs_utils::get_env_bool;
+use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -224,8 +224,9 @@ async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, T
     let mut root_ca_pem = Vec::new();
 
     // 1. Optional: load leaf certs as root CAs
-    if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
-        load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut root_ca_pem).await;
+    if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA)
+        && load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut root_ca_pem).await
+    {
         info!("Loaded leaf certificate(s) as root CA as per RUSTFS_TRUST_LEAF_CERT_AS_CA");
     }
 
@@ -275,12 +276,12 @@ async fn has_server_certificates(tls_path: &str) -> bool {
 
 /// Load mTLS client identity from the TLS directory.
 async fn load_mtls_identity(tls_dir: &Path) -> Result<Option<MtlsIdentityPem>, TlsMaterialError> {
-    let client_cert_path = match std::env::var(ENV_MTLS_CLIENT_CERT).ok() {
+    let client_cert_path = match get_env_opt_str(ENV_MTLS_CLIENT_CERT) {
         Some(p) => PathBuf::from(p),
         None => tls_dir.join(RUSTFS_CLIENT_CERT_FILENAME),
     };
 
-    let client_key_path = match std::env::var(ENV_MTLS_CLIENT_KEY).ok() {
+    let client_key_path = match get_env_opt_str(ENV_MTLS_CLIENT_KEY) {
         Some(p) => PathBuf::from(p),
         None => tls_dir.join(RUSTFS_CLIENT_KEY_FILENAME),
     };
@@ -335,19 +336,21 @@ async fn load_cert_file(path: &Path, pem_data: &mut Vec<u8>, desc: &str) -> bool
 
 /// Search for and load certificate files matching `cert_name` in the directory
 /// and one level of subdirectories.
-async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<u8>) {
+/// Returns `true` if at least one matching file was loaded.
+async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<u8>) -> bool {
     let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
         debug!("Certificate directory not found: {}", dir.display());
-        return;
+        return false;
     };
 
+    let mut loaded = false;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let Ok(ft) = entry.file_type().await else { continue };
 
         if ft.is_file() {
             let fname = entry.file_name().to_string_lossy().to_string();
-            if fname == cert_name {
-                load_cert_file(&entry.path(), pem_data, "certificate").await;
+            if fname == cert_name && load_cert_file(&entry.path(), pem_data, "certificate").await {
+                loaded = true;
             }
         } else if ft.is_dir() {
             // Only check direct subdirectories (one level deep)
@@ -357,14 +360,15 @@ async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<
                         && sub_ft.is_file()
                     {
                         let fname = sub_entry.file_name().to_string_lossy().to_string();
-                        if fname == cert_name {
-                            load_cert_file(&sub_entry.path(), pem_data, "certificate").await;
+                        if fname == cert_name && load_cert_file(&sub_entry.path(), pem_data, "certificate").await {
+                            loaded = true;
                         }
                     }
                 }
             }
         }
     }
+    loaded
 }
 
 /// Errors that can occur during TLS material loading.
@@ -484,14 +488,19 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
             interval.tick().await;
 
             match TlsMaterialSnapshot::load(&tls_path).await {
-                Ok(snapshot) => match snapshot.build_tls_acceptor(&tls_path).await {
-                    Ok(Some(new_holder)) => {
-                        info!("TLS certificates reloaded successfully");
-                        holder.swap(&new_holder);
+                Ok(snapshot) => {
+                    // Always refresh outbound material (root CAs, mTLS identity) on reload.
+                    snapshot.apply_outbound().await;
+
+                    match snapshot.build_tls_acceptor(&tls_path).await {
+                        Ok(Some(new_holder)) => {
+                            info!("TLS certificates reloaded successfully");
+                            holder.swap(&new_holder);
+                        }
+                        Ok(None) => debug!("TLS reload: no server certificates found in directory, skipping"),
+                        Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
                     }
-                    Ok(None) => debug!("TLS reload: no certificates found in directory, skipping"),
-                    Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
-                },
+                }
                 Err(e) => {
                     warn!("TLS material reload failed (will retry): {}", e);
                 }

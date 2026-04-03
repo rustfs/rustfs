@@ -155,12 +155,11 @@ pub async fn start_http_server(
     };
 
     let tls_path = config.tls_path.as_deref().unwrap_or_default();
-    // Load TLS materials and build server acceptor in one shot.
-    // Outbound material (root CAs, mTLS identity) is also applied here.
+    // Load TLS materials and build server acceptor.
+    // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    tls_snapshot.apply_outbound().await;
 
     let tls_acceptor = tls_snapshot
         .build_tls_acceptor(tls_path)
@@ -918,43 +917,53 @@ mod tests {
     use http::HeaderMap;
     use opentelemetry::propagation::Extractor;
 
-    /// Baseline constants — verify these match the production values above.
-    /// If a constant here disagrees with the runtime value, the test will fail.
+    /// Baseline constants — reference the authoritative config defaults.
+    /// If a config default changes, tests automatically follow.
     mod baseline {
+        use rustfs_config::{
+            DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE, DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE, DEFAULT_H2_MAX_FRAME_SIZE,
+            DEFAULT_H2_MAX_HEADER_LIST_SIZE, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE,
+        };
+
         /// Number of middleware layers in the canonical stack order (see http.rs).
         /// Layers 1-2 are per-connection (AddExtension), 3-15 are stateless.
         pub const MIDDLEWARE_LAYER_COUNT: usize = 15;
 
-        /// Current HTTP/2 defaults (hardcoded, to be made configurable in T06).
-        pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
-        pub const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
-        pub const H2_MAX_FRAME_SIZE: u32 = 512 * 1024;
-        pub const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+        /// Current HTTP/2 defaults (from rustfs_config).
+        pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
+        pub const H2_INITIAL_CONN_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE;
+        pub const H2_MAX_FRAME_SIZE: u32 = DEFAULT_H2_MAX_FRAME_SIZE;
+        pub const H2_MAX_HEADER_LIST_SIZE: u32 = DEFAULT_H2_MAX_HEADER_LIST_SIZE;
 
-        /// Current HTTP/1.1 defaults.
-        pub const HTTP1_HEADER_READ_TIMEOUT_SECS: u64 = 5;
-        pub const HTTP1_MAX_BUF_SIZE: usize = 64 * 1024;
+        /// Current HTTP/1.1 defaults (from rustfs_config).
+        pub const HTTP1_HEADER_READ_TIMEOUT_SECS: u64 = DEFAULT_HTTP1_HEADER_READ_TIMEOUT;
+        pub const HTTP1_MAX_BUF_SIZE: usize = DEFAULT_HTTP1_MAX_BUF_SIZE;
 
         /// Post-accept socket syscalls after T03 optimization.
         /// Linux: 1 (TCP_QUICKACK only). Other platforms: 0.
-        #[allow(dead_code)]
+        #[cfg(target_os = "linux")]
         pub const POST_ACCEPT_SYSCALL_COUNT_LINUX: usize = 1;
+        #[cfg(not(target_os = "linux"))]
         pub const POST_ACCEPT_SYSCALL_COUNT_OTHER: usize = 0;
     }
 
     #[test]
     fn test_baseline_h2_constants() {
-        // These must match the hardcoded values in the accept loop
-        assert_eq!(baseline::H2_INITIAL_STREAM_WINDOW_SIZE, 4 * 1024 * 1024);
-        assert_eq!(baseline::H2_INITIAL_CONN_WINDOW_SIZE, 8 * 1024 * 1024);
-        assert_eq!(baseline::H2_MAX_FRAME_SIZE, 512 * 1024);
-        assert_eq!(baseline::H2_MAX_HEADER_LIST_SIZE, 64 * 1024);
+        use rustfs_config::{
+            DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE, DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE, DEFAULT_H2_MAX_FRAME_SIZE,
+            DEFAULT_H2_MAX_HEADER_LIST_SIZE,
+        };
+        assert_eq!(baseline::H2_INITIAL_STREAM_WINDOW_SIZE, DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE);
+        assert_eq!(baseline::H2_INITIAL_CONN_WINDOW_SIZE, DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE);
+        assert_eq!(baseline::H2_MAX_FRAME_SIZE, DEFAULT_H2_MAX_FRAME_SIZE);
+        assert_eq!(baseline::H2_MAX_HEADER_LIST_SIZE, DEFAULT_H2_MAX_HEADER_LIST_SIZE);
     }
 
     #[test]
     fn test_baseline_http1_constants() {
-        assert_eq!(baseline::HTTP1_HEADER_READ_TIMEOUT_SECS, 5);
-        assert_eq!(baseline::HTTP1_MAX_BUF_SIZE, 64 * 1024);
+        use rustfs_config::{DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE};
+        assert_eq!(baseline::HTTP1_HEADER_READ_TIMEOUT_SECS, DEFAULT_HTTP1_HEADER_READ_TIMEOUT);
+        assert_eq!(baseline::HTTP1_MAX_BUF_SIZE, DEFAULT_HTTP1_MAX_BUF_SIZE);
     }
 
     #[test]
