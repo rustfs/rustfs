@@ -67,6 +67,7 @@ use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -998,6 +999,42 @@ fn render_scope_line(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: 
     Some(format!("{} {}", format_scope(sub_system, target), pairs.join(" ")))
 }
 
+fn env_var_name_for_target(sub_system: &str, target: &str, key: &str) -> String {
+    let base = env_help_key(sub_system, key);
+    if lookup_help_subsystem(sub_system).is_some_and(|metadata| metadata.multiple_targets) && target != DEFAULT_DELIMITER {
+        format!("{base}_{}", target.to_ascii_uppercase())
+    } else {
+        base
+    }
+}
+
+fn render_env_override_lines(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: bool) -> Vec<String> {
+    let mut keys = sorted_kv_entries(kvs)
+        .into_iter()
+        .map(|entry| entry.key.as_str())
+        .collect::<Vec<_>>();
+    if !keys.contains(&COMMENT_KEY) {
+        keys.push(COMMENT_KEY);
+    }
+
+    let mut lines = Vec::new();
+    for key in keys {
+        let env_name = env_var_name_for_target(sub_system, target, key);
+        let Ok(value) = env::var(&env_name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if redact_secrets && is_sensitive_key_name(key) {
+            continue;
+        }
+        lines.push(format!("# {env_name}={value}"));
+    }
+
+    lines
+}
+
 fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, redact_secrets: bool) -> S3Result<Vec<u8>> {
     let Some(targets) = config.0.get(&selector.sub_system) else {
         return Err(s3_error!(InvalidRequest, "config subsystem '{}' not found", selector.sub_system));
@@ -1017,11 +1054,13 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
             ));
         };
 
+        lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets));
         if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
             lines.push(line);
         }
     } else {
         for (target, kvs) in sorted_targets {
+            lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets));
             if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
                 lines.push(line);
             }
@@ -1657,6 +1696,41 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
         assert!(!response.keys_help.is_empty());
         assert!(response.keys_help.iter().all(|entry| entry.type_name.is_empty()));
+    }
+
+    #[test]
+    fn render_selected_config_includes_env_override_lines() {
+        rustfs_ecstore::config::init();
+        temp_env::with_vars(
+            [
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("http://env.example")),
+                ("RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY", Some("secret-token")),
+            ],
+            || {
+                let mut config = ServerConfig::new();
+                apply_set_directives(
+                    &mut config,
+                    &parse_config_directives(r#"notify_webhook:primary endpoint="http://file.example""#, false)
+                        .expect("parse directives"),
+                );
+
+                let rendered = String::from_utf8(
+                    render_selected_config(
+                        &config,
+                        &ConfigSelector {
+                            sub_system: "notify_webhook".to_string(),
+                            target: None,
+                        },
+                        true,
+                    )
+                    .expect("render config"),
+                )
+                .expect("utf8");
+
+                assert!(rendered.contains("# RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://env.example"));
+                assert!(!rendered.contains("RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY"));
+            },
+        );
     }
 
     #[test]
