@@ -442,3 +442,16 @@ pub const ENV_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: &str = "RUSTFS_OBJECT_IO_LOAD_LOW
 
 /// Default low load threshold: 10 ms.
 pub const DEFAULT_OBJECT_IO_LOAD_LOW_THRESHOLD_MS: u64 = 10;
+
+/// Environment variable to enable Wasabi-compatible S3 version id behavior (process-wide).
+///
+/// - **`true`** (default): Wasabi-style version id minting and acceptance of
+///   `X-Wasabi-Set-Version-Id` under the product rules (when that logic is wired).
+/// - **`false`**: Legacy UUID-style minting; any non-empty `X-Wasabi-Set-Version-Id` must be rejected.
+///
+/// Invalid values are logged once and treated as unset (default **`true`**).
+///
+/// Use the same value on every node in a cluster so minting and header policy stay consistent.
+///
+/// Example: `export RUSTFS_WASABI_VERSION_IDS=false`
+pub const ENV_WASABI_VERSION_IDS: &str = "RUSTFS_WASABI_VERSION_IDS";
