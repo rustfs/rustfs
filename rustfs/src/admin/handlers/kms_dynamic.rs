@@ -42,6 +42,48 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
     })
 }
 
+fn token_is_blank(auth_method: &rustfs_kms::config::VaultAuthMethod) -> bool {
+    matches!(
+        auth_method,
+        rustfs_kms::config::VaultAuthMethod::Token { token } if token.trim().is_empty()
+    )
+}
+
+fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAuthMethod> {
+    match &config.backend_config {
+        rustfs_kms::config::BackendConfig::VaultKv2(vault) => Some(vault.auth_method.clone()),
+        rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
+        rustfs_kms::config::BackendConfig::Local(_) => None,
+    }
+}
+
+fn normalize_configure_request_auth(
+    request: &mut ConfigureKmsRequest,
+    existing_config: Option<&KmsConfig>,
+) -> Result<(), String> {
+    let needs_existing_auth = match request {
+        ConfigureKmsRequest::VaultKv2(req) => token_is_blank(&req.auth_method),
+        ConfigureKmsRequest::VaultTransit(req) => token_is_blank(&req.auth_method),
+        ConfigureKmsRequest::Local(_) => false,
+    };
+
+    if !needs_existing_auth {
+        return Ok(());
+    }
+
+    let existing_auth = existing_config
+        .and_then(existing_vault_auth)
+        .ok_or_else(|| "Vault token is required when no existing KMS credentials are available".to_string())?;
+
+    match request {
+        ConfigureKmsRequest::VaultKv2(req) => req.auth_method = existing_auth,
+        ConfigureKmsRequest::VaultTransit(req) => req.auth_method = existing_auth,
+        ConfigureKmsRequest::Local(_) => {}
+    }
+
+    Ok(())
+}
+
 /// Save KMS configuration to cluster storage
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
@@ -153,7 +195,7 @@ impl Operation for ConfigureKmsHandler {
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-        let configure_request: ConfigureKmsRequest = if body.is_empty() {
+        let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
@@ -171,6 +213,11 @@ impl Operation for ConfigureKmsHandler {
         info!("Configuring KMS with request: {:?}", configure_request);
 
         let service_manager = kms_service_manager_from_context();
+        let existing_config = service_manager.get_config().await;
+
+        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
@@ -508,7 +555,7 @@ impl Operation for ReconfigureKmsHandler {
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
-        let configure_request: ConfigureKmsRequest = if body.is_empty() {
+        let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
             return Ok(S3Response::new((
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
@@ -526,6 +573,11 @@ impl Operation for ReconfigureKmsHandler {
         info!("Reconfiguring KMS with request: {:?}", configure_request);
 
         let service_manager = kms_service_manager_from_context();
+        let existing_config = service_manager.get_config().await;
+
+        if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
 
         // Convert request to KmsConfig
         let kms_config = configure_request.to_kms_config();
