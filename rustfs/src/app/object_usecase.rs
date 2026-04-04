@@ -24,7 +24,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background};
+use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
 use crate::storage::request_context::spawn_traced;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
@@ -5106,7 +5106,11 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            tokio::spawn(async move {
+            let request_context = req
+                .extensions
+                .get::<crate::storage::request_context::RequestContext>()
+                .cloned();
+            spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });
         }

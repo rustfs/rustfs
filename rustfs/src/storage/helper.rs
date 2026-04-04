@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::storage::access::ReqInfo;
+use crate::storage::request_context::RequestContext;
 use http::StatusCode;
 use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
@@ -28,6 +29,7 @@ use rustfs_utils::{
 use s3s::{S3Request, S3Response, S3Result};
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
+use tracing::{Instrument, info_span};
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
@@ -46,12 +48,30 @@ where
     }
 }
 
+/// Spawn a background task with request context correlation.
+/// Creates a child span with the request_id for tracing continuity,
+/// ensuring audit/notify tasks can be traced back to the original request.
+pub(crate) fn spawn_background_with_context<F>(request_context: Option<RequestContext>, fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match request_context {
+        Some(ctx) => {
+            let request_id = ctx.request_id.clone();
+            let span = info_span!("background-task", request_id = %request_id);
+            spawn_background(Instrument::instrument(fut, span));
+        }
+        None => spawn_background(fut),
+    }
+}
+
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
 pub struct OperationHelper {
     audit_builder: Option<AuditEntryBuilder>,
     api_builder: ApiDetailsBuilder,
     event_builder: Option<EventArgsBuilder>,
     start_time: std::time::Instant,
+    request_context: Option<RequestContext>,
 }
 
 impl OperationHelper {
@@ -108,6 +128,27 @@ impl OperationHelper {
             audit_builder = audit_builder.request_id(id_str);
         }
 
+        // Use RequestContext (canonical source) for request_id if available
+        let request_id = req
+            .extensions
+            .get::<RequestContext>()
+            .map(|ctx| ctx.request_id.clone())
+            .or_else(|| {
+                req.headers
+                    .get("x-amz-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            })
+            .or_else(|| {
+                req.headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        // Override the audit builder's request_id with the canonical source
+        audit_builder = audit_builder.request_id(&request_id);
+
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
             name: object_key.clone(),
@@ -137,11 +178,14 @@ impl OperationHelper {
             event_builder = event_builder.version_id(version_id);
         }
 
+        let request_context = req.extensions.get::<RequestContext>().cloned();
+
         Self {
             audit_builder: Some(audit_builder),
             api_builder,
             event_builder: Some(event_builder),
             start_time: std::time::Instant::now(),
+            request_context,
         }
     }
 
@@ -234,7 +278,8 @@ impl Drop for OperationHelper {
     fn drop(&mut self) {
         // Distribute audit logs
         if let Some(builder) = self.audit_builder.take() {
-            spawn_background(async move {
+            let ctx = self.request_context.clone();
+            spawn_background_with_context(ctx, async move {
                 AuditLogger::log(builder.build()).await;
             });
         }
@@ -246,7 +291,8 @@ impl Drop for OperationHelper {
             let event_args = builder.build();
             // Avoid generating notifications for copy requests
             if !event_args.is_replication_request() {
-                spawn_background(async move {
+                let ctx = self.request_context.clone();
+                spawn_background_with_context(ctx, async move {
                     notifier_global::notify(event_args).await;
                 });
             }
