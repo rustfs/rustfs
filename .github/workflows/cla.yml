@@ -18,7 +18,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
   issue_comment:
-    types: [created]
+    types: [created, edited]
 
 permissions:
   contents: write
@@ -42,7 +42,7 @@ jobs:
           permission-contents: write
 
       - name: Run CLA Bot
-        uses: overtrue/cla-bot@v0.0.6
+        uses: overtrue/cla-bot@v0.0.9
         with:
           github-token: ${{ github.token }}
           registry-token: ${{ steps.registry-token.outputs.token }}

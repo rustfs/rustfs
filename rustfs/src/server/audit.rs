@@ -14,11 +14,25 @@
 
 use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
-use rustfs_config::DEFAULT_DELIMITER;
 use tracing::{info, warn};
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
+    for subsystem in [
+        rustfs_config::audit::AUDIT_MQTT_SUB_SYS,
+        rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
+    ] {
+        let Some(targets) = config.0.get(subsystem) else {
+            continue;
+        };
+        if targets.keys().any(|key| key != rustfs_config::DEFAULT_DELIMITER) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Start the audit system.
@@ -55,10 +69,8 @@ pub async fn start_audit_system() -> AuditResult<()> {
         "The global server configuration is loaded"
     );
     // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    let mqtt_config = server_config.get_value(rustfs_config::audit::AUDIT_MQTT_SUB_SYS, DEFAULT_DELIMITER);
-    let webhook_config = server_config.get_value(rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER);
-
-    if mqtt_config.is_none() && webhook_config.is_none() {
+    let has_targets = has_any_audit_targets(&server_config);
+    if !has_targets {
         info!(
             target: "rustfs::main::start_audit_system",
             "Audit subsystem (MQTT/Webhook) is not configured, and audit system initialization is skipped."
@@ -68,9 +80,7 @@ pub async fn start_audit_system() -> AuditResult<()> {
 
     info!(
         target: "rustfs::main::start_audit_system",
-        "Audit subsystem configuration detected (MQTT: {}, Webhook: {}) and started initializing the audit system.",
-        mqtt_config.is_some(),
-        webhook_config.is_some()
+        "Audit subsystem configuration detected and started initializing the audit system."
     );
     // 3. Initialize and start the audit system
     let system = init_audit_system();

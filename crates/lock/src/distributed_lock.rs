@@ -18,6 +18,7 @@ use crate::{
     error::{LockError, Result},
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
+use futures::future::join_all;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,12 +53,13 @@ static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             // Best-effort release across all (LockId, client) entries.
-            let mut any_ok = false;
-            for (lock_id, client) in job.entries.into_iter() {
-                if client.release(&lock_id).await.unwrap_or(false) {
-                    any_ok = true;
-                }
-            }
+            let results = join_all(
+                job.entries
+                    .into_iter()
+                    .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) }),
+            )
+            .await;
+            let any_ok = results.into_iter().any(|released| released);
 
             if !any_ok {
                 tracing::warn!("DistributedLockGuard background release failed for one or more entries");
@@ -142,7 +144,7 @@ impl DistributedLockGuard {
                 let futures_iter = entries
                     .into_iter()
                     .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) });
-                let _ = futures::future::join_all(futures_iter).await;
+                let _ = join_all(futures_iter).await;
             });
             // Explicitly drop the JoinHandle to acknowledge detaching the task.
             drop(handle);
@@ -411,8 +413,13 @@ impl DistributedLock {
         } else {
             // Rollback: release all locks that were successfully acquired
             let rollback_count = individual_locks.len();
-            for (individual_lock_id, client) in &individual_locks {
-                if let Err(e) = client.release(individual_lock_id).await {
+            let rollback_results = join_all(individual_locks.iter().map(|(individual_lock_id, client)| async move {
+                (individual_lock_id, client.release(individual_lock_id).await)
+            }))
+            .await;
+
+            for (individual_lock_id, result) in rollback_results {
+                if let Err(e) = result {
                     tracing::warn!("Failed to rollback lock {} on client: {}", individual_lock_id, e);
                 }
             }

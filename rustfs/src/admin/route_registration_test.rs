@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts, system,
-        tier, user,
+        audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts,
+        system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -50,6 +50,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tier::register_tier_route(router).expect("register tier route");
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    audit::register_audit_target_route(router).expect("register audit target route");
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
@@ -60,7 +61,6 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
 #[test]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
-
     register_admin_routes(&mut router);
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
@@ -91,6 +91,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/idp/builtin/policy/detach"));
     assert_route(&router, Method::GET, &admin_path("/v3/idp/builtin/policy-entities"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
@@ -165,7 +168,6 @@ fn test_register_routes_cover_representative_admin_paths() {
 #[test]
 fn test_admin_alias_paths_match_existing_admin_routes() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
-
     register_admin_routes(&mut router);
 
     for (method, path) in [

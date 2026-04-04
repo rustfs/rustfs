@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod audit;
-mod cert;
 mod compress;
 pub mod cors;
 mod event;
@@ -24,14 +23,14 @@ mod prefix;
 mod readiness;
 mod runtime;
 mod service_state;
+pub mod tls_material;
 
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
 pub use audit::{start_audit_system, stop_audit_system};
-pub use cert::init_cert;
 pub use event::{init_event_notifier, shutdown_event_notifier};
 pub use http::start_http_server;
 pub use prefix::LOGO;
-pub use runtime::tokio_runtime_builder;
+pub use runtime::build_tokio_runtime;
 pub use service_state::SHUTDOWN_TIMEOUT;
 pub use service_state::ServiceState;
 pub use service_state::ServiceStateManager;
@@ -44,7 +43,6 @@ pub(crate) use prefix::{
     PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TONIC_PREFIX,
 };
 pub(crate) use readiness::ReadinessGateLayer;
-pub use runtime::build_tokio_runtime;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);

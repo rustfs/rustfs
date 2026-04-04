@@ -84,3 +84,69 @@ pub const ENV_SERVER_MTLS_ENABLE: &str = "RUSTFS_SERVER_MTLS_ENABLE";
 /// By default, RustFS server mTLS is disabled.
 /// To change this behavior, set the environment variable RUSTFS_SERVER_MTLS_ENABLE=1
 pub const DEFAULT_SERVER_MTLS_ENABLE: bool = false;
+
+// ── HTTP Transport Tuning Parameters ──
+
+/// Environment variable for HTTP/2 initial stream window size (bytes)
+/// Default: 4194304 (4 MB)
+pub const ENV_H2_INITIAL_STREAM_WINDOW_SIZE: &str = "RUSTFS_H2_INITIAL_STREAM_WINDOW_SIZE";
+pub const DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 4 * 1024 * 1024; // 4 MB
+
+/// Environment variable for HTTP/2 initial connection window size (bytes)
+/// Default: 8388608 (8 MB)
+pub const ENV_H2_INITIAL_CONN_WINDOW_SIZE: &str = "RUSTFS_H2_INITIAL_CONN_WINDOW_SIZE";
+pub const DEFAULT_H2_INITIAL_CONN_WINDOW_SIZE: u32 = 8 * 1024 * 1024; // 8 MB
+
+/// Environment variable for HTTP/2 max frame size (bytes)
+/// Range: 16384 (16 KB) to 16777216 (16 MB) per RFC 7540
+/// Default: 524288 (512 KB)
+pub const ENV_H2_MAX_FRAME_SIZE: &str = "RUSTFS_H2_MAX_FRAME_SIZE";
+pub const DEFAULT_H2_MAX_FRAME_SIZE: u32 = 512 * 1024; // 512 KB
+
+/// Environment variable for HTTP/2 max header list size (bytes)
+/// Default: 65536 (64 KB)
+pub const ENV_H2_MAX_HEADER_LIST_SIZE: &str = "RUSTFS_H2_MAX_HEADER_LIST_SIZE";
+pub const DEFAULT_H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024; // 64 KB
+
+/// Environment variable for HTTP/2 max concurrent streams
+/// Default: 2048
+pub const ENV_H2_MAX_CONCURRENT_STREAMS: &str = "RUSTFS_H2_MAX_CONCURRENT_STREAMS";
+pub const DEFAULT_H2_MAX_CONCURRENT_STREAMS: u32 = 2048;
+
+/// Environment variable for HTTP/2 keep-alive interval (seconds)
+/// Default: 20
+pub const ENV_H2_KEEP_ALIVE_INTERVAL: &str = "RUSTFS_H2_KEEP_ALIVE_INTERVAL";
+pub const DEFAULT_H2_KEEP_ALIVE_INTERVAL: u64 = 20;
+
+/// Environment variable for HTTP/2 keep-alive timeout (seconds)
+/// Default: 10
+pub const ENV_H2_KEEP_ALIVE_TIMEOUT: &str = "RUSTFS_H2_KEEP_ALIVE_TIMEOUT";
+pub const DEFAULT_H2_KEEP_ALIVE_TIMEOUT: u64 = 10;
+
+/// Environment variable for HTTP/1.1 header read timeout (seconds)
+/// Default: 5
+pub const ENV_HTTP1_HEADER_READ_TIMEOUT: &str = "RUSTFS_HTTP1_HEADER_READ_TIMEOUT";
+pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 5;
+
+/// Environment variable for HTTP/1.1 max buffer size (bytes)
+/// Default: 65536 (64 KB)
+pub const ENV_HTTP1_MAX_BUF_SIZE: &str = "RUSTFS_HTTP1_MAX_BUF_SIZE";
+pub const DEFAULT_HTTP1_MAX_BUF_SIZE: usize = 64 * 1024; // 64 KB
+
+// ── TLS Hot Reload Parameters ──
+
+/// Environment variable to enable TLS certificate hot reload
+/// Default: false
+/// To enable, set the environment variable RUSTFS_TLS_RELOAD_ENABLE=1
+pub const ENV_TLS_RELOAD_ENABLE: &str = "RUSTFS_TLS_RELOAD_ENABLE";
+
+/// Default value for TLS certificate hot reload
+/// By default, RustFS does not reload TLS certificates automatically.
+pub const DEFAULT_TLS_RELOAD_ENABLE: bool = false;
+
+/// Environment variable for TLS certificate reload interval (seconds)
+/// Default: 30 seconds. Minimum: 5 seconds.
+pub const ENV_TLS_RELOAD_INTERVAL: &str = "RUSTFS_TLS_RELOAD_INTERVAL";
+
+/// Default interval for TLS certificate reload check
+pub const DEFAULT_TLS_RELOAD_INTERVAL: u64 = 30;

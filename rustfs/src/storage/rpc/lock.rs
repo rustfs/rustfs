@@ -14,6 +14,22 @@
 
 use super::*;
 
+fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLockResult {
+    GenerallyLockResult {
+        success: response.success,
+        error_info: response.error,
+        lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+    }
+}
+
+fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
+    GenerallyLockResult {
+        success: false,
+        error_info: Some(error.into()),
+        lock_info: None,
+    }
+}
+
 impl NodeService {
     pub(super) async fn handle_refresh(
         &self,
@@ -143,5 +159,93 @@ impl NodeService {
                 lock_info: None,
             })),
         }
+    }
+
+    pub(super) async fn handle_lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut valid_requests = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    valid_requests.push(args);
+                    valid_indices.push(idx);
+                }
+                Err(err) => {
+                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                }
+            }
+        }
+
+        if !valid_requests.is_empty() {
+            let lock_client = self.get_lock_client()?;
+            match lock_client.acquire_locks_batch(&valid_requests).await {
+                Ok(batch_results) => {
+                    for (result_idx, response) in batch_results.into_iter().enumerate() {
+                        if let Some(request_idx) = valid_indices.get(result_idx) {
+                            results[*request_idx] = lock_result_from_response(response);
+                        }
+                    }
+                }
+                Err(err) => {
+                    for request_idx in valid_indices {
+                        results[request_idx] = lock_result_from_error(format!("can not batch lock, err: {err}"));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
+
+    pub(super) async fn handle_un_lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    lock_ids.push(args.lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => {
+                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                }
+            }
+        }
+
+        if !lock_ids.is_empty() {
+            let lock_client = self.get_lock_client()?;
+            match lock_client.release_locks_batch(&lock_ids).await {
+                Ok(batch_results) => {
+                    for (result_idx, success) in batch_results.into_iter().enumerate() {
+                        if let Some(request_idx) = valid_indices.get(result_idx) {
+                            results[*request_idx] = GenerallyLockResult {
+                                success,
+                                error_info: None,
+                                lock_info: None,
+                            };
+                        }
+                    }
+                }
+                Err(err) => {
+                    for request_idx in valid_indices {
+                        results[request_idx] = lock_result_from_error(format!("can not batch unlock, err: {err}"));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
     }
 }
