@@ -637,7 +637,7 @@ mod tests {
     use matchit::Router;
     use rustfs_ecstore::config::{KV, KVS};
     use std::collections::{HashMap, HashSet};
-    use temp_env::{with_var, with_vars};
+    use temp_env::{with_var, with_vars, with_vars_unset};
 
     fn enabled_kvs(value: &str) -> KVS {
         KVS(vec![KV {
@@ -645,6 +645,31 @@ mod tests {
             value: value.to_string(),
             hidden_if_empty: false,
         }])
+    }
+
+    fn with_audit_webhook_target_env_cleared<F>(target_name: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        let target_name = target_name.to_ascii_uppercase();
+        let mut env_keys = vec![format!(
+            "{ENV_PREFIX}{}{DEFAULT_DELIMITER}{}{DEFAULT_DELIMITER}{target_name}",
+            AUDIT_WEBHOOK_SUB_SYS.to_ascii_uppercase(),
+            ENABLE_KEY.to_ascii_uppercase(),
+        )];
+
+        for key in AUDIT_WEBHOOK_KEYS {
+            let env_key = format!(
+                "{ENV_PREFIX}{}{DEFAULT_DELIMITER}{}{DEFAULT_DELIMITER}{target_name}",
+                AUDIT_WEBHOOK_SUB_SYS.to_ascii_uppercase(),
+                key.to_ascii_uppercase(),
+            );
+            if !env_keys.contains(&env_key) {
+                env_keys.push(env_key);
+            }
+        }
+
+        with_vars_unset(env_keys, f);
     }
 
     #[test]
@@ -860,7 +885,7 @@ mod tests {
 
     #[test]
     fn audit_target_mutation_block_reason_allows_runtime_only_target() {
-        with_var("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", None::<&str>, || {
+        with_audit_webhook_target_env_cleared("primary", || {
             let config = Config(HashMap::new());
             assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary").is_none());
         });
