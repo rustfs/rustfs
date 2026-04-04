@@ -21,11 +21,11 @@ use crate::storage::access::has_bypass_governance_header;
 use crate::storage::concurrency::get_concurrency_manager;
 use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
-use crate::storage::request_context::spawn_traced;
 use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
 use bytes::Bytes;

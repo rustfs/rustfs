@@ -21,7 +21,10 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
-    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer},
+    layer::{
+        AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
+        RequestContextLayer,
+    },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
 use crate::storage;
@@ -693,8 +696,7 @@ fn process_connection(
                         if let Some(cl) = request.headers().get("content-length")
                             && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                         {
-                            counter!("rustfs.request.body.bytes_total", "direction" => "request")
-                                .increment(len);
+                            counter!("rustfs.request.body.bytes_total", "direction" => "request").increment(len);
                         }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
@@ -705,8 +707,7 @@ fn process_connection(
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         // Always track aggregate body bytes (lightweight counter, no debug logging)
-                        counter!("rustfs.request.body.bytes_total", "direction" => "response")
-                            .increment(chunk.len() as u64);
+                        counter!("rustfs.request.body.bytes_total", "direction" => "response").increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();

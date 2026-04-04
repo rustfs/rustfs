@@ -25,11 +25,11 @@ use crate::storage::concurrency::{
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
-use crate::storage::request_context::spawn_traced;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};

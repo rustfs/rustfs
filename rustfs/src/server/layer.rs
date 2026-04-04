@@ -26,6 +26,7 @@ use hyper::body::Incoming;
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::get_env_opt_str;
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -99,9 +100,7 @@ where
         let request_id = extract_request_id_from_headers(req.headers());
 
         // Extract OpenTelemetry trace/span context from incoming headers
-        let parent_cx = global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderMapCarrier(req.headers()))
-        });
+        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
         let span_ref = parent_cx.span();
         let span_context = span_ref.span_context();
         let trace_id = if span_context.is_valid() {
@@ -115,9 +114,18 @@ where
             None
         };
 
+        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
+        // otherwise fall back to the canonical request_id.
+        let x_amz_request_id = req
+            .headers()
+            .get(AMZ_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| request_id.clone());
+
         let ctx = RequestContext {
             request_id: request_id.clone(),
-            x_amz_request_id: request_id.clone(),
+            x_amz_request_id,
             trace_id,
             span_id,
             start_time: Instant::now(),
@@ -126,10 +134,11 @@ where
         req.extensions_mut().insert(ctx);
 
         // Set x-amz-request-id for S3 compatibility downstream
-        if !req.headers().contains_key("x-amz-request-id") {
-            if let Ok(val) = HeaderValue::from_str(&request_id) {
-                req.headers_mut().insert(http::header::HeaderName::from_static("x-amz-request-id"), val);
-            }
+        if !req.headers().contains_key(AMZ_REQUEST_ID)
+            && let Ok(val) = HeaderValue::from_str(&request_id)
+        {
+            req.headers_mut()
+                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
         }
 
         self.inner.call(req)

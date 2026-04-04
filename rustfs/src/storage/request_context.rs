@@ -56,6 +56,7 @@
 //! - NEVER use bare `tokio::spawn` in request-handling code paths
 
 use http::HeaderMap;
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::time::Instant;
 
 /// Canonical request context carried through the entire request lifecycle.
@@ -65,7 +66,8 @@ use std::time::Instant;
 pub struct RequestContext {
     /// Canonical request ID (from `x-request-id` header, set by `SetRequestIdLayer`).
     pub request_id: String,
-    /// S3-compatible request ID alias (always equal to `request_id`).
+    /// S3-compatible request ID alias (preserves upstream `x-amz-request-id` if present,
+    /// otherwise equals `request_id`).
     pub x_amz_request_id: String,
     /// OpenTelemetry trace ID (if present from upstream propagation).
     pub trace_id: Option<String>,
@@ -101,7 +103,7 @@ pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .or_else(|| headers.get("x-amz-request-id").and_then(|v| v.to_str().ok()).map(String::from))
+        .or_else(|| headers.get(AMZ_REQUEST_ID).and_then(|v| v.to_str().ok()).map(String::from))
         .unwrap_or_else(|| "unknown".to_string())
 }
 

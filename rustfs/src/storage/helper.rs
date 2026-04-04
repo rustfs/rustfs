@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::access::ReqInfo;
-use crate::storage::request_context::RequestContext;
+use crate::storage::access::{ReqInfo, request_context_from_req};
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use hashbrown::HashMap;
 use http::StatusCode;
 use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
@@ -25,8 +26,10 @@ use rustfs_s3_common::record_s3_op;
 use rustfs_s3_common::{EventName, S3Operation};
 use rustfs_utils::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
+    http::headers::AMZ_REQUEST_ID,
 };
 use s3s::{S3Request, S3Response, S3Result};
+use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span};
@@ -115,39 +118,21 @@ impl OperationHelper {
             api_builder = api_builder.object(&object_key);
         }
         // Audit builder
-        let mut audit_builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
+        // Resolve canonical request context and request_id in a single pass:
+        //   RequestContext.request_id > extract_request_id_from_headers() > "unknown"
+        let request_context = request_context_from_req(req);
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| extract_request_id_from_headers(&req.headers));
+
+        let audit_builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
             .remote_host(remote_host)
             .user_agent(get_request_user_agent(&req.headers))
             .req_host(get_request_host(&req.headers))
             .req_path(req.uri.path().to_string())
-            .req_query(extract_req_params(req));
-
-        if let Some(req_id) = req.headers.get("x-amz-request-id")
-            && let Ok(id_str) = req_id.to_str()
-        {
-            audit_builder = audit_builder.request_id(id_str);
-        }
-
-        // Use RequestContext (canonical source) for request_id if available
-        let request_id = req
-            .extensions
-            .get::<RequestContext>()
-            .map(|ctx| ctx.request_id.clone())
-            .or_else(|| {
-                req.headers
-                    .get("x-amz-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-            })
-            .or_else(|| {
-                req.headers
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        // Override the audit builder's request_id with the canonical source
-        audit_builder = audit_builder.request_id(&request_id);
+            .req_query(extract_req_params(req))
+            .request_id(&request_id);
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -156,6 +141,12 @@ impl OperationHelper {
         };
 
         let mut req_params = extract_params_header(&req.headers);
+        // Inject x-amz-request-id from RequestContext into req_params for event correlation
+        if let Some(ref ctx) = request_context {
+            req_params
+                .entry(AMZ_REQUEST_ID.to_string())
+                .or_insert_with(|| ctx.x_amz_request_id.clone());
+        }
         if let Some(principal_id) = req_info
             .and_then(|info| info.cred.as_ref())
             .map(|cred| cred.access_key.clone())
@@ -178,13 +169,14 @@ impl OperationHelper {
             event_builder = event_builder.version_id(version_id);
         }
 
-        let request_context = req.extensions.get::<RequestContext>().cloned();
-
         Self {
             audit_builder: Some(audit_builder),
             api_builder,
             event_builder: Some(event_builder),
-            start_time: std::time::Instant::now(),
+            start_time: request_context
+                .as_ref()
+                .map(|ctx| ctx.start_time)
+                .unwrap_or_else(std::time::Instant::now),
             request_context,
         }
     }
@@ -253,6 +245,20 @@ impl OperationHelper {
 
             if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
                 final_builder = final_builder.access_key(&sk);
+            }
+
+            // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
+            if let Some(ref ctx) = self.request_context
+                && (ctx.trace_id.is_some() || ctx.span_id.is_some())
+            {
+                let mut tags = HashMap::new();
+                if let Some(ref tid) = ctx.trace_id {
+                    tags.insert("traceId".to_string(), Value::String(tid.clone()));
+                }
+                if let Some(ref sid) = ctx.span_id {
+                    tags.insert("spanId".to_string(), Value::String(sid.clone()));
+                }
+                final_builder = final_builder.tags(tags);
             }
 
             self.audit_builder = Some(final_builder);
@@ -395,7 +401,8 @@ mod tests {
         let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
         req.headers.insert("host", HeaderValue::from_static("example.com"));
         req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
-        req.headers.insert("x-amz-request-id", HeaderValue::from_static("amz-header-uuid"));
+        req.headers
+            .insert("x-amz-request-id", HeaderValue::from_static("amz-header-uuid"));
 
         // No RequestContext inserted
         req.extensions.insert(ReqInfo {
