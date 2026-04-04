@@ -634,6 +634,7 @@ impl Operation for RemoveAuditTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matchit::Router;
     use rustfs_ecstore::config::{KV, KVS};
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
@@ -783,6 +784,47 @@ mod tests {
     }
 
     #[test]
+    fn collect_validated_key_values_rejects_unsupported_key() {
+        let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
+        let key_values = vec![KeyValue {
+            key: "queue_dir".to_string(),
+            value: "/tmp/rustfs-audit".to_string(),
+        }];
+
+        let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
+        assert!(err.to_string().contains("not allowed for audit target type"));
+    }
+
+    #[test]
+    fn extract_target_params_rejects_missing_or_unsupported_values() {
+        let mut root_router = Router::new();
+        root_router.insert("/", ()).expect("route should insert");
+        let missing_type_params = root_router.at("/").expect("route should match");
+        let missing_type = extract_target_params(&missing_type_params.params).unwrap_err();
+        assert!(missing_type.to_string().contains("missing required parameter: 'target_type'"));
+
+        let mut full_router = Router::new();
+        full_router
+            .insert("/v3/audit/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+        let unsupported_type_params = full_router
+            .at("/v3/audit/target/audit_kafka/primary")
+            .expect("route should match");
+        let unsupported_type = extract_target_params(&unsupported_type_params.params).unwrap_err();
+        assert!(unsupported_type.to_string().contains("unsupported audit target type"));
+
+        let mut partial_router = Router::new();
+        partial_router
+            .insert("/v3/audit/target/{target_type}", ())
+            .expect("route should insert");
+        let missing_name_params = partial_router
+            .at("/v3/audit/target/audit_webhook")
+            .expect("route should match");
+        let missing_name = extract_target_params(&missing_name_params.params).unwrap_err();
+        assert!(missing_name.to_string().contains("missing required parameter: 'target_name'"));
+    }
+
+    #[test]
     fn merge_audit_endpoints_marks_mixed_with_case_insensitive_instance_id() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),
@@ -814,5 +856,13 @@ mod tests {
         )]));
 
         assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+    }
+
+    #[test]
+    fn audit_target_mutation_block_reason_allows_runtime_only_target() {
+        with_var("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", None::<&str>, || {
+            let config = Config(HashMap::new());
+            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary").is_none());
+        });
     }
 }
