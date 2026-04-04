@@ -1442,6 +1442,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         object: None,
         version_id: None,
         region: get_global_region(),
+        ..Default::default()
     });
 
     license_check().map_err(|er| match er.kind() {
@@ -2163,6 +2164,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         object,
         version_id: None,
         region: get_global_region(),
+        ..Default::default()
     });
 
     license_check().map_err(|er| match er.kind() {

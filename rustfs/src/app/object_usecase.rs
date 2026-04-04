@@ -24,11 +24,12 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background};
+use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
@@ -928,7 +929,7 @@ impl DefaultObjectUsecase {
 
     fn spawn_cache_invalidation(bucket: String, key: String, version_id: Option<String>) {
         let manager = get_concurrency_manager();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager.invalidate_cache_versioned(&bucket, &key, version_id.as_deref()).await;
         });
     }
@@ -1015,9 +1016,9 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
+    fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
         let timeout_config = TimeoutConfig::from_env();
-        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
+        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
@@ -1535,7 +1536,7 @@ impl DefaultObjectUsecase {
                 .with_last_modified(last_modified_str.unwrap_or_default());
 
             let cache_key_clone = cache_key.to_string();
-            tokio::spawn(async move {
+            spawn_traced(async move {
                 let manager = get_concurrency_manager();
                 manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
                 debug!("Object cached successfully with metadata: {}", cache_key_clone);
@@ -2369,7 +2370,7 @@ impl DefaultObjectUsecase {
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
@@ -2599,7 +2600,12 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key)?;
+        let request_id = req
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
@@ -3711,7 +3717,7 @@ impl DefaultObjectUsecase {
         let manager = get_concurrency_manager();
         let bucket_clone = bucket.clone();
         let deleted_objects = dobjs.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             for dobj in deleted_objects {
                 manager
                     .invalidate_cache_versioned(
@@ -4114,7 +4120,7 @@ impl DefaultObjectUsecase {
         let version_id_clone = version_id.clone();
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
@@ -4626,7 +4632,7 @@ impl DefaultObjectUsecase {
         let rreq_clone = rreq.clone();
         let version_id_clone = version_id.clone();
 
-        tokio::spawn(async move {
+        spawn_traced(async move {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
@@ -4647,8 +4653,6 @@ impl DefaultObjectUsecase {
                     object_clone,
                     err.to_string()
                 );
-                // Note: Errors from background tasks cannot be returned to client
-                // Consider adding to monitoring/metrics system
             } else {
                 info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
             }
@@ -4721,7 +4725,7 @@ impl DefaultObjectUsecase {
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
         let stream = ReceiverStream::new(rx);
-        tokio::spawn(async move {
+        spawn_traced(async move {
             let _ = tx
                 .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
                 .await;
@@ -5078,7 +5082,7 @@ impl DefaultObjectUsecase {
             let manager = get_concurrency_manager();
             let fpath_clone = fpath.clone();
             let bucket_clone = bucket.clone();
-            tokio::spawn(async move {
+            spawn_traced(async move {
                 manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
             });
 
@@ -5102,7 +5106,11 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            tokio::spawn(async move {
+            let request_context = req
+                .extensions
+                .get::<crate::storage::request_context::RequestContext>()
+                .cloned();
+            spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });
         }
