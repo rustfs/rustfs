@@ -810,9 +810,9 @@ mod tests {
 
     #[test]
     fn collect_validated_key_values_rejects_unsupported_key() {
-        let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
+        let allowed_keys: HashSet<&str> = AUDIT_WEBHOOK_KEYS.iter().copied().collect();
         let key_values = vec![KeyValue {
-            key: "queue_dir".to_string(),
+            key: "not_a_real_key".to_string(),
             value: "/tmp/rustfs-audit".to_string(),
         }];
 
