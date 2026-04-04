@@ -21,8 +21,8 @@
 use crate::oidc_state::{OidcAuthSession, OidcStateStore};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
 use openidconnect::{
-    AsyncHttpClient, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
@@ -157,6 +157,7 @@ pub struct OidcProviderConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    pub other_audiences: Vec<String>,
     pub redirect_uri: Option<String>,
     pub redirect_uri_dynamic: bool,
     pub claim_name: String,
@@ -233,6 +234,15 @@ pub struct OidcSys {
     provider_states: RwLock<HashMap<String, ProviderState>>,
     state_store: OidcStateStore,
     http_client: ReqwestHttpClient,
+}
+
+fn trusted_aud(other_audiences: &[String], audience: &Audience) -> bool {
+    for aud in other_audiences {
+        if audience.as_str() == aud.as_str() {
+            return true;
+        }
+    }
+    false
 }
 
 impl OidcSys {
@@ -394,7 +404,9 @@ impl OidcSys {
             .id_token()
             .ok_or_else(|| "no id_token in token response".to_string())?;
 
-        let verifier = client.id_token_verifier();
+        let verifier = client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         let verified = id_token.claims(&verifier, &Nonce::new(session.nonce.clone()));
         if let Err(e) = verified {
             let refreshed_state = self
@@ -416,7 +428,9 @@ impl OidcSys {
             )
             .set_auth_type(AuthType::RequestBody);
 
-            let verifier = client.id_token_verifier();
+            let verifier = client
+                .id_token_verifier()
+                .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, &Nonce::new(session.nonce.clone()))
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
@@ -529,7 +543,9 @@ impl OidcSys {
 
         // Verify the token (signature, issuer, audience, expiry) — skip nonce
         // (nonce is only required for the authorization code flow)
-        let verifier = client.id_token_verifier();
+        let verifier = client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         if let Err(e) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
             state = self
                 .refresh_provider_state(&provider_id, &config)
@@ -544,7 +560,9 @@ impl OidcSys {
                 config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
             )
             .set_auth_type(AuthType::RequestBody);
-            let verifier = client.id_token_verifier();
+            let verifier = client
+                .id_token_verifier()
+                .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, |_: Option<&Nonce>| Ok(()))
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
@@ -742,6 +760,9 @@ impl OidcSys {
             scopes_str.split(',').map(|s| s.trim().to_string()).collect()
         };
 
+        let other_audiences_str = get_env(ENV_IDENTITY_OPENID_OTHER_AUDIENCES);
+        let other_audiences = other_audiences_str.split(',').map(|s| s.trim().to_string()).collect();
+
         let redirect_uri_dynamic_str = get_env(ENV_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC);
         let redirect_uri_dynamic = redirect_uri_dynamic_str.is_empty()
             || redirect_uri_dynamic_str
@@ -802,6 +823,7 @@ impl OidcSys {
             client_id: get_env(ENV_IDENTITY_OPENID_CLIENT_ID),
             client_secret,
             scopes,
+            other_audiences,
             redirect_uri,
             redirect_uri_dynamic,
             claim_name,
@@ -834,6 +856,9 @@ impl OidcSys {
         } else {
             scopes_str.split(',').map(|s| s.trim().to_string()).collect()
         };
+
+        let other_audiences_str = kvs.get(OIDC_OTHER_AUDIENCES);
+        let other_audiences = other_audiences_str.split(',').map(|s| s.trim().to_string()).collect();
 
         let redirect_uri_dynamic = kvs
             .lookup(OIDC_REDIRECT_URI_DYNAMIC)
@@ -868,6 +893,7 @@ impl OidcSys {
             client_id: kvs.get(OIDC_CLIENT_ID),
             client_secret,
             scopes,
+            other_audiences,
             redirect_uri,
             redirect_uri_dynamic,
             claim_name,
@@ -1352,6 +1378,7 @@ mod tests {
             client_id: "rustfs-oidc-test".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: false,
             claim_name: "sub".to_string(),
@@ -1717,6 +1744,7 @@ mod tests {
             client_id: "client-id".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: true,
             claim_name: "groups".to_string(),
@@ -1811,6 +1839,7 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: Some("secret".to_string()),
             scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: true,
             claim_name: "groups".to_string(),
