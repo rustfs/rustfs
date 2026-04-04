@@ -44,6 +44,8 @@ tracing = { workspace = true, features = ["std", "attributes"] }
 url = { workspace = true }
 rumqttc = { workspace = true }
 
+[dev-dependencies]
+temp-env = { workspace = true }
 
 [lints]
 workspace = true
