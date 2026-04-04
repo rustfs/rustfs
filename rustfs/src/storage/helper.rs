@@ -351,4 +351,62 @@ mod tests {
         assert_eq!(event_args.version_id, "version-123");
         assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
     }
+
+    #[test]
+    fn operation_helper_prioritizes_request_context_for_request_id() {
+        let input = DeleteObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
+        req.headers.insert("host", HeaderValue::from_static("example.com"));
+        req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+
+        // Insert RequestContext (set by ingress layer) with a specific request_id
+        req.extensions.insert(RequestContext {
+            request_id: "ingress-canonical-uuid".to_string(),
+            x_amz_request_id: "ingress-canonical-uuid".to_string(),
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        });
+
+        req.extensions.insert(ReqInfo {
+            bucket: Some("test-bucket".to_string()),
+            object: Some("test-key".to_string()),
+            ..Default::default()
+        });
+
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+        // Verify the helper stored the RequestContext
+        assert!(helper.request_context.is_some());
+        assert_eq!(helper.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
+    }
+
+    #[test]
+    fn operation_helper_no_request_context_when_absent() {
+        let input = DeleteObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
+        req.headers.insert("host", HeaderValue::from_static("example.com"));
+        req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+        req.headers.insert("x-amz-request-id", HeaderValue::from_static("amz-header-uuid"));
+
+        // No RequestContext inserted
+        req.extensions.insert(ReqInfo {
+            bucket: Some("test-bucket".to_string()),
+            object: Some("test-key".to_string()),
+            ..Default::default()
+        });
+
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+        // Verify the helper has no RequestContext
+        assert!(helper.request_context.is_none());
+    }
 }
