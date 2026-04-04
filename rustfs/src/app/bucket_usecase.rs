@@ -22,7 +22,7 @@ use crate::auth::get_condition_values;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::helper::OperationHelper;
+use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::s3_api::bucket::{build_list_buckets_output, build_list_objects_v2_output};
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::s3_api::{acl, encryption, replication, tagging};
@@ -1494,7 +1494,11 @@ impl DefaultBucketUsecase {
             && let Some(store) = new_object_layer_fn()
         {
             let bucket_name = bucket.clone();
-            tokio::spawn(async move {
+            let request_context = req
+                .extensions
+                .get::<crate::storage::request_context::RequestContext>()
+                .cloned();
+            spawn_background_with_context(request_context, async move {
                 if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
                 }

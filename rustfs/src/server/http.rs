@@ -21,7 +21,10 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
-    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    layer::{
+        AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
+        RequestContextLayer,
+    },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
 use crate::storage;
@@ -593,17 +596,18 @@ fn process_connection(
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
         //  4. SetRequestIdLayer                       — generates X-Request-ID
-        //  5. AdminChunkedContentLengthCompatLayer    — admin API compat
-        //  6. CatchPanicLayer                        — panic → 500
-        //  7. ReadinessGateLayer                     — blocks until ready
-        //  8. KeystoneAuthLayer                      — X-Auth-Token validation
-        //  9. TraceLayer                             — request/response tracing + metrics
-        // 10. PropagateRequestIdLayer                — X-Request-ID → response
-        // 11. PathCategoryInjectionLayer             — injects path category for compression
-        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 13. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 14. ConditionalCorsLayer                   — S3 API CORS
-        // 15. RedirectLayer                          — console redirect (conditional)
+        //  5. RequestContextLayer                    — creates RequestContext in extensions
+        //  6. AdminChunkedContentLengthCompatLayer    — admin API compat
+        //  7. CatchPanicLayer                        — panic → 500
+        //  8. ReadinessGateLayer                     — blocks until ready
+        //  9. KeystoneAuthLayer                      — X-Auth-Token validation
+        // 10. TraceLayer                             — request/response tracing + metrics
+        // 11. PropagateRequestIdLayer                — X-Request-ID → response
+        // 12. PathCategoryInjectionLayer             — injects path category for compression
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 15. ConditionalCorsLayer                   — S3 API CORS
+        // 16. RedirectLayer                          — console redirect (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -619,6 +623,7 @@ fn process_connection(
             // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
             .option_layer(trusted_proxy_layer)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(RequestContextLayer)
             .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
@@ -687,6 +692,12 @@ fn process_connection(
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
                         let labels = [("key_request_method", request.method().to_string())];
                         counter!("rustfs.api.requests.total", &labels).increment(1);
+                        // Aggregate request body size for throughput monitoring (lightweight)
+                        if let Some(cl) = request.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            counter!("rustfs.request.body.bytes_total", "direction" => "request").increment(len);
+                        }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
@@ -695,6 +706,8 @@ fn process_connection(
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        // Always track aggregate body bytes (lightweight counter, no debug logging)
+                        counter!("rustfs.request.body.bytes_total", "direction" => "response").increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
@@ -703,7 +716,7 @@ fn process_connection(
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
-                            let _ = (chunk, latency, span);
+                            let _ = (latency, span);
                         }
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
