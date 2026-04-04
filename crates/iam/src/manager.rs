@@ -755,7 +755,10 @@ where
 
         if let Some(groups) = groups {
             for group in groups.iter() {
-                let (gp, _) = self.policy_db_get_internal(group, true, present).await?;
+                let (gp, _) = match self.policy_db_get_internal(group, true, present).await {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                };
                 gp.iter().for_each(|v| {
                     policies.push(v.clone());
                 });
