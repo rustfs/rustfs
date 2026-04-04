@@ -21,7 +21,7 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
-    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer},
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
 use crate::storage;
@@ -593,17 +593,18 @@ fn process_connection(
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
         //  4. SetRequestIdLayer                       — generates X-Request-ID
-        //  5. AdminChunkedContentLengthCompatLayer    — admin API compat
-        //  6. CatchPanicLayer                        — panic → 500
-        //  7. ReadinessGateLayer                     — blocks until ready
-        //  8. KeystoneAuthLayer                      — X-Auth-Token validation
-        //  9. TraceLayer                             — request/response tracing + metrics
-        // 10. PropagateRequestIdLayer                — X-Request-ID → response
-        // 11. PathCategoryInjectionLayer             — injects path category for compression
-        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 13. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 14. ConditionalCorsLayer                   — S3 API CORS
-        // 15. RedirectLayer                          — console redirect (conditional)
+        //  5. RequestContextLayer                    — creates RequestContext in extensions
+        //  6. AdminChunkedContentLengthCompatLayer    — admin API compat
+        //  7. CatchPanicLayer                        — panic → 500
+        //  8. ReadinessGateLayer                     — blocks until ready
+        //  9. KeystoneAuthLayer                      — X-Auth-Token validation
+        // 10. TraceLayer                             — request/response tracing + metrics
+        // 11. PropagateRequestIdLayer                — X-Request-ID → response
+        // 12. PathCategoryInjectionLayer             — injects path category for compression
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 15. ConditionalCorsLayer                   — S3 API CORS
+        // 16. RedirectLayer                          — console redirect (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -619,6 +620,7 @@ fn process_connection(
             // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
             .option_layer(trusted_proxy_layer)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(RequestContextLayer)
             .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
