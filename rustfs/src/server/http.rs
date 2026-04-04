@@ -689,6 +689,13 @@ fn process_connection(
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
                         let labels = [("key_request_method", request.method().to_string())];
                         counter!("rustfs.api.requests.total", &labels).increment(1);
+                        // Aggregate request body size for throughput monitoring (lightweight)
+                        if let Some(cl) = request.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            counter!("rustfs.request.body.bytes_total", "direction" => "request")
+                                .increment(len);
+                        }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
@@ -697,6 +704,9 @@ fn process_connection(
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        // Always track aggregate body bytes (lightweight counter, no debug logging)
+                        counter!("rustfs.request.body.bytes_total", "direction" => "response")
+                            .increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
@@ -705,7 +715,7 @@ fn process_connection(
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
-                            let _ = (chunk, latency, span);
+                            let _ = (latency, span);
                         }
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
