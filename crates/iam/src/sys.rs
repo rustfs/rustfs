@@ -1337,7 +1337,7 @@ mod tests {
         }
 
         async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Ok(())
         }
 
         async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
@@ -1871,6 +1871,34 @@ mod tests {
         assert!(
             !prepared.needs_existing_object_tag,
             "inherited service account should not require object tag fetch based on session policy hint"
+        );
+    }
+
+    /// Regression test for rustfs#2392: `policy_db_get` must skip non-existent groups
+    /// instead of aborting the entire policy resolution. When a JWT contains groups
+    /// that exist in the IdP but not in IAM, policies from the remaining valid groups
+    /// must still be returned.
+    #[tokio::test]
+    async fn test_policy_db_get_skips_nonexistent_groups() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        // "testgroup" exists with "readwrite" policy; "nonexistent-group" does not exist in IAM.
+        let groups = Some(vec![
+            "testgroup".to_string(),
+            "nonexistent-group".to_string(),
+        ]);
+
+        let policies = iam_sys
+            .policy_db_get("sts-fallback-test-parent", &groups)
+            .await
+            .expect("policy_db_get should not fail when some groups are missing");
+
+        assert!(
+            policies.iter().any(|p| p == "readwrite"),
+            "policies from existing group 'testgroup' should be returned even when other groups are missing; got: {:?}",
+            policies
         );
     }
 }
