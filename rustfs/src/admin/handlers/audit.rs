@@ -880,7 +880,9 @@ mod tests {
             HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
         )]));
 
-        assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+        with_audit_webhook_target_env_cleared("primarycase", || {
+            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+        });
     }
 
     #[test]
