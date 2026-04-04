@@ -634,9 +634,10 @@ impl Operation for RemoveAuditTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matchit::Router;
     use rustfs_ecstore::config::{KV, KVS};
     use std::collections::{HashMap, HashSet};
-    use temp_env::{with_var, with_vars};
+    use temp_env::{with_var, with_vars, with_vars_unset};
 
     fn enabled_kvs(value: &str) -> KVS {
         KVS(vec![KV {
@@ -644,6 +645,31 @@ mod tests {
             value: value.to_string(),
             hidden_if_empty: false,
         }])
+    }
+
+    fn with_audit_webhook_target_env_cleared<F>(target_name: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        let target_name = target_name.to_ascii_uppercase();
+        let mut env_keys = vec![format!(
+            "{ENV_PREFIX}{}{DEFAULT_DELIMITER}{}{DEFAULT_DELIMITER}{target_name}",
+            AUDIT_WEBHOOK_SUB_SYS.to_ascii_uppercase(),
+            ENABLE_KEY.to_ascii_uppercase(),
+        )];
+
+        for key in AUDIT_WEBHOOK_KEYS {
+            let env_key = format!(
+                "{ENV_PREFIX}{}{DEFAULT_DELIMITER}{}{DEFAULT_DELIMITER}{target_name}",
+                AUDIT_WEBHOOK_SUB_SYS.to_ascii_uppercase(),
+                key.to_ascii_uppercase(),
+            );
+            if !env_keys.contains(&env_key) {
+                env_keys.push(env_key);
+            }
+        }
+
+        with_vars_unset(env_keys, f);
     }
 
     #[test]
@@ -783,6 +809,47 @@ mod tests {
     }
 
     #[test]
+    fn collect_validated_key_values_rejects_unsupported_key() {
+        let allowed_keys: HashSet<&str> = AUDIT_WEBHOOK_KEYS.iter().copied().collect();
+        let key_values = vec![KeyValue {
+            key: "not_a_real_key".to_string(),
+            value: "/tmp/rustfs-audit".to_string(),
+        }];
+
+        let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
+        assert!(err.to_string().contains("not allowed for audit target type"));
+    }
+
+    #[test]
+    fn extract_target_params_rejects_missing_or_unsupported_values() {
+        let mut root_router = Router::new();
+        root_router.insert("/", ()).expect("route should insert");
+        let missing_type_params = root_router.at("/").expect("route should match");
+        let missing_type = extract_target_params(&missing_type_params.params).unwrap_err();
+        assert!(missing_type.to_string().contains("missing required parameter: 'target_type'"));
+
+        let mut full_router = Router::new();
+        full_router
+            .insert("/v3/audit/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+        let unsupported_type_params = full_router
+            .at("/v3/audit/target/audit_kafka/primary")
+            .expect("route should match");
+        let unsupported_type = extract_target_params(&unsupported_type_params.params).unwrap_err();
+        assert!(unsupported_type.to_string().contains("unsupported audit target type"));
+
+        let mut partial_router = Router::new();
+        partial_router
+            .insert("/v3/audit/target/{target_type}", ())
+            .expect("route should insert");
+        let missing_name_params = partial_router
+            .at("/v3/audit/target/audit_webhook")
+            .expect("route should match");
+        let missing_name = extract_target_params(&missing_name_params.params).unwrap_err();
+        assert!(missing_name.to_string().contains("missing required parameter: 'target_name'"));
+    }
+
+    #[test]
     fn merge_audit_endpoints_marks_mixed_with_case_insensitive_instance_id() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),
@@ -813,6 +880,16 @@ mod tests {
             HashMap::from([("PrimaryCase".to_string(), enabled_kvs("on"))]),
         )]));
 
-        assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+        with_audit_webhook_target_env_cleared("primarycase", || {
+            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+        });
+    }
+
+    #[test]
+    fn audit_target_mutation_block_reason_allows_runtime_only_target() {
+        with_audit_webhook_target_env_cleared("primary", || {
+            let config = Config(HashMap::new());
+            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary").is_none());
+        });
     }
 }
