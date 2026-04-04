@@ -27,6 +27,7 @@ use openidconnect::{
 use rustfs_config::oidc::*;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1007,29 +1008,19 @@ pub(crate) fn decode_jwt_payload(token: &str) -> HashMap<String, serde_json::Val
     }
 }
 
-/// Get a claim value from raw claims with case-insensitive fallback.
-/// First tries exact match, then falls back to case-insensitive match if not found.
-fn get_claim_case_insensitive<'a>(claims: &'a HashMap<String, serde_json::Value>, key: &str) -> Option<&'a serde_json::Value> {
-    if let Some(v) = claims.get(key) {
-        return Some(v);
-    }
-    let key_lower = key.to_lowercase();
-    claims.iter().find(|(k, _)| k.to_lowercase() == key_lower).map(|(_, v)| v)
-}
-
 /// Extract a string claim from raw claims with case-insensitive fallback.
 fn extract_string_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> String {
-    get_claim_case_insensitive(claims, key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+    match get_claim_case_insensitive(claims, key) {
+        ClaimLookup::Found(value) => value.as_str().unwrap_or_default().to_string(),
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => String::new(),
+    }
 }
 
 /// Extract a groups/array claim from raw claims with case-insensitive fallback. Handles both string arrays and single strings.
 fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
     match get_claim_case_insensitive(claims, key) {
-        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-        Some(serde_json::Value::String(s)) => s.split(',').map(|s| s.trim().to_string()).collect(),
+        ClaimLookup::Found(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        ClaimLookup::Found(serde_json::Value::String(s)) => s.split(',').map(|s| s.trim().to_string()).collect(),
         _ => vec![],
     }
 }
@@ -1115,6 +1106,25 @@ mod tests {
 
         let groups = extract_groups_claim(&claims, "Policy");
         assert_eq!(groups, vec!["exact_match"]);
+    }
+
+    #[test]
+    fn test_extract_string_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), serde_json::json!("exact_match"));
+        claims.insert("policy".to_string(), serde_json::json!("lowercase"));
+
+        assert_eq!(extract_string_claim(&claims, "POLICY"), "");
+    }
+
+    #[test]
+    fn test_extract_groups_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), serde_json::json!(["exact_match"]));
+        claims.insert("policy".to_string(), serde_json::json!(["lowercase"]));
+
+        let groups = extract_groups_claim(&claims, "POLICY");
+        assert!(groups.is_empty());
     }
 
     #[test]
