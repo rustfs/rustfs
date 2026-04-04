@@ -81,6 +81,7 @@ impl ProtocolStorageClient {
             object: params.object,
             version_id: None,
             region: None,
+            request_context: Some(crate::storage::request_context::RequestContext::fallback()),
         });
 
         let req = S3Request {

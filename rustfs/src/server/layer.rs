@@ -17,18 +17,133 @@ use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
 use crate::storage::apply_cors_headers;
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::get_env_opt_str;
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::debug;
+
+/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
+struct HeaderMapCarrier<'a>(&'a HeaderMap);
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .0
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
+/// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
+/// and injects it into `request.extensions()`.
+///
+/// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
+/// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
+///
+/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
+/// if not already present.
+#[derive(Clone, Default)]
+pub struct RequestContextLayer;
+
+impl<S> Layer<S> for RequestContextLayer {
+    type Service = RequestContextService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestContextService { inner }
+    }
+}
+
+/// Service that injects [`RequestContext`] into every request.
+#[derive(Clone)]
+pub struct RequestContextService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<HttpRequest<B>> for RequestContextService<S>
+where
+    S: Service<HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let request_id = extract_request_id_from_headers(req.headers());
+
+        // Extract OpenTelemetry trace/span context from incoming headers
+        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
+        let span_ref = parent_cx.span();
+        let span_context = span_ref.span_context();
+        let trace_id = if span_context.is_valid() {
+            Some(span_context.trace_id().to_string())
+        } else {
+            None
+        };
+        let span_id = if span_context.is_valid() {
+            Some(span_context.span_id().to_string())
+        } else {
+            None
+        };
+
+        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
+        // otherwise fall back to the canonical request_id.
+        let x_amz_request_id = req
+            .headers()
+            .get(AMZ_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| request_id.clone());
+
+        let ctx = RequestContext {
+            request_id: request_id.clone(),
+            x_amz_request_id,
+            trace_id,
+            span_id,
+            start_time: Instant::now(),
+        };
+
+        req.extensions_mut().insert(ctx);
+
+        // Set x-amz-request-id for S3 compatibility downstream
+        if !req.headers().contains_key(AMZ_REQUEST_ID)
+            && let Ok(val) = HeaderValue::from_str(&request_id)
+        {
+            req.headers_mut()
+                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
+        }
+
+        self.inner.call(req)
+    }
+}
 
 /// Redirect layer that redirects browser requests to the console
 #[derive(Clone)]

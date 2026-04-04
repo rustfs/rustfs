@@ -25,6 +25,7 @@ use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
 use bytes::Bytes;
@@ -406,7 +407,7 @@ impl DefaultMultipartUsecase {
         };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
