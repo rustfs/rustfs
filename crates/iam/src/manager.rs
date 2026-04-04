@@ -757,7 +757,8 @@ where
             for group in groups.iter() {
                 let (gp, _) = match self.policy_db_get_internal(group, true, present).await {
                     Ok(result) => result,
-                    Err(_) => continue,
+                    Err(err) if is_err_no_such_group(&err) => continue,
+                    Err(err) => return Err(err),
                 };
                 gp.iter().for_each(|v| {
                     policies.push(v.clone());
