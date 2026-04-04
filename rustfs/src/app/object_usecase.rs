@@ -1015,9 +1015,9 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
+    fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
         let timeout_config = TimeoutConfig::from_env();
-        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
+        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
@@ -2599,7 +2599,12 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key)?;
+        let request_id = req
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
