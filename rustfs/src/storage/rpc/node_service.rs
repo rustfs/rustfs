@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::service::site_replication::reload_site_replication_runtime_state;
+use crate::admin::service::{
+    config::{
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, reload_dynamic_config_runtime_state,
+        reload_runtime_config_snapshot,
+    },
+    site_replication::reload_site_replication_runtime_state,
+};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -28,7 +34,7 @@ use rustfs_ecstore::{
     get_global_lock_client,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
-    rpc::{LocalPeerS3Client, PeerS3Client},
+    rpc::{LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client},
     store::{all_local_disk_path, find_local_disk_by_ref},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
@@ -786,11 +792,43 @@ impl Node for NodeService {
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
         let request = request.into_inner();
-        let _vars = match request.vars {
+        let vars = match request.vars {
             Some(vars) => vars.value,
             None => HashMap::new(),
         };
-        todo!()
+        let signal = vars.get(PEER_RESTSIGNAL).and_then(|value| value.parse::<u64>().ok());
+        let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
+
+        match signal {
+            Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
+                Ok(()) => Ok(Response::new(SignalServiceResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(SignalServiceResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
+            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => match reload_dynamic_config_runtime_state(sub_system).await {
+                Ok(()) => Ok(Response::new(SignalServiceResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(SignalServiceResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
+            Some(other) => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some(format!("unsupported service signal: {other}")),
+            })),
+            None => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some("missing or invalid service signal".to_string()),
+            })),
+        }
     }
 
     async fn background_heal_status(
@@ -2235,7 +2273,105 @@ mod tests {
         assert!(reload_response.error_info.is_some());
     }
 
-    // Note: signal_service test is skipped because it contains todo!() and would panic
+    #[tokio::test]
+    async fn test_signal_service_rejects_missing_signal() {
+        let service = create_test_node_service();
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: HashMap::new() }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("missing or invalid service signal"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_unsupported_signal() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), "99".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("unsupported service signal: 99"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_non_dynamic_subsystem() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), "identity_openid".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_refresh_config_requires_object_layer() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_REFRESH_CONFIG.to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("storage layer not initialized"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_reload_dynamic_requires_object_layer() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(
+            PEER_RESTSUB_SYS.to_string(),
+            rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
+        );
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("storage layer not initialized"));
+    }
 
     #[tokio::test]
     async fn test_node_service_debug() {

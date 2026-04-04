@@ -417,7 +417,7 @@ impl SetDisks {
                                 }
 
                                 let is_inline_buffer = {
-                                    if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+                                    if let Some(sc) = crate::config::get_global_storage_class() {
                                         sc.should_inline(erasure.shard_file_size(latest_meta.size), false)
                                     } else {
                                         false
