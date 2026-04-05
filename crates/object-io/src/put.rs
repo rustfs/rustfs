@@ -387,14 +387,6 @@ impl<S, B> HashReaderDetector for PutObjectReducedCopyReader<S, B> {}
 
 impl<S, B> TryGetIndex for PutObjectReducedCopyReader<S, B> {}
 
-impl<S, B, E> Reader for PutObjectReducedCopyReader<S, B>
-where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync,
-    B: Buf + Unpin + Send + Sync,
-    E: std::fmt::Display + Send + Sync,
-{
-}
-
 fn build_put_object_reduced_copy_reader<B, E>(candidate: PutObjectReducedCopyIngress<B, E>) -> Box<dyn Reader>
 where
     B: Buf + Send + Sync + Unpin + 'static,

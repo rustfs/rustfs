@@ -55,8 +55,10 @@ use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions};
-use rustfs_rio::{HashReader, Reader, WarpReader};
+use rustfs_ecstore::store_api::{
+    BucketOperations, BucketOptions, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions,
+};
+use rustfs_rio::HashReader;
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
@@ -374,20 +376,12 @@ where
         ..Default::default()
     };
 
-    // 13. Wrap reader in buffered reader then WarpReader (Box<dyn Reader>)
+    // 13. Wrap reader in buffered reader for streaming hash validation
     let buf_reader = tokio::io::BufReader::new(reader);
-    let warp_reader: Box<dyn Reader> = Box::new(WarpReader::new(buf_reader));
 
     // 14. Create HashReader (no MD5/SHA256 validation for Swift)
-    let hash_reader = HashReader::new(
-        warp_reader,
-        content_length,
-        content_length,
-        None,  // md5hex
-        None,  // sha256hex
-        false, // disable_multipart
-    )
-    .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
+    let hash_reader = HashReader::from_stream(buf_reader, content_length, content_length, None, None, false)
+        .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // 15. Hand the hash reader to the chunk-native PUT data wrapper
     let mut put_reader = ChunkNativePutData::new(hash_reader);
@@ -465,20 +459,12 @@ where
     // Content length (use -1 for unknown)
     let content_length = -1i64;
 
-    // Wrap reader in buffered reader then WarpReader
+    // Wrap reader in buffered reader for streaming hash validation
     let buf_reader = tokio::io::BufReader::new(reader);
-    let warp_reader: Box<dyn Reader> = Box::new(WarpReader::new(buf_reader));
 
     // Create HashReader
-    let hash_reader = HashReader::new(
-        warp_reader,
-        content_length,
-        content_length,
-        None,  // md5hex
-        None,  // sha256hex
-        false, // disable_multipart
-    )
-    .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
+    let hash_reader = HashReader::from_stream(buf_reader, content_length, content_length, None, None, false)
+        .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // Hand the hash reader to the chunk-native PUT data wrapper
     let mut put_reader = ChunkNativePutData::new(hash_reader);

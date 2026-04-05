@@ -165,17 +165,16 @@ impl ObjectIoCachedGetObjectSource for CachedGetObject {
     }
 }
 
-pub(super) fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
+pub(super) fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
     let timeout_config = TimeoutConfig::from_env();
-    let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
+    let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
     let request_start = std::time::Instant::now();
     let request_guard = ConcurrencyManager::track_request();
     let concurrent_requests = GetObjectGuard::concurrent_requests();
 
     let deadlock_detector = deadlock_detector::get_deadlock_detector();
-    let request_id = wrapper.request_id().to_string();
-    deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
-    let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+    deadlock_detector.register_request(request_id, format!("GetObject {bucket}/{key}"));
+    let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id.to_string());
 
     if wrapper.is_timeout() {
         warn!(
@@ -265,7 +264,7 @@ pub(super) fn spawn_get_object_cache_writeback(
     let cached_response = CachedGetObject::from_get_object_cache_writeback(writeback);
 
     let cache_key_clone = cache_key.to_string();
-    tokio::spawn(async move {
+    crate::storage::request_context::spawn_traced(async move {
         let manager = get_concurrency_manager();
         manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
         debug!("Object cached successfully with metadata: {}", cache_key_clone);
@@ -556,6 +555,7 @@ pub(super) fn complete_put_response(helper: OperationHelper, output: PutObjectOu
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_put_extract_notification(
     notify: Arc<dyn NotifyInterface>,
+    request_context: Option<crate::storage::request_context::RequestContext>,
     bucket: String,
     req_params: HashMap<String, String>,
     version_id: String,
@@ -577,7 +577,7 @@ pub(super) fn spawn_put_extract_notification(
         user_agent,
     };
 
-    tokio::spawn(async move {
+    crate::storage::helper::spawn_background_with_context(request_context, async move {
         notify.notify(event_args).await;
     });
 }

@@ -7706,6 +7706,7 @@ dependencies = [
  "rustfs-targets",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7902,6 +7903,7 @@ dependencies = [
  "rustfs-utils",
  "s3s",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -8428,6 +8430,7 @@ name = "rustfs-targets"
 version = "0.0.5"
 dependencies = [
  "async-trait",
+ "criterion",
  "reqwest 0.13.2",
  "rumqttc",
  "rustfs-config",

@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, oidc, storageclass};
+use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, audit, notify, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ChunkNativePutData, ObjectInfo, ObjectOptions, StorageAPI};
 use http::HeaderMap;
+use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::{NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -259,6 +261,159 @@ fn apply_external_oidc_map(cfg: &mut Config, root: &Map<String, Value>) -> bool 
     applied
 }
 
+fn parse_notify_scalar_value(key: &str, value: &Value) -> Option<String> {
+    match value {
+        Value::String(v) => Some(v.trim().to_string()),
+        Value::Bool(v) if key == ENABLE_KEY || key == rustfs_config::WEBHOOK_SKIP_TLS_VERIFY => Some(if *v {
+            EnableState::On.to_string()
+        } else {
+            EnableState::Off.to_string()
+        }),
+        Value::Bool(v) => Some(v.to_string()),
+        Value::Number(v) => Some(v.to_string()),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&str]) -> KVS {
+    let mut kvs = KVS::new();
+
+    for (key, value) in instance {
+        if !valid_keys.contains(&key.as_str()) || key == COMMENT_KEY {
+            continue;
+        }
+
+        if let Some(parsed) = parse_notify_scalar_value(key, value) {
+            kvs.insert(key.clone(), parsed);
+        }
+    }
+
+    kvs
+}
+
+fn decode_notify_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KVS> {
+    match value {
+        Value::Object(instance) => Some(decode_notify_instance_object(instance, valid_keys)),
+        Value::Array(_) => serde_json::from_value::<KVS>(value.clone()).ok(),
+        _ => None,
+    }
+}
+
+fn is_notify_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
+    section
+        .iter()
+        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_notify_scalar_value(key, value).is_some())
+}
+
+fn apply_external_notify_section(
+    cfg: &mut Config,
+    notify_obj: &Map<String, Value>,
+    external_key: &str,
+    subsystem_key: &str,
+    default_kvs: &KVS,
+    valid_keys: &[&str],
+) -> bool {
+    let Some(Value::Object(section_obj)) = notify_obj.get(external_key).or_else(|| notify_obj.get(subsystem_key)) else {
+        return false;
+    };
+
+    if section_obj.is_empty() {
+        return false;
+    }
+
+    let subsystem = cfg.0.entry(subsystem_key.to_string()).or_default();
+    let mut applied = false;
+
+    if is_notify_instance_shorthand(section_obj, valid_keys) {
+        let kvs = decode_notify_instance_object(section_obj, valid_keys);
+        if !kvs.is_empty() {
+            let mut merged = default_kvs.clone();
+            merged.extend(kvs);
+            subsystem.insert(DEFAULT_DELIMITER.to_string(), merged);
+            applied = true;
+        }
+        return applied;
+    }
+
+    for (raw_instance, value) in section_obj {
+        let Some(mut kvs) = decode_notify_instance_value(value, valid_keys) else {
+            continue;
+        };
+        if kvs.is_empty() {
+            continue;
+        }
+
+        let instance_key = if raw_instance == "default" {
+            DEFAULT_DELIMITER.to_string()
+        } else {
+            raw_instance.to_string()
+        };
+
+        if instance_key == DEFAULT_DELIMITER {
+            let mut merged = default_kvs.clone();
+            merged.extend(kvs);
+            kvs = merged;
+        }
+
+        subsystem.insert(instance_key, kvs);
+        applied = true;
+    }
+
+    applied
+}
+
+fn apply_external_notify_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
+    let Some(Value::Object(notify_obj)) = root.get("notify") else {
+        return false;
+    };
+
+    let mut applied = false;
+    applied |= apply_external_notify_section(
+        cfg,
+        notify_obj,
+        "webhook",
+        NOTIFY_WEBHOOK_SUB_SYS,
+        &notify::DEFAULT_NOTIFY_WEBHOOK_KVS,
+        NOTIFY_WEBHOOK_KEYS,
+    );
+    applied |= apply_external_notify_section(
+        cfg,
+        notify_obj,
+        "mqtt",
+        NOTIFY_MQTT_SUB_SYS,
+        &notify::DEFAULT_NOTIFY_MQTT_KVS,
+        NOTIFY_MQTT_KEYS,
+    );
+    applied
+}
+
+fn apply_external_audit_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
+    let audit_root = root.get("audit").or_else(|| root.get("logger")).and_then(Value::as_object);
+    let Some(audit_obj) = audit_root else {
+        return false;
+    };
+
+    let mut applied = false;
+    applied |= apply_external_notify_section(
+        cfg,
+        audit_obj,
+        "webhook",
+        AUDIT_WEBHOOK_SUB_SYS,
+        &audit::DEFAULT_AUDIT_WEBHOOK_KVS,
+        AUDIT_WEBHOOK_KEYS,
+    );
+    applied |= apply_external_notify_section(
+        cfg,
+        audit_obj,
+        "mqtt",
+        AUDIT_MQTT_SUB_SYS,
+        &audit::DEFAULT_AUDIT_MQTT_KVS,
+        AUDIT_MQTT_KEYS,
+    );
+    applied
+}
+
 fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
     let sc = root.get("storageclass").or_else(|| root.get("storage_class"));
     let Some(Value::Object(sc_obj)) = sc else {
@@ -303,8 +458,10 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
     let mut cfg = Config::new();
     let has_storage = apply_external_storage_class_map(&mut cfg, &root);
     let has_oidc = apply_external_oidc_map(&mut cfg, &root);
+    let has_notify = apply_external_notify_map(&mut cfg, &root);
+    let has_audit = apply_external_audit_map(&mut cfg, &root);
     let has_header = root.contains_key("version") || root.contains_key("region") || root.contains_key("credential");
-    if !has_storage && !has_oidc && !has_header {
+    if !has_storage && !has_oidc && !has_notify && !has_audit && !has_header {
         return Err(Error::other("unrecognized external server config shape"));
     }
     Ok(cfg)
@@ -447,6 +604,139 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
     oidc_obj
 }
 
+fn is_notify_bool_key(key: &str) -> bool {
+    key == ENABLE_KEY || key == rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
+}
+
+fn encode_notify_scalar_value(key: &str, value: &str) -> Value {
+    if is_notify_bool_key(key) {
+        if let Ok(state) = value.parse::<EnableState>() {
+            return Value::Bool(state.is_enabled());
+        }
+        if let Ok(boolean) = value.parse::<bool>() {
+            return Value::Bool(boolean);
+        }
+    }
+
+    Value::String(value.to_string())
+}
+
+fn is_hidden_if_empty(default_kvs: &KVS, key: &str) -> bool {
+    default_kvs
+        .0
+        .iter()
+        .find(|kv| kv.key == key)
+        .map(|kv| kv.hidden_if_empty)
+        .unwrap_or(false)
+}
+
+fn build_notify_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&str], default_kvs: &KVS) -> Map<String, Value> {
+    let mut instance = Map::new();
+
+    for key in valid_keys {
+        if *key == COMMENT_KEY {
+            continue;
+        }
+
+        let baseline_value = baseline.lookup(key).unwrap_or_default();
+        let effective_value = kvs.lookup(key).unwrap_or_else(|| baseline_value.clone());
+
+        if effective_value == baseline_value {
+            continue;
+        }
+
+        if effective_value.trim().is_empty() && baseline_value.trim().is_empty() {
+            continue;
+        }
+
+        if is_hidden_if_empty(default_kvs, key) && effective_value.trim().is_empty() && baseline_value.trim().is_empty() {
+            continue;
+        }
+
+        instance.insert((*key).to_string(), encode_notify_scalar_value(key, &effective_value));
+    }
+
+    instance
+}
+
+fn merged_notify_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS) -> KVS {
+    let mut merged = default_kvs.clone();
+    if let Some(kvs) = subsystem.get(DEFAULT_DELIMITER) {
+        merged.extend(kvs.clone());
+    }
+    merged
+}
+
+fn build_notify_subsystem_object(
+    cfg: &Config,
+    subsystem_key: &str,
+    default_kvs: &KVS,
+    valid_keys: &[&str],
+) -> Map<String, Value> {
+    let Some(subsystem) = cfg.0.get(subsystem_key) else {
+        return Map::new();
+    };
+
+    let effective_default = merged_notify_default_kvs(subsystem, default_kvs);
+    let mut subsystem_obj = Map::new();
+
+    if let Some(default_instance) = subsystem.get(DEFAULT_DELIMITER) {
+        let default_obj = build_notify_instance_diff_object(default_instance, default_kvs, valid_keys, default_kvs);
+        if !default_obj.is_empty() {
+            subsystem_obj.insert("default".to_string(), Value::Object(default_obj));
+        }
+    }
+
+    let mut instances = subsystem
+        .iter()
+        .filter(|(instance_key, _)| instance_key.as_str() != DEFAULT_DELIMITER)
+        .collect::<Vec<_>>();
+    instances.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+
+    for (instance_key, kvs) in instances {
+        let instance_obj = build_notify_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
+        if !instance_obj.is_empty() {
+            subsystem_obj.insert(instance_key.clone(), Value::Object(instance_obj));
+        }
+    }
+
+    subsystem_obj
+}
+
+fn build_notify_object(cfg: &Config) -> Map<String, Value> {
+    let mut notify_obj = Map::new();
+
+    let webhook_obj =
+        build_notify_subsystem_object(cfg, NOTIFY_WEBHOOK_SUB_SYS, &notify::DEFAULT_NOTIFY_WEBHOOK_KVS, NOTIFY_WEBHOOK_KEYS);
+    if !webhook_obj.is_empty() {
+        notify_obj.insert("webhook".to_string(), Value::Object(webhook_obj));
+    }
+
+    let mqtt_obj = build_notify_subsystem_object(cfg, NOTIFY_MQTT_SUB_SYS, &notify::DEFAULT_NOTIFY_MQTT_KVS, NOTIFY_MQTT_KEYS);
+    if !mqtt_obj.is_empty() {
+        notify_obj.insert("mqtt".to_string(), Value::Object(mqtt_obj));
+    }
+
+    notify_obj
+}
+
+fn build_audit_object(cfg: &Config) -> Map<String, Value> {
+    let mut audit_obj = Map::new();
+
+    let webhook_obj =
+        build_notify_subsystem_object(cfg, AUDIT_WEBHOOK_SUB_SYS, &audit::DEFAULT_AUDIT_WEBHOOK_KVS, AUDIT_WEBHOOK_KEYS);
+    if !webhook_obj.is_empty() {
+        audit_obj.insert("webhook".to_string(), Value::Object(webhook_obj));
+    }
+
+    let mqtt_obj = build_notify_subsystem_object(cfg, AUDIT_MQTT_SUB_SYS, &audit::DEFAULT_AUDIT_MQTT_KVS, AUDIT_MQTT_KEYS);
+    if !mqtt_obj.is_empty() {
+        audit_obj.insert("mqtt".to_string(), Value::Object(mqtt_obj));
+    }
+
+    audit_obj
+}
+
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut root = seed.and_then(parse_object_seed).unwrap_or_default();
 
@@ -476,6 +766,73 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
         root.remove(IDENTITY_OPENID_SUB_SYS);
     }
 
+    let mut notify_obj = match root.remove("notify") {
+        Some(Value::Object(v)) => v,
+        _ => Map::new(),
+    };
+    let rendered_notify = build_notify_object(cfg);
+    match rendered_notify.get("webhook") {
+        Some(Value::Object(v)) => {
+            notify_obj.insert("webhook".to_string(), Value::Object(v.clone()));
+            notify_obj.remove(NOTIFY_WEBHOOK_SUB_SYS);
+        }
+        _ => {
+            notify_obj.remove("webhook");
+            notify_obj.remove(NOTIFY_WEBHOOK_SUB_SYS);
+        }
+    }
+    match rendered_notify.get("mqtt") {
+        Some(Value::Object(v)) => {
+            notify_obj.insert("mqtt".to_string(), Value::Object(v.clone()));
+            notify_obj.remove(NOTIFY_MQTT_SUB_SYS);
+        }
+        _ => {
+            notify_obj.remove("mqtt");
+            notify_obj.remove(NOTIFY_MQTT_SUB_SYS);
+        }
+    }
+    if notify_obj.is_empty() {
+        root.remove("notify");
+    } else {
+        root.insert("notify".to_string(), Value::Object(notify_obj));
+    }
+    root.remove(NOTIFY_WEBHOOK_SUB_SYS);
+    root.remove(NOTIFY_MQTT_SUB_SYS);
+
+    let mut logger_obj = match root.remove("logger") {
+        Some(Value::Object(v)) => v,
+        _ => Map::new(),
+    };
+    let rendered_audit = build_audit_object(cfg);
+    match rendered_audit.get("webhook") {
+        Some(Value::Object(v)) => {
+            logger_obj.insert("webhook".to_string(), Value::Object(v.clone()));
+            logger_obj.remove(AUDIT_WEBHOOK_SUB_SYS);
+        }
+        _ => {
+            logger_obj.remove("webhook");
+            logger_obj.remove(AUDIT_WEBHOOK_SUB_SYS);
+        }
+    }
+    match rendered_audit.get("mqtt") {
+        Some(Value::Object(v)) => {
+            logger_obj.insert("mqtt".to_string(), Value::Object(v.clone()));
+            logger_obj.remove(AUDIT_MQTT_SUB_SYS);
+        }
+        _ => {
+            logger_obj.remove("mqtt");
+            logger_obj.remove(AUDIT_MQTT_SUB_SYS);
+        }
+    }
+    if logger_obj.is_empty() {
+        root.remove("logger");
+    } else {
+        root.insert("logger".to_string(), Value::Object(logger_obj));
+    }
+    root.remove("audit");
+    root.remove(AUDIT_WEBHOOK_SUB_SYS);
+    root.remove(AUDIT_MQTT_SUB_SYS);
+
     Ok(serde_json::to_vec(&Value::Object(root))?)
 }
 
@@ -494,6 +851,8 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
     build_storageclass_object(lhs) == build_storageclass_object(rhs)
         && build_semantic_oidc_object(lhs) == build_semantic_oidc_object(rhs)
+        && build_notify_object(lhs) == build_notify_object(rhs)
+        && build_audit_object(lhs) == build_audit_object(rhs)
 }
 
 fn is_object_not_found(err: &Error) -> bool {
@@ -710,7 +1069,7 @@ mod tests {
         configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
         read_config_with_metadata, storage_class_kvs_mut,
     };
-    use crate::config::{Config, oidc};
+    use crate::config::{Config, audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
@@ -723,6 +1082,8 @@ mod tests {
         ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
+    use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
     use rustfs_filemeta::FileInfo;
@@ -1331,6 +1692,152 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_server_config_reads_notify_targets() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "notify":{
+            "webhook":{
+              "primary":{
+                "enable":true,
+                "endpoint":"https://example.com/hook",
+                "queue_dir":"/tmp/webhook-queue"
+              }
+            },
+            "mqtt":{
+              "default":{
+                "enable":true,
+                "topic":"events"
+              },
+              "analytics":{
+                "enable":true,
+                "broker":"tcp://127.0.0.1:1883",
+                "topic":"events",
+                "queue_dir":""
+              }
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+
+        let webhook = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, "primary")
+            .expect("webhook target should be decoded");
+        assert_eq!(webhook.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(webhook.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/hook");
+        assert_eq!(webhook.get(rustfs_config::WEBHOOK_QUEUE_DIR), "/tmp/webhook-queue");
+
+        let mqtt_default = cfg
+            .get_value(NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("mqtt default should be decoded");
+        assert_eq!(mqtt_default.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(mqtt_default.get(rustfs_config::MQTT_TOPIC), "events");
+        assert_eq!(
+            mqtt_default.get(rustfs_config::MQTT_QUEUE_DIR),
+            notify::DEFAULT_NOTIFY_MQTT_KVS.get(rustfs_config::MQTT_QUEUE_DIR)
+        );
+
+        let mqtt = cfg
+            .get_value(NOTIFY_MQTT_SUB_SYS, "analytics")
+            .expect("mqtt target should be decoded");
+        assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER), "tcp://127.0.0.1:1883");
+        assert_eq!(mqtt.get(rustfs_config::MQTT_QUEUE_DIR), "");
+    }
+
+    #[test]
+    fn test_decode_server_config_reads_notify_shorthand_default() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "notify":{
+            "webhook":{
+              "enable":true,
+              "endpoint":"https://example.com/shorthand"
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+        let webhook_default = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("default webhook config should be decoded");
+        assert_eq!(webhook_default.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(webhook_default.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/shorthand");
+    }
+
+    #[test]
+    fn test_decode_server_config_keeps_instance_named_like_field() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "notify":{
+            "webhook":{
+              "enable":{
+                "enable":true,
+                "endpoint":"https://example.com/instance-enable"
+              }
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+        let named = cfg
+            .get_value(NOTIFY_WEBHOOK_SUB_SYS, "enable")
+            .expect("instance named 'enable' should be decoded");
+        assert_eq!(named.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(named.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/instance-enable");
+    }
+
+    #[test]
+    fn test_decode_server_config_reads_audit_targets() {
+        let input = r#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
+          "logger":{
+            "webhook":{
+              "primary":{
+                "enable":true,
+                "endpoint":"https://example.com/audit-hook",
+                "queue_dir":"/tmp/audit-queue"
+              }
+            },
+            "mqtt":{
+              "default":{
+                "enable":true,
+                "topic":"audit-events"
+              },
+              "analytics":{
+                "enable":true,
+                "broker":"tcp://127.0.0.1:1883",
+                "topic":"audit-events"
+              }
+            }
+          }
+        }"#;
+
+        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
+
+        let webhook = cfg
+            .get_value(AUDIT_WEBHOOK_SUB_SYS, "primary")
+            .expect("audit webhook target should be decoded");
+        assert_eq!(webhook.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(webhook.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/audit-hook");
+        assert_eq!(webhook.get(rustfs_config::WEBHOOK_QUEUE_DIR), "/tmp/audit-queue");
+
+        let mqtt_default = cfg
+            .get_value(AUDIT_MQTT_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("audit mqtt default should be decoded");
+        assert_eq!(mqtt_default.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(mqtt_default.get(rustfs_config::MQTT_TOPIC), "audit-events");
+
+        let mqtt = cfg
+            .get_value(AUDIT_MQTT_SUB_SYS, "analytics")
+            .expect("audit mqtt target should be decoded");
+        assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER), "tcp://127.0.0.1:1883");
+    }
+
+    #[test]
     fn test_encode_server_config_writes_external_object_shape() {
         let mut cfg = Config::new();
         let kvs = storage_class_kvs_mut(&mut cfg);
@@ -1387,6 +1894,174 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_server_config_writes_notify_object_shape() {
+        let mut cfg = Config::new();
+        let mut webhook_section = std::collections::HashMap::new();
+        webhook_section.insert(DEFAULT_DELIMITER.to_string(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
+        webhook_section.insert(
+            "primary".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
+                    value: "https://example.com/hook".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
+                    value: "/tmp/webhook-queue".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(NOTIFY_WEBHOOK_SUB_SYS.to_string(), webhook_section);
+
+        let mut mqtt_default = notify::DEFAULT_NOTIFY_MQTT_KVS.clone();
+        mqtt_default.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        mqtt_default.insert(rustfs_config::MQTT_TOPIC.to_string(), "events".to_string());
+        let mut mqtt_section = std::collections::HashMap::new();
+        mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
+        mqtt_section.insert(
+            "analytics".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::MQTT_BROKER.to_string(),
+                    value: "tcp://127.0.0.1:1883".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::MQTT_QUEUE_DIR.to_string(),
+                    value: "".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(NOTIFY_MQTT_SUB_SYS.to_string(), mqtt_section);
+
+        let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+        let v: Value = serde_json::from_slice(&out).expect("output should be json");
+        let notify = v
+            .get("notify")
+            .and_then(Value::as_object)
+            .expect("notify object should be present");
+        let webhook = notify
+            .get("webhook")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("primary"))
+            .and_then(Value::as_object)
+            .expect("webhook target should be encoded");
+        assert_eq!(
+            webhook.get(rustfs_config::WEBHOOK_ENDPOINT).and_then(Value::as_str),
+            Some("https://example.com/hook")
+        );
+        assert_eq!(webhook.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
+
+        let mqtt_default = notify
+            .get("mqtt")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("default"))
+            .and_then(Value::as_object)
+            .expect("mqtt default should be encoded");
+        assert_eq!(mqtt_default.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
+        assert_eq!(mqtt_default.get(rustfs_config::MQTT_TOPIC).and_then(Value::as_str), Some("events"));
+
+        let mqtt = notify
+            .get("mqtt")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("analytics"))
+            .and_then(Value::as_object)
+            .expect("mqtt target should be encoded");
+        assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER).and_then(Value::as_str), Some("tcp://127.0.0.1:1883"));
+        assert_eq!(mqtt.get(rustfs_config::MQTT_QUEUE_DIR).and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_encode_server_config_writes_audit_object_shape() {
+        let mut cfg = Config::new();
+        let mut webhook_section = std::collections::HashMap::new();
+        webhook_section.insert(DEFAULT_DELIMITER.to_string(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
+        webhook_section.insert(
+            "primary".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::WEBHOOK_ENDPOINT.to_string(),
+                    value: "https://example.com/audit-hook".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::WEBHOOK_QUEUE_DIR.to_string(),
+                    value: "/tmp/audit-queue".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(AUDIT_WEBHOOK_SUB_SYS.to_string(), webhook_section);
+
+        let mut mqtt_default = audit::DEFAULT_AUDIT_MQTT_KVS.clone();
+        mqtt_default.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        mqtt_default.insert(rustfs_config::MQTT_TOPIC.to_string(), "audit-events".to_string());
+        let mut mqtt_section = std::collections::HashMap::new();
+        mqtt_section.insert(DEFAULT_DELIMITER.to_string(), mqtt_default);
+        mqtt_section.insert(
+            "analytics".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::MQTT_BROKER.to_string(),
+                    value: "tcp://127.0.0.1:1883".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(AUDIT_MQTT_SUB_SYS.to_string(), mqtt_section);
+
+        let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+        let v: Value = serde_json::from_slice(&out).expect("output should be json");
+        let logger = v
+            .get("logger")
+            .and_then(Value::as_object)
+            .expect("logger object should be present");
+        let webhook = logger
+            .get("webhook")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("primary"))
+            .and_then(Value::as_object)
+            .expect("audit webhook target should be encoded");
+        assert_eq!(
+            webhook.get(rustfs_config::WEBHOOK_ENDPOINT).and_then(Value::as_str),
+            Some("https://example.com/audit-hook")
+        );
+        assert_eq!(webhook.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
+
+        let mqtt_default = logger
+            .get("mqtt")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("default"))
+            .and_then(Value::as_object)
+            .expect("audit mqtt default should be encoded");
+        assert_eq!(mqtt_default.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
+        assert_eq!(mqtt_default.get(rustfs_config::MQTT_TOPIC).and_then(Value::as_str), Some("audit-events"));
+    }
+
+    #[test]
     fn test_is_standard_object_server_config_detection() {
         let external = br#"{"version":"33","storageclass":{"standard":"EC:2","rrs":"EC:1"}}"#;
         assert!(is_standard_object_server_config(external));
@@ -1432,6 +2107,113 @@ mod tests {
             {"key":"scopes","value":"openid,profile,email"},
             {"key":"redirect_uri_dynamic","value":"on"}
           ]}
+        }"#;
+
+        let lhs = decode_server_config_blob(external).expect("decode external");
+        let rhs = decode_server_config_blob(legacy).expect("decode legacy");
+        assert!(configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[test]
+    fn test_configs_semantically_equal_accounts_for_notify() {
+        let external = br#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1","optimize":"availability"},
+          "notify":{
+            "webhook":{
+              "primary":{
+                "enable":true,
+                "endpoint":"https://example.com/hook"
+              }
+            }
+          }
+        }"#;
+        let legacy = br#"{
+          "storage_class":{"_":[
+            {"key":"standard","value":"EC:2"},
+            {"key":"rrs","value":"EC:1"},
+            {"key":"optimize","value":"availability"}
+          ]},
+          "notify_webhook":{
+            "_":[
+              {"key":"enable","value":"off"},
+              {"key":"endpoint","value":""},
+              {"key":"queue_limit","value":"100000"},
+              {"key":"queue_dir","value":"/opt/rustfs/events"},
+              {"key":"client_cert","value":""},
+              {"key":"client_key","value":""},
+              {"key":"comment","value":""},
+              {"key":"client_ca","value":""},
+              {"key":"skip_tls_verify","value":"off"}
+            ],
+            "primary":[
+              {"key":"enable","value":"on"},
+              {"key":"endpoint","value":"https://example.com/hook"}
+            ]
+          }
+        }"#;
+
+        let lhs = decode_server_config_blob(external).expect("decode external");
+        let rhs = decode_server_config_blob(legacy).expect("decode legacy");
+        assert!(configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[test]
+    fn test_configs_semantically_equal_detects_notify_changes() {
+        let lhs = decode_server_config_blob(
+            br#"{"version":"33","storageclass":{"standard":"EC:2","rrs":"EC:1"},"notify":{"webhook":{"primary":{"enable":true,"endpoint":"https://example.com/a"}}}}"#,
+        )
+        .expect("decode lhs");
+        let rhs = decode_server_config_blob(
+            br#"{"version":"33","storageclass":{"standard":"EC:2","rrs":"EC:1"},"notify":{"webhook":{"primary":{"enable":true,"endpoint":"https://example.com/b"}}}}"#,
+        )
+        .expect("decode rhs");
+
+        assert!(!configs_semantically_equal(&lhs, &rhs));
+    }
+
+    #[test]
+    fn test_configs_semantically_equal_accounts_for_audit() {
+        let external = br#"{
+          "version":"33",
+          "storageclass":{"standard":"EC:2","rrs":"EC:1","optimize":"availability"},
+          "logger":{
+            "webhook":{
+              "primary":{
+                "enable":true,
+                "endpoint":"https://example.com/audit-hook"
+              }
+            }
+          }
+        }"#;
+        let legacy = br#"{
+          "storage_class":{"_":[
+            {"key":"standard","value":"EC:2"},
+            {"key":"rrs","value":"EC:1"},
+            {"key":"optimize","value":"availability"}
+          ]},
+          "audit_webhook":{
+            "_":[
+              {"key":"enable","value":"off"},
+              {"key":"endpoint","value":""},
+              {"key":"auth_token","value":""},
+              {"key":"client_cert","value":""},
+              {"key":"client_key","value":""},
+              {"key":"client_ca","value":""},
+              {"key":"skip_tls_verify","value":"off"},
+              {"key":"batch_size","value":"1"},
+              {"key":"queue_limit","value":"100000"},
+              {"key":"queue_dir","value":"/opt/rustfs/events"},
+              {"key":"max_retry","value":"0"},
+              {"key":"retry_interval","value":"3s"},
+              {"key":"http_timeout","value":"5s"},
+              {"key":"comment","value":""}
+            ],
+            "primary":[
+              {"key":"enable","value":"on"},
+              {"key":"endpoint","value":"https://example.com/audit-hook"}
+            ]
+          }
         }"#;
 
         let lhs = decode_server_config_blob(external).expect("decode external");

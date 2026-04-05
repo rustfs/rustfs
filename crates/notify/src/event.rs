@@ -336,9 +336,21 @@ pub struct EventArgs {
 }
 
 impl EventArgs {
-    // Helper function to check if it is a copy request
+    /// True when the RustFS replication header is explicitly enabled (`true` or `1`).
+    ///
+    /// Only `x-rustfs-source-replication-request` is considered here. Many clients (including the
+    /// console) send `x-minio-source-replication-request` for MinIO compatibility; treating that
+    /// as replication would suppress webhooks on normal browser deletes. Storage still honors both
+    /// prefixes when parsing the typed HTTP headers for `ObjectOptions`.
     pub fn is_replication_request(&self) -> bool {
-        self.req_params.contains_key("x-rustfs-source-replication-request")
+        self.replication_header_value_true("x-rustfs-source-replication-request")
+    }
+
+    fn replication_header_value_true(&self, key: &str) -> bool {
+        self.req_params
+            .get(key)
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
     }
 }
 
@@ -522,5 +534,40 @@ mod tests {
         let glacier = event.glacier_event_data.expect("glacier event data should be present");
         assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
         assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+    }
+}
+
+#[cfg(test)]
+mod event_args_tests {
+    use super::EventArgs;
+    use hashbrown::HashMap;
+    use rustfs_ecstore::store_api::ObjectInfo;
+    use rustfs_s3_common::EventName;
+
+    fn args_with_headers(pairs: &[(&str, &str)]) -> EventArgs {
+        let mut req_params = HashMap::new();
+        for (k, v) in pairs {
+            req_params.insert((*k).to_string(), (*v).to_string());
+        }
+        EventArgs {
+            event_name: EventName::ObjectRemovedDelete,
+            bucket_name: "b".to_string(),
+            object: ObjectInfo::default(),
+            req_params,
+            resp_elements: HashMap::new(),
+            version_id: String::new(),
+            host: String::new(),
+            port: 0,
+            user_agent: String::new(),
+        }
+    }
+
+    #[test]
+    fn replication_request_requires_true_value() {
+        assert!(!args_with_headers(&[("x-rustfs-source-replication-request", "")]).is_replication_request());
+        assert!(!args_with_headers(&[("x-rustfs-source-replication-request", "false")]).is_replication_request());
+        assert!(args_with_headers(&[("x-rustfs-source-replication-request", "true")]).is_replication_request());
+        assert!(args_with_headers(&[("x-rustfs-source-replication-request", "True")]).is_replication_request());
+        assert!(!args_with_headers(&[("x-minio-source-replication-request", "true")]).is_replication_request());
     }
 }

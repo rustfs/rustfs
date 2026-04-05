@@ -19,7 +19,7 @@ use crate::store_api::{
 };
 use bytes::Bytes;
 use rustfs_rio::{
-    BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, Reader, TryGetIndex, WarpReader,
+    BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex,
 };
 use std::io::Cursor;
 use std::pin::Pin;
@@ -63,9 +63,6 @@ impl<R: AsyncRead + Unpin + Send + Sync> BlockReadable for IndexedDataMovementRe
         Box::pin(rustfs_utils::read_full(self, buf))
     }
 }
-
-impl<R: AsyncRead + Unpin + Send + Sync> Reader for IndexedDataMovementReader<R> {}
-
 pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     let bytes = index?;
     let mut decoded = Index::new();
@@ -85,8 +82,8 @@ pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: O
         None
     };
 
-    let reader = IndexedDataMovementReader::new(WarpReader::new(Cursor::new(chunk)), index);
-    let hash_reader = HashReader::new(Box::new(reader), size, actual_size, None, sha256hex, false)?;
+    let reader = IndexedDataMovementReader::new(Cursor::new(chunk), index);
+    let hash_reader = HashReader::from_reader(reader, size, actual_size, None, sha256hex, false)?;
     Ok(ChunkNativePutData::new(hash_reader))
 }
 
@@ -265,8 +262,8 @@ pub(crate) async fn migrate_object(
         .parts
         .first()
         .and_then(|part| decode_part_index(part.index.as_ref()));
-    let reader = IndexedDataMovementReader::new(WarpReader::new(BufReader::new(rd.stream)), index);
-    let hrd = HashReader::new(Box::new(reader), object_info.size, actual_size, object_info.etag.clone(), None, false)?;
+    let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
+    let hrd = HashReader::from_reader(reader, object_info.size, actual_size, object_info.etag.clone(), None, false)?;
     let mut data = ChunkNativePutData::new(hrd);
 
     if let Err(err) = store

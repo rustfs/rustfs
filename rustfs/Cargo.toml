@@ -47,6 +47,7 @@ webdav = ["rustfs-protocols/webdav"]
 license = []
 direct-io = []  # Aligned direct I/O reader support (uses aligned pread, does not set O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
+tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
 manual-test-runners = []
 

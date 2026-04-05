@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::{
-    Effect, Error as IamError, Functions, ID, Statement, action::Action, statement::BPStatement,
-    statement::variable_resolver_for_policy_args,
+    ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
+    statement::BPStatement, statement::variable_resolver_for_policy_args,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -241,29 +241,35 @@ impl Validator for BucketPolicy {
 
 fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
     let mut s = HashSet::new();
-    if let Some(pname) = claims.get(claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(pname) => {
+            if let Some(pnames) = pname.as_array() {
+                for pname in pnames {
+                    if let Some(pname_str) = pname.as_str() {
+                        for pname in pname_str.split(',') {
+                            let pname = pname.trim();
+                            if !pname.is_empty() {
+                                s.insert(pname.to_string());
+                            }
                         }
                     }
                 }
+                return (s, true);
             }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
+
+            if let Some(pname_str) = pname.as_str() {
+                for pname in pname_str.split(',') {
+                    let pname = pname.trim();
+                    if !pname.is_empty() {
+                        s.insert(pname.to_string());
+                    }
                 }
+                return (s, true);
             }
-            return (s, true);
         }
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => {}
     }
+
     (s, false)
 }
 
@@ -1692,5 +1698,67 @@ mod test {
             bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_private).await,
             "principal and resource match should keep ExistingObjectTag fetch hint"
         );
+    }
+
+    #[test]
+    fn test_get_values_from_claims_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::Array(vec![Value::String("consoleAdmin".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICYMINIO");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyminio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_exact_match_preferred() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, _) = get_values_from_claims(&claims, "Policy");
+        assert!(policies.contains("exact_match"));
+        assert!(!policies.contains("lowercase"));
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_case_insensitive_string() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::String("consoleAdmin,readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+        assert!(policies.contains("readwrite"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::String("consoleAdmin".to_string()));
+        claims.insert("policy".to_string(), Value::String("readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
     }
 }

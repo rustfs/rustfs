@@ -35,6 +35,7 @@ pub use policy::*;
 pub use principal::Principal;
 pub use resource::ResourceSet;
 pub use statement::Statement;
+pub use utils::{ClaimLookup, get_claim_case_insensitive};
 
 #[derive(thiserror::Error, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]

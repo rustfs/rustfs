@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compress_index::{Index, TryGetIndex};
-use crate::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, HashReaderMut, Reader};
+use crate::{BlockReadable, BoxReadBlockFuture, Reader};
 use pin_project_lite::pin_project;
 use std::io::{Error, Result};
 use std::pin::Pin;
@@ -21,20 +20,23 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 pin_project! {
-    pub struct HardLimitReader {
+    pub struct HardLimitReader<R> {
         #[pin]
-        pub inner: Box<dyn Reader>,
+        pub inner: R,
         remaining: i64,
     }
 }
 
-impl HardLimitReader {
-    pub fn new(inner: Box<dyn Reader>, limit: i64) -> Self {
+impl<R> HardLimitReader<R> {
+    pub fn new(inner: R, limit: i64) -> Self {
         HardLimitReader { inner, remaining: limit }
     }
 }
 
-impl AsyncRead for HardLimitReader {
+impl<R> AsyncRead for HardLimitReader<R>
+where
+    R: AsyncRead,
+{
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
         if self.remaining < 0 {
             return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
@@ -49,8 +51,8 @@ impl AsyncRead for HardLimitReader {
         if let Poll::Ready(Ok(())) = &poll {
             let after = buf.filled().len();
             let read = (after - before) as i64;
-            self.remaining -= read;
-            if self.remaining < 0 {
+            *this.remaining -= read;
+            if *this.remaining < 0 {
                 return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
             }
         }
@@ -58,28 +60,12 @@ impl AsyncRead for HardLimitReader {
     }
 }
 
-impl EtagResolvable for HardLimitReader {
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
+delegate_reader_capabilities_generic!(HardLimitReader<R>, inner);
 
-impl HashReaderDetector for HardLimitReader {
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
-
-impl TryGetIndex for HardLimitReader {
-    fn try_get_index(&self) -> Option<&Index> {
-        self.inner.try_get_index()
-    }
-}
-
-impl BlockReadable for HardLimitReader {
+impl<R> BlockReadable for HardLimitReader<R>
+where
+    R: Reader,
+{
     fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
         Box::pin(async move {
             if self.remaining < 0 {
@@ -119,9 +105,8 @@ impl BlockReadable for HardLimitReader {
 mod tests {
     use std::vec;
 
-    use crate::WarpReader;
-
     use super::*;
+    use crate::{BlockReadable, WarpReader};
     use rustfs_utils::read_full;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -129,7 +114,6 @@ mod tests {
     async fn test_hardlimit_reader_normal() {
         let data = b"hello world";
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
         let hardlimit = HardLimitReader::new(reader, 20);
         let mut r = hardlimit;
         let mut buf = Vec::new();
@@ -142,7 +126,6 @@ mod tests {
     async fn test_hardlimit_reader_exact_limit() {
         let data = b"1234567890";
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
         let hardlimit = HardLimitReader::new(reader, 10);
         let mut r = hardlimit;
         let mut buf = Vec::new();
@@ -155,7 +138,6 @@ mod tests {
     async fn test_hardlimit_reader_exceed_limit() {
         let data = b"abcdef";
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
         let hardlimit = HardLimitReader::new(reader, 3);
         let mut r = hardlimit;
         let mut buf = vec![0u8; 10];
@@ -180,7 +162,6 @@ mod tests {
     async fn test_hardlimit_reader_empty() {
         let data = b"";
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
         let hardlimit = HardLimitReader::new(reader, 5);
         let mut r = hardlimit;
         let mut buf = Vec::new();

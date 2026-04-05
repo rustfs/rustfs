@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::HashReaderDetector;
-use crate::HashReaderMut;
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{BlockReadable, BoxReadBlockFuture, EtagResolvable, Reader};
+use crate::{BlockReadable, BoxReadBlockFuture, Reader};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
@@ -26,39 +24,43 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
 
+const ENCRYPTION_BLOCK_SIZE: usize = 8 * 1024;
+
 pin_project! {
     /// A reader wrapper that encrypts data on the fly using AES-256-GCM.
     /// This is a demonstration. For production, use a secure and audited crypto library.
-    #[derive(Debug)]
     pub struct EncryptReader<R> {
         #[pin]
         pub inner: R,
-        key: [u8; 32],   // AES-256-GCM key
-        nonce: [u8; 12], // 96-bit nonce for GCM
+        cipher: Aes256Gcm,
+        base_nonce: [u8; 12], // 96-bit base nonce for GCM
         buffer: Vec<u8>,
         buffer_pos: usize,
+        read_buffer: Vec<u8>,
+        block_index: usize,
         finished: bool,
     }
 }
 
 impl<R> EncryptReader<R>
 where
-    R: Reader,
+    R: AsyncRead + Unpin + Send + Sync,
 {
     pub fn new(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
         Self {
             inner,
-            key,
-            nonce,
+            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
+            base_nonce: nonce,
             buffer: Vec::new(),
             buffer_pos: 0,
+            read_buffer: vec![0u8; ENCRYPTION_BLOCK_SIZE],
+            block_index: 0,
             finished: false,
         }
     }
 }
 
-fn encrypt_segment_bytes(key: &[u8; 32], nonce_bytes: &[u8; 12], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("key");
+fn encrypt_segment_bytes(cipher: &Aes256Gcm, nonce_bytes: &[u8; 12], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
     let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
     let plaintext_len = plaintext.len();
     let crc = {
@@ -116,7 +118,8 @@ where
     }
 
     fn encrypt_segment(&self, plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
-        encrypt_segment_bytes(&self.key, &self.nonce, plaintext)
+        let nonce = derive_block_nonce(&self.base_nonce, self.block_index);
+        encrypt_segment_bytes(&self.cipher, &nonce, plaintext)
     }
 }
 
@@ -140,10 +143,8 @@ where
         if *this.finished {
             return Poll::Ready(Ok(()));
         }
-        // Read a fixed block size from inner
-        let block_size = 8 * 1024;
-        let mut temp = vec![0u8; block_size];
-        let mut temp_buf = ReadBuf::new(&mut temp);
+        // Read a fixed block size from inner.
+        let mut temp_buf = ReadBuf::new(&mut this.read_buffer[..]);
         match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
@@ -160,8 +161,10 @@ where
                     *this.buffer_pos += to_copy;
                     Poll::Ready(Ok(()))
                 } else {
-                    *this.buffer = encrypt_segment_bytes(this.key, this.nonce, &temp_buf.filled()[..n])?;
+                    let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
+                    *this.buffer = encrypt_segment_bytes(this.cipher, &block_nonce, &this.read_buffer[..n])?;
                     *this.buffer_pos = 0;
+                    *this.block_index += 1;
                     let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
                     buf.put_slice(&this.buffer[..to_copy]);
                     *this.buffer_pos += to_copy;
@@ -173,27 +176,7 @@ where
     }
 }
 
-impl<R> EtagResolvable for EncryptReader<R>
-where
-    R: EtagResolvable,
-{
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
-
-impl<R> HashReaderDetector for EncryptReader<R>
-where
-    R: EtagResolvable + HashReaderDetector,
-{
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
+delegate_reader_capabilities_generic_no_index!(EncryptReader<R>, inner);
 
 impl<R> TryGetIndex for EncryptReader<R>
 where
@@ -251,15 +234,15 @@ where
 pin_project! {
     /// A reader wrapper that decrypts data on the fly using AES-256-GCM.
     /// This is a demonstration. For production, use a secure and audited crypto library.
-#[derive(Debug)]
     pub struct DecryptReader<R> {
         #[pin]
         pub inner: R,
-        key: [u8; 32],   // AES-256-GCM key
+        cipher: Aes256Gcm,
         base_nonce: [u8; 12], // Base nonce recorded in object metadata
-        current_nonce: [u8; 12], // Active nonce for the current encrypted segment
+        current_nonce_base: [u8; 12], // Active base nonce for the current encrypted segment
         multipart_mode: bool,
         current_part: usize,
+        block_index: usize,
         buffer: Vec<u8>,
         buffer_pos: usize,
         finished: bool,
@@ -267,7 +250,7 @@ pin_project! {
         header_buf: [u8; 8],
         header_read: usize,
         header_done: bool,
-        ciphertext_buf: Option<Vec<u8>>,
+        ciphertext_buf: Vec<u8>,
         ciphertext_read: usize,
         ciphertext_len: usize,
     }
@@ -275,23 +258,24 @@ pin_project! {
 
 impl<R> DecryptReader<R>
 where
-    R: Reader,
+    R: AsyncRead + Unpin + Send + Sync,
 {
     pub fn new(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
         Self {
             inner,
-            key,
+            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
             base_nonce: nonce,
-            current_nonce: nonce,
+            current_nonce_base: nonce,
             multipart_mode: false,
             current_part: 0,
+            block_index: 0,
             buffer: Vec::new(),
             buffer_pos: 0,
             finished: false,
             header_buf: [0u8; 8],
             header_read: 0,
             header_done: false,
-            ciphertext_buf: None,
+            ciphertext_buf: Vec::new(),
             ciphertext_read: 0,
             ciphertext_len: 0,
         }
@@ -305,18 +289,19 @@ where
 
         Self {
             inner,
-            key,
+            cipher: Aes256Gcm::new_from_slice(&key).expect("key"),
             base_nonce,
-            current_nonce: initial_nonce,
+            current_nonce_base: initial_nonce,
             multipart_mode: true,
             current_part: first_part,
+            block_index: 0,
             buffer: Vec::new(),
             buffer_pos: 0,
             finished: false,
             header_buf: [0u8; 8],
             header_read: 0,
             header_done: false,
-            ciphertext_buf: None,
+            ciphertext_buf: Vec::new(),
             ciphertext_read: 0,
             ciphertext_len: 0,
         }
@@ -398,15 +383,14 @@ where
                         "decrypt_reader: reached segment terminator, advancing to next part"
                     );
                     *this.current_part += 1;
-                    *this.current_nonce = derive_part_nonce(this.base_nonce, *this.current_part);
-                    this.ciphertext_buf.take();
+                    *this.current_nonce_base = derive_part_nonce(this.base_nonce, *this.current_part);
+                    *this.block_index = 0;
                     *this.ciphertext_read = 0;
                     *this.ciphertext_len = 0;
                     continue;
                 }
 
                 *this.finished = true;
-                this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
                 continue;
@@ -417,7 +401,6 @@ where
             if len == 0 {
                 tracing::warn!("encountered zero-length encrypted block, treating as end of stream");
                 *this.finished = true;
-                this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
                 continue;
@@ -428,15 +411,14 @@ where
                 return Poll::Ready(Err(Error::other("Invalid encrypted block length")));
             };
 
-            if this.ciphertext_buf.is_none() {
-                *this.ciphertext_buf = Some(vec![0u8; payload_len]);
-                *this.ciphertext_len = payload_len;
-                *this.ciphertext_read = 0;
+            if this.ciphertext_buf.len() < payload_len {
+                this.ciphertext_buf.resize(payload_len, 0);
             }
+            *this.ciphertext_len = payload_len;
+            *this.ciphertext_read = 0;
 
-            let ciphertext_buf = this.ciphertext_buf.as_mut().unwrap();
             while *this.ciphertext_read < *this.ciphertext_len {
-                let mut temp_buf = ReadBuf::new(&mut ciphertext_buf[*this.ciphertext_read..]);
+                let mut temp_buf = ReadBuf::new(&mut this.ciphertext_buf[*this.ciphertext_read..*this.ciphertext_len]);
                 match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(())) => {
@@ -450,7 +432,6 @@ where
                         *this.ciphertext_read += n;
                     }
                     Poll::Ready(Err(e)) => {
-                        this.ciphertext_buf.take();
                         *this.ciphertext_read = 0;
                         *this.ciphertext_len = 0;
                         return Poll::Ready(Err(e));
@@ -462,14 +443,37 @@ where
                 return Poll::Pending;
             }
 
+            let ciphertext_buf = &this.ciphertext_buf[..*this.ciphertext_len];
             let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(&ciphertext_buf[0..16]);
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
+            let block_nonce = derive_block_nonce(this.current_nonce_base, *this.block_index);
+            let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+            let legacy_part_nonce = if *this.multipart_mode {
+                derive_legacy_part_nonce(this.base_nonce, *this.current_part)
+            } else {
+                *this.base_nonce
+            };
+            let legacy_block_nonce = derive_block_nonce(&legacy_part_nonce, *this.block_index);
+            let plaintext = match this.cipher.decrypt(&nonce, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(primary_err) => {
+                    let legacy_nonce =
+                        Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
 
-            let cipher = Aes256Gcm::new_from_slice(this.key).expect("key");
-            let nonce = Nonce::try_from(this.current_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
-            let plaintext = cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| Error::other(format!("decrypt error: {e}")))?;
+                    match this.cipher.decrypt(&legacy_nonce, ciphertext) {
+                        Ok(plaintext) => plaintext,
+                        Err(_) => {
+                            // Accept previously written streams that reused the part nonce
+                            // for every block inside a segment.
+                            let legacy_part_nonce = Nonce::try_from(legacy_part_nonce.as_slice())
+                                .map_err(|_| Error::other("invalid nonce length"))?;
+                            this.cipher
+                                .decrypt(&legacy_part_nonce, ciphertext)
+                                .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
+                        }
+                    }
+                }
+            };
 
             debug!(
                 part = *this.current_part,
@@ -478,7 +482,6 @@ where
             );
 
             if plaintext.len() != plaintext_len as usize {
-                this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
                 return Poll::Ready(Err(Error::other("Plaintext length mismatch")));
@@ -490,7 +493,6 @@ where
                 hasher.finalize() as u32
             };
             if actual_crc != crc {
-                this.ciphertext_buf.take();
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
                 return Poll::Ready(Err(Error::other("CRC32 mismatch")));
@@ -498,7 +500,7 @@ where
 
             *this.buffer = plaintext;
             *this.buffer_pos = 0;
-            this.ciphertext_buf.take();
+            *this.block_index += 1;
             *this.ciphertext_read = 0;
             *this.ciphertext_len = 0;
 
@@ -510,27 +512,7 @@ where
     }
 }
 
-impl<R> EtagResolvable for DecryptReader<R>
-where
-    R: EtagResolvable,
-{
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
-
-impl<R> HashReaderDetector for DecryptReader<R>
-where
-    R: EtagResolvable + HashReaderDetector,
-{
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
+delegate_reader_capabilities_generic_no_index!(DecryptReader<R>, inner);
 
 impl<R> TryGetIndex for DecryptReader<R>
 where
@@ -541,18 +523,32 @@ where
     }
 }
 
+fn derive_block_nonce(base: &[u8; 12], block_index: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, block_index)
+}
+
 fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 4, part_number)
+}
+
+fn derive_legacy_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
+    derive_nonce_offset(base, 8, part_number)
+}
+
+fn derive_nonce_offset(base: &[u8; 12], start: usize, offset: usize) -> [u8; 12] {
     let mut nonce = *base;
     let mut suffix = [0u8; 4];
-    suffix.copy_from_slice(&nonce[8..12]);
+    suffix.copy_from_slice(&nonce[start..start + 4]);
     let current = u32::from_be_bytes(suffix);
-    let next = current.wrapping_add(part_number as u32);
-    nonce[8..12].copy_from_slice(&next.to_be_bytes());
+    let next = current.wrapping_add(offset as u32);
+    nonce[start..start + 4].copy_from_slice(&next.to_be_bytes());
     nonce
 }
 
 #[cfg(test)]
 mod tests {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use std::io::Cursor;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -599,6 +595,73 @@ mod tests {
         }
     }
 
+    fn encrypt_with_legacy_nonce_reuse(data: &[u8], key: [u8; 32], nonce: [u8; 12]) -> Vec<u8> {
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("valid key");
+        let nonce = Nonce::try_from(nonce.as_slice()).expect("valid nonce");
+        let mut encrypted = Vec::new();
+
+        for chunk in data.chunks(ENCRYPTION_BLOCK_SIZE) {
+            let crc = {
+                let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                hasher.update(chunk);
+                hasher.finalize() as u32
+            };
+            let ciphertext = cipher.encrypt(&nonce, chunk).expect("legacy encrypt");
+            let int_len = put_uvarint_len(chunk.len() as u64);
+            let clen = int_len + ciphertext.len() + 4;
+            let mut header = [0u8; 8];
+            header[1] = (clen & 0xFF) as u8;
+            header[2] = ((clen >> 8) & 0xFF) as u8;
+            header[3] = ((clen >> 16) & 0xFF) as u8;
+            header[4] = (crc & 0xFF) as u8;
+            header[5] = ((crc >> 8) & 0xFF) as u8;
+            header[6] = ((crc >> 16) & 0xFF) as u8;
+            header[7] = ((crc >> 24) & 0xFF) as u8;
+            encrypted.extend_from_slice(&header);
+            let mut plaintext_len_buf = [0u8; 10];
+            let encoded_len = put_uvarint(&mut plaintext_len_buf, chunk.len() as u64);
+            encrypted.extend_from_slice(&plaintext_len_buf[..encoded_len]);
+            encrypted.extend_from_slice(&ciphertext);
+        }
+
+        encrypted.extend_from_slice(&[0xFF, 0, 0, 0, 0, 0, 0, 0]);
+        encrypted
+    }
+
+    async fn encrypt_part_with_legacy_nonce_layout(
+        data: &[u8],
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        part_number: usize,
+    ) -> Vec<u8> {
+        let nonce = derive_legacy_part_nonce(&base_nonce, part_number);
+        let reader = BufReader::new(Cursor::new(data.to_vec()));
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypted
+    }
+
+    fn extract_encrypted_payloads(encrypted: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        let mut pos = 0;
+
+        while pos + 8 <= encrypted.len() {
+            let header = &encrypted[pos..pos + 8];
+            pos += 8;
+            if header[0] == 0xFF {
+                break;
+            }
+
+            let len = (header[1] as usize) | ((header[2] as usize) << 8) | ((header[3] as usize) << 16);
+            let payload_len = len - 4;
+            payloads.push(encrypted[pos..pos + payload_len].to_vec());
+            pos += payload_len;
+        }
+
+        payloads
+    }
+
     #[tokio::test]
     async fn test_encrypt_decrypt_reader_aes256gcm() {
         let data = b"hello sse encrypt";
@@ -608,7 +671,7 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = BufReader::new(&data[..]);
-        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let encrypt_reader = EncryptReader::new(reader, key, nonce);
 
         // Encrypt
         let mut encrypt_reader = encrypt_reader;
@@ -617,7 +680,7 @@ mod tests {
 
         // Decrypt using DecryptReader
         let reader = Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -636,7 +699,7 @@ mod tests {
 
         // Encrypt
         let reader = BufReader::new(&data[..]);
-        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
@@ -644,7 +707,7 @@ mod tests {
         // Now test DecryptReader
 
         let reader = Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -664,13 +727,13 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = std::io::Cursor::new(data.clone());
-        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = std::io::Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -718,12 +781,12 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = Cursor::new(data.clone());
-        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = ChunkedCursor::new(encrypted, 3);
-        let mut decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 
@@ -741,12 +804,12 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = Cursor::new(data.clone());
-        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = ChunkedCursor::new(encrypted, 8192);
-        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
+        let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut stream = ReaderStream::with_capacity(Box::new(decrypt_reader), 262_144);
 
         let mut decrypted = Vec::new();
@@ -769,13 +832,13 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = Cursor::new(data.clone());
-        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = ChunkedCursor::new(encrypted, 8192);
-        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
-        let limit_reader = HardLimitReader::new(Box::new(decrypt_reader), size as i64);
+        let decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let limit_reader = HardLimitReader::new(decrypt_reader, size as i64);
         let mut stream = ReaderStream::with_capacity(Box::new(limit_reader), 262_144);
 
         let mut decrypted = Vec::new();
@@ -800,7 +863,7 @@ mod tests {
         async fn encrypt_part(data: &[u8], key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Vec<u8> {
             let nonce = derive_part_nonce(&base_nonce, part_number);
             let reader = BufReader::new(Cursor::new(data.to_vec()));
-            let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
+            let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
             let mut encrypted = Vec::new();
             encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
             encrypted
@@ -814,7 +877,81 @@ mod tests {
         combined.extend_from_slice(&encrypted_two);
 
         let reader = BufReader::new(Cursor::new(combined));
-        let mut decrypt_reader = DecryptReader::new_multipart(WarpReader::new(reader), key, base_nonce);
+        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
+        expected.extend_from_slice(&part_one);
+        expected.extend_from_slice(&part_two);
+
+        assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_reader_uses_distinct_nonces_per_block() {
+        let data = vec![0xAB; ENCRYPTION_BLOCK_SIZE * 2];
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let reader = Cursor::new(data);
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+
+        let payloads = extract_encrypted_payloads(&encrypted);
+        assert!(payloads.len() >= 2);
+        assert_ne!(payloads[0], payloads[1]);
+    }
+
+    #[test]
+    fn test_part_and_block_nonces_do_not_collide_across_parts() {
+        let base_nonce = [0u8; 12];
+        let part_one_block_one = derive_block_nonce(&derive_part_nonce(&base_nonce, 1), 1);
+        let part_two_block_zero = derive_block_nonce(&derive_part_nonce(&base_nonce, 2), 0);
+
+        assert_ne!(part_one_block_one, part_two_block_zero);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_accepts_legacy_single_nonce_streams() {
+        let mut data = vec![0u8; ENCRYPTION_BLOCK_SIZE * 3 + 17];
+        rand::rng().fill(&mut data[..]);
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let encrypted = encrypt_with_legacy_nonce_reuse(&data, key, nonce);
+        let reader = Cursor::new(encrypted);
+        let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_accepts_legacy_multipart_nonce_layout() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let part_one = vec![0x11; ENCRYPTION_BLOCK_SIZE + 97];
+        let part_two = vec![0x22; ENCRYPTION_BLOCK_SIZE + 33];
+
+        let encrypted_one = encrypt_part_with_legacy_nonce_layout(&part_one, key, base_nonce, 1).await;
+        let encrypted_two = encrypt_part_with_legacy_nonce_layout(&part_two, key, base_nonce, 2).await;
+
+        let mut combined = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        combined.extend_from_slice(&encrypted_one);
+        combined.extend_from_slice(&encrypted_two);
+
+        let reader = BufReader::new(Cursor::new(combined));
+        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce);
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 

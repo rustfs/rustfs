@@ -586,7 +586,7 @@ impl DefaultObjectUsecase {
 
     fn spawn_cache_invalidation(bucket: String, key: String, version_id: Option<String>) {
         let manager = get_concurrency_manager();
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             manager.invalidate_cache_versioned(&bucket, &key, version_id.as_deref()).await;
         });
     }
@@ -977,7 +977,7 @@ impl DefaultObjectUsecase {
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
@@ -1022,7 +1022,12 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let bootstrap = init_get_object_bootstrap(&req.input.bucket, &req.input.key)?;
+        let request_id = req
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+        let bootstrap = init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let request_context = prepare_get_object_request_context(&req).await?;
         let base_buffer_size = self.base_buffer_size();
         let manager = get_concurrency_manager();
@@ -1978,7 +1983,7 @@ impl DefaultObjectUsecase {
         let manager = get_concurrency_manager();
         let bucket_clone = bucket.clone();
         let deleted_objects = dobjs.clone();
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             for dobj in deleted_objects {
                 manager
                     .invalidate_cache_versioned(
@@ -2091,7 +2096,7 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        tokio::spawn(async move {
+        crate::storage::helper::spawn_background(async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -2263,7 +2268,19 @@ impl DefaultObjectUsecase {
                 })
                 .await;
             }
-            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            helper = helper
+                .event_name(EventName::ObjectRemovedDelete)
+                .object(ObjectInfo {
+                    name: key.clone(),
+                    bucket: bucket.clone(),
+                    ..Default::default()
+                })
+                .version_id(String::new());
+            let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+            let _ = helper.complete(&result);
+            return result;
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
@@ -2367,7 +2384,7 @@ impl DefaultObjectUsecase {
         let version_id_clone = version_id.clone();
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
@@ -2879,7 +2896,7 @@ impl DefaultObjectUsecase {
         let rreq_clone = rreq.clone();
         let version_id_clone = version_id.clone();
 
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
@@ -2900,8 +2917,6 @@ impl DefaultObjectUsecase {
                     object_clone,
                     err.to_string()
                 );
-                // Note: Errors from background tasks cannot be returned to client
-                // Consider adding to monitoring/metrics system
             } else {
                 info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
             }
@@ -2974,7 +2989,7 @@ impl DefaultObjectUsecase {
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
         let stream = ReceiverStream::new(rx);
-        tokio::spawn(async move {
+        crate::storage::request_context::spawn_traced(async move {
             let _ = tx
                 .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
                 .await;

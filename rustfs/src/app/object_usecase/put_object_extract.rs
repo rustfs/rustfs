@@ -130,9 +130,8 @@ impl DefaultObjectUsecase {
         let sha256hex = get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref());
         let actual_size = size;
 
-        let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
-        let mut archive_reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut archive_reader =
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) =
             archive_reader.add_checksum_from_s3s(&request_context.headers, request_context.trailing_headers.clone(), false)
@@ -168,6 +167,10 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&request_context.headers);
         let port = get_request_port(&request_context.headers);
         let user_agent = get_request_user_agent(&request_context.headers);
+        let tracing_context = request_context
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .cloned();
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -229,30 +232,38 @@ impl DefaultObjectUsecase {
 
             debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
-            let mut reader: Box<dyn Reader> = if is_dir {
+            if is_dir {
                 if extract_options.ignore_dirs {
                     debug!("Skipping directory entry during archive extract: {}", fpath);
                     continue;
                 }
                 size = 0;
-                Box::new(WarpReader::new(std::io::Cursor::new(Vec::new())))
-            } else {
-                Box::new(WarpReader::new(f))
-            };
+            }
 
             let actual_size = size;
+            let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
 
-            if !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+            let mut hrd = if is_dir {
+                HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
+                    .map_err(ApiError::from)?
+            } else if should_compress {
                 insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-                let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-
-                reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+                let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
                 size = HashReader::SIZE_PRESERVE_LAYER;
-            }
-
-            let mut hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                HashReader::from_reader(
+                    CompressReader::new(hrd, CompressionAlgorithm::default()),
+                    size,
+                    actual_size,
+                    None,
+                    None,
+                    false,
+                )
+                .map_err(ApiError::from)?
+            } else {
+                HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
+            };
             apply_put_request_object_lock_opts(
                 &bucket,
                 object_lock_legal_hold_status.clone(),
@@ -280,7 +291,7 @@ impl DefaultObjectUsecase {
                 effective_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(hrd);
-                hrd = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                     .map_err(ApiError::from)?;
 
                 let encryption_metadata = material.metadata;
@@ -304,7 +315,7 @@ impl DefaultObjectUsecase {
             let manager = get_concurrency_manager();
             let fpath_clone = fpath.clone();
             let bucket_clone = bucket.clone();
-            tokio::spawn(async move {
+            crate::storage::request_context::spawn_traced(async move {
                 manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
             });
 
@@ -317,6 +328,7 @@ impl DefaultObjectUsecase {
 
             spawn_put_extract_notification(
                 notify.clone(),
+                tracing_context.clone(),
                 bucket.clone(),
                 req_params.clone(),
                 version_id.clone(),

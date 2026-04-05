@@ -15,6 +15,7 @@
 use rustfs_audit::*;
 use rustfs_ecstore::config::{Config, KVS};
 use std::collections::HashMap;
+use temp_env::with_vars;
 
 #[tokio::test]
 async fn test_audit_system_creation() {
@@ -35,34 +36,42 @@ async fn test_config_parsing_webhook() {
     let mut config = Config(HashMap::new());
     let mut audit_webhook_section = HashMap::new();
 
-    // Create default configuration
     let mut default_kvs = KVS::new();
-    default_kvs.insert("enable".to_string(), "on".to_string());
-    default_kvs.insert("endpoint".to_string(), "http://localhost:3020/webhook".to_string());
-
+    default_kvs.insert("enable".to_string(), "off".to_string());
+    default_kvs.insert("endpoint".to_string(), "".to_string());
     audit_webhook_section.insert("_".to_string(), default_kvs);
+    let mut instance_kvs = KVS::new();
+    instance_kvs.insert("enable".to_string(), "on".to_string());
+    instance_kvs.insert("endpoint".to_string(), "http://localhost:3020/webhook".to_string());
+    audit_webhook_section.insert("primary".to_string(), instance_kvs);
     config.0.insert("audit_webhook".to_string(), audit_webhook_section);
 
     let registry = AuditRegistry::new();
 
-    // This should not fail even if server storage is not initialized
-    // as it's an integration test
     let result = registry.create_audit_targets_from_config(&config).await;
+    assert!(result.is_ok(), "audit target creation should not require server storage");
+}
 
-    // We expect this to fail due to server storage not being initialized
-    // but the parsing should work correctly
-    match result {
-        Err(AuditError::StorageNotAvailable(_)) => {
-            // This is expected in test environment
-        }
-        Err(e) => {
-            // Other errors might indicate parsing issues
-            println!("Unexpected error: {e}");
-        }
-        Ok(_) => {
-            // Unexpected success in test environment without server storage
-        }
-    }
+#[test]
+fn test_env_only_audit_target_does_not_require_server_storage() {
+    with_vars(
+        [
+            ("RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY", Some("on")),
+            ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", Some("http://localhost:3020/webhook")),
+        ],
+        || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime");
+            runtime.block_on(async {
+                let config = Config(HashMap::new());
+                let registry = AuditRegistry::new();
+                let result = registry.create_audit_targets_from_config(&config).await;
+                assert!(result.is_ok(), "env-only audit target creation should not require server storage");
+            });
+        },
+    )
 }
 
 #[test]

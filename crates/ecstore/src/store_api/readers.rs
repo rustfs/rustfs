@@ -25,17 +25,7 @@ impl ChunkNativePutData {
         } else {
             None
         };
-        Self::new(
-            HashReader::new(
-                Box::new(WarpReader::new(Cursor::new(data))),
-                content_length,
-                content_length,
-                None,
-                sha256hex,
-                false,
-            )
-            .unwrap(),
-        )
+        Self::new(HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap())
     }
 
     pub fn take_stream(&mut self) -> std::io::Result<HashReader> {

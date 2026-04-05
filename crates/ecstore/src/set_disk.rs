@@ -76,9 +76,9 @@ use rustfs_filemeta::{
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
-use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
+use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _, WarpReader};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_common::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -963,6 +963,132 @@ impl ObjectIO for SetDisks {
     }
 }
 
+impl SetDisks {
+    async fn acquire_dist_delete_object_locks_batch(
+        &self,
+        batch: &rustfs_lock::BatchLockRequest,
+    ) -> (HashMap<(String, String), String>, HashSet<String>, Vec<Vec<rustfs_lock::LockId>>) {
+        let requests: Vec<rustfs_lock::LockRequest> = batch
+            .requests
+            .iter()
+            .map(|req| {
+                rustfs_lock::LockRequest::new(req.key.clone(), rustfs_lock::LockType::Exclusive, self.locker_owner.clone())
+                    .with_acquire_timeout(get_lock_acquire_timeout())
+                    .with_ttl(rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT)
+            })
+            .collect();
+
+        let write_quorum = if self.lockers.len() > 1 {
+            (self.lockers.len() / 2) + 1
+        } else {
+            1
+        };
+
+        let client_results = join_all(self.lockers.iter().cloned().enumerate().map(|(client_idx, client)| {
+            let requests = requests.clone();
+            async move { (client_idx, client.acquire_locks_batch(&requests).await) }
+        }))
+        .await;
+
+        let mut lock_ids_by_object: Vec<Vec<(usize, rustfs_lock::LockId)>> = vec![Vec::new(); requests.len()];
+        let mut errors_by_object: Vec<Option<String>> = vec![None; requests.len()];
+
+        for (client_idx, result) in client_results {
+            match result {
+                Ok(responses) => {
+                    for (req_idx, request) in requests.iter().enumerate() {
+                        match responses.get(req_idx) {
+                            Some(response) if response.success => {
+                                if let Some(lock_info) = response.lock_info.as_ref() {
+                                    lock_ids_by_object[req_idx].push((client_idx, lock_info.id.clone()));
+                                } else if errors_by_object[req_idx].is_none() {
+                                    errors_by_object[req_idx] = Some(format!(
+                                        "missing distributed lock id for {}/{}",
+                                        request.resource.bucket, request.resource.object
+                                    ));
+                                }
+                            }
+                            Some(response) => {
+                                if errors_by_object[req_idx].is_none() {
+                                    errors_by_object[req_idx] = Some(
+                                        response
+                                            .error
+                                            .clone()
+                                            .unwrap_or_else(|| "distributed lock acquisition failed".to_string()),
+                                    );
+                                }
+                            }
+                            None => {
+                                if errors_by_object[req_idx].is_none() {
+                                    errors_by_object[req_idx] =
+                                        Some(format!("client {client_idx} returned incomplete batch lock response"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    for error in errors_by_object.iter_mut().take(requests.len()) {
+                        if error.is_none() {
+                            *error = Some(format!("client {client_idx} batch lock request failed: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut failed_map = HashMap::new();
+        let mut locked_objects = HashSet::new();
+        let mut held_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
+        let mut rollback_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
+
+        for (req_idx, req) in batch.requests.iter().enumerate() {
+            let success_count = lock_ids_by_object[req_idx].len();
+            if success_count >= write_quorum {
+                for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
+                    held_lock_ids_by_client[client_idx].push(lock_id);
+                }
+                locked_objects.insert(req.key.object.as_ref().to_string());
+            } else {
+                for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
+                    rollback_lock_ids_by_client[client_idx].push(lock_id);
+                }
+                failed_map.insert(
+                    (req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()),
+                    errors_by_object[req_idx].clone().unwrap_or_else(|| {
+                        format!("failed to acquire distributed delete lock quorum: {success_count}/{write_quorum}")
+                    }),
+                );
+            }
+        }
+
+        self.release_dist_delete_object_locks_batch(rollback_lock_ids_by_client).await;
+
+        (failed_map, locked_objects, held_lock_ids_by_client)
+    }
+
+    async fn release_dist_delete_object_locks_batch(&self, lock_ids_by_client: Vec<Vec<rustfs_lock::LockId>>) {
+        join_all(self.lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
+            let lock_ids = lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
+            if lock_ids.is_empty() {
+                None
+            } else {
+                Some(async move {
+                    if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                        tracing::warn!(
+                            client_idx,
+                            lock_count = lock_ids.len(),
+                            "failed to release distributed delete locks in batch: {}",
+                            err
+                        );
+                    }
+                })
+            }
+        }))
+        .await;
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
     #[tracing::instrument(skip(self))]
@@ -1241,27 +1367,25 @@ impl ObjectOperations for SetDisks {
         }
 
         let mut failed_map = HashMap::new();
-        let mut batch_guards = Vec::with_capacity(batch.requests.len());
-
+        let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        for req in batch.requests.iter() {
-            let ns_lock = match self.new_ns_lock(req.key.bucket.as_ref(), req.key.object.as_ref()).await {
-                Ok(ns_lock) => ns_lock,
-                Err(e) => {
-                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
-                    continue;
-                }
-            };
-            let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
-                Ok(lock_guard) => lock_guard,
-                Err(e) => {
-                    failed_map.insert((req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()), e.to_string());
-                    continue;
-                }
-            };
-            batch_guards.push(_lock_guard);
-            locked_objects.insert(req.key.object.as_ref().to_string());
+        let dist_erasure = is_dist_erasure().await;
+        let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
+
+        if dist_erasure {
+            (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
+        } else {
+            let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
+            _local_batch_guards = batch_result.guards;
+
+            for key in batch_result.successful_locks {
+                locked_objects.insert(key.object.as_ref().to_string());
+            }
+
+            for (key, err) in batch_result.failed_locks {
+                failed_map.insert((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), format!("{err:?}"));
+            }
         }
 
         // Mark failures for objects that could not be locked
@@ -1426,6 +1550,10 @@ impl ObjectOperations for SetDisks {
         }
 
         // TODO: add_partial
+
+        if dist_erasure {
+            self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
+        }
 
         (del_objects, del_errs)
     }
@@ -1963,14 +2091,7 @@ impl ObjectOperations for SetDisks {
             }
             let gr = gr.unwrap();
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                gr.object_info.size,
-                gr.object_info.size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
             let mut p_reader = ChunkNativePutData::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
@@ -2038,14 +2159,7 @@ impl ObjectOperations for SetDisks {
                 }
             };
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::new(
-                Box::new(WarpReader::new(reader)),
-                part_info.actual_size,
-                part_info.actual_size,
-                None,
-                None,
-                false,
-            )?;
+            let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
             let mut p_reader = ChunkNativePutData::new(hash_reader);
             let p_info = self_
                 .clone()
@@ -4273,6 +4387,81 @@ mod tests {
             err_str.contains("quorum") || err_str.contains("not reached"),
             "expected quorum error, got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager1 = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager2 = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let client1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager1.clone()));
+        let client2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager2.clone()));
+        let set_disks = make_test_set_disks(vec![client1, client2]).await;
+
+        let batch = rustfs_lock::BatchLockRequest::new(set_disks.locker_owner.as_str())
+            .with_all_or_nothing(false)
+            .add_write_lock(ObjectKey::new("bucket", "object-a"))
+            .add_write_lock(ObjectKey::new("bucket", "object-b"));
+
+        let (failed_map, locked_objects, held_lock_ids_by_client) =
+            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+
+        assert!(failed_map.is_empty());
+        assert_eq!(locked_objects.len(), 2);
+        assert!(locked_objects.contains("object-a"));
+        assert!(locked_objects.contains("object-b"));
+        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), batch.requests.len() * 2);
+
+        set_disks
+            .release_dist_delete_object_locks_batch(held_lock_ids_by_client)
+            .await;
+
+        let local_lock_1 = NamespaceLock::with_local_manager("node-1".to_string(), manager1);
+        let local_lock_2 = NamespaceLock::with_local_manager("node-2".to_string(), manager2);
+
+        let guard_1 = local_lock_1
+            .get_write_lock(ObjectKey::new("bucket", "object-a"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("released batch lock should free node 1");
+        let guard_2 = local_lock_2
+            .get_write_lock(ObjectKey::new("bucket", "object-b"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("released batch lock should free node 2");
+
+        drop(guard_1);
+        drop(guard_2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_acquire_dist_delete_object_locks_batch_rolls_back_when_quorum_not_reached() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager.clone()));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_client, failing_client]).await;
+
+        let batch = rustfs_lock::BatchLockRequest::new(set_disks.locker_owner.as_str())
+            .with_all_or_nothing(false)
+            .add_write_lock(ObjectKey::new("bucket", "object-a"));
+
+        let (failed_map, locked_objects, held_lock_ids_by_client) =
+            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+
+        assert!(locked_objects.is_empty());
+        assert!(failed_map.contains_key(&("bucket".to_string(), "object-a".to_string())));
+        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
+
+        let local_lock = NamespaceLock::with_local_manager("node-1".to_string(), manager);
+        let guard = local_lock
+            .get_write_lock(ObjectKey::new("bucket", "object-a"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("quorum rollback should release the healthy node lock");
+
+        drop(guard);
     }
 
     #[test]
