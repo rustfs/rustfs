@@ -25,6 +25,8 @@ use rustfs_object_io::put::{
 use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
 
 const DEFAULT_SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
+const ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES: &str = "RUSTFS_PUT_SMALL_EAGER_MAX_BYTES";
+const ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER: &str = "RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER";
 
 fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
     [
@@ -46,6 +48,14 @@ fn clamp_small_put_eager_max_bytes(inline_object_limit_bytes: Option<usize>) -> 
         .min(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES as usize) as i64
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    rustfs_utils::get_env_opt_bool(name).unwrap_or(false)
+}
+
+fn env_non_negative_i64(name: &str) -> Option<i64> {
+    rustfs_utils::get_env_opt_i64(name).filter(|value| *value >= 0)
+}
+
 fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECStore, versioned: bool) -> i64 {
     let Some(first_pool) = store.pools.first() else {
         return DEFAULT_SMALL_PUT_EAGER_MAX_BYTES;
@@ -61,6 +71,16 @@ fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECSto
         .map(|config| config.inline_object_limit_bytes(data_shards, versioned));
 
     clamp_small_put_eager_max_bytes(inline_object_limit)
+}
+
+fn resolved_small_put_eager_max_bytes(default_max_bytes: i64) -> i64 {
+    if env_flag_enabled(ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER) {
+        return 0;
+    }
+
+    env_non_negative_i64(ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES)
+        .map(|value| value.min(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES).min(default_max_bytes))
+        .unwrap_or(default_max_bytes)
 }
 
 fn should_use_small_put_eager_path(size: i64, eager_max_bytes: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
@@ -336,7 +356,8 @@ impl DefaultObjectUsecase {
             &mut opts,
         )
         .await?;
-        let eager_max_bytes = topology_aware_small_put_eager_max_bytes(&store, opts.versioned);
+        let eager_max_bytes =
+            resolved_small_put_eager_max_bytes(topology_aware_small_put_eager_max_bytes(&store, opts.versioned));
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &request_context.headers)
             .await
@@ -614,6 +635,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
     use rustfs_io_core::BytesPool;
+    use serial_test::serial;
     use std::sync::Arc;
 
     #[test]
@@ -659,6 +681,30 @@ mod tests {
         );
         assert_eq!(clamp_small_put_eager_max_bytes(Some(128 * 1024)), 128 * 1024);
         assert_eq!(clamp_small_put_eager_max_bytes(None), DEFAULT_SMALL_PUT_EAGER_MAX_BYTES);
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_small_put_eager_max_bytes_honors_disable_env() {
+        temp_env::with_var(ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER, Some("true"), || {
+            assert_eq!(resolved_small_put_eager_max_bytes(256 * 1024), 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_small_put_eager_max_bytes_narrows_default_budget() {
+        temp_env::with_var(ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES, Some("4096"), || {
+            assert_eq!(resolved_small_put_eager_max_bytes(256 * 1024), 4096);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_small_put_eager_max_bytes_ignores_invalid_override() {
+        temp_env::with_var(ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES, Some("invalid"), || {
+            assert_eq!(resolved_small_put_eager_max_bytes(256 * 1024), 256 * 1024);
+        });
     }
 
     #[tokio::test]

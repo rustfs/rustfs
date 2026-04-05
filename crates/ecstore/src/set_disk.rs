@@ -118,6 +118,31 @@ use tokio::{
     time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
+
+const ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES: &str = "RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES";
+const ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE: &str = "RUSTFS_PUT_FORCE_DISABLE_INLINE";
+
+fn env_flag_enabled(name: &str) -> bool {
+    rustfs_utils::get_env_opt_bool(name).unwrap_or(false)
+}
+
+fn env_non_negative_usize(name: &str) -> Option<usize> {
+    rustfs_utils::get_env_opt_usize(name)
+}
+
+fn resolved_put_inline_buffer_enabled(object_size: i64, inline_by_topology: bool) -> bool {
+    if !inline_by_topology || object_size < 0 {
+        return false;
+    }
+
+    if env_flag_enabled(ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE) {
+        return false;
+    }
+
+    env_non_negative_usize(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES)
+        .map(|value| usize::try_from(object_size).is_ok_and(|size| size <= value))
+        .unwrap_or(inline_by_topology)
+}
 use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -783,11 +808,12 @@ impl ObjectIO for SetDisks {
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            let inline_by_topology = if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
                 false
-            }
+            };
+            resolved_put_inline_buffer_enabled(data.size(), inline_by_topology)
         };
         if is_inline_buffer {
             rustfs_io_metrics::record_put_inline_selected(data.size(), opts.versioned);
@@ -4207,6 +4233,31 @@ mod tests {
                 });
             });
         }
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_put_inline_buffer_enabled_honors_disable_env() {
+        temp_env::with_var(ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE, Some("true"), || {
+            assert!(!resolved_put_inline_buffer_enabled(4096, true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_put_inline_buffer_enabled_honors_max_bytes_override() {
+        temp_env::with_var(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES, Some("4096"), || {
+            assert!(resolved_put_inline_buffer_enabled(4096, true));
+            assert!(!resolved_put_inline_buffer_enabled(4097, true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_put_inline_buffer_enabled_ignores_invalid_override() {
+        temp_env::with_var(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES, Some("invalid"), || {
+            assert!(resolved_put_inline_buffer_enabled(4096, true));
+        });
     }
 
     async fn current_setup_type() -> SetupType {
