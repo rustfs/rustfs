@@ -21,12 +21,13 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use rustfs::embedded::RustFSServerBuilder;
+//! use rustfs::embedded::{find_available_port, RustFSServerBuilder};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     let port = find_available_port()?;
 //!     let server = RustFSServerBuilder::new()
-//!         .address("127.0.0.1:0")
+//!         .address(format!("127.0.0.1:{port}"))
 //!         .access_key("minioadmin")
 //!         .secret_key("minioadmin")
 //!         .build()
@@ -48,7 +49,10 @@
 use crate::app::context::{AppContext, init_global_app_context};
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{ServiceState, ServiceStateManager, init_event_notifier, start_audit_system, start_http_server};
+use crate::server::{
+    ServiceState, ServiceStateManager, init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server,
+    stop_audit_system,
+};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -137,7 +141,6 @@ pub struct RustFSServerBuilder {
     access_key: String,
     secret_key: String,
     volumes: Vec<String>,
-    temp_dir: Option<PathBuf>,
     region: String,
 }
 
@@ -151,25 +154,31 @@ impl RustFSServerBuilder {
     /// Create a new builder with sensible defaults.
     ///
     /// Defaults:
-    /// - address: `"127.0.0.1:0"` (random free port)
+    /// - address: `"127.0.0.1:9000"`
     /// - access_key / secret_key: `"minioadmin"`
     /// - region: `"us-east-1"`
     /// - A temporary directory is created automatically for data storage
+    ///
+    /// Use [`find_available_port`] to pick a free port when the default is
+    /// not suitable.
     pub fn new() -> Self {
         Self {
-            address: "127.0.0.1:0".to_string(),
+            address: "127.0.0.1:9000".to_string(),
             access_key: "minioadmin".to_string(),
             secret_key: "minioadmin".to_string(),
             volumes: Vec::new(),
-            temp_dir: None,
             region: "us-east-1".to_string(),
         }
     }
 
-    /// Set the listen address. Use port `0` for a random free port.
+    /// Set the listen address (e.g. `"127.0.0.1:9000"`).
     ///
-    /// The actual bound address (including resolved port) is available via
-    /// [`RustFSServer::address`] after [`build`](Self::build).
+    /// Use [`find_available_port`] to obtain a free port when the default is
+    /// not suitable. Port `0` is **not** supported — the builder cannot
+    /// discover the OS-assigned port after binding.
+    ///
+    /// The bound address is available via [`RustFSServer::address`] after
+    /// [`build`](Self::build).
     pub fn address(mut self, addr: impl Into<String>) -> Self {
         self.address = addr.into();
         self
@@ -223,14 +232,26 @@ impl RustFSServerBuilder {
             return Err(ServerError::AlreadyStarted);
         }
 
-        // Create temp dir for volumes if none provided.
-        let mut owns_temp_dir = false;
+        // Run the fallible init; reset the flag on failure so callers can retry.
+        match self.do_build().await {
+            Ok(server) => Ok(server),
+            Err(e) => {
+                SERVER_STARTED.store(false, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner build implementation. Separated so that [`build`] can reset
+    /// `SERVER_STARTED` on any error path.
+    async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
+        // Keep a TempDir guard alive so that if build fails the directory is
+        // cleaned up automatically. We disarm (into_path) on success.
+        let mut temp_dir_guard: Option<tempfile::TempDir> = None;
         if self.volumes.is_empty() {
             let dir = tempfile::tempdir().map_err(|e| ServerError::Init(format!("failed to create temp dir: {e}")))?;
-            let path = dir.keep();
-            self.volumes.push(path.display().to_string());
-            self.temp_dir = Some(path);
-            owns_temp_dir = true;
+            self.volumes.push(dir.path().display().to_string());
+            temp_dir_guard = Some(dir);
         }
 
         // Ensure volume directories exist.
@@ -267,15 +288,25 @@ impl RustFSServerBuilder {
             .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
 
         // Region.
-        if let Some(region_str) = &config.region
-            && let Ok(region) = region_str.parse()
-        {
+        if let Some(region_str) = &config.region {
+            let region = region_str
+                .parse()
+                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
             rustfs_ecstore::global::set_global_region(region);
         }
 
         // Resolve listen address.
         let server_addr =
             parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
+
+        if server_addr.port() == 0 {
+            return Err(ServerError::Init(
+                "port 0 is not supported in embedded mode because the actual bound port \
+                 cannot be discovered. Use `find_available_port()` to obtain a free port."
+                    .to_string(),
+            ));
+        }
+
         let server_port = server_addr.port();
 
         set_global_rustfs_port(server_port);
@@ -388,8 +419,8 @@ impl RustFSServerBuilder {
         readiness.mark_stage(SystemStage::FullReady);
         rustfs_common::set_global_init_time_now().await;
 
-        // Resolve the actual bound address (important when port=0).
-        let bound_addr = resolve_bound_address(&config.address, server_addr);
+        // Resolve the actual bound address.
+        let bound_addr = server_addr;
 
         info!(
             target: "rustfs::embedded",
@@ -397,14 +428,17 @@ impl RustFSServerBuilder {
             bound_addr
         );
 
+        // Success — disarm the temp dir guard so it isn't cleaned up on drop.
+        let temp_dir = temp_dir_guard.map(|g| g.keep());
+
         Ok(RustFSServer {
             address: bound_addr,
-            access_key: self.access_key,
-            secret_key: self.secret_key,
-            region: self.region,
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            region: self.region.clone(),
             shutdown_tx: Some(shutdown_tx),
             cancel_token: ctx,
-            temp_dir: if owns_temp_dir { self.temp_dir } else { None },
+            temp_dir,
         })
     }
 }
@@ -463,6 +497,14 @@ impl RustFSServer {
         // Cancel background services.
         self.cancel_token.cancel();
 
+        // Shutdown event notifier.
+        shutdown_event_notifier().await;
+
+        // Stop the audit system.
+        if let Err(e) = stop_audit_system().await {
+            warn!("Failed to stop audit system during shutdown: {e}");
+        }
+
         // Signal HTTP server to stop.
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -495,34 +537,13 @@ impl Drop for RustFSServer {
     }
 }
 
-/// Resolve the actual bound address. When the user requests port 0, the OS
-/// assigns a random port — we need to discover it.
-fn resolve_bound_address(_requested: &str, fallback: SocketAddr) -> SocketAddr {
-    // Try to connect to the address to verify it's up, but just return the
-    // parsed address. The real port is in the listener which we don't have
-    // direct access to here, so we rely on the server_addr from
-    // parse_and_resolve_address. When port != 0 this is accurate.
-    // When port == 0 we need the actual bound port.
-    //
-    // For port-0 support we probe by trying to connect.
-    if fallback.port() == 0 {
-        // The server is already listening. We can discover the port by
-        // attempting a connection to localhost on an ephemeral range,
-        // but that's fragile. Instead, we document that port=0 requires
-        // the user to use a concrete port or we fall back.
-        warn!(
-            "Port 0 was requested but the actual bound port cannot be reliably \
-             determined in embedded mode. Consider using a fixed port or \
-             calling `find_available_port()` first."
-        );
-    }
-    fallback
-}
-
 /// Find an available TCP port on localhost.
 ///
-/// Useful with [`RustFSServerBuilder::address`] when you need a guaranteed
-/// free port:
+/// Binds to port `0`, reads the OS-assigned port, then releases the socket.
+/// The port is **best-effort**: another process could claim it before RustFS
+/// binds (TOCTOU), but in practice this is reliable for testing.
+///
+/// Use with [`RustFSServerBuilder::address`]:
 ///
 /// ```rust,no_run
 /// use rustfs::embedded::{find_available_port, RustFSServerBuilder};

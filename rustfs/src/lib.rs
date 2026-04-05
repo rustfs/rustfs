@@ -21,12 +21,13 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use rustfs::embedded::{RustFSServer, RustFSServerBuilder};
+//! use rustfs::embedded::{find_available_port, RustFSServerBuilder};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     let port = find_available_port()?;
 //!     let server = RustFSServerBuilder::new()
-//!         .address("127.0.0.1:0") // random free port
+//!         .address(format!("127.0.0.1:{port}"))
 //!         .access_key("minioadmin")
 //!         .secret_key("minioadmin")
 //!         .build()
