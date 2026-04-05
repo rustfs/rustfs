@@ -162,7 +162,7 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let profiling_agent = init_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
@@ -205,7 +205,7 @@ pub(super) fn init_observability_http(
         let file_logging_result = (|| -> Result<_, TelemetryError> {
             fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
             let rotation_str = config
@@ -312,7 +312,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent,
         tracing_guard,
         stdout_guard,
@@ -462,9 +462,9 @@ fn build_logger_provider(
 
 /// Start the Pyroscope continuous profiling agent when profiling is enabled.
 ///
-/// Returns `None` on non-Unix platforms, when the feature is disabled, or when
-/// no usable profiling endpoint is configured.
-#[cfg(unix)]
+/// Returns `None` on unsupported platforms, when the feature is disabled, or
+/// when no usable profiling endpoint is configured.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
