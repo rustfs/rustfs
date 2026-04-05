@@ -678,10 +678,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use std::convert::Infallible;
     use temp_env::with_var;
+
+    #[derive(Clone, Debug)]
+    struct CaptureService;
+
+    impl<B> Service<Request<B>> for CaptureService {
+        type Response = Request<B>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<B>) -> Self::Future {
+            ready(Ok(req))
+        }
+    }
 
     #[test]
     fn admin_chunked_put_without_content_length_is_normalized() {
@@ -814,6 +833,49 @@ mod tests {
             let cors = ConditionalCorsLayer::new();
             assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
         });
+    }
+
+    #[test]
+    fn request_context_layer_populates_context_and_s3_request_id_from_x_request_id() {
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-123")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-123");
+        assert_eq!(context.x_amz_request_id, "req-123");
+        assert!(context.trace_id.is_none());
+        assert!(context.span_id.is_none());
+        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "req-123");
+    }
+
+    #[test]
+    fn request_context_layer_preserves_upstream_s3_request_id() {
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-123")
+            .header(AMZ_REQUEST_ID, "amz-456")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-123");
+        assert_eq!(context.x_amz_request_id, "amz-456");
+        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "amz-456");
     }
 
     #[tokio::test]
