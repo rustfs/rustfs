@@ -20,8 +20,7 @@ use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_object_io::put::{
     PutObjectChecksums, PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
-    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms,
-    resolve_put_transformed_fallback_reason,
+    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
 use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
 
@@ -64,12 +63,7 @@ fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECSto
     clamp_small_put_eager_max_bytes(inline_object_limit)
 }
 
-fn should_use_small_put_eager_path(
-    size: i64,
-    eager_max_bytes: i64,
-    compression_enabled: bool,
-    encryption_enabled: bool,
-) -> bool {
+fn should_use_small_put_eager_path(size: i64, eager_max_bytes: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
     size > 0 && size <= eager_max_bytes && !compression_enabled && !encryption_enabled
 }
 
@@ -312,6 +306,7 @@ impl DefaultObjectUsecase {
             encryption_enabled_for_put,
         ) {
             rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::PutTransform, reason);
+            rustfs_io_metrics::record_put_fallback(size, reason);
         }
 
         let mut metadata = metadata.unwrap_or_default();
@@ -368,96 +363,92 @@ impl DefaultObjectUsecase {
             sha256hex: get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref()),
         };
 
-        let stage = if should_use_small_put_eager_path(
-            size,
-            eager_max_bytes,
-            body_plan.should_compress(),
-            encryption_enabled_for_put,
-        ) {
-            small_object_eager_stage = true;
-            debug!(
-                "Plain PUT is using the eager small-object path (bucket={}, key={}, size={}, eager_max={})",
-                bucket, key, size, eager_max_bytes
-            );
-            build_small_put_eager_hash_stage(
-                body,
-                size,
-                bytes_pool.clone(),
-                hash_values,
-                &request_context.headers,
-                request_context.trailing_headers.clone(),
-            )
-            .await?
-        } else if body_plan.should_compress() {
-            transform_stage.mark_compression();
-            let algorithm = CompressionAlgorithm::default();
-            insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
-            insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
-
-            let ingress_source = build_put_object_ingress_source(body, body_plan);
-            let stage = build_put_object_plain_hash_stage(
-                ingress_source,
-                std::mem::take(&mut hash_values),
-                PutObjectLegacyHashStagePlan {
-                    size,
-                    actual_size: size,
-                    apply_s3_checksum: true,
-                    ignore_s3_checksum_value: false,
-                },
-                &request_context.headers,
-                request_context.trailing_headers.clone(),
-            )
-            .map_err(ApiError::from)?;
-
-            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
-                plain_reduced_copy_stage = true;
-            }
-            opts.want_checksum = stage.want_checksum;
-            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
-
-            let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-            hash_values.clear_for_transformed_body();
-            build_put_object_legacy_hash_stage(
-                reader,
-                hash_values,
-                PutObjectLegacyHashStagePlan {
-                    size,
-                    actual_size,
-                    apply_s3_checksum: size >= 0,
-                    ignore_s3_checksum_value: false,
-                },
-                &request_context.headers,
-                request_context.trailing_headers.clone(),
-            )
-            .map_err(ApiError::from)?
-        } else {
-            let ingress_source = build_put_object_ingress_source(body, body_plan);
-            let stage = build_put_object_plain_hash_stage(
-                ingress_source,
-                hash_values,
-                PutObjectLegacyHashStagePlan {
-                    size,
-                    actual_size,
-                    apply_s3_checksum: size >= 0,
-                    ignore_s3_checksum_value: false,
-                },
-                &request_context.headers,
-                request_context.trailing_headers.clone(),
-            )
-            .map_err(ApiError::from)?;
-
-            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
-                plain_reduced_copy_stage = true;
+        let stage =
+            if should_use_small_put_eager_path(size, eager_max_bytes, body_plan.should_compress(), encryption_enabled_for_put) {
+                small_object_eager_stage = true;
                 debug!(
-                    "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
-                    bucket, key
+                    "Plain PUT is using the eager small-object path (bucket={}, key={}, size={}, eager_max={})",
+                    bucket, key, size, eager_max_bytes
                 );
-            }
+                build_small_put_eager_hash_stage(
+                    body,
+                    size,
+                    bytes_pool.clone(),
+                    hash_values,
+                    &request_context.headers,
+                    request_context.trailing_headers.clone(),
+                )
+                .await?
+            } else if body_plan.should_compress() {
+                transform_stage.mark_compression();
+                let algorithm = CompressionAlgorithm::default();
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
+                insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            stage
-        };
+                let ingress_source = build_put_object_ingress_source(body, body_plan);
+                let stage = build_put_object_plain_hash_stage(
+                    ingress_source,
+                    std::mem::take(&mut hash_values),
+                    PutObjectLegacyHashStagePlan {
+                        size,
+                        actual_size: size,
+                        apply_s3_checksum: true,
+                        ignore_s3_checksum_value: false,
+                    },
+                    &request_context.headers,
+                    request_context.trailing_headers.clone(),
+                )
+                .map_err(ApiError::from)?;
+
+                if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                    plain_reduced_copy_stage = true;
+                }
+                opts.want_checksum = stage.want_checksum;
+                insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
+                insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
+
+                let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
+                size = HashReader::SIZE_PRESERVE_LAYER;
+                hash_values.clear_for_transformed_body();
+                build_put_object_legacy_hash_stage(
+                    reader,
+                    hash_values,
+                    PutObjectLegacyHashStagePlan {
+                        size,
+                        actual_size,
+                        apply_s3_checksum: size >= 0,
+                        ignore_s3_checksum_value: false,
+                    },
+                    &request_context.headers,
+                    request_context.trailing_headers.clone(),
+                )
+                .map_err(ApiError::from)?
+            } else {
+                let ingress_source = build_put_object_ingress_source(body, body_plan);
+                let stage = build_put_object_plain_hash_stage(
+                    ingress_source,
+                    hash_values,
+                    PutObjectLegacyHashStagePlan {
+                        size,
+                        actual_size,
+                        apply_s3_checksum: size >= 0,
+                        ignore_s3_checksum_value: false,
+                    },
+                    &request_context.headers,
+                    request_context.trailing_headers.clone(),
+                )
+                .map_err(ApiError::from)?;
+
+                if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                    plain_reduced_copy_stage = true;
+                    debug!(
+                        "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
+                        bucket, key
+                    );
+                }
+
+                stage
+            };
         let mut reader = stage.reader;
         if stage.want_checksum.is_some() {
             opts.want_checksum = stage.want_checksum;
@@ -600,8 +591,10 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::IoPath::Legacy
             };
             rustfs_io_metrics::record_io_path_selected("put", io_path);
+            rustfs_io_metrics::record_put_path_selected(actual_size, io_path);
             let effective_copy_mode = transform_stage.effective_copy_mode();
             rustfs_io_metrics::record_io_copy_mode("put", effective_copy_mode, actual_size.max(0) as usize);
+            rustfs_io_metrics::record_put_copy_mode(actual_size, effective_copy_mode);
             if let Some(transform_kind) = transform_stage.metric_kind() {
                 rustfs_io_metrics::record_put_transform_selected(transform_kind, io_path, actual_size.max(0) as usize);
             }
@@ -625,7 +618,12 @@ mod tests {
 
     #[test]
     fn small_put_eager_path_only_targets_plain_small_objects() {
-        assert!(should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, false));
+        assert!(should_use_small_put_eager_path(
+            64 * 1024,
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            false,
+            false
+        ));
         assert!(should_use_small_put_eager_path(
             DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
             DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
@@ -638,8 +636,18 @@ mod tests {
             false,
             false
         ));
-        assert!(!should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, true, false));
-        assert!(!should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, true));
+        assert!(!should_use_small_put_eager_path(
+            64 * 1024,
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            true,
+            false
+        ));
+        assert!(!should_use_small_put_eager_path(
+            64 * 1024,
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            false,
+            true
+        ));
         assert!(!should_use_small_put_eager_path(0, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, false));
     }
 
@@ -650,10 +658,7 @@ mod tests {
             DEFAULT_SMALL_PUT_EAGER_MAX_BYTES
         );
         assert_eq!(clamp_small_put_eager_max_bytes(Some(128 * 1024)), 128 * 1024);
-        assert_eq!(
-            clamp_small_put_eager_max_bytes(None),
-            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES
-        );
+        assert_eq!(clamp_small_put_eager_max_bytes(None), DEFAULT_SMALL_PUT_EAGER_MAX_BYTES);
     }
 
     #[tokio::test]

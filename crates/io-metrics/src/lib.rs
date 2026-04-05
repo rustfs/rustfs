@@ -229,6 +229,18 @@ impl FallbackReason {
     }
 }
 
+#[inline(always)]
+fn put_size_bucket_label(size_bytes: i64) -> &'static str {
+    match size_bytes {
+        ..=0 => "unknown",
+        1..=16_384 => "le_16kib",
+        16_385..=65_536 => "le_64kib",
+        65_537..=262_144 => "le_256kib",
+        262_145..=1_048_576 => "le_1mib",
+        _ => "gt_1mib",
+    }
+}
+
 /// Record GetObject request start.
 #[inline(always)]
 pub fn record_get_object_request_start(concurrent_requests: usize) {
@@ -405,6 +417,50 @@ pub fn record_put_transform_selected(kind: &'static str, io_path: IoPath, size_b
     .record(size_bytes as f64);
 }
 
+/// Record PUT path selection with size-bucket context.
+#[inline(always)]
+pub fn record_put_path_selected(size_bytes: i64, io_path: IoPath) {
+    counter!(
+        "rustfs.s3.put_object.path.selected.total",
+        "mode" => io_path.as_str(),
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .increment(1);
+}
+
+/// Record PUT copy mode with size-bucket context.
+#[inline(always)]
+pub fn record_put_copy_mode(size_bytes: i64, copy_mode: CopyMode) {
+    counter!(
+        "rustfs.s3.put_object.copy_mode.total",
+        "mode" => copy_mode.as_str(),
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .increment(1);
+}
+
+/// Record PUT fallback with size-bucket context.
+#[inline(always)]
+pub fn record_put_fallback(size_bytes: i64, reason: FallbackReason) {
+    counter!(
+        "rustfs.s3.put_object.fallback.total",
+        "reason" => reason.as_str(),
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .increment(1);
+}
+
+/// Record inline-object selection for PUT with size-bucket context.
+#[inline(always)]
+pub fn record_put_inline_selected(size_bytes: i64, versioned: bool) {
+    counter!(
+        "rustfs.s3.put_object.inline.selected.total",
+        "versioned" => if versioned { "true" } else { "false" },
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .increment(1);
+}
+
 // ============================================================================
 // BytesPool Metrics
 // ============================================================================
@@ -505,9 +561,24 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
     counter!("rustfs.s3.put_object.total").increment(1);
     histogram!("rustfs.s3.put_object.duration.ms").record(duration_ms);
+    counter!(
+        "rustfs.s3.put_object.bucketed.total",
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .increment(1);
+    histogram!(
+        "rustfs.s3.put_object.bucketed.duration.ms",
+        "size_bucket" => put_size_bucket_label(size_bytes)
+    )
+    .record(duration_ms);
 
     if size_bytes > 0 {
         histogram!("rustfs.s3.put_object.size.bytes").record(size_bytes as f64);
+        histogram!(
+            "rustfs.s3.put_object.bucketed.size.bytes",
+            "size_bucket" => put_size_bucket_label(size_bytes)
+        )
+        .record(size_bytes as f64);
     }
 
     if zero_copy_enabled {
@@ -932,6 +1003,30 @@ mod tests {
     fn test_record_put_transform_selected() {
         record_put_transform_selected("compression", IoPath::Fast, 2048);
         record_put_transform_selected("compression_encryption", IoPath::Legacy, 4096);
+    }
+
+    #[test]
+    fn test_record_put_path_selected() {
+        record_put_path_selected(8 * 1024, IoPath::Fast);
+        record_put_path_selected(2 * 1024 * 1024, IoPath::Legacy);
+    }
+
+    #[test]
+    fn test_record_put_copy_mode() {
+        record_put_copy_mode(8 * 1024, CopyMode::SingleCopy);
+        record_put_copy_mode(512 * 1024, CopyMode::Transformed);
+    }
+
+    #[test]
+    fn test_record_put_fallback() {
+        record_put_fallback(32 * 1024, FallbackReason::CompressionEnabled);
+        record_put_fallback(2 * 1024 * 1024, FallbackReason::EncryptionEnabled);
+    }
+
+    #[test]
+    fn test_record_put_inline_selected() {
+        record_put_inline_selected(8 * 1024, false);
+        record_put_inline_selected(32 * 1024, true);
     }
 
     #[test]

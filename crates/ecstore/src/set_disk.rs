@@ -789,6 +789,9 @@ impl ObjectIO for SetDisks {
                 false
             }
         };
+        if is_inline_buffer {
+            rustfs_io_metrics::record_put_inline_selected(data.size(), opts.versioned);
+        }
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());

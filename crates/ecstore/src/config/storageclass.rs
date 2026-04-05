@@ -167,8 +167,7 @@ impl Config {
     }
 
     pub fn inline_object_limit_bytes(&self, data_shards: usize, versioned: bool) -> usize {
-        self.inline_shard_limit_bytes(versioned)
-            .saturating_mul(data_shards.max(1))
+        self.inline_shard_limit_bytes(versioned).saturating_mul(data_shards.max(1))
     }
 
     pub fn capacity_optimized(&self) -> bool {
