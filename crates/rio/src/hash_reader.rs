@@ -91,8 +91,8 @@ use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
 use crate::{
-    BlockReadable, BoxReadBlockFuture, DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector,
-    WarpReader, boxed_reader, wrap_reader,
+    BlockReadable, BoxReadBlockFuture, DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader,
+    boxed_reader, wrap_reader,
 };
 use base64::Engine;
 use base64::engine::general_purpose;

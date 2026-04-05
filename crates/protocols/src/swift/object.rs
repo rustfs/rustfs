@@ -55,9 +55,7 @@ use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions,
-};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions};
 use rustfs_rio::HashReader;
 use std::collections::HashMap;
 use tracing::debug;

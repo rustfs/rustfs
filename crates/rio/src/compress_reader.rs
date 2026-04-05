@@ -459,8 +459,8 @@ fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: Compr
 
 #[cfg(test)]
 mod tests {
-    use crate::{BlockReadable, WarpReader};
     use super::*;
+    use crate::{BlockReadable, WarpReader};
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};

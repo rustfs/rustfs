@@ -18,9 +18,7 @@ use crate::store_api::{
     ChunkNativePutData, CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions,
 };
 use bytes::Bytes;
-use rustfs_rio::{
-    BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex,
-};
+use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{
