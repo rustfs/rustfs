@@ -224,6 +224,27 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
+    fn write_shard_inline(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: Bytes) {
+        match writer_opt {
+            Some(writer) => match writer.write_inline_sync(&shard) {
+                Ok(n) => {
+                    if n < shard.len() {
+                        *err = Some(Error::ShortWrite);
+                        *writer_opt = None;
+                    } else {
+                        *err = None;
+                    }
+                }
+                Err(e) => {
+                    *err = Some(Error::from(e));
+                }
+            },
+            None => {
+                *err = Some(Error::DiskNotFound);
+            }
+        }
+    }
+
     pub async fn write<T>(&mut self, data: &T) -> std::io::Result<()>
     where
         T: ShardSource,
@@ -274,9 +295,65 @@ impl<'a> MultiWriter<'a> {
         )))
     }
 
+    pub fn write_inline<T>(&mut self, data: &T) -> std::io::Result<()>
+    where
+        T: ShardSource,
+    {
+        assert_eq!(data.shard_count(), self.writers.len());
+
+        for (idx, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter_mut()).enumerate() {
+            if err.is_some() {
+                continue;
+            }
+            Self::write_shard_inline(writer_opt, err, data.shard(idx));
+        }
+
+        let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
+        if nil_count >= self.write_quorum {
+            return Ok(());
+        }
+
+        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
+            return Err(std::io::Error::other(format!(
+                "Failed to write inline data: {} (offline-disks={}/{})",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len()
+            )));
+        }
+
+        Err(std::io::Error::other(format!(
+            "Failed to write inline data: (offline-disks={}/{}): {}",
+            count_errs(&self.errs, &Error::DiskNotFound),
+            self.writers.len(),
+            self.errs
+                .iter()
+                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
     async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
         match writer_opt {
             Some(writer) => match writer.shutdown().await {
+                Ok(()) => {
+                    *err = None;
+                }
+                Err(e) => {
+                    *err = Some(Error::from(e));
+                    *writer_opt = None;
+                }
+            },
+            None => {
+                *err = Some(Error::DiskNotFound);
+            }
+        }
+    }
+
+    fn shutdown_writer_inline(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
+        match writer_opt {
+            Some(writer) => match writer.shutdown_inline_sync() {
                 Ok(()) => {
                     *err = None;
                 }
@@ -326,6 +403,40 @@ impl<'a> MultiWriter<'a> {
 
         Err(std::io::Error::other(format!(
             "Failed to shutdown writers: (offline-disks={}/{}): {}",
+            count_errs(&self.errs, &Error::DiskNotFound),
+            self.writers.len(),
+            self.errs
+                .iter()
+                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
+    pub fn shutdown_inline(&mut self) -> std::io::Result<()> {
+        for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
+            if err.is_some() {
+                continue;
+            }
+            Self::shutdown_writer_inline(writer_opt, err);
+        }
+
+        let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
+        if nil_count >= self.write_quorum {
+            return Ok(());
+        }
+
+        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
+            return Err(std::io::Error::other(format!(
+                "Failed to shutdown inline writers: {} (offline-disks={}/{})",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len()
+            )));
+        }
+
+        Err(std::io::Error::other(format!(
+            "Failed to shutdown inline writers: (offline-disks={}/{}): {}",
             count_errs(&self.errs, &Error::DiskNotFound),
             self.writers.len(),
             self.errs

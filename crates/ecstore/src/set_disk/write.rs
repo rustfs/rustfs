@@ -16,6 +16,38 @@ use super::*;
 use crate::store_api::ChunkNativePutData;
 
 impl SetDisks {
+    fn all_inline_bitrot_writers(writers: &[Option<crate::erasure_coding::BitrotWriterWrapper>]) -> bool {
+        writers.iter().all(|writer| {
+            writer
+                .as_ref()
+                .is_some_and(crate::erasure_coding::BitrotWriterWrapper::is_inline_buffer)
+        })
+    }
+
+    async fn write_chunk_native_put_data_inline(
+        data: &mut ChunkNativePutData,
+        erasure: Arc<erasure_coding::Erasure>,
+        writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
+        write_quorum: usize,
+    ) -> std::io::Result<usize> {
+        let stream = data.take_stream()?;
+        let mut assembler = erasure_coding::encode::BlockAssembler::new(stream, erasure.block_size);
+        let encoder = erasure_coding::encode::ErasureChunkEncoder::new(erasure).await;
+        let mut writer_group = erasure_coding::encode::MultiWriter::new(writers, write_quorum);
+
+        while let Some(block) = assembler.next_block().await? {
+            let encoded = encoder.encode_block(&block).await?;
+            writer_group.write_inline(&encoded)?;
+            encoder.release(encoded).await;
+        }
+
+        let total_bytes = assembler.total_bytes();
+        let stream = assembler.into_inner();
+        writer_group.shutdown_inline()?;
+        data.restore_stream(stream);
+        Ok(total_bytes)
+    }
+
     pub(super) fn default_read_quorum(&self) -> usize {
         self.set_drive_count - self.default_parity_count
     }
@@ -26,6 +58,10 @@ impl SetDisks {
         writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
         write_quorum: usize,
     ) -> std::io::Result<usize> {
+        if Self::all_inline_bitrot_writers(writers) {
+            return Self::write_chunk_native_put_data_inline(data, erasure, writers, write_quorum).await;
+        }
+
         let stream = data.take_stream()?;
         let (stream, written) = erasure_coding::encode::ErasureWritePipeline::new(erasure, write_quorum)
             .run(stream, writers)
@@ -681,5 +717,21 @@ mod tests {
             .map(|writer| writer.expect("writer").into_inline_data().expect("inline data").len())
             .collect();
         assert!(inline_lengths.iter().all(|len| *len > 0));
+    }
+
+    #[tokio::test]
+    async fn write_chunk_native_put_data_detects_inline_writer_set() {
+        let erasure = Arc::new(erasure_coding::Erasure::new(2, 1, 8));
+        let writers: Vec<Option<BitrotWriterWrapper>> = (0..erasure.total_shard_count())
+            .map(|_| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_inline_buffer(),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        assert!(SetDisks::all_inline_bitrot_writers(&writers));
     }
 }
