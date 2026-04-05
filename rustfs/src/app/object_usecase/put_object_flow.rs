@@ -605,7 +605,9 @@ mod tests {
         ]);
 
         let pool = Arc::new(BytesPool::new_tiered());
-        let data = read_small_put_body_eager(body, 6, pool).await.expect("eager read should succeed");
+        let data = read_small_put_body_eager(body, 6, pool)
+            .await
+            .expect("eager read should succeed");
         assert_eq!(data.as_ref(), b"abcdef");
     }
 
