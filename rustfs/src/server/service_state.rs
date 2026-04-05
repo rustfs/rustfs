@@ -19,7 +19,7 @@ use std::time::Duration;
 use tracing::info;
 
 // a configurable shutdown timeout
-pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 fn notify_systemd(state: &str) {
@@ -58,7 +58,7 @@ pub enum ShutdownSignal {
 
 #[atomic_enum]
 #[derive(PartialEq)]
-pub(crate) enum ServiceState {
+pub enum ServiceState {
     Starting,
     Ready,
     Stopping,
@@ -66,7 +66,7 @@ pub(crate) enum ServiceState {
 }
 
 #[cfg(unix)]
-pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
+pub async fn wait_for_shutdown() -> ShutdownSignal {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to create SIGTERM signal handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to create SIGINT signal handler");
@@ -88,7 +88,7 @@ pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
+pub async fn wait_for_shutdown() -> ShutdownSignal {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl-C signal");
@@ -98,7 +98,7 @@ pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
 }
 
 #[derive(Clone)]
-pub(crate) struct ServiceStateManager {
+pub struct ServiceStateManager {
     state: Arc<AtomicServiceState>,
 }
 

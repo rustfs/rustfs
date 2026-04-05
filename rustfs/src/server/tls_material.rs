@@ -108,7 +108,7 @@ impl TlsMaterialSnapshot {
     /// This is the single place that constructs the server `ServerConfig`,
     /// handling both multi-cert (SNI resolver) and single-cert fallback.
     /// Returns `None` if no TLS certificates are available.
-    pub async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
+    pub(crate) async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
         if tls_path.is_empty() || !self.has_server_certs {
             return Ok(None);
         }

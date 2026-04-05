@@ -122,7 +122,7 @@ impl WorkloadProfile {
     ///
     /// # Examples
     /// ```
-    /// use rustfs::config::workload_profiles::WorkloadProfile;
+    /// use rustfs::config::WorkloadProfile;
     ///
     /// let profile = WorkloadProfile::from_name("AiTraining");
     /// let profile2 = WorkloadProfile::from_name("aitraining"); // case-insensitive

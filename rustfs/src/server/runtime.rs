@@ -91,7 +91,7 @@ fn compute_default_max_blocking_threads() -> usize {
 /// // let builder = tokio_runtime_builder();
 /// // let runtime = builder.build().unwrap();
 /// ```
-pub(crate) fn tokio_runtime_builder() -> tokio::runtime::Builder {
+pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
 
     // Worker threads(Default physical cores)
@@ -190,7 +190,7 @@ fn print_tokio_thread_enable() -> bool {
 /// // let runtime = build_tokio_runtime().expect("Failed to build runtime");
 /// // runtime.block_on(async { /* ... */ })
 /// ```
-pub(crate) fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
+pub fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
     let mut builder = tokio_runtime_builder();
 
     // Check if dial9 is enabled
