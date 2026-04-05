@@ -121,9 +121,12 @@ use tokio_util::sync::CancellationToken;
 
 const ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES: &str = "RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES";
 const ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE: &str = "RUSTFS_PUT_FORCE_DISABLE_INLINE";
+const SLOW_PUT_STORAGE_PHASE_DEBUG_THRESHOLD_MS: u64 = 100;
+const SLOW_PUT_STORAGE_PHASE_WARN_THRESHOLD_MS: u64 = 1_000;
+const SLOW_PUT_STORAGE_PHASE_ERROR_THRESHOLD_MS: u64 = 5_000;
 
 fn env_flag_enabled(name: &str) -> bool {
-    rustfs_utils::get_env_opt_bool(name).unwrap_or(false)
+    rustfs_utils::get_env_bool(name, false)
 }
 
 fn env_non_negative_usize(name: &str) -> Option<usize> {
@@ -142,6 +145,38 @@ fn resolved_put_inline_buffer_enabled(object_size: i64, inline_by_topology: bool
     env_non_negative_usize(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES)
         .map(|value| usize::try_from(object_size).is_ok_and(|size| size <= value))
         .unwrap_or(inline_by_topology)
+}
+
+fn log_put_storage_phase(
+    bucket: &str,
+    object: &str,
+    phase: &str,
+    elapsed: Duration,
+    object_size: i64,
+    inline_selected: bool,
+    write_quorum: usize,
+) {
+    let duration_ms = elapsed.as_millis() as u64;
+    if duration_ms < SLOW_PUT_STORAGE_PHASE_DEBUG_THRESHOLD_MS {
+        return;
+    }
+
+    if duration_ms >= SLOW_PUT_STORAGE_PHASE_ERROR_THRESHOLD_MS {
+        error!(
+            phase,
+            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase is critically slow"
+        );
+    } else if duration_ms >= SLOW_PUT_STORAGE_PHASE_WARN_THRESHOLD_MS {
+        warn!(
+            phase,
+            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase is slow"
+        );
+    } else {
+        debug!(
+            phase,
+            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase exceeded debug threshold"
+        );
+    }
 }
 use tracing::error;
 use tracing::{debug, info, warn};
@@ -819,6 +854,7 @@ impl ObjectIO for SetDisks {
             rustfs_io_metrics::record_put_inline_selected(data.size(), opts.versioned);
         }
 
+        let writer_setup_start = Instant::now();
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
@@ -852,6 +888,15 @@ impl ObjectIO for SetDisks {
                 writers.push(None);
             }
         }
+        log_put_storage_phase(
+            bucket,
+            object,
+            "writer_setup",
+            writer_setup_start.elapsed(),
+            data.size(),
+            is_inline_buffer,
+            write_quorum,
+        );
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
@@ -863,13 +908,32 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
+        let encode_write_start = Instant::now();
         let w_size = match Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await {
             Ok(written) => written,
             Err(e) => {
+                log_put_storage_phase(
+                    bucket,
+                    object,
+                    "encode_write",
+                    encode_write_start.elapsed(),
+                    data.size(),
+                    is_inline_buffer,
+                    write_quorum,
+                );
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
         }; // TODO: delete temporary directory on error
+        log_put_storage_phase(
+            bucket,
+            object,
+            "encode_write",
+            encode_write_start.elapsed(),
+            data.size(),
+            is_inline_buffer,
+            write_quorum,
+        );
 
         if (w_size as i64) < data.size() {
             warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
@@ -945,6 +1009,7 @@ impl ObjectIO for SetDisks {
 
         drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
+        let post_write_lock_start = Instant::now();
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
@@ -954,7 +1019,17 @@ impl ObjectIO for SetDisks {
                 ))
             })?);
         }
+        log_put_storage_phase(
+            bucket,
+            object,
+            "post_write_lock",
+            post_write_lock_start.elapsed(),
+            data.size(),
+            is_inline_buffer,
+            write_quorum,
+        );
 
+        let finalize_start = Instant::now();
         let (online_disks, _, op_old_dir) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_TMP_BUCKET,
@@ -964,7 +1039,18 @@ impl ObjectIO for SetDisks {
             object,
             write_quorum,
         )
-        .await?;
+        .await
+        .inspect_err(|_| {
+            log_put_storage_phase(
+                bucket,
+                object,
+                "finalize",
+                finalize_start.elapsed(),
+                data.size(),
+                is_inline_buffer,
+                write_quorum,
+            );
+        })?;
 
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
@@ -974,6 +1060,15 @@ impl ObjectIO for SetDisks {
         drop(object_lock_guard); // drop object lock guard to release the lock
 
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
+        log_put_storage_phase(
+            bucket,
+            object,
+            "finalize",
+            finalize_start.elapsed(),
+            data.size(),
+            is_inline_buffer,
+            write_quorum,
+        );
 
         for (i, op_disk) in online_disks.iter().enumerate() {
             if let Some(disk) = op_disk

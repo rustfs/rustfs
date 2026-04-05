@@ -27,6 +27,9 @@ use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDe
 const DEFAULT_SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
 const ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES: &str = "RUSTFS_PUT_SMALL_EAGER_MAX_BYTES";
 const ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER: &str = "RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER";
+const SLOW_PUT_PHASE_DEBUG_THRESHOLD_MS: u64 = 100;
+const SLOW_PUT_PHASE_WARN_THRESHOLD_MS: u64 = 1_000;
+const SLOW_PUT_PHASE_ERROR_THRESHOLD_MS: u64 = 5_000;
 
 fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
     [
@@ -49,7 +52,7 @@ fn clamp_small_put_eager_max_bytes(inline_object_limit_bytes: Option<usize>) -> 
 }
 
 fn env_flag_enabled(name: &str) -> bool {
-    rustfs_utils::get_env_opt_bool(name).unwrap_or(false)
+    rustfs_utils::get_env_bool(name, false)
 }
 
 fn env_non_negative_i64(name: &str) -> Option<i64> {
@@ -85,6 +88,53 @@ fn resolved_small_put_eager_max_bytes(default_max_bytes: i64) -> i64 {
 
 fn should_use_small_put_eager_path(size: i64, eager_max_bytes: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
     size > 0 && size <= eager_max_bytes && !compression_enabled && !encryption_enabled
+}
+
+fn put_path_label(small_eager: bool, reduced_copy: bool, compressed: bool) -> &'static str {
+    if small_eager {
+        "small_eager"
+    } else if compressed {
+        "compressed"
+    } else if reduced_copy {
+        "reduced_copy"
+    } else {
+        "legacy_plain"
+    }
+}
+
+fn log_put_flow_phase(
+    bucket: &str,
+    key: &str,
+    phase: &str,
+    elapsed: std::time::Duration,
+    object_size: i64,
+    small_eager: bool,
+    reduced_copy: bool,
+    compressed: bool,
+    encrypted: bool,
+) {
+    let duration_ms = elapsed.as_millis() as u64;
+    if duration_ms < SLOW_PUT_PHASE_DEBUG_THRESHOLD_MS {
+        return;
+    }
+
+    let put_path = put_path_label(small_eager, reduced_copy, compressed);
+    if duration_ms >= SLOW_PUT_PHASE_ERROR_THRESHOLD_MS {
+        error!(
+            phase,
+            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase is critically slow"
+        );
+    } else if duration_ms >= SLOW_PUT_PHASE_WARN_THRESHOLD_MS {
+        warn!(
+            phase,
+            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase is slow"
+        );
+    } else {
+        debug!(
+            phase,
+            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase exceeded debug threshold"
+        );
+    }
 }
 
 struct PooledBufferReader {
@@ -384,6 +434,7 @@ impl DefaultObjectUsecase {
             sha256hex: get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref()),
         };
 
+        let reader_stage_start = std::time::Instant::now();
         let stage =
             if should_use_small_put_eager_path(size, eager_max_bytes, body_plan.should_compress(), encryption_enabled_for_put) {
                 small_object_eager_stage = true;
@@ -470,6 +521,17 @@ impl DefaultObjectUsecase {
 
                 stage
             };
+        log_put_flow_phase(
+            &bucket,
+            &key,
+            "build_hash_stage",
+            reader_stage_start.elapsed(),
+            actual_size,
+            small_object_eager_stage,
+            plain_reduced_copy_stage,
+            transform_stage.compression_applied(),
+            false,
+        );
         let mut reader = stage.reader;
         if stage.want_checksum.is_some() {
             opts.want_checksum = stage.want_checksum;
@@ -522,10 +584,22 @@ impl DefaultObjectUsecase {
             );
         }
 
+        let store_put_start = std::time::Instant::now();
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+        log_put_flow_phase(
+            &bucket,
+            &key,
+            "store_put_object",
+            store_put_start.elapsed(),
+            actual_size,
+            small_object_eager_stage,
+            plain_reduced_copy_stage,
+            transform_stage.compression_applied(),
+            transform_stage.encryption_applied(),
+        );
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
