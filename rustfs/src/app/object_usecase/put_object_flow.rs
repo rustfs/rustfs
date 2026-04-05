@@ -15,11 +15,13 @@
 use super::*;
 use bytes::Buf;
 use futures::{Stream, StreamExt};
+use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_object_io::put::{
     PutObjectChecksums, PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
+use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
 
 const SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
 
@@ -41,14 +43,65 @@ fn should_use_small_put_eager_path(size: i64, compression_enabled: bool, encrypt
     size > 0 && size <= SMALL_PUT_EAGER_MAX_BYTES && !compression_enabled && !encryption_enabled
 }
 
-async fn read_small_put_body_eager<S, B, E>(body: S, size: i64) -> S3Result<Vec<u8>>
+struct PooledBufferReader {
+    buffer: PooledBuffer,
+    position: usize,
+}
+
+impl PooledBufferReader {
+    fn new(buffer: PooledBuffer) -> Self {
+        Self { buffer, position: 0 }
+    }
+}
+
+impl tokio::io::AsyncRead for PooledBufferReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let remaining = &self.buffer[self.position..];
+        if remaining.is_empty() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        let to_copy = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..to_copy]);
+        self.position += to_copy;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl BlockReadable for PooledBufferReader {
+    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+        Box::pin(async move {
+            let remaining = &self.buffer[self.position..];
+            if remaining.is_empty() {
+                return Ok(0);
+            }
+
+            let to_copy = remaining.len().min(buf.len());
+            buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
+            self.position += to_copy;
+            Ok(to_copy)
+        })
+    }
+}
+
+impl EtagResolvable for PooledBufferReader {}
+
+impl HashReaderDetector for PooledBufferReader {}
+
+impl TryGetIndex for PooledBufferReader {}
+
+async fn read_small_put_body_eager<S, B, E>(body: S, size: i64, pool: std::sync::Arc<BytesPool>) -> S3Result<PooledBuffer>
 where
     S: Stream<Item = Result<B, E>>,
     B: Buf,
     E: std::fmt::Display,
 {
     let expected_len = usize::try_from(size).map_err(|_| s3_error!(InvalidRequest, "Object size overflow"))?;
-    let mut data = Vec::with_capacity(expected_len);
+    let mut data = pool.acquire_buffer(expected_len).await;
     let mut body = Box::pin(body);
 
     while let Some(result) = body.next().await {
@@ -81,6 +134,7 @@ where
 async fn build_small_put_eager_hash_stage<S, B, E>(
     body: S,
     size: i64,
+    pool: std::sync::Arc<BytesPool>,
     hash_values: PutObjectLegacyHashValues,
     headers: &HeaderMap,
     trailing_headers: Option<s3s::TrailingHeaders>,
@@ -90,9 +144,9 @@ where
     B: Buf,
     E: std::fmt::Display,
 {
-    let data = read_small_put_body_eager(body, size).await?;
+    let data = read_small_put_body_eager(body, size, pool).await?;
     build_put_object_legacy_hash_stage(
-        Box::new(WarpReader::new(std::io::Cursor::new(data))),
+        Box::new(PooledBufferReader::new(data)),
         hash_values,
         PutObjectLegacyHashStagePlan {
             size,
@@ -160,6 +214,7 @@ impl DefaultObjectUsecase {
         let mut transform_stage = PutObjectTransformStage::default();
         let mut plain_reduced_copy_stage = false;
         let mut small_object_eager_stage = false;
+        let bytes_pool = get_concurrency_manager().bytes_pool();
 
         let store = get_validated_store_adapter(&bucket).await?;
 
@@ -291,6 +346,7 @@ impl DefaultObjectUsecase {
             build_small_put_eager_hash_stage(
                 body,
                 size,
+                bytes_pool.clone(),
                 hash_values,
                 &request_context.headers,
                 request_context.trailing_headers.clone(),
@@ -528,6 +584,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::stream;
+    use rustfs_io_core::BytesPool;
+    use std::sync::Arc;
 
     #[test]
     fn small_put_eager_path_only_targets_plain_small_objects() {
@@ -546,15 +604,17 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def")),
         ]);
 
-        let data = read_small_put_body_eager(body, 6).await.expect("eager read should succeed");
-        assert_eq!(data, b"abcdef");
+        let pool = Arc::new(BytesPool::new_tiered());
+        let data = read_small_put_body_eager(body, 6, pool).await.expect("eager read should succeed");
+        assert_eq!(data.as_ref(), b"abcdef");
     }
 
     #[tokio::test]
     async fn read_small_put_body_eager_rejects_length_mismatch() {
         let body = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc"))]);
+        let pool = Arc::new(BytesPool::new_tiered());
 
-        let err = read_small_put_body_eager(body, 4)
+        let err = read_small_put_body_eager(body, 4, pool)
             .await
             .expect_err("short eager read should fail");
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
@@ -566,10 +626,25 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc")),
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def")),
         ]);
+        let pool = Arc::new(BytesPool::new_tiered());
 
-        let err = read_small_put_body_eager(body, 5)
+        let err = read_small_put_body_eager(body, 5, pool)
             .await
             .expect_err("overlong eager read should fail");
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_eager_returns_buffer_to_pool_after_drop() {
+        let body = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc"))]);
+        let pool = Arc::new(BytesPool::new_tiered());
+
+        let data = read_small_put_body_eager(body, 3, pool.clone())
+            .await
+            .expect("pooled eager read should succeed");
+        assert_eq!(pool.available_buffers(), 0);
+
+        drop(data);
+        assert_eq!(pool.available_buffers(), 1);
     }
 }
