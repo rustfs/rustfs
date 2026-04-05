@@ -155,7 +155,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard: None,
@@ -289,7 +289,7 @@ fn init_file_logging_internal(
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard,
