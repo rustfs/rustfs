@@ -150,18 +150,7 @@ impl Config {
             return false;
         }
 
-        let shard_size = shard_size as usize;
-
-        let mut inline_block = DEFAULT_INLINE_BLOCK;
-        if self.initialized {
-            inline_block = self.inline_block;
-        }
-
-        if versioned {
-            shard_size <= inline_block / 8
-        } else {
-            shard_size <= inline_block
-        }
+        shard_size as usize <= self.inline_shard_limit_bytes(versioned)
     }
 
     pub fn inline_block(&self) -> usize {
@@ -172,12 +161,51 @@ impl Config {
         }
     }
 
+    pub fn inline_shard_limit_bytes(&self, versioned: bool) -> usize {
+        let inline_block = self.inline_block();
+        if versioned { inline_block / 8 } else { inline_block }
+    }
+
+    pub fn inline_object_limit_bytes(&self, data_shards: usize, versioned: bool) -> usize {
+        self.inline_shard_limit_bytes(versioned)
+            .saturating_mul(data_shards.max(1))
+    }
+
     pub fn capacity_optimized(&self) -> bool {
         if !self.initialized {
             false
         } else {
             self.optimize.as_ref().is_some_and(|v| v.as_str() == "capacity")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_object_limit_matches_default_non_versioned_budget() {
+        let cfg = Config {
+            initialized: true,
+            inline_block: DEFAULT_INLINE_BLOCK,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.inline_shard_limit_bytes(false), DEFAULT_INLINE_BLOCK);
+        assert_eq!(cfg.inline_object_limit_bytes(8, false), DEFAULT_INLINE_BLOCK * 8);
+    }
+
+    #[test]
+    fn inline_object_limit_scales_down_for_versioned_objects() {
+        let cfg = Config {
+            initialized: true,
+            inline_block: DEFAULT_INLINE_BLOCK,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.inline_shard_limit_bytes(true), DEFAULT_INLINE_BLOCK / 8);
+        assert_eq!(cfg.inline_object_limit_bytes(8, true), DEFAULT_INLINE_BLOCK);
     }
 }
 

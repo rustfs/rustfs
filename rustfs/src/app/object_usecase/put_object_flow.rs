@@ -15,15 +15,17 @@
 use super::*;
 use bytes::Buf;
 use futures::{Stream, StreamExt};
+use rustfs_ecstore::config::GLOBAL_STORAGE_CLASS;
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_object_io::put::{
     PutObjectChecksums, PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
-    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
+    build_put_object_plain_hash_stage, plan_put_object_body_with_transforms,
+    resolve_put_transformed_fallback_reason,
 };
 use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
 
-const SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
+const DEFAULT_SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
 
 fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
     [
@@ -39,8 +41,36 @@ fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Byte
     })
 }
 
-fn should_use_small_put_eager_path(size: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
-    size > 0 && size <= SMALL_PUT_EAGER_MAX_BYTES && !compression_enabled && !encryption_enabled
+fn clamp_small_put_eager_max_bytes(inline_object_limit_bytes: Option<usize>) -> i64 {
+    inline_object_limit_bytes
+        .unwrap_or(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES as usize)
+        .min(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES as usize) as i64
+}
+
+fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECStore, versioned: bool) -> i64 {
+    let Some(first_pool) = store.pools.first() else {
+        return DEFAULT_SMALL_PUT_EAGER_MAX_BYTES;
+    };
+
+    let data_shards = first_pool
+        .set_drive_count
+        .saturating_sub(first_pool.default_parity_count)
+        .max(1);
+
+    let inline_object_limit = GLOBAL_STORAGE_CLASS
+        .get()
+        .map(|config| config.inline_object_limit_bytes(data_shards, versioned));
+
+    clamp_small_put_eager_max_bytes(inline_object_limit)
+}
+
+fn should_use_small_put_eager_path(
+    size: i64,
+    eager_max_bytes: i64,
+    compression_enabled: bool,
+    encryption_enabled: bool,
+) -> bool {
+    size > 0 && size <= eager_max_bytes && !compression_enabled && !encryption_enabled
 }
 
 struct PooledBufferReader {
@@ -311,6 +341,7 @@ impl DefaultObjectUsecase {
             &mut opts,
         )
         .await?;
+        let eager_max_bytes = topology_aware_small_put_eager_max_bytes(&store, opts.versioned);
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &request_context.headers)
             .await
@@ -337,11 +368,16 @@ impl DefaultObjectUsecase {
             sha256hex: get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref()),
         };
 
-        let stage = if should_use_small_put_eager_path(size, body_plan.should_compress(), encryption_enabled_for_put) {
+        let stage = if should_use_small_put_eager_path(
+            size,
+            eager_max_bytes,
+            body_plan.should_compress(),
+            encryption_enabled_for_put,
+        ) {
             small_object_eager_stage = true;
             debug!(
-                "Plain PUT is using the eager small-object path (bucket={}, key={}, size={})",
-                bucket, key, size
+                "Plain PUT is using the eager small-object path (bucket={}, key={}, size={}, eager_max={})",
+                bucket, key, size, eager_max_bytes
             );
             build_small_put_eager_hash_stage(
                 body,
@@ -589,12 +625,35 @@ mod tests {
 
     #[test]
     fn small_put_eager_path_only_targets_plain_small_objects() {
-        assert!(should_use_small_put_eager_path(64 * 1024, false, false));
-        assert!(should_use_small_put_eager_path(SMALL_PUT_EAGER_MAX_BYTES, false, false));
-        assert!(!should_use_small_put_eager_path(SMALL_PUT_EAGER_MAX_BYTES + 1, false, false));
-        assert!(!should_use_small_put_eager_path(64 * 1024, true, false));
-        assert!(!should_use_small_put_eager_path(64 * 1024, false, true));
-        assert!(!should_use_small_put_eager_path(0, false, false));
+        assert!(should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, false));
+        assert!(should_use_small_put_eager_path(
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            false,
+            false
+        ));
+        assert!(!should_use_small_put_eager_path(
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES + 1,
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES,
+            false,
+            false
+        ));
+        assert!(!should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, true, false));
+        assert!(!should_use_small_put_eager_path(64 * 1024, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, true));
+        assert!(!should_use_small_put_eager_path(0, DEFAULT_SMALL_PUT_EAGER_MAX_BYTES, false, false));
+    }
+
+    #[test]
+    fn clamp_small_put_eager_max_bytes_caps_inline_budget() {
+        assert_eq!(
+            clamp_small_put_eager_max_bytes(Some(rustfs_object_io::put::PUT_REDUCED_COPY_MIN_SIZE_BYTES as usize * 2)),
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES
+        );
+        assert_eq!(clamp_small_put_eager_max_bytes(Some(128 * 1024)), 128 * 1024);
+        assert_eq!(
+            clamp_small_put_eager_max_bytes(None),
+            DEFAULT_SMALL_PUT_EAGER_MAX_BYTES
+        );
     }
 
     #[tokio::test]

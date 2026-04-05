@@ -55,6 +55,7 @@ const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
     AMZ_SNOWBALL_IGNORE_ERRORS,
     AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
 ];
+pub const PUT_REDUCED_COPY_MIN_SIZE_BYTES: i64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PutObjectChecksums {
@@ -610,9 +611,7 @@ fn should_use_put_reduced_copy_candidate(
     encryption_enabled: bool,
     compression_enabled: bool,
 ) -> bool {
-    const ZERO_COPY_MIN_SIZE: i64 = 1024 * 1024;
-
-    if size <= ZERO_COPY_MIN_SIZE {
+    if size <= PUT_REDUCED_COPY_MIN_SIZE_BYTES {
         return false;
     }
 
