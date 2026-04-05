@@ -13,11 +13,15 @@
 // limitations under the License.
 
 use super::*;
+use bytes::Buf;
+use futures::{Stream, StreamExt};
 use rustfs_object_io::put::{
     PutObjectChecksums, PutObjectIngressKind, PutObjectLegacyHashStagePlan, PutObjectLegacyHashValues, PutObjectTransformStage,
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
+
+const SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
 
 fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
     [
@@ -31,6 +35,76 @@ fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Byte
     .find_map(|(checksum_type, value)| {
         value.and_then(|value| rustfs_rio::Checksum::new_with_type(checksum_type, value).map(|checksum| checksum.to_bytes(&[])))
     })
+}
+
+fn should_use_small_put_eager_path(size: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
+    size > 0 && size <= SMALL_PUT_EAGER_MAX_BYTES && !compression_enabled && !encryption_enabled
+}
+
+async fn read_small_put_body_eager<S, B, E>(body: S, size: i64) -> S3Result<Vec<u8>>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+{
+    let expected_len = usize::try_from(size).map_err(|_| s3_error!(InvalidRequest, "Object size overflow"))?;
+    let mut data = Vec::with_capacity(expected_len);
+    let mut body = Box::pin(body);
+
+    while let Some(result) = body.next().await {
+        let mut chunk = result.map_err(|err| S3Error::with_message(S3ErrorCode::IncompleteBody, err.to_string()))?;
+        let chunk_len = chunk.remaining();
+        if chunk_len == 0 {
+            continue;
+        }
+
+        let new_len = data
+            .len()
+            .checked_add(chunk_len)
+            .ok_or_else(|| s3_error!(InvalidRequest, "Object size overflow"))?;
+        if new_len > expected_len {
+            return Err(s3_error!(IncompleteBody));
+        }
+
+        let start = data.len();
+        data.resize(new_len, 0);
+        chunk.copy_to_slice(&mut data[start..new_len]);
+    }
+
+    if data.len() != expected_len {
+        return Err(s3_error!(IncompleteBody));
+    }
+
+    Ok(data)
+}
+
+async fn build_small_put_eager_hash_stage<S, B, E>(
+    body: S,
+    size: i64,
+    hash_values: PutObjectLegacyHashValues,
+    headers: &HeaderMap,
+    trailing_headers: Option<s3s::TrailingHeaders>,
+) -> S3Result<rustfs_object_io::put::PutObjectHashStage>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: Buf,
+    E: std::fmt::Display,
+{
+    let data = read_small_put_body_eager(body, size).await?;
+    build_put_object_legacy_hash_stage(
+        Box::new(WarpReader::new(std::io::Cursor::new(data))),
+        hash_values,
+        PutObjectLegacyHashStagePlan {
+            size,
+            actual_size: size,
+            apply_s3_checksum: true,
+            ignore_s3_checksum_value: false,
+        },
+        headers,
+        trailing_headers,
+    )
+    .map_err(ApiError::from)
+    .map_err(Into::into)
 }
 
 impl DefaultObjectUsecase {
@@ -85,6 +159,7 @@ impl DefaultObjectUsecase {
         let mut size = resolved_size;
         let mut transform_stage = PutObjectTransformStage::default();
         let mut plain_reduced_copy_stage = false;
+        let mut small_object_eager_stage = false;
 
         let store = get_validated_store_adapter(&bucket).await?;
 
@@ -154,8 +229,6 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_fallback(rustfs_io_metrics::IoStage::PutTransform, reason);
         }
 
-        let ingress_source = build_put_object_ingress_source(body, body_plan);
-
         let mut metadata = metadata.unwrap_or_default();
         apply_put_request_metadata(
             &mut metadata,
@@ -209,12 +282,27 @@ impl DefaultObjectUsecase {
             sha256hex: get_content_sha256_with_query(&request_context.headers, request_context.uri_query.as_deref()),
         };
 
-        let stage = if body_plan.should_compress() {
+        let stage = if should_use_small_put_eager_path(size, body_plan.should_compress(), encryption_enabled_for_put) {
+            small_object_eager_stage = true;
+            debug!(
+                "Plain PUT is using the eager small-object path (bucket={}, key={}, size={})",
+                bucket, key, size
+            );
+            build_small_put_eager_hash_stage(
+                body,
+                size,
+                hash_values,
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .await?
+        } else if body_plan.should_compress() {
             transform_stage.mark_compression();
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
+            let ingress_source = build_put_object_ingress_source(body, body_plan);
             let stage = build_put_object_plain_hash_stage(
                 ingress_source,
                 std::mem::take(&mut hash_values),
@@ -253,6 +341,7 @@ impl DefaultObjectUsecase {
             )
             .map_err(ApiError::from)?
         } else {
+            let ingress_source = build_put_object_ingress_source(body, body_plan);
             let stage = build_put_object_plain_hash_stage(
                 ingress_source,
                 hash_values,
@@ -411,8 +500,9 @@ impl DefaultObjectUsecase {
 
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
-            rustfs_io_metrics::record_put_object(duration_ms, size, body_plan.ingress.enable_zero_copy);
-            let io_path = if plain_reduced_copy_stage {
+            let fast_path_selected = plain_reduced_copy_stage || small_object_eager_stage;
+            rustfs_io_metrics::record_put_object(duration_ms, size, fast_path_selected);
+            let io_path = if fast_path_selected {
                 rustfs_io_metrics::IoPath::Fast
             } else {
                 rustfs_io_metrics::IoPath::Legacy
@@ -430,5 +520,56 @@ impl DefaultObjectUsecase {
             helper_object: obj_info,
             helper_version_id: raw_version,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream;
+
+    #[test]
+    fn small_put_eager_path_only_targets_plain_small_objects() {
+        assert!(should_use_small_put_eager_path(64 * 1024, false, false));
+        assert!(should_use_small_put_eager_path(SMALL_PUT_EAGER_MAX_BYTES, false, false));
+        assert!(!should_use_small_put_eager_path(SMALL_PUT_EAGER_MAX_BYTES + 1, false, false));
+        assert!(!should_use_small_put_eager_path(64 * 1024, true, false));
+        assert!(!should_use_small_put_eager_path(64 * 1024, false, true));
+        assert!(!should_use_small_put_eager_path(0, false, false));
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_eager_requires_exact_content_length() {
+        let body = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def")),
+        ]);
+
+        let data = read_small_put_body_eager(body, 6).await.expect("eager read should succeed");
+        assert_eq!(data, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_eager_rejects_length_mismatch() {
+        let body = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc"))]);
+
+        let err = read_small_put_body_eager(body, 4)
+            .await
+            .expect_err("short eager read should fail");
+        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_eager_rejects_overlong_body() {
+        let body = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"def")),
+        ]);
+
+        let err = read_small_put_body_eager(body, 5)
+            .await
+            .expect_err("overlong eager read should fail");
+        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
     }
 }
