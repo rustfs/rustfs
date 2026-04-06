@@ -23,6 +23,7 @@ use rustfs_object_io::put::{
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
 use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
+use rustfs_utils::http::headers::AMZ_TRAILER;
 
 const DEFAULT_SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
 const ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES: &str = "RUSTFS_PUT_SMALL_EAGER_MAX_BYTES";
@@ -88,6 +89,15 @@ fn resolved_small_put_eager_max_bytes(default_max_bytes: i64) -> i64 {
 
 fn should_use_small_put_eager_path(size: i64, eager_max_bytes: i64, compression_enabled: bool, encryption_enabled: bool) -> bool {
     size > 0 && size <= eager_max_bytes && !compression_enabled && !encryption_enabled
+}
+
+fn request_uses_trailing_checksum(headers: &HeaderMap, trailing_headers: &Option<s3s::TrailingHeaders>) -> bool {
+    trailing_headers.is_some()
+        || headers.contains_key(AMZ_TRAILER)
+        || matches!(
+            rustfs_rio::get_content_checksum(headers),
+            Ok(Some(checksum)) if checksum.checksum_type.trailing()
+        )
 }
 
 fn put_path_label(small_eager: bool, reduced_copy: bool, compressed: bool) -> &'static str {
@@ -217,6 +227,10 @@ where
         let start = data.len();
         data.resize(new_len, 0);
         chunk.copy_to_slice(&mut data[start..new_len]);
+
+        if data.len() == expected_len {
+            return Ok(data);
+        }
     }
 
     if data.len() != expected_len {
@@ -409,6 +423,8 @@ impl DefaultObjectUsecase {
         .await?;
         let eager_max_bytes =
             resolved_small_put_eager_max_bytes(topology_aware_small_put_eager_max_bytes(&store, opts.versioned));
+        let can_use_small_put_eager =
+            !request_uses_trailing_checksum(&request_context.headers, &request_context.trailing_headers);
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &request_context.headers)
             .await
@@ -436,92 +452,93 @@ impl DefaultObjectUsecase {
         };
 
         let reader_stage_start = std::time::Instant::now();
-        let stage =
-            if should_use_small_put_eager_path(size, eager_max_bytes, body_plan.should_compress(), encryption_enabled_for_put) {
-                small_object_eager_stage = true;
-                debug!(
-                    "Plain PUT is using the eager small-object path (bucket={}, key={}, size={}, eager_max={})",
-                    bucket, key, size, eager_max_bytes
-                );
-                build_small_put_eager_hash_stage(
-                    body,
+        let stage = if can_use_small_put_eager
+            && should_use_small_put_eager_path(size, eager_max_bytes, body_plan.should_compress(), encryption_enabled_for_put)
+        {
+            small_object_eager_stage = true;
+            debug!(
+                "Plain PUT is using the eager small-object path (bucket={}, key={}, size={}, eager_max={})",
+                bucket, key, size, eager_max_bytes
+            );
+            build_small_put_eager_hash_stage(
+                body,
+                size,
+                bytes_pool.clone(),
+                hash_values,
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .await?
+        } else if body_plan.should_compress() {
+            transform_stage.mark_compression();
+            let algorithm = CompressionAlgorithm::default();
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
+
+            let ingress_source = build_put_object_ingress_source(body, body_plan);
+            let stage = build_put_object_plain_hash_stage(
+                ingress_source,
+                std::mem::take(&mut hash_values),
+                PutObjectLegacyHashStagePlan {
                     size,
-                    bytes_pool.clone(),
-                    hash_values,
-                    &request_context.headers,
-                    request_context.trailing_headers.clone(),
-                )
-                .await?
-            } else if body_plan.should_compress() {
-                transform_stage.mark_compression();
-                let algorithm = CompressionAlgorithm::default();
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
-                insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
+                    actual_size: size,
+                    apply_s3_checksum: true,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?;
 
-                let ingress_source = build_put_object_ingress_source(body, body_plan);
-                let stage = build_put_object_plain_hash_stage(
-                    ingress_source,
-                    std::mem::take(&mut hash_values),
-                    PutObjectLegacyHashStagePlan {
-                        size,
-                        actual_size: size,
-                        apply_s3_checksum: true,
-                        ignore_s3_checksum_value: false,
-                    },
-                    &request_context.headers,
-                    request_context.trailing_headers.clone(),
-                )
-                .map_err(ApiError::from)?;
+            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                plain_reduced_copy_stage = true;
+            }
+            opts.want_checksum = stage.want_checksum;
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-                if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
-                    plain_reduced_copy_stage = true;
-                }
-                opts.want_checksum = stage.want_checksum;
-                insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
-                insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
+            let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
+            size = HashReader::SIZE_PRESERVE_LAYER;
+            hash_values.clear_for_transformed_body();
+            build_put_object_legacy_hash_stage(
+                reader,
+                hash_values,
+                PutObjectLegacyHashStagePlan {
+                    size,
+                    actual_size,
+                    apply_s3_checksum: size >= 0,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?
+        } else {
+            let ingress_source = build_put_object_ingress_source(body, body_plan);
+            let stage = build_put_object_plain_hash_stage(
+                ingress_source,
+                hash_values,
+                PutObjectLegacyHashStagePlan {
+                    size,
+                    actual_size,
+                    apply_s3_checksum: size >= 0,
+                    ignore_s3_checksum_value: false,
+                },
+                &request_context.headers,
+                request_context.trailing_headers.clone(),
+            )
+            .map_err(ApiError::from)?;
 
-                let reader: Box<dyn Reader> = Box::new(CompressReader::new(stage.reader, algorithm));
-                size = HashReader::SIZE_PRESERVE_LAYER;
-                hash_values.clear_for_transformed_body();
-                build_put_object_legacy_hash_stage(
-                    reader,
-                    hash_values,
-                    PutObjectLegacyHashStagePlan {
-                        size,
-                        actual_size,
-                        apply_s3_checksum: size >= 0,
-                        ignore_s3_checksum_value: false,
-                    },
-                    &request_context.headers,
-                    request_context.trailing_headers.clone(),
-                )
-                .map_err(ApiError::from)?
-            } else {
-                let ingress_source = build_put_object_ingress_source(body, body_plan);
-                let stage = build_put_object_plain_hash_stage(
-                    ingress_source,
-                    hash_values,
-                    PutObjectLegacyHashStagePlan {
-                        size,
-                        actual_size,
-                        apply_s3_checksum: size >= 0,
-                        ignore_s3_checksum_value: false,
-                    },
-                    &request_context.headers,
-                    request_context.trailing_headers.clone(),
-                )
-                .map_err(ApiError::from)?;
+            if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
+                plain_reduced_copy_stage = true;
+                debug!(
+                    "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
+                    bucket, key
+                );
+            }
 
-                if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
-                    plain_reduced_copy_stage = true;
-                    debug!(
-                        "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
-                        bucket, key
-                    );
-                }
-
-                stage
-            };
+            stage
+        };
         log_put_flow_phase(
             &bucket,
             &key,
@@ -708,10 +725,11 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures::stream;
+    use futures::{StreamExt, stream};
     use rustfs_io_core::BytesPool;
     use serial_test::serial;
     use std::sync::Arc;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn small_put_eager_path_only_targets_plain_small_objects() {
@@ -833,5 +851,18 @@ mod tests {
 
         drop(data);
         assert_eq!(pool.available_buffers(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_eager_returns_after_expected_bytes_without_waiting_for_eof() {
+        let body = stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abc")) }).chain(stream::pending());
+        let pool = Arc::new(BytesPool::new_tiered());
+
+        let data = timeout(Duration::from_millis(50), read_small_put_body_eager(body, 3, pool))
+            .await
+            .expect("eager read should not wait for stream termination")
+            .expect("eager read should succeed once content-length bytes are read");
+
+        assert_eq!(data.as_ref(), b"abc");
     }
 }

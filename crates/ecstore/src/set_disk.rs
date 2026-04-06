@@ -908,6 +908,7 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
+        let object_size = data.size();
         let encode_write_start = Instant::now();
         let w_size = match Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await {
             Ok(written) => written,
@@ -917,7 +918,7 @@ impl ObjectIO for SetDisks {
                     object,
                     "encode_write",
                     encode_write_start.elapsed(),
-                    data.size(),
+                    object_size,
                     is_inline_buffer,
                     write_quorum,
                 );

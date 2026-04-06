@@ -35,15 +35,39 @@ impl SetDisks {
         let encoder = erasure_coding::encode::ErasureChunkEncoder::new(erasure).await;
         let mut writer_group = erasure_coding::encode::MultiWriter::new(writers, write_quorum);
 
-        while let Some(block) = assembler.next_block().await? {
-            let encoded = encoder.encode_block(&block).await?;
-            writer_group.write_inline(&encoded)?;
+        loop {
+            let block = match assembler.next_block().await {
+                Ok(Some(block)) => block,
+                Ok(None) => break,
+                Err(err) => {
+                    data.restore_stream(assembler.into_inner());
+                    return Err(err);
+                }
+            };
+
+            let encoded = match encoder.encode_block(&block).await {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    data.restore_stream(assembler.into_inner());
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = writer_group.write_inline(&encoded) {
+                encoder.release(encoded).await;
+                data.restore_stream(assembler.into_inner());
+                return Err(err);
+            }
+
             encoder.release(encoded).await;
         }
 
         let total_bytes = assembler.total_bytes();
         let stream = assembler.into_inner();
-        writer_group.shutdown_inline()?;
+        if let Err(err) = writer_group.shutdown_inline() {
+            data.restore_stream(stream);
+            return Err(err);
+        }
         data.restore_stream(stream);
         Ok(total_bytes)
     }

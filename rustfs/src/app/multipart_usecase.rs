@@ -757,7 +757,8 @@ impl DefaultMultipartUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            let mut hrd =
+                HashReader::new(reader, size, actual_size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());

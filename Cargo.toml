@@ -286,7 +286,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
-dial9-tokio-telemetry = "0.2"
+dial9-tokio-telemetry = { version = "0.2", git = "https://github.com/dial9-rs/dial9-tokio-telemetry.git", rev = "60502082601b647c4a51962595721f631b7bbce1" }
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }

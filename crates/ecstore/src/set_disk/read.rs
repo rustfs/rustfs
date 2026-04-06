@@ -249,12 +249,13 @@ fn block_window(
     start_block: usize,
     end_block: usize,
 ) -> (usize, usize) {
+    let end_remainder = offset.saturating_add(length) % block_size;
     if start_block == end_block {
         (offset % block_size, length)
     } else if block_index == start_block {
         (offset % block_size, block_size - (offset % block_size))
     } else if block_index == end_block {
-        (0, (offset + length) % block_size)
+        (0, if end_remainder == 0 { block_size } else { end_remainder })
     } else {
         (0, block_size)
     }
@@ -292,7 +293,7 @@ async fn send_direct_data_shard_chunks(
     }
 
     let start_block = offset / block_size;
-    let end_block = offset.saturating_add(length) / block_size;
+    let end_block = offset.saturating_add(length.saturating_sub(1)) / block_size;
     let mut shard_cursors = shard_streams.into_iter().map(DirectShardCursor::new).collect::<Vec<_>>();
 
     for block_index in start_block..=end_block {
@@ -1462,7 +1463,12 @@ impl SetDisks {
 
         let length = if length < 0 { total_size - offset } else { length as usize };
 
-        if offset > total_size || offset + length > total_size {
+        let Some(end_offset_exclusive) = offset.checked_add(length) else {
+            error!("get_object_with_fileinfo offset overflow: {}, length: {}", offset, length);
+            return Err(Error::other("offset out of range"));
+        };
+
+        if offset > total_size || end_offset_exclusive > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
@@ -1475,7 +1481,7 @@ impl SetDisks {
 
         let mut end_offset = offset;
         if length > 0 {
-            end_offset += length - 1
+            end_offset = end_offset_exclusive - 1;
         }
 
         let (last_part_index, last_part_relative_offset) = if use_stored_part_sizes {

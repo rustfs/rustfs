@@ -164,12 +164,13 @@ fn block_window(
     start_block: usize,
     end_block: usize,
 ) -> (usize, usize) {
+    let end_remainder = offset.saturating_add(length) % block_size;
     if start_block == end_block {
         (offset % block_size, length)
     } else if block_index == start_block {
         (offset % block_size, block_size - (offset % block_size))
     } else if block_index == end_block {
-        (0, (offset + length) % block_size)
+        (0, if end_remainder == 0 { block_size } else { end_remainder })
     } else {
         (0, block_size)
     }
@@ -303,12 +304,19 @@ where
             return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
         }
 
-        if offset + length > total_length {
+        let end_offset = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length"))?;
+        if end_offset > total_length {
             return Err(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length"));
         }
 
         let start_block = offset / erasure.block_size;
-        let end_block = (offset + length) / erasure.block_size;
+        let end_block = if length == 0 {
+            start_block
+        } else {
+            end_offset.saturating_sub(1) / erasure.block_size
+        };
         let reader = ParallelReader::new(readers, erasure.clone(), offset, total_length);
 
         Ok(Self {
@@ -413,7 +421,10 @@ impl Erasure {
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));
         }
 
-        if offset + length > total_length {
+        let Some(end_offset) = offset.checked_add(length) else {
+            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
+        };
+        if end_offset > total_length {
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
         }
 
@@ -428,7 +439,7 @@ impl Erasure {
         let mut reader = ParallelReader::new(readers, self.clone(), offset, total_length);
 
         let start = offset / self.block_size;
-        let end = (offset + length) / self.block_size;
+        let end = end_offset.saturating_sub(1) / self.block_size;
 
         for i in start..=end {
             let (block_offset, block_length) = if start == end {
@@ -436,7 +447,8 @@ impl Erasure {
             } else if i == start {
                 (offset % self.block_size, self.block_size - (offset % self.block_size))
             } else if i == end {
-                (0, (offset + length) % self.block_size)
+                let end_remainder = end_offset % self.block_size;
+                (0, if end_remainder == 0 { self.block_size } else { end_remainder })
             } else {
                 (0, self.block_size)
             };
