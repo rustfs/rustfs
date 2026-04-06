@@ -14,7 +14,7 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
-    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
+    ReplicationState, ReplicationStatusType, Result, S3VersionId, VersionPurgeStatusType, is_restored_object_on_disk,
     replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
@@ -66,16 +66,16 @@ const MSGP_UINT32_SIZE: usize = 5;
 const DEFAULT_OBJECT_MAX_VERSIONS: usize = 10000;
 
 /// Returns the inline data map key for a version_id. "null" for null version.
-pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
-    if version_id.is_none() || version_id == Some(Uuid::nil()) {
+pub fn data_key_for_version(version_id: Option<S3VersionId>) -> String {
+    if version_id.is_none() || version_id == Some(S3VersionId::Uuid(Uuid::nil())) {
         NULL_VERSION_ID.to_string()
     } else {
-        version_id.unwrap_or_default().to_string()
+        version_id.map(|v| v.to_string()).unwrap_or_default()
     }
 }
 
-fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
-    if version_id.is_none() || version_id == Some(Uuid::nil()) {
+fn legacy_data_key_for_version(version_id: Option<S3VersionId>) -> Option<String> {
+    if version_id.is_none() || version_id == Some(S3VersionId::Uuid(Uuid::nil())) {
         Some(Uuid::nil().to_string())
     } else {
         None
@@ -172,7 +172,7 @@ impl FileMeta {
         });
     }
 
-    fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
+    fn find_inline_data_for_version(&self, version_id: Option<S3VersionId>) -> Result<Option<Vec<u8>>> {
         let key = data_key_for_version(version_id);
         if let Some(data) = self.data.find(key.as_str())? {
             return Ok(Some(data));
@@ -188,8 +188,8 @@ impl FileMeta {
     }
 
     // Find version
-    pub fn find_version(&self, vid: Option<Uuid>) -> Result<(usize, FileMetaVersion)> {
-        let vid = vid.unwrap_or_default();
+    pub fn find_version(&self, vid: Option<S3VersionId>) -> Result<(usize, FileMetaVersion)> {
+        let vid = vid.unwrap_or(S3VersionId::Uuid(Uuid::nil()));
         for (i, fver) in self.versions.iter().enumerate() {
             if fver.header.version_id == Some(vid) {
                 let version = self.get_idx(i)?;
@@ -206,8 +206,8 @@ impl FileMeta {
                 VersionType::Invalid | VersionType::Legacy => (),
                 VersionType::Object => {
                     // For non-versioned buckets, treat None as Uuid::nil()
-                    let fi_vid = fi.version_id.or(Some(Uuid::nil()));
-                    let ver_vid = version.header.version_id.or(Some(Uuid::nil()));
+                    let fi_vid = fi.version_id.or(Some(S3VersionId::Uuid(Uuid::nil())));
+                    let ver_vid = version.header.version_id.or(Some(S3VersionId::Uuid(Uuid::nil())));
 
                     if ver_vid == fi_vid {
                         let mut ver = FileMetaVersion::try_from(version.meta.as_slice())?;
@@ -267,7 +267,7 @@ impl FileMeta {
     pub fn add_version(&mut self, mut fi: FileInfo) -> Result<()> {
         // empty version_id means "null" (versioning disabled/suspended)
         if fi.version_id.is_none() {
-            fi.version_id = Some(Uuid::nil());
+            fi.version_id = Some(S3VersionId::Uuid(Uuid::nil()));
         }
 
         let version_key = data_key_for_version(fi.version_id);
@@ -307,9 +307,9 @@ impl FileMeta {
         let vid = version.get_version_id();
 
         // Match existing version for replace; null version: None and Some(nil) are equivalent
-        let matches = |h: &Option<Uuid>| {
-            let v_null = vid.is_none() || vid == Some(Uuid::nil());
-            let h_null = h.is_none() || *h == Some(Uuid::nil());
+        let matches = |h: &Option<S3VersionId>| {
+            let v_null = vid.is_none() || vid == Some(S3VersionId::Uuid(Uuid::nil()));
+            let h_null = h.is_none() || *h == Some(S3VersionId::Uuid(Uuid::nil()));
             (v_null && h_null) || (vid == *h)
         };
 
@@ -377,7 +377,7 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
-        let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
+        let vid = Some(fi.version_id.unwrap_or(S3VersionId::Uuid(Uuid::nil())));
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -571,7 +571,7 @@ impl FileMeta {
                     self.versions.remove(i);
 
                     if (fi.mark_deleted && fi.version_purge_status() != VersionPurgeStatusType::Complete)
-                        || (fi.deleted && vid == Some(Uuid::nil()))
+                        || (fi.deleted && vid == Some(S3VersionId::Uuid(Uuid::nil())))
                     {
                         self.add_version_filemata(ventry)?;
                     }
@@ -675,12 +675,11 @@ impl FileMeta {
         include_free_versions: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
-        let vid = {
-            if !version_id.is_empty() {
-                Uuid::parse_str(version_id)?
-            } else {
-                Uuid::nil()
-            }
+        let vid = if !version_id.is_empty() {
+            S3VersionId::parse_api_version_id(version_id)?
+                .ok_or_else(|| Error::UuidParse("version id required when non-empty string given".to_owned()))?
+        } else {
+            S3VersionId::Uuid(Uuid::nil())
         };
 
         let mut is_latest = true;
@@ -891,8 +890,9 @@ impl FileMeta {
             return Err(Error::other("empty version ID"));
         }
 
-        let uuid = Uuid::parse_str(version_id)?;
-        self.find_version(Some(uuid))
+        let vid = S3VersionId::parse_api_version_id(version_id)?
+            .ok_or_else(|| Error::other("empty or null version ID in find_version_str"))?;
+        self.find_version(Some(vid))
     }
 }
 
@@ -945,7 +945,7 @@ mod test {
     #[test]
     fn test_marshal_metadeletemarker() {
         let obj = MetaDeleteMarker {
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
 
@@ -965,7 +965,7 @@ mod test {
     #[test]
     fn test_marshal_metaversion() {
         let mut fi = FileInfo::new("tset", 3, 2);
-        fi.version_id = Some(Uuid::new_v4());
+        fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
         fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()).unwrap());
         let mut obj = FileMetaVersion::from(fi);
         obj.write_version = 110;
@@ -989,7 +989,7 @@ mod test {
     #[test]
     fn test_marshal_metaversionheader() {
         let mut obj = FileMetaVersionHeader::default();
-        let vid = Some(Uuid::new_v4());
+        let vid = Some(S3VersionId::Uuid(Uuid::new_v4()));
         obj.version_id = vid;
 
         let encoded = obj.marshal_msg().unwrap();
@@ -1100,8 +1100,8 @@ mod test {
         fi.set_inline_data();
         fm.add_version(fi).unwrap();
 
-        let current_key = data_key_for_version(Some(Uuid::nil()));
-        let legacy_key = legacy_data_key_for_version(Some(Uuid::nil())).unwrap();
+        let current_key = data_key_for_version(Some(S3VersionId::Uuid(Uuid::nil())));
+        let legacy_key = legacy_data_key_for_version(Some(S3VersionId::Uuid(Uuid::nil()))).unwrap();
         let payload = fm.data.find(current_key.as_str()).unwrap().unwrap();
 
         fm.data.remove_key(current_key.as_str()).unwrap();
@@ -1293,7 +1293,7 @@ mod test {
             let fm_clone: Arc<Mutex<FileMeta>> = Arc::clone(&fm);
             let handle = tokio::spawn(async move {
                 let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
-                fi.version_id = Some(Uuid::new_v4());
+                fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
                 fi.mod_time = Some(OffsetDateTime::now_utc());
 
                 let mut fm_guard = fm_clone.lock().unwrap();
@@ -1325,7 +1325,7 @@ mod test {
         let mut large_fm = FileMeta::new();
         for i in 0..100 {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi.mod_time = Some(OffsetDateTime::now_utc());
             large_fm.add_version(fi).unwrap();
         }
@@ -1348,7 +1348,7 @@ mod test {
         let same_time = OffsetDateTime::now_utc();
         for i in 0..5 {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi.mod_time = Some(same_time);
             fm.add_version(fi).unwrap();
         }
@@ -1453,7 +1453,7 @@ mod test {
         // Add object versions
         for i in 0..object_count {
             let mut fi = crate::fileinfo::FileInfo::new(&format!("obj-{i}"), 2, 1);
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi.mod_time = Some(OffsetDateTime::now_utc());
             fm.add_version(fi).unwrap();
         }
@@ -1461,7 +1461,7 @@ mod test {
         // Add delete markers
         for i in 0..delete_count {
             let delete_marker = MetaDeleteMarker {
-                version_id: Some(Uuid::new_v4()),
+                version_id: Some(S3VersionId::Uuid(Uuid::new_v4())),
                 mod_time: Some(OffsetDateTime::now_utc()),
                 meta_sys: HashMap::new(),
             };
@@ -1506,7 +1506,7 @@ mod test {
 
         for path in paths {
             let mut fi = crate::fileinfo::FileInfo::new(path, 2, 1);
-            fi.version_id = Some(Uuid::new_v4());
+            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi.mod_time = Some(OffsetDateTime::now_utc());
             fm.add_version(fi).unwrap();
         }
@@ -1531,7 +1531,7 @@ mod test {
 
         // Add a normal version
         let mut fi = crate::fileinfo::FileInfo::new("test", 2, 1);
-        fi.version_id = Some(Uuid::new_v4());
+        fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
         fi.mod_time = Some(OffsetDateTime::now_utc());
         fm.add_version(fi).unwrap();
 
@@ -1579,14 +1579,20 @@ mod test {
         inline_fi.set_inline_data();
         fm.add_version(inline_fi).unwrap();
 
-        let before = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        let before = fm
+            .data
+            .find(data_key_for_version(Some(S3VersionId::Uuid(Uuid::nil()))).as_str())
+            .unwrap();
         assert_eq!(before, Some(Bytes::from_static(b"inline").to_vec()));
 
         let invalid_disk_fi = crate::fileinfo::FileInfo::new("test", 2, 1);
         let err = fm.add_version(invalid_disk_fi).unwrap_err();
         assert!(err.to_string().contains("file meta version invalid"));
 
-        let after = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
+        let after = fm
+            .data
+            .find(data_key_for_version(Some(S3VersionId::Uuid(Uuid::nil()))).as_str())
+            .unwrap();
         assert_eq!(after, Some(Bytes::from_static(b"inline").to_vec()));
     }
 
@@ -1599,11 +1605,11 @@ mod test {
         // Create two distinct sets of versions
         for i in 0..3 {
             let mut fi1 = crate::fileinfo::FileInfo::new(&format!("test1-{i}"), 2, 1);
-            fi1.version_id = Some(Uuid::new_v4());
+            fi1.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi1.mod_time = Some(OffsetDateTime::from_unix_timestamp(1000 + i * 10).unwrap());
 
             let mut fi2 = crate::fileinfo::FileInfo::new(&format!("test2-{i}"), 2, 1);
-            fi2.version_id = Some(Uuid::new_v4());
+            fi2.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
             fi2.mod_time = Some(OffsetDateTime::from_unix_timestamp(1005 + i * 10).unwrap());
 
             let version1 = FileMetaVersion::from(fi1);
@@ -1648,7 +1654,7 @@ mod test {
 
         for uuid in test_uuids {
             let obj = MetaObject {
-                version_id: Some(uuid),
+                version_id: Some(S3VersionId::Uuid(uuid)),
                 data_dir: Some(uuid),
                 ..Default::default()
             };
@@ -1664,7 +1670,7 @@ mod test {
 
         // Test nil UUID separately because serialization converts it to None
         let obj = MetaObject {
-            version_id: Some(Uuid::nil()),
+            version_id: Some(S3VersionId::Uuid(Uuid::nil())),
             data_dir: Some(Uuid::nil()),
             ..Default::default()
         };

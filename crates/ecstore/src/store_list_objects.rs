@@ -388,7 +388,7 @@ impl ECStore {
             if marker == "null" {
                 None
             } else {
-                Some(Uuid::parse_str(&marker)?)
+                rustfs_filemeta::S3VersionId::parse_api_version_id(&marker)?
             }
         } else {
             None

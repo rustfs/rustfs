@@ -33,8 +33,8 @@ use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
-    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    get_file_info, read_xl_meta_no_data,
+    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, S3VersionId,
+    UpdateFn, data_key_for_version, get_file_info, read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -772,8 +772,8 @@ impl LocalDisk {
             };
 
             if let Some(dir) = data_dir {
-                let vid = fi.version_id.unwrap_or_default();
-                let _ = fm.data.remove(vec![vid, dir]);
+                let vk = data_key_for_version(fi.version_id);
+                let _ = fm.data.remove(&[vk, dir.to_string()]);
 
                 let dir_path = self.get_object_path(volume, format!("{path}/{dir}").as_str())?;
                 if let Err(err) = self.move_to_trash(&dir_path, true, false).await
@@ -2009,7 +2009,7 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
-        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+        let search_version_id = fi.version_id.or(Some(S3VersionId::Uuid(Uuid::nil())));
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
         let has_old_data_dir = {
@@ -2020,7 +2020,8 @@ impl DiskAPI for LocalDisk {
             })
         };
         if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
+            let vk = data_key_for_version(search_version_id);
+            let _ = xlmeta.data.remove(&[vk, old_data_dir.to_string()]);
         }
 
         xlmeta.add_version(fi.clone())?;
@@ -2394,8 +2395,8 @@ impl DiskAPI for LocalDisk {
         let old_dir = meta.delete_version(&fi)?;
 
         if let Some(uuid) = old_dir {
-            let vid = fi.version_id.unwrap_or_default();
-            let _ = meta.data.remove(vec![vid, uuid])?;
+            let vk = data_key_for_version(fi.version_id);
+            let _ = meta.data.remove(&[vk, uuid.to_string()])?;
 
             let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
             check_path_length(old_path.to_string_lossy().as_ref())?;

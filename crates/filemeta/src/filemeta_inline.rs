@@ -15,7 +15,6 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
-use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InlineData(Vec<u8>);
@@ -233,7 +232,7 @@ impl InlineData {
         Ok(true)
     }
 
-    pub fn remove(&mut self, remove_keys: Vec<Uuid>) -> Result<bool> {
+    pub fn remove(&mut self, remove_keys: &[String]) -> Result<bool> {
         let buf = self.after_version();
         if buf.is_empty() {
             return Ok(false);
@@ -244,14 +243,7 @@ impl InlineData {
         let mut keys = Vec::with_capacity(fields_len + 1);
         let mut values = Vec::with_capacity(fields_len + 1);
 
-        let remove_key = |found_key: &str| {
-            for key in remove_keys.iter() {
-                if key.to_string().as_str() == found_key {
-                    return true;
-                }
-            }
-            false
-        };
+        let remove_key = |found_key: &str| remove_keys.iter().any(|k| k == found_key);
 
         let mut found = false;
 

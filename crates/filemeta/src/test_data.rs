@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, VersionType};
+use crate::{
+    ChecksumAlgo, FileMeta, FileMetaShallowVersion, FileMetaVersion, MetaDeleteMarker, MetaObject, Result, S3VersionId,
+    VersionType,
+};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -31,7 +34,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     metadata.insert("X-Amz-Meta-Created".to_string(), "2024-01-15T10:30:00Z".to_string());
 
     let object_version = MetaObject {
-        version_id: Some(version_id),
+        version_id: Some(S3VersionId::Uuid(version_id)),
         data_dir: Some(data_dir),
         erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
         erasure_m: 4,
@@ -65,7 +68,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     // Add a delete marker version
     let delete_version_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555")?;
     let delete_marker = MetaDeleteMarker {
-        version_id: Some(delete_version_id),
+        version_id: Some(S3VersionId::Uuid(delete_version_id)),
         mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312260)?), // 1 minute later
         meta_sys: HashMap::new(),
     };
@@ -92,7 +95,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     };
 
     let mut legacy_shallow = FileMetaShallowVersion::try_from(legacy_version)?;
-    legacy_shallow.header.version_id = Some(legacy_version_id);
+    legacy_shallow.header.version_id = Some(S3VersionId::Uuid(legacy_version_id));
     legacy_shallow.header.mod_time = Some(OffsetDateTime::from_unix_timestamp(1705312140)?); // earlier time
     fm.versions.push(legacy_shallow);
 
@@ -117,7 +120,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
         metadata.insert("X-Amz-Meta-Test".to_string(), format!("test-value-{i}"));
 
         let object_version = MetaObject {
-            version_id: Some(version_id),
+            version_id: Some(S3VersionId::Uuid(version_id)),
             data_dir,
             erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
             erasure_m: 4,
@@ -152,7 +155,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
         if i % 3 == 2 {
             let delete_version_id = Uuid::new_v4();
             let delete_marker = MetaDeleteMarker {
-                version_id: Some(delete_version_id),
+                version_id: Some(S3VersionId::Uuid(delete_version_id)),
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312200 + i * 60 + 30)?),
                 meta_sys: HashMap::new(),
             };
@@ -222,10 +225,11 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
     // Add inline data
     let inline_data = b"This is inline data for testing purposes";
     let version_id = Uuid::new_v4();
-    fm.data.replace(&version_id.to_string(), inline_data.to_vec())?;
+    fm.data
+        .replace(&S3VersionId::Uuid(version_id).to_string(), inline_data.to_vec())?;
 
     let object_version = MetaObject {
-        version_id: Some(version_id),
+        version_id: Some(S3VersionId::Uuid(version_id)),
         data_dir: None,
         erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
         erasure_m: 1,

@@ -3412,7 +3412,7 @@ mod tests {
             name: "key".to_string(),
             delete_marker: false,
             replication_status: ReplicationStatusType::Failed,
-            version_id: Some(Uuid::nil()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::nil())),
             mod_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         };

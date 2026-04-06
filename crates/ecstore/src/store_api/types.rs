@@ -1,4 +1,5 @@
 use super::*;
+use rustfs_filemeta::S3VersionId;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
@@ -269,7 +270,7 @@ pub struct ObjectInfo {
     pub user_defined: HashMap<String, String>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub delete_marker: bool,
     pub transitioned_object: TransitionedObject,
     pub restore_ongoing: bool,
@@ -404,7 +405,7 @@ impl ObjectInfo {
         let mut version_id = fi.version_id;
 
         if versioned && version_id.is_none() {
-            version_id = Some(Uuid::nil())
+            version_id = Some(S3VersionId::Uuid(Uuid::nil()))
         }
 
         // etag
@@ -549,7 +550,7 @@ impl ObjectInfo {
         bucket: &str,
         prefix: &str,
         delimiter: Option<String>,
-        after_version_id: Option<Uuid>,
+        after_version_id: Option<S3VersionId>,
     ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
@@ -921,7 +922,7 @@ pub struct ListPartsInfo {
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub delete_marker_replication_status: Option<String>,
     pub version_purge_status: Option<VersionPurgeStatusType>,
     pub version_purge_statuses: Option<String>,
@@ -944,9 +945,9 @@ impl ObjectToDelete {
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
-    pub delete_marker_version_id: Option<Uuid>,
+    pub delete_marker_version_id: Option<S3VersionId>,
     pub object_name: String,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication

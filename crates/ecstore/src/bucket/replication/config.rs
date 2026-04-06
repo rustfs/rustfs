@@ -14,20 +14,19 @@
 
 use crate::bucket::replication::ReplicationRuleExt as _;
 use crate::bucket::tagging::decode_tags_to_map;
-use rustfs_filemeta::ReplicationType;
+use rustfs_filemeta::{ReplicationType, S3VersionId};
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
 use s3s::dto::{ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRuleStatus, ReplicationRules};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectOpts {
     pub name: String,
     pub user_tags: String,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub delete_marker: bool,
     pub ssec: bool,
     pub op_type: ReplicationType,

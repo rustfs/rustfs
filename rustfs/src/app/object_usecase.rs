@@ -71,7 +71,7 @@ use rustfs_ecstore::store_api::{
     PutObjReader,
 };
 use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
+    REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, S3VersionId, VersionPurgeStatusType,
     parse_restore_obj_status,
 };
 use rustfs_notify::EventArgsBuilder;
@@ -166,15 +166,18 @@ struct PutObjectChecksums {
     crc64nvme: Option<String>,
 }
 
-fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
+fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<S3VersionId>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
         Some(id) => {
             if id.eq_ignore_ascii_case("null") {
-                Ok((Some("null".to_string()), Some(Uuid::nil())))
+                Ok((Some("null".to_string()), Some(S3VersionId::Uuid(Uuid::nil()))))
             } else {
-                let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-                Ok((Some(id), Some(uuid)))
+                let parsed = S3VersionId::parse_api_version_id(&id).map_err(|e| e.to_string())?;
+                let Some(v) = parsed else {
+                    return Err("invalid version id".to_string());
+                };
+                Ok((Some(id), Some(v)))
             }
         }
         None => Ok((None, None)),
@@ -1076,7 +1079,10 @@ impl DefaultObjectUsecase {
                 actual_size: cached.content_length,
                 is_dir: false,
                 user_defined: cached.user_metadata.clone(),
-                version_id: cached.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+                version_id: cached
+                    .version_id
+                    .as_ref()
+                    .and_then(|v| S3VersionId::parse_api_version_id(v).ok().flatten()),
                 delete_marker: cached.delete_marker,
                 content_type: cached.content_type.clone(),
                 content_encoding: cached.content_encoding.clone(),
@@ -1555,15 +1561,10 @@ impl DefaultObjectUsecase {
 
         // Get version_id from object info
         // If versioning is enabled and version_id exists in object info, return it
-        // If version_id is Uuid::nil(), return "null" string (AWS S3 convention)
+        // If version_id is the nil UUID sentinel, return "null" string (AWS S3 convention)
         let output_version_id = if versioned {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
+            info.version_id
+                .map(|vid| if vid.is_nil() { "null".to_string() } else { vid.to_string() })
         } else {
             None
         };
@@ -1857,13 +1858,8 @@ impl DefaultObjectUsecase {
         };
 
         let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
+            info.version_id
+                .map(|vid| if vid.is_nil() { "null".to_string() } else { vid.to_string() })
         } else {
             None
         };
@@ -2475,7 +2471,7 @@ impl DefaultObjectUsecase {
             object_sizes.push(goi.size);
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::nil());
+                object.version_id = Some(S3VersionId::Uuid(Uuid::nil()));
             }
 
             if replicate_deletes {
@@ -2579,7 +2575,7 @@ impl DefaultObjectUsecase {
                 delete_marker: { if v.delete_marker { Some(true) } else { None } },
                 delete_marker_version_id: v.delete_marker_version_id.map(|v| v.to_string()),
                 key: Some(v.object_name.clone()),
-                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
+                version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(S3VersionId::Uuid(Uuid::nil())) {
                     None
                 } else {
                     v.version_id.map(|v| v.to_string())
@@ -2602,7 +2598,7 @@ impl DefaultObjectUsecase {
             {
                 let mut dobj = dobj.clone();
                 if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
-                    dobj.version_id = Some(Uuid::nil());
+                    dobj.version_id = Some(S3VersionId::Uuid(Uuid::nil()));
                 }
 
                 let deleted_object = DeletedObjectReplicationInfo {

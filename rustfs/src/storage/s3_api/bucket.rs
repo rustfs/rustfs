@@ -352,6 +352,7 @@ mod tests {
     };
     use crate::storage::s3_api::common::rustfs_owner;
     use rustfs_ecstore::store_api::{BucketInfo, ListObjectVersionsInfo, ListObjectsV2Info, ObjectInfo};
+    use rustfs_filemeta::S3VersionId;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use time::OffsetDateTime;
@@ -602,7 +603,7 @@ mod tests {
                     size: 10,
                     etag: Some("etag-a".to_string()),
                     storage_class: Some("STANDARD".to_string()),
-                    version_id: Some(Uuid::nil()),
+                    version_id: Some(S3VersionId::Uuid(Uuid::nil())),
                     is_latest: true,
                     ..Default::default()
                 },

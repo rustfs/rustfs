@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::S3VersionId;
 use bytes::Bytes;
 use core::fmt;
 use regex::Regex;
@@ -22,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 pub const REPLICATION_RESET: &str = "replication-reset";
 pub const REPLICATION_STATUS: &str = "replication-status";
@@ -543,7 +543,7 @@ pub struct MrfReplicateEntry {
     pub object: String,
 
     #[serde(skip_serializing, skip_deserializing)]
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
 
     #[serde(rename = "retryCount")]
     pub retry_count: i32,
@@ -714,7 +714,7 @@ pub struct ReplicateObjectInfo {
     pub size: i64,
     pub actual_size: i64,
     pub bucket: String,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub replication_status: ReplicationStatusType,

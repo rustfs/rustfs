@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::*;
+use crate::S3VersionId;
 
 impl FileMeta {
-    pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
-        let vid = vid.unwrap_or_default();
+    pub fn shard_data_dir_count(&self, vid: &Option<S3VersionId>, data_dir: &Option<Uuid>) -> usize {
+        let vid = vid.unwrap_or(S3VersionId::Uuid(Uuid::nil()));
         self.versions
             .iter()
             .filter(|v| {
@@ -39,8 +40,8 @@ impl FileMeta {
     }
 
     /// Count shared data directories
-    pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
-        let vid = version_id.unwrap_or_default();
+    pub fn shared_data_dir_count(&self, version_id: Option<S3VersionId>, data_dir: Option<Uuid>) -> usize {
+        let vid = version_id.unwrap_or(S3VersionId::Uuid(Uuid::nil()));
 
         if self.data.entries().unwrap_or_default() > 0
             && self.find_inline_data_for_version(version_id).unwrap_or_default().is_some()

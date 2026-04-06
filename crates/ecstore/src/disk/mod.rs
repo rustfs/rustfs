@@ -598,9 +598,17 @@ impl FileInfoVersions {
             return None;
         }
 
-        let vid = Uuid::parse_str(v).unwrap_or_default();
+        let want: Option<rustfs_filemeta::S3VersionId> = match rustfs_filemeta::S3VersionId::parse_api_version_id(v) {
+            Ok(opt) => opt,
+            Err(_) => return None,
+        };
 
-        self.versions.iter().position(|v| v.version_id == Some(vid))
+        match want {
+            None => self.versions.iter().position(|ver| {
+                ver.version_id.is_none() || ver.version_id == Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::nil()))
+            }),
+            Some(want) => self.versions.iter().position(|ver| ver.version_id == Some(want)),
+        }
     }
 }
 
@@ -722,6 +730,7 @@ mod tests {
     use super::*;
     use endpoint::Endpoint;
     use local::LocalDisk;
+    use rustfs_filemeta::S3VersionId;
     use std::path::PathBuf;
     use tokio::fs;
     use uuid::Uuid;
@@ -758,11 +767,11 @@ mod tests {
         let v1_uuid = Uuid::new_v4();
         let v2_uuid = Uuid::new_v4();
         let fi1 = FileInfo {
-            version_id: Some(v1_uuid),
+            version_id: Some(S3VersionId::Uuid(v1_uuid)),
             ..Default::default()
         };
         let fi2 = FileInfo {
-            version_id: Some(v2_uuid),
+            version_id: Some(S3VersionId::Uuid(v2_uuid)),
             ..Default::default()
         };
         versions.push(fi1);

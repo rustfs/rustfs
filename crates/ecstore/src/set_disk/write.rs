@@ -504,7 +504,7 @@ impl SetDisks {
 
         let mut fi = FileInfo::default();
         if let Some(ref version_id) = opts.version_id {
-            fi.version_id = Uuid::parse_str(version_id).ok();
+            fi.version_id = rustfs_filemeta::S3VersionId::parse_api_version_id(version_id).ok().flatten();
         }
 
         fi.set_tier_free_version_id(&Uuid::new_v4().to_string());

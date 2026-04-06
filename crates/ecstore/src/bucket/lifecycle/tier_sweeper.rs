@@ -21,6 +21,7 @@
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::global::GLOBAL_TierConfigMgr;
+use rustfs_filemeta::S3VersionId;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::io::Write;
@@ -34,7 +35,7 @@ static XXHASH_SEED: u64 = 0;
 struct ObjSweeper {
     object: String,
     bucket: String,
-    version_id: Option<Uuid>,
+    version_id: Option<S3VersionId>,
     versioned: bool,
     suspended: bool,
     transition_status: String,
@@ -54,7 +55,7 @@ impl ObjSweeper {
         })
     }
 
-    pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
+    pub fn with_version(&mut self, vid: Option<S3VersionId>) -> &Self {
         self.version_id = vid.clone();
         self
     }

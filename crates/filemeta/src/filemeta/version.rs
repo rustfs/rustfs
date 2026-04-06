@@ -24,6 +24,7 @@
 
 use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
 use super::*;
+use crate::S3VersionId;
 use rustfs_utils::http::{
     SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
     SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
@@ -109,10 +110,10 @@ impl FileMetaVersion {
         }
     }
 
-    pub fn get_version_id(&self) -> Option<Uuid> {
+    pub fn get_version_id(&self) -> Option<S3VersionId> {
         match self.version_type {
-            VersionType::Object => self.object.as_ref().map(|v| v.version_id).unwrap_or_default(),
-            VersionType::Delete => self.delete_marker.as_ref().map(|v| v.version_id).unwrap_or_default(),
+            VersionType::Object => self.object.as_ref().and_then(|v| v.version_id),
+            VersionType::Delete => self.delete_marker.as_ref().and_then(|v| v.version_id),
             _ => None,
         }
     }
@@ -298,7 +299,10 @@ impl FileMetaVersion {
                 if let Some(ref obj) = self.object {
                     // Calculate signature based on object metadata
                     let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-                    hasher.update(obj.version_id.unwrap_or_default().as_bytes());
+                    match &obj.version_id {
+                        None => hasher.update(Uuid::nil().as_bytes()),
+                        Some(v) => hasher.update(v.wire_slice()),
+                    }
                     if let Some(mod_time) = obj.mod_time {
                         hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
                     }
@@ -313,7 +317,10 @@ impl FileMetaVersion {
                 if let Some(ref dm) = self.delete_marker {
                     // Calculate signature for delete marker
                     let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-                    hasher.update(dm.version_id.unwrap_or_default().as_bytes());
+                    match &dm.version_id {
+                        None => hasher.update(Uuid::nil().as_bytes()),
+                        Some(v) => hasher.update(v.wire_slice()),
+                    }
                     if let Some(mod_time) = dm.mod_time {
                         hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
                     }
@@ -393,7 +400,7 @@ impl TryFrom<FileMetaShallowVersion> for FileMetaVersion {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
 pub struct FileMetaVersionHeader {
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub mod_time: Option<OffsetDateTime>,
     pub signature: [u8; 4],
     pub version_type: VersionType,
@@ -481,8 +488,11 @@ impl FileMetaVersionHeader {
         // array len 7
         rmp::encode::write_array_len(&mut wr, 7)?;
 
-        // version_id
-        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or_default().as_bytes())?;
+        // version_id (16-byte nil UUID when absent; 16- or 32-byte when set)
+        match &self.version_id {
+            None => rmp::encode::write_bin(&mut wr, Uuid::nil().as_bytes())?,
+            Some(v) => rmp::encode::write_bin(&mut wr, v.wire_slice())?,
+        }
         // mod_time
         rmp::encode::write_i64(&mut wr, self.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp_nanos() as i64)?;
         // signature
@@ -506,14 +516,27 @@ impl FileMetaVersionHeader {
             return Err(Error::other(format!("version header array len err need 7 got {alen}")));
         }
 
-        // version_id
-        rmp::decode::read_bin_len(&mut cur)?;
-        let mut buf = [0u8; 16];
-        cur.read_exact(&mut buf)?;
-        self.version_id = {
-            let id = Uuid::from_bytes(buf);
-            // if id.is_nil() { None } else { Some(id) }
-            Some(id)
+        // version_id (legacy fixed 16 bytes or extended 32-byte Wasabi form)
+        let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+        let mut bin = vec![0u8; bin_len];
+        cur.read_exact(&mut bin)?;
+        // Match legacy header decode: 16-byte field is always `Some(Uuid)` on read (including nil UUID).
+        self.version_id = match bin_len {
+            16 => {
+                let arr: [u8; 16] = bin
+                    .try_into()
+                    .map_err(|_| Error::other("FileMetaVersionHeader: version_id expected 16 bytes"))?;
+                Some(S3VersionId::Uuid(Uuid::from_bytes(arr)))
+            }
+            32 => Some(S3VersionId::WasabiAscii(
+                bin.try_into()
+                    .map_err(|_| Error::other("FileMetaVersionHeader: version_id expected 32 bytes"))?,
+            )),
+            _ => {
+                return Err(Error::other(format!(
+                    "FileMetaVersionHeader: version_id bin length {bin_len}, expected 16 or 32"
+                )));
+            }
         };
 
         // mod_time
@@ -629,7 +652,7 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
 // Because of custom message_pack, field order must be guaranteed
 pub struct MetaObject {
     #[serde(rename = "ID")]
-    pub version_id: Option<Uuid>, // Version ID
+    pub version_id: Option<S3VersionId>, // Version ID
     #[serde(rename = "DDir")]
     pub data_dir: Option<Uuid>, // Data dir ID
     #[serde(rename = "EcAlgo")]
@@ -690,7 +713,10 @@ impl MetaObject {
 
         // ID
         rmp::encode::write_str(wr, "ID")?;
-        rmp::encode::write_bin(wr, self.version_id.unwrap_or_default().as_bytes())?;
+        match &self.version_id {
+            None => rmp::encode::write_bin(wr, Uuid::nil().as_bytes())?,
+            Some(v) => rmp::encode::write_bin(wr, v.wire_slice())?,
+        }
 
         // DDir
         rmp::encode::write_str(wr, "DDir")?;
@@ -834,17 +860,16 @@ impl MetaObject {
 
             match key.as_str() {
                 "ID" => {
-                    let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
+                    let blen = rmp::decode::read_bin_len(rd).map_err(|e| {
                         tracing::error!(error = %e, "decode_from: read_bin_len ID failed");
                         e
-                    })?;
-                    let mut buf = [0u8; 16];
+                    })? as usize;
+                    let mut buf = vec![0u8; blen];
                     rd.read_exact(&mut buf).map_err(|e| {
                         tracing::error!(error = %e, "decode_from: read_exact ID buf failed");
                         e
                     })?;
-                    let id = Uuid::from_bytes(buf);
-                    self.version_id = if id.is_nil() { None } else { Some(id) };
+                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf)?;
                 }
                 "DDir" => {
                     let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
@@ -1137,7 +1162,7 @@ impl MetaObject {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
-        let version_id = self.version_id.filter(|&vid| !vid.is_nil());
+        let version_id = self.version_id.filter(|vid| !vid.is_nil());
 
         let parts = if all_parts {
             let mut parts = vec![ObjectPartInfo::default(); self.part_numbers.len()];
@@ -1303,7 +1328,10 @@ impl MetaObject {
     /// Get object signature
     pub fn get_signature(&self) -> [u8; 4] {
         let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-        hasher.update(self.version_id.unwrap_or_default().as_bytes());
+        match &self.version_id {
+            None => hasher.update(Uuid::nil().as_bytes()),
+            Some(v) => hasher.update(v.wire_slice()),
+        }
         if let Some(mod_time) = self.mod_time {
             hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
         }
@@ -1331,7 +1359,7 @@ impl MetaObject {
                 ..Default::default()
             };
             free_entry.delete_marker = Some(MetaDeleteMarker {
-                version_id: Some(vid),
+                version_id: Some(S3VersionId::Uuid(vid)),
                 mod_time: self.mod_time,
                 meta_sys: HashMap::<String, Vec<u8>>::new(),
             });
@@ -1478,7 +1506,7 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct MetaDeleteMarker {
     #[serde(rename = "ID")]
-    pub version_id: Option<Uuid>, // Version ID for delete marker
+    pub version_id: Option<S3VersionId>, // Version ID for delete marker
     #[serde(rename = "MTime")]
     pub mod_time: Option<OffsetDateTime>, // Object delete marker modified time
     #[serde(rename = "MetaSys")]
@@ -1500,7 +1528,7 @@ impl MetaDeleteMarker {
         let replication_state_internal = get_internal_replication_state(&metadata);
 
         let mut fi = FileInfo {
-            version_id: self.version_id.filter(|&vid| !vid.is_nil()),
+            version_id: self.version_id.filter(|vid| !vid.is_nil()),
             name: path.to_string(),
             volume: volume.to_string(),
             deleted: true,
@@ -1532,7 +1560,10 @@ impl MetaDeleteMarker {
 
         // ID
         rmp::encode::write_str(wr, "ID")?;
-        rmp::encode::write_bin(wr, self.version_id.unwrap_or_default().as_bytes())?;
+        match &self.version_id {
+            None => rmp::encode::write_bin(wr, Uuid::nil().as_bytes())?,
+            Some(v) => rmp::encode::write_bin(wr, v.wire_slice())?,
+        }
 
         // MTime Unix timestamp nanos
         rmp::encode::write_str(wr, "MTime")?;
@@ -1564,11 +1595,10 @@ impl MetaDeleteMarker {
 
             match key.as_str() {
                 "ID" => {
-                    let _ = rmp::decode::read_bin_len(rd)?;
-                    let mut buf = [0u8; 16];
+                    let blen = rmp::decode::read_bin_len(rd)? as usize;
+                    let mut buf = vec![0u8; blen];
                     rd.read_exact(&mut buf)?;
-                    let id = Uuid::from_bytes(buf);
-                    self.version_id = if id.is_nil() { None } else { Some(id) };
+                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf)?;
                 }
                 "MTime" => {
                     let nanos: i64 = rmp::decode::read_int(rd)?;
@@ -1619,7 +1649,10 @@ impl MetaDeleteMarker {
     /// Get delete marker signature
     pub fn get_signature(&self) -> [u8; 4] {
         let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-        hasher.update(self.version_id.unwrap_or_default().as_bytes());
+        match &self.version_id {
+            None => hasher.update(Uuid::nil().as_bytes()),
+            Some(v) => hasher.update(v.wire_slice()),
+        }
         if let Some(mod_time) = self.mod_time {
             hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
         }
@@ -1896,13 +1929,7 @@ pub struct FileInfoOpts {
 }
 
 pub fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
-    let vid = {
-        if version_id.is_empty() {
-            None
-        } else {
-            Some(Uuid::parse_str(version_id)?)
-        }
-    };
+    let vid = S3VersionId::parse_api_version_id(version_id)?;
 
     let meta = FileMeta::load(buf)?;
     if meta.versions.is_empty() {

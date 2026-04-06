@@ -808,7 +808,7 @@ pub struct ObjectOpts {
     pub user_tags: String,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<rustfs_filemeta::S3VersionId>,
     pub is_latest: bool,
     pub delete_marker: bool,
     pub num_versions: usize,
@@ -1363,7 +1363,7 @@ mod tests {
             mod_time: Some(base_time),
             successor_mod_time: Some(base_time),
             is_latest: false,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
         let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
@@ -1403,7 +1403,7 @@ mod tests {
             successor_mod_time: Some(base_time),
             is_latest: false,
             transition_status: "".to_string(),
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
         let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
@@ -1439,7 +1439,7 @@ mod tests {
             name: "obj".to_string(),
             mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
             is_latest: false,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
         let event = lc.noncurrent_versions_expiration_limit(&opts).await;
@@ -1597,7 +1597,7 @@ mod tests {
             is_latest: true,
             delete_marker: true,
             num_versions: 2,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
 
@@ -1636,7 +1636,7 @@ mod tests {
             is_latest: true,
             delete_marker: true,
             num_versions: 1,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
 
@@ -1675,7 +1675,7 @@ mod tests {
             is_latest: true,
             delete_marker: true,
             num_versions: 1,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
 
@@ -1717,7 +1717,7 @@ mod tests {
             is_latest: true,
             delete_marker: true,
             num_versions: 1,
-            version_id: Some(Uuid::new_v4()),
+            version_id: Some(rustfs_filemeta::S3VersionId::Uuid(Uuid::new_v4())),
             ..Default::default()
         };
 

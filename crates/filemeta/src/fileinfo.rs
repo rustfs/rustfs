@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::S3VersionId;
 use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_COMPLETE, VersionPurgeStatusType};
 use bytes::Bytes;
 use rmp_serde::Serializer;
@@ -209,7 +210,7 @@ impl ErasureInfo {
 pub struct FileInfo {
     pub volume: String,
     pub name: String,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<S3VersionId>,
     pub is_latest: bool,
     pub deleted: bool,
     pub transition_status: String,
@@ -553,7 +554,7 @@ pub struct FileInfoVersions {
 }
 
 impl FileInfoVersions {
-    pub fn find_version_index(&self, vid: Uuid) -> Option<usize> {
+    pub fn find_version_index(&self, vid: S3VersionId) -> Option<usize> {
         self.versions.iter().position(|v| v.version_id == Some(vid))
     }
 

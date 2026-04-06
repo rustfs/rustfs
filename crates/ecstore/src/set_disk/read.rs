@@ -361,7 +361,7 @@ impl SetDisks {
             return (meta_file_infos, errs);
         }
 
-        let vid = finfo.version_id.unwrap_or(Uuid::nil());
+        let vid = finfo.version_id.unwrap_or(rustfs_filemeta::S3VersionId::Uuid(Uuid::nil()));
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
