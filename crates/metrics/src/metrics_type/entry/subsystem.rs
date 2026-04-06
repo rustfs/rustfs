@@ -233,7 +233,7 @@ mod tests {
             MetricSubsystem::ApiRequests,
         );
 
-        assert_eq!(md.get_full_metric_name(), "counter.rustfs_api_requests_total");
+        assert_eq!(md.get_full_metric_name(), "rustfs_api_requests_total");
 
         let custom_md = MetricDescriptor::new(
             MetricName::Custom("test_metric".to_string()),
@@ -244,6 +244,6 @@ mod tests {
             MetricSubsystem::new("/custom/path-with-dash"),
         );
 
-        assert_eq!(custom_md.get_full_metric_name(), "gauge.rustfs_custom_path_with_dash_test_metric");
+        assert_eq!(custom_md.get_full_metric_name(), "rustfs_custom_path_with_dash_test_metric");
     }
 }
