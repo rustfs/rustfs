@@ -1885,10 +1885,7 @@ mod tests {
         let iam_sys = IamSys::new(cache_manager);
 
         // "testgroup" exists with "readwrite" policy; "nonexistent-group" does not exist in IAM.
-        let groups = Some(vec![
-            "testgroup".to_string(),
-            "nonexistent-group".to_string(),
-        ]);
+        let groups = Some(vec!["testgroup".to_string(), "nonexistent-group".to_string()]);
 
         let policies = iam_sys
             .policy_db_get("sts-fallback-test-parent", &groups)
