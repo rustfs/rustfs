@@ -898,7 +898,7 @@ impl DefaultObjectUsecase {
 
         let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
+            version_id: parse_object_version_id(version_id)?,
             ..Default::default()
         };
 
@@ -2045,7 +2045,7 @@ impl DefaultObjectUsecase {
 
         let version_id = req.input.version_id.clone();
         let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
+            version_id: parse_object_version_id(version_id)?,
             ..Default::default()
         };
 
@@ -2854,7 +2854,7 @@ impl DefaultObjectUsecase {
 
         let version_id_for_parse = version_id.clone();
         let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id_for_parse)?.map(Into::into),
+            version_id: parse_object_version_id(version_id_for_parse)?,
             ..Default::default()
         };
 

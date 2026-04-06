@@ -498,4 +498,110 @@ mod tests {
 
         info!("✅ PASSED: PutObject correctly returns 'null' version_id");
     }
+
+    /// PutObject with `X-Wasabi-Set-Version-Id` returns that id and GET-by-VersionId works.
+    #[tokio::test]
+    #[serial]
+    async fn test_put_object_x_wasabi_set_version_id_pinned() {
+        use http::HeaderValue;
+
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-pinned-vid";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        const PINNED: &str = "000000000000000000001-ABCDEabcd0";
+        let key = "pinned-wasabi.txt";
+
+        let out = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"v1"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("PutObject with X-Wasabi-Set-Version-Id should succeed");
+
+        assert_eq!(out.version_id.as_deref(), Some(PINNED), "response VersionId should match pinned header");
+
+        let got = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(PINNED)
+            .send()
+            .await
+            .expect("get by version id");
+        let body = got.body.collect().await.expect("read body").into_bytes();
+        assert_eq!(body.as_ref(), b"v1");
+    }
+
+    /// Same key + same `X-Wasabi-Set-Version-Id` on a second PUT should supersede (Wasabi-style retry).
+    #[tokio::test]
+    #[serial]
+    async fn test_put_object_same_wasabi_version_id_second_put_wins() {
+        use http::HeaderValue;
+
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-dup-put";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        const PINNED: &str = "000000000000000000002-BBCDFabcd1";
+        let key = "dup-wasabi.txt";
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"first"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("first put");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"second"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("second put same version id");
+
+        let got = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(PINNED)
+            .send()
+            .await
+            .expect("get by version id");
+        let body = got.body.collect().await.expect("read body").into_bytes();
+        assert_eq!(body.as_ref(), b"second");
+    }
 }

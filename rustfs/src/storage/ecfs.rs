@@ -26,6 +26,7 @@ use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_
 use std::fmt::Debug;
 use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
+#[cfg(test)]
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -152,15 +153,17 @@ impl FS {
     }
 }
 
-pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
-    if let Some(vid) = version_id {
-        let uuid = Uuid::parse_str(&vid).map_err(|e| {
-            error!("Invalid version ID: {}", e);
-            s3_error!(InvalidArgument, "Invalid version ID")
-        })?;
-        Ok(Some(uuid))
-    } else {
-        Ok(None)
+pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<String>> {
+    let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match version_id {
+        None => Ok(None),
+        Some(id) => {
+            let parsed = rustfs_filemeta::S3VersionId::parse_api_version_id(&id).map_err(|e| {
+                error!("Invalid version ID: {}", e);
+                s3_error!(InvalidArgument, "Invalid version ID")
+            })?;
+            Ok(parsed.map(|v| v.to_string()))
+        }
     }
 }
 

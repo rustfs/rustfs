@@ -19,6 +19,61 @@
 
 use crate::{Error, NULL_VERSION_ID, Result};
 use serde::de::{self, Visitor};
+
+/// Wasabi `URLFriendlyChars` for the random suffix of `createVersionId` (10 chars).
+/// Byte-for-byte parity with Wasabi: duplicate `e`/`z`, no `x` in the letter run.
+pub const WASABI_VERSION_ID_RANDOM_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcedefghijklmnopqrstuvwzyz0123456789-_";
+
+/// O(1) membership for the 10-character suffix of strict Wasabi `createVersionId` strings.
+const WASABI_RANDOM_SUFFIX_CHAR_OK: [bool; 256] = {
+    let mut lut = [false; 256];
+    let bytes = WASABI_VERSION_ID_RANDOM_ALPHABET;
+    let mut i = 0;
+    while i < bytes.len() {
+        lut[bytes[i] as usize] = true;
+        i += 1;
+    }
+    lut
+};
+
+/// Validates strict Wasabi `createVersionId` shape and copies into a stack array in one pass.
+///
+/// Returns [`None`] if `s` is not exactly 32 bytes or does not match
+/// `[0-9]{21}-` + 10 characters from [`WASABI_VERSION_ID_RANDOM_ALPHABET`].
+#[inline]
+fn try_copy_strict_wasabi_version_id(s: &str) -> Option<[u8; 32]> {
+    let b = s.as_bytes();
+    if b.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..21 {
+        let c = b[i];
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        out[i] = c;
+    }
+    if b[21] != b'-' {
+        return None;
+    }
+    out[21] = b'-';
+    for i in 22..32 {
+        let c = b[i];
+        if !WASABI_RANDOM_SUFFIX_CHAR_OK[c as usize] {
+            return None;
+        }
+        out[i] = c;
+    }
+    Some(out)
+}
+
+/// `true` if `s` is exactly 32 bytes and matches Wasabi `createVersionId` shape:
+/// `[0-9]{21}-` + 10 characters from [`WASABI_VERSION_ID_RANDOM_ALPHABET`].
+#[inline]
+pub fn is_strict_wasabi_create_version_id(s: &str) -> bool {
+    try_copy_strict_wasabi_version_id(s).is_some()
+}
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::fmt;
@@ -122,6 +177,20 @@ impl S3VersionId {
         }
         Err(Error::UuidParse(format!("invalid version id: {s}")))
     }
+
+    /// Strict parse for inbound `X-Wasabi-Set-Version-Id` (Phase 2: shape + charset, length 32).
+    pub fn parse_x_wasabi_set_version_id(s: &str) -> Result<Self> {
+        let t = s.trim();
+        if t.len() != 32 {
+            return Err(Error::other(format!("X-Wasabi-Set-Version-Id must be 32 characters, got {}", t.len())));
+        }
+        let Some(a) = try_copy_strict_wasabi_version_id(t) else {
+            return Err(Error::other(
+                "X-Wasabi-Set-Version-Id: value does not match required version id format".to_owned(),
+            ));
+        };
+        Ok(Self::WasabiAscii(a))
+    }
 }
 
 impl Serialize for S3VersionId {
@@ -201,5 +270,16 @@ mod tests {
         assert_eq!(S3VersionId::parse_api_version_id(w).unwrap(), Some(S3VersionId::WasabiAscii(wasabi)));
         assert!(S3VersionId::parse_api_version_id("").unwrap().is_none());
         assert!(S3VersionId::parse_api_version_id(NULL_VERSION_ID).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_x_wasabi_set_version_id_strict() {
+        let ok = "000000000000000000001-ABCDEabcd0";
+        assert_eq!(ok.len(), 32);
+        let id = S3VersionId::parse_x_wasabi_set_version_id(ok).unwrap();
+        assert_eq!(id.to_string(), ok);
+        assert!(S3VersionId::parse_x_wasabi_set_version_id("short").is_err());
+        // Wrong charset in suffix (x not in alphabet)
+        assert!(S3VersionId::parse_x_wasabi_set_version_id("000000000000000000001-xxxxxxxxxx").is_err());
     }
 }

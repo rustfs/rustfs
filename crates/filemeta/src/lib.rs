@@ -29,4 +29,4 @@ pub use filemeta::*;
 pub use filemeta_inline::*;
 pub use metacache::*;
 pub use replication::*;
-pub use s3_version_id::S3VersionId;
+pub use s3_version_id::{S3VersionId, WASABI_VERSION_ID_RANDOM_ALPHABET, is_strict_wasabi_create_version_id};

@@ -735,7 +735,7 @@ impl ObjectIO for SetDisks {
         };
 
         if opts.versioned && fi.version_id.is_none() {
-            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
+            fi.version_id = Some(crate::mint_new_object_version_id());
         }
 
         fi.data_dir = Some(Uuid::new_v4());
@@ -1110,7 +1110,7 @@ impl ObjectOperations for SetDisks {
                 if let Some(vid) = &dst_opts.version_id {
                     S3VersionId::parse_api_version_id(vid)?
                 } else {
-                    Some(S3VersionId::Uuid(Uuid::new_v4()))
+                    Some(crate::mint_new_object_version_id())
                 }
             } else {
                 src_info.version_id
@@ -1277,7 +1277,7 @@ impl ObjectOperations for SetDisks {
                     vr.mod_time = Some(OffsetDateTime::now_utc());
                     vr.deleted = true;
                     if versioned {
-                        vr.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
+                        vr.version_id = Some(crate::mint_new_object_version_id());
                     }
                 }
             }
@@ -1541,7 +1541,7 @@ impl ObjectOperations for SetDisks {
             fi.version_id = if let Some(vid) = opts.version_id.as_deref() {
                 S3VersionId::parse_api_version_id(vid).map_err(Error::other)?
             } else if opts.versioned {
-                Some(S3VersionId::Uuid(Uuid::new_v4()))
+                Some(crate::mint_new_object_version_id())
             } else {
                 None
             };
@@ -2708,7 +2708,7 @@ impl MultipartOperations for SetDisks {
         };
 
         if opts.versioned && opts.version_id.is_none() {
-            fi.version_id = Some(S3VersionId::Uuid(Uuid::new_v4()));
+            fi.version_id = Some(crate::mint_new_object_version_id());
         }
 
         fi.data_dir = Some(Uuid::new_v4());

@@ -14,9 +14,10 @@
 
 use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::ensure_wasabi_set_version_id_header_allowed;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::{WASABI_SET_VERSION_ID_HEADER, ensure_wasabi_set_version_id_header_allowed, wasabi_version_ids_enabled};
+use rustfs_filemeta::S3VersionId;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
 use rustfs_utils::http::{
@@ -71,14 +72,14 @@ pub async fn del_opts(
     // When VersionId='null' is specified, it means delete the object with null version ID
     let vid = if let Some(ref id) = vid {
         if id.eq_ignore_ascii_case("null") {
-            // Convert "null" to Uuid::nil() string representation
             Some(Uuid::nil().to_string())
+        } else if *id != Uuid::nil().to_string() {
+            S3VersionId::parse_api_version_id(id.as_str()).map_err(|e| {
+                error!("del_opts: invalid version id: {} error: {}", id, e);
+                StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone())
+            })?;
+            Some(id.clone())
         } else {
-            // Validate UUID format for other version IDs
-            if *id != Uuid::nil().to_string() && Uuid::parse_str(id.as_str()).is_err() {
-                error!("del_opts: invalid version id: {} error: invalid UUID format", id);
-                return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-            }
             Some(id.clone())
         }
     } else {
@@ -132,10 +133,11 @@ pub async fn get_opts(
         Some(ref id) => {
             if id.eq_ignore_ascii_case("null") {
                 Some(nil_uuid_str.clone())
+            } else if id.as_str() != nil_uuid_str.as_str() {
+                S3VersionId::parse_api_version_id(id.as_str())
+                    .map_err(|_| StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()))?;
+                Some(id.clone())
             } else {
-                if id.as_str() != nil_uuid_str.as_str() && Uuid::parse_str(id).is_err() {
-                    return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-                }
                 Some(id.clone())
             }
         }
@@ -215,11 +217,29 @@ pub async fn put_opts(
         vid
     };
 
-    let vid = vid.map(|v| v.as_str().trim().to_owned());
+    let mut vid = vid.map(|v| v.as_str().trim().to_owned());
+
+    if wasabi_version_ids_enabled()
+        && let Some(raw) = headers.get(WASABI_SET_VERSION_ID_HEADER).and_then(|v| v.to_str().ok())
+    {
+        let t = raw.trim();
+        if !t.is_empty() {
+            if !versioned || version_suspended {
+                return Err(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    "X-Wasabi-Set-Version-Id requires bucket versioning to be Enabled (not Off or Suspended)".to_owned(),
+                ));
+            }
+            let id = S3VersionId::parse_x_wasabi_set_version_id(t)
+                .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+            vid = Some(id.to_string());
+        }
+    }
 
     if let Some(ref id) = vid
         && *id != Uuid::nil().to_string()
-        && let Err(_err) = Uuid::parse_str(id.as_str())
+        && S3VersionId::parse_api_version_id(id.as_str()).is_err()
     {
         return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
