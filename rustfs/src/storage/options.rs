@@ -953,6 +953,24 @@ mod tests {
         }
     }
 
+    /// Synthetic bucket has no versioning metadata → `prefix_enabled` is false; strict Wasabi header must be rejected.
+    #[tokio::test]
+    async fn test_put_opts_wasabi_header_rejects_when_versioning_not_enabled() {
+        let mut headers = create_test_headers();
+        headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("000000000000000000001-ABCDEabcd0"));
+        let result = put_opts("test-bucket", "test-object", None, &headers, HashMap::new()).await;
+        assert!(result.is_err(), "expected InvalidArgument when versioning is not Enabled");
+        match result.unwrap_err() {
+            StorageError::InvalidArgument(_, _, msg) => {
+                assert!(
+                    msg.contains("Enabled") && (msg.contains("Suspended") || msg.contains("not Off")),
+                    "unexpected message: {msg}"
+                );
+            }
+            e => panic!("expected InvalidArgument, got {e:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_copy_dst_opts() {
         let headers = create_test_headers();

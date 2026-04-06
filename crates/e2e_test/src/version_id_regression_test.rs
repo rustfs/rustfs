@@ -27,8 +27,15 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
+    use http::HeaderValue;
     use serial_test::serial;
     use tracing::info;
+
+    fn assert_error_message_contains(msg: &str, needles: &[&str]) {
+        for n in needles {
+            assert!(msg.contains(n), "error message should mention {n:?}, got: {msg}");
+        }
+    }
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
         env.create_s3_client()
@@ -503,8 +510,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_put_object_x_wasabi_set_version_id_pinned() {
-        use http::HeaderValue;
-
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
         env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
@@ -550,8 +555,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_put_object_same_wasabi_version_id_second_put_wins() {
-        use http::HeaderValue;
-
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
         env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
@@ -603,5 +606,261 @@ mod tests {
             .expect("get by version id");
         let body = got.body.collect().await.expect("read body").into_bytes();
         assert_eq!(body.as_ref(), b"second");
+    }
+
+    /// HeadObject and ListObjectVersions surface the same pinned Wasabi VersionId as Put/Get.
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_pinned_version_id_head_and_list() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-head-list";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        const PINNED: &str = "000000000000000000003-CCCDEabcd2";
+        let key = "head-list-wasabi.txt";
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"payload"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("PutObject with pinned id");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(PINNED)
+            .send()
+            .await
+            .expect("HeadObject by version id");
+        assert_eq!(head.version_id().map(str::to_string).as_deref(), Some(PINNED));
+
+        let list = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .expect("ListObjectVersions");
+        let found = list
+            .versions()
+            .iter()
+            .any(|v| v.version_id() == Some(PINNED) && v.key() == Some(key));
+        assert!(found, "listing should include pinned version for key {key}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_header_rejected_when_versioning_suspended() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-suspended-hdr";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+        suspend_versioning(&client, bucket)
+            .await
+            .expect("Failed to suspend versioning");
+
+        const PINNED: &str = "000000000000000000004-DDCDEabcd3";
+        let bad = client
+            .put_object()
+            .bucket(bucket)
+            .key("k.txt")
+            .body(ByteStream::from_static(b"x"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await;
+        assert!(bad.is_err(), "expected PutObject to fail");
+        assert_error_message_contains(&format!("{:?}", bad.unwrap_err()), &["Enabled", "Suspended"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_header_rejected_when_bucket_unversioned() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-no-versioning";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        const PINNED: &str = "000000000000000000005-EECDEabcd4";
+        let bad = client
+            .put_object()
+            .bucket(bucket)
+            .key("k.txt")
+            .body(ByteStream::from_static(b"x"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await;
+        assert!(bad.is_err(), "expected PutObject to fail");
+        assert_error_message_contains(&format!("{:?}", bad.unwrap_err()), &["Enabled", "versioning"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_header_rejected_invalid_strict_shape() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-bad-shape";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        // 32 chars but suffix uses `x` (not in Wasabi URLFriendlyChars for this fork)
+        const BAD: &str = "000000000000000000006-xxxxxxxxxx";
+        assert_eq!(BAD.len(), 32);
+        let bad = client
+            .put_object()
+            .bucket(bucket)
+            .key("k.txt")
+            .body(ByteStream::from_static(b"x"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(BAD));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await;
+        assert!(bad.is_err(), "expected PutObject to fail");
+        assert_error_message_contains(&format!("{:?}", bad.unwrap_err()), &["X-Wasabi-Set-Version-Id", "format"]);
+    }
+
+    /// Whitespace-only header is treated as absent; object commits with a normal (minted) version id.
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_header_whitespace_only_ignored() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-ws-header";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        let out = client
+            .put_object()
+            .bucket(bucket)
+            .key("ws.txt")
+            .body(ByteStream::from_static(b"z"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_str("   ").expect("header value"));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("Put with whitespace-only Wasabi header should succeed");
+        let vid = out.version_id().expect("version_id should be set");
+        assert!(!vid.is_empty());
+        assert_ne!(vid, "   ");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wasabi_header_rejected_when_wasabi_mode_off() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_WASABI_VERSION_IDS", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-flag-off";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        const PINNED: &str = "000000000000000000007-FFCDEabcd5";
+        let bad = client
+            .put_object()
+            .bucket(bucket)
+            .key("k.txt")
+            .body(ByteStream::from_static(b"x"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await;
+        assert!(bad.is_err(), "expected PutObject to fail");
+        assert_error_message_contains(&format!("{:?}", bad.unwrap_err()), &["X-Wasabi-Set-Version-Id"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_object_by_wasabi_version_id() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-wasabi-delete-vid";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        enable_versioning(&client, bucket).await.expect("Failed to enable versioning");
+
+        const PINNED: &str = "000000000000000000008-GGCDEabcd6";
+        let key = "del-by-vid.txt";
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .customize()
+            .map_request(|mut req| {
+                req.headers_mut()
+                    .insert("x-wasabi-set-version-id", HeaderValue::from_static(PINNED));
+                Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
+            })
+            .send()
+            .await
+            .expect("put pinned version");
+
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(PINNED)
+            .send()
+            .await
+            .expect("delete specific version");
+
+        let get = client.get_object().bucket(bucket).key(key).version_id(PINNED).send().await;
+        assert!(get.is_err(), "GET for deleted version should fail");
     }
 }

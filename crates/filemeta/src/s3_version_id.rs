@@ -301,6 +301,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_x_wasabi_set_version_id_table_rejects_bad_shapes() {
+        let bad = [
+            "00000000000000000000-ABCDEabcd01",  // only 20 digits before '-'
+            "00000000000000000000A-ABCDEabcd0",  // non-digit in prefix region
+            "000000000000000000001XABCDEabcd0",  // missing '-' at position 21
+            "000000000000000000001-ABCDEabcd",   // 31 chars
+            "000000000000000000001-ABCDEabcd01", // 33 chars
+        ];
+        for s in bad {
+            assert!(S3VersionId::parse_x_wasabi_set_version_id(s).is_err(), "expected reject for {s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_api_version_id_len_boundaries() {
+        assert!(S3VersionId::parse_api_version_id("0123456789012345678901234567890").is_err()); // 31
+        assert!(S3VersionId::parse_api_version_id("012345678901234567890123456789012").is_err()); // 33
+        let u = Uuid::new_v4();
+        assert!(S3VersionId::parse_api_version_id(&u.to_string()).is_ok());
+    }
+
+    #[test]
     fn from_msgpack_id_bytes_rejects_bad_length() {
         let err = S3VersionId::from_msgpack_id_bytes(&[0u8; 8]).unwrap_err();
         assert!(err.to_string().contains("expected 16 or 32 byte binary ID field"), "{err}");

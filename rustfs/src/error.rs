@@ -239,10 +239,10 @@ impl From<StorageError> for ApiError {
             _ => S3ErrorCode::InternalError,
         };
 
-        let message = if code == S3ErrorCode::InternalError {
-            err.to_string()
-        } else {
-            ApiError::error_code_to_message(&code)
+        let message = match &err {
+            StorageError::InvalidArgument(_, _, msg) => msg.clone(),
+            _ if code == S3ErrorCode::InternalError => err.to_string(),
+            _ => ApiError::error_code_to_message(&code),
         };
         ApiError {
             code,

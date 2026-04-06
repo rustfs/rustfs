@@ -199,33 +199,43 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_with_env(extra_args, &[]).await
+    }
+
+    /// Start RustFS server with extra environment variables set on the child process only.
+    ///
+    /// Use this for tests that need a clean `LazyLock` read (e.g. `RUSTFS_WASABI_VERSION_IDS=false`)
+    /// without mutating the test harness process environment.
+    pub async fn start_rustfs_server_with_env(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.cleanup_existing_processes().await?;
 
         let mut args = vec![
             "--address",
-            &self.address,
+            self.address.as_str(),
             "--access-key",
-            &self.access_key,
+            self.access_key.as_str(),
             "--secret-key",
-            &self.secret_key,
+            self.secret_key.as_str(),
         ];
-
-        // Add extra arguments
         args.extend(extra_args);
+        args.push(self.temp_dir.as_str());
 
-        // Add temp directory as the last argument
-        args.push(&self.temp_dir);
-
-        info!("Starting RustFS server with args: {:?}", args);
+        info!("Starting RustFS server with args: {:?} env_overrides: {:?}", args, extra_env);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path).args(&args).spawn()?;
+        let mut cmd = Command::new(&binary_path);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.args(&args);
+        let process = cmd.spawn()?;
 
         self.process = Some(process);
-
-        // Wait for server to be ready
         self.wait_for_server_ready().await?;
-
         Ok(())
     }
 
