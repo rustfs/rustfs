@@ -182,3 +182,39 @@ impl PrometheusMetric {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MetricDescriptor, MetricName, MetricNamespace, MetricSubsystem};
+
+    #[test]
+    fn from_descriptor_uses_prometheus_metric_names_for_all_types() {
+        let cases = [
+            (MetricType::Counter, "rustfs_api_requests_total"),
+            (MetricType::Gauge, "rustfs_system_memory_used_bytes"),
+            (MetricType::Histogram, "rustfs_custom_path_latency_seconds"),
+        ];
+
+        for (metric_type, expected_name) in cases {
+            let subsystem = match metric_type {
+                MetricType::Counter => MetricSubsystem::ApiRequests,
+                MetricType::Gauge => MetricSubsystem::SystemMemory,
+                MetricType::Histogram => MetricSubsystem::new("/custom/path"),
+            };
+            let name = match metric_type {
+                MetricType::Counter => MetricName::ApiRequestsTotal,
+                MetricType::Gauge => MetricName::Custom("used_bytes".to_string()),
+                MetricType::Histogram => MetricName::Custom("latency_seconds".to_string()),
+            };
+
+            let metric = PrometheusMetric::from_descriptor(
+                &MetricDescriptor::new(name, metric_type, "test help".to_string(), vec![], MetricNamespace::RustFS, subsystem),
+                1.0,
+            );
+
+            assert_eq!(metric.name, expected_name);
+            assert_eq!(metric.metric_type, metric_type);
+        }
+    }
+}
