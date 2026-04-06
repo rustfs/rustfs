@@ -462,8 +462,9 @@ fn build_logger_provider(
 
 /// Start the Pyroscope continuous profiling agent when profiling is enabled.
 ///
-/// Returns `None` on unsupported platforms, when the feature is disabled, or
-/// when no usable profiling endpoint is configured.
+/// Returns `None` when profiling export is disabled, when no usable
+/// profiling endpoint is configured, or when building or starting the agent
+/// fails.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
