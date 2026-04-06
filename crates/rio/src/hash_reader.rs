@@ -553,11 +553,7 @@ impl HashReader {
     }
 
     pub async fn read_block(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = match self.inner.read_block(buf).await {
-            Ok(n) => n,
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-            Err(err) => return Err(err),
-        };
+        let n = self.inner.read_block(buf).await?;
         self.update_read_state(&buf[..n])?;
         if n == 0 {
             self.finish_checksum_validation()?;
@@ -689,7 +685,27 @@ mod tests {
     use crate::{DecryptReader, EncryptReader, encrypt_reader, wrap_reader};
     use rand::RngExt;
     use std::io::Cursor;
-    use tokio::io::{AsyncReadExt, BufReader};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+
+    struct UnexpectedEofReader;
+
+    impl AsyncRead for UnexpectedEofReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl BlockReadable for UnexpectedEofReader {
+        fn read_block<'a>(&'a mut self, _buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
+            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "synthetic unexpected eof")) })
+        }
+    }
+
+    impl EtagResolvable for UnexpectedEofReader {}
+    impl HashReaderDetector for UnexpectedEofReader {}
+    impl TryGetIndex for UnexpectedEofReader {}
 
     #[tokio::test]
     async fn test_hashreader_wrapping_logic() {
@@ -821,6 +837,16 @@ mod tests {
 
         let n3 = hash_reader.read_block(&mut second).await.unwrap();
         assert_eq!(n3, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hashreader_read_block_propagates_unexpected_eof() {
+        let mut hash_reader = HashReader::new(Box::new(UnexpectedEofReader), 0, 0, None, None, true).unwrap();
+        let mut buf = [0_u8; 8];
+
+        let err = hash_reader.read_block(&mut buf).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

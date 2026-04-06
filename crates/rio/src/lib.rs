@@ -17,6 +17,7 @@ pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
 
 use std::future::Future;
 use std::pin::Pin;
+use tokio::io::AsyncReadExt;
 
 macro_rules! delegate_reader_capabilities_generic {
     ($name:ident<$inner_ty:ident>, $inner:ident) => {
@@ -127,7 +128,19 @@ fn read_block_via_async_read<'a, R>(reader: &'a mut R, buf: &'a mut [u8]) -> Box
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'a,
 {
-    Box::pin(rustfs_utils::read_full(reader, buf))
+    Box::pin(async move {
+        let mut total = 0;
+
+        while total < buf.len() {
+            match reader.read(&mut buf[total..]).await {
+                Ok(0) => return Ok(total),
+                Ok(n) => total += n,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(total)
+    })
 }
 
 pub trait ReadStream: tokio::io::AsyncRead + Unpin + Send + Sync {}
@@ -257,5 +270,67 @@ where
 {
     fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
         self.as_mut().read_block(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::{self, ErrorKind};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    enum ReadStep {
+        Data(Vec<u8>),
+        Error(ErrorKind),
+        Eof,
+    }
+
+    struct StepReader {
+        steps: VecDeque<ReadStep>,
+    }
+
+    impl StepReader {
+        fn new(steps: impl IntoIterator<Item = ReadStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl AsyncRead for StepReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.steps.pop_front().unwrap_or(ReadStep::Eof) {
+                ReadStep::Data(data) => {
+                    buf.put_slice(&data);
+                    Poll::Ready(Ok(()))
+                }
+                ReadStep::Error(kind) => Poll::Ready(Err(io::Error::new(kind, "synthetic read failure"))),
+                ReadStep::Eof => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_block_via_async_read_preserves_midstream_error_kind() {
+        let reader = StepReader::new([ReadStep::Data(b"ab".to_vec()), ReadStep::Error(ErrorKind::ConnectionReset)]);
+        let mut reader = WarpReader::new(reader);
+        let mut buf = [0_u8; 4];
+
+        let err = reader.read_block(&mut buf).await.unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn test_read_block_via_async_read_returns_zero_on_initial_eof() {
+        let mut reader = WarpReader::new(StepReader::new([ReadStep::Eof]));
+        let mut buf = [0_u8; 4];
+
+        let n = reader.read_block(&mut buf).await.unwrap();
+
+        assert_eq!(n, 0);
     }
 }
