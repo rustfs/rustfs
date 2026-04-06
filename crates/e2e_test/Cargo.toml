@@ -20,6 +20,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "small_put_bench"
+path = "src/bin/small_put_bench.rs"
+test = false
+
 [lints]
 workspace = true
 
@@ -41,6 +46,7 @@ serde_json.workspace = true
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+clap = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true

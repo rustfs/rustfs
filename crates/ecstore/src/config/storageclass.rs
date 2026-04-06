@@ -179,35 +179,6 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inline_object_limit_matches_default_non_versioned_budget() {
-        let cfg = Config {
-            initialized: true,
-            inline_block: DEFAULT_INLINE_BLOCK,
-            ..Default::default()
-        };
-
-        assert_eq!(cfg.inline_shard_limit_bytes(false), DEFAULT_INLINE_BLOCK);
-        assert_eq!(cfg.inline_object_limit_bytes(8, false), DEFAULT_INLINE_BLOCK * 8);
-    }
-
-    #[test]
-    fn inline_object_limit_scales_down_for_versioned_objects() {
-        let cfg = Config {
-            initialized: true,
-            inline_block: DEFAULT_INLINE_BLOCK,
-            ..Default::default()
-        };
-
-        assert_eq!(cfg.inline_shard_limit_bytes(true), DEFAULT_INLINE_BLOCK / 8);
-        assert_eq!(cfg.inline_object_limit_bytes(8, true), DEFAULT_INLINE_BLOCK);
-    }
-}
-
 pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
     let standard = {
         let ssc_str = {
@@ -362,4 +333,33 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_object_limit_matches_default_non_versioned_budget() {
+        let cfg = Config {
+            initialized: true,
+            inline_block: DEFAULT_INLINE_BLOCK,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.inline_shard_limit_bytes(false), DEFAULT_INLINE_BLOCK);
+        assert_eq!(cfg.inline_object_limit_bytes(8, false), DEFAULT_INLINE_BLOCK * 8);
+    }
+
+    #[test]
+    fn inline_object_limit_scales_down_for_versioned_objects() {
+        let cfg = Config {
+            initialized: true,
+            inline_block: DEFAULT_INLINE_BLOCK,
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.inline_shard_limit_bytes(true), DEFAULT_INLINE_BLOCK / 8);
+        assert_eq!(cfg.inline_object_limit_bytes(8, true), DEFAULT_INLINE_BLOCK);
+    }
 }
