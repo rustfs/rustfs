@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(histogram_md.subsystem, MetricSubsystem::ApiRequests);
 
         // Verify that the full metric name generated is formatted correctly
-        assert_eq!(histogram_md.get_full_metric_name(), "histogram.rustfs_api_requests_seconds_distribution");
+        assert_eq!(histogram_md.get_full_metric_name(), "rustfs_api_requests_seconds_distribution");
 
         // Tests use custom subsystems
         let custom_histogram_md = new_histogram_md(
@@ -123,7 +123,7 @@ mod tests {
         // Verify the custom name and subsystem
         assert_eq!(
             custom_histogram_md.get_full_metric_name(),
-            "histogram.rustfs_custom_path_metrics_custom_latency_distribution"
+            "rustfs_custom_path_metrics_custom_latency_distribution"
         );
     }
 }
