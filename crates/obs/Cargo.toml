@@ -56,7 +56,7 @@ dial9-tokio-telemetry = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 
 
