@@ -528,13 +528,20 @@ impl FileMetaVersionHeader {
                     .map_err(|_| Error::other("FileMetaVersionHeader: version_id expected 16 bytes"))?;
                 Some(S3VersionId::Uuid(Uuid::from_bytes(arr)))
             }
-            32 => Some(S3VersionId::WasabiAscii(
-                bin.try_into()
-                    .map_err(|_| Error::other("FileMetaVersionHeader: version_id expected 32 bytes"))?,
-            )),
+            32 => {
+                let arr: [u8; 32] = bin
+                    .try_into()
+                    .map_err(|_| Error::other("invalid version id in version header: expected 32 bytes for Wasabi ASCII form"))?;
+                if std::str::from_utf8(arr.as_slice()).is_err() {
+                    return Err(Error::other(
+                        "invalid version id in version header: 32-byte Wasabi form must be valid UTF-8",
+                    ));
+                }
+                Some(S3VersionId::WasabiAscii(arr))
+            }
             _ => {
                 return Err(Error::other(format!(
-                    "FileMetaVersionHeader: version_id bin length {bin_len}, expected 16 or 32"
+                    "invalid version id in version header: expected 16 or 32 byte binary, got length {bin_len}"
                 )));
             }
         };
@@ -869,7 +876,14 @@ impl MetaObject {
                         tracing::error!(error = %e, "decode_from: read_exact ID buf failed");
                         e
                     })?;
-                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf)?;
+                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf).map_err(|e| {
+                        tracing::error!(
+                            error = %e,
+                            id_bin_len = blen,
+                            "decode_from MetaObject: invalid version id field (ID)"
+                        );
+                        e
+                    })?;
                 }
                 "DDir" => {
                     let _ = rmp::decode::read_bin_len(rd).map_err(|e| {
@@ -1598,7 +1612,14 @@ impl MetaDeleteMarker {
                     let blen = rmp::decode::read_bin_len(rd)? as usize;
                     let mut buf = vec![0u8; blen];
                     rd.read_exact(&mut buf)?;
-                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf)?;
+                    self.version_id = S3VersionId::from_msgpack_id_bytes(&buf).map_err(|e| {
+                        tracing::error!(
+                            error = %e,
+                            id_bin_len = blen,
+                            "decode_from MetaDeleteMarker: invalid version id field (ID)"
+                        );
+                        e
+                    })?;
                 }
                 "MTime" => {
                     let nanos: i64 = rmp::decode::read_int(rd)?;

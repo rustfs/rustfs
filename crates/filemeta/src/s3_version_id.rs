@@ -144,18 +144,32 @@ impl S3VersionId {
     }
 
     /// Decode msgpack `bin` for `ID` / header `version_id` (16-byte UUID or 32-byte Wasabi).
+    ///
+    /// On failure, error messages are phrased for operators (xl.meta / object metadata decode).
+    /// Wasabi-shaped ids are stored as UTF-8 ASCII; non-UTF-8 32-byte blobs are rejected as corrupt metadata.
     pub fn from_msgpack_id_bytes(buf: &[u8]) -> Result<Option<Self>> {
         match buf.len() {
             16 => {
-                let arr: [u8; 16] = buf.try_into().map_err(|_| Error::other("version id: expected 16 bytes"))?;
+                let arr: [u8; 16] = buf
+                    .try_into()
+                    .map_err(|_| Error::other("invalid version id in object metadata: expected 16 bytes for UUID form"))?;
                 let u = Uuid::from_bytes(arr);
                 if u.is_nil() { Ok(None) } else { Ok(Some(Self::Uuid(u))) }
             }
             32 => {
-                let arr: [u8; 32] = buf.try_into().map_err(|_| Error::other("version id: expected 32 bytes"))?;
+                let arr: [u8; 32] = buf.try_into().map_err(|_| {
+                    Error::other("invalid version id in object metadata: expected 32 bytes for Wasabi ASCII form")
+                })?;
+                if std::str::from_utf8(arr.as_slice()).is_err() {
+                    return Err(Error::other(
+                        "invalid version id in object metadata: 32-byte Wasabi form must be valid UTF-8",
+                    ));
+                }
                 Ok(Some(Self::WasabiAscii(arr)))
             }
-            n => Err(Error::other(format!("invalid version id binary length: expected 16 or 32, got {n}"))),
+            n => Err(Error::other(format!(
+                "invalid version id in object metadata: expected 16 or 32 byte binary ID field, got length {n}"
+            ))),
         }
     }
 
@@ -219,6 +233,9 @@ impl Visitor<'_> for S3VersionIdSerdeVisitor {
             }
             32 => {
                 let arr: [u8; 32] = v.try_into().map_err(|_| E::custom("version id: expected 32 bytes"))?;
+                if std::str::from_utf8(arr.as_slice()).is_err() {
+                    return Err(E::custom("invalid version id: 32-byte Wasabi form must be valid UTF-8"));
+                }
                 Ok(S3VersionId::WasabiAscii(arr))
             }
             n => Err(E::custom(format!("version id: expected 16 or 32 bytes, got {n}"))),
@@ -281,5 +298,20 @@ mod tests {
         assert!(S3VersionId::parse_x_wasabi_set_version_id("short").is_err());
         // Wrong charset in suffix (x not in alphabet)
         assert!(S3VersionId::parse_x_wasabi_set_version_id("000000000000000000001-xxxxxxxxxx").is_err());
+    }
+
+    #[test]
+    fn from_msgpack_id_bytes_rejects_bad_length() {
+        let err = S3VersionId::from_msgpack_id_bytes(&[0u8; 8]).unwrap_err();
+        assert!(err.to_string().contains("expected 16 or 32 byte binary ID field"), "{err}");
+    }
+
+    #[test]
+    fn from_msgpack_id_bytes_rejects_non_utf8_wasabi_length() {
+        let mut b = [0xFFu8; 32];
+        b[0] = b'0';
+        b[1] = b'1';
+        let err = S3VersionId::from_msgpack_id_bytes(b.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("must be valid UTF-8"), "{err}");
     }
 }
