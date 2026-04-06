@@ -102,6 +102,7 @@ fn put_path_label(small_eager: bool, reduced_copy: bool, compressed: bool) -> &'
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_put_flow_phase(
     bucket: &str,
     key: &str,

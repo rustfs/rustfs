@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUSTFS_BIN="${RUSTFS_BIN:-${ROOT_DIR}/target/debug/rustfs}"
-MC_BIN="${MC_BIN:-/Users/zhi/go/bin/mc}"
+MC_BIN="${MC_BIN:-mc}"
 
 PORT="${RUSTFS_BENCH_PORT:-9910}"
 CONSOLE_PORT="${RUSTFS_BENCH_CONSOLE_PORT:-9911}"
@@ -25,6 +25,20 @@ MC_CONFIG_DIR="${RUN_DIR}/mc-config"
 RESULTS_MD="${RUN_DIR}/RESULTS.md"
 SERVER_LOG="${LOG_DIR}/rustfs.log"
 BUCKET="${RUSTFS_BENCH_BUCKET:-small-put-benchmark}"
+
+# Verify mc (MinIO Client) is available
+if ! command -v "${MC_BIN}" >/dev/null 2>&1; then
+  echo "Error: 'mc' (MinIO Client) not found. MC_BIN=${MC_BIN}" >&2
+  echo "" >&2
+  echo "Install mc with one of the following:" >&2
+  echo "  macOS (Homebrew): brew install minio/stable/mc" >&2
+  echo "  Go:               go install github.com/minio/mc@latest" >&2
+  echo "  Linux (amd64):    curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc" >&2
+  echo "  Linux (arm64):    curl -sSL https://dl.min.io/client/mc/release/linux-arm64/mc -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc" >&2
+  echo "" >&2
+  echo "Or set MC_BIN=/path/to/mc before running this script." >&2
+  exit 1
+fi
 
 mkdir -p "${VOLUME_DIR}" "${LOG_DIR}" "${FILE_DIR}" "${MC_CONFIG_DIR}"
 mkdir -p "${VOLUME_DIR}"/disk{1..4}

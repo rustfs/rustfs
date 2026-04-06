@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUSTFS_BIN="${ROOT_DIR}/target/debug/rustfs"
-WARP_BIN="${WARP_BIN:-/Users/zhi/go/bin/warp}"
-MC_BIN="${MC_BIN:-/Users/zhi/go/bin/mc}"
+WARP_BIN="${WARP_BIN:-warp}"
+MC_BIN="${MC_BIN:-mc}"
 
 PORT="${RUSTFS_BENCH_PORT:-9900}"
 CONSOLE_PORT="${RUSTFS_BENCH_CONSOLE_PORT:-9901}"
@@ -25,6 +25,34 @@ WARP_CONCURRENCY="${RUSTFS_BENCH_CONCURRENCY:-32}"
 
 mkdir -p "${VOLUME_DIR}" "${LOG_DIR}" "${MC_CONFIG_DIR}"
 mkdir -p "${VOLUME_DIR}"/disk{1..4}
+
+# Verify mc (MinIO Client) is available
+if ! command -v "${MC_BIN}" >/dev/null 2>&1; then
+  echo "Error: 'mc' (MinIO Client) not found. MC_BIN=${MC_BIN}" >&2
+  echo "" >&2
+  echo "Install mc with one of the following:" >&2
+  echo "  macOS (Homebrew): brew install minio/stable/mc" >&2
+  echo "  Go:               go install github.com/minio/mc@latest" >&2
+  echo "  Linux (amd64):    curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc" >&2
+  echo "  Linux (arm64):    curl -sSL https://dl.min.io/client/mc/release/linux-arm64/mc -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc" >&2
+  echo "" >&2
+  echo "Or set MC_BIN=/path/to/mc before running this script." >&2
+  exit 1
+fi
+
+# Verify warp is available
+if ! command -v "${WARP_BIN}" >/dev/null 2>&1; then
+  echo "Error: 'warp' benchmark tool not found. WARP_BIN=${WARP_BIN}" >&2
+  echo "" >&2
+  echo "Install warp with one of the following:" >&2
+  echo "  Go:               go install github.com/minio/warp@latest" >&2
+  echo "  Linux (amd64):    curl -sSL https://github.com/minio/warp/releases/latest/download/warp_Linux_x86_64.tar.gz | tar -xz -C /usr/local/bin warp" >&2
+  echo "  macOS (amd64):    curl -sSL https://github.com/minio/warp/releases/latest/download/warp_Darwin_x86_64.tar.gz | tar -xz -C /usr/local/bin warp" >&2
+  echo "  macOS (arm64):    curl -sSL https://github.com/minio/warp/releases/latest/download/warp_Darwin_arm64.tar.gz | tar -xz -C /usr/local/bin warp" >&2
+  echo "" >&2
+  echo "Or set WARP_BIN=/path/to/warp before running this script." >&2
+  exit 1
+fi
 
 SIZES=(
   "4KiB"
