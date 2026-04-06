@@ -28,5 +28,12 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "queue_store_benchmark"
+harness = false
+
 [lints]
 workspace = true

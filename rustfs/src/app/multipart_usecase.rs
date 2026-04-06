@@ -25,6 +25,7 @@ use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
 use bytes::Bytes;
@@ -46,7 +47,7 @@ use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
 use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -406,7 +407,7 @@ impl DefaultMultipartUsecase {
         };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
@@ -730,8 +731,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
         let actual_size = size;
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
@@ -745,21 +744,27 @@ impl DefaultMultipartUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut reader = if is_compressible {
+            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
+                .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
-            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
-            reader = Box::new(compress_reader);
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            HashReader::from_reader(
+                CompressReader::new(hrd, CompressionAlgorithm::default()),
+                size,
+                actual_size,
+                None,
+                None,
+                false,
+            )
+            .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+        };
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
@@ -813,8 +818,9 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 fi.user_defined.extend(material.metadata);
 
@@ -1110,8 +1116,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
-
         let src_decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -1123,23 +1127,74 @@ impl DefaultMultipartUsecase {
             etag: src_info.etag.as_deref(),
         };
 
-        if let Some(material) = sse_decryption(src_decryption_request).await? {
-            reader = material.wrap_single_reader(reader);
-            if let Some(original) = material.original_size {
-                src_info.actual_size = original;
-            }
-        }
-
         let actual_size = length;
         let mut size = length;
 
-        if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-        }
+        let mut reader = match sse_decryption(src_decryption_request).await? {
+            Some(material) => {
+                if let Some(original) = material.original_size {
+                    src_info.actual_size = original;
+                }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(src_stream, size).await.map_err(ApiError::from)?;
+                    size = plaintext_size;
+
+                    if is_compressible {
+                        let hrd = HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        size = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            size,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                    }
+                } else if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                        .map_err(ApiError::from)?
+                }
+            }
+            None => {
+                if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                }
+            }
+        };
 
         let server_side_encryption = mp_info
             .user_defined
@@ -1180,8 +1235,9 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 mp_info.user_defined.extend(material.metadata);
 

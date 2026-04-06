@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod account_info;
+pub mod audit;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
@@ -51,6 +52,7 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _list_audit_targets = audit::ListAuditTargets {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
         let _inspect_data_handler = system::InspectDataHandler {};

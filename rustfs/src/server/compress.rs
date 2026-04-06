@@ -50,6 +50,11 @@ use std::str::FromStr;
 use tower_http::compression::predicate::Predicate;
 use tracing::debug;
 
+/// Response extension key for storing the request path category.
+/// Set by `PathCategoryInjectionLayer` before the compression predicate evaluates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestPathCategory(pub(crate) PathCategory);
+
 /// Configuration for HTTP response compression.
 ///
 /// This structure holds the whitelist-based compression settings:
@@ -319,6 +324,156 @@ impl Predicate for CompressionPredicate {
     }
 }
 
+// ── Path-Aware Compression ──
+
+/// Classifies request paths to determine if compression should apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathCategory {
+    /// S3 data plane (bucket/key operations) — compression applies via whitelist
+    S3DataPlane,
+    /// Admin API paths — skip compression (small JSON responses)
+    AdminApi,
+    /// Console paths — skip compression (static assets, already optimized)
+    Console,
+    /// Internode RPC paths — skip compression (binary protocol data)
+    InternodeRpc,
+    /// Health/probe paths — skip compression (tiny responses)
+    Probe,
+}
+
+impl PathCategory {
+    /// Classify a request URI path into a category.
+    pub(crate) fn classify(path: &str) -> Self {
+        if path.starts_with("/rustfs/rpc/") || path.starts_with("/rustfs/peer/") {
+            PathCategory::InternodeRpc
+        } else if path.starts_with("/rustfs/admin/") || path.starts_with("/minio/admin/") {
+            PathCategory::AdminApi
+        } else if path.starts_with("/rustfs/console") {
+            PathCategory::Console
+        } else if path.starts_with("/minio/health/") {
+            PathCategory::Probe
+        } else {
+            PathCategory::S3DataPlane
+        }
+    }
+
+    /// Returns true if compression should be considered for this path category.
+    /// Only S3 data plane paths go through the full compression predicate.
+    #[inline]
+    pub(crate) fn should_evaluate_compression(self) -> bool {
+        matches!(self, PathCategory::S3DataPlane)
+    }
+}
+
+/// A compression predicate that first checks the request path category
+/// before evaluating the full compression rules.
+///
+/// This avoids running MIME type / extension matching for admin, RPC, console,
+/// and health probe paths where compression is never beneficial.
+#[derive(Clone, Debug)]
+pub(crate) struct PathAwareCompressionPredicate {
+    inner: CompressionPredicate,
+}
+
+impl PathAwareCompressionPredicate {
+    pub(crate) fn new(config: CompressionConfig) -> Self {
+        Self {
+            inner: CompressionPredicate::new(config),
+        }
+    }
+}
+
+impl Predicate for PathAwareCompressionPredicate {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        // Fast path: skip full predicate evaluation for non-S3 paths
+        if let Some(RequestPathCategory(category)) = response.extensions().get::<RequestPathCategory>()
+            && !category.should_evaluate_compression()
+        {
+            return false;
+        }
+        self.inner.should_compress(response)
+    }
+}
+
+use http::Request;
+use http_body::Body;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tower::{Layer, Service};
+
+/// Tower layer that injects `RequestPathCategory` into each response's extensions
+/// based on the incoming request URI path. Must be placed before `CompressionLayer`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PathCategoryInjectionLayer;
+
+impl<S> Layer<S> for PathCategoryInjectionLayer {
+    type Service = PathCategoryInjectionService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PathCategoryInjectionService { inner }
+    }
+}
+
+/// Service wrapper that adds `RequestPathCategory` to response extensions.
+#[derive(Clone)]
+pub(crate) struct PathCategoryInjectionService<S> {
+    inner: S,
+}
+
+pin_project_lite::pin_project! {
+    /// Future for `PathCategoryInjectionService` that injects path category into response.
+    #[project = InjectCategoryFutProj]
+    pub(crate) struct InjectCategoryFut<F> {
+        #[pin]
+        inner: F,
+        category: PathCategory,
+    }
+}
+
+impl<F, ResBody, E> std::future::Future for InjectCategoryFut<F>
+where
+    F: std::future::Future<Output = Result<Response<ResBody>, E>>,
+{
+    type Output = Result<Response<ResBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Ready(Ok(mut resp)) => {
+                resp.extensions_mut().insert(RequestPathCategory(*this.category));
+                Poll::Ready(Ok(resp))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for PathCategoryInjectionService<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    ResBody: Body,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = InjectCategoryFut<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        let category = PathCategory::classify(req.uri().path());
+        InjectCategoryFut {
+            inner: self.inner.call(req),
+            category,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +625,46 @@ mod tests {
         assert_eq!(predicate.config.extensions.len(), 2);
         assert_eq!(predicate.config.mime_patterns.len(), 2);
         assert_eq!(predicate.config.min_size, 1000);
+    }
+
+    #[test]
+    fn test_path_category_classify_s3() {
+        assert_eq!(PathCategory::classify("/"), PathCategory::S3DataPlane);
+        assert_eq!(PathCategory::classify("/mybucket"), PathCategory::S3DataPlane);
+        assert_eq!(PathCategory::classify("/mybucket/mykey"), PathCategory::S3DataPlane);
+        assert_eq!(PathCategory::classify("/bucket?list-type=2"), PathCategory::S3DataPlane);
+    }
+
+    #[test]
+    fn test_path_category_classify_admin() {
+        assert_eq!(PathCategory::classify("/rustfs/admin/v3/service"), PathCategory::AdminApi);
+        assert_eq!(PathCategory::classify("/minio/admin/v3/info"), PathCategory::AdminApi);
+    }
+
+    #[test]
+    fn test_path_category_classify_console() {
+        assert_eq!(PathCategory::classify("/rustfs/console/index.html"), PathCategory::Console);
+        assert_eq!(PathCategory::classify("/rustfs/console"), PathCategory::Console);
+    }
+
+    #[test]
+    fn test_path_category_classify_rpc() {
+        assert_eq!(PathCategory::classify("/rustfs/rpc/read_file_stream"), PathCategory::InternodeRpc);
+        assert_eq!(PathCategory::classify("/rustfs/peer/health"), PathCategory::InternodeRpc);
+    }
+
+    #[test]
+    fn test_path_category_classify_probe() {
+        assert_eq!(PathCategory::classify("/minio/health/live"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/ready"), PathCategory::Probe);
+    }
+
+    #[test]
+    fn test_path_category_should_evaluate() {
+        assert!(PathCategory::S3DataPlane.should_evaluate_compression());
+        assert!(!PathCategory::AdminApi.should_evaluate_compression());
+        assert!(!PathCategory::Console.should_evaluate_compression());
+        assert!(!PathCategory::InternodeRpc.should_evaluate_compression());
+        assert!(!PathCategory::Probe.should_evaluate_compression());
     }
 }

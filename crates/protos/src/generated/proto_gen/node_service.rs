@@ -658,6 +658,26 @@ pub struct GenerallyLockResponse {
     #[prost(string, optional, tag = "3")]
     pub lock_info: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchGenerallyLockRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GenerallyLockResult {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    /// JSON serialized LockInfo
+    #[prost(string, optional, tag = "3")]
+    pub lock_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchGenerallyLockResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub results: ::prost::alloc::vec::Vec<GenerallyLockResult>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Mss {
     #[prost(map = "string, string", tag = "1")]
@@ -1776,6 +1796,36 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "Refresh"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn lock_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BatchGenerallyLockRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchGenerallyLockResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LockBatch");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LockBatch"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn un_lock_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BatchGenerallyLockRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchGenerallyLockResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/UnLockBatch");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "UnLockBatch"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn local_storage_info(
             &mut self,
             request: impl tonic::IntoRequest<super::LocalStorageInfoRequest>,
@@ -2512,6 +2562,14 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::GenerallyLockRequest>,
         ) -> std::result::Result<tonic::Response<super::GenerallyLockResponse>, tonic::Status>;
+        async fn lock_batch(
+            &self,
+            request: tonic::Request<super::BatchGenerallyLockRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchGenerallyLockResponse>, tonic::Status>;
+        async fn un_lock_batch(
+            &self,
+            request: tonic::Request<super::BatchGenerallyLockRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchGenerallyLockResponse>, tonic::Status>;
         async fn local_storage_info(
             &self,
             request: tonic::Request<super::LocalStorageInfoRequest>,
@@ -3819,6 +3877,62 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RefreshSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LockBatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct LockBatchSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::BatchGenerallyLockRequest> for LockBatchSvc<T> {
+                        type Response = super::BatchGenerallyLockResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::BatchGenerallyLockRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::lock_batch(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LockBatchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/UnLockBatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnLockBatchSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::BatchGenerallyLockRequest> for UnLockBatchSvc<T> {
+                        type Response = super::BatchGenerallyLockResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::BatchGenerallyLockRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::un_lock_batch(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnLockBatchSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

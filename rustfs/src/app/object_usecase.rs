@@ -24,11 +24,12 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::OperationHelper;
+use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
@@ -86,7 +87,7 @@ use rustfs_filemeta::{
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, EtagReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, DynReader, HashReader, wrap_reader};
 use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
@@ -183,7 +184,7 @@ struct GetObjectRequestContext {
 struct GetObjectReadSetup {
     info: ObjectInfo,
     event_info: ObjectInfo,
-    final_stream: Box<dyn Reader>,
+    final_stream: DynReader,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -928,7 +929,7 @@ impl DefaultObjectUsecase {
 
     fn spawn_cache_invalidation(bucket: String, key: String, version_id: Option<String>) {
         let manager = get_concurrency_manager();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager.invalidate_cache_versioned(&bucket, &key, version_id.as_deref()).await;
         });
     }
@@ -1015,9 +1016,9 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    fn init_get_object_bootstrap(bucket: &str, key: &str) -> S3Result<GetObjectBootstrap> {
+    fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
         let timeout_config = TimeoutConfig::from_env();
-        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), format!("get-{bucket}-{key}"));
+        let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
@@ -1319,14 +1320,7 @@ impl DefaultObjectUsecase {
                     decrypted_stream,
                 )
             }
-            None => (
-                None,
-                None,
-                None,
-                None,
-                false,
-                Box::new(WarpReader::new(encrypted_stream)) as Box<dyn Reader>,
-            ),
+            None => (None, None, None, None, false, wrap_reader(encrypted_stream)),
         };
 
         Ok(GetObjectReadSetup {
@@ -1542,7 +1536,7 @@ impl DefaultObjectUsecase {
                 .with_last_modified(last_modified_str.unwrap_or_default());
 
             let cache_key_clone = cache_key.to_string();
-            tokio::spawn(async move {
+            spawn_traced(async move {
                 let manager = get_concurrency_manager();
                 manager.put_cached_object(cache_key_clone.clone(), cached_response).await;
                 debug!("Object cached successfully with metadata: {}", cache_key_clone);
@@ -1824,8 +1818,6 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
         let actual_size = size;
 
         let mut md5hex = if let Some(base64_md5) = content_md5 {
@@ -1839,12 +1831,13 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+        let mut reader = if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            let mut hrd =
+                HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
@@ -1854,13 +1847,12 @@ impl DefaultObjectUsecase {
             insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-            reader = Box::new(CompressReader::new(hrd, algorithm));
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            HashReader::from_reader(CompressReader::new(hrd, algorithm), size, actual_size, None, None, false)
+                .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+        };
 
         if size >= 0 {
             if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
@@ -1901,7 +1893,7 @@ impl DefaultObjectUsecase {
             effective_kms_key_id = material.kms_key_id.clone();
 
             let encrypted_reader = material.wrap_reader(reader);
-            reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
             let encryption_metadata = material.metadata;
@@ -2378,7 +2370,7 @@ impl DefaultObjectUsecase {
         let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
                 .await;
@@ -2504,7 +2496,7 @@ impl DefaultObjectUsecase {
         key: &str,
         info: ObjectInfo,
         event_info: ObjectInfo,
-        final_stream: Box<dyn Reader>,
+        final_stream: DynReader,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -2608,7 +2600,12 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key)?;
+        let request_id = req
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+        let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
@@ -3339,8 +3336,6 @@ impl DefaultObjectUsecase {
             src_info.metadata_only = true;
         }
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(gr.stream));
-
         let decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -3352,11 +3347,12 @@ impl DefaultObjectUsecase {
             etag: src_info.etag.as_deref(),
         };
 
-        if let Some(material) = sse_decryption(decryption_request).await? {
-            reader = material.wrap_single_reader(reader);
-            if let Some(original) = material.original_size {
-                src_info.actual_size = original;
-            }
+        let decryption_material = sse_decryption(decryption_request).await?;
+
+        if let Some(material) = decryption_material.as_ref()
+            && let Some(original) = material.original_size
+        {
+            src_info.actual_size = original;
         }
 
         strip_managed_encryption_metadata(&mut src_info.user_defined);
@@ -3367,16 +3363,11 @@ impl DefaultObjectUsecase {
 
         let mut compress_metadata = HashMap::new();
 
-        if is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64 {
+        let should_compress = is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64;
+
+        if should_compress {
             insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
-
-            let hrd = EtagReader::new(reader, None);
-
-            // let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
-
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            length = HashReader::SIZE_PRESERVE_LAYER;
         } else {
             remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION);
             remove_str(&mut src_info.user_defined, SUFFIX_ACTUAL_SIZE);
@@ -3408,7 +3399,68 @@ impl DefaultObjectUsecase {
             src_info.user_defined.extend(object_lock_metadata);
         }
 
-        let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
+        let mut reader = match decryption_material {
+            Some(material) => {
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(gr.stream, length).await.map_err(ApiError::from)?;
+                    length = plaintext_size;
+
+                    if should_compress {
+                        let hrd = HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        length = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            length,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
+                            .map_err(ApiError::from)?
+                    }
+                } else if should_compress {
+                    let hrd =
+                        HashReader::from_stream(material.wrap_single_reader(gr.stream), length, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                    length = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        length,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(material.wrap_single_reader(gr.stream), length, actual_size, None, None, false)
+                        .map_err(ApiError::from)?
+                }
+            }
+            None => {
+                if should_compress {
+                    let hrd =
+                        HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
+                    length = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        length,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
+                }
+            }
+        };
 
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
@@ -3429,7 +3481,7 @@ impl DefaultObjectUsecase {
             effective_kms_key_id = material.kms_key_id.clone();
 
             let encrypted_reader = material.wrap_reader(reader);
-            reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
             src_info.user_defined.extend(material.metadata);
@@ -3665,7 +3717,7 @@ impl DefaultObjectUsecase {
         let manager = get_concurrency_manager();
         let bucket_clone = bucket.clone();
         let deleted_objects = dobjs.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             for dobj in deleted_objects {
                 manager
                     .invalidate_cache_versioned(
@@ -3778,7 +3830,7 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        tokio::spawn(async move {
+        spawn_background(async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -3950,7 +4002,21 @@ impl DefaultObjectUsecase {
                 })
                 .await;
             }
-            return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
+            helper = helper
+                .event_name(EventName::ObjectRemovedDelete)
+                .object(ObjectInfo {
+                    name: key.clone(),
+                    bucket: bucket.clone(),
+                    ..Default::default()
+                })
+                .version_id(String::new());
+            let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+            // Match non-empty delete path: capacity manager write-op telemetry.
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+            let _ = helper.complete(&result);
+            return result;
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
@@ -4054,7 +4120,7 @@ impl DefaultObjectUsecase {
         let version_id_clone = version_id.clone();
         let cache_bucket = bucket.clone();
         let cache_object = object.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
                 .await;
@@ -4566,7 +4632,7 @@ impl DefaultObjectUsecase {
         let rreq_clone = rreq.clone();
         let version_id_clone = version_id.clone();
 
-        tokio::spawn(async move {
+        spawn_traced(async move {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
@@ -4587,8 +4653,6 @@ impl DefaultObjectUsecase {
                     object_clone,
                     err.to_string()
                 );
-                // Note: Errors from background tasks cannot be returned to client
-                // Consider adding to monitoring/metrics system
             } else {
                 info!("successfully restored transitioned object: {}/{}", bucket_clone, object_clone);
             }
@@ -4661,7 +4725,7 @@ impl DefaultObjectUsecase {
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
         let stream = ReceiverStream::new(rx);
-        tokio::spawn(async move {
+        spawn_traced(async move {
             let _ = tx
                 .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
                 .await;
@@ -4816,9 +4880,8 @@ impl DefaultObjectUsecase {
         let sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
         let actual_size = size;
 
-        let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
-        let mut archive_reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut archive_reader =
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
         if let Err(err) = archive_reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
             return Err(ApiError::from(err).into());
@@ -4935,30 +4998,39 @@ impl DefaultObjectUsecase {
 
             debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
-            let mut reader: Box<dyn Reader> = if is_dir {
+            if is_dir {
                 if extract_options.ignore_dirs {
                     debug!("Skipping directory entry during archive extract: {}", fpath);
                     continue;
                 }
                 size = 0;
-                Box::new(WarpReader::new(std::io::Cursor::new(Vec::new())))
-            } else {
-                Box::new(WarpReader::new(f))
-            };
+            }
 
             let actual_size = size;
 
-            if !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+            let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
+
+            let mut hrd = if is_dir {
+                HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
+                    .map_err(ApiError::from)?
+            } else if should_compress {
                 insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
-                let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-
-                reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+                let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
                 size = HashReader::SIZE_PRESERVE_LAYER;
-            }
-
-            let mut hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                HashReader::from_reader(
+                    CompressReader::new(hrd, CompressionAlgorithm::default()),
+                    size,
+                    actual_size,
+                    None,
+                    None,
+                    false,
+                )
+                .map_err(ApiError::from)?
+            } else {
+                HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
+            };
             apply_put_request_object_lock_opts(
                 &bucket,
                 object_lock_legal_hold_status.clone(),
@@ -4986,7 +5058,7 @@ impl DefaultObjectUsecase {
                 effective_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(hrd);
-                hrd = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                     .map_err(ApiError::from)?;
 
                 let encryption_metadata = material.metadata;
@@ -5010,7 +5082,7 @@ impl DefaultObjectUsecase {
             let manager = get_concurrency_manager();
             let fpath_clone = fpath.clone();
             let bucket_clone = bucket.clone();
-            tokio::spawn(async move {
+            spawn_traced(async move {
                 manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
             });
 
@@ -5034,7 +5106,11 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            tokio::spawn(async move {
+            let request_context = req
+                .extensions
+                .get::<crate::storage::request_context::RequestContext>()
+                .cloned();
+            spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });
         }
