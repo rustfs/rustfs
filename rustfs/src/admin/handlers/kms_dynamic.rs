@@ -570,7 +570,7 @@ impl Operation for ReconfigureKmsHandler {
             }
         };
 
-        info!("Reconfiguring KMS with request: {:?}", configure_request);
+        info!("Reconfiguring KMS");
 
         let service_manager = kms_service_manager_from_context();
         let existing_config = service_manager.get_config().await;
