@@ -90,6 +90,7 @@ rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
+rustfs-object-io = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }

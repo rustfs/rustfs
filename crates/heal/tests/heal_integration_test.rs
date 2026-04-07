@@ -18,7 +18,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{BucketOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
+    store_api::{BucketOperations, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions},
 };
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
@@ -162,7 +162,7 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 
 /// Test helper: Upload test object
 async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
-    let mut reader = PutObjReader::from_vec(data.to_vec());
+    let mut reader = ChunkNativePutData::from_vec(data.to_vec());
     let object_info = (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await

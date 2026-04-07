@@ -426,7 +426,7 @@ pub async fn start_http_server(
                     }
                 }
             };
-
+            #[allow(unused)]
             let socket_ref = SockRef::from(&socket);
 
             // ── POST-ACCEPT SOCKET SYSCALLS ──
@@ -603,8 +603,8 @@ fn process_connection(
         //  9. KeystoneAuthLayer                      — X-Auth-Token validation
         // 10. TraceLayer                             — request/response tracing + metrics
         // 11. PropagateRequestIdLayer                — X-Request-ID → response
-        // 12. PathCategoryInjectionLayer             — injects path category for compression
-        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
         // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
         // 15. ConditionalCorsLayer                   — S3 API CORS
         // 16. RedirectLayer                          — console redirect (conditional)
@@ -739,8 +739,8 @@ fn process_connection(
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
-            .layer(PathCategoryInjectionLayer)
             .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
+            .layer(PathCategoryInjectionLayer)
             .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
@@ -927,8 +927,16 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::compress::RequestPathCategory;
+    use bytes::Bytes;
     use http::HeaderMap;
+    use http::Request as HttpRequest;
+    use http_body_util::Empty;
     use opentelemetry::propagation::Extractor;
+    use std::convert::Infallible;
+    use std::future::Ready;
+    use std::task::{Context, Poll};
+    use tower::{Layer, Service, ServiceBuilder};
 
     /// Baseline constants — reference the authoritative config defaults.
     /// If a config default changes, tests automatically follow.
@@ -1064,5 +1072,90 @@ mod tests {
         // HeaderMap::get is case insensitive
         assert_eq!(carrier.get("Content-Type"), Some("application/json"));
         assert_eq!(carrier.get("CONTENT-TYPE"), Some("application/json"));
+    }
+
+    #[derive(Clone, Copy)]
+    struct ObserveCategoryLayer;
+
+    #[derive(Clone)]
+    struct ObserveCategoryService<S> {
+        inner: S,
+    }
+
+    impl<S> Layer<S> for ObserveCategoryLayer {
+        type Service = ObserveCategoryService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            ObserveCategoryService { inner }
+        }
+    }
+
+    impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ObserveCategoryService<S>
+    where
+        S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>, Error = Infallible>,
+    {
+        type Response = Response<ResBody>;
+        type Error = Infallible;
+        type Future = Ready<std::result::Result<Response<ResBody>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+            let response = futures::executor::block_on(self.inner.call(req)).expect("infallible");
+            let mut response = response;
+            let seen = response.extensions().get::<RequestPathCategory>().is_some();
+            response
+                .headers_mut()
+                .insert("x-category-seen", if seen { "true" } else { "false" }.parse().expect("header"));
+            std::future::ready(Ok(response))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct OkService;
+
+    impl<ReqBody> Service<HttpRequest<ReqBody>> for OkService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<std::result::Result<Response<Empty<Bytes>>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<ReqBody>) -> Self::Future {
+            std::future::ready(Ok(Response::new(Empty::new())))
+        }
+    }
+
+    #[test]
+    fn test_service_builder_order_regression_for_response_extensions() {
+        let request = HttpRequest::builder().uri("/bucket/archive.zip").body(()).expect("request");
+
+        let mut broken_order = ServiceBuilder::new()
+            .layer(PathCategoryInjectionLayer)
+            .layer(ObserveCategoryLayer)
+            .service(OkService);
+
+        let broken_response = futures::executor::block_on(broken_order.call(request)).expect("response");
+        assert_eq!(
+            broken_response.headers().get("x-category-seen").and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+
+        let request = HttpRequest::builder().uri("/bucket/archive.zip").body(()).expect("request");
+
+        let mut fixed_order = ServiceBuilder::new()
+            .layer(ObserveCategoryLayer)
+            .layer(PathCategoryInjectionLayer)
+            .service(OkService);
+
+        let fixed_response = futures::executor::block_on(fixed_order.call(request)).expect("response");
+        assert_eq!(
+            fixed_response.headers().get("x-category-seen").and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
     }
 }

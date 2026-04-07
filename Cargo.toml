@@ -51,6 +51,7 @@ members = [
     "crates/workers", # Worker thread pools and task scheduling
     "crates/io-metrics", # Zero-copy metrics collection for performance analysis
     "crates/io-core", # Zero-copy core reader and writer implementations
+    "crates/object-io", # Object I/O policy and zero-copy helper primitives
     "crates/zip", # ZIP file handling and compression
 ]
 resolver = "3"
@@ -97,6 +98,7 @@ rustfs-metrics = { path = "crates/metrics", version = "0.0.5" }
 rustfs-notify = { path = "crates/notify", version = "0.0.5" }
 rustfs-io-metrics = { path = "crates/io-metrics", version = "0.0.5" }
 rustfs-io-core = { path = "crates/io-core", version = "0.0.5" }
+rustfs-object-io = { path = "crates/object-io", version = "0.0.5" }
 rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
 rustfs-protos = { path = "crates/protos", version = "0.0.5" }
@@ -246,11 +248,11 @@ rayon = "1.11.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
-rumqttc = { version = "0.25.1" }
+rumqttc = { package = "rumqttc-next", version = "0.29.0", features = ["websocket"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "79bb9abe6b353025ef4572a25db8eb64f1409faf", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "010ae03bdd8c93a9c046108190987bb0e6cb0692", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"
@@ -284,7 +286,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
-dial9-tokio-telemetry = "0.2"
+dial9-tokio-telemetry = { version = "0.2", git = "https://github.com/dial9-rs/dial9-tokio-telemetry.git", rev = "60502082601b647c4a51962595721f631b7bbce1" }
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }

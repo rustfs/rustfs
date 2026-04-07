@@ -15,6 +15,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngExt};
 use serde::{Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
 use std::io::{Error, Result};
 
 /// Generates a random access key of the specified length.
@@ -96,6 +97,16 @@ pub fn extract_claims<T: DeserializeOwned + Clone>(
         &DecodingKey::from_secret(secret.as_bytes()),
         &jsonwebtoken::Validation::new(Algorithm::HS512),
     )
+}
+
+pub fn extract_claims_allow_missing_exp<T: DeserializeOwned + Clone>(
+    token: &str,
+    secret: &str,
+) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
+    let mut validation = jsonwebtoken::Validation::new(Algorithm::HS512);
+    validation.required_spec_claims = HashSet::new();
+
+    jsonwebtoken::decode::<T>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
 }
 
 #[cfg(test)]

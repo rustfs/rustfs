@@ -23,7 +23,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.console_address | string | `":9001"` |  |
 | config.rustfs.console_enable | string | `"true"` |  |
 | config.rustfs.domains | string | `""` | Enable virtual host mode. |
-| config.rustfs.ec.storage_class_standard | string | `EC:4` | Standard storage class environment variable. |
 | config.rustfs.log_level | string | `"info"` |  |
 | config.rustfs.obs_environment | string | `"development"` |  |
 | config.rustfs.obs_log_directory | string | `"/logs"` |  |
@@ -48,7 +47,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
 | config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
 | config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
-| extraEnv | list | `[]` |  Extra environment variables for RustFS container. |
+| extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
@@ -134,6 +133,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
+| storageclass.pvcAnnotations | map | `{}` | PVC customized annotations. |
 | tolerations | list | `[]` |  |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |

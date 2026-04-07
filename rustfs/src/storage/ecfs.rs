@@ -29,7 +29,6 @@ use rustfs_ecstore::{
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
-use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
