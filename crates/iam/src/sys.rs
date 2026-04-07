@@ -468,6 +468,11 @@ impl<T: Store> IamSys<T> {
             }
         }
 
+        // Set expiration claim only when an explicit expiration was requested.
+        // Without this guard, permanent service accounts (expiration = None)
+        // get a default exp = now + 3600.  The IAM reload (every ~2 min) then
+        // fails to parse the JWT after 1 hour and silently drops the SA from
+        // cache, making it unusable even though it still exists on disk.
         if let Some(expiration) = opts.expiration {
             m.insert("exp".to_string(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
         }

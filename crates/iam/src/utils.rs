@@ -92,11 +92,11 @@ pub fn extract_claims<T: DeserializeOwned + Clone>(
     token: &str,
     secret: &str,
 ) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
-    jsonwebtoken::decode::<T>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::new(Algorithm::HS512),
-    )
+    let mut validation = jsonwebtoken::Validation::new(Algorithm::HS512);
+    // Permanent service accounts may omit the `exp` claim; when present
+    // it is still validated normally.
+    validation.required_spec_claims.remove("exp");
+    jsonwebtoken::decode::<T>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
 }
 
 pub fn extract_claims_allow_missing_exp<T: DeserializeOwned + Clone>(
