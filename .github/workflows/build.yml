@@ -204,6 +204,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Always enable Tokio unstable features (required by dial9-tokio-telemetry).
       # The RUSTFLAGS env var takes precedence over .cargo/config.toml [build] rustflags,
       # so we must include --cfg tokio_unstable here explicitly; otherwise an empty
