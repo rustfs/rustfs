@@ -336,9 +336,10 @@ impl RustFSServerBuilder {
         set_global_rustfs_port(server_port);
         set_global_addr(&config.address).await;
 
+        set_global_init_guard()?;
+
         // Endpoints / erasure setup.
         let server_addr_str = server_addr.to_string();
-        set_global_init_guard()?;
         let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
             .await
             .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
@@ -460,24 +461,23 @@ impl RustFSServerBuilder {
         readiness.mark_stage(SystemStage::FullReady);
         rustfs_common::set_global_init_time_now().await;
 
-        info!(
-            target: "rustfs::embedded",
-            "RustFS embedded server ready at http://{}",
-            bound_addr
-        );
-
-        // Success — disarm the temp dir guard so it isn't cleaned up on drop.
-        let temp_dir = temp_dir_guard.map(|g| g.keep());
-
-        Ok(RustFSServer {
+        let server = RustFSServer {
             address: bound_addr,
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
             region: self.region.clone(),
             shutdown_tx: Some(shutdown_tx),
             cancel_token: ctx,
-            temp_dir,
-        })
+            temp_dir: temp_dir_guard.map(|g| g.keep()),
+        };
+
+        info!(
+            target: "rustfs::embedded",
+            "RustFS embedded server ready at http://{}",
+            server.endpoint_address()
+        );
+
+        Ok(server)
     }
 }
 
