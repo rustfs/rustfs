@@ -426,7 +426,7 @@ pub async fn start_http_server(
                     }
                 }
             };
-
+            #[allow(unused)]
             let socket_ref = SockRef::from(&socket);
 
             // ── POST-ACCEPT SOCKET SYSCALLS ──

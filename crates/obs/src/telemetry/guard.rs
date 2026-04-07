@@ -41,7 +41,7 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
@@ -58,7 +58,7 @@ impl std::fmt::Debug for OtelGuard {
         s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some());
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         s.field("profiling_agent", &self.profiling_agent.is_some());
         s.field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
@@ -91,7 +91,7 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {err:?}");
         }
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
                 Err(err) => eprintln!("Profiling agent stop error: {err:?}"),

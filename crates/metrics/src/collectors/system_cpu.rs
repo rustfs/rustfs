@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(metrics.len(), 8);
 
         // Verify that metric names are properly generated from descriptors
-        assert!(metrics.iter().all(|m| m.name.starts_with("gauge.rustfs_system_cpu_")));
+        assert!(metrics.iter().all(|m| m.name.starts_with("rustfs_system_cpu_")));
     }
 
     #[test]
