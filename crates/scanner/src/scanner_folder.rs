@@ -608,15 +608,23 @@ impl FolderScanner {
 
             debug!("scan_folder: dir_path: {:?}", dir_path);
 
-            let mut dir_reader = tokio::fs::read_dir(&dir_path)
-                .await
-                .map_err(|e| ScannerError::Other(e.to_string()))?;
+            let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
+                Ok(dir_reader) => dir_reader,
+                Err(e) => {
+                    warn!("scan_folder: failed to read dir {}: {}", dir_path, e);
+                    return Ok(());
+                }
+            };
 
-            while let Some(entry) = dir_reader
-                .next_entry()
-                .await
-                .map_err(|e| ScannerError::Other(e.to_string()))?
-            {
+            loop {
+                let entry = match dir_reader.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("scan_folder: failed to iterate dir {}: {}", dir_path, e);
+                        break;
+                    }
+                };
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
@@ -632,7 +640,13 @@ impl FolderScanner {
                     continue;
                 }
 
-                let entry_type = entry.file_type().await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                let entry_type = match entry.file_type().await {
+                    Ok(entry_type) => entry_type,
+                    Err(e) => {
+                        warn!("scan_folder: failed to inspect entry {}: {}", entry_name, e);
+                        continue;
+                    }
+                };
 
                 // ok
 
@@ -816,7 +830,10 @@ impl FolderScanner {
 
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                if let Err(e) = fut.await {
+                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                    continue;
+                }
                 tokio::task::yield_now().await;
 
                 if !into.compacted {
@@ -865,7 +882,10 @@ impl FolderScanner {
 
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                if let Err(e) = fut.await {
+                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                    continue;
+                }
                 tokio::task::yield_now().await;
 
                 if !into.compacted {
@@ -1076,7 +1096,10 @@ impl FolderScanner {
 
                     // Use Box::pin for recursive async call
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
                     tokio::task::yield_now().await;
 
                     if !into.compacted {
@@ -1264,6 +1287,8 @@ mod tests {
     use super::*;
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
     use serial_test::serial;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
     use uuid::Uuid;
 
@@ -1452,5 +1477,39 @@ mod tests {
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn test_scan_folder_skips_unreadable_child_directory() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        let good_dir = bucket_dir.join("good");
+        let bad_dir = bucket_dir.join("bad");
+
+        std::fs::create_dir_all(&good_dir).expect("failed to create good dir");
+        std::fs::create_dir_all(&bad_dir).expect("failed to create bad dir");
+        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o000)).expect("failed to remove bad dir permissions");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        let mut into = DataUsageEntry::default();
+        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to restore bad dir permissions");
+
+        assert!(result.is_ok(), "expected unreadable child directory to be skipped");
     }
 }
