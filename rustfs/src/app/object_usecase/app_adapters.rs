@@ -104,6 +104,10 @@ impl ObjectIoCachedGetObjectSource for CachedGetObject {
         self.last_modified.as_deref()
     }
 
+    fn expires(&self) -> Option<&str> {
+        self.expires.as_deref()
+    }
+
     fn cache_control(&self) -> Option<&str> {
         self.cache_control.as_deref()
     }

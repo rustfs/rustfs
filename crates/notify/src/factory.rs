@@ -19,7 +19,8 @@ use rumqttc::QoS;
 use rustfs_config::notify::{ENV_NOTIFY_MQTT_KEYS, ENV_NOTIFY_WEBHOOK_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_WEBHOOK_KEYS};
 use rustfs_config::{
     DEFAULT_LIMIT, EVENT_DEFAULT_DIR, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
-    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY,
+    MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT,
     WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
     WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
@@ -27,7 +28,10 @@ use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
     Target,
     error::TargetError,
-    target::{mqtt::MQTTArgs, webhook::WebhookArgs},
+    target::{
+        mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
+        webhook::WebhookArgs,
+    },
 };
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -166,6 +170,14 @@ impl TargetFactory for MQTTTargetFactory {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or_else(|| Duration::from_secs(30)),
+            tls: MQTTTlsConfig::from_values(
+                config.lookup(MQTT_TLS_POLICY).as_deref(),
+                config.lookup(MQTT_TLS_CA).as_deref(),
+                config.lookup(MQTT_TLS_CLIENT_CERT).as_deref(),
+                config.lookup(MQTT_TLS_CLIENT_KEY).as_deref(),
+                config.lookup(MQTT_TLS_TRUST_LEAF_AS_CA).as_deref(),
+                config.lookup(MQTT_WS_PATH_ALLOWLIST).as_deref(),
+            )?,
             queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
@@ -185,12 +197,15 @@ impl TargetFactory for MQTTTargetFactory {
         let url = Url::parse(&broker)
             .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {e} (value: '{broker}')")))?;
 
-        match url.scheme() {
-            "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}
-            _ => {
-                return Err(TargetError::Configuration("Unsupported broker URL scheme".to_string()));
-            }
-        }
+        let tls = MQTTTlsConfig::from_values(
+            config.lookup(MQTT_TLS_POLICY).as_deref(),
+            config.lookup(MQTT_TLS_CA).as_deref(),
+            config.lookup(MQTT_TLS_CLIENT_CERT).as_deref(),
+            config.lookup(MQTT_TLS_CLIENT_KEY).as_deref(),
+            config.lookup(MQTT_TLS_TRUST_LEAF_AS_CA).as_deref(),
+            config.lookup(MQTT_WS_PATH_ALLOWLIST).as_deref(),
+        )?;
+        validate_mqtt_broker_url(&url, &tls)?;
 
         if config.lookup(MQTT_TOPIC).is_none() {
             return Err(TargetError::Configuration("Missing MQTT topic".to_string()));

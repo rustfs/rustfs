@@ -19,22 +19,28 @@
 #![allow(clippy::all)]
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
-use crate::bucket::lifecycle::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
+use crate::bucket::lifecycle::lifecycle::{
+    self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
+};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
 use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
-use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
+use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
+use crate::disk::error::DiskError;
+use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
+use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
 use crate::store_api::{
-    GetObjectReader, HTTPRangeSpec, ListOperations, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+    GetObjectReader, HTTPRangeSpec, ListOperations, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions,
+    ObjectToDelete,
 };
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
@@ -45,7 +51,7 @@ use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
-use rustfs_filemeta::{FileInfo, NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
+use rustfs_filemeta::{FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, get_file_info, is_restored_object_on_disk};
 use rustfs_s3_common::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::Body;
@@ -61,7 +67,8 @@ use std::env;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -84,6 +91,10 @@ pub const AMZ_ENCRYPTION_AES: &str = "AES256";
 pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
+const ENV_STALE_UPLOADS_EXPIRY: &str = "RUSTFS_API_STALE_UPLOADS_EXPIRY";
+const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL";
+const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -684,6 +695,334 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
     ExpiryState::resize_workers(workers, api).await;
+}
+
+#[derive(Debug, Clone)]
+struct StaleMultipartUploadCandidate {
+    path: String,
+    initiated: OffsetDateTime,
+    metadata: Option<HashMap<String, String>>,
+}
+
+fn parse_stale_uploads_duration(env_key: &str, default: StdDuration) -> StdDuration {
+    env::var(env_key)
+        .ok()
+        .and_then(|value| rustfs_madmin::utils::parse_duration(&value).ok())
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or(default)
+}
+
+fn stale_uploads_expiry() -> StdDuration {
+    parse_stale_uploads_duration(ENV_STALE_UPLOADS_EXPIRY, DEFAULT_STALE_UPLOADS_EXPIRY)
+}
+
+fn stale_uploads_cleanup_interval() -> StdDuration {
+    parse_stale_uploads_duration(ENV_STALE_UPLOADS_CLEANUP_INTERVAL, DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL)
+}
+
+fn encode_stale_upload_id(upload_uuid: &str) -> String {
+    base64_simd::URL_SAFE_NO_PAD
+        .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes())
+}
+
+fn initiated_from_upload_dir(upload_dir: &str, fallback: Option<OffsetDateTime>) -> OffsetDateTime {
+    upload_dir
+        .split_once('x')
+        .and_then(|(_, nanos)| nanos.parse::<i128>().ok())
+        .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .or(fallback)
+        .unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+fn stale_upload_default_due(initiated: OffsetDateTime, default_expiry: StdDuration) -> OffsetDateTime {
+    initiated + time::Duration::seconds(default_expiry.as_secs() as i64)
+}
+
+async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<String, String>, upload_dir: &str) -> Option<usize> {
+    let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
+    let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
+    let upload_id = encode_stale_upload_id(upload_dir);
+    let parts = set
+        .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+        .await
+        .ok()?;
+
+    Some(
+        parts
+            .parts
+            .iter()
+            .map(|part| part.actual_size.max(part.size as i64).max(0) as usize)
+            .sum(),
+    )
+}
+
+async fn stale_upload_lifecycle_due(
+    set: &Arc<SetDisks>,
+    metadata: &HashMap<String, String>,
+    initiated: OffsetDateTime,
+    upload_dir: &str,
+) -> Option<OffsetDateTime> {
+    let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
+    let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
+
+    let lifecycle = match metadata_sys::get_lifecycle_config(bucket).await {
+        Ok((lifecycle, _)) => lifecycle,
+        Err(_) => return None,
+    };
+
+    let object_opts = ObjectOpts {
+        name: object.clone(),
+        user_tags: metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default(),
+        mod_time: Some(initiated),
+        size: stale_upload_current_size(set, metadata, upload_dir).await.unwrap_or_default(),
+        is_latest: true,
+        delete_marker: false,
+        user_defined: metadata.clone(),
+        ..Default::default()
+    };
+
+    abort_incomplete_multipart_upload_due(&lifecycle, &object_opts)
+        .await
+        .map(|(due, _)| due)
+}
+
+async fn read_stale_multipart_candidate(
+    disk: &Disk,
+    sha_dir: &str,
+    upload_dir: &str,
+) -> Result<StaleMultipartUploadCandidate, DiskError> {
+    let metadata_path = format!("{sha_dir}/{upload_dir}/{STORAGE_FORMAT_FILE}");
+    let metadata_bytes = disk.read_metadata(RUSTFS_META_MULTIPART_BUCKET, &metadata_path).await?;
+
+    let (metadata, mod_time) = match get_file_info(
+        &metadata_bytes,
+        RUSTFS_META_MULTIPART_BUCKET,
+        &metadata_path,
+        "",
+        FileInfoOpts {
+            data: false,
+            include_free_versions: false,
+        },
+    ) {
+        Ok(file_info) => (Some(file_info.metadata), file_info.mod_time),
+        Err(err) => {
+            warn!(path = %metadata_path, error = ?err, "failed to parse multipart metadata during stale cleanup");
+            (None, None)
+        }
+    };
+
+    let initiated = initiated_from_upload_dir(upload_dir, mod_time);
+
+    Ok(StaleMultipartUploadCandidate {
+        path: format!("{sha_dir}/{upload_dir}"),
+        initiated,
+        metadata,
+    })
+}
+
+fn merge_stale_multipart_candidate(
+    candidates: &mut HashMap<String, StaleMultipartUploadCandidate>,
+    candidate: StaleMultipartUploadCandidate,
+) {
+    match candidates.get(&candidate.path) {
+        Some(existing) if existing.metadata.is_some() => {}
+        Some(existing) if existing.metadata.is_none() && candidate.metadata.is_none() => {}
+        _ => {
+            candidates.insert(candidate.path.clone(), candidate);
+        }
+    }
+}
+
+async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
+    for disk in set.get_local_disks().await.into_iter().flatten() {
+        if !disk.is_online().await {
+            continue;
+        }
+
+        let sha_dirs = match disk
+            .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, "", -1)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                    warn!(error = ?err, "failed to list multipart root during empty sha cleanup");
+                }
+                continue;
+            }
+        };
+
+        for sha_dir in sha_dirs {
+            let sha_dir = sha_dir.trim_end_matches('/').to_string();
+            let upload_dirs = match disk
+                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+                .await
+            {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                        warn!(sha_dir = %sha_dir, error = ?err, "failed to list multipart sha dir during empty sha cleanup");
+                    }
+                    continue;
+                }
+            };
+
+            if !upload_dirs.is_empty() {
+                continue;
+            }
+
+            if let Err(err) = disk
+                .delete(RUSTFS_META_MULTIPART_BUCKET, &sha_dir, DeleteOptions::default())
+                .await
+                && err != DiskError::FileNotFound
+                && err != DiskError::VolumeNotFound
+            {
+                warn!(sha_dir = %sha_dir, error = ?err, "failed to remove empty multipart sha dir");
+            }
+        }
+    }
+}
+
+async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: OffsetDateTime, default_expiry: StdDuration) -> usize {
+    let mut deleted = 0usize;
+    let mut candidates = HashMap::new();
+
+    for disk in set.get_local_disks().await.into_iter().flatten() {
+        if !disk.is_online().await {
+            continue;
+        }
+
+        let sha_dirs = match disk
+            .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, "", -1)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                    warn!(error = ?err, "failed to list multipart root during stale cleanup");
+                }
+                continue;
+            }
+        };
+
+        for sha_dir in sha_dirs {
+            let sha_dir = sha_dir.trim_end_matches('/').to_string();
+            let upload_dirs = match disk
+                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+                .await
+            {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                        warn!(sha_dir = %sha_dir, error = ?err, "failed to list multipart sha dir during stale cleanup");
+                    }
+                    continue;
+                }
+            };
+
+            for upload_dir in upload_dirs {
+                let upload_dir = upload_dir.trim_end_matches('/').to_string();
+                let candidate_path = format!("{sha_dir}/{upload_dir}");
+                if candidates
+                    .get(&candidate_path)
+                    .is_some_and(|existing: &StaleMultipartUploadCandidate| existing.metadata.is_some())
+                {
+                    continue;
+                }
+
+                let candidate = match read_stale_multipart_candidate(disk.as_ref(), &sha_dir, &upload_dir).await {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        if err != DiskError::FileNotFound {
+                            warn!(path = %candidate_path, error = ?err, "failed to read multipart metadata during stale cleanup");
+                        }
+                        let initiated = initiated_from_upload_dir(&upload_dir, None);
+                        StaleMultipartUploadCandidate {
+                            path: candidate_path,
+                            initiated,
+                            metadata: None,
+                        }
+                    }
+                };
+                merge_stale_multipart_candidate(&mut candidates, candidate);
+            }
+        }
+    }
+
+    for candidate in candidates.into_values() {
+        let upload_dir = candidate.path.rsplit('/').next().unwrap_or_default().to_string();
+        let mut due = stale_upload_default_due(candidate.initiated, default_expiry);
+        if let Some(metadata) = candidate.metadata.as_ref()
+            && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir).await
+            && lifecycle_due < due
+        {
+            due = lifecycle_due;
+        }
+
+        if now < due {
+            continue;
+        }
+
+        match set.delete_all(RUSTFS_META_MULTIPART_BUCKET, &candidate.path).await {
+            Ok(()) => {
+                deleted += 1;
+                let upload_id = encode_stale_upload_id(&upload_dir);
+                if let Some(metadata) = candidate.metadata.as_ref() {
+                    info!(
+                        bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY).cloned().unwrap_or_default(),
+                        object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY).cloned().unwrap_or_default(),
+                        upload_id = %upload_id,
+                        due = ?due,
+                        "removed stale multipart upload"
+                    );
+                } else {
+                    info!(path = %candidate.path, upload_id = %upload_id, due = ?due, "removed stale multipart upload");
+                }
+            }
+            Err(err) => warn!(path = %candidate.path, error = ?err, "failed to remove stale multipart upload"),
+        }
+    }
+
+    cleanup_empty_multipart_sha_dirs_on_local_disks(set).await;
+
+    deleted
+}
+
+async fn cleanup_stale_multipart_uploads_once_at(api: Arc<ECStore>, now: OffsetDateTime, default_expiry: StdDuration) -> usize {
+    let mut deleted = 0usize;
+    for pool in &api.pools {
+        for set in &pool.disk_set {
+            deleted += cleanup_stale_multipart_uploads_in_set(set, now, default_expiry).await;
+        }
+    }
+    deleted
+}
+
+pub async fn run_stale_multipart_upload_cleanup_once(api: Arc<ECStore>) -> usize {
+    cleanup_stale_multipart_uploads_once_at(api, OffsetDateTime::now_utc(), stale_uploads_expiry()).await
+}
+
+pub fn init_background_stale_multipart_upload_cleanup(api: Arc<ECStore>) {
+    let cleanup_interval = stale_uploads_cleanup_interval();
+    let default_expiry = stale_uploads_expiry();
+    let api = Arc::downgrade(&api);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+
+        loop {
+            interval.tick().await;
+
+            let Some(api) = Weak::upgrade(&api) else {
+                return;
+            };
+
+            let deleted = cleanup_stale_multipart_uploads_once_at(api, OffsetDateTime::now_utc(), default_expiry).await;
+            if deleted > 0 {
+                info!(deleted, "completed stale multipart cleanup pass");
+            }
+        }
+    });
 }
 
 pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Result<(), std::io::Error> {
@@ -1288,8 +1627,31 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 
 #[cfg(test)]
 mod tests {
-    use super::mark_delete_opts_skip_decommissioned_on_remote_success;
-    use crate::store_api::ObjectOptions;
+    use super::{
+        StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+    };
+    use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+    use crate::bucket::metadata_sys;
+    use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+    use crate::disk::endpoint::Endpoint;
+    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::error::is_err_invalid_upload_id;
+    use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
+    use crate::store::ECStore;
+    use crate::store_api::{
+        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectOptions, PutObjReader,
+    };
+    use serial_test::serial;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration as StdDuration;
+    use time::OffsetDateTime;
+    use tokio::fs;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     #[test]
     fn mark_delete_opts_skip_decommissioned_on_remote_success_sets_flag_on_success() {
@@ -1319,5 +1681,335 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    static STALE_MULTIPART_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
+
+    async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
+        if let Some((paths, ecstore)) = STALE_MULTIPART_TEST_ENV.get() {
+            return (paths.clone(), ecstore.clone());
+        }
+
+        let test_base_dir = format!("/tmp/rustfs_stale_multipart_test_{}", Uuid::new_v4());
+        let temp_dir = PathBuf::from(&test_base_dir);
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).await.ok();
+        }
+        fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let disk_paths = vec![
+            temp_dir.join("disk1"),
+            temp_dir.join("disk2"),
+            temp_dir.join("disk3"),
+            temp_dir.join("disk4"),
+        ];
+
+        for disk_path in &disk_paths {
+            fs::create_dir_all(disk_path).await.unwrap();
+        }
+
+        let mut endpoints = Vec::new();
+        for (i, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            endpoints.push(endpoint);
+        }
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "stale-multipart-test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+
+        crate::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+
+        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let buckets = ecstore
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect();
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+
+        let _ = STALE_MULTIPART_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
+
+        (disk_paths, ecstore)
+    }
+
+    async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket: &str) {
+        ecstore
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+    }
+
+    async fn set_abort_incomplete_lifecycle(bucket: &str, prefix: &str, days_after_initiation: i32) {
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>abort-multipart</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix>{prefix}</Prefix>
+    </Filter>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>{days_after_initiation}</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#
+        );
+
+        metadata_sys::update(bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("lifecycle metadata should be stored");
+    }
+
+    async fn set_abort_incomplete_lifecycle_with_size(
+        bucket: &str,
+        prefix: &str,
+        days_after_initiation: i32,
+        object_size_greater_than: usize,
+    ) {
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>abort-multipart-size</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <And>
+        <Prefix>{prefix}</Prefix>
+        <ObjectSizeGreaterThan>{object_size_greater_than}</ObjectSizeGreaterThan>
+      </And>
+    </Filter>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>{days_after_initiation}</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#
+        );
+
+        metadata_sys::update(bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("lifecycle metadata should be stored");
+    }
+
+    fn multipart_sha_dir(bucket: &str, object: &str) -> String {
+        hex_simd::encode_to_string(Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower)
+    }
+
+    #[test]
+    fn merge_stale_multipart_candidate_prefers_metadata_over_fallback() {
+        let mut candidates = HashMap::new();
+
+        merge_stale_multipart_candidate(
+            &mut candidates,
+            StaleMultipartUploadCandidate {
+                path: "sha/upload".to_string(),
+                initiated: OffsetDateTime::UNIX_EPOCH,
+                metadata: None,
+            },
+        );
+        merge_stale_multipart_candidate(
+            &mut candidates,
+            StaleMultipartUploadCandidate {
+                path: "sha/upload".to_string(),
+                initiated: OffsetDateTime::UNIX_EPOCH,
+                metadata: Some(HashMap::from([("k".to_string(), "v".to_string())])),
+            },
+        );
+
+        assert_eq!(
+            candidates
+                .get("sha/upload")
+                .and_then(|candidate| candidate.metadata.as_ref())
+                .and_then(|metadata| metadata.get("k")),
+            Some(&"v".to_string())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_uses_default_expiry_without_lifecycle() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-default-{}", Uuid::new_v4().simple());
+        let object = "default-cleanup/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(30);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart upload should be created");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(24 * 60 * 60),
+        )
+        .await;
+        assert!(deleted >= 1, "expected at least one stale multipart upload to be removed");
+
+        let err = ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("stale multipart upload should be removed");
+        assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_applies_abort_incomplete_lifecycle_before_default_expiry() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "logs/prefix/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 1).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(48);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart upload should be created");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        assert!(deleted >= 1, "expected lifecycle-driven stale multipart cleanup to run");
+
+        let err = ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("multipart upload should be removed by lifecycle abort rule");
+        assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_applies_abort_lifecycle_with_size_filter() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-size-{}", Uuid::new_v4().simple());
+        let object = "logs/sized/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle_with_size(&bucket, "logs/", 1, 5).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(48);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart upload should be created");
+
+        let mut data = PutObjReader::from_vec(vec![1, 2, 3, 4, 5, 6]);
+        ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut data, &ObjectOptions::default())
+            .await
+            .expect("multipart part should be uploaded");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        assert!(deleted >= 1, "expected lifecycle-driven stale multipart cleanup to run");
+
+        let err = ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("multipart upload should be removed by size-qualified lifecycle abort rule");
+        assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multipart_info_and_list_parts_do_not_expose_internal_metadata_keys() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-sanitize-{}", Uuid::new_v4().simple());
+        let object = "sanitize/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        let multipart_info = ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("multipart info should be readable");
+        assert!(!multipart_info.user_defined.contains_key(RUSTFS_MULTIPART_BUCKET_KEY));
+        assert!(!multipart_info.user_defined.contains_key(RUSTFS_MULTIPART_OBJECT_KEY));
+
+        let parts = ecstore
+            .list_object_parts(&bucket, object, &upload.upload_id, None, 0, &ObjectOptions::default())
+            .await
+            .expect("multipart parts should be readable");
+        assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_BUCKET_KEY));
+        assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_OBJECT_KEY));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cleanup_removes_empty_multipart_sha_dirs() {
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-empty-sha-{}", Uuid::new_v4().simple());
+        let object = "empty-sha/object.txt";
+        let sha_dir = multipart_sha_dir(&bucket, object);
+        for path in &paths {
+            fs::create_dir_all(path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir))
+                .await
+                .expect("empty multipart sha dir should be created for cleanup");
+            assert!(
+                path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir).exists(),
+                "empty multipart sha dir should exist before cleanup"
+            );
+        }
+
+        cleanup_empty_multipart_sha_dirs_on_local_disks(&ecstore.pools[0].disk_set[0]).await;
+
+        for path in &paths {
+            assert!(
+                !path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir).exists(),
+                "empty multipart sha dir should be removed"
+            );
+        }
     }
 }
