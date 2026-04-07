@@ -97,6 +97,10 @@ mod cluster_concurrency_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
+// Range request regression tests
+#[cfg(test)]
+mod range_request_test;
+
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;

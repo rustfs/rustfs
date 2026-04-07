@@ -119,6 +119,16 @@ run_large_data_test() {
     print_success "Large-dataset tests completed"
 }
 
+# Run direct chunk path benchmarks
+run_direct_chunk_benchmark() {
+    print_info "📦 Starting direct chunk path benchmarks..."
+    echo "================================================"
+
+    cargo bench --bench direct_chunk_benchmark
+
+    print_success "Direct chunk path benchmarks completed"
+}
+
 # Generate comparison report
 generate_comparison_report() {
     print_info "📊 Generating performance report..."
@@ -168,6 +178,7 @@ show_help() {
     echo "  full         Run the full benchmark suite"
     echo "  performance  Run detailed performance tests"
     echo "  simd         Run the SIMD-only tests"
+    echo "  direct       Run the direct chunk path benchmarks"
     echo "  large        Run large-dataset tests"
     echo "  clean        Remove previous results"
     echo "  help         Show this help message"
@@ -177,6 +188,7 @@ show_help() {
     echo "  $0 performance        # Detailed performance test"
     echo "  $0 full              # Full benchmark suite"
     echo "  $0 simd              # SIMD-only benchmark"
+    echo "  $0 direct            # Direct chunk path benchmark"
     echo "  $0 large             # Large-dataset benchmark"
     echo ""
     echo "Features:"
@@ -238,6 +250,11 @@ main() {
         "simd")
             cleanup
             run_simd_benchmark
+            generate_comparison_report
+            ;;
+        "direct")
+            cleanup
+            run_direct_chunk_benchmark
             generate_comparison_report
             ;;
         "large")
