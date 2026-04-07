@@ -24,7 +24,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
-use tracing::debug; // Added missing import for debug!  
+use tracing::debug;
 
 use crate::{QueryError, QueryResult};
 

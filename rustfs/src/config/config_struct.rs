@@ -97,6 +97,9 @@ pub struct Config {
     /// Vault token for vault backend
     pub kms_vault_token: Option<String>,
 
+    /// Vault mount path for vault or vault-transit backend
+    pub kms_vault_mount_path: Option<String>,
+
     /// Default KMS key ID for encryption
     pub kms_default_key_id: Option<String>,
 
@@ -129,6 +132,7 @@ impl Config {
             kms_key_dir,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
@@ -157,6 +161,7 @@ impl Config {
             kms_key_dir,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
@@ -197,6 +202,7 @@ impl std::fmt::Debug for Config {
             .field("kms_key_dir", &self.kms_key_dir)
             .field("kms_vault_address", &self.kms_vault_address)
             .field("kms_vault_token", &Masked(self.kms_vault_token.as_deref()))
+            .field("kms_vault_mount_path", &self.kms_vault_mount_path)
             .field("kms_default_key_id", &self.kms_default_key_id)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)
