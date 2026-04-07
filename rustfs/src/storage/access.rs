@@ -1854,15 +1854,6 @@ impl S3Access for FS {
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
 
-            let _ = get_or_fetch_object_tag_conditions(
-                req,
-                &src_bucket,
-                &src_key,
-                version_id.as_deref(),
-                Action::S3Action(S3Action::GetObjectAction),
-            )
-            .await?;
-
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
 
