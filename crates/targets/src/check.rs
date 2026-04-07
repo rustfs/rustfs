@@ -62,7 +62,7 @@ pub async fn check_mqtt_broker_available_with_tls(
     use crate::target::mqtt::build_mqtt_options;
     use rumqttc::{AsyncClient, QoS};
 
-    let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed:{e}"))?;
+    let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed: {e}"))?;
     let url = url.url();
 
     let mqtt_options = build_mqtt_options(
@@ -74,18 +74,18 @@ pub async fn check_mqtt_broker_available_with_tls(
         std::time::Duration::from_secs(5),
         None,
     )
-    .map_err(|e| format!("MQTT options build failed:{e}"))?;
+    .map_err(|e| format!("MQTT options build failed: {e}"))?;
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
 
     // Try to connect and subscribe
     client
         .subscribe(topic, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("MQTT subscription failed:{e}"))?;
+        .map_err(|e| format!("MQTT subscription failed: {e}"))?;
     // Wait for eventloop to receive at least one event
     match tokio::time::timeout(std::time::Duration::from_secs(3), eventloop.poll()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("MQTT connection failed:{e}")),
+        Ok(Err(e)) => Err(format!("MQTT connection failed: {e}")),
         Err(_) => Err("MQTT connection timeout".to_string()),
     }
 }
