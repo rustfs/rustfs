@@ -124,6 +124,13 @@ use uuid::Uuid;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
+pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
+pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+
+pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
+    metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
+}
 
 /// Get the duplex buffer size from environment variable or use default.
 ///
@@ -2572,7 +2579,11 @@ impl MultipartOperations for SetDisks {
             storage_class,
             max_parts,
             part_number_marker,
-            user_defined: fi.metadata.clone(),
+            user_defined: {
+                let mut metadata = fi.metadata.clone();
+                strip_internal_multipart_metadata(&mut metadata);
+                metadata
+            },
             ..Default::default()
         };
 
@@ -2905,6 +2916,9 @@ impl MultipartOperations for SetDisks {
             );
         }
 
+        user_defined.insert(RUSTFS_MULTIPART_BUCKET_KEY.to_string(), bucket.to_string());
+        user_defined.insert(RUSTFS_MULTIPART_OBJECT_KEY.to_string(), object.to_string());
+
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mod_time = opts.mod_time.unwrap_or(OffsetDateTime::now_utc());
@@ -2953,7 +2967,7 @@ impl MultipartOperations for SetDisks {
         _opts: &ObjectOptions,
     ) -> Result<MultipartInfo> {
         // TODO: nslock
-        let (fi, _) = self
+        let (mut fi, _) = self
             .check_upload_id_exists(bucket, object, upload_id, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
@@ -2962,7 +2976,10 @@ impl MultipartOperations for SetDisks {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             upload_id: upload_id.to_owned(),
-            user_defined: fi.metadata.clone(),
+            user_defined: {
+                strip_internal_multipart_metadata(&mut fi.metadata);
+                fi.metadata.clone()
+            },
             ..Default::default()
         })
     }
@@ -3253,6 +3270,7 @@ impl MultipartOperations for SetDisks {
 
         fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM);
         fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE);
+        strip_internal_multipart_metadata(&mut fi.metadata);
 
         fi.size = object_size as i64;
         fi.mod_time = opts.mod_time;
