@@ -64,6 +64,8 @@ Do not open a PR with code changes when the required checks fail.
 - Use `N/A` for non-applicable template sections.
 - Include verification commands in the PR description.
 - When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
+- After fixing code review comments or CI findings, always mark corresponding review
+  comments/threads as resolved before returning to the user.
 
 ## Security Baseline
 
