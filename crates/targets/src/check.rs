@@ -55,28 +55,34 @@ pub async fn check_mqtt_broker_available(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), String> {
-    use rumqttc::{AsyncClient, MqttOptions, QoS};
+    use crate::target::mqtt::MQTTTlsConfig;
+
+    check_mqtt_broker_available_with_tls(broker_url, topic, username, password, &MQTTTlsConfig::default()).await
+}
+
+pub async fn check_mqtt_broker_available_with_tls(
+    broker_url: &str,
+    topic: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    tls: &crate::target::mqtt::MQTTTlsConfig,
+) -> Result<(), String> {
+    use crate::target::mqtt::build_mqtt_options;
+    use rumqttc::{AsyncClient, QoS};
+
     let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed:{e}"))?;
     let url = url.url();
 
-    match url.scheme() {
-        "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" | "tls" | "tcps" => {}
-        _ => return Err("unsupported broker url scheme".to_string()),
-    }
-
-    let host = url.host_str().ok_or("Broker is missing host")?;
-    let port = url.port().unwrap_or(1883);
-    let mut mqtt_options = MqttOptions::new("rustfs_check", host, port);
-
-    // Set credentials if provided
-    if let Some(user) = username
-        && !user.is_empty()
-    {
-        let pass = password.unwrap_or("");
-        mqtt_options.set_credentials(user, pass);
-    }
-
-    mqtt_options.set_keep_alive(std::time::Duration::from_secs(5));
+    let mqtt_options = build_mqtt_options(
+        "rustfs_check".to_string(),
+        url,
+        username,
+        password,
+        tls,
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .map_err(|e| format!("MQTT options build failed:{e}"))?;
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
 
     // Try to connect and subscribe

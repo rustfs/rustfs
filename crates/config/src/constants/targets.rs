@@ -34,6 +34,12 @@ pub const MQTT_RECONNECT_INTERVAL: &str = "reconnect_interval";
 pub const MQTT_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
 pub const MQTT_QUEUE_DIR: &str = "queue_dir";
 pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
+pub const MQTT_TLS_POLICY: &str = "tls_policy";
+pub const MQTT_TLS_CA: &str = "tls_ca";
+pub const MQTT_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const MQTT_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const MQTT_TLS_TRUST_LEAF_AS_CA: &str = "tls_trust_leaf_as_ca";
+pub const MQTT_WS_PATH_ALLOWLIST: &str = "ws_path_allowlist";
 
 /// Environment variable controlling whether target queue files are Snappy-compressed.
 /// Applies to both notify and audit target queue stores.
