@@ -350,6 +350,7 @@ impl RustFSServerBuilder {
             })?;
 
         ecconfig::init();
+        ecconfig::try_migrate_server_config(store.clone()).await;
 
         // Global config system (with retry).
         let mut retry = 0;
