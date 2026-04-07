@@ -611,7 +611,10 @@ impl FolderScanner {
 
             let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
                 Ok(dir_reader) => dir_reader,
-                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    warn!("scan_folder: directory disappeared before read {}: {}", dir_path, e);
+                    return Ok(());
+                }
                 Err(e) => return Err(ScannerError::Io(e)),
             };
 
@@ -619,7 +622,11 @@ impl FolderScanner {
                 let entry = match dir_reader.next_entry().await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
-                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        warn!("scan_folder: directory disappeared during iteration {}: {}", dir_path, e);
+                        break;
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotADirectory => {
                         break;
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
@@ -643,14 +650,22 @@ impl FolderScanner {
                 // loops, but propagate other walk errors.
                 let mut entry_type = match entry.file_type().await {
                     Ok(entry_type) => entry_type,
-                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => continue,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        warn!("scan_folder: entry disappeared before type lookup {}: {}", entry_name, e);
+                        continue;
+                    }
+                    Err(e) if e.kind() == ErrorKind::TooManyLinks => continue,
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
 
                 if entry_type.is_symlink() {
                     let metadata = match tokio::fs::metadata(&file_path).await {
                         Ok(metadata) => metadata,
-                        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => continue,
+                        Err(e) if e.kind() == ErrorKind::NotFound => {
+                            warn!("scan_folder: symlink target disappeared before metadata lookup {}: {}", file_path, e);
+                            continue;
+                        }
+                        Err(e) if e.kind() == ErrorKind::TooManyLinks => continue,
                         Err(e) => return Err(ScannerError::Io(e)),
                     };
 
