@@ -20,6 +20,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
+default-run = "rustfs"
 description = "RustFS is a high-performance, distributed file system designed for modern cloud-native applications, providing efficient data storage and retrieval with advanced features like S3 Select, IAM, and policy management."
 keywords.workspace = true
 categories.workspace = true
@@ -30,15 +31,25 @@ documentation = "https://docs.rustfs.com/"
 name = "rustfs"
 path = "src/main.rs"
 
+[[bin]]
+name = "manual-test-dial9"
+path = "tests/manual/test_dial9.rs"
+test = false
+bench = false
+required-features = ["manual-test-runners"]
+
 [features]
-default = ["metrics"]
-metrics = []
-metrics-gpu = ["metrics", "rustfs-metrics/gpu"]
+default = ["direct-io"]
+metrics-gpu = ["rustfs-metrics/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
-full = ["metrics", "metrics-gpu", "ftps", "swift", "webdav"]
+direct-io = []  # Aligned direct I/O reader support (uses aligned pread, does not set O_DIRECT)
+io-scheduler-debug = []  # Enable debug information in I/O scheduler
+tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
+full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
+manual-test-runners = []
 
 [lints]
 workspace = true
@@ -73,6 +84,10 @@ rustfs-targets = { workspace = true }
 rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-io-core = { workspace = true }
+rustfs-io-metrics = { workspace = true }
+rustfs-object-io = { workspace = true }
+rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
@@ -118,6 +133,7 @@ astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 base64-simd.workspace = true
 clap = { workspace = true }
 const-str = { workspace = true }
@@ -127,6 +143,7 @@ matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
+percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
@@ -146,12 +163,16 @@ aes-gcm = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+# Data structures
+hashbrown = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+
+
 
 # Only enable pprof-based profiling on non-Windows targets.
 [target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]

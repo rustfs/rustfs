@@ -29,7 +29,6 @@ use rustfs_ecstore::{
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
-use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -42,44 +41,6 @@ pub struct FS {
 pub(crate) struct ListObjectUnorderedQuery {
     #[serde(rename = "allow-unordered")]
     pub(crate) allow_unordered: Option<String>,
-}
-
-pub(crate) struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl InMemoryAsyncReader {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
-        Self {
-            cursor: std::io::Cursor::new(data),
-        }
-    }
-}
-
-impl AsyncRead for InMemoryAsyncReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
-        buf.advance(bytes_read);
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemoryAsyncReader {
-    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        // std::io::Cursor natively supports negative SeekCurrent offsets
-        // It will automatically handle validation and return an error if the final position would be negative
-        std::io::Seek::seek(&mut self.cursor, position)?;
-        Ok(())
-    }
-
-    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
-        std::task::Poll::Ready(Ok(self.cursor.position()))
-    }
 }
 
 impl FS {
@@ -596,6 +557,15 @@ impl S3 for FS {
         usecase.execute_list_object_versions(req).await
     }
 
+    async fn list_object_versions_m(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
+        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_list_object_versions_m(req).await
+    }
+
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         record_s3_op(S3Operation::ListObjects, &req.input.bucket);
@@ -608,6 +578,13 @@ impl S3 for FS {
         record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_objects_v2(req).await
+    }
+
+    #[instrument(level = "debug", skip(self, req))]
+    async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
+        let usecase = DefaultBucketUsecase::from_global();
+        usecase.execute_list_objects_v2m(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]

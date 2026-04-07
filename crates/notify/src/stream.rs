@@ -15,8 +15,8 @@
 use crate::{Event, integration::NotificationMetrics};
 use rustfs_targets::{
     StoreError, Target, TargetError,
-    store::{Key, Store},
-    target::EntityTarget,
+    store::{Key, Store, ensure_store_entry_raw_readable},
+    target::QueuedPayload,
 };
 use rustfs_utils::get_env_usize;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 /// - `target`: The target to send events to
 /// - `cancel_rx`: Receiver to listen for cancellation signals
 pub async fn stream_events(
-    store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
+    store: &mut (dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
     target: &dyn Target<Event>,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
@@ -119,7 +119,7 @@ pub async fn stream_events(
 /// # Returns
 /// A sender to signal cancellation of the event stream
 pub fn start_event_stream(
-    mut store: Box<dyn Store<Event, Error = StoreError, Key = Key> + Send>,
+    mut store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
     target: Arc<dyn Target<Event> + Send + Sync>,
 ) -> mpsc::Sender<()> {
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
@@ -143,7 +143,7 @@ pub fn start_event_stream(
 /// # Returns
 /// A sender to signal cancellation of the event stream
 pub fn start_event_stream_with_batching(
-    mut store: Box<dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send>,
+    mut store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
     target: Arc<dyn Target<Event> + Send + Sync>,
     metrics: Arc<NotificationMetrics>,
     semaphore: Arc<Semaphore>,
@@ -170,7 +170,7 @@ pub fn start_event_stream_with_batching(
 /// # Notes
 /// This function processes events in batches to improve efficiency.
 pub async fn stream_events_with_batching(
-    store: &mut (dyn Store<EntityTarget<Event>, Error = StoreError, Key = Key> + Send),
+    store: &mut (dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
     target: &dyn Target<Event>,
     mut cancel_rx: mpsc::Receiver<()>,
     metrics: Arc<NotificationMetrics>,
@@ -185,7 +185,6 @@ pub async fn stream_events_with_batching(
     const MAX_RETRIES: usize = 5;
     const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-    let mut batch: Vec<EntityTarget<Event>> = Vec::with_capacity(batch_size);
     let mut batch_keys = Vec::with_capacity(batch_size);
     let mut last_flush = Instant::now();
 
@@ -201,8 +200,8 @@ pub async fn stream_events_with_batching(
         debug!("Found {} keys in store for target: {}", keys.len(), target.name());
         if keys.is_empty() {
             // If there is data in the batch and timeout, refresh the batch
-            if !batch.is_empty() && last_flush.elapsed() >= BATCH_TIMEOUT {
-                process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
+            if !batch_keys.is_empty() && last_flush.elapsed() >= BATCH_TIMEOUT {
+                process_batch(&mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
                 last_flush = Instant::now();
             }
 
@@ -218,41 +217,31 @@ pub async fn stream_events_with_batching(
                 info!("Cancellation received during processing for target: {}", target.name());
 
                 // Processing collected batches before exiting
-                if !batch.is_empty() {
-                    process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
+                if !batch_keys.is_empty() {
+                    process_batch(&mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
                 }
                 return;
             }
 
-            // Try to get events from storage
-            match store.get(&key) {
-                Ok(event) => {
-                    // Add to batch
-                    batch.push(event);
-                    batch_keys.push(key);
-                    metrics.increment_processing();
-
-                    // If the batch is full or enough time has passed since the last refresh, the batch will be processed
-                    if batch.len() >= batch_size || last_flush.elapsed() >= BATCH_TIMEOUT {
-                        process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore)
-                            .await;
-                        last_flush = Instant::now();
-                    }
+            // Skip unreadable entries so a single corrupt file cannot stall the stream.
+            // ensure_store_entry_raw_readable attempts get_raw; on I/O error it calls del() to
+            // remove the corrupt entry before returning Err, so no cleanup is needed here.
+            match ensure_store_entry_raw_readable(&*store, &key) {
+                Ok(true) => {}         // entry is readable, proceed
+                Ok(false) => continue, // entry not found (already removed), skip
+                Err(err) => {
+                    warn!("Skipping unreadable store entry {} for target {}: {}", key, target.name(), err);
+                    continue; // corrupt entry was already deleted by ensure_store_entry_raw_readable
                 }
-                Err(e) => {
-                    error!("Failed to target: {}, get event {} from store: {}", target.name(), key.to_string(), e);
-                    // Consider deleting unreadable events to prevent infinite loops from trying to read
-                    match store.del(&key) {
-                        Ok(_) => {
-                            info!("Deleted corrupted event {} from store", key.to_string());
-                        }
-                        Err(del_err) => {
-                            error!("Failed to delete corrupted event {}: {}", key.to_string(), del_err);
-                        }
-                    }
+            }
 
-                    metrics.increment_failed();
-                }
+            batch_keys.push(key);
+            metrics.increment_processing();
+
+            // If the batch is full or enough time has passed since the last refresh, the batch will be processed
+            if batch_keys.len() >= batch_size || last_flush.elapsed() >= BATCH_TIMEOUT {
+                process_batch(&mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
+                last_flush = Instant::now();
             }
         }
 
@@ -273,7 +262,6 @@ pub async fn stream_events_with_batching(
 /// # Notes
 /// This function processes a batch of events, sending each event to the target with retry
 async fn process_batch(
-    batch: &mut Vec<EntityTarget<Event>>,
     batch_keys: &mut Vec<Key>,
     target: &dyn Target<Event>,
     max_retries: usize,
@@ -281,8 +269,8 @@ async fn process_batch(
     metrics: &Arc<NotificationMetrics>,
     semaphore: &Arc<Semaphore>,
 ) {
-    debug!("Processing batch of {} events for target: {}", batch.len(), target.name());
-    if batch.is_empty() {
+    debug!("Processing batch of {} events for target: {}", batch_keys.len(), target.name());
+    if batch_keys.is_empty() {
         return;
     }
 
@@ -296,44 +284,42 @@ async fn process_batch(
     };
 
     // Handle every event in the batch
-    for (_event, key) in batch.iter().zip(batch_keys.iter()) {
+    for key in batch_keys.iter() {
         let mut retry_count = 0;
         let mut success = false;
 
         // Retry logic
         while retry_count < max_retries && !success {
-            // After sending successfully, the event in the storage is deleted synchronously.
             match target.send_from_store(key.clone()).await {
                 Ok(_) => {
-                    info!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());
+                    debug!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());
                     success = true;
                     metrics.increment_processed();
                 }
-                Err(e) => {
-                    // Different retry strategies are adopted according to the error type
-                    match &e {
-                        TargetError::NotConnected => {
-                            warn!("Target {} not connected, retrying...", target.name());
-                            retry_count += 1;
-                            tokio::time::sleep(base_delay * (1 << retry_count)).await; // Exponential backoff
-                        }
-                        TargetError::Timeout(_) => {
-                            warn!("Timeout for target {}, retrying...", target.name());
-                            retry_count += 1;
-                            tokio::time::sleep(base_delay * (1 << retry_count)).await;
-                        }
-                        _ => {
-                            // Permanent error, skip this event
-                            error!("Permanent error for target {}: {}", target.name(), e);
-                            metrics.increment_failed();
-                            break;
-                        }
+                Err(e) => match &e {
+                    TargetError::NotConnected => {
+                        warn!("Target {} not connected, retrying...", target.name());
+                        retry_count += 1;
+                        let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                        let backoff = 1u32 << retry_count as u32;
+                        tokio::time::sleep(base_delay * backoff + jitter).await;
                     }
-                }
+                    TargetError::Timeout(_) => {
+                        warn!("Timeout for target {}, retrying...", target.name());
+                        retry_count += 1;
+                        let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                        let backoff = 1u32 << retry_count as u32;
+                        tokio::time::sleep(base_delay * backoff + jitter).await;
+                    }
+                    _ => {
+                        error!("Permanent error for target {}: {}", target.name(), e);
+                        metrics.increment_failed();
+                        break;
+                    }
+                },
             }
         }
 
-        // Handle the situation where the maximum number of retry exhaustion is exhausted
         if retry_count >= max_retries && !success {
             warn!("Max retries exceeded for event {}, target: {}, skipping", key.to_string(), target.name());
             metrics.increment_failed();
@@ -341,7 +327,6 @@ async fn process_batch(
     }
 
     // Clear processed batches
-    batch.clear();
     batch_keys.clear();
 
     // Release semaphore permission (via drop)

@@ -313,6 +313,31 @@ async fn list_target_arns(env: &RustFSTestEnvironment) -> Result<Vec<String>, Bo
     Ok(serde_json::from_slice(&body)?)
 }
 
+async fn delete_webhook_target(env: &RustFSTestEnvironment, target_name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{target_name}/reset", env.url);
+    let response = signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status != StatusCode::OK {
+        return Err(format!("failed to delete webhook target {target_name}: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+fn notification_target_is_listed(targets: &serde_json::Value, target_name: &str) -> bool {
+    targets["notification_endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entry| {
+            entry["account_id"].as_str() == Some(target_name)
+                && entry["service"]
+                    .as_str()
+                    .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
+        })
+}
+
 async fn wait_for_target_visibility(
     env: &RustFSTestEnvironment,
     target_name: &str,
@@ -324,18 +349,7 @@ async fn wait_for_target_visibility(
         last_targets = list_notification_targets(env).await?;
         last_arns = list_target_arns(env).await?;
 
-        let listed = last_targets["notification_endpoints"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|entry| {
-                entry["account_id"].as_str() == Some(target_name)
-                    && entry["service"]
-                        .as_str()
-                        .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
-            });
-
-        if listed {
+        if notification_target_is_listed(&last_targets, target_name) {
             return Ok((last_targets, last_arns));
         }
 
@@ -345,10 +359,51 @@ async fn wait_for_target_visibility(
     Err(format!("target {target_name} did not become visible in admin APIs; targets={last_targets}, arns={last_arns:?}").into())
 }
 
+async fn wait_for_target_absence(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+) -> Result<(serde_json::Value, Vec<String>), Box<dyn Error + Send + Sync>> {
+    let mut last_targets = serde_json::Value::Null;
+    let mut last_arns = Vec::new();
+
+    for _ in 0..20 {
+        last_targets = list_notification_targets(env).await?;
+        last_arns = list_target_arns(env).await?;
+
+        let listed = notification_target_is_listed(&last_targets, target_name);
+        let arn_listed = last_arns.iter().any(|arn| arn.ends_with(&format!(":{target_name}:webhook")));
+        if !listed && !arn_listed {
+            return Ok((last_targets, last_arns));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("target {target_name} remained visible in admin APIs; targets={last_targets}, arns={last_arns:?}").into())
+}
+
+async fn restart_rustfs_server(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn Error + Send + Sync>> {
+    env.stop_server();
+    env.start_rustfs_server_without_cleanup(vec![]).await
+}
+
 async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
     let path = format!("{}/.rustfs.sys/config/config.json", env.temp_dir);
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => {
+            let mut entries = Vec::new();
+            match tokio::fs::read_dir(&path).await {
+                Ok(mut dir) => {
+                    while let Ok(Some(entry)) = dir.next_entry().await {
+                        entries.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                    entries.sort();
+                    format!("persisted config stored as object directory at {path}; entries={entries:?}")
+                }
+                Err(dir_err) => format!("persisted config directory exists at {path} but could not be listed: {dir_err}"),
+            }
+        }
         Err(err) => format!("failed to read persisted config at {path}: {err}"),
     }
 }
@@ -398,6 +453,66 @@ async fn read_listen_notification_event(
             }
         }
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_notification_target_persists_across_restart_and_delete() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let target_name = "restart-target";
+    configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
+
+    let (visible_targets, visible_arns) = wait_for_target_visibility(&env, target_name).await?;
+    assert!(notification_target_is_listed(&visible_targets, target_name));
+    assert!(
+        visible_arns
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing after initial configure: {visible_arns:?}"
+    );
+
+    restart_rustfs_server(&mut env).await?;
+
+    let (targets_after_restart, arns_after_restart) = wait_for_target_visibility(&env, target_name).await?;
+    assert!(notification_target_is_listed(&targets_after_restart, target_name));
+    assert!(
+        arns_after_restart
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing after restart: {arns_after_restart:?}"
+    );
+
+    delete_webhook_target(&env, target_name).await?;
+    let (targets_after_delete, arns_after_delete) = wait_for_target_absence(&env, target_name).await?;
+    assert!(!notification_target_is_listed(&targets_after_delete, target_name));
+    assert!(
+        !arns_after_delete
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN still visible after delete: {arns_after_delete:?}"
+    );
+
+    restart_rustfs_server(&mut env).await?;
+
+    let (targets_after_delete_restart, arns_after_delete_restart) = wait_for_target_absence(&env, target_name).await?;
+    assert!(!notification_target_is_listed(&targets_after_delete_restart, target_name));
+    assert!(
+        !arns_after_delete_restart
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN still visible after delete + restart: {arns_after_delete_restart:?}"
+    );
+
+    webhook_handle.abort();
+    let _ = webhook_handle.await;
+
+    Ok(())
 }
 
 #[tokio::test]

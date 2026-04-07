@@ -16,6 +16,25 @@
 //!
 //! This module provides timeout protection for GetObject requests to prevent
 //! indefinite hangs caused by deadlocks, resource exhaustion, or slow I/O.
+//!
+//! # Migration Note
+//!
+//! This module extends `rustfs_io_core::RequestTimeoutWrapper` with Tokio
+//! cancellation token support. For basic timeout handling without async
+//! cancellation, consider using the io-core version:
+//!
+//! ```ignore
+//! // Basic timeout handling
+//! use rustfs_io_core::RequestTimeoutWrapper;
+//! let wrapper = RequestTimeoutWrapper::new(config);
+//! ```
+//!
+//! # Key Features
+//!
+//! - Configurable request-level timeout (default 30 seconds)
+//! - Automatic cancellation of sub-tasks on timeout
+//! - Resource cleanup on timeout (locks, memory, file handles)
+//! - Prometheus metrics for timeout monitoring
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
@@ -47,8 +66,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-#[cfg(feature = "metrics")]
-use metrics::{counter, histogram};
+// Re-export types from rustfs_io_core for convenience
 
 /// Timeout configuration for GetObject requests.
 #[derive(Debug, Clone)]
@@ -190,66 +208,6 @@ pub struct TimeoutInfo {
     pub progress_percent: Option<f32>,
 }
 
-/// Progress tracking for long-running operations
-#[derive(Debug, Clone)]
-pub struct OperationProgress {
-    /// Start time
-    start_time: Instant,
-    /// Last progress update time
-    last_update: Instant,
-    /// Bytes transferred so far
-    bytes_transferred: u64,
-    /// Total object size (if known)
-    total_size: Option<u64>,
-    /// Stale timeout - if no progress for this duration, consider stuck
-    stale_timeout: Duration,
-}
-
-impl OperationProgress {
-    /// Create a new progress tracker
-    pub fn new(total_size: Option<u64>, stale_timeout: Duration) -> Self {
-        Self {
-            start_time: Instant::now(),
-            last_update: Instant::now(),
-            bytes_transferred: 0,
-            total_size,
-            stale_timeout,
-        }
-    }
-
-    /// Update progress with new bytes transferred
-    pub fn update(&mut self, bytes: u64) {
-        self.bytes_transferred = bytes;
-        self.last_update = Instant::now();
-    }
-
-    /// Check if progress is stale (no updates for stale_timeout)
-    pub fn is_stale(&self) -> bool {
-        self.last_update.elapsed() > self.stale_timeout
-    }
-
-    /// Get progress percentage (0-100)
-    pub fn progress_percent(&self) -> Option<f32> {
-        self.total_size.map(|total| {
-            if total == 0 {
-                100.0
-            } else {
-                (self.bytes_transferred as f32 / total as f32 * 100.0).min(100.0)
-            }
-        })
-    }
-
-    /// Get transfer rate in bytes per second
-    pub fn transfer_rate(&self) -> u64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            (self.bytes_transferred as f64 / elapsed) as u64
-        } else {
-            0
-        }
-    }
-}
-
 /// Result of a timed GetObject operation.
 #[derive(Debug)]
 pub enum TimedGetObjectResult<T, E> {
@@ -276,12 +234,15 @@ pub struct RequestTimeoutWrapper {
 
 impl RequestTimeoutWrapper {
     /// Create a new timeout wrapper with the given configuration.
+    ///
+    /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
+    /// the canonical request-id from `RequestContext`.
     pub fn new(config: TimeoutConfig) -> Self {
         Self {
             config,
             start_time: Instant::now(),
             cancel_token: CancellationToken::new(),
-            request_id: format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            request_id: "no-request-id".to_string(),
         }
     }
 
@@ -295,17 +256,17 @@ impl RequestTimeoutWrapper {
         }
     }
 
-    /// Create a new timeout wrapper with operation size for dynamic timeout calculation
+    /// Create a new timeout wrapper with operation size for dynamic timeout calculation.
+    ///
+    /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
+    /// the canonical request-id from `RequestContext`.
     pub fn with_operation_size(config: TimeoutConfig, operation_size: Option<u64>) -> Self {
-        // Store operation size in config for later use
-        // Note: Currently we don't store the size in the wrapper itself,
-        // but the config can be used to calculate appropriate timeout
-        let _ = operation_size; // Suppress unused warning for now
+        let _ = operation_size;
         Self {
             config,
             start_time: Instant::now(),
             cancel_token: CancellationToken::new(),
-            request_id: format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            request_id: "no-request-id".to_string(),
         }
     }
 
@@ -405,8 +366,7 @@ impl RequestTimeoutWrapper {
         );
 
         // Record start time for metrics
-        #[cfg(feature = "metrics")]
-        counter!("rustfs.get.object.requests.started").increment(1);
+        rustfs_io_metrics::record_get_object_request_started();
 
         // Clone cancel_token for the operation, keep original for potential cancellation
         let cancel_token_for_op = self.cancel_token.clone();
@@ -416,11 +376,7 @@ impl RequestTimeoutWrapper {
                 // Operation completed successfully
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.completed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -434,11 +390,7 @@ impl RequestTimeoutWrapper {
                 // Operation failed before timeout
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.failed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -455,11 +407,8 @@ impl RequestTimeoutWrapper {
                 // Cancel the operation
                 self.cancel_token.cancel();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.timeout.total").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
+                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     request_id = %request_id,
@@ -527,8 +476,7 @@ impl RequestTimeoutWrapper {
             "Starting timed operation"
         );
 
-        #[cfg(feature = "metrics")]
-        counter!("rustfs.get.object.requests.started").increment(1);
+        rustfs_io_metrics::record_get_object_request_started();
 
         // Clone cancel_token for the operation, keep original for potential cancellation
         let cancel_token_for_op = self.cancel_token.clone();
@@ -537,11 +485,7 @@ impl RequestTimeoutWrapper {
             Ok(Ok(result)) => {
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.completed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -556,11 +500,7 @@ impl RequestTimeoutWrapper {
             Ok(Err(e)) => {
                 let elapsed = start_time.elapsed();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.requests.failed").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
 
                 debug!(
                     request_id = %request_id,
@@ -576,11 +516,8 @@ impl RequestTimeoutWrapper {
                 let elapsed = start_time.elapsed();
                 self.cancel_token.cancel();
 
-                #[cfg(feature = "metrics")]
-                {
-                    counter!("rustfs.get.object.timeout.total").increment(1);
-                    histogram!("rustfs.get.object.duration.seconds").record(elapsed.as_secs_f64());
-                }
+                rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
+                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     request_id = %request_id,
@@ -620,130 +557,6 @@ pub fn get_duplex_buffer_size() -> usize {
 /// Get the I/O buffer size from environment or default.
 pub fn get_io_buffer_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_OBJECT_IO_BUFFER_SIZE, rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE)
-}
-
-/// Calculate adaptive timeout based on historical performance
-///
-/// This function adjusts timeout based on:
-/// - Historical transfer rates
-/// - Recent timeout occurrences
-/// - System load indicators
-pub fn calculate_adaptive_timeout(
-    base_timeout: Duration,
-    historical_rate_bps: Option<u64>,
-    recent_timeout_count: u32,
-    object_size: u64,
-) -> Duration {
-    // If we have recent timeouts, increase timeout
-    let timeout_multiplier = if recent_timeout_count > 3 {
-        2.0 // Double timeout if many recent timeouts
-    } else if recent_timeout_count > 1 {
-        1.5 // 50% increase if some timeouts
-    } else {
-        1.0 // No adjustment
-    };
-
-    // If we have historical rate data, use it for estimation
-    let estimated_duration = if let Some(rate) = historical_rate_bps {
-        if rate > 0 {
-            let estimated_secs = (object_size as f64 / rate as f64) * 1.2; // 20% buffer
-            Duration::from_secs_f64(estimated_secs)
-        } else {
-            base_timeout
-        }
-    } else {
-        base_timeout
-    };
-
-    // Apply timeout multiplier but clamp to reasonable bounds
-    let adaptive_duration = Duration::from_secs_f64(estimated_duration.as_secs_f64() * timeout_multiplier);
-
-    // Clamp to 5 seconds minimum and 10 minutes maximum
-    adaptive_duration.max(Duration::from_secs(5)).min(Duration::from_secs(600))
-}
-
-/// Estimate bytes per second for timeout calculation
-///
-/// Uses a conservative estimate to avoid premature timeouts
-pub fn estimate_bytes_per_second(object_size: u64, expected_duration: Duration) -> u64 {
-    let secs = expected_duration.as_secs_f64();
-    if secs > 0.0 {
-        (object_size as f64 / secs) as u64
-    } else {
-        rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND
-    }
-}
-
-#[cfg(test)]
-mod adaptive_timeout_tests {
-    use super::*;
-
-    #[test]
-    fn test_calculate_adaptive_timeout_basic() {
-        let base_timeout = Duration::from_secs(30);
-        let adaptive = calculate_adaptive_timeout(base_timeout, None, 0, 1024 * 1024);
-
-        // Should return base timeout when no historical data
-        assert_eq!(adaptive, base_timeout);
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_with_history() {
-        let base_timeout = Duration::from_secs(30);
-        let historical_rate = 2 * 1024 * 1024; // 2 MB/s
-        let object_size = 10 * 1024 * 1024; // 10 MB
-
-        let adaptive = calculate_adaptive_timeout(base_timeout, Some(historical_rate), 0, object_size);
-
-        // With 2 MB/s, 10 MB should take ~5 seconds + 20% buffer = 6 seconds
-        assert!(adaptive >= Duration::from_secs(5));
-        assert!(adaptive <= Duration::from_secs(10));
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_with_recent_timeouts() {
-        let base_timeout = Duration::from_secs(30);
-
-        // No timeouts
-        let adaptive1 = calculate_adaptive_timeout(base_timeout, None, 0, 1024 * 1024);
-        assert_eq!(adaptive1, base_timeout);
-
-        // Some timeouts (2 timeouts -> 1.5x multiplier -> 30 * 1.5 = 45 seconds)
-        let adaptive2 = calculate_adaptive_timeout(base_timeout, None, 2, 1024 * 1024);
-        assert!(adaptive2 > base_timeout);
-        assert!(adaptive2 <= Duration::from_secs(45)); // Changed from < to <=
-
-        // Many timeouts
-        let adaptive3 = calculate_adaptive_timeout(base_timeout, None, 5, 1024 * 1024);
-        assert!(adaptive3 >= base_timeout * 2);
-    }
-
-    #[test]
-    fn test_calculate_adaptive_timeout_clamping() {
-        let base_timeout = Duration::from_secs(1);
-        let adaptive = calculate_adaptive_timeout(base_timeout, None, 10, 1024 * 1024);
-
-        // Should clamp to minimum of 5 seconds
-        assert!(adaptive >= Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_estimate_bytes_per_second() {
-        let object_size = 10 * 1024 * 1024; // 10 MB
-        let duration = Duration::from_secs(10);
-
-        let bps = estimate_bytes_per_second(object_size, duration);
-        assert_eq!(bps, 1024 * 1024); // 1 MB/s
-    }
-
-    #[test]
-    fn test_estimate_bytes_per_second_zero_duration() {
-        let object_size = 1024;
-        let duration = Duration::from_secs(0);
-
-        let bps = estimate_bytes_per_second(object_size, duration);
-        assert_eq!(bps, rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND);
-    }
 }
 
 #[cfg(test)]
@@ -908,32 +721,23 @@ mod tests {
         assert_eq!(timeout1, config.get_object_timeout);
         assert_eq!(timeout2, config.get_object_timeout);
     }
-
+    use rustfs_concurrency::OperationProgress;
     #[test]
     fn test_operation_progress_new() {
         let progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
-        assert_eq!(progress.bytes_transferred, 0);
-        assert_eq!(progress.total_size, Some(1000));
-        assert!(!progress.is_stale());
-    }
-
-    #[test]
-    fn test_operation_progress_update() {
-        let mut progress = OperationProgress::new(Some(1000), Duration::from_secs(5));
-
+        assert_eq!(progress.current(), 0);
         progress.update(500);
-        assert_eq!(progress.bytes_transferred, 500);
+        assert_eq!(progress.current(), 500);
         assert!(!progress.is_stale());
 
         // Simulate time passing
         std::thread::sleep(Duration::from_millis(100));
         progress.update(1000);
-        assert_eq!(progress.bytes_transferred, 1000);
+        assert_eq!(progress.current(), 1000);
     }
-
     #[test]
     fn test_operation_progress_stale() {
-        let mut progress = OperationProgress::new(Some(1000), Duration::from_millis(100));
+        let progress = OperationProgress::new(Some(1000), Duration::from_millis(100));
 
         progress.update(500);
         assert!(!progress.is_stale());
@@ -953,7 +757,6 @@ mod tests {
 
         assert_eq!(progress.progress_percent(), Some(0.0));
 
-        let mut progress = progress;
         progress.update(500);
         assert_eq!(progress.progress_percent(), Some(50.0));
 

@@ -75,8 +75,33 @@ pub const AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER: &str = "x-amz-object-lock-legal-hold
 pub const AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
 pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 
-// AmzSnowballExtract will trigger unpacking of an archive content
+// Snowball auto-extract compatibility headers.
+//
+// Supported external request headers:
+// - X-Amz-Meta-Snowball-Auto-Extract
+// - X-Amz-Snowball-Auto-Extract
+// - X-Amz-Meta-Snowball-Prefix
+// - X-Amz-Meta-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Snowball-Ignore-Errors
+// - X-Amz-Meta-Minio-Snowball-Prefix
+// - X-Amz-Meta-Minio-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Minio-Snowball-Ignore-Errors
+//
+// Internal compatibility headers:
+// - X-Amz-Meta-Rustfs-Snowball-Prefix
+// - X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Rustfs-Snowball-Ignore-Errors
 pub const AMZ_SNOWBALL_EXTRACT: &str = "X-Amz-Meta-Snowball-Auto-Extract";
+pub const AMZ_SNOWBALL_EXTRACT_ALT: &str = "X-Amz-Snowball-Auto-Extract";
+pub const AMZ_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Snowball-Prefix";
+pub const AMZ_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Snowball-Ignore-Dirs";
+pub const AMZ_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Snowball-Ignore-Errors";
+pub const AMZ_MINIO_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Minio-Snowball-Prefix";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Errors";
+pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";

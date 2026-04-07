@@ -61,6 +61,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path", "sys"] }
 serde_json = { workspace = true }
+time = { workspace = true }
 
 [lints]
 workspace = true

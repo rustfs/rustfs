@@ -21,6 +21,7 @@ use crate::disk::{
 use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_core::BoxChunkStream;
 use std::{
     path::PathBuf,
     sync::{
@@ -725,6 +726,22 @@ impl DiskAPI for LocalDiskWrapper {
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<crate::disk::FileReader> {
         self.track_disk_health(
             || async { self.disk.read_file_stream(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
+        self.track_disk_health(
+            || async { self.disk.read_file_zero_copy(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
+        self.track_disk_health(
+            || async { self.disk.read_file_chunks(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
         .await

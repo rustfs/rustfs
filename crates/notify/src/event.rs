@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
 use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,21 @@ pub struct Source {
     pub user_agent: String,
 }
 
+/// Additional data included for restore-completed events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlacierEventData {
+    pub restore_event_data: RestoreEventData,
+}
+
+/// Restore-specific event attributes for `s3:ObjectRestore:Completed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreEventData {
+    pub lifecycle_restoration_expiry_time: String,
+    pub lifecycle_restore_storage_class: String,
+}
+
 /// Represents a storage event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,11 +127,33 @@ pub struct Event {
     pub response_elements: HashMap<String, String>,
     /// Metadata about the event
     pub s3: Metadata,
+    /// Additional restore event data when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glacier_event_data: Option<GlacierEventData>,
     /// Information about the source of the event
     pub source: Source,
 }
 
 impl Event {
+    fn event_version_for(event_name: EventName) -> &'static str {
+        match event_name {
+            EventName::ObjectReplicationFailed
+            | EventName::ObjectReplicationComplete
+            | EventName::ObjectReplicationMissedThreshold
+            | EventName::ObjectReplicationReplicatedAfterThreshold
+            | EventName::ObjectReplicationNotTracked => "2.2",
+            EventName::ObjectRestoreCompleted
+            | EventName::ObjectAclPut
+            | EventName::ObjectTaggingPut
+            | EventName::ObjectTaggingDelete
+            | EventName::LifecycleExpirationDelete
+            | EventName::LifecycleExpirationDeleteMarkerCreated
+            | EventName::LifecycleTransition
+            | EventName::IntelligentTiering => "2.3",
+            _ => "2.1",
+        }
+    }
+
     /// Creates a test event for a given bucket and object
     pub fn new_test_event(bucket: &str, key: &str, event_name: EventName) -> Self {
         let mut user_metadata = HashMap::new();
@@ -139,7 +176,7 @@ impl Event {
         user_metadata.insert("x-request-time".to_string(), Utc::now().to_rfc3339());
 
         Event {
-            event_version: "2.1".to_string(),
+            event_version: Self::event_version_for(event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: "us-east-1".to_string(),
             event_time: Utc::now(),
@@ -169,6 +206,7 @@ impl Event {
                     sequencer: "0055AED6DCD90281E5".to_string(),
                 },
             },
+            glacier_event_data: None,
             source: Source {
                 host: "127.0.0.1".to_string(),
                 port: "9000".to_string(),
@@ -237,8 +275,25 @@ impl Event {
             s3_metadata.object.user_metadata = Some(user_metadata);
         }
 
+        let glacier_event_data = if args.event_name == EventName::ObjectRestoreCompleted {
+            args.object.restore_expires.and_then(|expiry| {
+                let expiry_time = DateTime::<Utc>::from_timestamp(expiry.unix_timestamp(), expiry.nanosecond())?;
+                let storage_class = args.object.storage_class.clone().or_else(|| {
+                    (!args.object.transitioned_object.tier.is_empty()).then_some(args.object.transitioned_object.tier.clone())
+                })?;
+                Some(GlacierEventData {
+                    restore_event_data: RestoreEventData {
+                        lifecycle_restoration_expiry_time: expiry_time.to_rfc3339_opts(SecondsFormat::Millis, true),
+                        lifecycle_restore_storage_class: storage_class,
+                    },
+                })
+            })
+        } else {
+            None
+        };
+
         Self {
-            event_version: "2.1".to_string(),
+            event_version: Self::event_version_for(args.event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
             event_time: event_time.and_utc(),
@@ -247,6 +302,7 @@ impl Event {
             request_parameters: args.req_params,
             response_elements: resp_elements,
             s3: s3_metadata,
+            glacier_event_data,
             source: Source {
                 host: args.host,
                 port: if args.port == 0 {
@@ -280,9 +336,21 @@ pub struct EventArgs {
 }
 
 impl EventArgs {
-    // Helper function to check if it is a copy request
+    /// True when the RustFS replication header is explicitly enabled (`true` or `1`).
+    ///
+    /// Only `x-rustfs-source-replication-request` is considered here. Many clients (including the
+    /// console) send `x-minio-source-replication-request` for MinIO compatibility; treating that
+    /// as replication would suppress webhooks on normal browser deletes. Storage still honors both
+    /// prefixes when parsing the typed HTTP headers for `ObjectOptions`.
     pub fn is_replication_request(&self) -> bool {
-        self.req_params.contains_key("x-rustfs-source-replication-request")
+        self.replication_header_value_true("x-rustfs-source-replication-request")
+    }
+
+    fn replication_header_value_true(&self, key: &str) -> bool {
+        self.req_params
+            .get(key)
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
     }
 }
 
@@ -408,5 +476,98 @@ impl EventArgsBuilder {
             port: self.port,
             user_agent: self.user_agent,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_test_event_uses_aws_compatible_event_versions() {
+        let acl_event = Event::new_test_event("bucket", "key", EventName::ObjectAclPut);
+        assert_eq!(acl_event.event_version, "2.3");
+
+        let tagging_event = Event::new_test_event("bucket", "key", EventName::ObjectTaggingPut);
+        assert_eq!(tagging_event.event_version, "2.3");
+
+        let lifecycle_event = Event::new_test_event("bucket", "key", EventName::LifecycleExpirationDelete);
+        assert_eq!(lifecycle_event.event_version, "2.3");
+
+        let put_event = Event::new_test_event("bucket", "key", EventName::ObjectCreatedPut);
+        assert_eq!(put_event.event_version, "2.1");
+    }
+
+    #[test]
+    fn event_new_uses_aws_compatible_event_versions() {
+        let args = EventArgsBuilder::new(
+            EventName::LifecycleTransition,
+            "bucket",
+            rustfs_ecstore::store_api::ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.event_version, "2.3");
+    }
+
+    #[test]
+    fn object_restore_completed_includes_glacier_event_data() {
+        let args = EventArgsBuilder::new(
+            EventName::ObjectRestoreCompleted,
+            "bucket",
+            rustfs_ecstore::store_api::ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                restore_expires: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                storage_class: Some("GLACIER".to_string()),
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+
+        assert_eq!(event.event_version, "2.3");
+        let glacier = event.glacier_event_data.expect("glacier event data should be present");
+        assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
+        assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+    }
+}
+
+#[cfg(test)]
+mod event_args_tests {
+    use super::EventArgs;
+    use hashbrown::HashMap;
+    use rustfs_ecstore::store_api::ObjectInfo;
+    use rustfs_s3_common::EventName;
+
+    fn args_with_headers(pairs: &[(&str, &str)]) -> EventArgs {
+        let mut req_params = HashMap::new();
+        for (k, v) in pairs {
+            req_params.insert((*k).to_string(), (*v).to_string());
+        }
+        EventArgs {
+            event_name: EventName::ObjectRemovedDelete,
+            bucket_name: "b".to_string(),
+            object: ObjectInfo::default(),
+            req_params,
+            resp_elements: HashMap::new(),
+            version_id: String::new(),
+            host: String::new(),
+            port: 0,
+            user_agent: String::new(),
+        }
+    }
+
+    #[test]
+    fn replication_request_requires_true_value() {
+        assert!(!args_with_headers(&[("x-rustfs-source-replication-request", "")]).is_replication_request());
+        assert!(!args_with_headers(&[("x-rustfs-source-replication-request", "false")]).is_replication_request());
+        assert!(args_with_headers(&[("x-rustfs-source-replication-request", "true")]).is_replication_request());
+        assert!(args_with_headers(&[("x-rustfs-source-replication-request", "True")]).is_replication_request());
+        assert!(!args_with_headers(&[("x-minio-source-replication-request", "true")]).is_replication_request());
     }
 }

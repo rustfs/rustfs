@@ -30,7 +30,7 @@ impl std::error::Error for ParseEventNameError {}
 /// Based on AWS S3 event type and includes RustFS extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EventName {
-    // Single event type (values are 1-32 for compatible mask logic)
+    // Single event type (values are sequential for compatible mask logic)
     ObjectAccessedGet = 1,
     ObjectAccessedGetRetention = 2,
     ObjectAccessedGetLegalHold = 3,
@@ -42,8 +42,8 @@ pub enum EventName {
     ObjectCreatedPut = 9,
     ObjectCreatedPutRetention = 10,
     ObjectCreatedPutLegalHold = 11,
-    ObjectCreatedPutTagging = 12,
-    ObjectCreatedDeleteTagging = 13,
+    ObjectTaggingPut = 12,
+    ObjectTaggingDelete = 13,
     ObjectRemovedDelete = 14,
     ObjectRemovedDeleteMarkerCreated = 15,
     ObjectRemovedDeleteAllVersions = 16,
@@ -63,6 +63,11 @@ pub enum EventName {
     ScannerLargeVersions = 30,               // ObjectLargeVersions corresponding to Go
     ScannerBigPrefix = 31,                   // PrefixManyFolders corresponding to Go
     LifecycleDelMarkerExpirationDelete = 32, // ILMDelMarkerExpirationDelete corresponding to Go
+    ObjectAclPut = 33,
+    LifecycleExpirationDelete = 34,
+    LifecycleExpirationDeleteMarkerCreated = 35,
+    LifecycleTransition = 36,
+    IntelligentTiering = 37,
 
     // Compound "All" event type (no sequential value for mask)
     ObjectAccessedAll,
@@ -70,6 +75,8 @@ pub enum EventName {
     ObjectRemovedAll,
     ObjectReplicationAll,
     ObjectRestoreAll,
+    ObjectTaggingAll,
+    LifecycleExpirationAll,
     ObjectTransitionAll,
     ObjectScannerAll, // New, from Go
     #[default]
@@ -94,8 +101,8 @@ const SINGLE_EVENT_NAMES_IN_ORDER: [EventName; 32] = [
     EventName::ObjectCreatedPut,
     EventName::ObjectCreatedPutRetention,
     EventName::ObjectCreatedPutLegalHold,
-    EventName::ObjectCreatedPutTagging,
-    EventName::ObjectCreatedDeleteTagging,
+    EventName::ObjectTaggingPut,
+    EventName::ObjectTaggingDelete,
     EventName::ObjectRemovedDelete,
     EventName::ObjectRemovedDeleteMarkerCreated,
     EventName::ObjectRemovedDeleteAllVersions,
@@ -117,7 +124,15 @@ const SINGLE_EVENT_NAMES_IN_ORDER: [EventName; 32] = [
     EventName::LifecycleDelMarkerExpirationDelete,
 ];
 
-const LAST_SINGLE_TYPE_VALUE: u32 = EventName::LifecycleDelMarkerExpirationDelete as u32;
+const SINGLE_AWS_AND_EXTENSION_EVENTS_AFTER_COMPAT: [EventName; 5] = [
+    EventName::ObjectAclPut,
+    EventName::LifecycleExpirationDelete,
+    EventName::LifecycleExpirationDeleteMarkerCreated,
+    EventName::LifecycleTransition,
+    EventName::IntelligentTiering,
+];
+
+const LAST_SINGLE_TYPE_VALUE: u32 = EventName::IntelligentTiering as u32;
 
 impl EventName {
     /// The parsed string is EventName.
@@ -138,14 +153,21 @@ impl EventName {
             "s3:ObjectCreated:Put" => Ok(EventName::ObjectCreatedPut),
             "s3:ObjectCreated:PutRetention" => Ok(EventName::ObjectCreatedPutRetention),
             "s3:ObjectCreated:PutLegalHold" => Ok(EventName::ObjectCreatedPutLegalHold),
-            "s3:ObjectCreated:PutTagging" => Ok(EventName::ObjectCreatedPutTagging),
-            "s3:ObjectCreated:DeleteTagging" => Ok(EventName::ObjectCreatedDeleteTagging),
+            "s3:ObjectCreated:PutTagging" => Ok(EventName::ObjectTaggingPut),
+            "s3:ObjectCreated:DeleteTagging" => Ok(EventName::ObjectTaggingDelete),
+            "s3:ObjectTagging:*" => Ok(EventName::ObjectTaggingAll),
+            "s3:ObjectTagging:Put" => Ok(EventName::ObjectTaggingPut),
+            "s3:ObjectTagging:Delete" => Ok(EventName::ObjectTaggingDelete),
+            "s3:ObjectAcl:Put" => Ok(EventName::ObjectAclPut),
             "s3:ObjectRemoved:*" => Ok(EventName::ObjectRemovedAll),
             "s3:ObjectRemoved:Delete" => Ok(EventName::ObjectRemovedDelete),
             "s3:ObjectRemoved:DeleteMarkerCreated" => Ok(EventName::ObjectRemovedDeleteMarkerCreated),
             "s3:ObjectRemoved:NoOP" => Ok(EventName::ObjectRemovedNoOP),
             "s3:ObjectRemoved:DeleteAllVersions" => Ok(EventName::ObjectRemovedDeleteAllVersions),
             "s3:LifecycleDelMarkerExpiration:Delete" => Ok(EventName::LifecycleDelMarkerExpirationDelete),
+            "s3:LifecycleExpiration:*" => Ok(EventName::LifecycleExpirationAll),
+            "s3:LifecycleExpiration:Delete" => Ok(EventName::LifecycleExpirationDelete),
+            "s3:LifecycleExpiration:DeleteMarkerCreated" => Ok(EventName::LifecycleExpirationDeleteMarkerCreated),
             "s3:Replication:*" => Ok(EventName::ObjectReplicationAll),
             "s3:Replication:OperationFailedReplication" => Ok(EventName::ObjectReplicationFailed),
             "s3:Replication:OperationCompletedReplication" => Ok(EventName::ObjectReplicationComplete),
@@ -158,6 +180,8 @@ impl EventName {
             "s3:ObjectTransition:Failed" => Ok(EventName::ObjectTransitionFailed),
             "s3:ObjectTransition:Complete" => Ok(EventName::ObjectTransitionComplete),
             "s3:ObjectTransition:*" => Ok(EventName::ObjectTransitionAll),
+            "s3:LifecycleTransition" => Ok(EventName::LifecycleTransition),
+            "s3:IntelligentTiering" => Ok(EventName::IntelligentTiering),
             "s3:Scanner:ManyVersions" => Ok(EventName::ScannerManyVersions),
             "s3:Scanner:LargeVersions" => Ok(EventName::ScannerLargeVersions),
             "s3:Scanner:BigPrefix" => Ok(EventName::ScannerBigPrefix),
@@ -182,16 +206,21 @@ impl EventName {
             EventName::ObjectCreatedCopy => "s3:ObjectCreated:Copy",
             EventName::ObjectCreatedPost => "s3:ObjectCreated:Post",
             EventName::ObjectCreatedPut => "s3:ObjectCreated:Put",
-            EventName::ObjectCreatedPutTagging => "s3:ObjectCreated:PutTagging",
-            EventName::ObjectCreatedDeleteTagging => "s3:ObjectCreated:DeleteTagging",
             EventName::ObjectCreatedPutRetention => "s3:ObjectCreated:PutRetention",
             EventName::ObjectCreatedPutLegalHold => "s3:ObjectCreated:PutLegalHold",
+            EventName::ObjectTaggingAll => "s3:ObjectTagging:*",
+            EventName::ObjectTaggingPut => "s3:ObjectTagging:Put",
+            EventName::ObjectTaggingDelete => "s3:ObjectTagging:Delete",
+            EventName::ObjectAclPut => "s3:ObjectAcl:Put",
             EventName::ObjectRemovedAll => "s3:ObjectRemoved:*",
             EventName::ObjectRemovedDelete => "s3:ObjectRemoved:Delete",
             EventName::ObjectRemovedDeleteMarkerCreated => "s3:ObjectRemoved:DeleteMarkerCreated",
             EventName::ObjectRemovedNoOP => "s3:ObjectRemoved:NoOP",
             EventName::ObjectRemovedDeleteAllVersions => "s3:ObjectRemoved:DeleteAllVersions",
             EventName::LifecycleDelMarkerExpirationDelete => "s3:LifecycleDelMarkerExpiration:Delete",
+            EventName::LifecycleExpirationAll => "s3:LifecycleExpiration:*",
+            EventName::LifecycleExpirationDelete => "s3:LifecycleExpiration:Delete",
+            EventName::LifecycleExpirationDeleteMarkerCreated => "s3:LifecycleExpiration:DeleteMarkerCreated",
             EventName::ObjectReplicationAll => "s3:Replication:*",
             EventName::ObjectReplicationFailed => "s3:Replication:OperationFailedReplication",
             EventName::ObjectReplicationComplete => "s3:Replication:OperationCompletedReplication",
@@ -204,6 +233,8 @@ impl EventName {
             EventName::ObjectTransitionAll => "s3:ObjectTransition:*",
             EventName::ObjectTransitionFailed => "s3:ObjectTransition:Failed",
             EventName::ObjectTransitionComplete => "s3:ObjectTransition:Complete",
+            EventName::LifecycleTransition => "s3:LifecycleTransition",
+            EventName::IntelligentTiering => "s3:IntelligentTiering",
             EventName::ScannerManyVersions => "s3:Scanner:ManyVersions",
             EventName::ScannerLargeVersions => "s3:Scanner:LargeVersions",
             EventName::ScannerBigPrefix => "s3:Scanner:BigPrefix",
@@ -231,17 +262,9 @@ impl EventName {
                 EventName::ObjectCreatedCopy,
                 EventName::ObjectCreatedPost,
                 EventName::ObjectCreatedPut,
-                EventName::ObjectCreatedPutRetention,
-                EventName::ObjectCreatedPutLegalHold,
-                EventName::ObjectCreatedPutTagging,
-                EventName::ObjectCreatedDeleteTagging,
             ],
-            EventName::ObjectRemovedAll => vec![
-                EventName::ObjectRemovedDelete,
-                EventName::ObjectRemovedDeleteMarkerCreated,
-                EventName::ObjectRemovedNoOP,
-                EventName::ObjectRemovedDeleteAllVersions,
-            ],
+            EventName::ObjectTaggingAll => vec![EventName::ObjectTaggingPut, EventName::ObjectTaggingDelete],
+            EventName::ObjectRemovedAll => vec![EventName::ObjectRemovedDelete, EventName::ObjectRemovedDeleteMarkerCreated],
             EventName::ObjectReplicationAll => vec![
                 EventName::ObjectReplicationFailed,
                 EventName::ObjectReplicationComplete,
@@ -250,7 +273,15 @@ impl EventName {
                 EventName::ObjectReplicationReplicatedAfterThreshold,
             ],
             EventName::ObjectRestoreAll => vec![EventName::ObjectRestorePost, EventName::ObjectRestoreCompleted],
-            EventName::ObjectTransitionAll => vec![EventName::ObjectTransitionFailed, EventName::ObjectTransitionComplete],
+            EventName::LifecycleExpirationAll => vec![
+                EventName::LifecycleExpirationDelete,
+                EventName::LifecycleExpirationDeleteMarkerCreated,
+            ],
+            EventName::ObjectTransitionAll => vec![
+                EventName::ObjectTransitionFailed,
+                EventName::ObjectTransitionComplete,
+                EventName::LifecycleTransition,
+            ],
             EventName::ObjectScannerAll => vec![
                 // New
                 EventName::ScannerManyVersions,
@@ -259,7 +290,9 @@ impl EventName {
             ],
             EventName::Everything => {
                 // New
-                SINGLE_EVENT_NAMES_IN_ORDER.to_vec()
+                let mut all = SINGLE_EVENT_NAMES_IN_ORDER.to_vec();
+                all.extend(SINGLE_AWS_AND_EXTENSION_EVENTS_AFTER_COMPAT);
+                all
             }
             // A single type returns to itself directly
             _ => vec![*self],
@@ -299,8 +332,9 @@ impl EventName {
             EventName::ObjectCreatedPut => Some(S3Operation::PutObject),
             EventName::ObjectCreatedPutRetention => Some(S3Operation::PutObjectRetention),
             EventName::ObjectCreatedPutLegalHold => Some(S3Operation::PutObjectLegalHold),
-            EventName::ObjectCreatedPutTagging => Some(S3Operation::PutObjectTagging),
-            EventName::ObjectCreatedDeleteTagging => Some(S3Operation::DeleteObjectTagging),
+            EventName::ObjectTaggingPut => Some(S3Operation::PutObjectTagging),
+            EventName::ObjectTaggingDelete => Some(S3Operation::DeleteObjectTagging),
+            EventName::ObjectAclPut => Some(S3Operation::PutObjectAcl),
             EventName::ObjectRemovedDelete => Some(S3Operation::DeleteObject),
             EventName::ObjectRemovedDeleteMarkerCreated => Some(S3Operation::DeleteObject),
             EventName::ObjectRemovedDeleteAllVersions => Some(S3Operation::DeleteObject),
@@ -497,16 +531,17 @@ impl S3Operation {
             Self::DeleteBucket => Some(EventName::BucketRemoved),
             Self::DeleteObject => Some(EventName::ObjectRemovedDelete),
             Self::DeleteObjects => Some(EventName::ObjectRemovedDeleteObjects),
-            Self::DeleteObjectTagging => Some(EventName::ObjectCreatedDeleteTagging),
+            Self::DeleteObjectTagging => Some(EventName::ObjectTaggingDelete),
             Self::GetObject => Some(EventName::ObjectAccessedGet),
             Self::GetObjectAttributes => Some(EventName::ObjectAccessedAttributes),
             Self::GetObjectLegalHold => Some(EventName::ObjectAccessedGetLegalHold),
             Self::GetObjectRetention => Some(EventName::ObjectAccessedGetRetention),
             Self::HeadObject => Some(EventName::ObjectAccessedHead),
             Self::PutObject => Some(EventName::ObjectCreatedPut),
+            Self::PutObjectAcl => Some(EventName::ObjectAclPut),
             Self::PutObjectLegalHold => Some(EventName::ObjectCreatedPutLegalHold),
             Self::PutObjectRetention => Some(EventName::ObjectCreatedPutRetention),
-            Self::PutObjectTagging => Some(EventName::ObjectCreatedPutTagging),
+            Self::PutObjectTagging => Some(EventName::ObjectTaggingPut),
             Self::RestoreObject => Some(EventName::ObjectRestorePost),
             Self::SelectObjectContent => Some(EventName::ObjectAccessedGet),
             Self::AbortMultipartUpload => Some(EventName::ObjectRemovedAbortMultipartUpload),
@@ -541,6 +576,10 @@ mod tests {
                 event: EventName::ObjectCreatedPut,
                 serialized_str: "\"s3:ObjectCreated:Put\"",
             },
+            TestCase {
+                event: EventName::ObjectTaggingPut,
+                serialized_str: "\"s3:ObjectTagging:Put\"",
+            },
         ];
 
         for case in &test_cases {
@@ -574,6 +613,9 @@ mod tests {
     #[test]
     fn test_s3_operation_to_event_name() {
         assert_eq!(S3Operation::PutObject.to_event_name(), Some(EventName::ObjectCreatedPut));
+        assert_eq!(S3Operation::PutObjectAcl.to_event_name(), Some(EventName::ObjectAclPut));
+        assert_eq!(S3Operation::PutObjectTagging.to_event_name(), Some(EventName::ObjectTaggingPut));
+        assert_eq!(S3Operation::DeleteObjectTagging.to_event_name(), Some(EventName::ObjectTaggingDelete));
         assert_eq!(S3Operation::GetObject.to_event_name(), Some(EventName::ObjectAccessedGet));
         assert_eq!(S3Operation::ListBuckets.to_event_name(), None);
         assert_eq!(S3Operation::RestoreObject.to_event_name(), Some(EventName::ObjectRestorePost));
@@ -587,6 +629,9 @@ mod tests {
     #[test]
     fn test_event_name_to_s3_operation() {
         assert_eq!(EventName::ObjectCreatedPut.to_s3_operation(), Some(S3Operation::PutObject));
+        assert_eq!(EventName::ObjectAclPut.to_s3_operation(), Some(S3Operation::PutObjectAcl));
+        assert_eq!(EventName::ObjectTaggingPut.to_s3_operation(), Some(S3Operation::PutObjectTagging));
+        assert_eq!(EventName::ObjectTaggingDelete.to_s3_operation(), Some(S3Operation::DeleteObjectTagging));
         assert_eq!(EventName::ObjectAccessedGet.to_s3_operation(), Some(S3Operation::GetObject));
         assert_eq!(EventName::BucketCreated.to_s3_operation(), Some(S3Operation::CreateBucket));
         assert_eq!(EventName::Everything.to_s3_operation(), None);
@@ -595,6 +640,37 @@ mod tests {
         assert_eq!(
             EventName::ObjectRemovedAbortMultipartUpload.to_s3_operation(),
             Some(S3Operation::AbortMultipartUpload)
+        );
+    }
+
+    #[test]
+    fn test_event_name_aliases_parse_to_aws_compatible_variants() {
+        assert_eq!(EventName::parse("s3:ObjectCreated:PutTagging").unwrap(), EventName::ObjectTaggingPut);
+        assert_eq!(
+            EventName::parse("s3:ObjectCreated:DeleteTagging").unwrap(),
+            EventName::ObjectTaggingDelete
+        );
+        assert_eq!(
+            EventName::parse("s3:ObjectTransition:Complete").unwrap(),
+            EventName::ObjectTransitionComplete
+        );
+        assert_eq!(
+            EventName::parse("s3:LifecycleDelMarkerExpiration:Delete").unwrap(),
+            EventName::LifecycleDelMarkerExpirationDelete
+        );
+    }
+
+    #[test]
+    fn test_object_created_all_expansion_matches_aws_scope() {
+        let expanded = EventName::ObjectCreatedAll.expand();
+        assert_eq!(
+            expanded,
+            vec![
+                EventName::ObjectCreatedCompleteMultipartUpload,
+                EventName::ObjectCreatedCopy,
+                EventName::ObjectCreatedPost,
+                EventName::ObjectCreatedPut,
+            ]
         );
     }
 }

@@ -14,7 +14,10 @@
 
 use super::is_admin::IsAdminHandler;
 use crate::{
-    admin::router::{AdminOperation, Operation, S3Router},
+    admin::{
+        handlers::site_replication::site_replication_iam_change_hook,
+        router::{AdminOperation, Operation, S3Router},
+    },
     auth::{check_key_valid, get_session_token},
     server::ADMIN_PREFIX,
 };
@@ -23,8 +26,10 @@ use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -164,11 +169,31 @@ async fn handle_assume_role(
 
     debug!("AssumeRole get new_cred {:?}", &new_cred);
 
-    if let Err(_err) = iam_store.set_temp_user(&new_cred.access_key, &new_cred, None).await {
-        return Err(s3_error!(InternalError, "set_temp_user failed"));
-    }
+    let updated_at = iam_store
+        .set_temp_user(&new_cred.access_key, &new_cred, None)
+        .await
+        .map_err(|_| s3_error!(InternalError, "set_temp_user failed"))?;
 
-    // TODO: globalSiteReplicationSys
+    let root_access_key = get_global_action_cred().map(|cred| cred.access_key);
+    if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
+        && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "sts-credential".to_string(),
+            sts_credential: Some(SRSTSCredential {
+                access_key: new_cred.access_key.clone(),
+                secret_key: new_cred.secret_key.clone(),
+                session_token: new_cred.session_token.clone(),
+                parent_user: new_cred.parent_user.clone(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+    {
+        warn!("site replication STS hook failed, err: {err}");
+    }
 
     let resp = AssumeRoleOutput {
         credentials: Some(Credentials {
@@ -358,10 +383,29 @@ pub async fn create_oidc_sts_credentials(
     // Store temp user in IAM
     let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
 
-    iam_store
+    let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)
         .await
         .map_err(|_| s3_error!(InternalError, "failed to store temp user"))?;
+
+    if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+        r#type: "sts-credential".to_string(),
+        sts_credential: Some(SRSTSCredential {
+            access_key: new_cred.access_key.clone(),
+            secret_key: new_cred.secret_key.clone(),
+            session_token: new_cred.session_token.clone(),
+            parent_user: new_cred.parent_user.clone(),
+            parent_policy_mapping: policies.join(","),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    })
+    .await
+    {
+        warn!("site replication OIDC STS hook failed, err: {err}");
+    }
 
     Ok(new_cred)
 }

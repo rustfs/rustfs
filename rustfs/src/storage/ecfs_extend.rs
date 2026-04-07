@@ -187,7 +187,6 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     };
 
     // Optional performance metrics collection for monitoring and optimization
-    #[cfg(feature = "metrics")]
     {
         use metrics::histogram;
         histogram!("rustfs.buffer.size.bytes").record(buffer_size as f64);

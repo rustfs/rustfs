@@ -15,6 +15,7 @@
 use crate::{
     admin::{
         auth::validate_admin_request,
+        handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::has_space_be,
     },
@@ -24,10 +25,11 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
-use rustfs_madmin::GroupAddRemove;
+use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
@@ -205,24 +207,11 @@ impl Operation for DeleteGroup {
         )
         .await?;
 
-        let group = params
-            .get("group")
-            .ok_or_else(|| s3_error!(InvalidArgument, "missing group name in request"))?
-            .trim();
-
-        // Validate the group name format
-        if group.is_empty() || group.len() > 256 {
-            return Err(s3_error!(InvalidArgument, "invalid group name"));
-        }
-
-        // Sanity check the group name
-        if group.contains(['/', '\\', '\0']) {
-            return Err(s3_error!(InvalidArgument, "group name contains invalid characters"));
-        }
+        let group = decode_delete_group_name(&params)?;
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        iam_store.remove_users_from_group(group, vec![]).await.map_err(|e| {
+        let updated_at = iam_store.remove_users_from_group(&group, vec![]).await.map_err(|e| {
             warn!("delete group failed, e: {:?}", e);
             match e {
                 rustfs_iam::error::Error::GroupNotEmpty => {
@@ -241,10 +230,57 @@ impl Operation for DeleteGroup {
             }
         })?;
 
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: GroupAddRemove {
+                    group: group.to_string(),
+                    members: vec![],
+                    status: GroupStatus::Enabled,
+                    is_remove: true,
+                },
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group delete hook failed, err: {err}");
+        }
+
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+fn decode_delete_group_name<'a>(params: &'a Params<'_, '_>) -> S3Result<std::borrow::Cow<'a, str>> {
+    let group_raw = params
+        .get("group")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing group name in request"))?
+        .trim();
+
+    // Path segments stay percent-encoded in `req.uri.path()` / matchit; IAM uses decoded names (same as GET query).
+    let decoded = percent_decode_str(group_raw)
+        .decode_utf8()
+        .map_err(|_| s3_error!(InvalidArgument, "invalid group name encoding"))?;
+    let group = decoded.trim();
+
+    if group.is_empty() || group.len() > 256 {
+        return Err(s3_error!(InvalidArgument, "invalid group name"));
+    }
+
+    if group.contains(['/', '\\', '\0']) {
+        return Err(s3_error!(InvalidArgument, "group name contains invalid characters"));
+    }
+
+    if group.len() == decoded.len() {
+        Ok(decoded)
+    } else {
+        Ok(std::borrow::Cow::Owned(group.to_string()))
     }
 }
 
@@ -287,26 +323,46 @@ impl Operation for SetGroupStatus {
 
         let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
 
-        if let Some(status) = query.status {
-            match status.as_str() {
-                "enabled" => {
-                    iam_store.set_group_status(&query.group, true).await.map_err(|e| {
-                        warn!("enable group failed, e: {:?}", e);
-                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                    })?;
-                }
-                "disabled" => {
-                    iam_store.set_group_status(&query.group, false).await.map_err(|e| {
-                        warn!("enable group failed, e: {:?}", e);
-                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                    })?;
-                }
+        let updated_at = if let Some(status) = query.status.as_deref() {
+            match status {
+                "enabled" => iam_store.set_group_status(&query.group, true).await.map_err(|e| {
+                    warn!("enable group failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?,
+                "disabled" => iam_store.set_group_status(&query.group, false).await.map_err(|e| {
+                    warn!("enable group failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?,
                 _ => {
                     return Err(s3_error!(InvalidArgument, "invalid status"));
                 }
             }
         } else {
             return Err(s3_error!(InvalidArgument, "status is required"));
+        };
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: GroupAddRemove {
+                    group: query.group.clone(),
+                    members: vec![],
+                    status: if matches!(query.status.as_deref(), Some("disabled")) {
+                        GroupStatus::Disabled
+                    } else {
+                        GroupStatus::Enabled
+                    },
+                    is_remove: false,
+                },
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group status hook failed, err: {err}");
         }
 
         let mut header = HeaderMap::new();
@@ -387,15 +443,15 @@ impl Operation for UpdateGroupMembers {
             }
         }
 
-        if args.is_remove {
+        let updated_at = if args.is_remove {
             warn!("remove group members");
             iam_store
-                .remove_users_from_group(&args.group, args.members)
+                .remove_users_from_group(&args.group, args.members.clone())
                 .await
                 .map_err(|e| {
                     warn!("remove group members failed, e: {:?}", e);
                     S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-                })?;
+                })?
         } else {
             warn!("add group members");
 
@@ -406,15 +462,92 @@ impl Operation for UpdateGroupMembers {
                 return Err(s3_error!(InvalidArgument, "not such group"));
             }
 
-            iam_store.add_users_to_group(&args.group, args.members).await.map_err(|e| {
-                warn!("add group members failed, e: {:?}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
-            })?;
+            iam_store
+                .add_users_to_group(&args.group, args.members.clone())
+                .await
+                .map_err(|e| {
+                    warn!("add group members failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?
+        };
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: args,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!("site replication group membership hook failed, err: {err}");
         }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matchit::Router;
+
+    fn with_delete_group_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/group/{group}", ())
+            .expect("route should insert");
+
+        let matched = router.at(path).expect("route should match");
+        f(&matched.params)
+    }
+
+    #[test]
+    fn decode_delete_group_name_percent_decodes_path_segment() {
+        let group = with_delete_group_params("/rustfs/admin/v3/group/dev%2Bops%20team", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect("encoded group name should decode");
+
+        assert_eq!(group, "dev+ops team");
+    }
+
+    #[test]
+    fn decode_delete_group_name_rejects_invalid_utf8() {
+        let err = with_delete_group_params("/rustfs/admin/v3/group/%FF", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("invalid utf-8 should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("invalid group name encoding"));
+    }
+
+    #[test]
+    fn decode_delete_group_name_rejects_blank_name_after_decoding() {
+        let err = with_delete_group_params("/rustfs/admin/v3/group/%20", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("blank group should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("invalid group name"));
+    }
+
+    #[test]
+    fn decode_delete_group_name_rejects_path_separator_after_decoding() {
+        let err = with_delete_group_params("/rustfs/admin/v3/group/team%2Fops", |params| {
+            decode_delete_group_name(params).map(|group| group.into_owned())
+        })
+        .expect_err("decoded slash should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("group name contains invalid characters"));
     }
 }

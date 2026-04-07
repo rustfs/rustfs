@@ -37,8 +37,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{EtagResolvable, HashReaderDetector, HashReaderMut, TryGetIndex};
-
 pin_project! {
     #[derive(Debug)]
     pub struct LimitReader<R> {
@@ -46,6 +44,7 @@ pin_project! {
         pub inner: R,
         limit: usize,
         read: usize,
+        scratch: Vec<u8>,
     }
 }
 
@@ -56,7 +55,12 @@ where
 {
     /// Create a new LimitReader wrapping `inner`, with a total read limit of `limit` bytes.
     pub fn new(inner: R, limit: usize) -> Self {
-        Self { inner, limit, read: 0 }
+        Self {
+            inner,
+            limit,
+            read: 0,
+            scratch: Vec::new(),
+        }
     }
 }
 
@@ -84,8 +88,8 @@ where
             }
             poll
         } else {
-            let mut temp = vec![0u8; allowed];
-            let mut temp_buf = ReadBuf::new(&mut temp);
+            this.scratch.resize(allowed, 0);
+            let mut temp_buf = ReadBuf::new(&mut this.scratch[..allowed]);
             let poll = this.inner.as_mut().poll_read(cx, &mut temp_buf);
             if let Poll::Ready(Ok(())) = &poll {
                 let n = temp_buf.filled().len();
@@ -97,28 +101,7 @@ where
     }
 }
 
-impl<R> EtagResolvable for LimitReader<R>
-where
-    R: EtagResolvable,
-{
-    fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
-    }
-}
-
-impl<R> HashReaderDetector for LimitReader<R>
-where
-    R: HashReaderDetector,
-{
-    fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
-    }
-    fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
-    }
-}
-
-impl<R> TryGetIndex for LimitReader<R> where R: AsyncRead + Unpin + Send + Sync {}
+delegate_reader_capabilities_generic!(LimitReader<R>, inner);
 
 #[cfg(test)]
 mod tests {

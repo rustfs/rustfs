@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
 use object_store::{
-    Attributes, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    Attributes, CopyOptions, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use pin_project_lite::pin_project;
@@ -29,7 +29,6 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
 use rustfs_ecstore::store_api::ObjectIO;
-use rustfs_ecstore::store_api::ObjectOperations;
 use rustfs_ecstore::store_api::ObjectOptions;
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -233,29 +232,8 @@ impl ObjectStore for EcObjectStore {
         Err(unsupported_store_error("get_ranges"))
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        info!("{:?}", location);
-        let opts = ObjectOptions::default();
-        let info = self
-            .store
-            .get_object_info(&self.input.bucket, &self.input.key, &opts)
-            .await
-            .map_err(|_| o_Error::NotFound {
-                path: format!("{}/{}", self.input.bucket, self.input.key),
-                source: "can not get object info".into(),
-            })?;
-
-        Ok(ObjectMeta {
-            location: location.clone(),
-            last_modified: Utc::now(),
-            size: info.size as u64,
-            e_tag: info.etag,
-            version: None,
-        })
-    }
-
-    async fn delete(&self, _location: &Path) -> Result<()> {
-        Err(unsupported_store_error("delete"))
+    fn delete_stream(&self, _locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
+        stream::once(ready(Err(unsupported_store_error("delete_stream")))).boxed()
     }
 
     fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -266,12 +244,8 @@ impl ObjectStore for EcObjectStore {
         Err(unsupported_store_error("list_with_delimiter"))
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Err(unsupported_store_error("copy"))
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _too: &Path) -> Result<()> {
-        Err(unsupported_store_error("copy_if_not_exists"))
+    async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> Result<()> {
+        Err(unsupported_store_error("copy_opts"))
     }
 }
 

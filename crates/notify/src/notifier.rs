@@ -399,7 +399,7 @@ mod tests {
     use rustfs_targets::{
         TargetError,
         store::{Key, Store},
-        target::EntityTarget,
+        target::{EntityTarget, QueuedPayload, QueuedPayloadMeta},
     };
     use serde::{Serialize, de::DeserializeOwned};
     use std::sync::{
@@ -442,7 +442,7 @@ mod tests {
             Ok(())
         }
 
-        async fn send_from_store(&self, _key: Key) -> Result<(), TargetError> {
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
             Ok(())
         }
 
@@ -450,7 +450,7 @@ mod tests {
             Ok(())
         }
 
-        fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
             None
         }
 

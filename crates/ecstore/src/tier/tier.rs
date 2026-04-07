@@ -49,9 +49,9 @@ use crate::{
     StorageAPI,
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
-    global::{get_global_endpoints, is_first_cluster_node_local},
+    global::is_first_cluster_node_local,
     store::ECStore,
-    store_api::{ObjectIO as _, ObjectOptions, PutObjReader},
+    store_api::{ChunkNativePutData, ObjectIO as _, ObjectOptions},
 };
 use rustfs_rio::HashReader;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
@@ -1006,7 +1006,7 @@ impl TierConfigMgr {
     #[tracing::instrument(level = "debug", name = "tier_save", skip(self))]
     pub async fn save(&self) -> std::result::Result<(), std::io::Error> {
         let Some(api) = new_object_layer_fn() else {
-            return Err(std::io::Error::other("errServerNotInitialized"));
+            return Err(tier_config_not_initialized_error("save tiering config"));
         };
         //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;
 
@@ -1046,9 +1046,8 @@ impl TierConfigMgr {
         opts: &ObjectOptions,
     ) -> std::result::Result<(), std::io::Error> {
         debug!("save tier config:{}", file);
-        let _ = api
-            .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data.to_vec()), opts)
-            .await?;
+        let mut put_data = ChunkNativePutData::from_vec(data.to_vec());
+        let _ = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await?;
         Ok(())
     }
 
@@ -1104,11 +1103,12 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 Ok(data) => {
                     let cfg = TierConfigMgr::unmarshal(&data)?;
                     let normalized = encode_external_tiering_config_blob(&cfg)?;
+                    let mut put_data = ChunkNativePutData::from_vec(normalized.to_vec());
                     let _ = api
                         .put_object(
                             RUSTFS_META_BUCKET,
                             &config_file,
-                            &mut PutObjReader::from_vec(normalized.to_vec()),
+                            &mut put_data,
                             &ObjectOptions {
                                 max_parity: true,
                                 ..Default::default()
@@ -1158,10 +1158,11 @@ async fn read_tier_config_from_bucket<S: StorageAPI>(
 }
 
 async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
+    let mut put_data = ChunkNativePutData::from_vec(data.to_vec());
     api.put_object(
         RUSTFS_META_BUCKET,
         path,
-        &mut PutObjReader::from_vec(data.to_vec()),
+        &mut put_data,
         &ObjectOptions {
             max_parity: true,
             ..Default::default()
@@ -1229,6 +1230,10 @@ pub async fn try_migrate_tiering_config<S: StorageAPI>(api: Arc<S>) {
 
 pub fn is_err_config_not_found(err: &StorageError) -> bool {
     matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::BucketNotFound(_)) || err == &StorageError::ConfigNotFound
+}
+
+fn tier_config_not_initialized_error(operation: &str) -> std::io::Error {
+    std::io::Error::other(format!("failed to {operation}: object layer not initialized"))
 }
 
 #[cfg(test)]
@@ -1334,5 +1339,14 @@ mod tests {
                 .map(|s3| s3.bucket.as_str()),
             Some("bucket-a")
         );
+    }
+
+    #[test]
+    fn test_tier_config_not_initialized_error_formats_operation_context() {
+        let err = tier_config_not_initialized_error("save tiering config");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("failed to save tiering config"), "{rendered}");
+        assert!(rendered.contains("object layer not initialized"), "{rendered}");
     }
 }

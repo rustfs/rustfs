@@ -22,6 +22,7 @@ pub mod bucket;
 pub mod cache_value;
 pub mod compress;
 pub mod config;
+mod data_movement;
 pub mod data_usage;
 pub mod disk;
 pub mod disks_layout;

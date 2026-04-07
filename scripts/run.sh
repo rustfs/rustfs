@@ -38,7 +38,8 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="info,rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
+#    export RUST_LOG="info,rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
+    export RUST_LOG="error"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -64,14 +65,14 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp/v1/logs # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
 #export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
 export RUSTFS_OBS_PROFILING_ENDPOINT=http://localhost:4040 # OpenTelemetry Collector profiling address
-#export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
+export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
 export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
 export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-#export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
 export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep

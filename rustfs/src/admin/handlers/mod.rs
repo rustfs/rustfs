@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod account_info;
+pub mod audit;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
@@ -33,6 +34,7 @@ pub mod quota;
 pub mod rebalance;
 pub mod replication;
 pub mod service_account;
+pub mod site_replication;
 pub mod sts;
 pub mod system;
 pub mod tier;
@@ -50,6 +52,7 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _list_audit_targets = audit::ListAuditTargets {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
         let _inspect_data_handler = system::InspectDataHandler {};
@@ -64,6 +67,9 @@ mod tests {
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
+        let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
+        let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
+        let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking

@@ -13,19 +13,33 @@
 // limitations under the License.
 
 use crate::error::StoreError;
-use rustfs_config::DEFAULT_LIMIT;
 use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
+use rustfs_config::{DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, ENV_TARGET_STORE_COMPRESS, EnableState};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
-use std::sync::{Arc, RwLock};
 use std::{
     collections::HashMap,
     marker::PhantomData,
     path::PathBuf,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+fn resolve_queue_store_compression_from_env_value(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.parse::<EnableState>().ok().map(|state| state.is_enabled()))
+        .unwrap_or(DEFAULT_TARGET_STORE_COMPRESS)
+}
+
+fn queue_store_compression_enabled() -> bool {
+    let value = std::env::var(ENV_TARGET_STORE_COMPRESS).ok();
+    resolve_queue_store_compression_from_env_value(value.as_deref())
+}
 
 /// Represents a key for an entry in the store
 #[derive(Debug, Clone)]
@@ -63,21 +77,7 @@ impl Key {
 
 impl std::fmt::Display for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name_part = if self.item_count > 1 {
-            format!("{}:{}", self.item_count, self.name)
-        } else {
-            self.name.clone()
-        };
-
-        let mut file_name = name_part;
-        if !self.extension.is_empty() {
-            file_name.push_str(&self.extension);
-        }
-
-        if self.compress {
-            file_name.push_str(COMPRESS_EXT);
-        }
-        write!(f, "{file_name}")
+        f.write_str(&self.to_key_string())
     }
 }
 
@@ -123,6 +123,28 @@ pub fn parse_key(s: &str) -> Key {
     }
 }
 
+pub fn ensure_store_entry_raw_readable<T>(
+    store: &(dyn Store<T, Error = StoreError, Key = Key> + Send),
+    key: &Key,
+) -> Result<bool, StoreError>
+where
+    T: Send + Sync + 'static + Clone + Serialize,
+{
+    match store.get_raw(key) {
+        Ok(_) => Ok(true),
+        Err(StoreError::NotFound) => Ok(false),
+        Err(err) => {
+            match store.del(key) {
+                Ok(()) | Err(StoreError::NotFound) => {}
+                Err(del_err) => {
+                    return Err(StoreError::Internal(format!("Failed to remove unreadable store entry {key}: {del_err}")));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Trait for a store that can store and retrieve items of type T
 pub trait Store<T>: Send + Sync
 where
@@ -142,14 +164,23 @@ where
     /// Stores multiple items in a single batch
     fn put_multiple(&self, items: Vec<T>) -> Result<Self::Key, Self::Error>;
 
+    /// Stores raw bytes in a single entry.
+    fn put_raw(&self, data: &[u8]) -> Result<Self::Key, Self::Error>;
+
     /// Retrieves a single item by key
     fn get(&self, key: &Self::Key) -> Result<T, Self::Error>;
 
     /// Retrieves multiple items by key
     fn get_multiple(&self, key: &Self::Key) -> Result<Vec<T>, Self::Error>;
 
+    /// Retrieves the raw bytes stored for a key.
+    fn get_raw(&self, key: &Self::Key) -> Result<Vec<u8>, Self::Error>;
+
     /// Deletes an item by key
     fn del(&self, key: &Self::Key) -> Result<(), Self::Error>;
+
+    /// Deletes the underlying store directory and clears all in-memory state.
+    fn delete(&self) -> Result<(), Self::Error>;
 
     /// Lists all keys in the store
     fn list(&self) -> Vec<Self::Key>;
@@ -169,7 +200,10 @@ pub struct QueueStore<T> {
     entry_limit: u64,
     directory: PathBuf,
     file_ext: String,
+    compress: bool,
     entries: Arc<RwLock<HashMap<String, i64>>>, // key -> modtime as unix nano
+    pending_entries: Arc<AtomicU64>,
+    fs_guard: Arc<RwLock<()>>,
     _phantom: PhantomData<T>,
 }
 
@@ -179,35 +213,70 @@ impl<T> Clone for QueueStore<T> {
             entry_limit: self.entry_limit,
             directory: self.directory.clone(),
             file_ext: self.file_ext.clone(),
+            compress: self.compress,
             entries: Arc::clone(&self.entries),
+            pending_entries: Arc::clone(&self.pending_entries),
+            fs_guard: Arc::clone(&self.fs_guard),
             _phantom: PhantomData,
         }
+    }
+}
+
+struct EntryReservation<'a> {
+    pending_entries: &'a AtomicU64,
+}
+
+impl Drop for EntryReservation<'_> {
+    fn drop(&mut self) {
+        self.pending_entries.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// Creates a new QueueStore
     pub fn new(directory: impl Into<PathBuf>, limit: u64, ext: &str) -> Self {
+        Self::new_with_compression(directory, limit, ext, queue_store_compression_enabled())
+    }
+
+    /// Creates a new QueueStore with an explicit compression setting.
+    pub fn new_with_compression(directory: impl Into<PathBuf>, limit: u64, ext: &str, compress: bool) -> Self {
         let file_ext = if ext.is_empty() { DEFAULT_EXT } else { ext };
+        let entry_limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
 
         QueueStore {
             directory: directory.into(),
-            entry_limit: if limit == 0 { DEFAULT_LIMIT } else { limit },
+            entry_limit,
             file_ext: file_ext.to_string(),
-            entries: Arc::new(RwLock::new(HashMap::with_capacity(limit as usize))),
+            compress,
+            entries: Arc::new(RwLock::new(HashMap::with_capacity(entry_limit as usize))),
+            pending_entries: Arc::new(AtomicU64::new(0)),
+            fs_guard: Arc::new(RwLock::new(())),
             _phantom: PhantomData,
         }
     }
 
     /// Returns the full path for a key
     fn file_path(&self, key: &Key) -> PathBuf {
-        self.directory.join(key.to_string())
+        self.directory.join(key.to_key_string())
+    }
+
+    fn build_key(&self, item_count: usize) -> Key {
+        Key {
+            name: Uuid::new_v4().to_string(),
+            extension: self.file_ext.clone(),
+            item_count,
+            compress: self.compress,
+        }
     }
 
     /// Reads a file for the given key
     fn read_file(&self, key: &Key) -> Result<Vec<u8>, StoreError> {
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
         let path = self.file_path(key);
-        debug!("Reading file for key: {},path: {}", key.to_string(), path.display());
+        debug!("Reading file for key: {},path: {}", key, path.display());
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound
@@ -220,41 +289,89 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             return Err(StoreError::NotFound);
         }
 
-        if key.compress {
-            let mut decoder = Decoder::new();
-            decoder
-                .decompress_vec(&data)
-                .map_err(|e| StoreError::Compression(e.to_string()))
-        } else {
-            Ok(data)
+        if !key.compress {
+            return Ok(data);
+        }
+
+        let mut decoder = Decoder::new();
+        decoder
+            .decompress_vec(&data)
+            .map_err(|e| StoreError::Compression(e.to_string()))
+    }
+
+    fn reserve_entry_slot(&self) -> Result<EntryReservation<'_>, StoreError> {
+        loop {
+            let entries = self
+                .entries
+                .read()
+                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
+            let entries_len = entries.len() as u64;
+            let pending = self.pending_entries.load(Ordering::SeqCst);
+
+            if entries_len + pending >= self.entry_limit {
+                return Err(StoreError::LimitExceeded);
+            }
+
+            if self
+                .pending_entries
+                .compare_exchange(pending, pending + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(EntryReservation {
+                    pending_entries: self.pending_entries.as_ref(),
+                });
+            }
         }
     }
 
-    /// Writes data to a file for the given key
-    fn write_file(&self, key: &Key, data: &[u8]) -> Result<(), StoreError> {
+    /// Writes data to a file for the given key.
+    fn write_file(&self, key: &Key, data: &[u8]) -> Result<i64, StoreError> {
         let path = self.file_path(key);
         // Create directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
 
-        let data = if key.compress {
+        if key.compress {
             let mut encoder = Encoder::new();
-            encoder
+            let compressed = encoder
                 .compress_vec(data)
-                .map_err(|e| StoreError::Compression(e.to_string()))?
+                .map_err(|e| StoreError::Compression(e.to_string()))?;
+            std::fs::write(&path, &compressed).map_err(StoreError::Io)?;
         } else {
-            data.to_vec()
-        };
-
-        std::fs::write(&path, &data).map_err(StoreError::Io)?;
+            std::fs::write(&path, data).map_err(StoreError::Io)?;
+        }
         let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+        debug!("Wrote event to store: {}", key);
+        Ok(modified)
+    }
+
+    fn insert_entry(&self, key: &Key, modified: i64) -> Result<(), StoreError> {
         let mut entries = self
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        entries.insert(key.to_string(), modified);
-        debug!("Wrote event to store: {}", key.to_string());
+        entries.insert(key.to_key_string(), modified);
+        Ok(())
+    }
+
+    fn remove_file_if_present(&self, key: &Key) -> Result<(), StoreError> {
+        let path = self.file_path(key);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StoreError::Io(err)),
+        }
+    }
+
+    fn write_and_index(&self, key: &Key, data: &[u8]) -> Result<(), StoreError> {
+        let modified = self.write_file(key, data)?;
+        if let Err(err) = self.insert_entry(key, modified) {
+            self.remove_file_if_present(key).map_err(|cleanup_err| {
+                StoreError::Internal(format!("Failed to index store entry {key}: {err}; cleanup failed: {cleanup_err}"))
+            })?;
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -267,15 +384,20 @@ where
     type Key = Key;
 
     fn open(&self) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on store filesystem".to_string()))?;
         std::fs::create_dir_all(&self.directory).map_err(StoreError::Io)?;
 
-        let entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
-        // Get the write lock to update the internal state
+        let dir_entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
         let mut entries_map = self
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        for entry in entries {
+        self.pending_entries.store(0, Ordering::SeqCst);
+        entries_map.clear();
+        for entry in dir_entries {
             let entry = entry.map_err(StoreError::Io)?;
             let metadata = entry.metadata().map_err(StoreError::Io)?;
             if metadata.is_file() {
@@ -292,71 +414,47 @@ where
     }
 
     fn put(&self, item: Arc<T>) -> Result<Self::Key, Self::Error> {
-        // Check storage limits
-        {
-            let entries = self
-                .entries
-                .read()
-                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
-
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(StoreError::LimitExceeded);
-            }
-        }
-
-        let uuid = Uuid::new_v4();
-        let key = Key {
-            name: uuid.to_string(),
-            extension: self.file_ext.clone(),
-            item_count: 1,
-            compress: true,
-        };
-
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
+        let key = self.build_key(1);
         let data = serde_json::to_vec(&*item).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        self.write_file(&key, &data)?;
+        self.write_and_index(&key, &data)?;
 
         Ok(key)
     }
 
     fn put_multiple(&self, items: Vec<T>) -> Result<Self::Key, Self::Error> {
-        // Check storage limits
-        {
-            let entries = self
-                .entries
-                .read()
-                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
-
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(StoreError::LimitExceeded);
-            }
-        }
         if items.is_empty() {
-            // Or return an error, or a special key?
             return Err(StoreError::Internal("Cannot put_multiple with empty items list".to_string()));
         }
-        let uuid = Uuid::new_v4();
-        let key = Key {
-            name: uuid.to_string(),
-            extension: self.file_ext.clone(),
-            item_count: items.len(),
-            compress: true,
-        };
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
+        let key = self.build_key(items.len());
 
-        // Serialize all items into a single Vec<u8>
-        // This current approach for get_multiple/put_multiple assumes items are concatenated JSON objects.
-        // This might be problematic for deserialization if not handled carefully.
-        // A better approach for multiple items might be to store them as a JSON array `Vec<T>`.
-        // For now, sticking to current logic of concatenating.
         let mut buffer = Vec::new();
         for item in items {
-            // If items are Vec<Event>, and Event is large, this could be inefficient.
-            // The current get_multiple deserializes one by one.
-            let item_data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
-            buffer.extend_from_slice(&item_data);
-            // If using JSON array: buffer = serde_json::to_vec(&items)?
+            serde_json::to_writer(&mut buffer, &item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         }
 
-        self.write_file(&key, &buffer)?;
+        self.write_and_index(&key, &buffer)?;
+
+        Ok(key)
+    }
+
+    fn put_raw(&self, data: &[u8]) -> Result<Self::Key, Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
+        let _reservation = self.reserve_entry_slot()?;
+        let key = self.build_key(1);
+        self.write_and_index(&key, data)?;
 
         Ok(key)
     }
@@ -373,8 +471,8 @@ where
     }
 
     fn get_multiple(&self, key: &Self::Key) -> Result<Vec<T>, Self::Error> {
-        debug!("Reading items from store for key: {}", key.to_string());
-        let data = self.read_file(key)?;
+        debug!("Reading items from store for key: {}", key);
+        let data = self.get_raw(key)?;
         if data.is_empty() {
             return Err(StoreError::Deserialization("Cannot deserialize empty data".to_string()));
         }
@@ -404,7 +502,7 @@ where
                         warn!(
                             "Expected {} items for key {}, but only found {}. Possible data corruption or incorrect item_count.",
                             key.item_count,
-                            key.to_string(),
+                            key,
                             items.len()
                         );
                         // Depending on strictness, this could be an error.
@@ -426,20 +524,24 @@ where
         Ok(items)
     }
 
+    fn get_raw(&self, key: &Self::Key) -> Result<Vec<u8>, Self::Error> {
+        self.read_file(key)
+    }
+
     fn del(&self, key: &Self::Key) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .read()
+            .map_err(|_| StoreError::Internal("Failed to acquire read lock on store filesystem".to_string()))?;
         let path = self.file_path(key);
-        std::fs::remove_file(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // If file not found, still try to remove from entries map in case of inconsistency
-                warn!(
-                    "File not found for key {} during del, but proceeding to remove from entries map.",
-                    key.to_string()
-                );
-                StoreError::NotFound
-            } else {
-                StoreError::Io(e)
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already gone — still clean up the entries map to avoid stale keys.
+                warn!("File not found for key {} during del, cleaning up entries map.", key);
             }
-        })?;
+            Err(e) => return Err(StoreError::Io(e)),
+        }
 
         // Get the write lock to update the internal state
         let mut entries = self
@@ -447,13 +549,30 @@ where
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
-        if entries.remove(&key.to_string()).is_none() {
-            // Key was not in the map, could be an inconsistency or already deleted.
-            // This is not necessarily an error if the file deletion succeeded or was NotFound.
+        if entries.remove(&key.to_key_string()).is_none() {
             debug!("Key {} not found in entries map during del, might have been already removed.", key);
         }
         debug!("Deleted event from store: {}", key.to_string());
         Ok(())
+    }
+
+    fn delete(&self) -> Result<(), Self::Error> {
+        let _fs_guard = self
+            .fs_guard
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on store filesystem".to_string()))?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
+        entries.clear();
+        self.pending_entries.store(0, Ordering::SeqCst);
+
+        match std::fs::remove_dir_all(&self.directory) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StoreError::Io(err)),
+        }
     }
 
     fn list(&self) -> Vec<Self::Key> {
@@ -490,5 +609,138 @@ where
 
     fn boxed_clone(&self) -> Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync> {
         Box::new(self.clone()) as Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    fn temp_store_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn resolve_queue_store_compression_defaults_to_true() {
+        assert!(resolve_queue_store_compression_from_env_value(None));
+    }
+
+    #[test]
+    fn resolve_queue_store_compression_respects_disabled_env_value() {
+        assert!(!resolve_queue_store_compression_from_env_value(Some("off")));
+        assert!(!resolve_queue_store_compression_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn put_uses_store_compression_setting_in_key() {
+        let dir = temp_store_dir("put-key");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+
+        let key = store.put(Arc::new("payload".to_string())).unwrap();
+
+        assert!(!key.compress);
+        assert!(store.file_path(&key).exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_key_round_trips_batch_and_compression_suffixes() {
+        let key = Key {
+            name: "event-id".to_string(),
+            extension: ".json".to_string(),
+            item_count: 3,
+            compress: true,
+        };
+
+        let parsed = parse_key(&key.to_key_string());
+
+        assert_eq!(parsed.name, key.name);
+        assert_eq!(parsed.extension, key.extension);
+        assert_eq!(parsed.item_count, key.item_count);
+        assert_eq!(parsed.compress, key.compress);
+    }
+
+    #[test]
+    fn put_raw_and_get_raw_round_trip_bytes() {
+        let dir = temp_store_dir("raw-roundtrip");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", true);
+        store.open().unwrap();
+
+        let payload = br#"{"kind":"notify","bucket":"demo","key":"alpha.txt"}"#;
+        let key = store.put_raw(payload).unwrap();
+        let raw = store.get_raw(&key).unwrap();
+
+        assert_eq!(raw, payload);
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn delete_removes_directory_and_clears_entries() {
+        let dir = temp_store_dir("delete-store");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+        let _ = store.put(Arc::new("payload".to_string())).unwrap();
+
+        store.delete().unwrap();
+
+        assert!(store.list().is_empty());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn put_enforces_entry_limit() {
+        let dir = temp_store_dir("limit");
+        let store = QueueStore::<String>::new_with_compression(&dir, 1, ".test", false);
+        store.open().unwrap();
+
+        let _ = store.put(Arc::new("first".to_string())).unwrap();
+        let err = store.put(Arc::new("second".to_string())).unwrap_err();
+
+        assert!(matches!(err, StoreError::LimitExceeded));
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn concurrent_put_raw_respects_entry_limit() {
+        let dir = temp_store_dir("concurrent-limit");
+        let store = Arc::new(QueueStore::<String>::new_with_compression(&dir, 1, ".test", true));
+        store.open().unwrap();
+
+        let start = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for idx in 0..4 {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                let payload = vec![b'x'; 32 * 1024 + idx];
+                start.wait();
+                store.put_raw(&payload)
+            }));
+        }
+
+        let mut successes = 0;
+        let mut limit_errors = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(_) => successes += 1,
+                Err(StoreError::LimitExceeded) => limit_errors += 1,
+                Err(err) => panic!("unexpected error: {err}"),
+            }
+        }
+
+        assert_eq!(successes, 1);
+        assert_eq!(limit_errors, 3);
+        assert_eq!(store.len(), 1);
+
+        let _ = store.delete();
     }
 }
