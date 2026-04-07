@@ -70,7 +70,7 @@ pub async fn start_http_server(
     config: &config::Config,
     worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
-) -> Result<tokio::sync::broadcast::Sender<()>> {
+) -> Result<(tokio::sync::broadcast::Sender<()>, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
 
@@ -488,7 +488,7 @@ pub async fn start_http_server(
         worker_state_manager.update(ServiceState::Stopped);
     });
 
-    Ok(shutdown_tx)
+    Ok((shutdown_tx, local_addr))
 }
 
 #[derive(Clone)]

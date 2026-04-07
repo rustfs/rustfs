@@ -258,7 +258,9 @@ impl RustFSServerBuilder {
         for v in &self.volumes {
             let p = Path::new(v);
             if !p.exists() {
-                std::fs::create_dir_all(p).map_err(|e| ServerError::Init(format!("failed to create volume dir {v}: {e}")))?;
+                tokio::fs::create_dir_all(p)
+                    .await
+                    .map_err(|e| ServerError::Init(format!("failed to create volume dir {v}: {e}")))?;
             }
         }
 
@@ -337,7 +339,8 @@ impl RustFSServerBuilder {
         // Start HTTP server.
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let shutdown_tx = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
+        let (shutdown_tx, bound_addr) = start_http_server(&s3_config, state_manager.clone(), readiness.clone())
+            .await?;
         let ctx = CancellationToken::new();
         let shutdown_embedded_server = || {
             let _ = shutdown_tx.send(());
@@ -439,9 +442,6 @@ impl RustFSServerBuilder {
         readiness.mark_stage(SystemStage::FullReady);
         rustfs_common::set_global_init_time_now().await;
 
-        // Resolve the actual bound address.
-        let bound_addr = server_addr;
-
         info!(
             target: "rustfs::embedded",
             "RustFS embedded server ready at http://{}",
@@ -537,7 +537,7 @@ impl RustFSServer {
 
         // Clean up temp directory if we created it.
         if let Some(ref dir) = self.temp_dir
-            && let Err(e) = std::fs::remove_dir_all(dir)
+            && let Err(e) = tokio::fs::remove_dir_all(dir).await
         {
             warn!("Failed to clean up temp dir {}: {e}", dir.display());
         }
