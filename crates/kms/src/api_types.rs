@@ -122,11 +122,7 @@ pub enum ConfigureKmsRequest {
     )]
     VaultKv2(ConfigureVaultKmsRequest),
     /// Configure with Vault Transit backend
-    #[serde(
-        rename = "VaultTransit",
-        alias = "vault-transit",
-        alias = "vault_transit"
-    )]
+    #[serde(rename = "VaultTransit", alias = "vault-transit", alias = "vault_transit")]
     VaultTransit(ConfigureVaultTransitKmsRequest),
 }
 
@@ -472,8 +468,7 @@ mod tests {
                 "mount_path": "transit",
                 "default_key_id": "rustfs-master-key"
             });
-            let request: ConfigureKmsRequest =
-                serde_json::from_value(raw).expect("vault-transit request should deserialize");
+            let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("vault-transit request should deserialize");
             let config = request.to_kms_config();
             assert_eq!(config.backend, KmsBackend::VaultTransit);
             let vault = config.vault_transit_config().expect("vault-transit config should be present");

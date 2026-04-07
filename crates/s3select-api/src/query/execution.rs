@@ -24,7 +24,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
-use tracing::debug; // Added missing import for debug!  
+use tracing::debug;
 
 use crate::{QueryError, QueryResult};
 
@@ -50,10 +50,9 @@ impl Drop for PhaseTimer {
     fn drop(&mut self) {
         let duration = self.start_time.elapsed();
 
-        #[cfg(all(feature = "metrics", not(test)))]
         if !std::thread::panicking() {
-            use metrics::histogram;
-            histogram!("rustfs.s3select.phase.duration.seconds", "phase" => &self.phase_name).record(duration.as_secs_f64());
+            metrics::histogram!("rustfs.s3select.phase.duration.seconds", "phase" => &self.phase_name)
+                .record(duration.as_secs_f64());
         }
 
         debug!("Phase '{}' took {:?}", self.phase_name, duration);
