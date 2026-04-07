@@ -639,8 +639,8 @@ impl FolderScanner {
                     continue;
                 }
 
-                // Mirror MinIO readDirFn semantics: ignore entries that disappeared
-                // during traversal or hit symlink loops, but propagate other walk errors.
+                // Ignore entries that disappeared during traversal or hit symlink
+                // loops, but propagate other walk errors.
                 let mut entry_type = match entry.file_type().await {
                     Ok(entry_type) => entry_type,
                     Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => continue,
