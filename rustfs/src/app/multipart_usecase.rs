@@ -23,7 +23,7 @@ use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
-    parse_copy_source_range, put_opts,
+    parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::build_list_parts_output;
@@ -558,6 +558,12 @@ impl DefaultMultipartUsecase {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        validate_archive_content_encoding(
+            &key,
+            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
+            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+        )?;
 
         let mut metadata = extract_metadata(&req.headers);
 
