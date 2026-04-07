@@ -429,7 +429,7 @@ impl RustFSServerBuilder {
         );
 
         // Success — disarm the temp dir guard so it isn't cleaned up on drop.
-        let temp_dir = temp_dir_guard.map(|g| g.keep());
+        let temp_dir = temp_dir_guard.map(|g| g.into_path());
 
         Ok(RustFSServer {
             address: bound_addr,
