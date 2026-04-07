@@ -23,7 +23,7 @@ use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
-use crate::utils::extract_claims;
+use crate::utils::{extract_claims, extract_claims_allow_missing_exp};
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_madmin::AddOrUpdateUserReq;
@@ -396,14 +396,9 @@ impl<T: Store> IamSys<T> {
             }
         }
 
-        // set expiration time default to 1 hour
-        m.insert(
-            "exp".to_string(),
-            Value::Number(serde_json::Number::from(
-                opts.expiration
-                    .map_or(OffsetDateTime::now_utc().unix_timestamp() + 3600, |t| t.unix_timestamp()),
-            )),
-        );
+        if let Some(expiration) = opts.expiration {
+            m.insert("exp".to_string(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
+        }
 
         let (access_key, secret_key) = if !opts.access_key.is_empty() || !opts.secret_key.is_empty() {
             (opts.access_key, opts.secret_key)
@@ -417,7 +412,6 @@ impl<T: Store> IamSys<T> {
         cred.status = ACCOUNT_ON.to_owned();
         cred.name = opts.name;
         cred.description = opts.description;
-        cred.expiration = opts.expiration;
 
         let create_at = self.store.add_service_account(cred.clone()).await?;
 
@@ -456,7 +450,7 @@ impl<T: Store> IamSys<T> {
     }
 
     async fn get_service_account_internal(&self, access_key: &str) -> Result<(UserIdentity, Option<Policy>)> {
-        let (sa, claims) = match self.get_account_with_claims(access_key).await {
+        let (sa, claims) = match self.get_account_with_claims_allow_missing_exp(access_key).await {
             Ok(res) => res,
             Err(err) => {
                 if is_err_no_such_account(&err) {
@@ -490,6 +484,19 @@ impl<T: Store> IamSys<T> {
         };
 
         let m = extract_jwt_claims(&acc)?;
+
+        Ok((acc, m))
+    }
+
+    async fn get_account_with_claims_allow_missing_exp(
+        &self,
+        access_key: &str,
+    ) -> Result<(UserIdentity, HashMap<String, Value>)> {
+        let Some(acc) = self.store.get_user(access_key).await else {
+            return Err(IamError::NoSuchAccount(access_key.to_string()));
+        };
+
+        let m = crate::manager::extract_jwt_claims_allow_missing_exp(&acc)?;
 
         Ok((acc, m))
     }
@@ -553,7 +560,7 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         }
 
-        extract_jwt_claims(&u)
+        crate::manager::extract_jwt_claims_allow_missing_exp(&u)
     }
 
     pub async fn delete_service_account(&self, access_key: &str, notify: bool) -> Result<()> {
@@ -1039,6 +1046,23 @@ pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<Ha
     Ok(ms.claims)
 }
 
+pub fn get_claims_from_token_with_secret_allow_missing_exp(token: &str, secret: &str) -> Result<HashMap<String, Value>> {
+    let mut ms = extract_claims_allow_missing_exp::<HashMap<String, Value>>(token, secret)
+        .map_err(|e| Error::other(format!("extract claims err {e}")))?;
+
+    if let Some(session_policy) = ms.claims.get(SESSION_POLICY_NAME) {
+        let policy_str = session_policy.as_str().unwrap_or_default();
+        let policy = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(policy_str.as_bytes())
+            .map_err(|e| Error::other(format!("base64 decode err {e}")))?;
+        ms.claims.insert(
+            SESSION_POLICY_NAME_EXTRACTED.to_string(),
+            Value::String(String::from_utf8(policy).map_err(|e| Error::other(format!("utf8 decode err {e}")))?),
+        );
+    }
+    Ok(ms.claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,7 +1070,7 @@ mod tests {
     use crate::error::Error;
     use crate::manager::get_default_policyes;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
-    use rustfs_credentials::Credentials;
+    use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
     use rustfs_policy::auth::UserIdentity;
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -1086,7 +1110,7 @@ mod tests {
             _item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Ok(())
         }
 
         async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
@@ -1274,6 +1298,88 @@ mod tests {
 
             Ok(())
         }
+    }
+
+    fn ensure_test_global_credentials() {
+        if get_global_action_cred().is_none() {
+            let _ = init_global_action_credentials(Some("TESTROOTACCESSKEY".to_string()), Some("TESTROOTSECRET123".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_new_service_account_without_expiration_omits_exp_claim() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account("svc-parent-user", None, NewServiceAccountOpts::default())
+            .await
+            .expect("service account should be created without expiration");
+
+        assert!(cred.expiration.is_none());
+
+        let claims = get_claims_from_token_with_secret_allow_missing_exp(&cred.session_token, &cred.secret_key)
+            .expect("service account JWT without expiration should decode");
+        assert!(
+            !claims.contains_key("exp"),
+            "service account without explicit expiration should not get a default JWT exp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_service_account_updates_exp_claim() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let initial_expiration = OffsetDateTime::now_utc() + time::Duration::hours(2);
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "svc-parent-user",
+                None,
+                NewServiceAccountOpts {
+                    expiration: Some(initial_expiration),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("service account with explicit expiration should be created");
+
+        let updated_expiration = OffsetDateTime::now_utc() + time::Duration::hours(4);
+        iam_sys
+            .update_service_account(
+                &cred.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: Some(updated_expiration),
+                    status: None,
+                },
+            )
+            .await
+            .expect("service account expiration should update");
+
+        let updated_user = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("updated service account should exist");
+        assert_eq!(updated_user.credentials.expiration, Some(updated_expiration));
+
+        let claims =
+            get_claims_from_token_with_secret(&updated_user.credentials.session_token, &updated_user.credentials.secret_key)
+                .expect("updated service account JWT should decode");
+        assert_eq!(
+            claims.get("exp").and_then(|v| v.as_i64()),
+            Some(updated_expiration.unix_timestamp()),
+            "updating service account expiration must rewrite the JWT exp claim"
+        );
     }
 
     /// Regression test: temp credentials without groups in args still receive group-attached
