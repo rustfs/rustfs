@@ -312,13 +312,6 @@ impl DefaultObjectUsecase {
                 }
             };
 
-            let manager = get_concurrency_manager();
-            let fpath_clone = fpath.clone();
-            let bucket_clone = bucket.clone();
-            crate::storage::request_context::spawn_traced(async move {
-                manager.invalidate_cache_versioned(&bucket_clone, &fpath_clone, None).await;
-            });
-
             let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
             let output = PutObjectOutput {

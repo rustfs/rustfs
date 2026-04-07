@@ -18,7 +18,6 @@ use super::*;
 pub(super) struct GetObjectRequestContext {
     pub(super) bucket: String,
     pub(super) key: String,
-    pub(super) cache_key: String,
     pub(super) version_id_for_event: String,
     pub(super) part_number: Option<usize>,
     pub(super) rs: Option<HTTPRangeSpec>,

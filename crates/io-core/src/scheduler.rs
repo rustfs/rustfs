@@ -170,8 +170,6 @@ pub struct IoStrategy {
     pub buffer_multiplier: f64,
     /// Whether to enable readahead.
     pub enable_readahead: bool,
-    /// Whether cache writeback is enabled.
-    pub cache_writeback_enabled: bool,
     /// Whether to use buffered I/O.
     pub use_buffered_io: bool,
 
@@ -206,7 +204,6 @@ impl Default for IoStrategy {
             buffer_size: 128 * 1024,
             buffer_multiplier: 1.0,
             enable_readahead: true,
-            cache_writeback_enabled: false,
             use_buffered_io: true,
             concurrent_requests: 0,
             observed_bandwidth_bps: None,
@@ -384,7 +381,6 @@ impl IoScheduler {
             buffer_size,
             buffer_multiplier: concurrency_factor * load_factor * sequential_factor,
             enable_readahead: is_sequential && load_level != IoLoadLevel::Critical,
-            cache_writeback_enabled: load_level == IoLoadLevel::Low,
             use_buffered_io: true,
             concurrent_requests,
             observed_bandwidth_bps: None,

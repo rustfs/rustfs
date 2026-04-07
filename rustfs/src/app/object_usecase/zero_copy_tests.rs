@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage::concurrency::ConcurrencyManager;
 use futures::StreamExt;
 use http::{Extensions, HeaderMap, Method, Uri};
 use rustfs_ecstore::store_api::GetObjectChunkPath;
