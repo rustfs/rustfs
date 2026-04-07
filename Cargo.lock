@@ -8430,6 +8430,7 @@ dependencies = [
  "futures",
  "futures-core",
  "http 1.4.0",
+ "metrics",
  "object_store",
  "parking_lot 0.12.5",
  "pin-project-lite",
