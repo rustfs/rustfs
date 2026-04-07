@@ -110,6 +110,7 @@ pub struct ConfigureVaultTransitKmsRequest {
 #[serde(tag = "backend_type")]
 pub enum ConfigureKmsRequest {
     /// Configure with Local backend
+    #[serde(alias = "local", alias = "Local")]
     Local(ConfigureLocalKmsRequest),
     /// Configure with Vault KV v2 + Transit backend
     #[serde(
@@ -121,6 +122,11 @@ pub enum ConfigureKmsRequest {
     )]
     VaultKv2(ConfigureVaultKmsRequest),
     /// Configure with Vault Transit backend
+    #[serde(
+        rename = "VaultTransit",
+        alias = "vault-transit",
+        alias = "vault_transit"
+    )]
     VaultTransit(ConfigureVaultTransitKmsRequest),
 }
 
@@ -453,24 +459,39 @@ mod tests {
 
     #[test]
     fn test_deserialize_vault_transit_configure_request() {
+        let cases = ["VaultTransit", "vault-transit", "vault_transit"];
+        for raw_backend in cases {
+            let raw = serde_json::json!({
+                "backend_type": raw_backend,
+                "address": "http://127.0.0.1:8200",
+                "auth_method": {
+                    "Token": {
+                        "token": "dev-root-token"
+                    }
+                },
+                "mount_path": "transit",
+                "default_key_id": "rustfs-master-key"
+            });
+            let request: ConfigureKmsRequest =
+                serde_json::from_value(raw).expect("vault-transit request should deserialize");
+            let config = request.to_kms_config();
+            assert_eq!(config.backend, KmsBackend::VaultTransit);
+            let vault = config.vault_transit_config().expect("vault-transit config should be present");
+            assert_eq!(vault.mount_path, "transit");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_local_configure_request() {
         let raw = serde_json::json!({
-            "backend_type": "VaultTransit",
-            "address": "http://127.0.0.1:8200",
-            "auth_method": {
-                "Token": {
-                    "token": "dev-root-token"
-                }
-            },
-            "mount_path": "transit",
-            "default_key_id": "rustfs-master-key"
+            "backend_type": "local",
+            "key_dir": "./target/kms-key-dir"
         });
 
         let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("vault-transit request should deserialize");
         let config = request.to_kms_config();
 
-        assert_eq!(config.backend, KmsBackend::VaultTransit);
-        let vault = config.vault_transit_config().expect("vault-transit config should be present");
-        assert_eq!(vault.mount_path, "transit");
+        assert_eq!(config.backend, KmsBackend::Local);
     }
 
     #[test]

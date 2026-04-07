@@ -535,7 +535,7 @@ impl KmsBackend for VaultTransitKmsBackend {
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
-        let envelope = DataKeyEnvelope::deserialize(&request.ciphertext_blob)?;
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)?;
         let plaintext = self.client.decrypt(&request, None).await?;
         Ok(DecryptResponse {
             plaintext,
