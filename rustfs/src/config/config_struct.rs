@@ -139,6 +139,7 @@ impl Config {
             kms_key_dir: None,
             kms_vault_address: None,
             kms_vault_token: None,
+            kms_vault_mount_path: None,
             kms_default_key_id: None,
             buffer_profile_disable: false,
             buffer_profile: "GeneralPurpose".to_string(),

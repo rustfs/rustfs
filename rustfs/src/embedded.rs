@@ -235,11 +235,20 @@ impl RustFSServerBuilder {
         // Enforce single-server-per-process. Startup initializes process-global
         // OnceLock-backed state that cannot be rolled back safely, so any build
         // attempt is one-shot for the lifetime of the process.
-        if SERVER_STARTED.swap(true, Ordering::SeqCst) {
+        if SERVER_STARTED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(ServerError::AlreadyStarted);
         }
 
-        self.do_build().await
+        match self.do_build().await {
+            Ok(server) => Ok(server),
+            Err(err) => {
+                SERVER_STARTED.store(false, Ordering::SeqCst);
+                Err(err)
+            }
+        }
     }
 
     /// Inner build implementation. Separated from [`build`] so the outer
@@ -281,7 +290,7 @@ impl RustFSServerBuilder {
 
         // Crypto provider.
         if let Err(err) = default_provider().install_default() {
-            debug!("Ignoring crypto provider installation error: {err}");
+            debug!("Ignoring crypto provider installation error: {err:?}");
         }
 
         // Trusted proxies.
@@ -317,10 +326,10 @@ impl RustFSServerBuilder {
         set_global_addr(&config.address).await;
 
         // Endpoints / erasure setup.
-        let (endpoint_pools, setup_type) =
-            EndpointServerPools::from_volumes(server_addr.to_string().as_str(), config.volumes.clone())
-                .await
-                .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
+        let server_addr_str = server_addr.to_string();
+        let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
+            .await
+            .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
 
         set_global_endpoints(endpoint_pools.as_ref().clone());
         update_erasure_type(setup_type).await;

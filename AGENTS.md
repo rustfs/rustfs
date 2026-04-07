@@ -66,6 +66,9 @@ Do not open a PR with code changes when the required checks fail.
 - When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
 - After fixing code review comments or CI findings, always mark corresponding review
   comments/threads as resolved before returning to the user.
+- In handling review comments, confirm the underlying issue before changing code.
+  If a suggested change is not appropriate for behavior or risk, reply with a
+  concise rationale instead of blindly applying it.
 
 ## Security Baseline
 

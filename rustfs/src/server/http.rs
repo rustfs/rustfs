@@ -72,7 +72,6 @@ pub async fn start_http_server(
     readiness: Arc<GlobalReadiness>,
 ) -> Result<(tokio::sync::broadcast::Sender<()>, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
-    let server_port = server_addr.port();
 
     // The listening address and port are obtained from the parameters
     let listener = {
@@ -184,6 +183,7 @@ pub async fn start_http_server(
             local_addr.ip()
         }
     };
+    let local_port = local_addr.port();
 
     let local_ip_str = if local_ip.is_ipv6() {
         format!("[{local_ip}]")
@@ -192,19 +192,19 @@ pub async fn start_http_server(
     };
 
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
-    let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
+    let api_endpoints = format!("{protocol}://{local_ip_str}:{local_port}");
+    let localhost_endpoint = format!("{protocol}://127.0.0.1:{local_port}");
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if config.console_enable {
-        admin::console::init_console_cfg(local_ip, server_port);
+        admin::console::init_console_cfg(local_ip, local_port);
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html"
+            "Console WebUI available at: {protocol}://{local_ip_str}:{local_port}/rustfs/console/index.html"
         );
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",
+            "Console WebUI (localhost): {protocol}://127.0.0.1:{local_port}/rustfs/console/index.html",
 
         );
     } else {
@@ -245,9 +245,9 @@ pub async fn start_http_server(
             for domain in &config.server_domains {
                 domain_sets.insert(domain.to_string());
                 if let Some((host, _)) = domain.split_once(':') {
-                    domain_sets.insert(format!("{host}:{server_port}"));
+                    domain_sets.insert(format!("{host}:{local_port}"));
                 } else {
-                    domain_sets.insert(format!("{domain}:{server_port}"));
+                    domain_sets.insert(format!("{domain}:{local_port}"));
                 }
             }
 

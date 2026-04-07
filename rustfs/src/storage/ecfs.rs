@@ -44,6 +44,7 @@ pub(crate) struct ListObjectUnorderedQuery {
     pub(crate) allow_unordered: Option<String>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
