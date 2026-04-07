@@ -627,6 +627,7 @@ impl FolderScanner {
                         break;
                     }
                     Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                        warn!("scan_folder: path became non-directory during iteration {}: {}", dir_path, e);
                         break;
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
@@ -654,7 +655,10 @@ impl FolderScanner {
                         warn!("scan_folder: entry disappeared before type lookup {}: {}", entry_name, e);
                         continue;
                     }
-                    Err(e) if e.kind() == ErrorKind::TooManyLinks => continue,
+                    Err(e) if e.kind() == ErrorKind::TooManyLinks => {
+                        warn!("scan_folder: entry hit symlink loop before type lookup {}: {}", entry_name, e);
+                        continue;
+                    }
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
 
@@ -665,11 +669,15 @@ impl FolderScanner {
                             warn!("scan_folder: symlink target disappeared before metadata lookup {}: {}", file_path, e);
                             continue;
                         }
-                        Err(e) if e.kind() == ErrorKind::TooManyLinks => continue,
+                        Err(e) if e.kind() == ErrorKind::TooManyLinks => {
+                            warn!("scan_folder: symlink target hit loop before metadata lookup {}: {}", file_path, e);
+                            continue;
+                        }
                         Err(e) => return Err(ScannerError::Io(e)),
                     };
 
                     if metadata.is_dir() {
+                        warn!("scan_folder: ignoring symlinked directory {}", file_path);
                         continue;
                     }
 
