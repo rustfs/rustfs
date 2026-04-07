@@ -29,7 +29,6 @@ use rustfs_ecstore::{
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
-use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -42,37 +41,6 @@ pub struct FS {
 pub(crate) struct ListObjectUnorderedQuery {
     #[serde(rename = "allow-unordered")]
     pub(crate) allow_unordered: Option<String>,
-}
-
-#[allow(dead_code)]
-pub(crate) struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
-}
-
-impl AsyncRead for InMemoryAsyncReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let unfilled = buf.initialize_unfilled();
-        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
-        buf.advance(bytes_read);
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncSeek for InMemoryAsyncReader {
-    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        // std::io::Cursor natively supports negative SeekCurrent offsets
-        // It will automatically handle validation and return an error if the final position would be negative
-        std::io::Seek::seek(&mut self.cursor, position)?;
-        Ok(())
-    }
-
-    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
-        std::task::Poll::Ready(Ok(self.cursor.position()))
-    }
 }
 
 impl Default for FS {
