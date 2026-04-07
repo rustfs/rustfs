@@ -338,16 +338,21 @@ impl RustFSServerBuilder {
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
         let shutdown_tx = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
-
         let ctx = CancellationToken::new();
+        let shutdown_embedded_server = || {
+            let _ = shutdown_tx.send(());
+            ctx.cancel();
+        };
 
         // Storage engine.
-        let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
-            .await
-            .map_err(|e| {
+        let store = match ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone()).await {
+            Ok(store) => store,
+            Err(e) => {
                 error!("ECStore::new {:?}", e);
-                ServerError::Init(format!("ECStore: {e}"))
-            })?;
+                shutdown_embedded_server();
+                return Err(ServerError::Init(format!("ECStore: {e}")));
+            }
+        };
 
         ecconfig::init();
         ecconfig::try_migrate_server_config(store.clone()).await;
@@ -357,6 +362,7 @@ impl RustFSServerBuilder {
         while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
             retry += 1;
             if retry > 15 {
+                shutdown_embedded_server();
                 return Err(ServerError::Init(format!("init_global_config_sys failed after 15 retries: {e}")));
             }
             debug!("init_global_config_sys retry {retry}: {e}");
@@ -390,7 +396,10 @@ impl RustFSServerBuilder {
                 ..Default::default()
             })
             .await
-            .unwrap_or_default()
+            .map_err(|e| {
+                shutdown_embedded_server();
+                ServerError::Init(format!("list_bucket: {e}"))
+            })?
             .into_iter()
             .map(|v| v.name)
             .collect();
@@ -402,11 +411,17 @@ impl RustFSServerBuilder {
         // IAM.
         init_iam_sys(store.clone())
             .await
-            .map_err(|e| ServerError::Init(format!("IAM: {e}")))?;
+            .map_err(|e| {
+                shutdown_embedded_server();
+                ServerError::Init(format!("IAM: {e}"))
+            })?;
         readiness.mark_stage(SystemStage::IamReady);
 
         // App context.
-        let iam_interface = rustfs_iam::get().map_err(|e| ServerError::Init(format!("IAM get: {e}")))?;
+        let iam_interface = rustfs_iam::get().map_err(|e| {
+            shutdown_embedded_server();
+            ServerError::Init(format!("IAM get: {e}"))
+        })?;
         let kms_interface =
             rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
         let _app_context =
