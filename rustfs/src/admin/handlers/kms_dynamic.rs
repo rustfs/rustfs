@@ -210,7 +210,7 @@ impl Operation for ConfigureKmsHandler {
             }
         };
 
-        info!("Configuring KMS with request: {:?}", configure_request);
+        info!("Configuring KMS from admin request");
 
         let service_manager = kms_service_manager_from_context();
         let existing_config = service_manager.get_config().await;
