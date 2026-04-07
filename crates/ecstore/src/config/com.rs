@@ -16,7 +16,7 @@ use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, audit, notify, oidc, stor
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{ChunkNativePutData, ObjectInfo, ObjectOptions, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS};
@@ -128,10 +128,8 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    if let Err(err) = api
-        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
-        .await
-    {
+    let mut put_data = ChunkNativePutData::from_vec(data);
+    if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
         return Err(err);
     }
@@ -1078,10 +1076,10 @@ mod tests {
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::set_disk::SetDisks;
     use crate::store_api::{
-        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
-        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
+        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info,
+        ListOperations, MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
@@ -1304,7 +1302,7 @@ mod tests {
             &self,
             _bucket: &str,
             _object: &str,
-            _data: &mut PutObjReader,
+            _data: &mut ChunkNativePutData,
             _opts: &ObjectOptions,
         ) -> Result<ObjectInfo> {
             panic!("unused in test")
@@ -1491,7 +1489,7 @@ mod tests {
             _object: &str,
             _upload_id: &str,
             _part_id: usize,
-            _data: &mut PutObjReader,
+            _data: &mut ChunkNativePutData,
             _opts: &ObjectOptions,
         ) -> Result<PartInfo> {
             panic!("unused in test")
