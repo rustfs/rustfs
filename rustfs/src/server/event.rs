@@ -62,7 +62,7 @@ fn install_ecstore_event_dispatch_hook() {
 }
 
 /// Shuts down the event notifier system gracefully
-pub(crate) async fn shutdown_event_notifier() {
+pub async fn shutdown_event_notifier() {
     info!("Shutting down event notifier system...");
 
     if !rustfs_notify::is_notification_system_initialized() {
@@ -84,7 +84,7 @@ pub(crate) async fn shutdown_event_notifier() {
 }
 
 #[instrument]
-pub(crate) async fn init_event_notifier() {
+pub async fn init_event_notifier() {
     info!(
         target: "rustfs::main::init_event_notifier",
         "Initializing event notifier..."

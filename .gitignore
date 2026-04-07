@@ -50,3 +50,6 @@ rustfs-webdav.code-workspace
 
 .aiexclude
 *.bak
+# Local test/benchmark artifacts
+benchmarks.logs
+tmp/

@@ -12,41 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod admin;
-mod app;
-mod auth;
-mod auth_keystone;
-mod capacity;
-mod config;
-mod error;
-mod init;
-mod license;
-mod profiling;
-#[cfg(any(feature = "ftps", feature = "webdav"))]
-mod protocols;
-mod server;
-mod storage;
-mod update;
-mod version;
-
 // Ensure the correct path for parse_license is imported
-use crate::app::context::{AppContext, init_global_app_context};
-use crate::init::{
+use rustfs::app::context::{AppContext, init_global_app_context};
+use rustfs::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
 
 #[cfg(feature = "ftps")]
-use crate::init::{init_ftp_system, init_ftps_system};
+use rustfs::init::{init_ftp_system, init_ftps_system};
 
 #[cfg(feature = "webdav")]
-use crate::init::init_webdav_system;
+use rustfs::init::init_webdav_system;
 
-use crate::capacity::capacity_integration::init_capacity_management;
-use crate::server::{
+use rustfs::capacity::capacity_integration::init_capacity_management;
+use rustfs::license::{current_license, init_license, license_status};
+use rustfs::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use license::{current_license, init_license, license_status};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -95,8 +78,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
     not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 ))]
 #[global_allocator]
-static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
-    profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
+static GLOBAL: rustfs::profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
+    rustfs::profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
 
 #[cfg(target_os = "windows")]
 #[global_allocator]
@@ -108,7 +91,7 @@ fn main() {
     }
 
     // Build Tokio runtime with optional dial9 telemetry support
-    let runtime = server::build_tokio_runtime().expect("Failed to build Tokio runtime");
+    let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
     if let Err(ref e) = result {
         // Use eprintln as tracing may not be initialized at this point
@@ -154,7 +137,7 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 async fn async_main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    let command_result = match config::Opt::parse_command(args) {
+    let command_result = match rustfs::config::Opt::parse_command(args) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Command parse failed, error: {}", e);
@@ -163,19 +146,19 @@ async fn async_main() -> Result<()> {
     };
 
     // Handle info command
-    if let config::CommandResult::Info(opts) = command_result {
-        config::execute_info(&opts);
+    if let rustfs::config::CommandResult::Info(opts) = command_result {
+        rustfs::config::execute_info(&opts);
         return Ok(());
     }
 
     // Get config for server command
     let config = match command_result {
-        config::CommandResult::Server(cfg) => cfg,
-        config::CommandResult::Info(_) => unreachable!(),
+        rustfs::config::CommandResult::Server(cfg) => cfg,
+        rustfs::config::CommandResult::Info(_) => unreachable!(),
     };
 
     // Initialize the global config snapshot for info command
-    config::init_config_snapshot(&config);
+    rustfs::config::init_config_snapshot(&config);
 
     // Initialize the configuration
     init_license(config.license.clone());
@@ -216,10 +199,10 @@ async fn async_main() -> Result<()> {
     }
 
     // print startup logo
-    info!("{}", server::LOGO);
+    info!("{}", rustfs::server::LOGO);
 
     // Initialize performance profiling if enabled
-    profiling::init_from_env().await;
+    rustfs::profiling::init_from_env().await;
 
     // Initialize trusted proxies system
     rustfs_trusted_proxies::init();
@@ -233,7 +216,7 @@ async fn async_main() -> Result<()> {
     // Server-side TLS acceptor is built separately inside start_http_server()
     // using the same TlsMaterialSnapshot loading logic.
     if let Some(tls_path) = &config.tls_path {
-        match server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+        match rustfs::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
             Ok(snapshot) => {
                 snapshot.apply_outbound().await;
                 info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
@@ -256,14 +239,14 @@ async fn async_main() -> Result<()> {
 }
 
 #[instrument(skip(config))]
-async fn run(config: config::Config) -> Result<()> {
+async fn run(config: rustfs::config::Config) -> Result<()> {
     debug!("config: {:?}", &config);
     // 1. Initialize global readiness tracker
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region_str) = &config.region {
         region_str
-            .parse()
+            .parse::<s3s::region::Region>()
             .map(rustfs_ecstore::global::set_global_region)
             .map_err(|e| Error::other(format!("invalid region '{}': {}", region_str, e)))?;
     }
@@ -277,7 +260,7 @@ async fn run(config: config::Config) -> Result<()> {
         server_address = %server_address,
         ip = %server_addr.ip(),
         port = %server_port,
-        version = %version::get_version(),
+        version = %rustfs::version::get_version(),
         "Starting RustFS server at {}",
         &server_address
     );
@@ -353,14 +336,14 @@ async fn run(config: config::Config) -> Result<()> {
     let s3_shutdown_tx = {
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let s3_shutdown_tx = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
+        let (s3_shutdown_tx, _) = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
     let console_shutdown_tx = if config.console_enable && !config.console_address.is_empty() {
         let mut console_config = config.clone();
         console_config.address = console_config.console_address.clone();
-        let console_shutdown_tx = start_http_server(&console_config, state_manager.clone(), readiness.clone()).await?;
+        let (console_shutdown_tx, _) = start_http_server(&console_config, state_manager.clone(), readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
@@ -468,7 +451,7 @@ async fn run(config: config::Config) -> Result<()> {
     }
 
     // Initialize deadlock detector if enabled
-    let detector = storage::deadlock_detector::get_deadlock_detector();
+    let detector = rustfs::storage::deadlock_detector::get_deadlock_detector();
     if detector.is_enabled() {
         detector.start();
         info!(target: "rustfs::main::run","Deadlock detector started successfully.");
@@ -504,7 +487,7 @@ async fn run(config: config::Config) -> Result<()> {
     // 3a. Initialize Keystone authentication if enabled
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
-        match auth_keystone::init_keystone_auth(keystone_config).await {
+        match rustfs::auth_keystone::init_keystone_auth(keystone_config).await {
             Ok(_) => info!("Keystone authentication initialized successfully"),
             Err(e) => {
                 error!("Failed to initialize Keystone authentication: {}", e);
@@ -569,13 +552,13 @@ async fn run(config: config::Config) -> Result<()> {
         init_metrics_system(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
-        crate::init::init_auto_tuner(ctx.clone()).await;
+        rustfs::init::init_auto_tuner(ctx.clone()).await;
     }
 
     info!(
         target: "rustfs::main::run",
         "RustFS server version: {} started successfully at {}, current time: {}",
-        version::get_version(),
+        rustfs::version::get_version(),
         &server_address,
         jiff::Zoned::now()
     );
@@ -718,7 +701,7 @@ async fn handle_shutdown(
         target: "rustfs::main::handle_shutdown",
         "Stopping profiling tasks..."
     );
-    profiling::shutdown_profiling();
+    rustfs::profiling::shutdown_profiling();
 
     info!(
         target: "rustfs::main::handle_shutdown",

@@ -27,6 +27,10 @@ categories.workspace = true
 documentation = "https://docs.rustfs.com/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rustfs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rustfs"
 path = "src/main.rs"
@@ -89,6 +93,7 @@ rustfs-io-metrics = { workspace = true }
 rustfs-object-io = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
+tempfile = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }

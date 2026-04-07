@@ -43,6 +43,12 @@ pub(crate) struct ListObjectUnorderedQuery {
     pub(crate) allow_unordered: Option<String>,
 }
 
+impl Default for FS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FS {
     pub fn new() -> Self {
         rustfs_s3_common::init_s3_metrics();
