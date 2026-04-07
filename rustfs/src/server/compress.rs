@@ -316,6 +316,8 @@ impl Predicate for CompressionPredicate {
         }
 
         // Hard-stop archive/media/package MIME types even if the whitelist matches.
+        // This includes tar, gzip, bzip2, xz, zstd, zip, rar, 7z, lzip, lzma, lzop variants,
+        // plus video/*, audio/*, image/*, font/*, application/pdf, and application/wasm.
         if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
             && let Ok(ct) = content_type.to_str()
         {
