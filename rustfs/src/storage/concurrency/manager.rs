@@ -18,9 +18,8 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::object_cache::{CacheStats, CachedGetObject, TieredObjectCache, WarmupPattern};
 use super::request_guard::GetObjectGuard;
-use rustfs_concurrency::{GetObjectCacheEligibility, GetObjectQueueSnapshot};
+use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
 use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
@@ -37,12 +36,8 @@ pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::
 
 #[derive(Clone)]
 pub struct ConcurrencyManager {
-    /// Tiered object cache (L1 + L2) for frequently accessed objects
-    cache: Arc<TieredObjectCache>,
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
-    /// Whether object caching is enabled (from RUSTFS_OBJECT_CACHE_ENABLE env var)
-    cache_enabled: bool,
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
@@ -94,35 +89,16 @@ impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
     /// Reads configuration from environment variables:
-    /// - `RUSTFS_OBJECT_CACHE_ENABLE`: Enable/disable object caching (default: true)
-    /// - `RUSTFS_OBJECT_TIERED_CACHE_ENABLE`: Enable tiered L1+L2 caching (default: true)
     /// - `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`: Maximum concurrent disk reads (default: 64)
     pub fn new() -> Self {
         // Load scheduler configuration once at initialization
         let scheduler_config = IoSchedulerConfig::from_env();
-
-        let cache_enabled =
-            rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_CACHE_ENABLE, rustfs_config::DEFAULT_OBJECT_CACHE_ENABLE);
-
-        let tiered_cache_enabled = rustfs_utils::get_env_bool(
-            rustfs_config::ENV_OBJECT_TIERED_CACHE_ENABLE,
-            rustfs_config::DEFAULT_OBJECT_TIERED_CACHE_ENABLE,
-        );
 
         let max_disk_reads = scheduler_config.max_concurrent_reads;
 
         // Detect storage media
         let storage_media =
             detect_storage_media(scheduler_config.storage_detection_enabled, &scheduler_config.storage_media_override);
-
-        // Create tiered cache configuration
-        let cache = if tiered_cache_enabled {
-            Arc::new(TieredObjectCache::new())
-        } else {
-            // If tiered cache is disabled, create a simple tiered cache (acts as single-level)
-            // For now, we always use TieredObjectCache since the configuration is now enabled by default
-            Arc::new(TieredObjectCache::new())
-        };
 
         // Initialize I/O pattern detector
         let pattern_detector = Arc::new(Mutex::new(IoPatternDetector::new(
@@ -155,9 +131,7 @@ impl ConcurrencyManager {
         };
 
         Self {
-            cache,
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
-            cache_enabled,
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
             priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
             bytes_pool: Arc::new(BytesPool::new_tiered()),
@@ -169,34 +143,9 @@ impl ConcurrencyManager {
         }
     }
 
-    /// Check if object caching is enabled
-    ///
-    /// Returns true if the `RUSTFS_OBJECT_CACHE_ENABLE` environment variable
-    /// is set to "true" (case-insensitive). When disabled, cache lookups and
-    /// writebacks are skipped, reducing memory usage at the cost of repeated
-    /// disk reads for the same objects.
-    ///
-    /// # Returns
-    ///
-    /// `true` if caching is enabled, `false` otherwise
-    pub fn is_cache_enabled(&self) -> bool {
-        self.cache_enabled
-    }
-
     /// Track a GetObject request
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
-    }
-
-    /// Try to get an object from cache
-    pub async fn get_cached(&self, key: &str) -> Option<Arc<Vec<u8>>> {
-        self.cache.get_bytes(key).await
-    }
-
-    /// Cache an object for future retrievals
-    pub async fn cache_object(&self, key: String, data: Vec<u8>) {
-        let cached_data = Arc::new(data);
-        self.cache.put_bytes(key, cached_data).await;
     }
 
     /// Get the bytes pool for buffer allocation
@@ -531,256 +480,12 @@ impl ConcurrencyManager {
         &self.scheduler_config
     }
 
-    /// Get cache statistics
-    pub async fn cache_stats(&self) -> CacheStats {
-        self.cache.stats_as_hot_cache().await
-    }
-
-    /// Clear all cached objects
-    pub async fn clear_cache(&self) {
-        self.cache.clear().await;
-    }
-
-    /// Reset cache hit/miss metrics counters.
-    ///
-    /// This is useful for testing to get a clean slate for hit rate calculations.
-    pub fn reset_cache_metrics(&self) {
-        self.cache.reset_metrics();
-    }
-
-    /// Check if a key is cached
-    pub async fn is_cached(&self, key: &str) -> bool {
-        self.cache.contains(key).await
-    }
-
-    /// Get multiple cached objects in a single operation
-    pub async fn get_cached_batch(&self, keys: &[String]) -> Vec<Option<Arc<Vec<u8>>>> {
-        self.cache.get_batch_bytes(keys).await
-    }
-
-    /// Remove a specific object from cache
-    pub async fn remove_cached(&self, key: &str) -> bool {
-        self.cache.remove(key).await.is_some()
-    }
-
-    /// Get the most frequently accessed keys
-    pub async fn get_hot_keys(&self, limit: usize) -> Vec<(String, u64)> {
-        let keys = self.cache.get_hot_keys(limit).await;
-        keys.into_iter().map(|(k, v)| (k, v as u64)).collect()
-    }
-
-    /// Get cache hit rate percentage
-    pub fn cache_hit_rate(&self) -> f64 {
-        self.cache.hit_rate()
-    }
-
-    /// Warm up cache with frequently accessed objects
-    ///
-    /// This can be called during server startup or maintenance windows
-    /// to pre-populate the cache with known hot objects.
-    pub async fn warm_cache(&self, objects: Vec<(String, Vec<u8>)>) {
-        if !self.cache_enabled {
-            debug!("Cache is disabled, skipping warmup");
-            return;
-        }
-
-        // Cache each object
-        for (key, data) in objects {
-            self.cache_object(key, data).await;
-        }
-    }
-
-    /// Warm up cache with a specific pattern.
-    ///
-    /// This method supports different warming patterns for more intelligent
-    /// cache pre-population during server startup or maintenance windows.
-    ///
-    /// # Arguments
-    ///
-    /// * `pattern` - The warming pattern to use
-    ///
-    /// # Returns
-    ///
-    /// The number of objects successfully warmed
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Warm the 100 most recently accessed objects
-    /// let pattern = WarmupPattern::RecentAccesses { limit: 100 };
-    /// let warmed = manager.warm_cache_with_pattern(pattern).await;
-    ///
-    /// // Warm specific keys
-    /// let keys = vec!["bucket1/key1".to_string(), "bucket1/key2".to_string()];
-    /// let pattern = WarmupPattern::SpecificKeys(keys);
-    /// manager.warm_cache_with_pattern(pattern).await;
-    /// ```
-    pub async fn warm_cache_with_pattern(&self, pattern: WarmupPattern) -> usize {
-        if !self.cache_enabled {
-            debug!("Cache is disabled, skipping warmup");
-            return 0;
-        }
-
-        debug!("warm_cache_with_pattern called with pattern: {:?}", pattern);
-
-        // Delegate to the tiered cache's warm implementation
-        // Note: This returns the count of keys identified for warming,
-        // but actual object loading from storage would need to be implemented
-        // at a higher layer (object_usecase) that has access to storage backends
-        self.cache.warm(pattern).await
-    }
-
     /// Get optimized buffer size for a request
     ///
     /// This wraps the advanced buffer sizing logic and makes it accessible
     /// through the concurrency manager interface.
     pub fn buffer_size(&self, file_size: i64, base: usize, sequential: bool) -> usize {
         get_advanced_buffer_size(file_size, base, sequential)
-    }
-
-    // ============================================
-    // Response Cache Methods (CachedGetObject)
-    // ============================================
-
-    /// Get a cached GetObject response with full metadata
-    ///
-    /// This method retrieves a complete GetObject response from the response cache,
-    /// including body data and all response metadata (e_tag, last_modified, content_type, etc.).
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
-    ///
-    /// # Returns
-    ///
-    /// * `Some(Arc<CachedGetObject>)` - Cached response data if found and not expired
-    /// * `None` - Cache miss
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let cache_key = format!("{}/{}", bucket, key);
-    /// if let Some(cached) = manager.get_cached_object(&cache_key).await {
-    ///     // Build response from cached data
-    ///     let output = GetObjectOutput {
-    ///         body: Some(StreamingBlob::from(cached.body.clone())),
-    ///         content_length: Some(cached.content_length),
-    ///         e_tag: cached.e_tag.clone(),
-    ///         last_modified: cached.last_modified.as_ref().map(|s| parse_rfc3339(s)),
-    ///         ..Default::default()
-    ///     };
-    /// }
-    /// ```
-    pub async fn get_cached_object(&self, key: &str) -> Option<Arc<CachedGetObject>> {
-        self.cache.get_response(key).await
-    }
-
-    /// Cache a complete GetObject response for future retrievals
-    ///
-    /// This method caches a complete GetObject response including body and all metadata.
-    /// Objects larger than the maximum cache size (10MB by default) or empty objects
-    /// are not cached.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - Cache key in the format "{bucket}/{key}" or "{bucket}/{key}?versionId={version_id}"
-    /// * `response` - The complete cached response to store
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let cached = CachedGetObject {
-    ///     body: Bytes::from(data),
-    ///     content_length: data.len() as i64,
-    ///     content_type: Some("application/octet-stream".to_string()),
-    ///     e_tag: Some("\"abc123\"".to_string()),
-    ///     last_modified: Some("2024-01-01T00:00:00Z".to_string()),
-    ///     ..Default::default()
-    /// };
-    /// manager.put_cached_object(cache_key, cached).await;
-    /// ```
-    pub async fn put_cached_object(&self, key: String, response: CachedGetObject) {
-        self.cache.put_response(key, response).await;
-    }
-
-    /// Invalidate cache entries for a specific object
-    ///
-    /// This method removes both simple byte cache and response cache entries
-    /// for the given key. Should be called after write operations (put_object,
-    /// copy_object, delete_object, etc.) to prevent stale data from being served.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - Cache key to invalidate (e.g., "{bucket}/{key}")
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After put_object succeeds
-    /// let cache_key = format!("{}/{}", bucket, key);
-    /// manager.invalidate_cache(&cache_key).await;
-    /// ```
-    pub async fn invalidate_cache(&self, key: &str) {
-        self.cache.invalidate(key).await;
-    }
-
-    /// Invalidate cache entries for an object and its latest version
-    ///
-    /// For versioned buckets, this invalidates both:
-    /// - The specific version key: "{bucket}/{key}?versionId={version_id}"
-    /// - The latest version key: "{bucket}/{key}"
-    ///
-    /// This ensures that after a write/delete, clients don't receive stale data.
-    /// Should be called after any write operation that modifies object data or creates
-    /// new versions.
-    ///
-    /// # Arguments
-    ///
-    /// * `bucket` - Bucket name
-    /// * `key` - Object key
-    /// * `version_id` - Optional version ID (if None, only invalidates the base key)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // After delete_object with version
-    /// manager.invalidate_cache_versioned(&bucket, &key, Some(&version_id)).await;
-    ///
-    /// // After put_object (invalidates latest)
-    /// manager.invalidate_cache_versioned(&bucket, &key, None).await;
-    /// ```
-    pub async fn invalidate_cache_versioned(&self, bucket: &str, key: &str, version_id: Option<&str>) {
-        self.cache.invalidate_versioned(bucket, key, version_id).await;
-    }
-
-    /// Generate a cache key for an object
-    ///
-    /// Creates a cache key in the appropriate format based on whether a version ID
-    /// is specified. For versioned requests, uses "{bucket}/{key}?versionId={version_id}".
-    /// For non-versioned requests, uses "{bucket}/{key}".
-    ///
-    /// # Arguments
-    ///
-    /// * `bucket` - Bucket name
-    /// * `key` - Object key
-    /// * `version_id` - Optional version ID
-    ///
-    /// # Returns
-    ///
-    /// Cache key string
-    pub fn make_cache_key(bucket: &str, key: &str, version_id: Option<&str>) -> String {
-        match version_id {
-            Some(vid) => format!("{bucket}/{key}?versionId={vid}"),
-            None => format!("{bucket}/{key}"),
-        }
-    }
-
-    /// Get maximum cacheable object size
-    ///
-    /// Returns the maximum size in bytes for objects that can be cached.
-    /// Objects larger than this size are not cached to prevent memory exhaustion.
-    pub fn max_object_size(&self) -> usize {
-        self.cache.max_object_size()
     }
 
     // ============================================
@@ -868,26 +573,6 @@ impl ConcurrencyManager {
         self.disk_read_semaphore.acquire().await
     }
 
-    /// Build the minimal cache eligibility decision for a GetObject response.
-    pub fn get_object_cache_eligibility(
-        &self,
-        cache_writeback_enabled: bool,
-        is_part_request: bool,
-        is_range_request: bool,
-        encryption_applied: bool,
-        response_size: i64,
-    ) -> GetObjectCacheEligibility {
-        GetObjectCacheEligibility {
-            cache_enabled: self.is_cache_enabled(),
-            cache_writeback_enabled,
-            is_part_request,
-            is_range_request,
-            encryption_applied,
-            response_size,
-            max_cacheable_size: self.max_object_size(),
-        }
-    }
-
     /// Get the global concurrency manager instance.
     pub fn global() -> &'static Self {
         &CONCURRENCY_MANAGER
@@ -907,7 +592,6 @@ impl Default for ConcurrencyManager {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use bytes::Bytes;
     use serial_test::serial;
 
     #[tokio::test]
@@ -924,43 +608,6 @@ mod integration_tests {
 
         assert_eq!(small_priority, IoPriority::High);
         assert_eq!(large_priority, IoPriority::Low);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_concurrency_manager_cache_operations() {
-        let manager = ConcurrencyManager::new();
-
-        // Test cache put and get
-        let obj = CachedGetObject::new(Bytes::from("test data"), 9)
-            .with_content_type("text/plain".to_string())
-            .with_e_tag("\"abc123\"".to_string());
-
-        manager.put_cached_object("test-key".to_string(), obj).await;
-
-        let cached = manager.get_cached_object("test-key").await;
-        assert!(cached.is_some());
-
-        let cached_obj = cached.unwrap();
-        assert_eq!(cached_obj.content_type, Some("text/plain".to_string()));
-        assert_eq!(cached_obj.e_tag, Some("\"abc123\"".to_string()));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_concurrency_manager_cache_stats() {
-        let manager = ConcurrencyManager::new();
-
-        // Add some objects
-        for i in 0..5 {
-            let obj = CachedGetObject::new(Bytes::from(format!("data{}", i)), 5);
-            manager.put_cached_object(format!("key{}", i), obj).await;
-        }
-
-        // Get stats
-        let stats = manager.cache_stats().await;
-
-        assert!(stats.entries >= 5);
     }
 
     #[tokio::test]
@@ -1006,44 +653,6 @@ mod integration_tests {
         assert_eq!(manager.get_io_priority(500 * 1024), IoPriority::High); // 500KB
         assert_eq!(manager.get_io_priority(5 * 1024 * 1024), IoPriority::Normal); // 5MB
         assert_eq!(manager.get_io_priority(50 * 1024 * 1024), IoPriority::Low); // 50MB
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_concurrency_manager_cache_invalidation() {
-        let manager = ConcurrencyManager::new();
-
-        // Add an object
-        let obj = CachedGetObject::new(Bytes::from("test"), 4);
-        manager.put_cached_object("test-key".to_string(), obj).await;
-
-        // Verify it's cached
-        assert!(manager.is_cached("test-key").await);
-
-        // Invalidate
-        manager.invalidate_cache("test-key").await;
-
-        // Should not be cached anymore
-        assert!(!manager.is_cached("test-key").await);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_concurrency_manager_cache_clear() {
-        let manager = ConcurrencyManager::new();
-
-        // Add multiple objects
-        for i in 0..10 {
-            let obj = CachedGetObject::new(Bytes::from(format!("data{}", i)), 5);
-            manager.put_cached_object(format!("key{}", i), obj).await;
-        }
-
-        // Clear cache
-        manager.clear_cache().await;
-
-        // Verify all are removed
-        let stats = manager.cache_stats().await;
-        assert_eq!(stats.entries, 0);
     }
 
     #[tokio::test]

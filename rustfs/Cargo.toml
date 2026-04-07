@@ -124,7 +124,6 @@ serde_urlencoded = { workspace = true }
 # Cryptography and Security
 rustls = { workspace = true }
 subtle = { workspace = true }
-chrono = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
@@ -142,7 +141,6 @@ hex-simd.workspace = true
 matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
-moka = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }

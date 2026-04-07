@@ -14,14 +14,13 @@
 
 //! Concurrency optimization module for high-performance object retrieval.
 //!
-//! This module provides concurrency management, I/O scheduling, and object caching
+//! This module provides concurrency management and I/O scheduling
 //! for high-performance object retrieval operations.
 //!
 //! # Architecture
 //!
 //! The module is organized into several components:
 //! - **I/O Scheduling**: Adaptive buffer sizing and load management
-//! - **Object Caching**: Tiered L1/L2 cache for frequently accessed objects
 //! - **Concurrency Management**: Coordination of concurrent GetObject requests
 //! - **Request Tracking**: RAII guards for request lifecycle management
 //!
@@ -37,7 +36,6 @@
 // pub mod io_profile; // Migrated to rustfs-io-core
 pub mod io_schedule;
 pub mod manager;
-pub mod object_cache;
 pub mod request_guard;
 
 // ============================================
@@ -53,10 +51,6 @@ pub use io_schedule::{
 
 // Request tracking
 pub use request_guard::GetObjectGuard;
-
-// Cache types
-#[allow(unused_imports)]
-pub use object_cache::{CacheHealthStatus, CacheStats, CachedGetObject};
 
 // Concurrency manager
 pub use manager::ConcurrencyManager;

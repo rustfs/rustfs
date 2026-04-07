@@ -625,8 +625,6 @@ impl DefaultObjectUsecase {
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_version.clone());
-
         let put_version = if bucket_prefix_versioning_enabled(&bucket, &key).await {
             raw_version.clone()
         } else {

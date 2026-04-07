@@ -16,7 +16,6 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http::HeaderMap;
 use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LANGUAGE};
-use rustfs_concurrency::GetObjectCacheEligibility;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
@@ -32,7 +31,8 @@ use s3s::dto::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+#[cfg(test)]
+use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tokio_util::io::ReaderStream;
 
@@ -164,30 +164,6 @@ pub fn get_object_sequential_hint(rs: Option<&HTTPRangeSpec>) -> bool {
     }
 }
 
-pub trait CachedGetObjectSource {
-    fn body(&self) -> &Arc<Bytes>;
-    fn content_length(&self) -> i64;
-    fn content_type(&self) -> Option<&str>;
-    fn e_tag(&self) -> Option<&str>;
-    fn last_modified(&self) -> Option<&str>;
-    fn expires(&self) -> Option<&str>;
-    fn cache_control(&self) -> Option<&str>;
-    fn content_disposition(&self) -> Option<&str>;
-    fn content_encoding(&self) -> Option<&str>;
-    fn content_language(&self) -> Option<&str>;
-    fn storage_class(&self) -> Option<&str>;
-    fn version_id(&self) -> Option<&str>;
-    fn delete_marker(&self) -> bool;
-    fn tag_count(&self) -> Option<i32>;
-    fn user_metadata(&self) -> &HashMap<String, String>;
-    fn checksum_crc32(&self) -> Option<&str>;
-    fn checksum_crc32c(&self) -> Option<&str>;
-    fn checksum_sha1(&self) -> Option<&str>;
-    fn checksum_sha256(&self) -> Option<&str>;
-    fn checksum_crc64nvme(&self) -> Option<&str>;
-    fn checksum_type(&self) -> Option<&ChecksumType>;
-}
-
 pub struct GetObjectOutputContext {
     pub output: GetObjectOutput,
     pub event_info: ObjectInfo,
@@ -200,6 +176,14 @@ pub struct GetObjectOutputContext {
 pub struct GetObjectStrategyLayout {
     pub is_sequential_hint: bool,
     pub optimal_buffer_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetObjectBodyPlanningInputs {
+    pub is_part_request: bool,
+    pub is_range_request: bool,
+    pub encryption_applied: bool,
+    pub response_size: i64,
 }
 
 pub enum GetObjectBodySource {
@@ -237,79 +221,25 @@ pub struct LegacyReadPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetObjectBodyPlan {
-    CacheWriteback,
     BufferEncrypted,
     BufferSeekable,
     Stream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GetObjectDataPlaneRequestSource {
-    CacheServed,
-    Disk,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetObjectDataPlaneMetricContract {
-    pub request_source: GetObjectDataPlaneRequestSource,
     pub io_path: rustfs_io_metrics::IoPath,
     pub copy_mode: rustfs_io_metrics::CopyMode,
-    pub record_cache_served_metric: bool,
-    pub record_cache_writeback_metric: bool,
 }
 
 impl GetObjectDataPlaneMetricContract {
-    pub fn cache_served() -> Self {
-        Self {
-            request_source: GetObjectDataPlaneRequestSource::CacheServed,
-            io_path: rustfs_io_metrics::IoPath::Fast,
-            copy_mode: rustfs_io_metrics::CopyMode::SharedBytes,
-            record_cache_served_metric: true,
-            record_cache_writeback_metric: false,
-        }
+    pub fn disk(io_path: rustfs_io_metrics::IoPath, copy_mode: rustfs_io_metrics::CopyMode) -> Self {
+        Self { io_path, copy_mode }
     }
-
-    pub fn disk(
-        io_path: rustfs_io_metrics::IoPath,
-        copy_mode: rustfs_io_metrics::CopyMode,
-        body_plan: GetObjectBodyPlan,
-    ) -> Self {
-        Self {
-            request_source: GetObjectDataPlaneRequestSource::Disk,
-            io_path,
-            copy_mode,
-            record_cache_served_metric: false,
-            record_cache_writeback_metric: matches!(body_plan, GetObjectBodyPlan::CacheWriteback),
-        }
-    }
-}
-
-pub struct GetObjectCacheWriteback {
-    pub body: Arc<Bytes>,
-    pub content_length: i64,
-    pub content_type: Option<String>,
-    pub content_encoding: Option<String>,
-    pub cache_control: Option<String>,
-    pub content_disposition: Option<String>,
-    pub content_language: Option<String>,
-    pub expires: Option<String>,
-    pub storage_class: Option<String>,
-    pub version_id: Option<String>,
-    pub delete_marker: bool,
-    pub user_metadata: HashMap<String, String>,
-    pub e_tag: Option<String>,
-    pub last_modified: Option<String>,
-    pub checksum_crc32: Option<String>,
-    pub checksum_crc32c: Option<String>,
-    pub checksum_sha1: Option<String>,
-    pub checksum_sha256: Option<String>,
-    pub checksum_crc64nvme: Option<String>,
-    pub checksum_type: Option<ChecksumType>,
 }
 
 pub struct GetObjectBodyMaterialization {
     pub body: Option<StreamingBlob>,
-    pub cache_writeback: Option<GetObjectCacheWriteback>,
     pub plan: GetObjectBodyPlan,
 }
 
@@ -330,53 +260,26 @@ pub struct ChunkReadSetupResult {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeGetObjectBodyError {
-    #[error("failed to read object for caching: {0}")]
-    CacheRead(std::io::Error),
     #[error("failed to read decrypted object: {0}")]
     EncryptedRead(std::io::Error),
-}
-
-pub enum GetObjectResponseMode {
-    Plain,
-    CorsWrapped,
 }
 
 pub struct GetObjectFlowResult {
     pub output: GetObjectOutput,
     pub event_info: ObjectInfo,
     pub version_id_for_event: String,
-    pub response_mode: GetObjectResponseMode,
 }
 
 pub fn build_get_object_flow_result(
     output: GetObjectOutput,
     event_info: ObjectInfo,
     version_id_for_event: String,
-    response_mode: GetObjectResponseMode,
 ) -> GetObjectFlowResult {
     GetObjectFlowResult {
         output,
         event_info,
         version_id_for_event,
-        response_mode,
     }
-}
-
-pub fn build_cached_get_object_flow_result_from_source<T>(
-    bucket: &str,
-    key: &str,
-    cached: &T,
-    version_id_for_event: String,
-) -> GetObjectFlowResult
-where
-    T: CachedGetObjectSource,
-{
-    build_get_object_flow_result(
-        build_cached_get_object_output_from_source(cached),
-        build_cached_get_object_event_info_from_source(bucket, key, cached),
-        version_id_for_event,
-        GetObjectResponseMode::Plain,
-    )
 }
 
 pub fn build_cors_wrapped_get_object_flow_result(
@@ -390,79 +293,7 @@ pub fn build_cors_wrapped_get_object_flow_result(
         optimal_buffer_size: _,
         copy_mode_override: _,
     } = output_context;
-    build_get_object_flow_result(output, event_info, version_id_for_event, GetObjectResponseMode::CorsWrapped)
-}
-
-pub fn build_cached_get_object_output_from_source<T>(cached: &T) -> GetObjectOutput
-where
-    T: CachedGetObjectSource,
-{
-    let body_data = Arc::clone(cached.body());
-    let body = Some(StreamingBlob::wrap::<_, std::convert::Infallible>(futures_util::stream::once(
-        async move { Ok((*body_data).clone()) },
-    )));
-
-    let last_modified = cached
-        .last_modified()
-        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-        .map(Timestamp::from);
-    let expires = cached
-        .expires()
-        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-        .map(Timestamp::from);
-
-    let content_type = cached.content_type().and_then(|ct| ContentType::from_str(ct).ok());
-
-    let metadata = (!cached.user_metadata().is_empty()).then(|| cached.user_metadata().clone());
-
-    GetObjectOutput {
-        body,
-        content_length: Some(cached.content_length()),
-        accept_ranges: Some("bytes".to_string()),
-        e_tag: cached.e_tag().map(to_s3s_etag),
-        last_modified,
-        expires,
-        content_type,
-        cache_control: cached.cache_control().map(str::to_string),
-        content_disposition: cached.content_disposition().map(str::to_string),
-        content_encoding: cached.content_encoding().map(str::to_string),
-        content_language: cached.content_language().map(str::to_string),
-        version_id: cached.version_id().map(str::to_string),
-        delete_marker: Some(cached.delete_marker()),
-        tag_count: cached.tag_count(),
-        metadata,
-        checksum_crc32: cached.checksum_crc32().map(str::to_string),
-        checksum_crc32c: cached.checksum_crc32c().map(str::to_string),
-        checksum_sha1: cached.checksum_sha1().map(str::to_string),
-        checksum_sha256: cached.checksum_sha256().map(str::to_string),
-        checksum_crc64nvme: cached.checksum_crc64nvme().map(str::to_string),
-        checksum_type: cached.checksum_type().cloned(),
-        ..Default::default()
-    }
-}
-pub fn build_cached_get_object_event_info_from_source<T>(bucket: &str, key: &str, cached: &T) -> ObjectInfo
-where
-    T: CachedGetObjectSource,
-{
-    let last_modified = cached.last_modified().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-    let version_id = cached.version_id().and_then(|v| uuid::Uuid::parse_str(v).ok());
-
-    ObjectInfo {
-        bucket: bucket.to_string(),
-        name: key.to_string(),
-        storage_class: cached.storage_class().map(str::to_string),
-        mod_time: last_modified,
-        size: cached.content_length(),
-        actual_size: cached.content_length(),
-        is_dir: false,
-        user_defined: cached.user_metadata().clone(),
-        version_id,
-        delete_marker: cached.delete_marker(),
-        content_type: cached.content_type().map(str::to_string),
-        content_encoding: cached.content_encoding().map(str::to_string),
-        etag: cached.e_tag().map(str::to_string),
-        ..Default::default()
-    }
+    build_get_object_flow_result(output, event_info, version_id_for_event)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -559,19 +390,15 @@ pub fn plan_get_object_strategy_layout(
 }
 
 pub fn plan_get_object_body(
-    cache_eligibility: GetObjectCacheEligibility,
+    planning_inputs: GetObjectBodyPlanningInputs,
     seekable_object_size_threshold: usize,
 ) -> GetObjectBodyPlan {
-    if cache_eligibility.should_cache() {
-        return GetObjectBodyPlan::CacheWriteback;
-    }
+    let should_buffer_for_seek = planning_inputs.response_size > 0
+        && planning_inputs.response_size <= seekable_object_size_threshold as i64
+        && !planning_inputs.is_part_request
+        && !planning_inputs.is_range_request;
 
-    let should_buffer_for_seek = cache_eligibility.response_size > 0
-        && cache_eligibility.response_size <= seekable_object_size_threshold as i64
-        && !cache_eligibility.is_part_request
-        && !cache_eligibility.is_range_request;
-
-    if cache_eligibility.encryption_applied && should_buffer_for_seek {
+    if planning_inputs.encryption_applied && should_buffer_for_seek {
         GetObjectBodyPlan::BufferEncrypted
     } else if should_buffer_for_seek {
         GetObjectBodyPlan::BufferSeekable
@@ -580,57 +407,8 @@ pub fn plan_get_object_body(
     }
 }
 
-pub fn build_get_object_cache_writeback(info: &ObjectInfo, body: Bytes, content_length: i64) -> GetObjectCacheWriteback {
-    let checksums = read_object_checksums(info, &HeaderMap::new(), None).unwrap_or_default();
-    let body = FrozenGetObjectBody::new(body);
-    GetObjectCacheWriteback {
-        body: body.into_shared_body(),
-        content_length,
-        content_type: info.content_type.clone(),
-        content_encoding: info.content_encoding.clone(),
-        cache_control: None,
-        content_disposition: None,
-        content_language: None,
-        expires: None,
-        storage_class: info.storage_class.clone(),
-        version_id: info.version_id.map(|vid| {
-            if vid == uuid::Uuid::nil() {
-                "null".to_string()
-            } else {
-                vid.to_string()
-            }
-        }),
-        delete_marker: info.delete_marker,
-        user_metadata: HashMap::new(),
-        e_tag: info.etag.clone(),
-        last_modified: info.mod_time.and_then(|t| t.format(&Rfc3339).ok()),
-        checksum_crc32: checksums.crc32,
-        checksum_crc32c: checksums.crc32c,
-        checksum_sha1: checksums.sha1,
-        checksum_sha256: checksums.sha256,
-        checksum_crc64nvme: checksums.crc64nvme,
-        checksum_type: checksums.checksum_type,
-    }
-}
-
-pub fn finalize_get_object_cache_writeback(
-    info: &ObjectInfo,
-    writeback: GetObjectCacheWriteback,
-    user_metadata: HashMap<String, String>,
-) -> GetObjectCacheWriteback {
-    GetObjectCacheWriteback {
-        cache_control: info.user_defined.get(CACHE_CONTROL.as_str()).cloned(),
-        content_disposition: info.user_defined.get(CONTENT_DISPOSITION.as_str()).cloned(),
-        content_language: info.user_defined.get(CONTENT_LANGUAGE.as_str()).cloned(),
-        expires: info.expires.and_then(|t| t.format(&Rfc3339).ok()),
-        user_metadata,
-        ..writeback
-    }
-}
-
 pub async fn materialize_get_object_body<R>(
     mut final_stream: R,
-    info: &ObjectInfo,
     plan: GetObjectBodyPlan,
     response_content_length: i64,
     optimal_buffer_size: usize,
@@ -639,23 +417,6 @@ where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
     match plan {
-        GetObjectBodyPlan::CacheWriteback => {
-            let mut buf = Vec::with_capacity(response_content_length as usize);
-            tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf)
-                .await
-                .map_err(MaterializeGetObjectBodyError::CacheRead)?;
-            let body = FrozenGetObjectBody::new(Bytes::from(buf));
-
-            Ok(GetObjectBodyMaterialization {
-                body: body.build_blob(response_content_length, optimal_buffer_size),
-                cache_writeback: Some(build_get_object_cache_writeback(
-                    info,
-                    body.shared_body().as_ref().clone(),
-                    response_content_length,
-                )),
-                plan,
-            })
-        }
         GetObjectBodyPlan::BufferEncrypted => {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf)
@@ -665,7 +426,6 @@ where
 
             Ok(GetObjectBodyMaterialization {
                 body: body.build_blob(response_content_length, optimal_buffer_size),
-                cache_writeback: None,
                 plan,
             })
         }
@@ -676,15 +436,10 @@ where
                 Err(_) => build_reader_blob(final_stream, response_content_length, optimal_buffer_size),
             };
 
-            Ok(GetObjectBodyMaterialization {
-                body,
-                cache_writeback: None,
-                plan,
-            })
+            Ok(GetObjectBodyMaterialization { body, plan })
         }
         GetObjectBodyPlan::Stream => Ok(GetObjectBodyMaterialization {
             body: build_reader_blob(final_stream, response_content_length, optimal_buffer_size),
-            cache_writeback: None,
             plan,
         }),
     }
@@ -1056,116 +811,6 @@ pub fn plan_chunk_read(
 mod tests {
     use super::*;
 
-    struct MockCachedSource {
-        body: Arc<Bytes>,
-        content_length: i64,
-        content_type: Option<String>,
-        e_tag: Option<String>,
-        last_modified: Option<String>,
-        expires: Option<String>,
-        cache_control: Option<String>,
-        content_disposition: Option<String>,
-        content_encoding: Option<String>,
-        content_language: Option<String>,
-        storage_class: Option<String>,
-        version_id: Option<String>,
-        delete_marker: bool,
-        tag_count: Option<i32>,
-        user_metadata: HashMap<String, String>,
-        checksum_crc32: Option<String>,
-        checksum_crc32c: Option<String>,
-        checksum_sha1: Option<String>,
-        checksum_sha256: Option<String>,
-        checksum_crc64nvme: Option<String>,
-        checksum_type: Option<ChecksumType>,
-    }
-
-    impl CachedGetObjectSource for MockCachedSource {
-        fn body(&self) -> &Arc<Bytes> {
-            &self.body
-        }
-
-        fn content_length(&self) -> i64 {
-            self.content_length
-        }
-
-        fn content_type(&self) -> Option<&str> {
-            self.content_type.as_deref()
-        }
-
-        fn e_tag(&self) -> Option<&str> {
-            self.e_tag.as_deref()
-        }
-
-        fn last_modified(&self) -> Option<&str> {
-            self.last_modified.as_deref()
-        }
-
-        fn expires(&self) -> Option<&str> {
-            self.expires.as_deref()
-        }
-
-        fn cache_control(&self) -> Option<&str> {
-            self.cache_control.as_deref()
-        }
-
-        fn content_disposition(&self) -> Option<&str> {
-            self.content_disposition.as_deref()
-        }
-
-        fn content_encoding(&self) -> Option<&str> {
-            self.content_encoding.as_deref()
-        }
-
-        fn content_language(&self) -> Option<&str> {
-            self.content_language.as_deref()
-        }
-
-        fn storage_class(&self) -> Option<&str> {
-            self.storage_class.as_deref()
-        }
-
-        fn version_id(&self) -> Option<&str> {
-            self.version_id.as_deref()
-        }
-
-        fn delete_marker(&self) -> bool {
-            self.delete_marker
-        }
-
-        fn tag_count(&self) -> Option<i32> {
-            self.tag_count
-        }
-
-        fn user_metadata(&self) -> &HashMap<String, String> {
-            &self.user_metadata
-        }
-
-        fn checksum_crc32(&self) -> Option<&str> {
-            self.checksum_crc32.as_deref()
-        }
-
-        fn checksum_crc32c(&self) -> Option<&str> {
-            self.checksum_crc32c.as_deref()
-        }
-
-        fn checksum_sha1(&self) -> Option<&str> {
-            self.checksum_sha1.as_deref()
-        }
-
-        fn checksum_sha256(&self) -> Option<&str> {
-            self.checksum_sha256.as_deref()
-        }
-
-        fn checksum_crc64nvme(&self) -> Option<&str> {
-            self.checksum_crc64nvme.as_deref()
-        }
-
-        fn checksum_type(&self) -> Option<&ChecksumType> {
-            self.checksum_type.as_ref()
-        }
-    }
-
     #[test]
     fn map_chunk_copy_mode_uses_expected_metric_modes() {
         assert_eq!(
@@ -1426,60 +1071,37 @@ mod tests {
     }
 
     #[test]
-    fn plan_get_object_body_prefers_cache_writeback_when_cacheable() {
+    fn plan_get_object_body_buffers_seekable_small_plain_request() {
         let plan = plan_get_object_body(
-            GetObjectCacheEligibility {
-                cache_enabled: true,
-                cache_writeback_enabled: true,
+            GetObjectBodyPlanningInputs {
                 is_part_request: false,
                 is_range_request: false,
                 encryption_applied: false,
                 response_size: 1024,
-                max_cacheable_size: 2048,
             },
             4096,
         );
 
-        assert_eq!(plan, GetObjectBodyPlan::CacheWriteback);
+        assert_eq!(plan, GetObjectBodyPlan::BufferSeekable);
     }
 
     #[test]
-    fn cache_served_metric_contract_is_mutually_exclusive_with_cache_writeback() {
-        let contract = GetObjectDataPlaneMetricContract::cache_served();
+    fn disk_metric_contract_preserves_io_labels() {
+        let contract =
+            GetObjectDataPlaneMetricContract::disk(rustfs_io_metrics::IoPath::Legacy, rustfs_io_metrics::CopyMode::SingleCopy);
 
-        assert_eq!(contract.request_source, GetObjectDataPlaneRequestSource::CacheServed);
-        assert_eq!(contract.io_path, rustfs_io_metrics::IoPath::Fast);
-        assert_eq!(contract.copy_mode, rustfs_io_metrics::CopyMode::SharedBytes);
-        assert!(contract.record_cache_served_metric);
-        assert!(!contract.record_cache_writeback_metric);
-    }
-
-    #[test]
-    fn disk_metric_contract_can_mark_cache_writeback_without_reclassifying_request_source() {
-        let contract = GetObjectDataPlaneMetricContract::disk(
-            rustfs_io_metrics::IoPath::Legacy,
-            rustfs_io_metrics::CopyMode::SingleCopy,
-            GetObjectBodyPlan::CacheWriteback,
-        );
-
-        assert_eq!(contract.request_source, GetObjectDataPlaneRequestSource::Disk);
         assert_eq!(contract.io_path, rustfs_io_metrics::IoPath::Legacy);
         assert_eq!(contract.copy_mode, rustfs_io_metrics::CopyMode::SingleCopy);
-        assert!(!contract.record_cache_served_metric);
-        assert!(contract.record_cache_writeback_metric);
     }
 
     #[test]
     fn plan_get_object_body_uses_encrypted_buffer_for_small_plain_request() {
         let plan = plan_get_object_body(
-            GetObjectCacheEligibility {
-                cache_enabled: false,
-                cache_writeback_enabled: false,
+            GetObjectBodyPlanningInputs {
                 is_part_request: false,
                 is_range_request: false,
                 encryption_applied: true,
                 response_size: 1024,
-                max_cacheable_size: 0,
             },
             4096,
         );
@@ -1516,74 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn build_get_object_cache_writeback_formats_metadata() {
-        let info = ObjectInfo {
-            content_type: Some("application/octet-stream".to_string()),
-            etag: Some("abc123".to_string()),
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
-            checksum: rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"abc")
-                .map(|checksum| checksum.to_bytes(&[])),
-            ..Default::default()
-        };
-
-        let writeback = build_get_object_cache_writeback(&info, Bytes::from_static(b"abc"), 3);
-
-        assert_eq!(*writeback.body, Bytes::from_static(b"abc"));
-        assert_eq!(writeback.content_length, 3);
-        assert_eq!(writeback.content_type.as_deref(), Some("application/octet-stream"));
-        assert_eq!(writeback.e_tag.as_deref(), Some("abc123"));
-        assert_eq!(writeback.last_modified.as_deref(), Some("1970-01-01T00:00:00Z"));
-        assert_eq!(writeback.checksum_crc32.as_deref(), Some("NSRBwg=="));
-    }
-
-    #[test]
-    fn finalize_get_object_cache_writeback_applies_http_metadata_and_user_metadata() {
-        let mut info = ObjectInfo {
-            expires: Some(OffsetDateTime::UNIX_EPOCH),
-            ..Default::default()
-        };
-        info.user_defined
-            .insert("cache-control".to_string(), "max-age=3600".to_string());
-        info.user_defined
-            .insert("content-disposition".to_string(), "attachment".to_string());
-        info.user_defined.insert("content-language".to_string(), "en-US".to_string());
-
-        let writeback = finalize_get_object_cache_writeback(
-            &info,
-            GetObjectCacheWriteback {
-                body: Arc::new(Bytes::from_static(b"abc")),
-                content_length: 3,
-                content_type: None,
-                content_encoding: None,
-                cache_control: None,
-                content_disposition: None,
-                content_language: None,
-                expires: None,
-                storage_class: None,
-                version_id: None,
-                delete_marker: false,
-                user_metadata: HashMap::new(),
-                e_tag: None,
-                last_modified: None,
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-                checksum_type: None,
-            },
-            HashMap::from([(String::from("custom"), String::from("value"))]),
-        );
-
-        assert_eq!(writeback.cache_control.as_deref(), Some("max-age=3600"));
-        assert_eq!(writeback.content_disposition.as_deref(), Some("attachment"));
-        assert_eq!(writeback.content_language.as_deref(), Some("en-US"));
-        assert_eq!(writeback.expires.as_deref(), Some("1970-01-01T00:00:00Z"));
-        assert_eq!(writeback.user_metadata.get("custom").map(String::as_str), Some("value"));
-    }
-
-    #[test]
-    fn frozen_get_object_body_reuses_same_shared_bytes_for_cache_writeback() {
+    fn frozen_get_object_body_reuses_same_shared_bytes_for_memory_blob() {
         let frozen = FrozenGetObjectBody::new(Bytes::from_static(b"abc"));
         let shared = Arc::clone(frozen.shared_body());
         assert_eq!(*shared, Bytes::from_static(b"abc"));
@@ -1626,45 +1181,6 @@ mod tests {
         assert_eq!(output_context.output.version_id.as_deref(), Some("null"));
         assert_eq!(output_context.copy_mode_override, Some(rustfs_io_metrics::CopyMode::Reconstructed));
         assert_eq!(output_context.optimal_buffer_size, 4096);
-    }
-
-    #[test]
-    fn build_cached_get_object_flow_result_from_source_builds_plain_mode() {
-        let result = build_cached_get_object_flow_result_from_source(
-            "bucket",
-            "key",
-            &MockCachedSource {
-                body: Arc::new(Bytes::from_static(b"abc")),
-                content_length: 3,
-                content_type: None,
-                e_tag: None,
-                last_modified: None,
-                expires: None,
-                cache_control: None,
-                content_disposition: None,
-                content_encoding: None,
-                content_language: None,
-                storage_class: None,
-                version_id: None,
-                delete_marker: false,
-                tag_count: None,
-                user_metadata: HashMap::new(),
-                checksum_crc32: Some("crc32".to_string()),
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-                checksum_type: Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)),
-            },
-            "vid".to_string(),
-        );
-
-        assert!(matches!(result.response_mode, GetObjectResponseMode::Plain));
-        assert_eq!(result.version_id_for_event, "vid");
-        assert_eq!(result.event_info.bucket, "bucket");
-        assert_eq!(result.event_info.name, "key");
-        assert_eq!(result.output.checksum_crc32.as_deref(), Some("crc32"));
-        assert_eq!(result.output.checksum_type, Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)));
     }
 
     #[test]
@@ -1720,7 +1236,6 @@ mod tests {
             "vid".to_string(),
         );
 
-        assert!(matches!(result.response_mode, GetObjectResponseMode::CorsWrapped));
         assert_eq!(result.version_id_for_event, "vid");
     }
 

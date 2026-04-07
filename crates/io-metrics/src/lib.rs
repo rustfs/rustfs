@@ -34,7 +34,7 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //! // Simple recording
-//! record_get_object(100.0, 1024, true);
+//! record_get_object(100.0, 1024);
 //!
 //! // Advanced usage with collector
 //! let metrics = Arc::new(PerformanceMetrics::new());
@@ -167,7 +167,6 @@ pub enum IoStage {
     Unknown,
     ReadSetup,
     HttpBridge,
-    CacheWriteback,
     LocalDiskChunk,
     RangeGuard,
     PutTransform,
@@ -180,7 +179,6 @@ impl IoStage {
             Self::Unknown => "unknown",
             Self::ReadSetup => "read_setup",
             Self::HttpBridge => "http_bridge",
-            Self::CacheWriteback => "cache_writeback",
             Self::LocalDiskChunk => "local_disk_chunk",
             Self::RangeGuard => "range_guard",
             Self::PutTransform => "put_transform",
@@ -261,14 +259,6 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
     histogram!("rustfs_io_get_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
 }
 
-/// Record GetObject cache-served response.
-#[inline(always)]
-pub fn record_get_object_cache_served(duration_secs: f64, size_bytes: usize) {
-    counter!("rustfs_io_get_object_cache_served_total").increment(1);
-    histogram!("rustfs_io_get_object_cache_serve_duration_seconds").record(duration_secs);
-    histogram!("rustfs_io_get_object_cache_size_bytes").record(size_bytes as f64);
-}
-
 /// Record GetObject timeout for a specific stage.
 #[inline(always)]
 pub fn record_get_object_timeout(stage: Option<&str>, elapsed_secs: Option<f64>) {
@@ -319,12 +309,6 @@ pub fn record_get_object_io_state(
     gauge!("rustfs_io_queue_permits_available").set(permits_available as f64);
     gauge!("rustfs_io_buffer_multiplier").set(buffer_multiplier);
     counter!("rustfs_io_strategy_selected_total", "level" => load_level.to_string()).increment(1);
-}
-
-/// Record object cache writeback.
-#[inline(always)]
-pub fn record_object_cache_writeback() {
-    counter!("rustfs_io_object_cache_writeback_total").increment(1);
 }
 
 /// Record which request path was selected for an operation.
@@ -526,23 +510,16 @@ pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
 ///
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
-/// * `from_cache` - Whether the object was served from cache
 ///
 /// Note: this function records aggregate S3 GET metrics only. It must not be
 /// interpreted as the definitive source of truth for data-plane copy mode.
 #[inline(always)]
-pub fn record_get_object(duration_ms: f64, size_bytes: i64, from_cache: bool) {
+pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
     counter!("rustfs.s3.get_object.total").increment(1);
     histogram!("rustfs.s3.get_object.duration.ms").record(duration_ms);
 
     if size_bytes > 0 {
         histogram!("rustfs.s3.get_object.size.bytes").record(size_bytes as f64);
-    }
-
-    if from_cache {
-        counter!("rustfs.s3.get_object.cache.hits.total").increment(1);
-    } else {
-        counter!("rustfs.s3.get_object.cache.misses.total").increment(1);
     }
 }
 
@@ -672,51 +649,6 @@ pub fn record_io_load_level(load_level: &str, concurrent_requests: u64) {
     .increment(1);
 
     gauge!("rustfs.io.concurrent.requests").set(concurrent_requests as f64);
-}
-
-// ============================================================================
-// Cache Performance Metrics
-// ============================================================================
-
-/// Record tiered cache operation.
-///
-/// # Arguments
-///
-/// * `tier` - Cache tier ("l1" for hot objects, "l2" for standard objects)
-/// * `operation` - Operation type ("hit", "miss", "put", "evict")
-/// * `size_bytes` - Object size in bytes (for put/evict operations)
-#[inline(always)]
-pub fn record_tiered_cache_operation(tier: &str, operation: &str, size_bytes: Option<usize>) {
-    counter!("rustfs.cache.operations.total",
-        "tier" => tier.to_string(),
-        "operation" => operation.to_string(),
-    )
-    .increment(1);
-
-    // Track cache size for put/evict operations
-    if let Some(size) = size_bytes
-        && matches!(operation, "put" | "evict")
-    {
-        gauge!("rustfs.cache.operation.size.bytes",
-            "tier" => tier.to_string(),
-            "operation" => operation.to_string(),
-        )
-        .set(size as f64);
-    }
-}
-
-/// Record cache hit rate for a tier.
-///
-/// # Arguments
-///
-/// * `tier` - Cache tier ("l1", "l2", or "overall")
-/// * `hit_rate` - Hit rate as a percentage (0.0 - 100.0)
-#[inline(always)]
-pub fn record_cache_hit_rate(tier: &str, hit_rate: f64) {
-    gauge!("rustfs.cache.hit.rate",
-        "tier" => tier.to_string(),
-    )
-    .set(hit_rate);
 }
 
 /// Record cache size and entry count.
@@ -1040,8 +972,8 @@ mod tests {
     // S3 Operation Metrics Tests
     #[test]
     fn test_record_get_object() {
-        record_get_object(100.0, 1024 * 1024, true);
-        record_get_object(50.0, 2048, false);
+        record_get_object(100.0, 1024 * 1024);
+        record_get_object(50.0, 2048);
     }
 
     #[test]
@@ -1080,21 +1012,6 @@ mod tests {
         record_io_load_level("low", 2);
         record_io_load_level("medium", 5);
         record_io_load_level("high", 15);
-    }
-
-    // Cache Metrics Tests
-    #[test]
-    fn test_record_tiered_cache_operation() {
-        record_tiered_cache_operation("l1", "hit", None);
-        record_tiered_cache_operation("l2", "put", Some(1024));
-        record_tiered_cache_operation("l1", "evict", Some(2048));
-    }
-
-    #[test]
-    fn test_record_cache_hit_rate() {
-        record_cache_hit_rate("l1", 85.0);
-        record_cache_hit_rate("l2", 60.0);
-        record_cache_hit_rate("overall", 70.0);
     }
 
     #[test]
