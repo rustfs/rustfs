@@ -24,7 +24,7 @@ use rustfs_utils::http::headers::{
     AMZ_STORAGE_CLASS,
 };
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
     SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes,
     is_internal_key,
 };
@@ -228,6 +228,10 @@ impl FileMeta {
                                     // Insert into meta_user
                                     obj.meta_user.insert(k.clone(), v.clone());
                                 }
+                            }
+
+                            if let Some(checksum) = fi.checksum.as_ref() {
+                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, checksum.to_vec());
                             }
 
                             if let Some(mod_time) = fi.mod_time {
@@ -1907,7 +1911,6 @@ mod test {
 
 #[tokio::test]
 async fn test_read_xl_meta_no_data() {
-    use tokio::fs;
     use tokio::fs::File;
     use tokio::io::AsyncWriteExt;
 
@@ -1926,13 +1929,15 @@ async fn test_read_xl_meta_no_data() {
 
     buff.resize(buff.len() + 100, 0);
 
-    let filepath = "./test_xl.meta";
+    // Use tempfile to avoid conflicts with parallel tests or previous runs
+    let dir = tempfile::tempdir().unwrap();
+    let filepath = dir.path().join("test_xl.meta");
 
-    let mut file = File::create(filepath).await.unwrap();
+    let mut file = File::create(&filepath).await.unwrap();
     // Write string data
     file.write_all(&buff).await.unwrap();
 
-    let mut f = File::open(filepath).await.unwrap();
+    let mut f = File::open(&filepath).await.unwrap();
 
     let stat = f.metadata().await.unwrap();
 
@@ -1940,8 +1945,6 @@ async fn test_read_xl_meta_no_data() {
 
     let mut newfm = FileMeta::default();
     newfm.unmarshal_msg(&data).unwrap();
-
-    fs::remove_file(filepath).await.unwrap();
 
     assert_eq!(fm, newfm)
 }

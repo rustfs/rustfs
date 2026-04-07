@@ -25,6 +25,7 @@ use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts,
 };
+use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::build_list_parts_output;
 use crate::storage::*;
 use bytes::Bytes;
@@ -43,9 +44,12 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
-use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
+use rustfs_ecstore::store_api::{
+    ChunkNativePutData, CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions,
+};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_object_io::put::PutObjectChecksums;
 use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
@@ -406,7 +410,7 @@ impl DefaultMultipartUsecase {
         };
         let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
-        tokio::spawn(async move {
+        spawn_traced(async move {
             manager
                 .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
                 .await;
@@ -718,6 +722,13 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
+        let mut requested_checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
+        if !requested_checksum_type.is_set()
+            && let Some(checksum_algo) = fi.user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            && let Some(checksum_type) = fi.user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+        {
+            requested_checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(checksum_algo, checksum_type);
+        }
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -746,10 +757,14 @@ impl DefaultMultipartUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            let mut hrd =
+                HashReader::new(reader, size, actual_size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
+            }
+            if requested_checksum_type.is_set() && hrd.checksum().is_none() {
+                hrd.enable_auto_checksum(requested_checksum_type).map_err(ApiError::from)?;
             }
 
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
@@ -763,6 +778,9 @@ impl DefaultMultipartUsecase {
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
+        }
+        if requested_checksum_type.is_set() && reader.checksum().is_none() {
+            reader.enable_auto_checksum(requested_checksum_type).map_err(ApiError::from)?;
         }
 
         let has_ssec = sse_customer_algorithm.is_some();
@@ -823,18 +841,20 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = PutObjReader::new(reader);
+        let mut reader = ChunkNativePutData::new(reader);
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
 
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+        let mut checksums = PutObjectChecksums {
+            crc32: input.checksum_crc32,
+            crc32c: input.checksum_crc32c,
+            sha1: input.checksum_sha1,
+            sha256: input.checksum_sha256,
+            crc64nvme: input.checksum_crc64nvme,
+        };
 
         if let Some(alg) = &input.checksum_algorithm
             && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
@@ -854,25 +874,26 @@ impl DefaultMultipartUsecase {
             })
         {
             match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                ChecksumAlgorithm::CRC32 => checksums.crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksums.crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksums.sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksums.sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksums.crc64nvme = checksum_str,
                 _ => (),
             }
         }
+        checksums.merge_from_map(&reader.content_crc());
 
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
+            checksum_crc32: checksums.crc32,
+            checksum_crc32c: checksums.crc32c,
+            checksum_sha1: checksums.sha1,
+            checksum_sha256: checksums.sha256,
+            checksum_crc64nvme: checksums.crc64nvme,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             ..Default::default()
         };
@@ -1190,7 +1211,7 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = PutObjReader::new(reader);
+        let mut reader = ChunkNativePutData::new(reader);
 
         let dst_opts = ObjectOptions {
             user_defined: mp_info.user_defined.clone(),

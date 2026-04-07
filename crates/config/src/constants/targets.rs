@@ -34,3 +34,10 @@ pub const MQTT_RECONNECT_INTERVAL: &str = "reconnect_interval";
 pub const MQTT_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
 pub const MQTT_QUEUE_DIR: &str = "queue_dir";
 pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
+
+/// Environment variable controlling whether target queue files are Snappy-compressed.
+/// Applies to both notify and audit target queue stores.
+pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
+
+/// Queue-store compression is enabled by default to reduce disk footprint.
+pub const DEFAULT_TARGET_STORE_COMPRESS: bool = true;

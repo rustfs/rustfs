@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod audit;
-mod cert;
 mod compress;
 pub mod cors;
 mod event;
@@ -24,9 +23,9 @@ mod prefix;
 mod readiness;
 mod runtime;
 mod service_state;
+pub(crate) mod tls_material;
 
 pub(crate) use audit::{start_audit_system, stop_audit_system};
-pub(crate) use cert::init_cert;
 pub(crate) use event::{init_event_notifier, shutdown_event_notifier};
 pub(crate) use http::start_http_server;
 pub(crate) use prefix::*;
