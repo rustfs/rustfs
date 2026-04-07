@@ -115,12 +115,7 @@ pub(super) fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &st
         request_start,
         request_guard,
         _deadlock_request_guard: deadlock_request_guard,
-        concurrent_requests,
     })
-}
-
-pub(super) struct GetObjectBodyAdapterOutput {
-    pub(super) body: Option<StreamingBlob>,
 }
 
 pub(super) async fn build_get_object_body_adapter<R>(
@@ -130,7 +125,7 @@ pub(super) async fn build_get_object_body_adapter<R>(
     response_content_length: i64,
     optimal_buffer_size: usize,
     planning_inputs: ObjectIoGetObjectBodyPlanningInputs,
-) -> S3Result<GetObjectBodyAdapterOutput>
+) -> S3Result<Option<StreamingBlob>>
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
@@ -164,20 +159,45 @@ where
                 }
             })?;
 
-    Ok(GetObjectBodyAdapterOutput { body: materialized.body })
+    Ok(materialized.body)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finalize_get_object_completion(
-    bucket: &str,
-    key: &str,
-    wrapper: &RequestTimeoutWrapper,
-    timeout_config: &TimeoutConfig,
-    total_duration: Duration,
-    response_content_length: i64,
-    optimal_buffer_size: usize,
-    metric_contract: ObjectIoGetObjectDataPlaneMetricContract,
-) {
+pub(super) struct GetObjectCompletionInputs<'a> {
+    pub(super) bucket: &'a str,
+    pub(super) key: &'a str,
+    pub(super) wrapper: &'a RequestTimeoutWrapper,
+    pub(super) timeout_config: &'a TimeoutConfig,
+    pub(super) total_duration: Duration,
+    pub(super) response_content_length: i64,
+    pub(super) optimal_buffer_size: usize,
+    pub(super) metric_contract: ObjectIoGetObjectDataPlaneMetricContract,
+}
+
+pub(super) struct GetObjectStrategyRuntimeInputs<'a> {
+    pub(super) base_buffer_size: usize,
+    pub(super) manager: &'a ConcurrencyManager,
+    pub(super) bucket: &'a str,
+    pub(super) key: &'a str,
+    pub(super) info: &'a ObjectInfo,
+    pub(super) rs: Option<&'a HTTPRangeSpec>,
+    pub(super) response_content_length: i64,
+    pub(super) permit_wait_duration: Duration,
+    pub(super) queue_utilization: f64,
+    pub(super) queue_status: &'a concurrency::IoQueueStatus,
+}
+
+pub(super) fn finalize_get_object_completion(inputs: GetObjectCompletionInputs<'_>) {
+    let GetObjectCompletionInputs {
+        bucket,
+        key,
+        wrapper,
+        timeout_config,
+        total_duration,
+        response_content_length,
+        optimal_buffer_size,
+        metric_contract,
+    } = inputs;
+
     rustfs_io_metrics::record_get_object_completion(total_duration.as_secs_f64(), response_content_length, optimal_buffer_size);
 
     rustfs_io_metrics::record_get_object(total_duration.as_millis() as f64, response_content_length);
@@ -204,20 +224,20 @@ pub(super) fn finalize_get_object_completion(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finalize_get_object_strategy_runtime(
-    base_buffer_size: usize,
-    manager: &ConcurrencyManager,
-    bucket: &str,
-    key: &str,
-    info: &ObjectInfo,
-    rs: Option<&HTTPRangeSpec>,
-    response_content_length: i64,
-    permit_wait_duration: Duration,
-    queue_utilization: f64,
-    queue_status: &concurrency::IoQueueStatus,
-    concurrent_requests: usize,
-) -> (concurrency::IoStrategy, usize) {
+pub(super) fn finalize_get_object_strategy_runtime(inputs: GetObjectStrategyRuntimeInputs<'_>) -> usize {
+    let GetObjectStrategyRuntimeInputs {
+        base_buffer_size,
+        manager,
+        bucket,
+        key,
+        info,
+        rs,
+        response_content_length,
+        permit_wait_duration,
+        queue_utilization,
+        queue_status,
+    } = inputs;
+
     let strategy_layout = object_io_plan_get_object_strategy_layout(
         rs,
         response_content_length,
@@ -279,7 +299,6 @@ pub(super) fn finalize_get_object_strategy_runtime(
         io_strategy.load_level.as_str(),
         io_strategy.buffer_multiplier,
     );
-    rustfs_io_metrics::record_io_priority_assignment(io_priority.as_str());
 
     let strategy_layout = object_io_plan_get_object_strategy_layout(
         rs,
@@ -299,11 +318,11 @@ pub(super) fn finalize_get_object_strategy_runtime(
         response_content_length,
         get_buffer_size_opt_in(response_content_length),
         strategy_layout.optimal_buffer_size,
-        concurrent_requests,
+        io_strategy.concurrent_requests,
         io_strategy.load_level
     );
 
-    (io_strategy, strategy_layout.optimal_buffer_size)
+    strategy_layout.optimal_buffer_size
 }
 
 pub(super) fn prepare_put_object_request_context(req: &S3Request<PutObjectInput>) -> PutObjectRequestContext {
