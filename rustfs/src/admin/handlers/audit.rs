@@ -537,7 +537,7 @@ impl Operation for AuditTargetConfig {
                 .await
                 .map_err(|e| match e {
                     TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-                    _ => s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e),
+                    _ => s3_error!(InvalidArgument, "MQTT broker check failed: {}", e),
                 })?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
