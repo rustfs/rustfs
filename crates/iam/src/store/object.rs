@@ -17,7 +17,7 @@ use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group}
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
-    manager::{extract_jwt_claims, get_default_policyes},
+    manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policyes},
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
@@ -565,7 +565,13 @@ impl Store for ObjectStore {
         }
 
         if !u.credentials.session_token.is_empty() {
-            match extract_jwt_claims(&u) {
+            let claims_result = if user_type == UserType::Svc && u.credentials.expiration.is_none() {
+                extract_jwt_claims_allow_missing_exp(&u)
+            } else {
+                extract_jwt_claims(&u)
+            };
+
+            match claims_result {
                 Ok(claims) => {
                     u.credentials.claims = Some(claims);
                 }

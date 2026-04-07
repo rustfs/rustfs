@@ -100,8 +100,11 @@ config:
 
 extraEnv: [] # This is for setting extra environment variables in the rustfs container. It should be a list of key value pairs. For example:
 # extraEnv:
-#   - name: RUSTFS_EXTRA_ENV
-#     value: "extra_value"
+#   - name: RUSTFS_ERASURE_SET_DRIVE_COUNT
+#     value: "16"
+#   - name: RUSTFS_STORAGE_CLASS_STANDARD
+#     value: "EC:4"
+
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
@@ -261,6 +264,10 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
+  pvcAnnotations: {}
+  # pvcAnnotations:
+    # - name: team
+    #   value: "RustFS"
 
 pdb:
   create: false
