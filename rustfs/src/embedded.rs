@@ -70,7 +70,7 @@ use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -242,13 +242,7 @@ impl RustFSServerBuilder {
             return Err(ServerError::AlreadyStarted);
         }
 
-        match self.do_build().await {
-            Ok(server) => Ok(server),
-            Err(err) => {
-                SERVER_STARTED.store(false, Ordering::SeqCst);
-                Err(err)
-            }
-        }
+        self.do_build().await
     }
 
     /// Inner build implementation. Separated from [`build`] so the outer
@@ -490,11 +484,22 @@ pub struct RustFSServer {
 }
 
 impl RustFSServer {
+    fn endpoint_address(&self) -> SocketAddr {
+        let ip = match self.address.ip() {
+            ip @ IpAddr::V4(v4) if !v4.is_unspecified() => ip,
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ip @ IpAddr::V6(v6) if !v6.is_unspecified() => ip,
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+
+        SocketAddr::new(ip, self.address.port())
+    }
+
     /// The HTTP endpoint URL (e.g. `"http://127.0.0.1:54321"`).
     ///
     /// Pass this to your S3 client's `endpoint_url` setting.
     pub fn endpoint(&self) -> String {
-        format!("http://{}", self.address)
+        format!("http://{}", self.endpoint_address())
     }
 
     /// The bound socket address.
