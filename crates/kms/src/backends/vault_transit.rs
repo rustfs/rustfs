@@ -535,10 +535,11 @@ impl KmsBackend for VaultTransitKmsBackend {
     }
 
     async fn decrypt(&self, request: DecryptRequest) -> Result<DecryptResponse> {
+        let envelope = DataKeyEnvelope::deserialize(&request.ciphertext_blob)?;
         let plaintext = self.client.decrypt(&request, None).await?;
         Ok(DecryptResponse {
             plaintext,
-            key_id: "vault-transit".to_string(),
+            key_id: envelope.master_key_id,
             encryption_algorithm: Some("vault-transit".to_string()),
         })
     }
