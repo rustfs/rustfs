@@ -16,6 +16,8 @@
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
     use crate::config::{Config, Opt};
+    use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
+    use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
     use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
@@ -78,6 +80,35 @@ mod tests {
         assert!(opt.console_enable);
         assert_eq!(opt.console_address, ":9001");
         assert_eq!(opt.address, ":9000");
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_new_defaults() {
+        let volumes = vec!["/tmp/rustfs-vol1".to_string()];
+        let address = "127.0.0.1:9100".to_string();
+        let config = Config::new(&address, volumes.clone());
+
+        assert_eq!(config.volumes, volumes);
+        assert_eq!(config.address, address);
+        assert_eq!(config.server_domains, Vec::<String>::new());
+        assert_eq!(config.access_key, DEFAULT_ACCESS_KEY);
+        assert_eq!(config.secret_key, DEFAULT_SECRET_KEY);
+        assert_eq!(config.console_enable, DEFAULT_CONSOLE_ENABLE);
+        assert_eq!(config.console_address, DEFAULT_CONSOLE_ADDRESS);
+        assert_eq!(config.obs_endpoint, DEFAULT_OBS_ENDPOINT);
+        assert_eq!(config.tls_path, None);
+        assert_eq!(config.license, None);
+        assert_eq!(config.region, Some(RUSTFS_REGION.to_string()));
+        assert!(!config.kms_enable);
+        assert_eq!(config.kms_backend, "local");
+        assert_eq!(config.kms_key_dir, None);
+        assert_eq!(config.kms_vault_address, None);
+        assert_eq!(config.kms_vault_token, None);
+        assert_eq!(config.kms_vault_mount_path, None);
+        assert_eq!(config.kms_default_key_id, None);
+        assert!(!config.buffer_profile_disable);
+        assert_eq!(config.buffer_profile, "GeneralPurpose");
     }
 
     #[test]

@@ -185,11 +185,12 @@ impl RustFSServerBuilder {
     /// Set the listen address (e.g. `"127.0.0.1:9000"`).
     ///
     /// Use [`find_available_port`] to obtain a free port when the default is
-    /// not suitable. Port `0` is **not** supported — the builder cannot
-    /// discover the OS-assigned port after binding.
+    /// not suitable. Port `0` is **not** supported because startup requires
+    /// a concrete listen address and port during initialization.
     ///
     /// The bound address is available via [`RustFSServer::address`] after
-    /// [`build`](Self::build).
+    /// [`build`](Self::build), but that is too late for the earlier
+    /// initialization that depends on the configured address.
     pub fn address(mut self, addr: impl Into<String>) -> Self {
         self.address = addr.into();
         self
@@ -236,29 +237,33 @@ impl RustFSServerBuilder {
     /// # Errors
     ///
     /// Returns [`ServerError::AlreadyStarted`] if another server is already
-    /// running in this process, or if a previous startup attempt has already
-    /// initialized process-global state.
+    /// running in this process, or if another startup attempt has already
+    /// entered irreversible global initialization.
     pub async fn build(mut self) -> Result<RustFSServer, ServerError> {
-        // Enforce single-server-per-process. Startup initializes process-global
-        // OnceLock-backed state that cannot be rolled back safely, so any build
-        // attempt is one-shot for the lifetime of the process.
-        if SERVER_STARTED
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(ServerError::AlreadyStarted);
-        }
-
-        let result = self.do_build().await;
-        if result.is_err() {
-            SERVER_STARTED.store(false, Ordering::SeqCst);
-        }
-        result
+        self.do_build().await
     }
 
     /// Inner build implementation. Separated from [`build`] so the outer
     /// method can enforce the one-shot process-global startup guard.
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
+        // Build is allowed to fail before irreversible global initialization
+        // (for example on temporary I/O or directory setup errors), and in that
+        // case callers can retry.
+        let mut global_init_started = false;
+        let mut set_global_init_guard = || -> Result<(), ServerError> {
+            if global_init_started {
+                return Ok(());
+            }
+            if SERVER_STARTED
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Err(ServerError::AlreadyStarted);
+            }
+            global_init_started = true;
+            Ok(())
+        };
+
         // Keep a TempDir guard alive so that if build fails the directory is
         // cleaned up automatically. We disarm (keep) on success.
         let mut temp_dir_guard: Option<tempfile::TempDir> = None;
@@ -319,8 +324,9 @@ impl RustFSServerBuilder {
 
         if server_addr.port() == 0 {
             return Err(ServerError::Init(
-                "port 0 is not supported in embedded mode because the actual bound port \
-                 cannot be discovered. Use `find_available_port()` to obtain a free port."
+                "port 0 is not supported in embedded mode because startup requires \
+                 a stable listen address and port before endpoint/global initialization. \
+                 Use `find_available_port()` to obtain a free port."
                     .to_string(),
             ));
         }
@@ -332,6 +338,7 @@ impl RustFSServerBuilder {
 
         // Endpoints / erasure setup.
         let server_addr_str = server_addr.to_string();
+        set_global_init_guard()?;
         let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
             .await
             .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
