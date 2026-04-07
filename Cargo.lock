@@ -3215,6 +3215,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "zip",
  "zstd",
 ]
 

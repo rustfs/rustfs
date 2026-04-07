@@ -80,3 +80,4 @@ suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
 rcgen.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
+zip.workspace = true
