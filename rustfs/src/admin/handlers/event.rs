@@ -25,7 +25,7 @@ use rustfs_config::notify::{
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{check_mqtt_broker_available_with_tls, target::mqtt::MQTTTlsConfig};
+use rustfs_targets::{TargetError, check_mqtt_broker_available_with_tls, target::mqtt::MQTTTlsConfig};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -464,7 +464,10 @@ impl Operation for NotificationTarget {
                 .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
             check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
                 .await
-                .map_err(|e| s3_error!(InvalidArgument, "failed to validate MQTT broker configuration or availability: {}", e))?;
+                .map_err(|e| match e {
+                    TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+                    _ => s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e),
+                })?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
                 validate_queue_dir(queue_dir.as_str()).await?;

@@ -21,7 +21,9 @@
 /// * `password` - Optional password for authentication
 /// # Returns
 /// * `Ok(())` - If the connection is successful
-/// * `Err(String)` - If the connection fails, contains an error message
+/// * `Err(TargetError)` - If the check fails.
+///   `TargetError::Configuration` indicates a bad configuration (invalid URL, TLS settings, etc.).
+///   Other variants indicate a connectivity or runtime failure.
 ///
 /// # Example
 /// ```rust,no_run
@@ -46,7 +48,7 @@ pub async fn check_mqtt_broker_available(
     topic: &str,
     username: Option<&str>,
     password: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), crate::TargetError> {
     use crate::target::mqtt::MQTTTlsConfig;
 
     check_mqtt_broker_available_with_tls(broker_url, topic, username, password, &MQTTTlsConfig::default()).await
@@ -58,13 +60,15 @@ pub async fn check_mqtt_broker_available_with_tls(
     username: Option<&str>,
     password: Option<&str>,
     tls: &crate::target::mqtt::MQTTTlsConfig,
-) -> Result<(), String> {
+) -> Result<(), crate::TargetError> {
     use crate::target::mqtt::build_mqtt_options;
     use rumqttc::{AsyncClient, QoS};
 
-    let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed: {e}"))?;
+    let url = rustfs_utils::parse_url(broker_url)
+        .map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
     let url = url.url();
 
+    // build_mqtt_options returns TargetError directly; Configuration variants propagate as-is.
     let mqtt_options = build_mqtt_options(
         "rustfs_check".to_string(),
         url,
@@ -73,19 +77,18 @@ pub async fn check_mqtt_broker_available_with_tls(
         tls,
         std::time::Duration::from_secs(5),
         None,
-    )
-    .map_err(|e| format!("MQTT options build failed: {e}"))?;
+    )?;
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
 
     // Try to connect and subscribe
     client
         .subscribe(topic, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("MQTT subscription failed: {e}"))?;
+        .map_err(|e| crate::TargetError::Network(format!("MQTT subscription failed: {e}")))?;
     // Wait for eventloop to receive at least one event
     match tokio::time::timeout(std::time::Duration::from_secs(3), eventloop.poll()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("MQTT connection failed: {e}")),
-        Err(_) => Err("MQTT connection timeout".to_string()),
+        Ok(Err(e)) => Err(crate::TargetError::Network(format!("MQTT connection failed: {e}"))),
+        Err(_) => Err(crate::TargetError::Timeout("MQTT connection timed out".to_string())),
     }
 }
