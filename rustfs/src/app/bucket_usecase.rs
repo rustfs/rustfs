@@ -170,18 +170,18 @@ fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType
     }
 }
 
-fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<MinioUserMetadata> {
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadataCollection> {
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| MinioMetadataEntry { key, value })
+        .map(|(key, value)| UserMetadataEntry { key, value })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.key.cmp(&right.key));
 
     if items.is_empty() {
         None
     } else {
-        Some(MinioUserMetadata { items })
+        Some(UserMetadataCollection { items })
     }
 }
 
@@ -2729,7 +2729,7 @@ mod tests {
                 assert_eq!(version.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(
                     version.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![MinioMetadataEntry {
+                    Some(vec![UserMetadataEntry {
                         key: "project".to_string(),
                         value: "alpha".to_string(),
                     }])
@@ -2745,7 +2745,7 @@ mod tests {
                 assert!(marker.user_tags.is_none());
                 assert_eq!(
                     marker.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![MinioMetadataEntry {
+                    Some(vec![UserMetadataEntry {
                         key: "marker".to_string(),
                         value: "true".to_string(),
                     }])
@@ -2840,7 +2840,7 @@ mod tests {
         assert!(object.owner.is_some());
         assert_eq!(
             object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-            Some(vec![MinioMetadataEntry {
+            Some(vec![UserMetadataEntry {
                 key: "project".to_string(),
                 value: "alpha".to_string(),
             }])
