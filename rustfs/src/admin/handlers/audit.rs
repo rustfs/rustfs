@@ -534,7 +534,7 @@ impl Operation for AuditTargetConfig {
                 .map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
             rustfs_targets::target::mqtt::validate_mqtt_broker_url(&parsed_broker, &tls)
                 .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
-            check_mqtt_broker_available_with_tls(endpoint, topic, username, password, &tls)
+            check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
                 .await
                 .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
 
