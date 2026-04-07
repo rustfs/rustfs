@@ -40,14 +40,6 @@
 ///     }
 ///  }
 /// ```
-/// # Note
-/// Need to add `rumqttc` and `url` dependencies in `Cargo.toml`
-/// ```toml
-/// [dependencies]
-/// rumqttc = "0.25.0"
-/// url = "2.5.7"
-/// tokio = { version = "1", features = ["full"] }
-/// ```
 ///
 pub async fn check_mqtt_broker_available(
     broker_url: &str,
