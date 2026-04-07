@@ -8240,7 +8240,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "http 1.4.0",
- "rustfs-concurrency",
  "rustfs-ecstore",
  "rustfs-io-core",
  "rustfs-io-metrics",

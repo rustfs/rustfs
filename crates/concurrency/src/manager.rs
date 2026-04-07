@@ -55,38 +55,6 @@ impl GetObjectQueueSnapshot {
     }
 }
 
-/// Minimal cache writeback decision inputs for GetObject orchestration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GetObjectCacheEligibility {
-    /// Whether response caching is globally enabled.
-    pub cache_enabled: bool,
-    /// Whether the selected I/O strategy allows cache writeback.
-    pub cache_writeback_enabled: bool,
-    /// Whether the request is for a specific multipart part.
-    pub is_part_request: bool,
-    /// Whether the request is a range read.
-    pub is_range_request: bool,
-    /// Whether server-side or customer-provided encryption was applied.
-    pub encryption_applied: bool,
-    /// Response payload size in bytes.
-    pub response_size: i64,
-    /// Maximum cacheable object size in bytes.
-    pub max_cacheable_size: usize,
-}
-
-impl GetObjectCacheEligibility {
-    /// Return whether this GetObject response should be cached.
-    pub fn should_cache(&self) -> bool {
-        self.cache_enabled
-            && self.cache_writeback_enabled
-            && !self.is_part_request
-            && !self.is_range_request
-            && !self.encryption_applied
-            && self.response_size > 0
-            && (self.response_size as usize) <= self.max_cacheable_size
-    }
-}
-
 /// Main concurrency manager that provides access to all concurrency features
 pub struct ConcurrencyManager {
     config: ConcurrencyConfig,
@@ -318,20 +286,6 @@ mod tests {
         assert_eq!(snapshot.permits_in_use, 48);
         assert_eq!(snapshot.permits_available(), 16);
         assert!(snapshot.is_congested(70.0));
-    }
-
-    #[test]
-    fn test_cache_eligibility() {
-        let plan = GetObjectCacheEligibility {
-            cache_enabled: true,
-            cache_writeback_enabled: true,
-            is_part_request: false,
-            is_range_request: false,
-            encryption_applied: false,
-            response_size: 1024,
-            max_cacheable_size: 2048,
-        };
-        assert!(plan.should_cache());
     }
 
     #[test]

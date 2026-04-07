@@ -458,8 +458,6 @@ pub struct IoStrategyCore {
     pub buffer_multiplier: f64,
     /// Whether sequential read-ahead should be enabled
     pub enable_readahead: bool,
-    /// Whether cache writeback should be enabled
-    pub cache_writeback_enabled: bool,
     /// Whether tokio BufReader should be used
     pub use_buffered_io: bool,
 
@@ -491,7 +489,6 @@ pub struct IoStrategyCore {
     pub should_expand_for_sequential: bool,
     pub should_reduce_for_concurrency: bool,
     pub should_reduce_for_bandwidth: bool,
-    pub should_disable_cache_writeback: bool,
     pub should_disable_readahead: bool,
 
     // ===== Priority Scheduling =====
@@ -515,7 +512,6 @@ impl IoStrategyCore {
             buffer_size,
             buffer_multiplier: 1.0,
             enable_readahead: false,
-            cache_writeback_enabled: true,
             use_buffered_io: true,
             concurrent_requests: 1,
             observed_bandwidth_bps: None,
@@ -536,7 +532,6 @@ impl IoStrategyCore {
             should_expand_for_sequential: false,
             should_reduce_for_concurrency: false,
             should_reduce_for_bandwidth: false,
-            should_disable_cache_writeback: false,
             should_disable_readahead: false,
             priority_enabled: false,
             priority: IoPriority::Normal,
@@ -600,11 +595,6 @@ pub struct IoStrategyDebugInfo {
     pub readahead_disabled_by_load: bool,
     pub readahead_disabled_by_bandwidth: bool,
 
-    // ===== Cache Writeback Decisions =====
-    pub cache_writeback_disabled_by_load: bool,
-    pub cache_writeback_disabled_by_pattern: bool,
-    pub cache_writeback_disabled_by_request_size: bool,
-
     // ===== Threshold Snapshots =====
     pub final_buffer_floor: usize,
     pub queue_depth_hint: usize,
@@ -656,7 +646,6 @@ pub struct IoStrategyDebugInfo {
 /// // Apply strategy to I/O operations
 /// let buffer_size = strategy.buffer_size;
 /// let enable_readahead = strategy.enable_readahead;
-/// let enable_cache_writeback = strategy.cache_writeback_enabled;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct IoStrategy {
@@ -718,11 +707,6 @@ impl IoStrategy {
             IoLoadLevel::High | IoLoadLevel::Critical => false,
         };
 
-        let cache_writeback_enabled = match load_level {
-            IoLoadLevel::Low | IoLoadLevel::Medium | IoLoadLevel::High => true,
-            IoLoadLevel::Critical => false, // Disable under extreme load
-        };
-
         // Build minimal scheduling context for compatibility path
         let scheduling_context = IoSchedulingContext::from_wait_duration(permit_wait_duration, base_buffer_size);
         #[cfg(feature = "io-scheduler-debug")]
@@ -740,7 +724,6 @@ impl IoStrategy {
             buffer_size,
             buffer_multiplier,
             enable_readahead,
-            cache_writeback_enabled,
             use_buffered_io: true,
 
             // Performance state
@@ -767,7 +750,6 @@ impl IoStrategy {
             should_expand_for_sequential: false,
             should_reduce_for_concurrency: false,
             should_reduce_for_bandwidth: false,
-            should_disable_cache_writeback: !cache_writeback_enabled,
             should_disable_readahead: !enable_readahead,
 
             // Priority scheduling
@@ -810,9 +792,6 @@ impl IoStrategy {
             readahead_disabled_by_pattern: false,
             readahead_disabled_by_load: !enable_readahead,
             readahead_disabled_by_bandwidth: false,
-            cache_writeback_disabled_by_load: !cache_writeback_enabled,
-            cache_writeback_disabled_by_pattern: false,
-            cache_writeback_disabled_by_request_size: false,
             final_buffer_floor: 32 * KI_B,
             queue_depth_hint: 0,
             permit_wait_ms: permit_wait_duration.as_millis() as u64,
@@ -1016,17 +995,6 @@ impl IoStrategy {
 
         let enable_readahead = should_enable_readahead;
 
-        // Determine cache writeback
-        let cache_writeback_enabled = match load_level {
-            IoLoadLevel::Critical => false,
-            _ => !bandwidth_limited,
-        };
-
-        #[cfg(feature = "io-scheduler-debug")]
-        let cache_writeback_disabled_by_load = matches!(load_level, IoLoadLevel::Critical);
-        #[cfg(feature = "io-scheduler-debug")]
-        let cache_writeback_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
-
         // Calculate priority based on request size
         let priority = if context.file_size > 0 {
             IoPriority::from_size_with_thresholds(
@@ -1052,7 +1020,6 @@ impl IoStrategy {
             buffer_size,
             buffer_multiplier,
             enable_readahead,
-            cache_writeback_enabled,
             use_buffered_io: true,
 
             // ===== Performance State =====
@@ -1074,7 +1041,6 @@ impl IoStrategy {
             should_expand_for_sequential: matches!(context.access_pattern, AccessPattern::Sequential),
             should_reduce_for_concurrency: concurrency_multiplier < 1.0,
             should_reduce_for_bandwidth: bandwidth_limited,
-            should_disable_cache_writeback: !cache_writeback_enabled,
             should_disable_readahead: !enable_readahead,
 
             // ===== Priority Scheduling =====
@@ -1161,11 +1127,6 @@ impl IoStrategy {
             readahead_disabled_by_load,
             readahead_disabled_by_bandwidth,
 
-            // ===== Cache Writeback Decisions =====
-            cache_writeback_disabled_by_load,
-            cache_writeback_disabled_by_pattern,
-            cache_writeback_disabled_by_request_size: false,
-
             // ===== Threshold Snapshots =====
             final_buffer_floor: clamp_min,
             queue_depth_hint: context.concurrent_requests,
@@ -1212,12 +1173,11 @@ impl IoStrategy {
     #[allow(dead_code)]
     pub fn description(&self) -> String {
         format!(
-            "IoStrategy[{:?}]: buffer={}KB, multiplier={:.2}, readahead={}, cache_wb={}, wait={:?}",
+            "IoStrategy[{:?}]: buffer={}KB, multiplier={:.2}, readahead={}, wait={:?}",
             self.load_level,
             self.buffer_size / 1024,
             self.buffer_multiplier,
             self.enable_readahead,
-            self.cache_writeback_enabled,
             self.permit_wait_duration
         )
     }
@@ -2151,10 +2111,9 @@ mod tests {
         let config = IoSchedulerConfig::default();
         let strategy = IoStrategy::from_context_with_config(&context, &config);
 
-        // Critical load should disable readahead and cache writeback
+        // Critical load should disable readahead
         assert_eq!(strategy.load_level, IoLoadLevel::Critical);
         assert!(!strategy.enable_readahead, "Critical load should disable readahead");
-        assert!(!strategy.cache_writeback_enabled, "Critical load should disable cache writeback");
         // Buffer: 256KB * 0.4 (critical) * 1.35 (sequential) ≈ 138KB
         assert!(strategy.buffer_size < 200 * 1024, "Critical load should reduce buffer");
     }

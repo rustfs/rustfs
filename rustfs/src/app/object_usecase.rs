@@ -31,7 +31,7 @@ use crate::capacity::capacity_manager::get_capacity_manager;
 use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
-use crate::storage::concurrency::{CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_manager};
+use crate::storage::concurrency::{GetObjectGuard, get_concurrency_manager};
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use crate::storage::helper::OperationHelper;
@@ -599,13 +599,6 @@ impl DefaultObjectUsecase {
         }
     }
 
-    fn spawn_cache_invalidation(bucket: String, key: String, version_id: Option<String>) {
-        let manager = get_concurrency_manager();
-        crate::storage::request_context::spawn_traced(async move {
-            manager.invalidate_cache_versioned(&bucket, &key, version_id.as_deref()).await;
-        });
-    }
-
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         if let Some(context) = &self.context {
@@ -986,18 +979,6 @@ impl DefaultObjectUsecase {
                 None
             }
         };
-
-        let manager = get_concurrency_manager();
-        let version_id = req.input.version_id.clone();
-        let cache_key = ConcurrencyManager::make_cache_key(&bucket, &object, version_id.clone().as_deref());
-        let cache_bucket = bucket.clone();
-        let cache_object = object.clone();
-        crate::storage::request_context::spawn_traced(async move {
-            manager
-                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id.as_deref())
-                .await;
-            debug!("Cache invalidated for tagged object: {}", cache_key);
-        });
 
         counter!("rustfs.put_object_tagging.success").increment(1);
 
@@ -1793,7 +1774,6 @@ impl DefaultObjectUsecase {
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), raw_dest_version.clone());
         let dest_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_dest_version
         } else {
@@ -1994,21 +1974,6 @@ impl DefaultObjectUsecase {
                 },
             )
             .await;
-
-        let manager = get_concurrency_manager();
-        let bucket_clone = bucket.clone();
-        let deleted_objects = dobjs.clone();
-        crate::storage::request_context::spawn_traced(async move {
-            for dobj in deleted_objects {
-                manager
-                    .invalidate_cache_versioned(
-                        &bucket_clone,
-                        &dobj.object_name,
-                        dobj.version_id.map(|v| v.to_string()).as_deref(),
-                    )
-                    .await;
-            }
-        });
 
         if is_all_buckets_not_found(
             &errs
@@ -2267,8 +2232,6 @@ impl DefaultObjectUsecase {
         // Fast in-memory update for immediate quota consistency
         rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
-        Self::spawn_cache_invalidation(bucket.clone(), key.clone(), obj_info.version_id.map(|v| v.to_string()));
-
         if obj_info.name.is_empty() {
             if replicate_force_delete {
                 schedule_replication_delete(DeletedObjectReplicationInfo {
@@ -2394,20 +2357,6 @@ impl DefaultObjectUsecase {
                 None
             }
         };
-
-        let manager = get_concurrency_manager();
-        let version_id_clone = version_id.clone();
-        let cache_bucket = bucket.clone();
-        let cache_object = object.clone();
-        crate::storage::request_context::spawn_traced(async move {
-            manager
-                .invalidate_cache_versioned(&cache_bucket, &cache_object, version_id_clone.as_deref())
-                .await;
-            debug!(
-                "Cache invalidated for deleted tagged object: bucket={}, object={}, version_id={:?}",
-                cache_bucket, cache_object, version_id_clone
-            );
-        });
 
         counter!("rustfs.delete_object_tagging.success").increment(1);
 
