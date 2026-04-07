@@ -57,13 +57,20 @@ use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
+    bucket::replication::init_background_replication,
     bucket::{
         metadata_sys::init_bucket_metadata_sys,
         migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
     },
-    bucket::replication::init_background_replication, config as ecconfig,
-    endpoints::EndpointServerPools, global::set_global_rustfs_port, notification_sys::new_global_notification_sys,
-    set_global_endpoints, store::ECStore, store::init_local_disks, store_api::BucketOperations, store_api::BucketOptions,
+    config as ecconfig,
+    endpoints::EndpointServerPools,
+    global::set_global_rustfs_port,
+    notification_sys::new_global_notification_sys,
+    set_global_endpoints,
+    store::ECStore,
+    store::init_local_disks,
+    store_api::BucketOperations,
+    store_api::BucketOptions,
     update_erasure_type,
 };
 use rustfs_iam::init_iam_sys;
@@ -249,7 +256,7 @@ impl RustFSServerBuilder {
     /// method can enforce the one-shot process-global startup guard.
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
         // Keep a TempDir guard alive so that if build fails the directory is
-        // cleaned up automatically. We disarm (into_path) on success.
+        // cleaned up automatically. We disarm (keep) on success.
         let mut temp_dir_guard: Option<tempfile::TempDir> = None;
         if self.volumes.is_empty() {
             let dir = tempfile::tempdir().map_err(|e| ServerError::Init(format!("failed to create temp dir: {e}")))?;
@@ -342,8 +349,7 @@ impl RustFSServerBuilder {
         // Start HTTP server.
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let (shutdown_tx, bound_addr) = start_http_server(&s3_config, state_manager.clone(), readiness.clone())
-            .await?;
+        let (shutdown_tx, bound_addr) = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
         let ctx = CancellationToken::new();
         let shutdown_embedded_server = || {
             let _ = shutdown_tx.send(());
@@ -415,12 +421,10 @@ impl RustFSServerBuilder {
         try_migrate_iam_config(store.clone()).await;
 
         // IAM.
-        init_iam_sys(store.clone())
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("IAM: {e}"))
-            })?;
+        init_iam_sys(store.clone()).await.map_err(|e| {
+            shutdown_embedded_server();
+            ServerError::Init(format!("IAM: {e}"))
+        })?;
         readiness.mark_stage(SystemStage::IamReady);
 
         // App context.
@@ -452,7 +456,7 @@ impl RustFSServerBuilder {
         );
 
         // Success — disarm the temp dir guard so it isn't cleaned up on drop.
-        let temp_dir = temp_dir_guard.map(|g| g.into_path());
+        let temp_dir = temp_dir_guard.map(|g| g.keep());
 
         Ok(RustFSServer {
             address: bound_addr,

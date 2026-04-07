@@ -49,14 +49,6 @@ pub(crate) struct InMemoryAsyncReader {
     cursor: std::io::Cursor<Vec<u8>>,
 }
 
-impl InMemoryAsyncReader {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
-        Self {
-            cursor: std::io::Cursor::new(data),
-        }
-    }
-}
-
 impl AsyncRead for InMemoryAsyncReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
