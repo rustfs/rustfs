@@ -16,8 +16,9 @@ use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::error::Error as IamError;
-use rustfs_iam::sys::SESSION_POLICY_NAME;
-use rustfs_iam::sys::get_claims_from_token_with_secret;
+use rustfs_iam::sys::{
+    SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
+};
 use rustfs_utils::http::ip::get_source_ip_raw;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -353,8 +354,12 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     };
 
     if !token.is_empty() {
-        let claims: HashMap<String, Value> =
-            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?;
+        let claims: HashMap<String, Value> = if cred.is_service_account() {
+            get_claims_from_token_with_secret_allow_missing_exp(token, secret)
+                .map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+        } else {
+            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+        };
         return Ok(claims);
     }
 
