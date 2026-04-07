@@ -43,6 +43,50 @@ pub(crate) struct ListObjectUnorderedQuery {
     pub(crate) allow_unordered: Option<String>,
 }
 
+pub(crate) struct InMemoryAsyncReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+}
+
+impl InMemoryAsyncReader {
+    pub(crate) fn new(data: Vec<u8>) -> Self {
+        Self {
+            cursor: std::io::Cursor::new(data),
+        }
+    }
+}
+
+impl AsyncRead for InMemoryAsyncReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let unfilled = buf.initialize_unfilled();
+        let bytes_read = std::io::Read::read(&mut self.cursor, unfilled)?;
+        buf.advance(bytes_read);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for InMemoryAsyncReader {
+    fn start_seek(mut self: std::pin::Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        // std::io::Cursor natively supports negative SeekCurrent offsets
+        // It will automatically handle validation and return an error if the final position would be negative
+        std::io::Seek::seek(&mut self.cursor, position)?;
+        Ok(())
+    }
+
+    fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
+        std::task::Poll::Ready(Ok(self.cursor.position()))
+    }
+}
+
+impl Default for FS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FS {
     pub fn new() -> Self {
         rustfs_s3_common::init_s3_metrics();

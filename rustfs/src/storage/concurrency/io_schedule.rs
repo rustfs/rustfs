@@ -1754,6 +1754,13 @@ pub struct IoPriorityMetrics {
 }
 
 #[allow(dead_code)]
+impl Default for IoPriorityMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
 impl IoPriorityMetrics {
     /// Create a new metrics instance.
     pub const fn new() -> Self {
