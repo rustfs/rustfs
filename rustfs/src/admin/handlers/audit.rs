@@ -530,6 +530,10 @@ impl Operation for AuditTargetConfig {
                 kv_map.get(rustfs_config::MQTT_WS_PATH_ALLOWLIST).map(String::as_str),
             )
             .map_err(|e| s3_error!(InvalidArgument, "invalid MQTT TLS settings: {}", e))?;
+            let parsed_broker = Url::parse(endpoint)
+                .map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
+            rustfs_targets::target::mqtt::validate_mqtt_broker_url(&parsed_broker, &tls)
+                .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
             check_mqtt_broker_available_with_tls(endpoint, topic, username, password, &tls)
                 .await
                 .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;

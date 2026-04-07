@@ -308,7 +308,7 @@ pub fn validate_mqtt_broker_url(broker: &Url, tls: &MQTTTlsConfig) -> Result<(),
         .any(|allowed_path| *allowed_path == broker.path())
     {
         return Err(TargetError::Configuration(format!(
-            "Websocket broker path '{}' is not in the allowed whitelist",
+            "Websocket broker path '{}' is not in the {MQTT_WS_PATH_ALLOWLIST} allowlist",
             broker.path()
         )));
     }
@@ -1072,7 +1072,7 @@ mod tests {
         let url = Url::parse("wss://broker.example.com/private").expect("valid url");
         let tls = MQTTTlsConfig::from_values(Some("system_ca"), None, None, None, None, Some("/mqtt")).expect("valid tls config");
         let err = validate_mqtt_broker_url(&url, &tls).expect_err("path outside allowlist should be rejected");
-        assert!(err.to_string().contains("allowed whitelist"));
+        assert!(err.to_string().contains("allowlist"));
     }
 
     #[test]
