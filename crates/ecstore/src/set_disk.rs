@@ -2841,6 +2841,12 @@ impl MultipartOperations for SetDisks {
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
+        // Wasabi-style commit: `getReplicationHeaders` on Complete can replace the version id chosen
+        // at Initiate (no initiate↔complete equality check). Apply when Complete carries an explicit id.
+        if let Some(ref vid) = opts.version_id {
+            fi.version_id = S3VersionId::parse_api_version_id(vid.as_str()).map_err(Error::other)?;
+        }
+
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
         let disks = self.disks.read().await;

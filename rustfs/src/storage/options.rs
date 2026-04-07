@@ -262,6 +262,63 @@ pub async fn put_opts(
     Ok(opts)
 }
 
+/// Options for [`CompleteMultipartUpload`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html):
+/// same Wasabi header + versioning rules as [`put_opts`], merged with checksum / replication fields from
+/// [`get_complete_multipart_upload_opts`]. Bucket versioning is read at **complete** time (Wasabi-aligned).
+pub async fn complete_multipart_upload_opts(
+    bucket: &str,
+    object: &str,
+    headers: &HeaderMap<HeaderValue>,
+) -> Result<ObjectOptions> {
+    ensure_wasabi_set_version_id_header_allowed(headers, bucket, object)?;
+
+    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
+    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+
+    let vid = get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned());
+    let mut vid = vid.map(|v| v.as_str().trim().to_owned());
+
+    if wasabi_version_ids_enabled()
+        && let Some(raw) = headers.get(WASABI_SET_VERSION_ID_HEADER).and_then(|v| v.to_str().ok())
+    {
+        let t = raw.trim();
+        if !t.is_empty() {
+            if !versioned || version_suspended {
+                return Err(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    "X-Wasabi-Set-Version-Id requires bucket versioning to be Enabled (not Off or Suspended)".to_owned(),
+                ));
+            }
+            let id = S3VersionId::parse_x_wasabi_set_version_id(t)
+                .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+            vid = Some(id.to_string());
+        }
+    }
+
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && S3VersionId::parse_api_version_id(id.as_str()).is_err()
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+    }
+
+    let mut opts = get_complete_multipart_upload_opts(headers)
+        .map_err(|e| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), e.to_string()))?;
+
+    opts.version_id = {
+        if is_dir_object(object) && vid.is_none() {
+            Some(Uuid::nil().to_string())
+        } else {
+            vid
+        }
+    };
+    opts.version_suspended = version_suspended;
+    opts.versioned = versioned;
+
+    Ok(opts)
+}
+
 pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> std::io::Result<ObjectOptions> {
     let mut user_defined = HashMap::new();
 
@@ -959,6 +1016,23 @@ mod tests {
         let mut headers = create_test_headers();
         headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("000000000000000000001-ABCDEabcd0"));
         let result = put_opts("test-bucket", "test-object", None, &headers, HashMap::new()).await;
+        assert!(result.is_err(), "expected InvalidArgument when versioning is not Enabled");
+        match result.unwrap_err() {
+            StorageError::InvalidArgument(_, _, msg) => {
+                assert!(
+                    msg.contains("Enabled") && (msg.contains("Suspended") || msg.contains("not Off")),
+                    "unexpected message: {msg}"
+                );
+            }
+            e => panic!("expected InvalidArgument, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_opts_wasabi_header_rejects_when_versioning_not_enabled() {
+        let mut headers = create_test_headers();
+        headers.insert(WASABI_SET_VERSION_ID_HEADER, HeaderValue::from_static("000000000000000000001-ABCDEabcd0"));
+        let result = complete_multipart_upload_opts("test-bucket", "test-object", &headers).await;
         assert!(result.is_err(), "expected InvalidArgument when versioning is not Enabled");
         match result.unwrap_err() {
             StorageError::InvalidArgument(_, _, msg) => {
