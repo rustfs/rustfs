@@ -24,7 +24,7 @@ use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system
 use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::check_mqtt_broker_available;
+use rustfs_targets::{TargetError, check_mqtt_broker_available_with_tls, target::mqtt::MQTTTlsConfig};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -521,9 +521,24 @@ impl Operation for AuditTargetConfig {
                 .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
             let username = kv_map.get(rustfs_config::MQTT_USERNAME).map(String::as_str);
             let password = kv_map.get(rustfs_config::MQTT_PASSWORD).map(String::as_str);
-            check_mqtt_broker_available(endpoint, topic, username, password)
+            let tls = MQTTTlsConfig::from_values(
+                kv_map.get(rustfs_config::MQTT_TLS_POLICY).map(String::as_str),
+                kv_map.get(rustfs_config::MQTT_TLS_CA).map(String::as_str),
+                kv_map.get(rustfs_config::MQTT_TLS_CLIENT_CERT).map(String::as_str),
+                kv_map.get(rustfs_config::MQTT_TLS_CLIENT_KEY).map(String::as_str),
+                kv_map.get(rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA).map(String::as_str),
+                kv_map.get(rustfs_config::MQTT_WS_PATH_ALLOWLIST).map(String::as_str),
+            )
+            .map_err(|e| s3_error!(InvalidArgument, "invalid MQTT TLS settings: {}", e))?;
+            let parsed_broker = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
+            rustfs_targets::target::mqtt::validate_mqtt_broker_url(&parsed_broker, &tls)
+                .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+            check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
                 .await
-                .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
+                .map_err(|e| match e {
+                    TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+                    _ => s3_error!(InvalidArgument, "MQTT broker check failed: {}", e),
+                })?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
                 validate_queue_dir(queue_dir.as_str()).await?;

@@ -20,13 +20,21 @@ use crate::{
     target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
 };
 use async_trait::async_trait;
-use rumqttc::{AsyncClient, ConnectionError, EventLoop, MqttOptions, Outgoing, Packet, QoS, mqttbytes::Error as MqttBytesError};
+use hyper_rustls::ConfigBuilderExt;
+use rumqttc::{
+    AsyncClient, Broker, ConnectionError, EventLoop, Incoming, MqttOptions, Outgoing, QoS, Transport,
+    mqttbytes::Error as MqttBytesError,
+};
+use rustfs_config::{
+    EnableState, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_WS_PATH_ALLOWLIST,
+};
+use rustls::ClientConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{
     marker::PhantomData,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -36,6 +44,381 @@ use url::Url;
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_LOOP_POLL_TIMEOUT: Duration = Duration::from_secs(10); // For initial connection check in task
+const DEFAULT_MQTT_TCP_PORT: u16 = 1883;
+const DEFAULT_MQTT_TLS_PORT: u16 = 8883;
+const DEFAULT_MQTT_WSS_PORT: u16 = 443;
+const MAX_MQTT_PACKET_SIZE_BYTES: u32 = 100 * 1024 * 1024;
+const DEFAULT_MQTT_WS_PATH_ALLOWLIST: &[&str] = &["/", "/mqtt"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MQTTTlsPolicy {
+    SystemCa,
+    CustomCa,
+}
+
+impl MQTTTlsPolicy {
+    fn parse(value: &str) -> Result<Self, TargetError> {
+        match value.trim() {
+            value if value.eq_ignore_ascii_case("system_ca") => Ok(Self::SystemCa),
+            value if value.eq_ignore_ascii_case("custom_ca") => Ok(Self::CustomCa),
+            _ => Err(TargetError::Configuration(
+                "MQTT tls_policy must be one of: system_ca, custom_ca".to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MQTTTlsConfig {
+    pub policy: Option<MQTTTlsPolicy>,
+    pub ca_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+    pub trust_leaf_as_ca: bool,
+    pub ws_path_allowlist: Vec<String>,
+}
+
+impl MQTTTlsConfig {
+    pub fn from_values(
+        policy: Option<&str>,
+        ca_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+        trust_leaf_as_ca: Option<&str>,
+        ws_path_allowlist: Option<&str>,
+    ) -> Result<Self, TargetError> {
+        let policy = match policy.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => Some(MQTTTlsPolicy::parse(value)?),
+            None => None,
+        };
+
+        let trust_leaf_as_ca = match trust_leaf_as_ca.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => value
+                .parse::<EnableState>()
+                .map(EnableState::is_enabled)
+                .map_err(|_| TargetError::Configuration(format!("Invalid value for {MQTT_TLS_TRUST_LEAF_AS_CA}")))?,
+            None => false,
+        };
+
+        let ws_path_allowlist = match ws_path_allowlist.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => parse_ws_path_allowlist(value)?,
+            None => Vec::new(),
+        };
+
+        Ok(Self {
+            policy,
+            ca_path: ca_path.unwrap_or_default().trim().to_string(),
+            client_cert_path: client_cert_path.unwrap_or_default().trim().to_string(),
+            client_key_path: client_key_path.unwrap_or_default().trim().to_string(),
+            trust_leaf_as_ca,
+            ws_path_allowlist,
+        })
+    }
+
+    fn effective_ws_path_allowlist(&self) -> Vec<&str> {
+        if self.ws_path_allowlist.is_empty() {
+            DEFAULT_MQTT_WS_PATH_ALLOWLIST.to_vec()
+        } else {
+            self.ws_path_allowlist.iter().map(String::as_str).collect()
+        }
+    }
+}
+
+fn parse_ws_path_allowlist(value: &str) -> Result<Vec<String>, TargetError> {
+    let mut allowlist = Vec::new();
+    for raw in value.split(',') {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if !path.starts_with('/') || path.contains('?') || path.contains('#') {
+            return Err(TargetError::Configuration(format!(
+                "{MQTT_WS_PATH_ALLOWLIST} entries must be absolute paths without query or fragment"
+            )));
+        }
+        allowlist.push(path.to_string());
+    }
+
+    if allowlist.is_empty() {
+        return Err(TargetError::Configuration(format!(
+            "{MQTT_WS_PATH_ALLOWLIST} must contain at least one websocket path"
+        )));
+    }
+
+    Ok(allowlist)
+}
+
+fn keep_alive_seconds(duration: Duration) -> u16 {
+    duration.as_secs().min(u64::from(u16::MAX)) as u16
+}
+
+fn default_broker_port(scheme: &str) -> u16 {
+    match scheme {
+        "ssl" | "tls" | "tcps" | "mqtts" => DEFAULT_MQTT_TLS_PORT,
+        "wss" => DEFAULT_MQTT_WSS_PORT,
+        _ => DEFAULT_MQTT_TCP_PORT,
+    }
+}
+
+fn websocket_broker_url(broker: &Url, secure: bool) -> Result<String, TargetError> {
+    let mut url = broker.clone();
+    url.set_scheme("ws")
+        .map_err(|_| TargetError::Configuration("Failed to normalize websocket broker URL scheme".to_string()))?;
+
+    if secure && url.port().is_none() {
+        url.set_port(Some(DEFAULT_MQTT_WSS_PORT))
+            .map_err(|_| TargetError::Configuration("Failed to set default secure websocket broker port".to_string()))?;
+    }
+
+    Ok(url.to_string())
+}
+
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none()
+        && rustls::crypto::aws_lc_rs::default_provider().install_default().is_err()
+    {
+        debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
+    }
+}
+
+fn validate_path_is_absolute(path: &str, field: &str) -> Result<(), TargetError> {
+    if !Path::new(path).is_absolute() {
+        return Err(TargetError::Configuration(format!("{field} must be an absolute path")));
+    }
+    Ok(())
+}
+
+fn build_root_store(ca_path: &str, trust_leaf_as_ca: bool) -> Result<rustls::RootCertStore, TargetError> {
+    let certs =
+        rustfs_utils::load_certs(ca_path).map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_ca: {e}")))?;
+    let mut store = rustls::RootCertStore::empty();
+
+    if trust_leaf_as_ca {
+        let (valid, invalid) = store.add_parsable_certificates(certs);
+        if valid == 0 {
+            return Err(TargetError::Configuration(format!(
+                "MQTT tls_ca did not contain any parsable trust anchors (ignored {invalid} entries)"
+            )));
+        }
+    } else {
+        for cert in certs {
+            store
+                .add(cert)
+                .map_err(|e| TargetError::Configuration(format!("Failed to add MQTT tls_ca to root store: {e}")))?;
+        }
+    }
+
+    Ok(store)
+}
+
+fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transport, TargetError> {
+    ensure_rustls_provider_installed();
+
+    let client_config = match tls
+        .policy
+        .ok_or_else(|| TargetError::Configuration("Secure MQTT schemes require an explicit tls_policy".to_string()))?
+    {
+        MQTTTlsPolicy::SystemCa => {
+            let builder = ClientConfig::builder()
+                .with_native_roots()
+                .map_err(|e| TargetError::Configuration(format!("Failed to load native root certificates: {e}")))?;
+
+            if tls.client_cert_path.is_empty() {
+                builder.with_no_client_auth()
+            } else {
+                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
+                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
+                builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to build MQTT client mTLS identity: {e}")))?
+            }
+        }
+        MQTTTlsPolicy::CustomCa => {
+            let builder = ClientConfig::builder().with_root_certificates(build_root_store(&tls.ca_path, tls.trust_leaf_as_ca)?);
+
+            if tls.client_cert_path.is_empty() {
+                builder.with_no_client_auth()
+            } else {
+                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
+                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
+                builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to build MQTT client mTLS identity: {e}")))?
+            }
+        }
+    };
+
+    if matches!(broker.scheme(), "wss") {
+        Ok(Transport::wss_with_config(client_config.into()))
+    } else {
+        Ok(Transport::tls_with_config(client_config.into()))
+    }
+}
+
+pub fn validate_mqtt_broker_url(broker: &Url, tls: &MQTTTlsConfig) -> Result<(), TargetError> {
+    match broker.scheme() {
+        "ws" | "wss" | "tcp" | "ssl" | "tls" | "tcps" | "mqtt" | "mqtts" => {}
+        _ => {
+            return Err(TargetError::Configuration("unknown protocol in broker address".to_string()));
+        }
+    }
+
+    if !broker.username().is_empty() || broker.password().is_some() {
+        return Err(TargetError::Configuration("Broker URL must not embed username or password".to_string()));
+    }
+
+    broker
+        .host_str()
+        .ok_or_else(|| TargetError::Configuration("Broker is missing host".to_string()))?;
+
+    let secure_scheme = matches!(broker.scheme(), "wss" | "ssl" | "tls" | "tcps" | "mqtts");
+    let websocket_scheme = matches!(broker.scheme(), "ws" | "wss");
+
+    if !websocket_scheme {
+        if !matches!(broker.path(), "" | "/") {
+            return Err(TargetError::Configuration(
+                "Broker URL path is only supported for ws/wss schemes".to_string(),
+            ));
+        }
+
+        if broker.query().is_some() {
+            return Err(TargetError::Configuration(
+                "Broker URL query is only supported for ws/wss schemes".to_string(),
+            ));
+        }
+
+        if broker.fragment().is_some() {
+            return Err(TargetError::Configuration(
+                "Broker URL fragment is only supported for ws/wss schemes".to_string(),
+            ));
+        }
+
+        if !tls.ws_path_allowlist.is_empty() {
+            return Err(TargetError::Configuration(format!(
+                "{MQTT_WS_PATH_ALLOWLIST} is only supported for ws/wss schemes"
+            )));
+        }
+    } else if !tls
+        .effective_ws_path_allowlist()
+        .iter()
+        .any(|allowed_path| *allowed_path == broker.path())
+    {
+        return Err(TargetError::Configuration(format!(
+            "Websocket broker path '{}' is not in the {MQTT_WS_PATH_ALLOWLIST} allowlist",
+            broker.path()
+        )));
+    }
+
+    if secure_scheme {
+        let policy = tls
+            .policy
+            .ok_or_else(|| TargetError::Configuration("Secure MQTT schemes require an explicit tls_policy".to_string()))?;
+
+        if !tls.client_cert_path.is_empty() {
+            validate_path_is_absolute(&tls.client_cert_path, MQTT_TLS_CLIENT_CERT)?;
+        }
+
+        if !tls.client_key_path.is_empty() {
+            validate_path_is_absolute(&tls.client_key_path, MQTT_TLS_CLIENT_KEY)?;
+        }
+
+        if tls.client_cert_path.is_empty() != tls.client_key_path.is_empty() {
+            return Err(TargetError::Configuration(
+                "MQTT tls_client_cert and tls_client_key must be specified together".to_string(),
+            ));
+        }
+
+        match policy {
+            MQTTTlsPolicy::SystemCa => {
+                if !tls.ca_path.is_empty() {
+                    return Err(TargetError::Configuration(format!(
+                        "{MQTT_TLS_CA} is not allowed when tls_policy=system_ca"
+                    )));
+                }
+                if tls.trust_leaf_as_ca {
+                    return Err(TargetError::Configuration(format!(
+                        "{MQTT_TLS_TRUST_LEAF_AS_CA} requires tls_policy=custom_ca"
+                    )));
+                }
+            }
+            MQTTTlsPolicy::CustomCa => {
+                if tls.ca_path.is_empty() {
+                    return Err(TargetError::Configuration(format!("{MQTT_TLS_CA} is required when tls_policy=custom_ca")));
+                }
+                validate_path_is_absolute(&tls.ca_path, MQTT_TLS_CA)?;
+            }
+        }
+    } else if tls.policy.is_some()
+        || !tls.ca_path.is_empty()
+        || !tls.client_cert_path.is_empty()
+        || !tls.client_key_path.is_empty()
+        || tls.trust_leaf_as_ca
+    {
+        return Err(TargetError::Configuration(
+            "TLS settings are only allowed for mqtts/ssl/tls/tcps/wss schemes".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn build_mqtt_options(
+    client_id: String,
+    broker: &Url,
+    username: Option<&str>,
+    password: Option<&str>,
+    tls: &MQTTTlsConfig,
+    keep_alive: Duration,
+    max_packet_size: Option<u32>,
+) -> Result<MqttOptions, TargetError> {
+    validate_mqtt_broker_url(broker, tls)?;
+
+    let host = broker
+        .host_str()
+        .ok_or_else(|| TargetError::Configuration("Broker is missing host".to_string()))?;
+    let port = broker.port().unwrap_or_else(|| default_broker_port(broker.scheme()));
+    let mut mqtt_options = match broker.scheme() {
+        "tcp" | "mqtt" => MqttOptions::new(client_id, (host, port)),
+        "ssl" | "tls" | "tcps" | "mqtts" => {
+            let mut options = MqttOptions::new(client_id, (host, port));
+            options.set_transport(build_mqtt_tls_transport(broker, tls)?);
+            options
+        }
+        "ws" => {
+            let websocket_broker = Broker::websocket(broker.as_str().to_string())
+                .map_err(|e| TargetError::Configuration(format!("Invalid websocket broker URL: {e}")))?;
+            MqttOptions::new(client_id, websocket_broker)
+        }
+        "wss" => {
+            let websocket_broker = Broker::websocket(websocket_broker_url(broker, true)?)
+                .map_err(|e| TargetError::Configuration(format!("Invalid secure websocket broker URL: {e}")))?;
+            let mut options = MqttOptions::new(client_id, websocket_broker);
+            options.set_transport(build_mqtt_tls_transport(broker, tls)?);
+            options
+        }
+        _ => {
+            return Err(TargetError::Configuration("unknown protocol in broker address".to_string()));
+        }
+    };
+
+    mqtt_options.set_keep_alive(keep_alive_seconds(keep_alive));
+
+    if let Some(max_packet_size) = max_packet_size {
+        mqtt_options.set_max_packet_size(Some(max_packet_size));
+    }
+
+    if let Some(user) = username
+        && !user.is_empty()
+    {
+        mqtt_options.set_credentials(user.to_string(), password.unwrap_or("").to_string());
+    }
+
+    Ok(mqtt_options)
+}
 
 /// Arguments for configuring an MQTT target
 #[derive(Debug, Clone)]
@@ -52,6 +435,8 @@ pub struct MQTTArgs {
     pub username: String,
     /// The password for the broker
     pub password: String,
+    /// Explicit TLS configuration for secure MQTT transports
+    pub tls: MQTTTlsConfig,
     /// The maximum interval for reconnection attempts (Note: rumqttc has internal strategy)
     pub max_reconnect_interval: Duration,
     /// The keep alive interval
@@ -70,12 +455,7 @@ impl MQTTArgs {
             return Ok(());
         }
 
-        match self.broker.scheme() {
-            "ws" | "wss" | "tcp" | "ssl" | "tls" | "tcps" | "mqtt" | "mqtts" => {}
-            _ => {
-                return Err(TargetError::Configuration("unknown protocol in broker address".to_string()));
-            }
-        }
+        validate_mqtt_broker_url(&self.broker, &self.tls)?;
 
         if self.topic.is_empty() {
             return Err(TargetError::Configuration("MQTT topic cannot be empty".to_string()));
@@ -187,16 +567,15 @@ where
             .init_cell
             .get_or_try_init(|| async {
                 debug!(target_id = %target_id_clone, "Initializing MQTT background task.");
-                let host = args_clone.broker.host_str().unwrap_or("localhost");
-                let port = args_clone.broker.port().unwrap_or(1883);
-                let mut mqtt_options = MqttOptions::new(format!("rustfs_notify_{}", uuid::Uuid::new_v4()), host, port);
-                mqtt_options
-                    .set_keep_alive(args_clone.keep_alive)
-                    .set_max_packet_size(100 * 1024 * 1024, 100 * 1024 * 1024); // 100MB
-
-                if !args_clone.username.is_empty() {
-                    mqtt_options.set_credentials(args_clone.username.clone(), args_clone.password.clone());
-                }
+                let mqtt_options = build_mqtt_options(
+                    format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
+                    &args_clone.broker,
+                    Some(args_clone.username.as_str()),
+                    Some(args_clone.password.as_str()),
+                    &args_clone.tls,
+                    args_clone.keep_alive,
+                    Some(MAX_MQTT_PACKET_SIZE_BYTES),
+                )?;
 
                 let (new_client, eventloop) = AsyncClient::new(mqtt_options, 10);
 
@@ -341,40 +720,40 @@ async fn run_mqtt_event_loop(
             polled_event_result = async {
                 if !initial_connection_established || !connected_status.load(Ordering::SeqCst) {
                     match tokio::time::timeout(EVENT_LOOP_POLL_TIMEOUT, eventloop.poll()).await {
-                        Ok(Ok(event)) => Ok(event),
-                        Ok(Err(e)) => Err(e),
+                        Ok(result) => Some(result),
                         Err(_) => {
                             debug!(target_id = %target_id, "MQTT poll timed out (EVENT_LOOP_POLL_TIMEOUT) while not connected or status pending.");
-                            Err(ConnectionError::NetworkTimeout)
+                            connected_status.store(false, Ordering::SeqCst);
+                            None
                         }
                     }
                 } else {
-                    eventloop.poll().await
+                    Some(eventloop.poll().await)
                 }
             } => {
                 match polled_event_result {
-                    Ok(notification) => {
+                    Some(Ok(notification)) => {
                         trace!(target_id = %target_id, event = ?notification, "Received MQTT event");
                         match notification {
-                            rumqttc::Event::Incoming(Packet::ConnAck(_conn_ack)) => {
+                            rumqttc::Event::Incoming(Incoming::ConnAck(_conn_ack)) => {
                                 info!(target_id = %target_id, "MQTT connected (ConnAck).");
                                 connected_status.store(true, Ordering::SeqCst);
                                 initial_connection_established = true;
                             }
-                            rumqttc::Event::Incoming(Packet::Publish(publish)) => {
-                                debug!(target_id = %target_id, topic = %publish.topic, payload_len = publish.payload.len(), "Received message on subscribed topic.");
+                            rumqttc::Event::Incoming(Incoming::Publish(publish)) => {
+                                debug!(target_id = %target_id, topic = ?publish.topic, payload_len = publish.payload.len(), "Received message on subscribed topic.");
                             }
-                            rumqttc::Event::Incoming(Packet::Disconnect) => {
+                            rumqttc::Event::Incoming(Incoming::Disconnect(_)) => {
                                 info!(target_id = %target_id, "Received Disconnect packet from broker. MQTT connection lost.");
                                 connected_status.store(false, Ordering::SeqCst);
                             }
-                            rumqttc::Event::Incoming(Packet::PingResp) => {
+                            rumqttc::Event::Incoming(Incoming::PingResp(_)) => {
                                 trace!(target_id = %target_id, "Received PingResp from broker. Connection is alive.");
                             }
-                            rumqttc::Event::Incoming(Packet::SubAck(suback)) => {
+                            rumqttc::Event::Incoming(Incoming::SubAck(suback)) => {
                                 trace!(target_id = %target_id, "Received SubAck for pkid: {}", suback.pkid);
                             }
-                            rumqttc::Event::Incoming(Packet::PubAck(puback)) => {
+                            rumqttc::Event::Incoming(Incoming::PubAck(puback)) => {
                                 trace!(target_id = %target_id, "Received PubAck for pkid: {}", puback.pkid);
                             }
                             // Process other incoming packet types as needed (PubRec, PubRel, PubComp, UnsubAck)
@@ -393,18 +772,13 @@ async fn run_mqtt_event_loop(
                             }
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         connected_status.store(false, Ordering::SeqCst);
                         error!(target_id = %target_id, error = %e, "Error from MQTT event loop poll");
 
-                        if matches!(e, ConnectionError::NetworkTimeout) && (!initial_connection_established || !connected_status.load(Ordering::SeqCst)) {
-                           warn!(target_id = %target_id, "Timeout during initial poll or pending state, will retry.");
-                           continue;
-                        }
-
                         if matches!(e,
                             ConnectionError::Io(_) |
-                            ConnectionError::NetworkTimeout |
+                            ConnectionError::Timeout(_) |
                             ConnectionError::ConnectionRefused(_) |
                             ConnectionError::Tls(_)
                         ) {
@@ -421,6 +795,10 @@ async fn run_mqtt_event_loop(
                         // If the error is temporary and rumqttc is handling reconnection, poll() should eventually succeed or return a different error again.
                         // Sleep briefly to avoid busy cycles in case of rapid failure.
                         tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    None => {
+                        warn!(target_id = %target_id, "Timeout during initial poll or pending state, will retry.");
+                        continue;
                     }
                 }
             }
@@ -443,7 +821,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
             match state_err {
                 // If StateError is caused by deserialization issues, check the underlying MqttBytesError
                 rumqttc::StateError::Deserialization(mqtt_bytes_err) => { // The type of mqtt_bytes_err is &rumqttc::mqttbytes::Error
-                    matches!(
+                        matches!(
                         mqtt_bytes_err,
                         MqttBytesError::InvalidProtocol // Invalid agreement
                         | MqttBytesError::InvalidProtocolLevel(_) // Invalid protocol level
@@ -451,7 +829,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
                         | MqttBytesError::InvalidPacketType(_) // Invalid package type
                         | MqttBytesError::MalformedPacket // Package format error
                         | MqttBytesError::PayloadTooLong // Too long load
-                        | MqttBytesError::PayloadSizeLimitExceeded(_) // Load size limit exceeded
+                        | MqttBytesError::PayloadSizeLimitExceeded { .. } // Load size limit exceeded
                         | MqttBytesError::TopicNotUtf8 // Topic Non-UTF-8 (Serious Agreement Violation)
                     )
                 }
@@ -638,5 +1016,70 @@ where
 
     fn is_enabled(&self) -> bool {
         self.args.enable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MQTTTlsConfig, validate_mqtt_broker_url};
+    use url::Url;
+
+    #[test]
+    fn validate_mqtt_broker_url_rejects_non_websocket_path() {
+        let url = Url::parse("mqtt://broker.example.com:1883/custom").expect("valid url");
+        let err = validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect_err("non-websocket path should be rejected");
+        assert!(err.to_string().contains("path is only supported"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_rejects_non_websocket_query() {
+        let url = Url::parse("mqtt://broker.example.com:1883?client_id=test").expect("valid url");
+        let err = validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect_err("non-websocket query should be rejected");
+        assert!(err.to_string().contains("query is only supported"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_rejects_non_websocket_fragment() {
+        let url = Url::parse("mqtt://broker.example.com:1883/#section").expect("valid url");
+        let err =
+            validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect_err("non-websocket fragment should be rejected");
+        assert!(err.to_string().contains("fragment is only supported"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_allows_websocket_path_and_query() {
+        let url = Url::parse("ws://broker.example.com:8080/mqtt?client_id=test").expect("valid url");
+        validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect("websocket path and query should be allowed");
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_rejects_url_embedded_credentials() {
+        let url = Url::parse("mqtt://user:pass@broker.example.com:1883").expect("valid url");
+        let err = validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect_err("url credentials should be rejected");
+        assert!(err.to_string().contains("must not embed username or password"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_requires_explicit_tls_policy_for_secure_scheme() {
+        let url = Url::parse("mqtts://broker.example.com:8883").expect("valid url");
+        let err = validate_mqtt_broker_url(&url, &MQTTTlsConfig::default())
+            .expect_err("secure scheme should require explicit tls policy");
+        assert!(err.to_string().contains("explicit tls_policy"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_rejects_disallowed_websocket_path() {
+        let url = Url::parse("wss://broker.example.com/private").expect("valid url");
+        let tls = MQTTTlsConfig::from_values(Some("system_ca"), None, None, None, None, Some("/mqtt")).expect("valid tls config");
+        let err = validate_mqtt_broker_url(&url, &tls).expect_err("path outside allowlist should be rejected");
+        assert!(err.to_string().contains("allowlist"));
+    }
+
+    #[test]
+    fn validate_mqtt_broker_url_requires_tls_ca_for_custom_ca_policy() {
+        let url = Url::parse("mqtts://broker.example.com:8883").expect("valid url");
+        let tls = MQTTTlsConfig::from_values(Some("custom_ca"), None, None, None, None, None).expect("valid tls config");
+        let err = validate_mqtt_broker_url(&url, &tls).expect_err("custom_ca policy without path should be rejected");
+        assert!(err.to_string().contains("tls_ca"));
     }
 }
