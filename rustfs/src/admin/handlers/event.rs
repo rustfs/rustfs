@@ -465,7 +465,7 @@ impl Operation for NotificationTarget {
                 .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
             check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
                 .await
-                .map_err(|e| s3_error!(InvalidArgument, "MQTT Broker unavailable: {}", e))?;
+                .map_err(|e| s3_error!(InvalidArgument, "failed to validate MQTT broker configuration or availability: {}", e))?;
 
             if let Some(queue_dir) = kv_map.get("queue_dir") {
                 validate_queue_dir(queue_dir.as_str()).await?;
