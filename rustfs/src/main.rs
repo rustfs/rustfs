@@ -233,7 +233,7 @@ async fn async_main() -> Result<()> {
     // Server-side TLS acceptor is built separately inside start_http_server()
     // using the same TlsMaterialSnapshot loading logic.
     if let Some(tls_path) = &config.tls_path {
-        match crate::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+        match server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
             Ok(snapshot) => {
                 snapshot.apply_outbound().await;
                 info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
@@ -468,7 +468,7 @@ async fn run(config: config::Config) -> Result<()> {
     }
 
     // Initialize deadlock detector if enabled
-    let detector = crate::storage::deadlock_detector::get_deadlock_detector();
+    let detector = storage::deadlock_detector::get_deadlock_detector();
     if detector.is_enabled() {
         detector.start();
         info!(target: "rustfs::main::run","Deadlock detector started successfully.");
@@ -581,6 +581,8 @@ async fn run(config: config::Config) -> Result<()> {
     );
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
+    // Update service status to Ready
+    state_manager.update(ServiceState::Ready);
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
