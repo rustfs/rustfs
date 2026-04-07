@@ -147,7 +147,6 @@ impl QuotaChecker {
             .await
             .map_err(QuotaError::StorageError)?;
 
- 
         rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
         Ok(())
     }

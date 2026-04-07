@@ -49,24 +49,24 @@ impl SqlQueryExecution {
         }
     }
 
-    async fn start(&self) -> QueryResult<Output> {  
-        // Time optimize phase - automatically records on drop  
-        let _optimize_timer = self.query_state_machine.time_phase("optimize");  
-        self.query_state_machine.begin_optimize();  
-        let physical_plan = self.optimizer.optimize(&self.plan, &self.query_state_machine.session).await?;  
-        self.query_state_machine.end_optimize();  
-      
-        // Time schedule phase - automatically records on drop    
-        let _schedule_timer = self.query_state_machine.time_phase("schedule");  
-        self.query_state_machine.begin_schedule();  
-        let stream = self  
-            .scheduler  
-            .schedule(physical_plan.clone(), self.query_state_machine.session.inner().task_ctx())  
-            .await?  
-            .stream();  
-        self.query_state_machine.end_schedule();  
-      
-        Ok(Output::StreamData(stream))  
+    async fn start(&self) -> QueryResult<Output> {
+        // Time optimize phase - automatically records on drop
+        let _optimize_timer = self.query_state_machine.time_phase("optimize");
+        self.query_state_machine.begin_optimize();
+        let physical_plan = self.optimizer.optimize(&self.plan, &self.query_state_machine.session).await?;
+        self.query_state_machine.end_optimize();
+
+        // Time schedule phase - automatically records on drop
+        let _schedule_timer = self.query_state_machine.time_phase("schedule");
+        self.query_state_machine.begin_schedule();
+        let stream = self
+            .scheduler
+            .schedule(physical_plan.clone(), self.query_state_machine.session.inner().task_ctx())
+            .await?
+            .stream();
+        self.query_state_machine.end_schedule();
+
+        Ok(Output::StreamData(stream))
     }
 }
 

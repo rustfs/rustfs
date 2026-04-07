@@ -413,9 +413,7 @@ impl Metrics {
             latency: (0..Metric::LastRealtime as usize)
                 .map(|_| LockedLastMinuteLatency::new())
                 .collect(),
-            actions: (0..IlmAction::ActionCount as usize)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            actions: (0..IlmAction::ActionCount as usize).map(|_| AtomicU64::new(0)).collect(),
             actions_latency: (0..IlmAction::ActionCount as usize)
                 .map(|_| LockedLastMinuteLatency::new())
                 .collect(),
@@ -667,7 +665,11 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
     let tracker_clone = Arc::clone(&tracker);
     let disk_insert = disk_name.clone();
     tokio::spawn(async move {
-        global_metrics().current_paths.write().await.insert(disk_insert, tracker_clone);
+        global_metrics()
+            .current_paths
+            .write()
+            .await
+            .insert(disk_insert, tracker_clone);
     });
 
     let update_fn: UpdateCurrentPathFn = {
