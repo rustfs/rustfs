@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::fs::FileType;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -610,20 +611,18 @@ impl FolderScanner {
 
             let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
                 Ok(dir_reader) => dir_reader,
-                Err(e) => {
-                    warn!("scan_folder: failed to read dir {}: {}", dir_path, e);
-                    return Ok(());
-                }
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(ScannerError::Io(e)),
             };
 
             loop {
                 let entry = match dir_reader.next_entry().await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
-                    Err(e) => {
-                        warn!("scan_folder: failed to iterate dir {}: {}", dir_path, e);
+                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
                         break;
                     }
+                    Err(e) => return Err(ScannerError::Io(e)),
                 };
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
@@ -640,13 +639,27 @@ impl FolderScanner {
                     continue;
                 }
 
-                let entry_type = match entry.file_type().await {
+                // Mirror MinIO readDirFn semantics: ignore entries that disappeared
+                // during traversal or hit symlink loops, but propagate other walk errors.
+                let mut entry_type = match entry.file_type().await {
                     Ok(entry_type) => entry_type,
-                    Err(e) => {
-                        warn!("scan_folder: failed to inspect entry {}: {}", entry_name, e);
+                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => continue,
+                    Err(e) => return Err(ScannerError::Io(e)),
+                };
+
+                if entry_type.is_symlink() {
+                    let metadata = match tokio::fs::metadata(&file_path).await {
+                        Ok(metadata) => metadata,
+                        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => continue,
+                        Err(e) => return Err(ScannerError::Io(e)),
+                    };
+
+                    if metadata.is_dir() {
                         continue;
                     }
-                };
+
+                    entry_type = metadata.file_type();
+                }
 
                 // ok
 
@@ -1288,7 +1301,7 @@ mod tests {
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
     use serial_test::serial;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::AtomicBool;
     use uuid::Uuid;
 
@@ -1511,5 +1524,36 @@ mod tests {
             .expect("failed to restore bad dir permissions");
 
         assert!(result.is_ok(), "expected unreadable child directory to be skipped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn test_scan_folder_ignores_symlinked_child_directory() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        let target_dir = bucket_dir.join("target");
+        let link_dir = bucket_dir.join("link");
+
+        std::fs::create_dir_all(&target_dir).expect("failed to create target dir");
+        symlink(&target_dir, &link_dir).expect("failed to create symlinked dir");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        let mut into = DataUsageEntry::default();
+        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+        assert!(result.is_ok(), "expected symlinked child directory to be ignored");
+        assert_eq!(into.failed_objects, 0, "expected ignored symlink not to count as a failed object");
     }
 }
