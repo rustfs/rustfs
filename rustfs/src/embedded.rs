@@ -249,7 +249,11 @@ impl RustFSServerBuilder {
             return Err(ServerError::AlreadyStarted);
         }
 
-        self.do_build().await
+        let result = self.do_build().await;
+        if result.is_err() {
+            SERVER_STARTED.store(false, Ordering::SeqCst);
+        }
+        result
     }
 
     /// Inner build implementation. Separated from [`build`] so the outer
@@ -456,7 +460,10 @@ impl RustFSServerBuilder {
         );
 
         // Success — disarm the temp dir guard so it isn't cleaned up on drop.
-        let temp_dir = temp_dir_guard.map(|g| g.keep());
+        let temp_dir = temp_dir_guard
+            .map(|g| g.keep())
+            .transpose()
+            .map_err(|e| ServerError::Init(format!("failed to persist temp dir: {e}")))?;
 
         Ok(RustFSServer {
             address: bound_addr,
