@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
-use crate::sys::get_claims_from_token_with_secret;
+use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
@@ -687,6 +687,8 @@ where
             cr.description = opts.description;
         }
 
+        let token_without_expiration = cr.expiration.is_none();
+
         if opts.expiration.is_some() {
             // TODO: check expiration
             cr.expiration = opts.expiration;
@@ -702,7 +704,11 @@ where
             }
         }
 
-        let mut m: HashMap<String, Value> = get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?;
+        let mut m: HashMap<String, Value> = if token_without_expiration {
+            get_claims_from_token_with_secret_allow_missing_exp(&cr.session_token, &current_secret_key)?
+        } else {
+            get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?
+        };
         m.remove(SESSION_POLICY_NAME_EXTRACTED);
 
         let nosp = if let Some(policy) = &opts.session_policy {
@@ -730,6 +736,10 @@ where
                 );
                 m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
             }
+        }
+
+        if let Some(expiration) = opts.expiration {
+            m.insert("exp".to_owned(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
         }
 
         m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
@@ -1337,7 +1347,11 @@ where
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
         let mut u = u;
         if !u.credentials.session_token.is_empty() {
-            u.credentials.claims = Some(extract_jwt_claims(&u)?);
+            u.credentials.claims = Some(if u.credentials.expiration.is_none() {
+                extract_jwt_claims_allow_missing_exp(&u)?
+            } else {
+                extract_jwt_claims(&u)?
+            });
         }
 
         if u.credentials.is_temp() && !u.credentials.is_service_account() {
@@ -1877,6 +1891,21 @@ pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
 
     for key in keys {
         if let Ok(claims) = get_claims_from_token_with_secret(&u.credentials.session_token, key) {
+            return Ok(claims);
+        }
+    }
+    Err(Error::other("unable to extract claims"))
+}
+
+pub fn extract_jwt_claims_allow_missing_exp(u: &UserIdentity) -> Result<HashMap<String, Value>> {
+    let Some(sys_key) = get_token_signing_key() else {
+        return Err(Error::other("global active sk not init"));
+    };
+
+    let keys = vec![&sys_key, &u.credentials.secret_key];
+
+    for key in keys {
+        if let Ok(claims) = get_claims_from_token_with_secret_allow_missing_exp(&u.credentials.session_token, key) {
             return Ok(claims);
         }
     }
