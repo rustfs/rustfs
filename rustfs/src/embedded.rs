@@ -225,25 +225,21 @@ impl RustFSServerBuilder {
     /// # Errors
     ///
     /// Returns [`ServerError::AlreadyStarted`] if another server is already
-    /// running in this process.
+    /// running in this process, or if a previous startup attempt has already
+    /// initialized process-global state.
     pub async fn build(mut self) -> Result<RustFSServer, ServerError> {
-        // Enforce single-server-per-process.
+        // Enforce single-server-per-process. Startup initializes process-global
+        // OnceLock-backed state that cannot be rolled back safely, so any build
+        // attempt is one-shot for the lifetime of the process.
         if SERVER_STARTED.swap(true, Ordering::SeqCst) {
             return Err(ServerError::AlreadyStarted);
         }
 
-        // Run the fallible init; reset the flag on failure so callers can retry.
-        match self.do_build().await {
-            Ok(server) => Ok(server),
-            Err(e) => {
-                SERVER_STARTED.store(false, Ordering::SeqCst);
-                Err(e)
-            }
-        }
+        self.do_build().await
     }
 
-    /// Inner build implementation. Separated so that [`build`] can reset
-    /// `SERVER_STARTED` on any error path.
+    /// Inner build implementation. Separated from [`build`] so the outer
+    /// method can enforce the one-shot process-global startup guard.
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
         // Keep a TempDir guard alive so that if build fails the directory is
         // cleaned up automatically. We disarm (into_path) on success.
