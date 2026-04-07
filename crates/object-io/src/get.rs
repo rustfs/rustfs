@@ -170,6 +170,7 @@ pub trait CachedGetObjectSource {
     fn content_type(&self) -> Option<&str>;
     fn e_tag(&self) -> Option<&str>;
     fn last_modified(&self) -> Option<&str>;
+    fn expires(&self) -> Option<&str>;
     fn cache_control(&self) -> Option<&str>;
     fn content_disposition(&self) -> Option<&str>;
     fn content_encoding(&self) -> Option<&str>;
@@ -405,6 +406,10 @@ where
         .last_modified()
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
         .map(Timestamp::from);
+    let expires = cached
+        .expires()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .map(Timestamp::from);
 
     let content_type = cached.content_type().and_then(|ct| ContentType::from_str(ct).ok());
 
@@ -416,6 +421,7 @@ where
         accept_ranges: Some("bytes".to_string()),
         e_tag: cached.e_tag().map(to_s3s_etag),
         last_modified,
+        expires,
         content_type,
         cache_control: cached.cache_control().map(str::to_string),
         content_disposition: cached.content_disposition().map(str::to_string),
@@ -890,8 +896,12 @@ pub fn build_get_object_output(
         body,
         content_length: Some(response_content_length),
         last_modified,
+        expires: info.expires.map(Timestamp::from),
         content_type,
+        cache_control: info.user_defined.get(CACHE_CONTROL.as_str()).cloned(),
+        content_disposition: info.user_defined.get(CONTENT_DISPOSITION.as_str()).cloned(),
         content_encoding: info.content_encoding.clone(),
+        content_language: info.user_defined.get(CONTENT_LANGUAGE.as_str()).cloned(),
         accept_ranges: Some("bytes".to_string()),
         content_range,
         e_tag: info.etag.as_ref().map(|etag| to_s3s_etag(etag)),
@@ -1052,6 +1062,7 @@ mod tests {
         content_type: Option<String>,
         e_tag: Option<String>,
         last_modified: Option<String>,
+        expires: Option<String>,
         cache_control: Option<String>,
         content_disposition: Option<String>,
         content_encoding: Option<String>,
@@ -1088,6 +1099,10 @@ mod tests {
 
         fn last_modified(&self) -> Option<&str> {
             self.last_modified.as_deref()
+        }
+
+        fn expires(&self) -> Option<&str> {
+            self.expires.as_deref()
         }
 
         fn cache_control(&self) -> Option<&str> {
@@ -1624,6 +1639,7 @@ mod tests {
                 content_type: None,
                 e_tag: None,
                 last_modified: None,
+                expires: None,
                 cache_control: None,
                 content_disposition: None,
                 content_encoding: None,
@@ -1649,6 +1665,46 @@ mod tests {
         assert_eq!(result.event_info.name, "key");
         assert_eq!(result.output.checksum_crc32.as_deref(), Some("crc32"));
         assert_eq!(result.output.checksum_type, Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT)));
+    }
+
+    #[test]
+    fn build_get_object_output_preserves_http_metadata_like_cached_path() {
+        let mut info = ObjectInfo {
+            content_type: Some("application/octet-stream".to_string()),
+            content_encoding: Some("zstd".to_string()),
+            etag: Some("etag".to_string()),
+            expires: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        info.user_defined
+            .insert("cache-control".to_string(), "max-age=3600".to_string());
+        info.user_defined
+            .insert("content-disposition".to_string(), "attachment; filename=\"bundle.zip\"".to_string());
+        info.user_defined.insert("content-language".to_string(), "en-US".to_string());
+
+        let output = build_get_object_output(
+            None,
+            &info,
+            info.content_type
+                .as_ref()
+                .and_then(|content_type| ContentType::from_str(content_type).ok()),
+            info.mod_time.map(Timestamp::from),
+            8,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &GetObjectChecksums::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(output.cache_control.as_deref(), Some("max-age=3600"));
+        assert_eq!(output.content_disposition.as_deref(), Some("attachment; filename=\"bundle.zip\""));
+        assert_eq!(output.content_language.as_deref(), Some("en-US"));
+        assert_eq!(output.content_encoding.as_deref(), Some("zstd"));
+        assert_eq!(output.expires, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
     }
 
     #[test]

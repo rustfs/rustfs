@@ -192,6 +192,8 @@ spec:
         name: logs
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        annotations:
+          {{- toYaml .Values.storageclass.pvcAnnotations | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}
@@ -204,6 +206,8 @@ spec:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        annotations:
+          {{- toYaml $.Values.storageclass.pvcAnnotations | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $.Values.storageclass.name }}
@@ -216,6 +220,8 @@ spec:
         name: data
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        annotations:
+          {{- toYaml .Values.storageclass.pvcAnnotations | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}

@@ -344,6 +344,7 @@ impl ECStore {
         init_global_bucket_monitor(num_nodes);
 
         init_background_expiry(self.clone()).await;
+        crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
 
         TransitionState::init(self.clone()).await;
         crate::tier::tier::try_migrate_tiering_config(self.clone()).await;

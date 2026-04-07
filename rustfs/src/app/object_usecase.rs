@@ -38,6 +38,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+    validate_archive_content_encoding,
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::s3_api::{acl, restore, select};
@@ -315,6 +316,20 @@ fn apply_put_request_metadata(
     tagging: Option<TaggingHeader>,
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
+    let request_content_type = content_type.as_ref().map(ToString::to_string).or_else(|| {
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    });
+    let request_content_encoding = content_encoding.as_ref().map(ToString::to_string).or_else(|| {
+        headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    });
+    validate_archive_content_encoding(object_name, request_content_type.as_deref(), request_content_encoding.as_deref())?;
+
     if let Some(cache_control) = cache_control {
         metadata.insert("cache-control".to_string(), cache_control.to_string());
     }

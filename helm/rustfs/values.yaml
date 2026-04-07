@@ -264,6 +264,10 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
+  pvcAnnotations: {}
+  # pvcAnnotations:
+    # - name: team
+    #   value: "RustFS"
 
 pdb:
   create: false
