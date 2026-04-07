@@ -564,6 +564,8 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     );
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
+    // Update service status to Ready
+    state_manager.update(ServiceState::Ready);
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
