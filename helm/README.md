@@ -23,7 +23,6 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.console_address | string | `":9001"` |  |
 | config.rustfs.console_enable | string | `"true"` |  |
 | config.rustfs.domains | string | `""` | Enable virtual host mode. |
-| config.rustfs.ec.storage_class_standard | string | `EC:4` | Standard storage class environment variable. |
 | config.rustfs.log_level | string | `"info"` |  |
 | config.rustfs.obs_environment | string | `"development"` |  |
 | config.rustfs.obs_log_directory | string | `"/logs"` |  |
