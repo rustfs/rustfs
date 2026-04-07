@@ -601,6 +601,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-tungstenite"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb26fbd2a93308b1c1b74ac4e494a11ac10db57c476882240573bdf961463520"
+dependencies = [
+ "atomic-waker",
+ "futures-core",
+ "futures-io",
+ "futures-task",
+ "futures-util",
+ "log",
+ "pin-project-lite",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3543,9 +3563,9 @@ dependencies = [
 
 [[package]]
 name = "flume"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -5510,6 +5530,16 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "mqttbytes-core-next"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f2068d9ea771ce85a7b8caa23d9e542b10b118e99b2b16dbcac626211c9903c"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -7509,23 +7539,54 @@ dependencies = [
 ]
 
 [[package]]
-name = "rumqttc"
-version = "0.25.1"
+name = "rumqttc-core-next"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
+checksum = "bad77a37d1cf72bf95973879c3b6542530889a27ced6861d98de80145ea0e871"
 dependencies = [
- "bytes",
- "fixedbitset",
- "flume",
+ "async-tungstenite",
+ "futures-io",
  "futures-util",
- "log",
+ "http 1.4.0",
  "rustls-native-certs",
- "rustls-pemfile",
- "rustls-webpki 0.102.8",
+ "rustls-pki-types",
+ "rustls-webpki",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
+]
+
+[[package]]
+name = "rumqttc-next"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70844faf7766027294c088fdc456096cb0877eb4a346cc8119b7fc444eeb6afa"
+dependencies = [
+ "rumqttc-v5-next",
+]
+
+[[package]]
+name = "rumqttc-v5-next"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8418a883899469a505b30076738ddf344f8c625690fb10602ea965786a094b0"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "fixedbitset",
+ "flume",
+ "futures-io",
+ "futures-util",
+ "http 1.4.0",
+ "log",
+ "mqttbytes-core-next",
+ "rumqttc-core-next",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
  "tokio-util",
 ]
 
@@ -7723,7 +7784,7 @@ dependencies = [
  "futures",
  "hashbrown 0.16.1",
  "metrics",
- "rumqttc",
+ "rumqttc-next",
  "rustfs-config",
  "rustfs-ecstore",
  "rustfs-s3-common",
@@ -8151,7 +8212,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "quick-xml 0.39.2",
  "rayon",
- "rumqttc",
+ "rumqttc-next",
  "rustc-hash",
  "rustfs-config",
  "rustfs-ecstore",
@@ -8455,11 +8516,13 @@ version = "0.0.5"
 dependencies = [
  "async-trait",
  "criterion",
+ "hyper-rustls",
  "reqwest 0.13.2",
- "rumqttc",
+ "rumqttc-next",
  "rustfs-config",
  "rustfs-s3-common",
  "rustfs-utils",
+ "rustls",
  "serde",
  "serde_json",
  "snap",
@@ -8640,7 +8703,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.10",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -8655,15 +8718,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -8690,7 +8744,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.10",
+ "rustls-webpki",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
@@ -8702,17 +8756,6 @@ name = "rustls-platform-verifier-android"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted 0.9.0",
-]
 
 [[package]]
 name = "rustls-webpki"
@@ -10234,6 +10277,24 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.4.0",
+ "httparse",
+ "log",
+ "rand 0.9.2",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.6",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "twox-hash"

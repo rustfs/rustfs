@@ -53,6 +53,12 @@ fn test_mqtt_valid_fields() {
         "reconnect_interval",
         "queue_dir",
         "queue_limit",
+        "tls_policy",
+        "tls_ca",
+        "tls_client_cert",
+        "tls_client_key",
+        "tls_trust_leaf_as_ca",
+        "ws_path_allowlist",
     ];
 
     // This tests the MQTT configuration fields we support
