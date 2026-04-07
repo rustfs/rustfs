@@ -255,9 +255,12 @@ impl Default for LockedLastMinuteLatency {
 // vec![val; N] and #[derive(Clone)] on the parent struct both need.
 impl Clone for LockedLastMinuteLatency {
     fn clone(&self) -> Self {
-        let inner = self.latency.lock().expect("LockedLastMinuteLatency mutex poisoned");
+        let inner = match self.latency.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         Self {
-            latency: Arc::new(Mutex::new(inner.clone())),
+            latency: Arc::new(Mutex::new(inner)),
         }
     }
 }
@@ -287,18 +290,18 @@ impl LockedLastMinuteLatency {
             size,
         };
 
-        self.latency
-            .lock()
-            .expect("LockedLastMinuteLatency mutex poisoned")
-            .add_all(now, &elem);
+        match self.latency.lock() {
+            Ok(mut guard) => guard.add_all(now, &elem),
+            Err(poisoned) => poisoned.into_inner().add_all(now, &elem),
+        }
     }
 
     /// Return accumulated totals for the last minute window.
     pub fn total(&self) -> AccElem {
-        self.latency
-            .lock()
-            .expect("LockedLastMinuteLatency mutex poisoned")
-            .get_total()
+        match self.latency.lock() {
+            Ok(mut latency) => latency.get_total(),
+            Err(poisoned) => poisoned.into_inner().get_total(),
+        }
     }
 }
 

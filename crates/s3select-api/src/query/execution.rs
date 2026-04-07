@@ -33,14 +33,14 @@ use super::logical_planner::Plan;
 use super::session::SessionCtx;
 
 pub struct PhaseTimer {
-    phase_name: String,
+    phase_name: &'static str,
     start_time: Instant,
 }
 
 impl PhaseTimer {
-    pub fn new(phase_name: &str) -> Self {
+    pub fn new(phase_name: &'static str) -> Self {
         Self {
-            phase_name: phase_name.to_string(),
+            phase_name,
             start_time: Instant::now(),
         }
     }
@@ -50,10 +50,12 @@ impl Drop for PhaseTimer {
     fn drop(&mut self) {
         let duration = self.start_time.elapsed();
 
-        #[cfg(all(feature = "metrics", not(test)))]
         if !std::thread::panicking() {
-            use metrics::histogram;
-            histogram!("rustfs.s3select.phase.duration.seconds", "phase" => &self.phase_name).record(duration.as_secs_f64());
+            metrics::histogram!(
+                "rustfs.s3select.phase.duration.seconds",
+                "phase" => self.phase_name
+            )
+            .record(duration.as_secs_f64());
         }
 
         debug!("Phase '{}' took {:?}", self.phase_name, duration);
@@ -166,16 +168,17 @@ pub struct QueryStateMachine {
 }
 
 impl QueryStateMachine {
-    fn record_phase_timestamp(&self, phase: &str, event: &str) {
+    fn record_phase_timestamp(&self, phase: &'static str, event: &'static str) {
         let elapsed = self.start.elapsed();
-        let phase = phase.to_string(); // Convert to owned String  
-        let event = event.to_string();
-        metrics::histogram!("s3select.phase.timestamp.seconds",         
-        "phase" => phase, "event" => event)
+        metrics::histogram!(
+            "rustfs.s3select.phase.timestamp.seconds",
+            "phase" => phase,
+            "event" => event
+        )
         .record(elapsed.as_secs_f64());
     }
     #[must_use]
-    pub fn time_phase(&self, phase_name: &str) -> PhaseTimer {
+    pub fn time_phase(&self, phase_name: &'static str) -> PhaseTimer {
         PhaseTimer::new(phase_name)
     }
 
