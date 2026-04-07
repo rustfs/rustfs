@@ -22,7 +22,7 @@ use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
-use rustfs_kms::init_global_kms_service_manager;
+use rustfs_kms::{KmsBackend, init_global_kms_service_manager};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -30,14 +30,26 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
-    let manager = match resolve_kms_runtime_service_manager() {
+    let manager = kms_service_manager_from_context();
+    manager.get_encryption_service().await
+}
+
+fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
+    match resolve_kms_runtime_service_manager() {
         Some(manager) => manager,
         None => {
             warn!("KMS service manager not initialized, initializing now as fallback");
             init_global_kms_service_manager()
         }
-    };
-    manager.get_encryption_service().await
+    }
+}
+
+fn backend_name(backend: &KmsBackend) -> &'static str {
+    match backend {
+        KmsBackend::Local => "local",
+        KmsBackend::VaultKv2 => "vault-kv2",
+        KmsBackend::VaultTransit => "vault-transit",
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,11 +180,15 @@ impl Operation for KmsStatusHandler {
             hit_count: hits,
             miss_count: misses,
         });
+        let config = kms_service_manager_from_context().get_config().await;
 
         let response = KmsStatusResponse {
-            backend_type: "vault".to_string(), // TODO: Get from config
+            backend_type: config
+                .as_ref()
+                .map(|cfg| backend_name(&cfg.backend).to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             backend_status,
-            cache_enabled: cache_stats.is_some(),
+            cache_enabled: config.as_ref().is_some_and(|cfg| cfg.enable_cache),
             cache_stats,
             default_key_id: service.get_default_key_id().cloned(),
         };
@@ -213,12 +229,16 @@ impl Operation for KmsConfigHandler {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
         };
 
-        // TODO: Get actual config from service
+        let config = kms_service_manager_from_context()
+            .get_config()
+            .await
+            .ok_or_else(|| s3_error!(InternalError, "KMS config not available"))?;
+
         let response = KmsConfigResponse {
-            backend: "vault".to_string(),
-            cache_enabled: true,
-            cache_max_keys: 1000,
-            cache_ttl_seconds: 300,
+            backend: backend_name(&config.backend).to_string(),
+            cache_enabled: config.enable_cache,
+            cache_max_keys: config.cache_config.max_keys,
+            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
             default_key_id: service.get_default_key_id().cloned(),
         };
 

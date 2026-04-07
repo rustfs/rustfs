@@ -626,7 +626,7 @@ pub struct HealthStatus {
     pub kms_healthy: bool,
     /// Whether encryption/decryption operations are working
     pub encryption_working: bool,
-    /// Backend type (e.g., "local", "vault")
+    /// Backend type (e.g., "local", "vault-kv2", "vault-transit")
     pub backend_type: String,
     /// Additional health details
     pub details: HashMap<String, String>,
