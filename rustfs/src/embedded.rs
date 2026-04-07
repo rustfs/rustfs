@@ -57,7 +57,11 @@ use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
-    bucket::metadata_sys::init_bucket_metadata_sys, bucket::replication::init_background_replication, config as ecconfig,
+    bucket::{
+        metadata_sys::init_bucket_metadata_sys,
+        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
+    },
+    bucket::replication::init_background_replication, config as ecconfig,
     endpoints::EndpointServerPools, global::set_global_rustfs_port, notification_sys::new_global_notification_sys,
     set_global_endpoints, store::ECStore, store::init_local_disks, store_api::BucketOperations, store_api::BucketOptions,
     update_erasure_type,
@@ -271,10 +275,12 @@ impl RustFSServerBuilder {
         let guard = init_obs(Some(config.obs_endpoint.clone()))
             .await
             .map_err(|e| ServerError::Init(format!("init_obs: {e}")))?;
-        let _ = set_global_guard(guard);
+        set_global_guard(guard).map_err(|e| ServerError::Init(format!("set_global_guard: {e}")))?;
 
         // Crypto provider.
-        let _ = default_provider().install_default();
+        if let Err(err) = default_provider().install_default() {
+            debug!("Ignoring crypto provider installation error: {err}");
+        }
 
         // Trusted proxies.
         rustfs_trusted_proxies::init();
@@ -388,7 +394,9 @@ impl RustFSServerBuilder {
             .map(|v| v.name)
             .collect();
 
+        try_migrate_bucket_metadata(store.clone()).await;
         init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
+        try_migrate_iam_config(store.clone()).await;
 
         // IAM.
         init_iam_sys(store.clone())
@@ -442,8 +450,10 @@ impl RustFSServerBuilder {
 /// A running embedded RustFS server.
 ///
 /// Use [`endpoint`](Self::endpoint) to get the HTTP URL for S3 clients.
-/// Call [`shutdown`](Self::shutdown) (or drop) to stop the server and
-/// clean up resources.
+/// Call [`shutdown`](Self::shutdown) to stop the server and clean up resources.
+///
+/// Dropping the server performs best-effort synchronous cleanup and may leave
+/// async or process-global subsystems running until process exit.
 pub struct RustFSServer {
     address: SocketAddr,
     access_key: String,

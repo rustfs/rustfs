@@ -19,7 +19,13 @@
 
 use super::Opt;
 use crate::apply_external_env_compat;
-use rustfs_config::{ENV_RUSTFS_ROOT_PASSWORD, ENV_RUSTFS_ROOT_USER, RUSTFS_REGION};
+use rustfs_config::{
+    DEFAULT_CONSOLE_ADDRESS,
+    DEFAULT_CONSOLE_ENABLE,
+    ENV_RUSTFS_ROOT_PASSWORD,
+    ENV_RUSTFS_ROOT_USER,
+    RUSTFS_REGION,
+};
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 
 /// Helper function to resolve credentials from multiple sources with precedence:
@@ -122,8 +128,8 @@ impl Config {
             server_domains: Vec::new(),
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
-            console_enable: false,
-            console_address: String::new(),
+            console_enable: DEFAULT_CONSOLE_ENABLE,
+            console_address: DEFAULT_CONSOLE_ADDRESS.to_string(),
             obs_endpoint: rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
             tls_path: None,
             license: None,
