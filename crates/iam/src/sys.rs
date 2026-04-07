@@ -1592,6 +1592,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_update_service_account_adds_exp_claim_to_non_expiring_account() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account("svc-parent-user", None, NewServiceAccountOpts::default())
+            .await
+            .expect("service account without explicit expiration should be created");
+
+        let updated_expiration = OffsetDateTime::now_utc() + time::Duration::hours(3);
+        iam_sys
+            .update_service_account(
+                &cred.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: Some(updated_expiration),
+                    status: None,
+                },
+            )
+            .await
+            .expect("service account without expiration should accept a new expiration");
+
+        let updated_user = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("updated service account should exist");
+        assert_eq!(updated_user.credentials.expiration, Some(updated_expiration));
+
+        let claims =
+            get_claims_from_token_with_secret(&updated_user.credentials.session_token, &updated_user.credentials.secret_key)
+                .expect("updated service account JWT should decode after adding expiration");
+        assert_eq!(claims.get("exp").and_then(|v| v.as_i64()), Some(updated_expiration.unix_timestamp()));
+    }
+
     /// Regression test: temp credentials without groups in args still receive group-attached
     /// policies via the parent user (groups fallback). Without the fallback, policy_db_get
     /// would get None for groups and the user would have no group policies, so the action

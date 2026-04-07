@@ -687,6 +687,8 @@ where
             cr.description = opts.description;
         }
 
+        let token_without_expiration = cr.expiration.is_none();
+
         if opts.expiration.is_some() {
             // TODO: check expiration
             cr.expiration = opts.expiration;
@@ -702,7 +704,7 @@ where
             }
         }
 
-        let mut m: HashMap<String, Value> = if cr.expiration.is_none() {
+        let mut m: HashMap<String, Value> = if token_without_expiration {
             get_claims_from_token_with_secret_allow_missing_exp(&cr.session_token, &current_secret_key)?
         } else {
             get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?
