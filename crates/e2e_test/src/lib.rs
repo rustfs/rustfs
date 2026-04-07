@@ -116,6 +116,9 @@ mod bucket_logging_test;
 #[cfg(test)]
 mod multipart_auth_test;
 
+#[cfg(test)]
+mod stale_multipart_cleanup_cluster_test;
+
 // Object lambda end-to-end regression tests
 #[cfg(test)]
 mod object_lambda_test;
