@@ -46,6 +46,7 @@ pub const VAULT_ADDRESS: &str = "127.0.0.1:8200";
 pub const VAULT_TOKEN: &str = "dev-root-token";
 pub const VAULT_TRANSIT_PATH: &str = "transit";
 pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
+pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
 
 /// Initialize tracing for KMS tests with KMS-specific log levels
 pub fn init_logging() {
@@ -385,6 +386,10 @@ pub struct VaultTestEnvironment {
 }
 
 impl VaultTestEnvironment {
+    fn resolve_vault_binary() -> String {
+        std::env::var(ENV_TEST_VAULT_BIN).unwrap_or_else(|_| "vault".to_string())
+    }
+
     /// Create a new Vault test environment
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let base_env = RustFSTestEnvironment::new().await?;
@@ -399,7 +404,8 @@ impl VaultTestEnvironment {
     pub async fn start_vault(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Vault server in development mode");
 
-        let vault_process = Command::new("vault")
+        let vault_binary = Self::resolve_vault_binary();
+        let vault_process = Command::new(&vault_binary)
             .args([
                 "server",
                 "-dev",
@@ -490,10 +496,10 @@ impl VaultTestEnvironment {
         self.base_env.start_rustfs_server(Vec::new()).await
     }
 
-    /// Configure Vault KMS backend
-    pub async fn configure_vault_kms(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Configure Vault Transit KMS backend
+    pub async fn configure_vault_transit_kms(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let kms_config = serde_json::json!({
-            "backend_type": "vault",
+            "backend_type": "VaultTransit",
             "address": VAULT_URL,
             "auth_method": {
                 "Token": {
@@ -501,8 +507,6 @@ impl VaultTestEnvironment {
                 }
             },
             "mount_path": VAULT_TRANSIT_PATH,
-            "kv_mount": "secret",
-            "key_path_prefix": "rustfs/kms/keys",
             "default_key_id": VAULT_KEY_NAME,
             "skip_tls_verify": true
         })
@@ -787,7 +791,7 @@ impl LocalKMSTestEnvironment {
 
         // Configure KMS with the default key in one step
         let kms_config = serde_json::json!({
-            "backend_type": "local",
+            "backend_type": "Local",
             "key_dir": self.kms_keys_dir,
             "file_permissions": 0o600,
             "default_key_id": default_key_id
