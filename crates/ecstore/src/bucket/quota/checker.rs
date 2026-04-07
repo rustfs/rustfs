@@ -107,9 +107,10 @@ impl QuotaChecker {
         };
 
         let duration = start_time.elapsed();
-        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaCheck, duration).await;
+        // inc_time is now a plain fn (not async) — no .await needed.
+        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaCheck, duration);
         if !allowed {
-            rustfs_common::metrics::Metrics::inc_time(Metric::QuotaViolation, duration).await;
+            rustfs_common::metrics::Metrics::inc_time(Metric::QuotaViolation, duration);
         }
 
         Ok(result)
@@ -146,7 +147,7 @@ impl QuotaChecker {
             .await
             .map_err(QuotaError::StorageError)?;
 
-        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed()).await;
+        rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
         Ok(())
     }
 
