@@ -27,14 +27,14 @@ use self::get_object_flow::{GetObjectBootstrap, GetObjectFlowRuntime};
 use self::types::*;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::capacity::capacity_manager::get_capacity_manager;
+use crate::capacity::record_capacity_write;
 use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{GetObjectGuard, get_concurrency_manager};
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::OperationHelper;
+use crate::storage::helper::{OperationHelper, spawn_background};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -1020,9 +1020,9 @@ impl DefaultObjectUsecase {
 
         let request_id = req
             .extensions
-            .get::<crate::storage::request_context::RequestContext>()
+            .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
-            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
         let bootstrap = init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let request_context = prepare_get_object_request_context(&req).await?;
         let base_buffer_size = self.base_buffer_size();
@@ -1848,6 +1848,7 @@ impl DefaultObjectUsecase {
 
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
         let bypass_governance = has_bypass_governance_header(&req.headers);
+        let capacity_scope_token = Uuid::new_v4();
 
         #[derive(Default, Clone)]
         struct DeleteResult {
@@ -1970,6 +1971,7 @@ impl DefaultObjectUsecase {
                 object_to_delete.clone(),
                 ObjectOptions {
                     version_suspended: version_cfg.suspended(),
+                    capacity_scope_token: Some(capacity_scope_token),
                     ..Default::default()
                 },
             )
@@ -2076,7 +2078,7 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        crate::storage::helper::spawn_background(async move {
+        spawn_background(async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -2108,8 +2110,7 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        record_capacity_write(Some(capacity_scope_token)).await;
         result
     }
 
@@ -2144,6 +2145,8 @@ impl DefaultObjectUsecase {
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
         let force_delete = opts.delete_prefix;
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
@@ -2255,8 +2258,7 @@ impl DefaultObjectUsecase {
                 })
                 .version_id(String::new());
             let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
-            let manager = get_capacity_manager();
-            manager.record_write_operation().await;
+            record_capacity_write(Some(capacity_scope_token)).await;
             let _ = helper.complete(&result);
             return result;
         }
@@ -2304,8 +2306,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        record_capacity_write(Some(capacity_scope_token)).await;
         let _ = helper.complete(&result);
         result
     }
@@ -2860,7 +2861,7 @@ impl DefaultObjectUsecase {
         let rreq_clone = rreq.clone();
         let version_id_clone = version_id.clone();
 
-        crate::storage::request_context::spawn_traced(async move {
+        request_context::spawn_traced(async move {
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
@@ -2953,7 +2954,7 @@ impl DefaultObjectUsecase {
 
         let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
         let stream = ReceiverStream::new(rx);
-        crate::storage::request_context::spawn_traced(async move {
+        request_context::spawn_traced(async move {
             let _ = tx
                 .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
                 .await;

@@ -12,16 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Application layer module entry.
-//! Concrete use-case modules will be introduced incrementally in Phase 3.
+pub mod capacity_manager;
+pub mod scan;
+pub mod types;
 
-pub mod admin_usecase;
-pub mod bucket_usecase;
-pub mod context;
-pub mod multipart_usecase;
-pub mod object_usecase;
-
-#[cfg(test)]
-mod capacity_dirty_scope_test;
-#[cfg(test)]
-mod lifecycle_transition_api_test;
+pub use scan::scan_used_capacity_disks;
+pub use types::{CapacityDiskRef, CapacityScanSummary};

@@ -400,7 +400,7 @@ pub(super) fn complete_put_response(helper: OperationHelper, output: PutObjectOu
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_put_extract_notification(
     notify: Arc<dyn NotifyInterface>,
-    request_context: Option<crate::storage::request_context::RequestContext>,
+    request_context: Option<request_context::RequestContext>,
     bucket: String,
     req_params: HashMap<String, String>,
     version_id: String,
@@ -422,7 +422,7 @@ pub(super) fn spawn_put_extract_notification(
         user_agent,
     };
 
-    crate::storage::helper::spawn_background_with_context(request_context, async move {
+    helper::spawn_background_with_context(request_context, async move {
         notify.notify(event_args).await;
     });
 }

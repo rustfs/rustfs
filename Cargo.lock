@@ -7712,6 +7712,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-metrics",
  "rustfs-notify",
+ "rustfs-object-capacity",
  "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
@@ -7757,7 +7758,6 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
- "walkdir",
  "zip",
 ]
 
@@ -8227,6 +8227,25 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wildmatch",
+]
+
+[[package]]
+name = "rustfs-object-capacity"
+version = "0.0.5"
+dependencies = [
+ "criterion",
+ "futures",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-io-metrics",
+ "rustfs-utils",
+ "serial_test",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -9726,6 +9745,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
+ "futures",
  "parking_lot 0.12.5",
 ]
 

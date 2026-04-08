@@ -67,6 +67,7 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
+use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
@@ -131,6 +132,36 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn env_non_negative_usize(name: &str) -> Option<usize> {
     rustfs_utils::get_env_opt_usize(name)
+}
+
+fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
+    let mut unique = HashSet::with_capacity(disks.len());
+    let mut scoped_disks = Vec::with_capacity(disks.len());
+
+    for disk in disks.iter().flatten() {
+        let scope_disk = CapacityScopeDisk {
+            endpoint: disk.endpoint().to_string(),
+            drive_path: disk.to_string(),
+        };
+        if unique.insert(scope_disk.clone()) {
+            scoped_disks.push(scope_disk);
+        }
+    }
+
+    CapacityScope { disks: scoped_disks }
+}
+
+fn record_capacity_scope_if_needed(scope_token: Option<Uuid>, disks: &[Option<DiskStore>]) {
+    let scope = capacity_scope_from_disks(disks);
+    if scope.disks.is_empty() {
+        return;
+    }
+
+    record_global_dirty_scope(scope.clone());
+
+    if let Some(token) = scope_token {
+        record_capacity_scope(token, scope);
+    }
 }
 
 fn resolved_put_inline_buffer_enabled(object_size: i64, inline_by_topology: bool) -> bool {
@@ -1087,6 +1118,8 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
+
         fi.replication_state_internal = Some(opts.put_replication_state());
 
         fi.is_latest = true;
@@ -1681,6 +1714,8 @@ impl ObjectOperations for SetDisks {
             }
         }
 
+        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+
         // TODO: add_partial
 
         if dist_erasure {
@@ -1829,6 +1864,10 @@ impl ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
+            if let Ok(disks) = self.get_disks(0, 0).await {
+                record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            }
+
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
             return Ok(oi);
@@ -1854,6 +1893,10 @@ impl ObjectOperations for SetDisks {
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+
+        if let Ok(disks) = self.get_disks(0, 0).await {
+            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        }
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
@@ -2157,6 +2200,8 @@ impl ObjectOperations for SetDisks {
                 error = ?err,
                 "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
             );
+        } else {
+            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
         }
 
         for disk in disks.iter() {
@@ -3514,6 +3559,8 @@ impl MultipartOperations for SetDisks {
                 break;
             }
         }
+
+        record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
         fi.is_latest = true;
 

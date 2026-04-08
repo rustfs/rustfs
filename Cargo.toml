@@ -35,6 +35,7 @@ members = [
     "crates/metrics", # Metrics collection and reporting
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/object-capacity", # Capacity scan and refresh core
     "crates/policy", # Policy management
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
@@ -99,6 +100,7 @@ rustfs-notify = { path = "crates/notify", version = "0.0.5" }
 rustfs-io-metrics = { path = "crates/io-metrics", version = "0.0.5" }
 rustfs-io-core = { path = "crates/io-core", version = "0.0.5" }
 rustfs-object-io = { path = "crates/object-io", version = "0.0.5" }
+rustfs-object-capacity = { path = "crates/object-capacity", version = "0.0.5" }
 rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
 rustfs-protos = { path = "crates/protos", version = "0.0.5" }

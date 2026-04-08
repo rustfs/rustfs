@@ -32,7 +32,7 @@ const SLOW_PUT_PHASE_DEBUG_THRESHOLD_MS: u64 = 100;
 const SLOW_PUT_PHASE_WARN_THRESHOLD_MS: u64 = 1_000;
 const SLOW_PUT_PHASE_ERROR_THRESHOLD_MS: u64 = 5_000;
 
-fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<bytes::Bytes> {
+fn resolved_checksum_bytes(checksums: &PutObjectChecksums) -> Option<Bytes> {
     [
         (rustfs_rio::ChecksumType::CRC32, checksums.crc32.as_deref()),
         (rustfs_rio::ChecksumType::CRC32C, checksums.crc32c.as_deref()),
@@ -117,7 +117,7 @@ fn log_put_flow_phase(
     bucket: &str,
     key: &str,
     phase: &str,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
     object_size: i64,
     small_eager: bool,
     reduced_copy: bool,
@@ -159,11 +159,11 @@ impl PooledBufferReader {
     }
 }
 
-impl tokio::io::AsyncRead for PooledBufferReader {
+impl AsyncRead for PooledBufferReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let remaining = &self.buffer[self.position..];
         if remaining.is_empty() {
@@ -199,7 +199,7 @@ impl HashReaderDetector for PooledBufferReader {}
 
 impl TryGetIndex for PooledBufferReader {}
 
-async fn read_small_put_body_eager<S, B, E>(body: S, size: i64, pool: std::sync::Arc<BytesPool>) -> S3Result<PooledBuffer>
+async fn read_small_put_body_eager<S, B, E>(body: S, size: i64, pool: Arc<BytesPool>) -> S3Result<PooledBuffer>
 where
     S: Stream<Item = Result<B, E>>,
     B: Buf,
@@ -243,7 +243,7 @@ where
 async fn build_small_put_eager_hash_stage<S, B, E>(
     body: S,
     size: i64,
-    pool: std::sync::Arc<BytesPool>,
+    pool: Arc<BytesPool>,
     hash_values: PutObjectLegacyHashValues,
     headers: &HeaderMap,
     trailing_headers: Option<s3s::TrailingHeaders>,
@@ -587,6 +587,8 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -689,8 +691,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        record_capacity_write(Some(capacity_scope_token)).await;
 
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;
