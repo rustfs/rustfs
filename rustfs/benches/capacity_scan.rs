@@ -1,6 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rustfs::capacity::scan_used_capacity_disks;
-use rustfs_madmin::Disk;
+use rustfs::capacity::{CapacityDiskRef, scan_used_capacity_disks};
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -19,7 +18,7 @@ struct DiskSpec {
 
 struct CapacityScanFixture {
     _dirs: Vec<TempDir>,
-    disks: Vec<Disk>,
+    disks: Vec<CapacityDiskRef>,
 }
 
 impl CapacityScanFixture {
@@ -30,10 +29,9 @@ impl CapacityScanFixture {
         for (idx, spec) in specs.iter().enumerate() {
             let dir = TempDir::new().expect("create temp dir");
             populate_files(dir.path(), spec.file_count, spec.file_size).expect("populate files");
-            disks.push(Disk {
+            disks.push(CapacityDiskRef {
                 endpoint: format!("bench-disk-{idx}"),
                 drive_path: dir.path().to_string_lossy().into_owned(),
-                ..Default::default()
             });
             dirs.push(dir);
         }

@@ -7713,6 +7713,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-metrics",
  "rustfs-notify",
+ "rustfs-object-capacity",
  "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
@@ -8228,6 +8229,24 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wildmatch",
+]
+
+[[package]]
+name = "rustfs-object-capacity"
+version = "0.0.5"
+dependencies = [
+ "futures",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-io-metrics",
+ "rustfs-utils",
+ "serial_test",
+ "temp-env",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

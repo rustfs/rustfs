@@ -14,7 +14,8 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
-use crate::app::admin_usecase::refresh_capacity_with_scope;
+use super::scan::refresh_capacity_with_scope;
+use super::types::CapacityDiskRef;
 use futures::FutureExt;
 use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use rustfs_config::{
@@ -381,7 +382,7 @@ pub enum DataSource {
 }
 
 impl DataSource {
-    pub(crate) fn as_metric_label(self) -> &'static str {
+    pub fn as_metric_label(self) -> &'static str {
         match self {
             Self::RealTime => "realtime",
             Self::Scheduled => "scheduled",
@@ -868,7 +869,6 @@ impl HybridCapacityManager {
     }
 
     /// Return whether a refresh is currently in flight.
-    #[cfg(test)]
     pub async fn refresh_in_progress(&self) -> bool {
         self.refresh_state.lock().await.running
     }
@@ -890,20 +890,19 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 /// without affecting the global singleton, avoiding test pollution.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// let manager = create_isolated_manager(HybridStrategyConfig::default());
 /// manager
 ///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
 ///     .await;
 /// ```
-#[cfg(test)]
 #[allow(dead_code)]
 pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
     Arc::new(HybridCapacityManager::new(config))
 }
 
 /// Start background update task
-pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
+pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     let manager = get_capacity_manager();
     let mut interval = manager.get_config().scheduled_update_interval;
 

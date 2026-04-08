@@ -14,6 +14,7 @@
 
 //! Capacity management integration for application startup
 
+use crate::capacity::CapacityDiskRef;
 use crate::capacity::capacity_manager::{DataSource, get_capacity_manager, start_background_task};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_io_metrics::{record_capacity_cache_hit, record_capacity_cache_miss};
@@ -34,14 +35,12 @@ pub async fn init_capacity_management() {
 
     info!("Found {} local disk(s)", disks.len());
 
-    // Convert DiskStore to Disk (for compatibility with capacity_manager)
-    let disk_refs: Vec<rustfs_madmin::Disk> = disks
+    // Convert DiskStore to the capacity crate's lightweight disk reference type.
+    let disk_refs: Vec<CapacityDiskRef> = disks
         .iter()
-        .map(|ds| rustfs_madmin::Disk {
+        .map(|ds| CapacityDiskRef {
             endpoint: ds.endpoint().to_string(),
             drive_path: ds.to_string(),
-            root_disk: true,
-            ..Default::default()
         })
         .collect();
 

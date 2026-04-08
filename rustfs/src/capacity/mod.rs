@@ -48,53 +48,22 @@
 //! Capacity metrics flow through the existing observability pipeline via the `metrics`
 //! crate and `rustfs-io-metrics`; this module does not expose a Prometheus HTTP endpoint.
 //!
-//! ## Testing
-//!
-//! For isolated tests, use `create_isolated_manager()` to create independent
-//! instances instead of the global singleton:
-//!
-//! ```ignore
-//! use crate::capacity::create_isolated_manager;
-//!
-//! let manager = create_isolated_manager(HybridStrategyConfig::default());
-//! // Test without affecting global state
-//! ```
-//!
-
-use std::time::Duration;
-
 pub mod capacity_integration;
-pub mod capacity_manager;
 #[cfg(test)]
 mod capacity_manager_test;
 #[cfg(test)]
 mod write_trigger_test;
 
-/// Public summary type for external tooling such as benches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapacityScanSummary {
-    pub used_bytes: u64,
-    pub file_count: usize,
-    pub sampled_count: usize,
-    pub is_estimated: bool,
-    pub had_partial_errors: bool,
-    pub scan_duration: Duration,
+pub mod capacity_manager {
+    pub use rustfs_object_capacity::capacity_manager::*;
 }
 
-/// Scan the provided local disk roots and return a summarized used-capacity result.
-///
-/// This is primarily intended for benchmarks and operational tooling that need to exercise
-/// the same scan path as admin capacity queries without going through the full admin stack.
-pub async fn scan_used_capacity_disks(
-    disks: &[rustfs_madmin::Disk],
-) -> Result<CapacityScanSummary, Box<dyn std::error::Error + Send + Sync>> {
-    let scan = crate::app::admin_usecase::calculate_data_dir_used_capacity(disks).await?;
-    Ok(CapacityScanSummary {
-        used_bytes: scan.used_bytes,
-        file_count: scan.file_count,
-        sampled_count: scan.sampled_count,
-        is_estimated: scan.is_estimated,
-        had_partial_errors: scan.had_partial_errors,
-        scan_duration: scan.scan_duration,
-    })
+pub mod scan {
+    pub use rustfs_object_capacity::scan::*;
 }
+
+pub mod types {
+    pub use rustfs_object_capacity::types::*;
+}
+
+pub use rustfs_object_capacity::{CapacityDiskRef, CapacityScanSummary, scan_used_capacity_disks};
