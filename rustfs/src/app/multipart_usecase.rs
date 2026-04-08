@@ -16,6 +16,7 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::capacity::capacity_manager::get_capacity_manager;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::entity;
@@ -66,6 +67,7 @@ use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 use urlencoding::encode;
+use uuid::Uuid;
 
 async fn maybe_enqueue_transition_immediate(obj_info: &rustfs_ecstore::store_api::ObjectInfo, src: LcEventSrc) {
     enqueue_transition_immediate(obj_info, src).await;
@@ -286,7 +288,9 @@ impl DefaultMultipartUsecase {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let mut opts = get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
 
         let uploaded_parts_vec = multipart_upload
             .parts
@@ -360,9 +364,13 @@ impl DefaultMultipartUsecase {
 
         let obj_info = store
             .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
+            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
+        let manager = get_capacity_manager();
+        manager
+            .record_write_operation_with_scope_token(Some(capacity_scope_token))
+            .await;
 
         // check quota after completing multipart upload
         if let Some(metadata_sys) = self.bucket_metadata_sys() {

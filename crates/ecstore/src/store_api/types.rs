@@ -73,6 +73,7 @@ pub struct ObjectOptions {
     pub resolved_checksum: Option<Bytes>,
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
+    pub capacity_scope_token: Option<Uuid>,
 }
 
 impl ObjectOptions {

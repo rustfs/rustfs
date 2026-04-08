@@ -587,6 +587,8 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -690,7 +692,9 @@ impl DefaultObjectUsecase {
         };
 
         let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        manager
+            .record_write_operation_with_scope_token(Some(capacity_scope_token))
+            .await;
 
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;

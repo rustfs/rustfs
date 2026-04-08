@@ -16,10 +16,13 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::capacity_manager::{
-    CapacityUpdate, DataSource, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks, get_max_files_threshold,
-    get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout, get_stat_timeout,
+    CapacityUpdate, DataSource, DiskCapacityUpdate, get_capacity_manager, get_enable_dynamic_timeout, get_follow_symlinks,
+    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout,
+    get_stat_timeout,
 };
 use crate::error::ApiError;
+use futures::{StreamExt, stream};
+use rustfs_common::capacity_scope::CapacityScopeDisk;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -27,9 +30,10 @@ use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_io_metrics::{
-    record_capacity_dynamic_timeout, record_capacity_scan_sampling, record_capacity_stall_detected, record_capacity_symlink,
-    record_capacity_timeout_fallback,
+use rustfs_io_metrics::capacity_metrics::{
+    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_dynamic_timeout,
+    record_capacity_refresh_request, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
+    record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,
 };
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
@@ -41,6 +45,9 @@ use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+
+const MAX_CAPACITY_SCAN_CONCURRENCY: usize = 4;
+const CAPACITY_PROGRESS_CHECK_STRIDE: usize = 512;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
@@ -94,10 +101,83 @@ pub struct QueryPoolStatusRequest {
     pub by_id: bool,
 }
 
-/// Calculate actual used capacity of all data directories
-pub(crate) async fn calculate_data_dir_used_capacity(
+#[derive(Debug)]
+struct DiskScanOutcome {
+    disk_label: String,
+    drive_path: String,
+    duration: Duration,
+    result: Result<CapacityScanResult, std::io::Error>,
+}
+
+#[derive(Debug, Clone)]
+struct DiskCapacityScanResult {
+    disk: CapacityScopeDisk,
+    scan: CapacityScanResult,
+}
+
+#[derive(Debug, Clone)]
+struct CapacityScanReport {
+    summary: CapacityScanResult,
+    per_disk: Vec<DiskCapacityScanResult>,
+}
+
+impl CapacityScanReport {
+    fn into_capacity_update(self, expected_disk_count: usize, replaces_disk_cache: bool) -> CapacityUpdate {
+        let mut update = self.summary.to_capacity_update();
+
+        if !self.summary.had_partial_errors && self.per_disk.len() == expected_disk_count {
+            update.per_disk = self
+                .per_disk
+                .into_iter()
+                .map(|entry| DiskCapacityUpdate {
+                    disk: entry.disk,
+                    used_bytes: entry.scan.used_bytes,
+                    file_count: entry.scan.file_count,
+                    is_estimated: entry.scan.is_estimated,
+                })
+                .collect();
+            update.expected_disk_count = Some(expected_disk_count);
+            update.replaces_disk_cache = replaces_disk_cache;
+            update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
+        }
+
+        update
+    }
+}
+
+fn disk_metric_label(disk: &rustfs_madmin::Disk) -> String {
+    let mount_name = Path::new(&disk.drive_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(disk.drive_path.as_str());
+    format!("{}:{mount_name}", disk.endpoint)
+}
+
+fn disk_scope_key(disk: &rustfs_madmin::Disk) -> CapacityScopeDisk {
+    CapacityScopeDisk {
+        endpoint: disk.endpoint.clone(),
+        drive_path: disk.drive_path.clone(),
+    }
+}
+
+async fn scan_disk_used_capacity(disk: rustfs_madmin::Disk) -> DiskScanOutcome {
+    let disk_label = disk_metric_label(&disk);
+    let drive_path = disk.drive_path.clone();
+    let start = Instant::now();
+    let result = get_dir_size_async(Path::new(&drive_path)).await;
+
+    DiskScanOutcome {
+        disk_label,
+        drive_path,
+        duration: start.elapsed(),
+        result,
+    }
+}
+
+async fn calculate_data_dir_used_capacity_report(
     disks: &[rustfs_madmin::Disk],
-) -> Result<CapacityScanResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<CapacityScanReport, Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     let mut total_used = 0u64;
     let mut total_files = 0usize;
@@ -105,21 +185,25 @@ pub(crate) async fn calculate_data_dir_used_capacity(
     let mut has_failure = false;
     let mut has_success = false;
     let mut is_estimated = false;
+    let mut per_disk = Vec::with_capacity(disks.len());
 
-    for disk in disks {
-        let path = Path::new(&disk.drive_path);
+    let concurrency_limit = disks.len().clamp(1, MAX_CAPACITY_SCAN_CONCURRENCY);
+    let mut scans = stream::iter(disks.iter().cloned().map(scan_disk_used_capacity)).buffer_unordered(concurrency_limit);
 
-        if !path.exists() {
-            warn!("Data directory does not exist: {}", disk.drive_path);
-            has_failure = true;
-            continue;
-        }
-
-        match get_dir_size_async(path).await {
+    while let Some(outcome) = scans.next().await {
+        match outcome.result {
             Ok(scan) => {
+                record_capacity_scan_disk(
+                    outcome.disk_label.as_str(),
+                    outcome.duration,
+                    scan.file_count,
+                    scan.sampled_count,
+                    scan.is_estimated,
+                    scan.had_partial_errors,
+                );
                 debug!(
-                    "Data directory {} size: {} bytes, files={}, sampled={}, estimated={}",
-                    disk.drive_path, scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated
+                    "Data directory {} size: {} bytes, files={}, sampled={}, estimated={}, duration={:?}",
+                    outcome.drive_path, scan.used_bytes, scan.file_count, scan.sampled_count, scan.is_estimated, outcome.duration
                 );
                 total_used += scan.used_bytes;
                 total_files += scan.file_count;
@@ -127,9 +211,19 @@ pub(crate) async fn calculate_data_dir_used_capacity(
                 is_estimated |= scan.is_estimated;
                 has_failure |= scan.had_partial_errors;
                 has_success = true;
+                if let Some(disk) = disks
+                    .iter()
+                    .find(|disk| disk.drive_path == outcome.drive_path && disk_metric_label(disk) == outcome.disk_label)
+                {
+                    per_disk.push(DiskCapacityScanResult {
+                        disk: disk_scope_key(disk),
+                        scan,
+                    });
+                }
             }
             Err(e) => {
-                warn!("Failed to get size for directory {}: {:?}", disk.drive_path, e);
+                record_capacity_scan_disk(outcome.disk_label.as_str(), outcome.duration, 0, 0, false, true);
+                warn!("Failed to get size for directory {}: {:?}", outcome.drive_path, e);
                 has_failure = true;
             }
         }
@@ -143,7 +237,7 @@ pub(crate) async fn calculate_data_dir_used_capacity(
         warn!("Some directories failed to calculate size, result may be incomplete");
     }
 
-    let mut result = CapacityScanResult {
+    let mut summary = CapacityScanResult {
         used_bytes: total_used,
         file_count: total_files,
         sampled_count: total_sampled,
@@ -153,10 +247,59 @@ pub(crate) async fn calculate_data_dir_used_capacity(
     };
 
     if has_failure {
-        result = result.with_partial_errors();
+        summary = summary.with_partial_errors();
     }
 
-    Ok(result)
+    Ok(CapacityScanReport { summary, per_disk })
+}
+
+/// Calculate actual used capacity of all data directories
+pub(crate) async fn calculate_data_dir_used_capacity(
+    disks: &[rustfs_madmin::Disk],
+) -> Result<CapacityScanResult, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(calculate_data_dir_used_capacity_report(disks).await?.summary)
+}
+
+async fn select_capacity_refresh_disks(
+    capacity_manager: &crate::capacity::capacity_manager::HybridCapacityManager,
+    disks: &[rustfs_madmin::Disk],
+) -> (Vec<rustfs_madmin::Disk>, bool) {
+    if !capacity_manager.can_refresh_dirty_subset().await {
+        return (disks.to_vec(), false);
+    }
+
+    let dirty_disks = capacity_manager.get_dirty_disks().await;
+    if dirty_disks.is_empty() {
+        return (disks.to_vec(), false);
+    }
+
+    let dirty_set: HashSet<CapacityScopeDisk> = dirty_disks.into_iter().collect();
+    let selected: Vec<_> = disks
+        .iter()
+        .filter(|disk| dirty_set.contains(&disk_scope_key(disk)))
+        .cloned()
+        .collect();
+
+    if selected.is_empty() || selected.len() >= disks.len() {
+        (disks.to_vec(), false)
+    } else {
+        (selected, true)
+    }
+}
+
+pub(crate) async fn refresh_capacity_with_scope(
+    disks: Vec<rustfs_madmin::Disk>,
+    dirty_subset: bool,
+) -> Result<CapacityUpdate, String> {
+    let report = calculate_data_dir_used_capacity_report(&disks)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if dirty_subset && report.summary.had_partial_errors {
+        return Err("dirty subset refresh had partial errors".to_string());
+    }
+
+    Ok(report.into_capacity_update(disks.len(), !dirty_subset))
 }
 
 // ============================================================================
@@ -203,10 +346,11 @@ impl SymlinkTracker {
 
     /// Record a visited symlink path and update metrics
     fn record_symlink(&mut self, path: PathBuf, size: u64) {
-        self.visited.insert(path);
-        self.symlink_count += 1;
-        self.symlink_size += size;
-        record_capacity_symlink(size);
+        if self.visited.insert(path) {
+            self.symlink_count += 1;
+            self.symlink_size += size;
+            record_capacity_symlink(size);
+        }
     }
 
     /// Get symlink statistics
@@ -376,35 +520,31 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
         sample_rate
     };
 
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Directory not found: {:?}", path),
-        ));
-    }
-
     tokio::task::spawn_blocking(move || {
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Directory not found: {:?}", path),
+            ));
+        }
+
         let start_time = Instant::now();
         let mut exact_prefix_bytes = 0u64;
         let mut overflow_sampled_bytes = 0u64;
         let mut file_count = 0usize;
         let mut sampled_count = 0usize;
         let mut had_partial_errors = false;
+        let mut last_progress_check_files = 0usize;
 
-        let mut symlink_tracker = if follow_symlinks {
-            Some(SymlinkTracker::new(max_symlink_depth))
-        } else {
-            None
-        };
+        let mut symlink_tracker = SymlinkTracker::new(max_symlink_depth);
 
         let mut progress_monitor =
             ProgressMonitor::new(base_timeout, min_timeout, max_timeout, stall_timeout, enable_dynamic_timeout);
 
-        let mut walker_builder = WalkDir::new(&path);
-        if !follow_symlinks {
-            walker_builder = walker_builder.follow_links(false);
-        }
-        let walker = walker_builder.into_iter();
+        let walker = WalkDir::new(&path)
+            .follow_links(follow_symlinks)
+            .follow_root_links(follow_symlinks)
+            .into_iter();
 
         for entry_result in walker {
             let entry = match entry_result {
@@ -416,6 +556,22 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 }
             };
 
+            if entry.path_is_symlink()
+                && let Ok(target) = std::fs::read_link(entry.path())
+                && symlink_tracker.should_follow(&target, entry.depth() as u8)
+            {
+                symlink_tracker.record_symlink(target, 0);
+            }
+
+            let file_type = entry.file_type();
+            if file_type.is_dir() {
+                continue;
+            }
+
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -425,20 +581,6 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 }
             };
 
-            if metadata.is_symlink() {
-                if let Some(ref mut tracker) = symlink_tracker
-                    && let Ok(target) = std::fs::read_link(entry.path())
-                    && tracker.should_follow(&target, 0)
-                {
-                    tracker.record_symlink(target, metadata.len());
-                }
-                continue;
-            }
-
-            if !metadata.is_file() {
-                continue;
-            }
-
             file_count += 1;
             let exact_count = file_count.min(max_files_threshold);
             let avg_size = if exact_count > 0 {
@@ -447,7 +589,10 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 0
             };
 
-            if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
+            let should_check_progress =
+                file_count == 1 || file_count.saturating_sub(last_progress_check_files) >= CAPACITY_PROGRESS_CHECK_STRIDE;
+
+            if should_check_progress && let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
                 if sampled_count > 0 {
                     let overflow_count = file_count.saturating_sub(max_files_threshold);
                     let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
@@ -458,6 +603,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                     );
                     progress_monitor.record_timeout_fallback();
                     record_capacity_scan_sampling(sampled_count, true);
+                    record_capacity_scan_mode("timeout_fallback");
                     return Ok(CapacityScanResult {
                         used_bytes: estimated_total,
                         file_count,
@@ -468,6 +614,9 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                     });
                 }
                 return Err(e);
+            }
+            if should_check_progress {
+                last_progress_check_files = file_count;
             }
 
             if file_count <= max_files_threshold {
@@ -488,11 +637,45 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             }
         }
 
-        if let Some(tracker) = symlink_tracker {
-            let (count, size) = tracker.get_stats();
-            if count > 0 {
-                info!("Symlink tracking: {} symlinks processed, total target size: {} bytes", count, size);
+        if file_count > last_progress_check_files {
+            let exact_count = file_count.min(max_files_threshold);
+            let avg_size = if exact_count > 0 {
+                exact_prefix_bytes / exact_count as u64
+            } else {
+                0
+            };
+
+            if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
+                if sampled_count > 0 {
+                    let overflow_count = file_count.saturating_sub(max_files_threshold);
+                    let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+                    let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
+                    info!(
+                        "Timeout/stall at {} files during final check, using sampled estimate: exact_prefix={} overflow_estimate={} sampled={}",
+                        file_count, exact_prefix_bytes, estimated_overflow, sampled_count
+                    );
+                    progress_monitor.record_timeout_fallback();
+                    record_capacity_scan_sampling(sampled_count, true);
+                    record_capacity_scan_mode("timeout_fallback");
+                    return Ok(CapacityScanResult {
+                        used_bytes: estimated_total,
+                        file_count,
+                        sampled_count,
+                        is_estimated: true,
+                        scan_duration: start_time.elapsed(),
+                        had_partial_errors,
+                    });
+                }
+                return Err(e);
             }
+        }
+
+        let (symlink_count, symlink_size) = symlink_tracker.get_stats();
+        if symlink_count > 0 {
+            info!(
+                "Symlink tracking: {} symlinks processed, total tracked size: {} bytes",
+                symlink_count, symlink_size
+            );
         }
 
         if file_count > max_files_threshold && sampled_count > 0 {
@@ -504,6 +687,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 file_count, estimated_size, exact_prefix_bytes, sampled_count, overflow_count
             );
             record_capacity_scan_sampling(sampled_count, true);
+            record_capacity_scan_mode("estimated");
             Ok(CapacityScanResult {
                 used_bytes: estimated_size,
                 file_count,
@@ -533,6 +717,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 file_count, estimated_size, avg_prefix_size
             );
             record_capacity_scan_sampling(0, true);
+            record_capacity_scan_mode("estimated");
             Ok(CapacityScanResult {
                 used_bytes: estimated_size,
                 file_count,
@@ -549,6 +734,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 exact_prefix_bytes,
                 start_time.elapsed()
             );
+            record_capacity_scan_mode("exact");
             Ok(CapacityScanResult {
                 used_bytes: exact_prefix_bytes,
                 file_count,
@@ -693,11 +879,13 @@ impl DefaultAdminUsecase {
 
         // Check if we have a valid cache
         if let Some(cached) = capacity_manager.get_capacity().await {
+            record_capacity_cache_hit();
             let cache_age = cached.last_update.elapsed();
             let fast_update_threshold = capacity_manager.get_config().fast_update_threshold;
 
             // If cache is fresh (< fast_update_threshold), use it directly
             if cache_age < fast_update_threshold {
+                record_capacity_cache_served("fresh");
                 info.total_used_capacity = cached.total_used;
                 debug!(
                     "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
@@ -710,12 +898,13 @@ impl DefaultAdminUsecase {
 
                 if needs_update && should_block {
                     let start = Instant::now();
+                    record_capacity_refresh_request("blocking", DataSource::WriteTriggered.as_metric_label());
+                    let (refresh_disks, dirty_subset) =
+                        select_capacity_refresh_disks(capacity_manager.as_ref(), &storage_info.disks).await;
                     match capacity_manager
-                        .refresh_or_join(DataSource::WriteTriggered, || async {
-                            calculate_data_dir_used_capacity(&storage_info.disks)
-                                .await
-                                .map(|scan| scan.to_capacity_update())
-                                .map_err(|e| e.to_string())
+                        .refresh_or_join(DataSource::WriteTriggered, move || {
+                            let refresh_disks = refresh_disks.clone();
+                            async move { refresh_capacity_with_scope(refresh_disks, dirty_subset).await }
                         })
                         .await
                     {
@@ -730,10 +919,12 @@ impl DefaultAdminUsecase {
                         }
                         Err(e) => {
                             warn!("Foreground capacity refresh failed: {}, using cached value", e);
+                            record_capacity_cache_served("stale");
                             info.total_used_capacity = cached.total_used;
                         }
                     }
                 } else {
+                    record_capacity_cache_served("stale");
                     info.total_used_capacity = cached.total_used;
                     debug!(
                         "Using stale cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, needs_update={}, blocking={})",
@@ -748,13 +939,12 @@ impl DefaultAdminUsecase {
 
                     let disks = storage_info.disks.clone();
                     let manager = capacity_manager.clone();
+                    record_capacity_refresh_request("background", DataSource::Scheduled.as_metric_label());
+                    let (refresh_disks, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
                     if manager
                         .clone()
                         .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
-                            calculate_data_dir_used_capacity(&disks)
-                                .await
-                                .map(|scan| scan.to_capacity_update())
-                                .map_err(|e| e.to_string())
+                            refresh_capacity_with_scope(refresh_disks, dirty_subset).await
                         })
                         .await
                     {
@@ -767,12 +957,12 @@ impl DefaultAdminUsecase {
         } else {
             // No cache, perform initial calculation
             let start = Instant::now();
+            record_capacity_cache_miss();
+            record_capacity_refresh_request("initial", DataSource::RealTime.as_metric_label());
             match capacity_manager
-                .refresh_or_join(DataSource::RealTime, || async {
-                    calculate_data_dir_used_capacity(&storage_info.disks)
-                        .await
-                        .map(|scan| scan.to_capacity_update())
-                        .map_err(|e| e.to_string())
+                .refresh_or_join(DataSource::RealTime, || {
+                    let disks = storage_info.disks.clone();
+                    async move { refresh_capacity_with_scope(disks, false).await }
                 })
                 .await
             {
@@ -790,6 +980,8 @@ impl DefaultAdminUsecase {
                         "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
                         e
                     );
+                    record_capacity_cache_served("fallback");
+                    record_capacity_scan_mode("fallback");
                     info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
                     capacity_manager
                         .update_capacity(CapacityUpdate::fallback(info.total_used_capacity), DataSource::Fallback)
@@ -885,6 +1077,9 @@ impl DefaultAdminUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::capacity_manager::{DiskCapacityUpdate, HybridStrategyConfig, create_isolated_manager};
+    use rustfs_common::capacity_scope::CapacityScope;
+    use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
     use serial_test::serial;
 
     #[tokio::test]
@@ -989,5 +1184,182 @@ mod tests {
     async fn test_get_dir_size_async_nonexistent_directory() {
         let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_calculate_data_dir_used_capacity_returns_partial_success() {
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+
+        let disks = vec![
+            rustfs_madmin::Disk {
+                endpoint: "disk-1".to_string(),
+                drive_path: temp_dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            rustfs_madmin::Disk {
+                endpoint: "disk-2".to_string(),
+                drive_path: "/nonexistent/path".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let result = calculate_data_dir_used_capacity(&disks).await.unwrap();
+        assert_eq!(result.used_bytes, 13);
+        assert_eq!(result.file_count, 1);
+        assert!(result.had_partial_errors);
+    }
+
+    #[tokio::test]
+    async fn test_select_capacity_refresh_disks_returns_full_when_disk_cache_incomplete() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: "disk-1".to_string(),
+                    drive_path: "/tmp/disk-1".to_string(),
+                }],
+            })
+            .await;
+
+        let disks = vec![
+            rustfs_madmin::Disk {
+                endpoint: "disk-1".to_string(),
+                drive_path: "/tmp/disk-1".to_string(),
+                ..Default::default()
+            },
+            rustfs_madmin::Disk {
+                endpoint: "disk-2".to_string(),
+                drive_path: "/tmp/disk-2".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (selected, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
+        assert!(!dirty_subset);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_select_capacity_refresh_disks_returns_dirty_subset_when_cache_complete() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 300,
+                    file_count: 3,
+                    is_estimated: false,
+                    per_disk: vec![
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "disk-1".to_string(),
+                                drive_path: "/tmp/disk-1".to_string(),
+                            },
+                            used_bytes: 100,
+                            file_count: 1,
+                            is_estimated: false,
+                        },
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "disk-2".to_string(),
+                                drive_path: "/tmp/disk-2".to_string(),
+                            },
+                            used_bytes: 200,
+                            file_count: 2,
+                            is_estimated: false,
+                        },
+                    ],
+                    expected_disk_count: Some(2),
+                    replaces_disk_cache: true,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::RealTime,
+            )
+            .await;
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: "disk-2".to_string(),
+                    drive_path: "/tmp/disk-2".to_string(),
+                }],
+            })
+            .await;
+
+        let disks = vec![
+            rustfs_madmin::Disk {
+                endpoint: "disk-1".to_string(),
+                drive_path: "/tmp/disk-1".to_string(),
+                ..Default::default()
+            },
+            rustfs_madmin::Disk {
+                endpoint: "disk-2".to_string(),
+                drive_path: "/tmp/disk-2".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (selected, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
+        assert!(dirty_subset);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].endpoint, "disk-2");
+        assert_eq!(selected[0].drive_path, "/tmp/disk-2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn test_get_dir_size_async_ignores_symlink_targets_when_follow_disabled() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let scan_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let target_path = target_dir.path().join("external.txt");
+        let mut file = File::create(&target_path).unwrap();
+        file.write_all(b"external-bytes").unwrap();
+        symlink(&target_path, scan_dir.path().join("external-link")).unwrap();
+
+        let size = temp_env::async_with_vars([(ENV_CAPACITY_FOLLOW_SYMLINKS, Some("false"))], async {
+            get_dir_size_async(scan_dir.path()).await
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(size.used_bytes, 0);
+        assert_eq!(size.file_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn test_get_dir_size_async_counts_symlink_targets_when_follow_enabled() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let scan_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let target_path = target_dir.path().join("external.txt");
+        let mut file = File::create(&target_path).unwrap();
+        file.write_all(b"external-bytes").unwrap();
+        symlink(&target_path, scan_dir.path().join("external-link")).unwrap();
+
+        let size = temp_env::async_with_vars([(ENV_CAPACITY_FOLLOW_SYMLINKS, Some("true"))], async {
+            get_dir_size_async(scan_dir.path()).await
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(size.used_bytes, "external-bytes".len() as u64);
+        assert_eq!(size.file_count, 1);
     }
 }

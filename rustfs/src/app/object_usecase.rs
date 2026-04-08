@@ -271,6 +271,11 @@ async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventS
     enqueue_transition_immediate(obj_info, src).await;
 }
 
+async fn record_capacity_write_with_scope_token(scope_token: Option<Uuid>) {
+    let manager = get_capacity_manager();
+    manager.record_write_operation_with_scope_token(scope_token).await;
+}
+
 fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
@@ -1848,6 +1853,7 @@ impl DefaultObjectUsecase {
 
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
         let bypass_governance = has_bypass_governance_header(&req.headers);
+        let capacity_scope_token = Uuid::new_v4();
 
         #[derive(Default, Clone)]
         struct DeleteResult {
@@ -1970,6 +1976,7 @@ impl DefaultObjectUsecase {
                 object_to_delete.clone(),
                 ObjectOptions {
                     version_suspended: version_cfg.suspended(),
+                    capacity_scope_token: Some(capacity_scope_token),
                     ..Default::default()
                 },
             )
@@ -2108,8 +2115,7 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
         result
     }
 
@@ -2144,6 +2150,8 @@ impl DefaultObjectUsecase {
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
         let force_delete = opts.delete_prefix;
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
@@ -2255,8 +2263,7 @@ impl DefaultObjectUsecase {
                 })
                 .version_id(String::new());
             let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
-            let manager = get_capacity_manager();
-            manager.record_write_operation().await;
+            record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
             let _ = helper.complete(&result);
             return result;
         }
@@ -2304,8 +2311,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
         let _ = helper.complete(&result);
         result
     }

@@ -61,9 +61,40 @@
 //! ```
 //!
 
+use std::time::Duration;
+
 pub mod capacity_integration;
 pub mod capacity_manager;
 #[cfg(test)]
 mod capacity_manager_test;
 #[cfg(test)]
 mod write_trigger_test;
+
+/// Public summary type for external tooling such as benches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityScanSummary {
+    pub used_bytes: u64,
+    pub file_count: usize,
+    pub sampled_count: usize,
+    pub is_estimated: bool,
+    pub had_partial_errors: bool,
+    pub scan_duration: Duration,
+}
+
+/// Scan the provided local disk roots and return a summarized used-capacity result.
+///
+/// This is primarily intended for benchmarks and operational tooling that need to exercise
+/// the same scan path as admin capacity queries without going through the full admin stack.
+pub async fn scan_used_capacity_disks(
+    disks: &[rustfs_madmin::Disk],
+) -> Result<CapacityScanSummary, Box<dyn std::error::Error + Send + Sync>> {
+    let scan = crate::app::admin_usecase::calculate_data_dir_used_capacity(disks).await?;
+    Ok(CapacityScanSummary {
+        used_bytes: scan.used_bytes,
+        file_count: scan.file_count,
+        sampled_count: scan.sampled_count,
+        is_estimated: scan.is_estimated,
+        had_partial_errors: scan.had_partial_errors,
+        scan_duration: scan.scan_duration,
+    })
+}
