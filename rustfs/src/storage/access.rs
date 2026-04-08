@@ -108,7 +108,7 @@ fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
 }
 
 fn normalize_compat_object_key(key: &str) -> String {
-    key.trim_start_matches('/').to_string()
+    key.strip_prefix('/').unwrap_or(key).to_string()
 }
 
 fn normalize_compat_object_key_in_place(key: &mut String) {
@@ -1980,7 +1980,7 @@ mod tests {
             ("", ""),
             ("plain", "plain"),
             ("/plain", "plain"),
-            ("///plain", "plain"),
+            ("///plain", "//plain"),
             ("/a//b", "a//b"),
             ("/a/./b", "a/./b"),
             ("/a/../b", "a/../b"),
@@ -1989,7 +1989,7 @@ mod tests {
             ("/+plus%percent", "+plus%percent"),
             ("/你好/世界", "你好/世界"),
             ("/", ""),
-            ("////", ""),
+            ("////", "///"),
         ];
 
         for (raw, expected) in cases {
@@ -2025,7 +2025,7 @@ mod tests {
         normalize_compat_object_identifiers_in_place(&mut objects);
 
         assert_eq!(objects[0].key, "foo");
-        assert_eq!(objects[1].key, "bar/baz");
+        assert_eq!(objects[1].key, "//bar/baz");
         assert_eq!(objects[1].version_id.as_deref(), Some("v1"));
         assert_eq!(objects[2].key, "nested//path");
     }
@@ -2548,10 +2548,10 @@ mod tests {
             .expect_err("missing credentials should reject access");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(req.input.key, "dst/./object");
-        assert_req_object(&req, "src//object");
+        assert_req_object(&req, "//src//object");
         match &req.input.copy_source {
             CopySource::Bucket { key, version_id, .. } => {
-                assert_eq!(key.as_ref(), "src//object");
+                assert_eq!(key.as_ref(), "//src//object");
                 assert_eq!(version_id.as_deref(), Some("v1"));
             }
             _ => panic!("expected bucket copy source"),
@@ -2591,7 +2591,7 @@ mod tests {
             .expect_err("missing credentials should reject access");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(req.input.delete.objects[0].key, "foo");
-        assert_eq!(req.input.delete.objects[1].key, "bar//baz");
+        assert_eq!(req.input.delete.objects[1].key, "//bar//baz");
         assert_eq!(req.input.delete.objects[1].version_id.as_deref(), Some("v2"));
     }
 
@@ -2613,8 +2613,8 @@ mod tests {
             .await
             .expect_err("missing credentials should reject access");
         assert_eq!(get_err.code(), &S3ErrorCode::AccessDenied);
-        assert_eq!(get_req.input.key, "a//b");
-        assert_req_object(&get_req, "a//b");
+        assert_eq!(get_req.input.key, "//a//b");
+        assert_req_object(&get_req, "//a//b");
 
         let mut head_req = build_request(
             HeadObjectInput::builder()
@@ -2675,8 +2675,8 @@ mod tests {
             .await
             .expect_err("missing credentials should reject access");
         assert_eq!(create_err.code(), &S3ErrorCode::AccessDenied);
-        assert_eq!(create_req.input.key, "multipart/object");
-        assert_req_object(&create_req, "multipart/object");
+        assert_eq!(create_req.input.key, "//multipart/object");
+        assert_req_object(&create_req, "//multipart/object");
 
         let mut list_req = build_request(
             ListPartsInput::builder()
