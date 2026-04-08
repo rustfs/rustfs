@@ -687,23 +687,26 @@ impl HybridCapacityManager {
             }
 
             let write_record = self.write_record.read().await;
+            let write_frequency = write_record.recent_write_count(WriteRecord::current_unix_second());
+            if write_frequency <= self.config.write_frequency_threshold {
+                return false;
+            }
+
             if let Some(last_write_time) = write_record.last_write_time {
                 let time_since_write = last_write_time.elapsed();
 
-                // Recent write, trigger fast update
                 if time_since_write < self.config.write_trigger_delay {
                     debug!(
-                        "Recent write detected ({:?} ago, trigger_delay={:?}), needs fast update",
-                        time_since_write, self.config.write_trigger_delay
+                        "Write-triggered refresh still debounced ({:?} ago, trigger_delay={:?}, writes/min={})",
+                        time_since_write, self.config.write_trigger_delay, write_frequency
                     );
-                    return true;
+                    return false;
                 }
-            }
 
-            // High write frequency, trigger update
-            let write_frequency = write_record.recent_write_count(WriteRecord::current_unix_second());
-            if write_frequency > self.config.write_frequency_threshold {
-                debug!("High write frequency detected ({} writes/min), needs fast update", write_frequency);
+                debug!(
+                    "Write-triggered refresh eligible after debounce ({:?} ago, trigger_delay={:?}, writes/min={})",
+                    time_since_write, self.config.write_trigger_delay, write_frequency
+                );
                 return true;
             }
         }
@@ -1184,11 +1187,11 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_needs_fast_update_uses_write_trigger_delay() {
+    async fn test_needs_fast_update_waits_for_write_trigger_delay() {
         let manager = create_isolated_manager(HybridStrategyConfig {
             scheduled_update_interval: Duration::from_secs(60),
-            write_trigger_delay: Duration::from_millis(1),
-            write_frequency_threshold: usize::MAX,
+            write_trigger_delay: Duration::from_millis(50),
+            write_frequency_threshold: 1,
             fast_update_threshold: Duration::from_millis(10),
             enable_smart_update: true,
             enable_write_trigger: true,
@@ -1200,12 +1203,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
 
         manager.record_write_operation().await;
+        manager.record_write_operation().await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         assert!(
             !manager.needs_fast_update().await,
-            "recent write should respect write_trigger_delay instead of fast_update_threshold"
+            "write-triggered refresh should wait for debounce delay after a qualifying burst"
         );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(manager.needs_fast_update().await);
     }
 
     #[tokio::test]

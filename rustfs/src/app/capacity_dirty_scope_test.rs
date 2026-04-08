@@ -87,7 +87,7 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
     rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
 
-    let server_addr: std::net::SocketAddr = "127.0.0.1:9021".parse().unwrap();
+    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
         .await
         .unwrap();

@@ -36,6 +36,27 @@ fn capacity_disk_refs(disks: &[rustfs_madmin::Disk]) -> Vec<CapacityDiskRef> {
         .collect()
 }
 
+async fn refresh_admin_disks_with_subset_fallback(
+    capacity_manager: &capacity_manager::HybridCapacityManager,
+    all_disks: Vec<CapacityDiskRef>,
+    allow_dirty_subset: bool,
+) -> Result<capacity_manager::CapacityUpdate, String> {
+    let (refresh_disks, dirty_subset) = if allow_dirty_subset {
+        scan::select_capacity_refresh_disks(capacity_manager, &all_disks).await
+    } else {
+        (all_disks.clone(), false)
+    };
+
+    match scan::refresh_capacity_with_scope(refresh_disks.clone(), dirty_subset).await {
+        Ok(update) => Ok(update),
+        Err(err) if dirty_subset => {
+            warn!("Dirty-subset capacity refresh failed: {}. Retrying full-disk refresh for recovery", err);
+            scan::refresh_capacity_with_scope(all_disks, false).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub async fn refresh_or_join_admin_disks(
     capacity_manager: Arc<capacity_manager::HybridCapacityManager>,
     source: capacity_manager::DataSource,
@@ -43,16 +64,15 @@ pub async fn refresh_or_join_admin_disks(
     allow_dirty_subset: bool,
 ) -> Result<capacity_manager::CapacityUpdate, String> {
     let all_disks = capacity_disk_refs(disks);
-    let (refresh_disks, dirty_subset) = if allow_dirty_subset {
-        scan::select_capacity_refresh_disks(capacity_manager.as_ref(), &all_disks).await
-    } else {
-        (all_disks, false)
-    };
+    let refresh_manager = capacity_manager.clone();
 
     capacity_manager
         .refresh_or_join(source, move || {
-            let refresh_disks = refresh_disks.clone();
-            async move { scan::refresh_capacity_with_scope(refresh_disks, dirty_subset).await }
+            let capacity_manager = refresh_manager.clone();
+            let all_disks = all_disks.clone();
+            async move {
+                refresh_admin_disks_with_subset_fallback(capacity_manager.as_ref(), all_disks, allow_dirty_subset).await
+            }
         })
         .await
 }
@@ -64,15 +84,11 @@ pub async fn spawn_refresh_if_needed_admin_disks(
     allow_dirty_subset: bool,
 ) -> bool {
     let all_disks = capacity_disk_refs(disks);
-    let (refresh_disks, dirty_subset) = if allow_dirty_subset {
-        scan::select_capacity_refresh_disks(capacity_manager.as_ref(), &all_disks).await
-    } else {
-        (all_disks, false)
-    };
+    let refresh_manager = capacity_manager.clone();
 
     capacity_manager
         .spawn_refresh_if_needed(source, move || async move {
-            scan::refresh_capacity_with_scope(refresh_disks, dirty_subset).await
+            refresh_admin_disks_with_subset_fallback(refresh_manager.as_ref(), all_disks, allow_dirty_subset).await
         })
         .await
 }
