@@ -77,7 +77,7 @@ fn merge_capacity_scopes(existing: &mut CapacityScope, incoming: CapacityScope) 
 
 pub fn record_capacity_scope(token: Uuid, scope: CapacityScope) {
     let now = Instant::now();
-    let mut entries = capacity_scope_registry().lock().expect("capacity scope registry poisoned");
+    let mut entries = capacity_scope_registry().lock().unwrap_or_else(|p| p.into_inner());
     if !entries.contains_key(&token) && entries.len() >= CAPACITY_SCOPE_REGISTRY_SOFT_LIMIT {
         prune_expired_entries(&mut entries, now);
         enforce_hard_limit(&mut entries, CAPACITY_SCOPE_REGISTRY_HARD_LIMIT);
@@ -92,7 +92,7 @@ pub fn record_capacity_scope(token: Uuid, scope: CapacityScope) {
 
 pub fn take_capacity_scope(token: Uuid) -> Option<CapacityScope> {
     let now = Instant::now();
-    let mut entries = capacity_scope_registry().lock().expect("capacity scope registry poisoned");
+    let mut entries = capacity_scope_registry().lock().unwrap_or_else(|p| p.into_inner());
     let entry = entries.remove(&token)?;
     if now.duration_since(entry.recorded_at) > CAPACITY_SCOPE_TTL {
         return None;
@@ -105,16 +105,12 @@ pub fn record_global_dirty_scope(scope: CapacityScope) {
         return;
     }
 
-    let mut dirty_scopes = global_dirty_scope_registry()
-        .lock()
-        .expect("global dirty scope registry poisoned");
+    let mut dirty_scopes = global_dirty_scope_registry().lock().unwrap_or_else(|p| p.into_inner());
     dirty_scopes.extend(scope.disks);
 }
 
 pub fn drain_global_dirty_scopes() -> Vec<CapacityScopeDisk> {
-    let mut dirty_scopes = global_dirty_scope_registry()
-        .lock()
-        .expect("global dirty scope registry poisoned");
+    let mut dirty_scopes = global_dirty_scope_registry().lock().unwrap_or_else(|p| p.into_inner());
     dirty_scopes.drain().collect()
 }
 

@@ -459,9 +459,10 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
                 }
             };
 
-            if entry.path_is_symlink()
+            if follow_symlinks
+                && entry.path_is_symlink()
                 && let Ok(target) = std::fs::read_link(entry.path())
-                && symlink_tracker.should_follow(&target, entry.depth() as u8)
+                && symlink_tracker.should_follow(&target, entry.depth().min(u8::MAX as usize) as u8)
             {
                 symlink_tracker.record_symlink(target, 0);
             }

@@ -31,11 +31,12 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
 };
+use tempfile::TempDir;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-static CAPACITY_DIRTY_SCOPE_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
+static CAPACITY_DIRTY_SCOPE_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
 static CAPACITY_DIRTY_SCOPE_INIT: Once = Once::new();
 
 fn init_capacity_dirty_scope_tracing() {
@@ -45,22 +46,18 @@ fn init_capacity_dirty_scope_tracing() {
 async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     init_capacity_dirty_scope_tracing();
 
-    if let Some((paths, store)) = CAPACITY_DIRTY_SCOPE_ENV.get() {
+    if let Some((paths, store, _)) = CAPACITY_DIRTY_SCOPE_ENV.get() {
         return (paths.clone(), store.clone());
     }
 
-    let test_base_dir = format!("/tmp/rustfs_capacity_dirty_scope_test_{}", Uuid::new_v4());
-    let temp_dir = PathBuf::from(&test_base_dir);
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).await.ok();
-    }
-    fs::create_dir_all(&temp_dir).await.unwrap();
+    let temp_dir = TempDir::new().expect("create temp dir for capacity dirty scope test");
+    let temp_path = temp_dir.path().to_path_buf();
 
     let disk_paths = vec![
-        temp_dir.join("disk1"),
-        temp_dir.join("disk2"),
-        temp_dir.join("disk3"),
-        temp_dir.join("disk4"),
+        temp_path.join("disk1"),
+        temp_path.join("disk2"),
+        temp_path.join("disk3"),
+        temp_path.join("disk4"),
     ];
     for disk_path in &disk_paths {
         fs::create_dir_all(disk_path).await.unwrap();
@@ -102,7 +99,7 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    let _ = CAPACITY_DIRTY_SCOPE_ENV.set((disk_paths.clone(), ecstore.clone()));
+    let _ = CAPACITY_DIRTY_SCOPE_ENV.set((disk_paths.clone(), ecstore.clone(), temp_dir));
     (disk_paths, ecstore)
 }
 
