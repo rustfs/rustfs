@@ -952,6 +952,8 @@ mod tests {
         ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
     };
     use serial_test::serial;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     #[serial]
@@ -1090,6 +1092,22 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_update_capacity_preserves_retrieval_metadata() {
+        let manager = HybridCapacityManager::from_env();
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 10), DataSource::RealTime)
+            .await;
+
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 1000);
+        assert_eq!(cached.file_count, 10);
+        assert_eq!(cached.source, DataSource::RealTime);
+        assert!(!cached.is_estimated);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_record_write_operation() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1097,6 +1115,18 @@ mod tests {
 
         let frequency = manager.get_write_frequency().await;
         assert_eq!(frequency, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_write_frequency_window() {
+        let manager = HybridCapacityManager::from_env();
+
+        for _ in 0..20 {
+            manager.record_write_operation().await;
+        }
+
+        assert_eq!(manager.get_write_frequency().await, 20);
     }
 
     #[tokio::test]
@@ -1114,6 +1144,42 @@ mod tests {
 
         // Fresh cache, should not need update
         assert!(!manager.needs_fast_update().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_cache_age_tracking() {
+        let manager = HybridCapacityManager::from_env();
+
+        assert!(manager.get_cache_age().await.is_none());
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 1), DataSource::RealTime)
+            .await;
+
+        let age = manager.get_cache_age().await.unwrap();
+        assert!(age < Duration::from_secs(1));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let age = manager.get_cache_age().await.unwrap();
+        assert!(age >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_data_source_tracking() {
+        let manager = HybridCapacityManager::from_env();
+
+        for source in [
+            DataSource::RealTime,
+            DataSource::Scheduled,
+            DataSource::WriteTriggered,
+            DataSource::Fallback,
+        ] {
+            manager.update_capacity(CapacityUpdate::exact(1000, 1), source).await;
+            assert_eq!(manager.get_capacity().await.unwrap().source, source);
+        }
     }
 
     #[tokio::test]
@@ -1166,6 +1232,124 @@ mod tests {
             !manager.needs_fast_update().await,
             "write-triggered refresh should be disabled when enable_write_trigger is false"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrent_access() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let mgr = manager.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.update_capacity(CapacityUpdate::exact(i as u64 * 100, i), DataSource::RealTime)
+                    .await;
+                mgr.record_write_operation().await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert!(manager.get_capacity().await.is_some());
+        assert_eq!(manager.get_write_frequency().await, 10);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_performance_overhead() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let start = Instant::now();
+
+        for i in 0..1000 {
+            manager
+                .update_capacity(CapacityUpdate::exact(i as u64, i), DataSource::RealTime)
+                .await;
+            manager.record_write_operation().await;
+            let _ = manager.get_capacity().await;
+        }
+
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refresh_or_join_singleflight() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mgr1 = manager.clone();
+        let calls1 = calls.clone();
+        let first = tokio::spawn(async move {
+            mgr1.refresh_or_join(DataSource::Scheduled, move || async move {
+                calls1.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::exact(2048, 8))
+            })
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mgr2 = manager.clone();
+        let calls2 = calls.clone();
+        let second = tokio::spawn(async move {
+            mgr2.refresh_or_join(DataSource::WriteTriggered, move || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(4096, 16))
+            })
+            .await
+        });
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.total_used, 2048);
+        assert_eq!(second.total_used, 2048);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 2048);
+        assert_eq!(cached.file_count, 8);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_refresh_if_needed_deduplicates_background_refresh() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_manager = manager.clone();
+        let first_calls = calls.clone();
+        let started = first_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::estimated(8192, 32))
+            })
+            .await;
+        assert!(started);
+
+        let second_manager = manager.clone();
+        let second_calls = calls.clone();
+        let started = second_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(1, 1))
+            })
+            .await;
+        assert!(!started);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!manager.refresh_in_progress().await);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 8192);
+        assert!(cached.is_estimated);
     }
 
     #[tokio::test]

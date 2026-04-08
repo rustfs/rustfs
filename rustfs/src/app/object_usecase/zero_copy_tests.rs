@@ -85,7 +85,7 @@ async fn setup_direct_chunk_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         .unwrap();
 
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -151,7 +151,7 @@ async fn setup_direct_chunk_multi_disk_test_env() -> (Vec<PathBuf>, Arc<ECStore>
         .unwrap();
 
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -212,7 +212,7 @@ async fn create_direct_chunk_test_multipart_object(
     parts
 }
 
-fn find_part_file(root: &std::path::Path, part_name: &str) -> Option<PathBuf> {
+fn find_part_file(root: &Path, part_name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -231,7 +231,7 @@ fn find_part_file(root: &std::path::Path, part_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_part_files(root: &std::path::Path, part_name: &str, out: &mut Vec<PathBuf>) {
+fn find_part_files(root: &Path, part_name: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -248,7 +248,7 @@ fn find_part_files(root: &std::path::Path, part_name: &str, out: &mut Vec<PathBu
     }
 }
 
-async fn remove_part_files(root: &std::path::Path, part_name: &str) -> Vec<(PathBuf, Vec<u8>)> {
+async fn remove_part_files(root: &Path, part_name: &str) -> Vec<(PathBuf, Vec<u8>)> {
     let mut paths = Vec::new();
     find_part_files(root, part_name, &mut paths);
 

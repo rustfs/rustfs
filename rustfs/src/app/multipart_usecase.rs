@@ -1061,7 +1061,7 @@ impl DefaultMultipartUsecase {
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
 
-        let h = http::HeaderMap::new();
+        let h = HeaderMap::new();
         let get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,
@@ -1113,7 +1113,7 @@ impl DefaultMultipartUsecase {
             (0, src_info.size)
         };
 
-        let h = http::HeaderMap::new();
+        let h = HeaderMap::new();
         let get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,

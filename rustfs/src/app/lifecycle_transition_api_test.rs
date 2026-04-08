@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
-use crate::capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use crate::storage::ecfs::FS;
 use bytes::Bytes;
 use futures::stream;
@@ -36,6 +35,7 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
+use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;

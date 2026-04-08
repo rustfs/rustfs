@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{CapacityDiskRef, capacity_manager, scan};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
     record_capacity_scan_mode,
 };
+use rustfs_object_capacity::{CapacityDiskRef, capacity_manager, scan};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -106,8 +106,13 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
         if needs_update && should_block {
             let start = Instant::now();
             record_capacity_refresh_request("blocking", capacity_manager::DataSource::WriteTriggered.as_metric_label());
-            match refresh_or_join_admin_disks(capacity_manager.clone(), capacity_manager::DataSource::WriteTriggered, disks, true)
-                .await
+            return match refresh_or_join_admin_disks(
+                capacity_manager.clone(),
+                capacity_manager::DataSource::WriteTriggered,
+                disks,
+                true,
+            )
+            .await
             {
                 Ok(update) => {
                     let elapsed = start.elapsed();
@@ -115,14 +120,14 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                         "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
                         elapsed, update.file_count, update.is_estimated
                     );
-                    return update.total_used;
+                    update.total_used
                 }
                 Err(err) => {
                     warn!("Foreground capacity refresh failed: {}, using cached value", err);
                     record_capacity_cache_served("stale");
-                    return cached.total_used;
+                    cached.total_used
                 }
-            }
+            };
         }
 
         record_capacity_cache_served("stale");

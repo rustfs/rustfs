@@ -120,7 +120,6 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 # Serialization and Data Formats
 bytes = { workspace = true }
 flatbuffers.workspace = true
-walkdir = { workspace = true }
 rmp-serde.workspace = true
 rustfs-signer.workspace = true
 serde.workspace = true

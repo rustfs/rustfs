@@ -33,7 +33,7 @@ pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capacity::capacity_manager::{CapacityUpdate, DataSource, get_capacity_manager};
+    use rustfs_object_capacity::capacity_manager::{CapacityUpdate, DataSource, get_capacity_manager};
 
     #[tokio::test]
     async fn test_get_capacity_with_metrics() {

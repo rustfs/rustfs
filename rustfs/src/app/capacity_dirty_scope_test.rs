@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     bucket::metadata_sys,
@@ -23,6 +22,7 @@ use rustfs_ecstore::{
         BucketOperations, BucketOptions, ChunkNativePutData, HealOperations, MakeBucketOptions, ObjectIO, ObjectOptions,
     },
 };
+use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
 use std::{
     collections::HashSet,

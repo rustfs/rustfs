@@ -50,25 +50,8 @@
 //!
 
 pub mod capacity_integration;
-#[cfg(test)]
-mod capacity_manager_test;
 pub mod service;
-#[cfg(test)]
-mod write_trigger_test;
 
-pub mod capacity_manager {
-    pub use rustfs_object_capacity::capacity_manager::*;
-}
-
-pub mod scan {
-    pub use rustfs_object_capacity::scan::*;
-}
-
-pub mod types {
-    pub use rustfs_object_capacity::types::*;
-}
-
-pub use rustfs_object_capacity::{CapacityDiskRef, CapacityScanSummary, scan_used_capacity_disks};
 pub use service::{
     capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,
     refresh_or_join_admin_disks, resolve_admin_used_capacity, spawn_refresh_if_needed_admin_disks,

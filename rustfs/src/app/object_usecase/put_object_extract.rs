@@ -167,10 +167,7 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&request_context.headers);
         let port = get_request_port(&request_context.headers);
         let user_agent = get_request_user_agent(&request_context.headers);
-        let tracing_context = request_context
-            .extensions
-            .get::<crate::storage::request_context::RequestContext>()
-            .cloned();
+        let tracing_context = request_context.extensions.get::<request_context::RequestContext>().cloned();
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
@@ -301,7 +298,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(metadata);
             let capacity_scope_token = Uuid::new_v4();
             opts.capacity_scope_token = Some(capacity_scope_token);
-            let mut reader = rustfs_ecstore::store_api::ChunkNativePutData::new(hrd);
+            let mut reader = ChunkNativePutData::new(hrd);
 
             let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,
@@ -313,7 +310,7 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
-            crate::capacity::record_capacity_write(Some(capacity_scope_token)).await;
+            record_capacity_write(Some(capacity_scope_token)).await;
 
             let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
