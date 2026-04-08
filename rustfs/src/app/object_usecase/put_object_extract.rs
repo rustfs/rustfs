@@ -19,57 +19,6 @@ use rustfs_object_io::put::{
     normalize_extract_entry_key, resolve_put_object_extract_options,
 };
 
-async fn authorize_extract_put_target(request_context: &PutObjectRequestContext, bucket: &str, object: &str) -> S3Result<()> {
-    let mut auth_req = S3Request {
-        input: PutObjectInput::default(),
-        method: request_context.method.clone(),
-        uri: request_context.uri.clone(),
-        headers: request_context.headers.clone(),
-        extensions: request_context.extensions.clone(),
-        credentials: request_context.credentials.clone(),
-        region: request_context.region.clone(),
-        service: request_context.service.clone(),
-        trailing_headers: request_context.trailing_headers.clone(),
-    };
-    {
-        let req_info = req_info_mut(&mut auth_req)?;
-        req_info.bucket = Some(bucket.to_string());
-        req_info.object = Some(object.to_string());
-        req_info.version_id = None;
-    }
-    authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_extract_entry_notification(
-    notify: Arc<dyn NotifyInterface>,
-    request_context: Option<crate::storage::request_context::RequestContext>,
-    bucket: String,
-    req_params: hashbrown::HashMap<String, String>,
-    version_id: String,
-    host: String,
-    port: u16,
-    user_agent: String,
-    obj_info: ObjectInfo,
-    output: PutObjectOutput,
-) {
-    let event_args = rustfs_notify::EventArgs {
-        event_name: EventName::ObjectCreatedPut,
-        bucket_name: bucket,
-        object: obj_info,
-        req_params,
-        resp_elements: extract_resp_elements(&S3Response::new(output)),
-        version_id,
-        host,
-        port,
-        user_agent,
-    };
-
-    crate::storage::helper::spawn_background_with_context(request_context, async move {
-        notify.notify(event_args).await;
-    });
-}
-
 impl DefaultObjectUsecase {
     pub(super) async fn run_put_object_extract_flow(
         input: PutObjectInput,
@@ -227,7 +176,24 @@ impl DefaultObjectUsecase {
             let is_dir = f.header().entry_type().is_dir();
             let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
 
-            authorize_extract_put_target(&request_context, &bucket, &fpath).await?;
+            let mut auth_req = S3Request {
+                input: PutObjectInput::default(),
+                method: request_context.method.clone(),
+                uri: request_context.uri.clone(),
+                headers: request_context.headers.clone(),
+                extensions: request_context.extensions.clone(),
+                credentials: request_context.credentials.clone(),
+                region: request_context.region.clone(),
+                service: request_context.service.clone(),
+                trailing_headers: request_context.trailing_headers.clone(),
+            };
+            {
+                let req_info = req_info_mut(&mut auth_req)?;
+                req_info.bucket = Some(bucket.clone());
+                req_info.object = Some(fpath.clone());
+                req_info.version_id = None;
+            }
+            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
             let mut size = f.header().size().unwrap_or_default() as i64;
             let archive_entry_mod_time = f
@@ -350,18 +316,23 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
 
-            spawn_extract_entry_notification(
-                notify.clone(),
-                tracing_context.clone(),
-                bucket.clone(),
-                req_params.clone(),
-                version_id.clone(),
-                host.clone(),
+            let event_args = rustfs_notify::EventArgs {
+                event_name: EventName::ObjectCreatedPut,
+                bucket_name: bucket.clone(),
+                object: obj_info.clone(),
+                req_params: req_params.clone(),
+                resp_elements: extract_resp_elements(&S3Response::new(output)),
+                version_id: version_id.clone(),
+                host: host.clone(),
                 port,
-                user_agent.clone(),
-                obj_info.clone(),
-                output,
-            );
+                user_agent: user_agent.clone(),
+            };
+            crate::storage::helper::spawn_background_with_context(tracing_context.clone(), {
+                let notify = notify.clone();
+                async move {
+                    notify.notify(event_args).await;
+                }
+            });
         }
 
         let mut checksums = PutObjectChecksums {

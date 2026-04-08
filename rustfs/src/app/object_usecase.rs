@@ -156,21 +156,6 @@ impl Drop for DeadlockRequestGuard {
     }
 }
 
-fn prepare_put_object_request_context(req: &S3Request<PutObjectInput>) -> PutObjectRequestContext {
-    PutObjectRequestContext {
-        headers: req.headers.clone(),
-        trailing_headers: req.trailing_headers.clone(),
-        uri_query: req.uri.query().map(str::to_string),
-        is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
-        method: req.method.clone(),
-        uri: req.uri.clone(),
-        extensions: req.extensions.clone(),
-        credentials: req.credentials.clone(),
-        region: req.region.clone(),
-        service: req.service.clone(),
-    }
-}
-
 async fn resolve_bucket_default_server_side_encryption(bucket: &str) -> (Option<ServerSideEncryption>, Option<String>) {
     let Some((config, _timestamp)) = metadata_sys::get_sse_config(bucket).await.ok() else {
         return (None, None);
@@ -634,7 +619,18 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_context = prepare_put_object_request_context(&req);
+        let request_context = PutObjectRequestContext {
+            headers: req.headers.clone(),
+            trailing_headers: req.trailing_headers.clone(),
+            uri_query: req.uri.query().map(str::to_string),
+            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+        };
         let (event_name, quota_operation) = if request_context.is_post_object {
             (EventName::ObjectCreatedPost, QuotaOperation::PostObject)
         } else {
@@ -3112,7 +3108,18 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let request_context = prepare_put_object_request_context(&req);
+        let request_context = PutObjectRequestContext {
+            headers: req.headers.clone(),
+            trailing_headers: req.trailing_headers.clone(),
+            uri_query: req.uri.query().map(str::to_string),
+            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+        };
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         if is_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
@@ -3159,35 +3166,6 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
-    }
-
-    #[test]
-    fn prepare_put_object_request_context_defaults_to_regular_put() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let request_context = prepare_put_object_request_context(&req);
-        assert!(!request_context.is_post_object);
-        assert_eq!(request_context.method, Method::PUT);
-    }
-
-    #[test]
-    fn prepare_put_object_request_context_detects_post_marker() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-
-        let request_context = prepare_put_object_request_context(&req);
-        assert!(request_context.is_post_object);
-        assert_eq!(request_context.method, Method::POST);
     }
 
     #[tokio::test]
