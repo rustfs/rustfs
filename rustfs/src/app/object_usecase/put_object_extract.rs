@@ -313,7 +313,7 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
-            record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
+            crate::capacity::record_capacity_write(Some(capacity_scope_token)).await;
 
             let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 

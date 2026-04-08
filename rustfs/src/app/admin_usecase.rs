@@ -15,9 +15,7 @@
 //! Admin application use-case contracts.
 
 use crate::app::context::{AppContext, get_global_app_context};
-use crate::capacity::CapacityDiskRef;
-use crate::capacity::capacity_manager::{CapacityUpdate, DataSource, get_capacity_manager};
-use crate::capacity::scan::{refresh_capacity_with_scope, select_capacity_refresh_disks};
+use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
 use rustfs_common::data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
@@ -26,14 +24,9 @@ use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_io_metrics::capacity_metrics::{
-    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
-    record_capacity_scan_mode,
-};
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
@@ -63,16 +56,6 @@ pub struct DependencyReadiness {
 pub struct QueryPoolStatusRequest {
     pub pool: String,
     pub by_id: bool,
-}
-
-fn capacity_disk_refs(disks: &[rustfs_madmin::Disk]) -> Vec<CapacityDiskRef> {
-    disks
-        .iter()
-        .map(|disk| CapacityDiskRef {
-            endpoint: disk.endpoint.clone(),
-            drive_path: disk.drive_path.clone(),
-        })
-        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -200,122 +183,8 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        // Use hybrid strategy for capacity calculation
-        let capacity_manager = get_capacity_manager();
-
-        // Check if we have a valid cache
-        if let Some(cached) = capacity_manager.get_capacity().await {
-            record_capacity_cache_hit();
-            let cache_age = cached.last_update.elapsed();
-            let fast_update_threshold = capacity_manager.get_config().fast_update_threshold;
-
-            // If cache is fresh (< fast_update_threshold), use it directly
-            if cache_age < fast_update_threshold {
-                record_capacity_cache_served("fresh");
-                info.total_used_capacity = cached.total_used;
-                debug!(
-                    "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
-                    cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
-                );
-            } else {
-                // Cache is stale, check if we need fast update
-                let needs_update = capacity_manager.needs_fast_update().await;
-                let should_block = capacity_manager.should_block_on_refresh(cache_age);
-
-                if needs_update && should_block {
-                    let start = Instant::now();
-                    record_capacity_refresh_request("blocking", DataSource::WriteTriggered.as_metric_label());
-                    let capacity_disks = capacity_disk_refs(&storage_info.disks);
-                    let (refresh_disks, dirty_subset) =
-                        select_capacity_refresh_disks(capacity_manager.as_ref(), &capacity_disks).await;
-                    match capacity_manager
-                        .refresh_or_join(DataSource::WriteTriggered, move || {
-                            let refresh_disks = refresh_disks.clone();
-                            async move { refresh_capacity_with_scope(refresh_disks, dirty_subset).await }
-                        })
-                        .await
-                    {
-                        Ok(update) => {
-                            info.total_used_capacity = update.total_used;
-
-                            let elapsed = start.elapsed();
-                            debug!(
-                                "Foreground capacity refresh completed in {:?} (files={}, estimated={})",
-                                elapsed, update.file_count, update.is_estimated
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Foreground capacity refresh failed: {}, using cached value", e);
-                            record_capacity_cache_served("stale");
-                            info.total_used_capacity = cached.total_used;
-                        }
-                    }
-                } else {
-                    record_capacity_cache_served("stale");
-                    info.total_used_capacity = cached.total_used;
-                    debug!(
-                        "Using stale cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, needs_update={}, blocking={})",
-                        cached.total_used,
-                        cache_age,
-                        cached.source,
-                        cached.file_count,
-                        cached.is_estimated,
-                        needs_update,
-                        should_block
-                    );
-
-                    let disks = capacity_disk_refs(&storage_info.disks);
-                    let manager = capacity_manager.clone();
-                    record_capacity_refresh_request("background", DataSource::Scheduled.as_metric_label());
-                    let (refresh_disks, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
-                    if manager
-                        .clone()
-                        .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
-                            refresh_capacity_with_scope(refresh_disks, dirty_subset).await
-                        })
-                        .await
-                    {
-                        debug!("Background capacity update started");
-                    } else {
-                        debug!("Background update already in progress, skipping spawn");
-                    }
-                }
-            }
-        } else {
-            // No cache, perform initial calculation
-            let start = Instant::now();
-            record_capacity_cache_miss();
-            record_capacity_refresh_request("initial", DataSource::RealTime.as_metric_label());
-            match capacity_manager
-                .refresh_or_join(DataSource::RealTime, || {
-                    let disks = capacity_disk_refs(&storage_info.disks);
-                    async move { refresh_capacity_with_scope(disks, false).await }
-                })
-                .await
-            {
-                Ok(update) => {
-                    info.total_used_capacity = update.total_used;
-
-                    let elapsed = start.elapsed();
-                    info!(
-                        "Initial capacity calculation completed: {} bytes in {:?} (files={}, estimated={})",
-                        update.total_used, elapsed, update.file_count, update.is_estimated
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to calculate data directory used capacity: {}, falling back to disk used capacity",
-                        e
-                    );
-                    record_capacity_cache_served("fallback");
-                    record_capacity_scan_mode("fallback");
-                    info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
-                    capacity_manager
-                        .update_capacity(CapacityUpdate::fallback(info.total_used_capacity), DataSource::Fallback)
-                        .await;
-                }
-            }
-        }
+        info.total_used_capacity =
+            resolve_admin_used_capacity(&storage_info.disks, info.total_capacity.saturating_sub(info.total_free_capacity)).await;
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),

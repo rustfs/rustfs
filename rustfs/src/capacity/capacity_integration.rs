@@ -14,64 +14,20 @@
 
 //! Capacity management integration for application startup
 
-use crate::capacity::CapacityDiskRef;
-use crate::capacity::capacity_manager::{DataSource, get_capacity_manager, start_background_task};
-use rustfs_ecstore::disk::DiskAPI;
-use rustfs_io_metrics::{record_capacity_cache_hit, record_capacity_cache_miss};
-use tracing::{info, warn};
+use crate::capacity::{get_cached_capacity_with_metrics, init_capacity_management_for_local_disks};
 
 /// Initialize capacity management system
 /// This should be called during application startup after local disks are initialized
 pub async fn init_capacity_management() {
-    info!("Initializing capacity management system...");
-
-    // Get all local disks
-    let disks = rustfs_ecstore::store::all_local_disk().await;
-
-    if disks.is_empty() {
-        warn!("No local disks found, capacity management will not run");
-        return;
-    }
-
-    info!("Found {} local disk(s)", disks.len());
-
-    // Convert DiskStore to the capacity crate's lightweight disk reference type.
-    let disk_refs: Vec<CapacityDiskRef> = disks
-        .iter()
-        .map(|ds| CapacityDiskRef {
-            endpoint: ds.endpoint().to_string(),
-            drive_path: ds.to_string(),
-        })
-        .collect();
-
-    // Start background update task
-    info!("Starting background capacity update task...");
-    start_background_task(disk_refs).await;
-
-    info!("Capacity management system initialized successfully");
+    init_capacity_management_for_local_disks().await;
 }
 
 /// Get capacity statistics with metrics
 #[allow(dead_code)]
 pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
-    let manager = get_capacity_manager();
-
-    // Check cache
-    if let Some(cached) = manager.get_capacity().await {
-        record_capacity_cache_hit();
-
-        let source = match cached.source {
-            DataSource::RealTime => "real-time",
-            DataSource::Scheduled => "scheduled",
-            DataSource::WriteTriggered => "write-triggered",
-            DataSource::Fallback => "fallback",
-        };
-
-        return Some((cached.total_used, source.to_string()));
-    }
-
-    record_capacity_cache_miss();
-    None
+    get_cached_capacity_with_metrics()
+        .await
+        .map(|(capacity, source)| (capacity, source.to_string()))
 }
 
 #[cfg(test)]

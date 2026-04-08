@@ -691,10 +691,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let manager = get_capacity_manager();
-        manager
-            .record_write_operation_with_scope_token(Some(capacity_scope_token))
-            .await;
+        crate::capacity::record_capacity_write(Some(capacity_scope_token)).await;
 
         {
             let duration_ms = start_time.elapsed().as_millis() as f64;

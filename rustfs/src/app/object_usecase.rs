@@ -27,7 +27,7 @@ use self::get_object_flow::{GetObjectBootstrap, GetObjectFlowRuntime};
 use self::types::*;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::capacity::capacity_manager::get_capacity_manager;
+use crate::capacity::record_capacity_write;
 use crate::config::RustFSBufferConfig;
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
@@ -269,11 +269,6 @@ mod deadlock_request_guard_tests {
 }
 async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
     enqueue_transition_immediate(obj_info, src).await;
-}
-
-async fn record_capacity_write_with_scope_token(scope_token: Option<Uuid>) {
-    let manager = get_capacity_manager();
-    manager.record_write_operation_with_scope_token(scope_token).await;
 }
 
 fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
@@ -2115,7 +2110,7 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
+        record_capacity_write(Some(capacity_scope_token)).await;
         result
     }
 
@@ -2263,7 +2258,7 @@ impl DefaultObjectUsecase {
                 })
                 .version_id(String::new());
             let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
-            record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
+            record_capacity_write(Some(capacity_scope_token)).await;
             let _ = helper.complete(&result);
             return result;
         }
@@ -2311,7 +2306,7 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        record_capacity_write_with_scope_token(Some(capacity_scope_token)).await;
+        record_capacity_write(Some(capacity_scope_token)).await;
         let _ = helper.complete(&result);
         result
     }

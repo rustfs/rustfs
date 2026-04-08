@@ -16,7 +16,7 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::capacity::capacity_manager::get_capacity_manager;
+use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::entity;
@@ -367,10 +367,7 @@ impl DefaultMultipartUsecase {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
-        let manager = get_capacity_manager();
-        manager
-            .record_write_operation_with_scope_token(Some(capacity_scope_token))
-            .await;
+        record_capacity_write(Some(capacity_scope_token)).await;
 
         // check quota after completing multipart upload
         if let Some(metadata_sys) = self.bucket_metadata_sys() {
