@@ -565,15 +565,6 @@ impl DefaultObjectUsecase {
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
-        let put_path = if small_object_eager_stage {
-            "small_eager"
-        } else if transform_stage.compression_applied() {
-            "compressed"
-        } else if plain_reduced_copy_stage {
-            "reduced_copy"
-        } else {
-            "legacy_plain"
-        };
         log_put_flow_phase(
             &bucket,
             &key,

@@ -21,7 +21,7 @@ use crate::storage::options::filter_object_metadata;
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
 use rustfs_object_io::get::{
     GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodyPlanningInputs as ObjectIoGetObjectBodyPlanningInputs,
     GetObjectBodySource, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
@@ -127,22 +127,31 @@ fn finalize_get_object_completion(
     );
 }
 
+fn get_object_strategy_range<'a>(
+    request_context: &'a GetObjectRequestContext,
+    resolved_range: Option<&'a HTTPRangeSpec>,
+) -> Option<&'a HTTPRangeSpec> {
+    resolved_range.or(request_context.rs.as_ref())
+}
+
 fn finalize_get_object_strategy_runtime(
     request_context: &GetObjectRequestContext,
+    resolved_range: Option<&HTTPRangeSpec>,
     manager: &ConcurrencyManager,
     base_buffer_size: usize,
     info: &ObjectInfo,
     response_content_length: i64,
     io_planning: &GetObjectIoPlanning<'_>,
 ) -> usize {
+    let strategy_range = get_object_strategy_range(request_context, resolved_range);
     let strategy_layout = object_io_plan_get_object_strategy_layout(
-        request_context.rs.as_ref(),
+        strategy_range,
         response_content_length,
         0,
         get_buffer_size_opt_in(response_content_length),
     );
 
-    if let Some(range_spec) = request_context.rs.as_ref()
+    if let Some(range_spec) = strategy_range
         && range_spec.start >= 0
     {
         manager.record_access(range_spec.start as u64, response_content_length as u64);
@@ -201,7 +210,7 @@ fn finalize_get_object_strategy_runtime(
     );
 
     let strategy_layout = object_io_plan_get_object_strategy_layout(
-        request_context.rs.as_ref(),
+        strategy_range,
         response_content_length,
         io_strategy.buffer_size,
         get_buffer_size_opt_in(response_content_length),
@@ -254,6 +263,7 @@ pub(super) async fn build_get_object_output_context(
 
     let optimal_buffer_size = finalize_get_object_strategy_runtime(
         request_context,
+        rs.as_ref(),
         manager,
         base_buffer_size,
         &info,
@@ -356,4 +366,55 @@ pub(super) async fn run_get_object_flow(
     );
 
     Ok(object_io_build_cors_wrapped_get_object_flow_result(output_context, version_id_for_event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_object_strategy_range;
+    use super::*;
+    use http::HeaderMap;
+    use rustfs_ecstore::store_api::ObjectOptions;
+
+    fn sample_range(start: i64, end: i64) -> HTTPRangeSpec {
+        HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end,
+        }
+    }
+
+    fn sample_request_context() -> GetObjectRequestContext {
+        GetObjectRequestContext {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            part_number: None,
+            rs: None,
+            opts: ObjectOptions::default(),
+            headers: HeaderMap::new(),
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        }
+    }
+
+    #[test]
+    fn strategy_range_prefers_resolved_range_for_part_reads() {
+        let request_context = sample_request_context();
+        let resolved_range = sample_range(1024, 2047);
+
+        let strategy_range = get_object_strategy_range(&request_context, Some(&resolved_range)).unwrap();
+
+        assert_eq!(strategy_range.start, 1024);
+        assert_eq!(strategy_range.end, 2047);
+    }
+
+    #[test]
+    fn strategy_range_falls_back_to_raw_request_range() {
+        let mut request_context = sample_request_context();
+        request_context.rs = Some(sample_range(0, 511));
+
+        let strategy_range = get_object_strategy_range(&request_context, None).unwrap();
+
+        assert_eq!(strategy_range.start, 0);
+        assert_eq!(strategy_range.end, 511);
+    }
 }
