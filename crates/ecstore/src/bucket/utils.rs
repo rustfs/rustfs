@@ -15,7 +15,6 @@
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
-use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::xml;
 use tracing::instrument;
 
@@ -200,8 +199,7 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
     if object.len() > 1024 {
         return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
     }
-
-    if object.starts_with(SLASH_SEPARATOR) {
+    if object.starts_with('/') {
         return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned()));
     }
 
@@ -238,6 +236,10 @@ pub fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
 pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(StorageError::BucketNameInvalid(bucket.to_string()));
+    }
+
+    if object.starts_with('/') {
+        return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_string(), object.to_string()));
     }
 
     if object.is_empty() {
@@ -367,6 +369,7 @@ mod tests {
         assert!(is_valid_object_name("file.txt"));
         assert!(is_valid_object_name("path/to/file.txt"));
         assert!(is_valid_object_name("a/b/c/d/e/f"));
+        assert!(is_valid_object_name("/leading/slash"));
         assert!(is_valid_object_name("object-123"));
         assert!(is_valid_object_name("object(1)"));
         assert!(is_valid_object_name("object[1]"));
@@ -420,6 +423,7 @@ mod tests {
         assert!(is_valid_object_prefix("prefix/with/slashes"));
         assert!(is_valid_object_prefix("prefix/"));
         assert!(is_valid_object_prefix("deep/nested/prefix/"));
+        assert!(is_valid_object_prefix("/leading/slash"));
         assert!(is_valid_object_prefix("normal-prefix"));
         assert!(is_valid_object_prefix("prefix_with_underscores"));
         assert!(is_valid_object_prefix("prefix.with.dots"));
@@ -455,6 +459,7 @@ mod tests {
     fn test_check_bucket_and_object_names() {
         // Valid names
         assert!(check_bucket_and_object_names("valid-bucket", "valid-object").is_ok());
+        assert!(check_bucket_and_object_names("valid-bucket", "/valid-object").is_err());
 
         // Invalid bucket names
         assert!(check_bucket_and_object_names("", "valid-object").is_err());
@@ -474,12 +479,14 @@ mod tests {
     #[test]
     fn test_check_multipart_args() {
         assert!(check_new_multipart_args("valid-bucket", "valid-object").is_ok());
+        assert!(check_new_multipart_args("valid-bucket", "/valid-object").is_err());
         assert!(check_new_multipart_args("", "valid-object").is_err());
         assert!(check_new_multipart_args("valid-bucket", "").is_err());
 
         // Use valid base64 encoded upload_id
         let valid_upload_id = "dXBsb2FkLWlk"; // base64 encoded "upload-id"
         assert!(check_multipart_object_args("valid-bucket", "valid-object", valid_upload_id).is_ok());
+        assert!(check_multipart_object_args("valid-bucket", "/valid-object", valid_upload_id).is_err());
         assert!(check_multipart_object_args("", "valid-object", valid_upload_id).is_err());
         assert!(check_multipart_object_args("valid-bucket", "", valid_upload_id).is_err());
         // Empty string is valid base64 (decodes to empty vec), so this should pass bucket/object validation
@@ -509,6 +516,7 @@ mod tests {
         // Test bucket and object name validation
         assert!(check_bucket_and_object_names("test-bucket", "test-object").is_ok());
         assert!(check_bucket_and_object_names("test-bucket", "folder/test-object").is_ok());
+        assert!(check_bucket_and_object_names("test-bucket", "/foo/bar").is_err());
 
         // Test list objects arguments
         assert!(check_list_objs_args("test-bucket", "prefix", &Some("marker".to_string())).is_ok());
@@ -523,6 +531,7 @@ mod tests {
 
         // Test put object arguments
         assert!(check_put_object_args("test-bucket", "test-object").is_ok());
+        assert!(check_put_object_args("test-bucket", "/foo/bar").is_err());
         assert!(check_put_object_args("", "test-object").is_err());
         assert!(check_put_object_args("test-bucket", "").is_err());
     }

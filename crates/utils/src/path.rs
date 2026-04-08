@@ -44,8 +44,15 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 /// The trailing slash is removed and `GLOBAL_DIR_SUFFIX` is appended.
 /// If it does not end with a slash, the name is returned as is.
 pub fn encode_dir_object(object: &str) -> String {
-    if has_suffix(object, SLASH_SEPARATOR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
+    let is_dir_object = has_suffix(object, SLASH_SEPARATOR);
+    let object = if is_dir_object {
+        object.strip_suffix(SLASH_SEPARATOR).unwrap_or_default()
+    } else {
+        object
+    };
+
+    if is_dir_object {
+        format!("{object}{GLOBAL_DIR_SUFFIX}")
     } else {
         object.to_string()
     }
@@ -66,7 +73,9 @@ pub fn is_dir_object(object: &str) -> bool {
 #[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
-        format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
+        let mut object = object.trim_end_matches(GLOBAL_DIR_SUFFIX).to_string();
+        object.push_str(SLASH_SEPARATOR);
+        object
     } else {
         object.to_string()
     }

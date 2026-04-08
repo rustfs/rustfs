@@ -107,6 +107,39 @@ fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
     headers.contains_key(AMZ_WRITE_OFFSET_BYTES_HEADER)
 }
 
+fn normalize_compat_object_key(key: &str) -> String {
+    key.trim_start_matches('/').to_string()
+}
+
+fn normalize_compat_object_key_in_place(key: &mut String) {
+    if key.starts_with('/') {
+        *key = normalize_compat_object_key(key);
+    }
+}
+
+fn normalize_compat_boxed_object_key_in_place(key: &mut Box<str>) {
+    if key.starts_with('/') {
+        *key = normalize_compat_object_key(key).into_boxed_str();
+    }
+}
+
+fn normalize_compat_copy_source_in_place(copy_source: &mut CopySource) -> S3Result<(String, String, Option<String>)> {
+    match copy_source {
+        CopySource::AccessPoint { .. } => Err(s3_error!(NotImplemented)),
+        CopySource::Outpost { .. } => Err(s3_error!(NotImplemented)),
+        CopySource::Bucket { bucket, key, version_id } => {
+            normalize_compat_boxed_object_key_in_place(key);
+            Ok((bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string())))
+        }
+    }
+}
+
+fn normalize_compat_object_identifiers_in_place(objects: &mut [ObjectIdentifier]) {
+    for object in objects {
+        normalize_compat_object_key_in_place(&mut object.key);
+    }
+}
+
 /// True when the bucket policy may evaluate `s3:ExistingObjectTag` for this request (statement
 /// matches principal/action/resource and conditions reference ExistingObjectTag keys).
 enum BucketPolicyExistingObjectTagHint {
@@ -787,6 +820,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -798,6 +832,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -809,14 +844,9 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         {
-            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Bucket { bucket, key, version_id } => {
-                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-                }
-            };
+            let (src_bucket, src_key, version_id) = normalize_compat_copy_source_in_place(&mut req.input.copy_source)?;
 
             let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(src_bucket.clone());
@@ -847,6 +877,7 @@ impl S3Access for FS {
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1007,6 +1038,7 @@ impl S3Access for FS {
             return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
         }
 
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1026,6 +1058,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1038,6 +1071,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        normalize_compat_object_identifiers_in_place(&mut req.input.delete.objects);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = None;
@@ -1270,6 +1304,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1282,6 +1317,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_acl(&self, req: &mut S3Request<GetObjectAclInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1294,6 +1330,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_attributes(&self, req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1314,6 +1351,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_legal_hold(&self, req: &mut S3Request<GetObjectLegalHoldInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1336,6 +1374,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_retention(&self, req: &mut S3Request<GetObjectRetentionInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1348,6 +1387,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1387,6 +1427,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1500,6 +1541,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1509,6 +1551,7 @@ impl S3Access for FS {
 
     /// Checks whether the PostObject request has accesses to the resources.
     async fn post_object(&self, req: &mut S3Request<PostObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         validate_post_object_success_controls(&req.input)?;
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
@@ -1704,6 +1747,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1733,6 +1777,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_acl(&self, req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1745,6 +1790,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1765,6 +1811,7 @@ impl S3Access for FS {
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1784,6 +1831,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1806,6 +1854,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1818,6 +1867,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1829,6 +1879,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1840,14 +1891,9 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        normalize_compat_object_key_in_place(&mut req.input.key);
         {
-            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Bucket { bucket, key, version_id } => {
-                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-                }
-            };
+            let (src_bucket, src_key, version_id) = normalize_compat_copy_source_in_place(&mut req.input.copy_source)?;
 
             let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(src_bucket.clone());
@@ -1856,7 +1902,6 @@ impl S3Access for FS {
 
             authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
-
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -1899,6 +1944,11 @@ mod tests {
         req.extensions.insert(ReqInfo::default());
     }
 
+    fn assert_req_object<T>(req: &S3Request<T>, expected: &str) {
+        let req_info = req.extensions.get::<ReqInfo>().expect("request info should remain available");
+        assert_eq!(req_info.object.as_deref(), Some(expected));
+    }
+
     #[test]
     fn get_bucket_policy_uses_get_bucket_policy_action() {
         assert_eq!(get_bucket_policy_authorize_action(), Action::S3Action(S3Action::GetBucketPolicyAction));
@@ -1922,6 +1972,62 @@ mod tests {
     #[test]
     fn list_parts_uses_list_multipart_upload_parts_action() {
         assert_eq!(list_parts_authorize_action(), Action::S3Action(S3Action::ListMultipartUploadPartsAction));
+    }
+
+    #[test]
+    fn normalize_compat_object_key_strips_only_leading_slashes() {
+        let cases = [
+            ("", ""),
+            ("plain", "plain"),
+            ("/plain", "plain"),
+            ("///plain", "plain"),
+            ("/a//b", "a//b"),
+            ("/a/./b", "a/./b"),
+            ("/a/../b", "a/../b"),
+            ("/folder/trailing/", "folder/trailing/"),
+            ("/hello world", "hello world"),
+            ("/+plus%percent", "+plus%percent"),
+            ("/你好/世界", "你好/世界"),
+            ("/", ""),
+            ("////", ""),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                normalize_compat_object_key(raw),
+                expected,
+                "normalization should only strip leading slashes for {:?}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_compat_object_identifiers_updates_every_entry() {
+        let mut objects = vec![
+            ObjectIdentifier {
+                key: "/foo".to_string(),
+                version_id: None,
+                ..Default::default()
+            },
+            ObjectIdentifier {
+                key: "///bar/baz".to_string(),
+                version_id: Some("v1".to_string()),
+                ..Default::default()
+            },
+            ObjectIdentifier {
+                key: "nested//path".to_string(),
+                version_id: None,
+                ..Default::default()
+            },
+        ];
+
+        normalize_compat_object_identifiers_in_place(&mut objects);
+
+        assert_eq!(objects[0].key, "foo");
+        assert_eq!(objects[1].key, "bar/baz");
+        assert_eq!(objects[1].version_id.as_deref(), Some("v1"));
+        assert_eq!(objects[2].key, "nested//path");
     }
 
     #[test]
@@ -2216,7 +2322,7 @@ mod tests {
     async fn post_object_marks_request_extensions() {
         let input = PostObjectInput::builder()
             .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
+            .key("/test-key".to_string())
             .build()
             .expect("post object input should build");
 
@@ -2240,13 +2346,15 @@ mod tests {
             req.extensions.get::<PostObjectRequestMarker>().is_some(),
             "post object request should carry the marker for downstream handling"
         );
+        assert_eq!(req.input.key, "test-key");
+        assert_req_object(&req, "test-key");
     }
 
     #[tokio::test]
     async fn put_object_rejects_write_offset_bytes_before_authorization() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
+            .key("/test-key".to_string())
             .build()
             .expect("put object input should build");
 
@@ -2256,7 +2364,7 @@ mod tests {
         let mut req = S3Request {
             input,
             method: Method::PUT,
-            uri: Uri::from_static("/test-bucket/test-key"),
+            uri: Uri::from_static("/test-bucket//test-key"),
             headers,
             extensions: http::Extensions::new(),
             credentials: None,
@@ -2280,6 +2388,7 @@ mod tests {
 
         let req_info = req.extensions.get::<ReqInfo>().expect("request info should remain available");
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(req.input.key, "test-key");
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
     }
 
@@ -2295,14 +2404,14 @@ mod tests {
     async fn put_object_rejects_write_offset_bytes_before_authorize_request() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
+            .key("/test-key".to_string())
             .build()
             .expect("put object input should build");
 
         let mut req = S3Request {
             input,
             method: Method::PUT,
-            uri: Uri::from_static("/test-bucket/test-key"),
+            uri: Uri::from_static("/test-bucket//test-key"),
             headers: HeaderMap::new(),
             extensions: http::Extensions::new(),
             credentials: None,
@@ -2332,6 +2441,7 @@ mod tests {
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
         assert_eq!(req_info.version_id, None);
+        assert_eq!(req.input.key, "test-key");
     }
 
     #[tokio::test]
@@ -2340,7 +2450,7 @@ mod tests {
         let mut req = build_request(
             AbortMultipartUploadInput::builder()
                 .bucket("bucket".to_string())
-                .key("object".to_string())
+                .key("/object".to_string())
                 .upload_id("upload-id".to_string())
                 .build()
                 .unwrap(),
@@ -2353,6 +2463,8 @@ mod tests {
             .await
             .expect_err("missing credentials should reject access");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(req.input.key, "object");
+        assert_req_object(&req, "object");
     }
 
     #[tokio::test]
@@ -2361,7 +2473,7 @@ mod tests {
         let mut req = build_request(
             CompleteMultipartUploadInput::builder()
                 .bucket("bucket".to_string())
-                .key("object".to_string())
+                .key("/object".to_string())
                 .upload_id("upload-id".to_string())
                 .multipart_upload(Some(CompletedMultipartUpload::default()))
                 .build()
@@ -2375,6 +2487,8 @@ mod tests {
             .await
             .expect_err("missing credentials should reject access");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(req.input.key, "object");
+        assert_req_object(&req, "object");
     }
 
     #[tokio::test]
@@ -2383,12 +2497,12 @@ mod tests {
         let mut req = build_request(
             UploadPartCopyInput::builder()
                 .bucket("dst-bucket".to_string())
-                .key("dst-object".to_string())
+                .key("/dst-object".to_string())
                 .upload_id("upload-id".to_string())
                 .part_number(1)
                 .copy_source(CopySource::Bucket {
                     bucket: "src-bucket".into(),
-                    key: "src-object".into(),
+                    key: "/src-object".into(),
                     version_id: None,
                 })
                 .build()
@@ -2402,5 +2516,203 @@ mod tests {
             .await
             .expect_err("missing credentials should reject access");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(req.input.key, "dst-object");
+        assert_req_object(&req, "src-object");
+        match &req.input.copy_source {
+            CopySource::Bucket { key, .. } => assert_eq!(key.as_ref(), "src-object"),
+            _ => panic!("expected bucket copy source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_object_normalizes_source_and_destination_keys_before_authorization() {
+        let fs = FS::new();
+        let mut req = build_request(
+            CopyObjectInput::builder()
+                .copy_source(CopySource::Bucket {
+                    bucket: "src-bucket".into(),
+                    key: "///src//object".into(),
+                    version_id: Some("v1".into()),
+                })
+                .bucket("dst-bucket".to_string())
+                .key("/dst/./object".to_string())
+                .build()
+                .unwrap(),
+            Method::PUT,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .copy_object(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(req.input.key, "dst/./object");
+        assert_req_object(&req, "src//object");
+        match &req.input.copy_source {
+            CopySource::Bucket { key, version_id, .. } => {
+                assert_eq!(key.as_ref(), "src//object");
+                assert_eq!(version_id.as_deref(), Some("v1"));
+            }
+            _ => panic!("expected bucket copy source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_objects_normalizes_body_keys_before_authorization() {
+        let fs = FS::new();
+        let mut req = build_request(
+            DeleteObjectsInput::builder()
+                .bucket("bucket".to_string())
+                .delete(Delete {
+                    objects: vec![
+                        ObjectIdentifier {
+                            key: "/foo".to_string(),
+                            version_id: None,
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "///bar//baz".to_string(),
+                            version_id: Some("v2".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    quiet: None,
+                })
+                .build()
+                .unwrap(),
+            Method::POST,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .delete_objects(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(req.input.delete.objects[0].key, "foo");
+        assert_eq!(req.input.delete.objects[1].key, "bar//baz");
+        assert_eq!(req.input.delete.objects[1].version_id.as_deref(), Some("v2"));
+    }
+
+    #[tokio::test]
+    async fn object_access_paths_normalize_leading_slashes_consistently() {
+        let fs = FS::new();
+
+        let mut get_req = build_request(
+            GetObjectInput::builder()
+                .bucket("bucket".to_string())
+                .key("///a//b".to_string())
+                .build()
+                .unwrap(),
+            Method::GET,
+        );
+        ensure_req_info(&mut get_req);
+        let get_err = fs
+            .get_object(&mut get_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(get_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(get_req.input.key, "a//b");
+        assert_req_object(&get_req, "a//b");
+
+        let mut head_req = build_request(
+            HeadObjectInput::builder()
+                .bucket("bucket".to_string())
+                .key("/a/../b".to_string())
+                .build()
+                .unwrap(),
+            Method::HEAD,
+        );
+        ensure_req_info(&mut head_req);
+        let head_err = fs
+            .head_object(&mut head_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(head_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(head_req.input.key, "a/../b");
+        assert_req_object(&head_req, "a/../b");
+
+        let mut attrs_req = build_request(
+            GetObjectAttributesInput::builder()
+                .bucket("bucket".to_string())
+                .key("/folder/./child".to_string())
+                .version_id(Some("v3".to_string()))
+                .build()
+                .unwrap(),
+            Method::GET,
+        );
+        ensure_req_info(&mut attrs_req);
+        let attrs_err = fs
+            .get_object_attributes(&mut attrs_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(attrs_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(attrs_req.input.key, "folder/./child");
+        let req_info = attrs_req
+            .extensions
+            .get::<ReqInfo>()
+            .expect("request info should remain available");
+        assert_eq!(req_info.object.as_deref(), Some("folder/./child"));
+        assert_eq!(req_info.version_id.as_deref(), Some("v3"));
+    }
+
+    #[tokio::test]
+    async fn multipart_object_access_paths_normalize_leading_slashes_consistently() {
+        let fs = FS::new();
+
+        let mut create_req = build_request(
+            CreateMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("///multipart/object".to_string())
+                .build()
+                .unwrap(),
+            Method::POST,
+        );
+        ensure_req_info(&mut create_req);
+        let create_err = fs
+            .create_multipart_upload(&mut create_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(create_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(create_req.input.key, "multipart/object");
+        assert_req_object(&create_req, "multipart/object");
+
+        let mut list_req = build_request(
+            ListPartsInput::builder()
+                .bucket("bucket".to_string())
+                .key("/multipart//object".to_string())
+                .upload_id("upload-id".to_string())
+                .build()
+                .unwrap(),
+            Method::GET,
+        );
+        ensure_req_info(&mut list_req);
+        let list_err = fs
+            .list_parts(&mut list_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(list_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(list_req.input.key, "multipart//object");
+        assert_req_object(&list_req, "multipart//object");
+
+        let mut upload_req = build_request(
+            UploadPartInput::builder()
+                .bucket("bucket".to_string())
+                .key("/multipart/object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .build()
+                .unwrap(),
+            Method::PUT,
+        );
+        ensure_req_info(&mut upload_req);
+        let upload_err = fs
+            .upload_part(&mut upload_req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(upload_err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(upload_req.input.key, "multipart/object");
+        assert_req_object(&upload_req, "multipart/object");
     }
 }

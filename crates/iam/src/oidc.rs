@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::RwLock;
 use std::time::{Duration as StdDuration, Instant};
@@ -916,8 +917,26 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
     merge_oidc_provider_configs(env_configs, persisted_configs)
 }
 
+fn build_oidc_http_client(config_url: &str) -> Result<ReqwestHttpClient, String> {
+    let parsed = Url::parse(config_url).map_err(|e| format!("invalid config_url: {e}"))?;
+    let mut builder = reqwest::Client::builder();
+
+    let should_bypass_proxy = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    });
+
+    if should_bypass_proxy {
+        builder = builder.no_proxy();
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| format!("failed to build OIDC http client: {e}"))?;
+    Ok(ReqwestHttpClient(client))
+}
+
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-    let http_client = ReqwestHttpClient(reqwest::Client::new());
+    let http_client = build_oidc_http_client(&config.config_url)?;
     let state = OidcSys::discover_provider(config, &http_client).await?;
 
     Ok(OidcProviderValidationResult {
