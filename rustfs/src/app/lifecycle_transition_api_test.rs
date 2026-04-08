@@ -35,12 +35,14 @@ use rustfs_ecstore::{
         warm_backend::{WarmBackend, WarmBackendGetOpts},
     },
 };
+use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
     collections::HashMap,
     convert::Infallible,
+    fs as stdfs,
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
@@ -538,4 +540,50 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         wait_for_remote_absence(&backend, &remote_object, TRANSITION_WAIT_TIMEOUT).await,
         "transitioned object should be removed from remote tier after delete usecase"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
+    let (disk_paths, ecstore) = setup_test_env().await;
+    let manager = create_isolated_manager(HybridStrategyConfig::default());
+    let _ = manager.get_dirty_disks().await;
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let _backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-capacity-transition-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"transition should mark dirty scope";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+    let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+
+    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
+        ecstore.clone(),
+        bucket.as_str(),
+    )
+    .await
+    .expect("Failed to enqueue transitioned object");
+
+    let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should transition before dirty scope assertion");
+
+    let dirty_disks = manager.get_dirty_disks().await;
+    assert_eq!(dirty_disks.len(), disk_paths.len());
+
+    let actual_paths: std::collections::HashSet<_> = dirty_disks
+        .into_iter()
+        .map(|disk| stdfs::canonicalize(&disk.drive_path).unwrap().to_string_lossy().into_owned())
+        .collect();
+    let expected_paths: std::collections::HashSet<_> = disk_paths
+        .iter()
+        .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(actual_paths, expected_paths);
 }

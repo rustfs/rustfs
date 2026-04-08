@@ -1494,10 +1494,7 @@ impl DefaultBucketUsecase {
             && let Some(store) = new_object_layer_fn()
         {
             let bucket_name = bucket.clone();
-            let request_context = req
-                .extensions
-                .get::<crate::storage::request_context::RequestContext>()
-                .cloned();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
             spawn_background_with_context(request_context, async move {
                 if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
@@ -1883,7 +1880,7 @@ impl DefaultBucketUsecase {
 
         let store = get_validated_store(&bucket).await?;
 
-        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+        let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
 
@@ -1963,7 +1960,7 @@ impl DefaultBucketUsecase {
             .transpose()?;
 
         let store = get_validated_store(&bucket).await?;
-        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+        let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
