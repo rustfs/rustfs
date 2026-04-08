@@ -27,6 +27,10 @@ categories = ["filesystem", "development-tools"]
 [lib]
 doctest = false
 
+[[bench]]
+name = "capacity_scan"
+harness = false
+
 [lints]
 workspace = true
 
@@ -42,6 +46,7 @@ uuid = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }

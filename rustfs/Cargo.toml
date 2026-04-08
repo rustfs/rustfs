@@ -42,10 +42,6 @@ test = false
 bench = false
 required-features = ["manual-test-runners"]
 
-[[bench]]
-name = "capacity_scan"
-harness = false
-
 [features]
 default = ["direct-io"]
 metrics-gpu = ["rustfs-metrics/gpu"]
@@ -196,7 +192,6 @@ jemalloc_pprof = { workspace = true }
 pprof = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

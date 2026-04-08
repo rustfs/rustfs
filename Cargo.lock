@@ -7665,7 +7665,6 @@ dependencies = [
  "bytes",
  "clap",
  "const-str",
- "criterion",
  "datafusion",
  "flatbuffers",
  "futures",
@@ -8235,6 +8234,7 @@ dependencies = [
 name = "rustfs-object-capacity"
 version = "0.0.5"
 dependencies = [
+ "criterion",
  "futures",
  "rustfs-common",
  "rustfs-config",

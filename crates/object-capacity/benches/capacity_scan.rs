@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rustfs::capacity::{CapacityDiskRef, scan_used_capacity_disks};
+use rustfs_object_capacity::{CapacityDiskRef, scan_used_capacity_disks};
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
