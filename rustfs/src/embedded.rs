@@ -290,6 +290,33 @@ impl RustFSServerBuilder {
         config.region = Some(self.region.clone());
         config.console_enable = false;
 
+        // --- Retry-safe preflight before any process-global mutation ---
+        let region = if let Some(region_str) = &config.region {
+            Some(
+                region_str
+                    .parse()
+                    .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        let server_addr =
+            parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
+
+        if server_addr.port() == 0 {
+            return Err(ServerError::Init(
+                "port 0 is not supported in embedded mode because startup requires \
+                 a stable listen address and port before endpoint/global initialization. \
+                 Use `find_available_port()` to obtain a free port."
+                    .to_string(),
+            ));
+        }
+
+        let server_port = server_addr.port();
+
+        set_global_init_guard()?;
+
         // --- Initialization sequence (mirrors main.rs::run) ---
 
         // Observability (minimal / no-op endpoint for embedded use).
@@ -310,33 +337,12 @@ impl RustFSServerBuilder {
         init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
             .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
 
-        // Region.
-        if let Some(region_str) = &config.region {
-            let region = region_str
-                .parse()
-                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
+        if let Some(region) = region {
             rustfs_ecstore::global::set_global_region(region);
         }
 
-        // Resolve listen address.
-        let server_addr =
-            parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
-
-        if server_addr.port() == 0 {
-            return Err(ServerError::Init(
-                "port 0 is not supported in embedded mode because startup requires \
-                 a stable listen address and port before endpoint/global initialization. \
-                 Use `find_available_port()` to obtain a free port."
-                    .to_string(),
-            ));
-        }
-
-        let server_port = server_addr.port();
-
         set_global_rustfs_port(server_port);
         set_global_addr(&config.address).await;
-
-        set_global_init_guard()?;
 
         // Endpoints / erasure setup.
         let server_addr_str = server_addr.to_string();
@@ -614,4 +620,26 @@ pub fn find_available_port() -> Result<u16, std::io::Error> {
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RustFSServerBuilder, SERVER_STARTED, ServerError, find_available_port};
+    use serial_test::serial;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    #[serial]
+    async fn build_returns_already_started_before_global_init() {
+        SERVER_STARTED.store(true, Ordering::SeqCst);
+
+        let result = RustFSServerBuilder::new()
+            .address(format!("127.0.0.1:{}", find_available_port().expect("test port")))
+            .build()
+            .await;
+
+        SERVER_STARTED.store(false, Ordering::SeqCst);
+
+        assert!(matches!(result, Err(ServerError::AlreadyStarted)));
+    }
 }
