@@ -20,6 +20,7 @@ pub const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 pub const SLASH_SEPARATOR: &str = "/";
 
 pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
+const LEADING_SLASH_ESCAPE_PREFIX: &str = "__RUSTFS_LEADING_SLASH_HEX__";
 
 #[inline]
 pub fn is_separator(c: u8) -> bool {
@@ -38,16 +39,72 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
     }
 }
 
+fn encode_leading_slash_object(object: &str) -> String {
+    if !object.starts_with(SLASH_SEPARATOR) {
+        return object.to_string();
+    }
+
+    let mut encoded = String::with_capacity(LEADING_SLASH_ESCAPE_PREFIX.len() + object.len() * 2);
+    encoded.push_str(LEADING_SLASH_ESCAPE_PREFIX);
+
+    for byte in object.as_bytes() {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    encoded
+}
+
+fn decode_leading_slash_object(object: &str) -> String {
+    let Some(encoded) = object.strip_prefix(LEADING_SLASH_ESCAPE_PREFIX) else {
+        return object.to_string();
+    };
+
+    if encoded.len() % 2 != 0 {
+        return object.to_string();
+    }
+
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for idx in (0..encoded.len()).step_by(2) {
+        let Some(pair) = encoded.get(idx..idx + 2) else {
+            return object.to_string();
+        };
+        let Ok(byte) = u8::from_str_radix(pair, 16) else {
+            return object.to_string();
+        };
+        bytes.push(byte);
+    }
+
+    let Ok(decoded) = String::from_utf8(bytes) else {
+        return object.to_string();
+    };
+
+    if decoded.starts_with(SLASH_SEPARATOR) && encode_leading_slash_object(&decoded) == object {
+        decoded
+    } else {
+        object.to_string()
+    }
+}
+
 /// Encodes a directory object name by replacing the trailing slash with `GLOBAL_DIR_SUFFIX`.
 ///
 /// If the object name ends with a slash, it is considered a directory object.
 /// The trailing slash is removed and `GLOBAL_DIR_SUFFIX` is appended.
 /// If it does not end with a slash, the name is returned as is.
 pub fn encode_dir_object(object: &str) -> String {
-    if has_suffix(object, SLASH_SEPARATOR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
+    let is_dir_object = has_suffix(object, SLASH_SEPARATOR);
+    let object = if is_dir_object {
+        object.strip_suffix(SLASH_SEPARATOR).unwrap_or_default()
     } else {
-        object.to_string()
+        object
+    };
+    let object = encode_leading_slash_object(object);
+
+    if is_dir_object {
+        format!("{object}{GLOBAL_DIR_SUFFIX}")
+    } else {
+        object
     }
 }
 
@@ -65,11 +122,17 @@ pub fn is_dir_object(object: &str) -> bool {
 /// Otherwise, the name is returned as is.
 #[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
-    if has_suffix(object, GLOBAL_DIR_SUFFIX) {
-        format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
+    let (object, is_dir_object) = if has_suffix(object, GLOBAL_DIR_SUFFIX) {
+        (object.trim_end_matches(GLOBAL_DIR_SUFFIX), true)
     } else {
-        object.to_string()
+        (object, false)
+    };
+
+    let mut object = decode_leading_slash_object(object);
+    if is_dir_object {
+        object.push_str(SLASH_SEPARATOR);
     }
+    object
 }
 
 /// Ensures that the string ends with a trailing slash if it is not empty.
@@ -842,6 +905,21 @@ mod tests {
             PathBuf::from("c"),
         ]);
         assert_eq!(result, PathBuf::from("b/c"));
+    }
+
+    #[test]
+    fn test_encode_dir_object_preserves_leading_slash_objects() {
+        let encoded = encode_dir_object("/foo");
+        assert_ne!(encoded, "foo");
+        assert_eq!(decode_dir_object(&encoded), "/foo");
+
+        let encoded_dir = encode_dir_object("/foo/");
+        assert!(encoded_dir.ends_with(GLOBAL_DIR_SUFFIX));
+        assert_eq!(decode_dir_object(&encoded_dir), "/foo/");
+
+        let joined_with_leading = path_join_buf(&["bucket", &encoded]);
+        let joined_without_leading = path_join_buf(&["bucket", &encode_dir_object("foo")]);
+        assert_ne!(joined_with_leading, joined_without_leading);
     }
 
     #[test]
