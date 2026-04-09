@@ -37,7 +37,6 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
-use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -244,12 +243,11 @@ impl<T: Store> IamSys<T> {
 
     pub async fn info_policy(&self, name: &str) -> Result<rustfs_madmin::PolicyInfo> {
         let d = self.store.get_policy_doc(name).await?;
-
-        let pdata = serde_json::to_string(&d.policy)?;
+        let pdata = serde_json::to_value(&d.policy)?;
 
         Ok(rustfs_madmin::PolicyInfo {
             policy_name: name.to_string(),
-            policy: json!(pdata),
+            policy: pdata,
             create_date: d.create_date,
             update_date: d.update_date,
         })
@@ -2043,6 +2041,34 @@ mod tests {
             policies.iter().any(|p| p == "readwrite"),
             "policies from existing group 'testgroup' should be returned even when other groups are missing; got: {:?}",
             policies
+        );
+    }
+
+    #[tokio::test]
+    async fn test_info_policy_returns_policy_as_json_object() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let policy_info = iam_sys
+            .info_policy("readonly")
+            .await
+            .expect("info_policy should return existing default policy");
+
+        assert!(
+            policy_info.policy.is_object(),
+            "policy field should be a JSON object for MinIO-compatible policy readback; got: {}",
+            policy_info.policy
+        );
+        assert!(
+            policy_info.policy.get("Version").is_some(),
+            "policy object should contain Version field; got: {}",
+            policy_info.policy
+        );
+        assert!(
+            policy_info.policy.get("Statement").is_some(),
+            "policy object should contain Statement field; got: {}",
+            policy_info.policy
         );
     }
 }
