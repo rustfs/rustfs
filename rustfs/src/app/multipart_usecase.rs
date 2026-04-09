@@ -26,8 +26,7 @@ use crate::storage::options::{
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
 use crate::storage::s3_api::multipart::{
-    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params,
-    parse_list_parts_params,
+    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
 };
 use crate::storage::*;
 use bytes::Bytes;
