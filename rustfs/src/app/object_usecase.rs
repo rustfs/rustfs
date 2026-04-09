@@ -3155,7 +3155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_put_object_tagging_rejects_too_many_tags_before_store_lookup() {
+    async fn execute_put_object_tagging_rejects_too_many_tags() {
         let tag_set = (0..11)
             .map(|index| Tag {
                 key: Some(format!("k{index}")),
