@@ -1721,7 +1721,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
-        Ok(S3Response::new(replication::build_put_bucket_replication_output()))
+        Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
