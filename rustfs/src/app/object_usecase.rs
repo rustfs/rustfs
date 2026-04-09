@@ -38,8 +38,8 @@ use crate::storage::options::{
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
     validate_archive_content_encoding,
 };
+use crate::storage::s3_api::acl;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
@@ -2933,8 +2933,10 @@ impl DefaultObjectUsecase {
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
 
             if already_restored {
-                let output =
-                    restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
+                let output = RestoreObjectOutput {
+                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+                    restore_output_path: None,
+                };
                 helper = helper
                     .object(event_object_info.clone())
                     .version_id(version_id_str.clone())
@@ -2989,7 +2991,10 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let output = restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
+        let output = RestoreObjectOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+            restore_output_path: None,
+        };
         helper = helper.object(event_object_info).version_id(version_id_str);
         let result = Ok(S3Response::with_headers(output, header));
         let _ = helper.complete(&result);
@@ -3070,9 +3075,9 @@ impl DefaultObjectUsecase {
             drop(tx);
         });
 
-        Ok(S3Response::new(select::build_select_object_content_output(
-            SelectObjectContentEventStream::new(stream),
-        )))
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
     }
 
     #[instrument(level = "debug", skip(self, req, request_context))]
