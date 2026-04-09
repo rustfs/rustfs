@@ -973,7 +973,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
+        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1788,7 +1788,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2867,6 +2867,26 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
