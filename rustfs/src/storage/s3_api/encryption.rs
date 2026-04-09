@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{GetBucketEncryptionOutput, PutBucketEncryptionOutput, ServerSideEncryptionConfiguration};
+use s3s::dto::{GetBucketEncryptionOutput, ServerSideEncryptionConfiguration};
 
 pub(crate) fn build_get_bucket_encryption_output(
     server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
@@ -22,13 +22,9 @@ pub(crate) fn build_get_bucket_encryption_output(
     }
 }
 
-pub(crate) fn build_put_bucket_encryption_output() -> PutBucketEncryptionOutput {
-    PutBucketEncryptionOutput::default()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_get_bucket_encryption_output, build_put_bucket_encryption_output};
+    use super::build_get_bucket_encryption_output;
     use s3s::dto::ServerSideEncryptionConfiguration;
 
     #[test]
@@ -37,11 +33,5 @@ mod tests {
         let output = build_get_bucket_encryption_output(config.clone());
 
         assert_eq!(output.server_side_encryption_configuration, config);
-    }
-
-    #[test]
-    fn test_build_put_bucket_encryption_output_is_default() {
-        let output = build_put_bucket_encryption_output();
-        assert_eq!(output, Default::default());
     }
 }

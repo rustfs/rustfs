@@ -1436,7 +1436,7 @@ impl DefaultBucketUsecase {
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
         }
-        Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
+        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2920,6 +2920,21 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_acl(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketEncryptionInput::builder()
+            .bucket("test-bucket".to_string())
+            .server_side_encryption_configuration(ServerSideEncryptionConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
