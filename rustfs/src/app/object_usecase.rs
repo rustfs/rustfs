@@ -647,7 +647,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&request_context.headers) {
-            return self.execute_put_object_extract(req).await;
+            return self.execute_put_object_extract(req, request_context).await;
         }
 
         let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
@@ -3075,20 +3075,12 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let request_context = PutObjectRequestContext {
-            headers: req.headers.clone(),
-            trailing_headers: req.trailing_headers.clone(),
-            uri_query: req.uri.query().map(str::to_string),
-            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
-            method: req.method.clone(),
-            uri: req.uri.clone(),
-            extensions: req.extensions.clone(),
-            credentials: req.credentials.clone(),
-            region: req.region.clone(),
-            service: req.service.clone(),
-        };
+    #[instrument(level = "debug", skip(self, req, request_context))]
+    async fn execute_put_object_extract(
+        &self,
+        req: S3Request<PutObjectInput>,
+        request_context: PutObjectRequestContext,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         if is_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
