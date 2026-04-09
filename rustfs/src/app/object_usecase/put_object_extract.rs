@@ -64,29 +64,9 @@ impl DefaultObjectUsecase {
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
         let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(&request_context.headers)?);
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        let mut effective_sse = original_sse.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        })
-                })
-            })
-        });
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (default_sse, default_kms_key_id) = resolve_bucket_default_server_side_encryption(&bucket).await;
+        let mut effective_sse = original_sse.or(default_sse);
+        let mut effective_kms_key_id = ssekms_key_id.or(default_kms_key_id);
         if effective_sse
             .as_ref()
             .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
@@ -196,7 +176,24 @@ impl DefaultObjectUsecase {
             let is_dir = f.header().entry_type().is_dir();
             let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
 
-            authorize_extract_put_target(&request_context, &bucket, &fpath).await?;
+            let mut auth_req = S3Request {
+                input: PutObjectInput::default(),
+                method: request_context.method.clone(),
+                uri: request_context.uri.clone(),
+                headers: request_context.headers.clone(),
+                extensions: request_context.extensions.clone(),
+                credentials: request_context.credentials.clone(),
+                region: request_context.region.clone(),
+                service: request_context.service.clone(),
+                trailing_headers: request_context.trailing_headers.clone(),
+            };
+            {
+                let req_info = req_info_mut(&mut auth_req)?;
+                req_info.bucket = Some(bucket.clone());
+                req_info.object = Some(fpath.clone());
+                req_info.version_id = None;
+            }
+            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
             let mut size = f.header().size().unwrap_or_default() as i64;
             let archive_entry_mod_time = f
@@ -319,18 +316,23 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
 
-            spawn_put_extract_notification(
-                notify.clone(),
-                tracing_context.clone(),
-                bucket.clone(),
-                req_params.clone(),
-                version_id.clone(),
-                host.clone(),
+            let event_args = rustfs_notify::EventArgs {
+                event_name: EventName::ObjectCreatedPut,
+                bucket_name: bucket.clone(),
+                object: obj_info.clone(),
+                req_params: req_params.clone(),
+                resp_elements: extract_resp_elements(&S3Response::new(output)),
+                version_id: version_id.clone(),
+                host: host.clone(),
                 port,
-                user_agent.clone(),
-                obj_info.clone(),
-                output,
-            );
+                user_agent: user_agent.clone(),
+            };
+            crate::storage::helper::spawn_background_with_context(tracing_context.clone(), {
+                let notify = notify.clone();
+                async move {
+                    notify.notify(event_args).await;
+                }
+            });
         }
 
         let mut checksums = PutObjectChecksums {

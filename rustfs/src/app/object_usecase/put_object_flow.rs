@@ -52,14 +52,6 @@ fn clamp_small_put_eager_max_bytes(inline_object_limit_bytes: Option<usize>) -> 
         .min(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES as usize) as i64
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    rustfs_utils::get_env_bool(name, false)
-}
-
-fn env_non_negative_i64(name: &str) -> Option<i64> {
-    rustfs_utils::get_env_opt_i64(name).filter(|value| *value >= 0)
-}
-
 fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECStore, versioned: bool) -> i64 {
     let Some(first_pool) = store.pools.first() else {
         return DEFAULT_SMALL_PUT_EAGER_MAX_BYTES;
@@ -78,11 +70,12 @@ fn topology_aware_small_put_eager_max_bytes(store: &rustfs_ecstore::store::ECSto
 }
 
 fn resolved_small_put_eager_max_bytes(default_max_bytes: i64) -> i64 {
-    if env_flag_enabled(ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER) {
+    if rustfs_utils::get_env_bool(ENV_RUSTFS_PUT_FORCE_DISABLE_SMALL_EAGER, false) {
         return 0;
     }
 
-    env_non_negative_i64(ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES)
+    rustfs_utils::get_env_opt_i64(ENV_RUSTFS_PUT_SMALL_EAGER_MAX_BYTES)
+        .filter(|value| *value >= 0)
         .map(|value| value.min(DEFAULT_SMALL_PUT_EAGER_MAX_BYTES).min(default_max_bytes))
         .unwrap_or(default_max_bytes)
 }
@@ -91,37 +84,13 @@ fn should_use_small_put_eager_path(size: i64, eager_max_bytes: i64, compression_
     size > 0 && size <= eager_max_bytes && !compression_enabled && !encryption_enabled
 }
 
-fn request_uses_trailing_checksum(headers: &HeaderMap, trailing_headers: &Option<s3s::TrailingHeaders>) -> bool {
-    trailing_headers.is_some()
-        || headers.contains_key(AMZ_TRAILER)
-        || matches!(
-            rustfs_rio::get_content_checksum(headers),
-            Ok(Some(checksum)) if checksum.checksum_type.trailing()
-        )
-}
-
-fn put_path_label(small_eager: bool, reduced_copy: bool, compressed: bool) -> &'static str {
-    if small_eager {
-        "small_eager"
-    } else if compressed {
-        "compressed"
-    } else if reduced_copy {
-        "reduced_copy"
-    } else {
-        "legacy_plain"
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn log_put_flow_phase(
     bucket: &str,
     key: &str,
     phase: &str,
     elapsed: Duration,
     object_size: i64,
-    small_eager: bool,
-    reduced_copy: bool,
-    compressed: bool,
+    put_path: &'static str,
     encrypted: bool,
 ) {
     let duration_ms = elapsed.as_millis() as u64;
@@ -129,21 +98,20 @@ fn log_put_flow_phase(
         return;
     }
 
-    let put_path = put_path_label(small_eager, reduced_copy, compressed);
     if duration_ms >= SLOW_PUT_PHASE_ERROR_THRESHOLD_MS {
         error!(
             phase,
-            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase is critically slow"
+            duration_ms, object_size, put_path, encrypted, bucket, key, "Small PUT phase is critically slow"
         );
     } else if duration_ms >= SLOW_PUT_PHASE_WARN_THRESHOLD_MS {
         warn!(
             phase,
-            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase is slow"
+            duration_ms, object_size, put_path, encrypted, bucket, key, "Small PUT phase is slow"
         );
     } else {
         debug!(
             phase,
-            duration_ms, object_size, put_path, compressed, encrypted, bucket, key, "Small PUT phase exceeded debug threshold"
+            duration_ms, object_size, put_path, encrypted, bucket, key, "Small PUT phase exceeded debug threshold"
         );
     }
 }
@@ -274,9 +242,8 @@ impl DefaultObjectUsecase {
     pub(super) async fn run_put_object_flow(
         input: PutObjectInput,
         request_context: PutObjectRequestContext,
-        request_method_name: &'static str,
         resolved_size: i64,
-    ) -> S3Result<PutObjectFlowResult> {
+    ) -> S3Result<(PutObjectOutput, ObjectInfo)> {
         let start_time = std::time::Instant::now();
 
         let PutObjectInput {
@@ -315,7 +282,7 @@ impl DefaultObjectUsecase {
         let server_side_encryption =
             server_side_encryption.or(extract_server_side_encryption_from_headers(&request_context.headers)?);
 
-        validate_object_key(&key, request_method_name)?;
+        validate_object_key(&key, if request_context.is_post_object { "POST" } else { "PUT" })?;
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -325,33 +292,11 @@ impl DefaultObjectUsecase {
         let mut small_object_eager_stage = false;
         let bytes_pool = get_concurrency_manager().bytes_pool();
 
-        let store = get_validated_store_adapter(&bucket).await?;
+        let store = get_validated_store(&bucket).await?;
 
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-
-        let mut effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        })
-                })
-            })
-        });
-
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (default_sse, default_kms_key_id) = resolve_bucket_default_server_side_encryption(&bucket).await;
+        let mut effective_sse = server_side_encryption.or(default_sse);
+        let mut effective_kms_key_id = ssekms_key_id.or(default_kms_key_id);
 
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
@@ -423,8 +368,12 @@ impl DefaultObjectUsecase {
         .await?;
         let eager_max_bytes =
             resolved_small_put_eager_max_bytes(topology_aware_small_put_eager_max_bytes(&store, opts.versioned));
-        let can_use_small_put_eager =
-            !request_uses_trailing_checksum(&request_context.headers, &request_context.trailing_headers);
+        let can_use_small_put_eager = request_context.trailing_headers.is_none()
+            && !request_context.headers.contains_key(AMZ_TRAILER)
+            && !matches!(
+                rustfs_rio::get_content_checksum(&request_context.headers),
+                Ok(Some(checksum)) if checksum.checksum_type.trailing()
+            );
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &request_context.headers)
             .await
@@ -539,15 +488,22 @@ impl DefaultObjectUsecase {
 
             stage
         };
+        let put_path = if small_object_eager_stage {
+            "small_eager"
+        } else if transform_stage.compression_applied() {
+            "compressed"
+        } else if plain_reduced_copy_stage {
+            "reduced_copy"
+        } else {
+            "legacy_plain"
+        };
         log_put_flow_phase(
             &bucket,
             &key,
             "build_hash_stage",
             reader_stage_start.elapsed(),
             actual_size,
-            small_object_eager_stage,
-            plain_reduced_copy_stage,
-            transform_stage.compression_applied(),
+            put_path,
             false,
         );
         let mut reader = stage.reader;
@@ -615,19 +571,17 @@ impl DefaultObjectUsecase {
             "store_put_object",
             store_put_start.elapsed(),
             actual_size,
-            small_object_eager_stage,
-            plain_reduced_copy_stage,
-            transform_stage.compression_applied(),
+            put_path,
             transform_stage.encryption_applied(),
         );
 
-        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+        enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
-        let put_version = if bucket_prefix_versioning_enabled(&bucket, &key).await {
+        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_version.clone()
         } else {
             None
@@ -712,11 +666,7 @@ impl DefaultObjectUsecase {
             }
         }
 
-        Ok(PutObjectFlowResult {
-            output,
-            helper_object: obj_info,
-            helper_version_id: raw_version,
-        })
+        Ok((output, obj_info))
     }
 }
 
