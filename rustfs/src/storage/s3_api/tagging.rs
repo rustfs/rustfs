@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{DeleteObjectTaggingOutput, GetBucketTaggingOutput, GetObjectTaggingOutput, PutObjectTaggingOutput, Tag};
+use s3s::dto::Tag;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::collections::HashSet;
 
@@ -54,28 +54,9 @@ pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_get_bucket_tagging_output(tag_set: Vec<Tag>) -> GetBucketTaggingOutput {
-    GetBucketTaggingOutput { tag_set }
-}
-
-pub(crate) fn build_get_object_tagging_output(tag_set: Vec<Tag>, version_id: Option<String>) -> GetObjectTaggingOutput {
-    GetObjectTaggingOutput { tag_set, version_id }
-}
-
-pub(crate) fn build_put_object_tagging_output(version_id: Option<String>) -> PutObjectTaggingOutput {
-    PutObjectTaggingOutput { version_id }
-}
-
-pub(crate) fn build_delete_object_tagging_output(version_id: Option<String>) -> DeleteObjectTaggingOutput {
-    DeleteObjectTaggingOutput { version_id }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_delete_object_tagging_output, build_get_bucket_tagging_output, build_get_object_tagging_output,
-        build_put_object_tagging_output, validate_object_tag_set,
-    };
+    use super::validate_object_tag_set;
     use s3s::S3ErrorCode;
     use s3s::dto::Tag;
 
@@ -145,22 +126,5 @@ mod tests {
             .expect_err("duplicate tag key must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::InvalidTag);
         assert!(err.to_string().contains("Cannot provide multiple Tags with the same key"));
-    }
-
-    #[test]
-    fn test_build_tagging_outputs_preserve_fields() {
-        let tag_set = vec![tag(Some("k1"), Some("v1"))];
-        let version_id = Some("vid-1".to_string());
-
-        let bucket_output = build_get_bucket_tagging_output(tag_set.clone());
-        let get_object_output = build_get_object_tagging_output(tag_set.clone(), version_id.clone());
-        let put_object_output = build_put_object_tagging_output(version_id.clone());
-        let delete_object_output = build_delete_object_tagging_output(version_id.clone());
-
-        assert_eq!(bucket_output.tag_set, tag_set);
-        assert_eq!(get_object_output.tag_set, vec![tag(Some("k1"), Some("v1"))]);
-        assert_eq!(get_object_output.version_id, version_id);
-        assert_eq!(put_object_output.version_id, Some("vid-1".to_string()));
-        assert_eq!(delete_object_output.version_id, Some("vid-1".to_string()));
     }
 }
