@@ -118,6 +118,7 @@ pub fn drain_global_dirty_scopes() -> Vec<CapacityScopeDisk> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::thread;
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -127,12 +128,32 @@ mod tests {
     fn clear_capacity_scope_registry_for_test() {
         capacity_scope_registry()
             .lock()
-            .expect("capacity scope registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         global_dirty_scope_registry()
             .lock()
-            .expect("global dirty scope registry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    fn poison_capacity_scope_registry_for_test() {
+        let _ = thread::spawn(|| {
+            let _guard = capacity_scope_registry()
+                .lock()
+                .expect("capacity scope registry lock should succeed");
+            panic!("poison capacity scope registry");
+        })
+        .join();
+    }
+
+    fn poison_global_dirty_scope_registry_for_test() {
+        let _ = thread::spawn(|| {
+            let _guard = global_dirty_scope_registry()
+                .lock()
+                .expect("global dirty scope registry lock should succeed");
+            panic!("poison global dirty scope registry");
+        })
+        .join();
     }
 
     #[test]
@@ -208,9 +229,30 @@ mod tests {
             );
         }
 
-        let entries = capacity_scope_registry().lock().expect("capacity scope registry poisoned");
+        let entries = capacity_scope_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(entries.len() <= CAPACITY_SCOPE_REGISTRY_HARD_LIMIT);
         drop(entries);
+        clear_capacity_scope_registry_for_test();
+    }
+
+    #[test]
+    fn record_capacity_scope_recovers_from_poisoned_registry() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        clear_capacity_scope_registry_for_test();
+        poison_capacity_scope_registry_for_test();
+        let token = Uuid::new_v4();
+        let scope = CapacityScope {
+            disks: vec![CapacityScopeDisk {
+                endpoint: "node-a".to_string(),
+                drive_path: "/tmp/disk-a".to_string(),
+            }],
+        };
+
+        record_capacity_scope(token, scope.clone());
+
+        assert_eq!(take_capacity_scope(token), Some(scope));
         clear_capacity_scope_registry_for_test();
     }
 
@@ -242,6 +284,25 @@ mod tests {
         assert!(drained.iter().any(|disk| disk.endpoint == "node-a"));
         assert!(drained.iter().any(|disk| disk.endpoint == "node-b"));
         assert!(drain_global_dirty_scopes().is_empty());
+        clear_capacity_scope_registry_for_test();
+    }
+
+    #[test]
+    fn record_global_dirty_scope_recovers_from_poisoned_registry() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        clear_capacity_scope_registry_for_test();
+        poison_global_dirty_scope_registry_for_test();
+
+        record_global_dirty_scope(CapacityScope {
+            disks: vec![CapacityScopeDisk {
+                endpoint: "node-a".to_string(),
+                drive_path: "/tmp/disk-a".to_string(),
+            }],
+        });
+
+        let drained = drain_global_dirty_scopes();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].endpoint, "node-a");
         clear_capacity_scope_registry_for_test();
     }
 }
