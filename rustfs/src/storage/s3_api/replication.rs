@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{GetBucketReplicationOutput, PutBucketReplicationOutput, ReplicationConfiguration};
+use s3s::dto::{GetBucketReplicationOutput, ReplicationConfiguration};
 
 pub(crate) fn build_get_bucket_replication_output(
     replication_configuration: ReplicationConfiguration,
@@ -22,13 +22,9 @@ pub(crate) fn build_get_bucket_replication_output(
     }
 }
 
-pub(crate) fn build_put_bucket_replication_output() -> PutBucketReplicationOutput {
-    PutBucketReplicationOutput::default()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_get_bucket_replication_output, build_put_bucket_replication_output};
+    use super::build_get_bucket_replication_output;
     use s3s::dto::ReplicationConfiguration;
 
     #[test]
@@ -37,11 +33,5 @@ mod tests {
         let output = build_get_bucket_replication_output(config.clone());
 
         assert_eq!(output.replication_configuration, Some(config));
-    }
-
-    #[test]
-    fn test_build_put_bucket_replication_output_is_default() {
-        let output = build_put_bucket_replication_output();
-        assert_eq!(output, Default::default());
     }
 }

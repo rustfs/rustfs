@@ -14,10 +14,11 @@
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
 use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
+
+const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {
@@ -110,23 +111,16 @@ pub(crate) fn parse_list_multipart_uploads_params(
     let prefix = prefix.unwrap_or_default();
     let max_uploads = match max_uploads {
         Some(value) => {
-            let value = usize::try_from(value).map_err(|_| {
-                S3Error::with_message(
-                    S3ErrorCode::InvalidArgument,
-                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
-                )
-            })?;
-
-            if value == 0 || value > MAX_PARTS_COUNT {
+            if !(1..=MAX_MULTIPART_UPLOADS_LIST).contains(&value) {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidArgument,
-                    format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT),
+                    format!("max-uploads must be between 1 and {}", MAX_MULTIPART_UPLOADS_LIST),
                 ));
             }
 
-            value
+            value as usize
         }
-        None => MAX_PARTS_COUNT,
+        None => MAX_MULTIPART_UPLOADS_LIST as usize,
     };
 
     if let Some(key_marker) = &key_marker
@@ -181,12 +175,11 @@ pub(crate) fn build_list_multipart_uploads_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params,
-        parse_list_parts_params,
+        MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
+        parse_list_multipart_uploads_params, parse_list_parts_params,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
     use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
@@ -338,7 +331,7 @@ mod tests {
         let parsed = parse_list_multipart_uploads_params(None, None, None).expect("expected default params");
         assert_eq!(parsed.prefix, "");
         assert_eq!(parsed.key_marker, None);
-        assert_eq!(parsed.max_uploads, MAX_PARTS_COUNT);
+        assert_eq!(parsed.max_uploads, MAX_MULTIPART_UPLOADS_LIST as usize);
     }
 
     #[test]
@@ -360,7 +353,7 @@ mod tests {
             .expect_err("expected invalid max_uploads");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
 
-        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some((MAX_PARTS_COUNT + 1) as i32))
+        let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), None, Some(MAX_MULTIPART_UPLOADS_LIST + 1))
             .expect_err("expected invalid max_uploads");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
