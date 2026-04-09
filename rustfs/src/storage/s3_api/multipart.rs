@@ -320,6 +320,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_list_parts_params_rejects_negative_part_number_marker() {
+        let err = parse_list_parts_params(Some(-1), None).expect_err("expected invalid part_number_marker");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("part-number-marker must be non-negative"));
+    }
+
+    #[test]
     fn test_parse_list_multipart_uploads_params_defaults_and_valid_values() {
         let parsed =
             parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("prefix/key-marker".to_string()), Some(100))
