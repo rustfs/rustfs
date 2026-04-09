@@ -210,17 +210,18 @@ pub async fn start_http_server(
     } else {
         info!(target: "rustfs::main::startup", "RustFS API: {api_endpoints}  {localhost_endpoint}");
         info!(target: "rustfs::main::startup", "RustFS Start Time: {now_time}");
-        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
-            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
-        {
-            warn!(
-                "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-                rustfs_credentials::DEFAULT_ACCESS_KEY,
-                rustfs_credentials::DEFAULT_SECRET_KEY
-            );
-        }
         info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
         info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
+    }
+
+    if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
+        && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
+    {
+        warn!(
+            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+            rustfs_credentials::DEFAULT_ACCESS_KEY,
+            rustfs_credentials::DEFAULT_SECRET_KEY
+        );
     }
 
     // Setup S3 service
