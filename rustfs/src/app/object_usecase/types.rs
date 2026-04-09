@@ -18,12 +18,10 @@ use super::*;
 pub(super) struct GetObjectRequestContext {
     pub(super) bucket: String,
     pub(super) key: String,
-    pub(super) version_id_for_event: String,
     pub(super) part_number: Option<usize>,
     pub(super) rs: Option<HTTPRangeSpec>,
     pub(super) opts: ObjectOptions,
     pub(super) headers: HeaderMap,
-    pub(super) method: hyper::Method,
     pub(super) sse_customer_key: Option<String>,
     pub(super) sse_customer_key_md5: Option<String>,
 }
@@ -42,10 +40,4 @@ pub(super) struct PutObjectRequestContext {
     pub(super) credentials: Option<s3s::auth::Credentials>,
     pub(super) region: Option<s3s::region::Region>,
     pub(super) service: Option<String>,
-}
-
-pub(super) struct PutObjectFlowResult {
-    pub(super) output: PutObjectOutput,
-    pub(super) helper_object: ObjectInfo,
-    pub(super) helper_version_id: Option<String>,
 }

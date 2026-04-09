@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::app_adapters::get_validated_store_adapter;
 use super::types::GetObjectRequestContext;
 use crate::error::ApiError;
 use crate::storage::concurrency::{self, ConcurrencyManager};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::{
-    DecryptionRequest, check_preconditions, sse_decryption, validate_sse_headers_for_read, validate_ssec_for_read,
+    DecryptionRequest, check_preconditions, get_validated_store, sse_decryption, validate_sse_headers_for_read,
+    validate_ssec_for_read,
 };
 use http::HeaderMap;
 use rustfs_concurrency::GetObjectQueueSnapshot;
-use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectOptions};
+use rustfs_ecstore::store_api::{ObjectIO, ObjectOperations};
 use rustfs_object_io::get::{
     ChunkReadDecision, ChunkReadPlanError, GetObjectEncryptionState as ObjectIoGetObjectEncryptionState, GetObjectReadSetup,
     build_reader_read_setup as object_io_build_reader_read_setup,
@@ -115,21 +115,20 @@ pub(super) async fn acquire_get_object_io_planning<'a>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_get_object_read(
     request_context: &GetObjectRequestContext,
     store: &rustfs_ecstore::store::ECStore,
     manager: &ConcurrencyManager,
-    bucket: &str,
-    key: &str,
-    rs: Option<HTTPRangeSpec>,
-    h: HeaderMap,
-    opts: &ObjectOptions,
-    part_number: Option<usize>,
     read_start: std::time::Instant,
 ) -> S3Result<GetObjectReadSetup> {
     let reader = store
-        .get_object_reader(bucket, key, rs.clone(), h, opts)
+        .get_object_reader(
+            &request_context.bucket,
+            &request_context.key,
+            request_context.rs.clone(),
+            HeaderMap::new(),
+            &request_context.opts,
+        )
         .await
         .map_err(ApiError::from)?;
 
@@ -159,7 +158,8 @@ pub(super) async fn prepare_get_object_read(
         request_context.sse_customer_key.as_ref(),
         request_context.sse_customer_key_md5.as_ref(),
     )?;
-    let read_plan = object_io_plan_legacy_read(&info, rs, part_number).map_err(ApiError::from)?;
+    let read_plan =
+        object_io_plan_legacy_read(&info, request_context.rs.clone(), request_context.part_number).map_err(ApiError::from)?;
 
     debug!(
         "GET object metadata check: parts={}, provided_sse_key={:?}",
@@ -168,8 +168,8 @@ pub(super) async fn prepare_get_object_read(
     );
 
     let decryption_request = DecryptionRequest {
-        bucket,
-        key,
+        bucket: &request_context.bucket,
+        key: &request_context.key,
         metadata: &info.user_defined,
         sse_customer_key: request_context.sse_customer_key.as_ref(),
         sse_customer_key_md5: request_context.sse_customer_key_md5.as_ref(),
@@ -218,68 +218,44 @@ pub(super) async fn prepare_get_object_read(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_get_object_read_execution<'a>(
     request_context: &GetObjectRequestContext,
     manager: &'a ConcurrencyManager,
     wrapper: &RequestTimeoutWrapper,
     timeout_config: &TimeoutConfig,
-    bucket: &str,
-    key: &str,
-    rs: Option<HTTPRangeSpec>,
-    opts: &ObjectOptions,
-    part_number: Option<usize>,
 ) -> S3Result<GetObjectPreparedRead<'a>> {
-    let h = HeaderMap::new();
-    let io_planning = acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
-    let store = get_validated_store_adapter(bucket).await?;
+    let io_planning =
+        acquire_get_object_io_planning(manager, wrapper, timeout_config, &request_context.bucket, &request_context.key).await?;
+    let store = get_validated_store(&request_context.bucket).await?;
 
     let read_start = std::time::Instant::now();
     let read_setup = match object_io_get_object_chunk_fast_path_guard(
         request_context.sse_customer_key.is_some(),
         request_context.sse_customer_key_md5.is_some(),
     ) {
-        Ok(()) => match prepare_get_object_chunk_read(
-            request_context,
-            &store,
-            manager,
-            bucket,
-            key,
-            rs.clone(),
-            part_number,
-            opts,
-            read_start,
-        )
-        .await?
-        {
+        Ok(()) => match prepare_get_object_chunk_read(request_context, &store, manager, read_start).await? {
             Some(read_setup) => read_setup,
-            None => {
-                prepare_get_object_read(request_context, &store, manager, bucket, key, rs, h, opts, part_number, read_start)
-                    .await?
-            }
+            None => prepare_get_object_read(request_context, &store, manager, read_start).await?,
         },
         Err(fallback) => {
             rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
-            prepare_get_object_read(request_context, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?
+            prepare_get_object_read(request_context, &store, manager, read_start).await?
         }
     };
 
     Ok(GetObjectPreparedRead { io_planning, read_setup })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_get_object_chunk_read(
     request_context: &GetObjectRequestContext,
     store: &rustfs_ecstore::store::ECStore,
     manager: &ConcurrencyManager,
-    bucket: &str,
-    key: &str,
-    mut rs: Option<HTTPRangeSpec>,
-    part_number: Option<usize>,
-    opts: &ObjectOptions,
     read_start: std::time::Instant,
 ) -> S3Result<Option<GetObjectReadSetup>> {
-    let info = store.get_object_info(bucket, key, opts).await.map_err(ApiError::from)?;
+    let info = store
+        .get_object_info(&request_context.bucket, &request_context.key, &request_context.opts)
+        .await
+        .map_err(ApiError::from)?;
 
     validate_sse_headers_for_read(&info.user_defined, &request_context.headers)?;
     validate_ssec_for_read(
@@ -301,7 +277,12 @@ pub(super) async fn prepare_get_object_chunk_read(
         return Ok(None);
     }
 
-    let plan = match object_io_plan_chunk_read(&info, opts.version_id.is_none(), rs.clone(), part_number) {
+    let plan = match object_io_plan_chunk_read(
+        &info,
+        request_context.opts.version_id.is_none(),
+        request_context.rs.clone(),
+        request_context.part_number,
+    ) {
         Ok(ChunkReadDecision::Eligible(plan)) => plan,
         Ok(ChunkReadDecision::Fallback(fallback)) => {
             rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
@@ -311,14 +292,20 @@ pub(super) async fn prepare_get_object_chunk_read(
         Err(ChunkReadPlanError::MethodNotAllowed) => return Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
         Err(ChunkReadPlanError::Io(err)) => return Err(ApiError::from(err).into()),
     };
-    rs = plan.rs.clone();
+    let rs = plan.rs.clone();
 
     let read_duration = read_start.elapsed();
     manager.record_disk_operation(info.size as u64, read_duration, true).await;
     let event_info = info.clone();
 
     let chunk_result = match store
-        .get_object_chunks(bucket, key, rs.clone(), HeaderMap::new(), opts)
+        .get_object_chunks(
+            &request_context.bucket,
+            &request_context.key,
+            rs.clone(),
+            HeaderMap::new(),
+            &request_context.opts,
+        )
         .await
         .map_err(ApiError::from)
     {

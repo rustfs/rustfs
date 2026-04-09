@@ -14,7 +14,6 @@
 
 //! Object application use-case contracts.
 
-mod app_adapters;
 mod get_object_flow;
 mod get_object_zero_copy;
 mod put_object_extract;
@@ -22,8 +21,7 @@ mod put_object_flow;
 mod types;
 #[cfg(test)]
 mod zero_copy_tests;
-use self::app_adapters::*;
-use self::get_object_flow::{GetObjectBootstrap, GetObjectFlowRuntime};
+use self::get_object_flow::GetObjectBootstrap;
 use self::types::*;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
@@ -158,6 +156,26 @@ impl Drop for DeadlockRequestGuard {
     }
 }
 
+async fn resolve_bucket_default_server_side_encryption(bucket: &str) -> (Option<ServerSideEncryption>, Option<String>) {
+    let Some((config, _timestamp)) = metadata_sys::get_sse_config(bucket).await.ok() else {
+        return (None, None);
+    };
+    let Some(default_sse) = config
+        .rules
+        .first()
+        .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+    else {
+        return (None, None);
+    };
+
+    let server_side_encryption = Some(match default_sse.sse_algorithm.as_str() {
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    });
+
+    (server_side_encryption, default_sse.kms_master_key_id.clone())
+}
+
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
     let Some(existing) = existing else {
         return;
@@ -267,10 +285,6 @@ mod deadlock_request_guard_tests {
         assert_eq!(detector.tracked_count(), 0);
     }
 }
-async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
-}
-
 fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
@@ -605,9 +619,24 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_context = prepare_put_object_request_context(&req);
-        let (event_name, quota_operation, request_method_name) = put_object_execution_context(&req);
-        let helper = new_operation_helper(&req, event_name, S3Operation::PutObject, false);
+        let request_context = PutObjectRequestContext {
+            headers: req.headers.clone(),
+            trailing_headers: req.trailing_headers.clone(),
+            uri_query: req.uri.query().map(str::to_string),
+            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+        };
+        let (event_name, quota_operation) = if request_context.is_post_object {
+            (EventName::ObjectCreatedPost, QuotaOperation::PostObject)
+        } else {
+            (EventName::ObjectCreatedPut, QuotaOperation::PutObject)
+        };
+        let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
 
         if request_context.is_post_object && is_post_object_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
@@ -626,10 +655,17 @@ impl DefaultObjectUsecase {
             .await?;
 
         let input = req.input;
-        let flow_result =
-            DefaultObjectUsecase::run_put_object_flow(input, request_context, request_method_name, resolved_size).await?;
-        let helper = bind_helper_object(helper, flow_result.helper_object, flow_result.helper_version_id);
-        complete_put_response(helper, flow_result.output)
+        let (output, helper_object) = DefaultObjectUsecase::run_put_object_flow(input, request_context, resolved_size).await?;
+        let helper_version_id = helper_object.version_id.map(|version_id| version_id.to_string());
+        let helper = helper.object(helper_object);
+        let helper = if let Some(version_id) = helper_version_id {
+            helper.version_id(version_id)
+        } else {
+            helper
+        };
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     pub async fn execute_put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1023,17 +1059,106 @@ impl DefaultObjectUsecase {
             .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
-        let bootstrap = init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
-        let request_context = prepare_get_object_request_context(&req).await?;
+        let bootstrap = {
+            let timeout_config = TimeoutConfig::from_env();
+            let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.clone());
+            let request_start = std::time::Instant::now();
+            let request_guard = crate::storage::concurrency::ConcurrencyManager::track_request();
+            let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+            let deadlock_detector = deadlock_detector::get_deadlock_detector();
+            deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
+            let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+
+            if wrapper.is_timeout() {
+                warn!(
+                    bucket = %req.input.bucket,
+                    key = %req.input.key,
+                    timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                    elapsed_ms = wrapper.elapsed().as_millis(),
+                    "GetObject request timed out before processing"
+                );
+                return Err(s3_error!(InternalError, "Request timeout before processing"));
+            }
+
+            rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
+
+            debug!(
+                "GetObject request started with {} concurrent requests, timeout={:?}",
+                concurrent_requests, timeout_config.get_object_timeout
+            );
+
+            GetObjectBootstrap {
+                timeout_config,
+                wrapper,
+                request_start,
+                request_guard,
+                _deadlock_request_guard: deadlock_request_guard,
+            }
+        };
+        let (request_context, version_id_for_event) = {
+            let GetObjectInput {
+                bucket,
+                key,
+                version_id,
+                part_number,
+                range,
+                ..
+            } = req.input.clone();
+
+            validate_object_key(&key, "GET")?;
+
+            let part_number = part_number.map(|value| value as usize);
+            if let Some(part_number) = part_number
+                && part_number == 0
+            {
+                return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
+            }
+
+            let rs = range.map(|value| match value {
+                Range::Int { first, last } => HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: first as i64,
+                    end: last.map_or(-1, |last| last as i64),
+                },
+                Range::Suffix { length } => HTTPRangeSpec {
+                    is_suffix_length: true,
+                    start: length as i64,
+                    end: -1,
+                },
+            });
+
+            if rs.is_some() && part_number.is_some() {
+                return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+            }
+
+            let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
+                .await
+                .map_err(ApiError::from)?;
+
+            (
+                GetObjectRequestContext {
+                    bucket,
+                    key,
+                    part_number,
+                    rs,
+                    opts,
+                    headers: req.headers.clone(),
+                    sse_customer_key: req.input.sse_customer_key.clone(),
+                    sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
+                },
+                version_id.unwrap_or_default(),
+            )
+        };
         let base_buffer_size = self.base_buffer_size();
         let manager = get_concurrency_manager();
-        let flow_runtime = GetObjectFlowRuntime {
-            manager,
-            bootstrap: &bootstrap,
-            base_buffer_size,
-        };
-        let helper = new_operation_helper(&req, EventName::ObjectAccessedGet, S3Operation::GetObject, true);
-        let flow_result = get_object_flow::run_get_object_flow(request_context.clone(), flow_runtime).await;
+        let cors_bucket = request_context.bucket.clone();
+        let cors_method = req.method.clone();
+        let cors_headers = request_context.headers.clone();
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let flow_result =
+            get_object_flow::run_get_object_flow(request_context, version_id_for_event, manager, &bootstrap, base_buffer_size)
+                .await;
 
         let GetObjectBootstrap {
             mut request_guard,
@@ -1042,7 +1167,15 @@ impl DefaultObjectUsecase {
         } = bootstrap;
 
         let result = match flow_result {
-            Ok(flow_result) => complete_get_flow_result(helper, &request_context, flow_result).await,
+            Ok(flow_result) => {
+                let helper = helper
+                    .object(flow_result.event_info)
+                    .version_id(flow_result.version_id_for_event);
+                let response = wrap_response_with_cors(&cors_bucket, &cors_method, &cors_headers, flow_result.output).await;
+                let result = Ok(response);
+                let _ = helper.complete(&result);
+                result
+            }
             Err(err) => Err(err),
         };
 
@@ -1766,7 +1899,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+        enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
@@ -2975,8 +3108,19 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let request_context = prepare_put_object_request_context(&req);
-        let helper = new_operation_helper(&req, EventName::ObjectCreatedPut, S3Operation::PutObject, true);
+        let request_context = PutObjectRequestContext {
+            headers: req.headers.clone(),
+            trailing_headers: req.trailing_headers.clone(),
+            uri_query: req.uri.query().map(str::to_string),
+            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+        };
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         if is_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
@@ -2990,7 +3134,9 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(default_notify_interface);
         let input = req.input;
         let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
-        complete_put_response(helper, output)
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 }
 
@@ -3020,37 +3166,6 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
-    }
-
-    #[test]
-    fn put_object_execution_context_defaults_to_put() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let (event_name, quota_operation, method_name) = put_object_execution_context(&req);
-        assert_eq!(event_name, EventName::ObjectCreatedPut);
-        assert!(matches!(quota_operation, QuotaOperation::PutObject));
-        assert_eq!(method_name, "PUT");
-    }
-
-    #[test]
-    fn put_object_execution_context_uses_post_marker() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-
-        let (event_name, quota_operation, method_name) = put_object_execution_context(&req);
-        assert_eq!(event_name, EventName::ObjectCreatedPost);
-        assert!(matches!(quota_operation, QuotaOperation::PostObject));
-        assert_eq!(method_name, "POST");
     }
 
     #[tokio::test]
