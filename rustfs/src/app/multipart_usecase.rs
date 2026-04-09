@@ -26,7 +26,8 @@ use crate::storage::options::{
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
 use crate::storage::s3_api::multipart::{
-    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+    ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
+    parse_list_multipart_uploads_params, parse_list_parts_params,
 };
 use crate::storage::*;
 use bytes::Bytes;
@@ -919,25 +920,22 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
-        let params = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
+        let ListMultipartUploadsParams {
+            prefix,
+            key_marker,
+            max_uploads,
+        } = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let result = store
-            .list_multipart_uploads(
-                &bucket,
-                &params.prefix,
-                delimiter,
-                params.key_marker,
-                upload_id_marker,
-                params.max_uploads,
-            )
+            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, params.prefix, result)))
+        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
@@ -1445,19 +1443,17 @@ mod tests {
 
     #[tokio::test]
     async fn execute_list_multipart_uploads_rejects_invalid_max_uploads_before_store_lookup() {
-        use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
-
         let input = ListMultipartUploadsInput::builder()
             .bucket("bucket".to_string())
             .max_uploads(Some(0))
             .build()
             .unwrap();
         let req = build_request(input, Method::GET);
-        let expected = format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT);
+        let expected = "max-uploads must be between 1 and 1000";
 
         let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), Some(expected.as_str()));
+        assert_eq!(err.message(), Some(expected));
     }
 
     #[tokio::test]
