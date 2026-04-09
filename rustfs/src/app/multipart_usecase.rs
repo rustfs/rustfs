@@ -25,7 +25,10 @@ use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
-use crate::storage::s3_api::multipart::{build_list_parts_output, parse_list_parts_params};
+use crate::storage::s3_api::multipart::{
+    build_list_multipart_uploads_output, build_list_parts_output, parse_list_multipart_uploads_params,
+    parse_list_parts_params,
+};
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -42,7 +45,7 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
+use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
     ChunkNativePutData, CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions,
 };
@@ -917,55 +920,25 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        let params = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let prefix = prefix.unwrap_or_default();
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
-
         let result = store
-            .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
+            .list_multipart_uploads(
+                &bucket,
+                &params.prefix,
+                delimiter,
+                params.key_marker,
+                upload_id_marker,
+                params.max_uploads,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, params.prefix, result)))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
@@ -1454,6 +1427,38 @@ mod tests {
 
         let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_multipart_uploads_rejects_invalid_key_marker_before_store_lookup() {
+        let input = ListMultipartUploadsInput::builder()
+            .bucket("bucket".to_string())
+            .prefix(Some("prefix/".to_string()))
+            .key_marker(Some("other/key".to_string()))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.message(), Some("Invalid key marker"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_multipart_uploads_rejects_invalid_max_uploads_before_store_lookup() {
+        use rustfs_ecstore::set_disk::MAX_PARTS_COUNT;
+
+        let input = ListMultipartUploadsInput::builder()
+            .bucket("bucket".to_string())
+            .max_uploads(Some(0))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+        let expected = format!("max-uploads must be between 1 and {}", MAX_PARTS_COUNT);
+
+        let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some(expected.as_str()));
     }
 
     #[tokio::test]
