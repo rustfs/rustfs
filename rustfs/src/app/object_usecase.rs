@@ -636,8 +636,6 @@ impl DefaultObjectUsecase {
         } else {
             (EventName::ObjectCreatedPut, QuotaOperation::PutObject)
         };
-        let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
-
         if request_context.is_post_object && is_post_object_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
         }
@@ -649,6 +647,8 @@ impl DefaultObjectUsecase {
         if is_put_object_extract_requested(&request_context.headers) {
             return self.execute_put_object_extract(req, request_context).await;
         }
+
+        let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
 
         let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
         self.check_bucket_quota(&req.input.bucket, quota_operation, resolved_size as u64)
