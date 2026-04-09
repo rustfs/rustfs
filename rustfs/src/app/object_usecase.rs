@@ -950,42 +950,11 @@ impl DefaultObjectUsecase {
             ..
         } = req.input.clone();
 
-        if tagging.tag_set.len() > 10 {
-            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
-            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
-        }
+        crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
-        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
-        for tag in &tagging.tag_set {
-            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
-                error!("Empty tag key");
-                s3_error!(InvalidTag, "Tag key cannot be empty")
-            })?;
-
-            if key.len() > 128 {
-                error!("Tag key too long: {} bytes", key.len());
-                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
-            }
-
-            let value = tag.value.as_ref().ok_or_else(|| {
-                error!("Null tag value");
-                s3_error!(InvalidTag, "Tag value cannot be null")
-            })?;
-
-            if value.len() > 256 {
-                error!("Tag value too long: {} bytes", value.len());
-                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
-            }
-
-            if !tag_keys.insert(key) {
-                error!("Duplicate tag key: {}", key);
-                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
-            }
-        }
 
         let tags = encode_tags(tagging.tag_set);
         debug!("Encoded tags: {}", tags);
@@ -3183,6 +3152,51 @@ mod tests {
 
         let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_tagging_rejects_too_many_tags() {
+        let tag_set = (0..11)
+            .map(|index| Tag {
+                key: Some(format!("k{index}")),
+                value: Some(format!("v{index}")),
+            })
+            .collect();
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging { tag_set })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some(String::new()),
+                    value: Some("v1".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Tag key cannot be empty"));
     }
 
     #[tokio::test]

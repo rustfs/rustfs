@@ -25,7 +25,7 @@ use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
-use crate::storage::s3_api::multipart::build_list_parts_output;
+use crate::storage::s3_api::multipart::{build_list_parts_output, parse_list_parts_params};
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -944,23 +944,21 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        let params = parse_list_parts_params(part_number_marker, max_parts)?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
-
         let res = store
-            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
+            .list_object_parts(
+                &bucket,
+                &key,
+                &upload_id,
+                params.part_number_marker,
+                params.max_parts,
+                &ObjectOptions::default(),
+            )
             .await
             .map_err(ApiError::from)?;
 
@@ -1432,6 +1430,38 @@ mod tests {
 
         let err = make_usecase().execute_list_parts(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_parts_rejects_negative_part_number_marker_before_store_lookup() {
+        let input = ListPartsInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .part_number_marker(Some(-1))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("part-number-marker must be non-negative"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_parts_rejects_invalid_max_parts_before_store_lookup() {
+        let input = ListPartsInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .max_parts(Some(1001))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("max-parts must be between 1 and 1000"));
     }
 
     #[tokio::test]
