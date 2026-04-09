@@ -423,7 +423,9 @@ impl WriteRecord {
     fn recent_write_count(&self, now_second: u64) -> usize {
         self.write_buckets
             .iter()
-            .filter(|bucket| bucket.count > 0 && now_second.saturating_sub(bucket.second) < WRITE_WINDOW_SECS)
+            .filter(|bucket| {
+                bucket.count > 0 && bucket.second <= now_second && now_second.saturating_sub(bucket.second) < WRITE_WINDOW_SECS
+            })
             .map(|bucket| bucket.count)
             .sum()
     }
@@ -1130,6 +1132,25 @@ mod tests {
         }
 
         assert_eq!(manager.get_write_frequency().await, 20);
+    }
+
+    #[test]
+    #[serial]
+    fn test_recent_write_count_ignores_future_buckets() {
+        let mut record = WriteRecord {
+            last_write_time: None,
+            write_count: 1,
+            write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
+        };
+
+        record.write_buckets[0] = WriteBucket { second: 120, count: 3 };
+        record.write_buckets[1] = WriteBucket { second: 90, count: 2 };
+
+        assert_eq!(
+            record.recent_write_count(100),
+            2,
+            "buckets from future seconds should not inflate recent write frequency"
+        );
     }
 
     #[tokio::test]
