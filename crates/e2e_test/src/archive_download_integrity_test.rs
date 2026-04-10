@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
+    use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, rustfs_binary_path};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     use http::header::{CONTENT_TYPE, HOST};
@@ -28,6 +28,8 @@ mod tests {
     use std::io::{Cursor, Write};
     use std::process::Command;
     use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     const ARCHIVE_TEST_BUCKET: &str = "archive-download-integrity";
@@ -114,6 +116,75 @@ mod tests {
             .header("Accept-Encoding", accept_encoding)
             .send()
             .await?)
+    }
+
+    fn find_header_terminator(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    async fn read_proxy_request(stream: &mut tokio::net::TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err("proxy request ended before headers were fully received".into());
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if find_header_terminator(&buffer).is_some() {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn spawn_reverse_proxy_to_presigned_url(
+        target_url: String,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>), Box<dyn Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let proxy_url = format!("http://{address}/");
+
+        let handle = tokio::spawn(async move {
+            let (mut downstream, _) = listener.accept().await?;
+            read_proxy_request(&mut downstream).await?;
+
+            let upstream_response: Result<reqwest::Response, reqwest::Error> = local_http_client().get(&target_url).send().await;
+            let (status, body, content_type) = match upstream_response {
+                Ok(response) => {
+                    let status = response.status();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    match response.bytes().await {
+                        Ok(body) => (status, body.to_vec(), content_type),
+                        Err(err) => {
+                            let body = format!("upstream body read failed: {err}").into_bytes();
+                            (StatusCode::BAD_GATEWAY, body, Some("text/plain".to_string()))
+                        }
+                    }
+                }
+                Err(err) => {
+                    let body = format!("upstream request failed: {err}").into_bytes();
+                    (StatusCode::BAD_GATEWAY, body, Some("text/plain".to_string()))
+                }
+            };
+
+            let mut response_head = format!("HTTP/1.1 {}\r\ncontent-length: {}\r\nconnection: close\r\n", status, body.len());
+            if let Some(content_type) = content_type {
+                response_head.push_str(&format!("content-type: {content_type}\r\n"));
+            }
+            response_head.push_str("\r\n");
+
+            downstream.write_all(response_head.as_bytes()).await?;
+            downstream.write_all(&body).await?;
+            downstream.shutdown().await?;
+            Ok(())
+        });
+
+        Ok((proxy_url, handle))
     }
 
     async fn signed_put_request_with_headers(
@@ -323,6 +394,132 @@ mod tests {
             "multipart archive SHA256 mismatch"
         );
 
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_presigned_get_and_reverse_proxy_preserve_multipart_bytes_with_fast_path()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_OBJECT_GET_CHUNK_FAST_PATH_ENABLE", "true")]).await?;
+        env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
+
+        let client = env.create_s3_client();
+        let payload = random_bytes(MULTIPART_PART_SIZE + 768 * 1024);
+        let zip_bytes = build_zip_bytes(&[("payload.bin", payload.as_slice())])?;
+        assert!(zip_bytes.len() > MULTIPART_PART_SIZE, "zip payload must exceed multipart threshold");
+
+        let create_output = client
+            .create_multipart_upload()
+            .bucket(MULTIPART_ARCHIVE_TEST_BUCKET)
+            .key("presigned-multipart-bundle.zip")
+            .content_type("application/zip")
+            .send()
+            .await?;
+        let upload_id = create_output.upload_id().expect("multipart upload id");
+
+        let first_part = zip_bytes[..MULTIPART_PART_SIZE].to_vec();
+        let second_part = zip_bytes[MULTIPART_PART_SIZE..].to_vec();
+
+        let upload_part_1 = client
+            .upload_part()
+            .bucket(MULTIPART_ARCHIVE_TEST_BUCKET)
+            .key("presigned-multipart-bundle.zip")
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(first_part))
+            .send()
+            .await?;
+
+        let upload_part_2 = client
+            .upload_part()
+            .bucket(MULTIPART_ARCHIVE_TEST_BUCKET)
+            .key("presigned-multipart-bundle.zip")
+            .upload_id(upload_id)
+            .part_number(2)
+            .body(ByteStream::from(second_part))
+            .send()
+            .await?;
+
+        let completed_upload = CompletedMultipartUpload::builder()
+            .parts(
+                CompletedPart::builder()
+                    .part_number(1)
+                    .e_tag(upload_part_1.e_tag().unwrap_or_default())
+                    .build(),
+            )
+            .parts(
+                CompletedPart::builder()
+                    .part_number(2)
+                    .e_tag(upload_part_2.e_tag().unwrap_or_default())
+                    .build(),
+            )
+            .build();
+
+        client
+            .complete_multipart_upload()
+            .bucket(MULTIPART_ARCHIVE_TEST_BUCKET)
+            .key("presigned-multipart-bundle.zip")
+            .upload_id(upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await?;
+
+        let object_url = format!("{}/{}/{}", env.url, MULTIPART_ARCHIVE_TEST_BUCKET, "presigned-multipart-bundle.zip");
+        let direct_response =
+            presigned_get_request_with_accept_encoding(&object_url, &env.access_key, &env.secret_key, "identity").await?;
+        assert_eq!(direct_response.status(), StatusCode::OK);
+        assert_eq!(
+            direct_response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(zip_bytes.len())
+        );
+        let direct_body = direct_response.bytes().await?;
+        assert_eq!(direct_body.len(), zip_bytes.len());
+        assert_eq!(direct_body.as_ref(), zip_bytes.as_slice());
+
+        let signed = pre_sign_v4(
+            http::Request::builder()
+                .method(http::Method::GET)
+                .uri(object_url.parse::<http::Uri>()?)
+                .header(
+                    HOST,
+                    object_url
+                        .parse::<http::Uri>()?
+                        .authority()
+                        .ok_or("request URL missing authority")?
+                        .to_string(),
+                )
+                .body(Body::empty())?,
+            &env.access_key,
+            &env.secret_key,
+            "",
+            "us-east-1",
+            600,
+            OffsetDateTime::now_utc(),
+        );
+        let (proxy_url, proxy_handle) = spawn_reverse_proxy_to_presigned_url(signed.uri().to_string()).await?;
+        let proxied_response: reqwest::Response = local_http_client().get(&proxy_url).send().await?;
+        assert_eq!(proxied_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxied_response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(zip_bytes.len())
+        );
+        let proxied_body: bytes::Bytes = proxied_response.bytes().await?;
+        assert_eq!(proxied_body.len(), zip_bytes.len());
+        assert_eq!(proxied_body.as_ref(), zip_bytes.as_slice());
+
+        proxy_handle.await??;
         env.stop_server();
         Ok(())
     }

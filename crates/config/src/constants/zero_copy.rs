@@ -18,6 +18,24 @@
 //! read operations, which use memory mapping (mmap) to avoid data copying.
 
 // =============================================================================
+// GET Fast Path Configuration
+// =============================================================================
+
+/// Environment variable for the GetObject chunk fast path master switch.
+///
+/// When disabled, `GetObject` bypasses the chunk-streaming fast path entirely and
+/// always uses the legacy reader path. This provides an operational stopgap for
+/// regressions in the streaming data plane while keeping zero-copy internals
+/// configurable independently for future opt-in validation.
+pub const ENV_OBJECT_GET_CHUNK_FAST_PATH_ENABLE: &str = "RUSTFS_OBJECT_GET_CHUNK_FAST_PATH_ENABLE";
+
+/// Default: GetObject chunk fast path is disabled.
+///
+/// The legacy reader path remains the safe default until the chunk-streaming
+/// path has sufficient regression coverage for full-body delivery semantics.
+pub const DEFAULT_OBJECT_GET_CHUNK_FAST_PATH_ENABLE: bool = false;
+
+// =============================================================================
 // Zero-Copy Configuration
 // =============================================================================
 

@@ -143,6 +143,14 @@ pub fn chunk_body_data_plane_labels(
     )
 }
 
+#[must_use]
+pub const fn get_object_chunk_path_label(path: GetObjectChunkPath) -> &'static str {
+    match path {
+        GetObjectChunkPath::Direct => "direct",
+        GetObjectChunkPath::Bridge => "bridge",
+    }
+}
+
 pub fn get_object_chunk_fast_path_guard(
     has_sse_customer_key: bool,
     has_sse_customer_key_md5: bool,
