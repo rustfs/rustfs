@@ -1061,6 +1061,13 @@ impl LocalDisk {
         }
 
         let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
+            if let Some((_, existing_skip_object)) = dir_stack.iter_mut().find(|(name, _)| *name == dir_name) {
+                *existing_skip_object |= skip_object;
+            } else {
+                dir_stack.push((dir_name, skip_object));
+            }
+        };
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1129,7 +1136,7 @@ impl LocalDisk {
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        dir_stack.push((dir_name, true));
+                        schedule_dir(&mut dir_stack, dir_name, true);
                     }
                 }
                 Err(err) => {
@@ -1138,7 +1145,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push((meta.name, false));
+                            schedule_dir(&mut dir_stack, meta.name, false);
                         }
                     }
 
@@ -2741,6 +2748,60 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .unwrap();
+
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
+            .await
+            .unwrap();
+        fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "marker/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
     }
 
     #[tokio::test]
