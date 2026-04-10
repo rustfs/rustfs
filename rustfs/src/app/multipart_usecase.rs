@@ -440,9 +440,9 @@ impl DefaultMultipartUsecase {
             helper = helper.version_id(version_id.clone());
         }
 
-        let helper_result: S3Result<S3Response<()>> = Ok(S3Response::new(()));
-        let _ = helper.complete(&helper_result);
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
