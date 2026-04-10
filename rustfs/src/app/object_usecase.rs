@@ -693,10 +693,6 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let request_context = PutObjectRequestContext {
             headers: req.headers.clone(),
             trailing_headers: req.trailing_headers.clone(),
@@ -747,10 +743,6 @@ impl DefaultObjectUsecase {
     }
 
     pub async fn execute_put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let PutObjectAclInput {
             bucket,
@@ -790,10 +782,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold).suppress_event();
         let PutObjectLegalHoldInput {
@@ -849,10 +837,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutObjectLockConfigurationInput {
             bucket,
             object_lock_configuration,
@@ -922,10 +906,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention).suppress_event();
         let PutObjectRetentionInput {
@@ -1015,10 +995,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
@@ -1097,10 +1073,6 @@ impl DefaultObjectUsecase {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let request_id = req
             .extensions
             .get::<request_context::RequestContext>()
@@ -1183,10 +1155,6 @@ impl DefaultObjectUsecase {
     }
 
     pub async fn execute_get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetObjectAclInput {
             bucket, key, version_id, ..
         } = req.input;
@@ -1207,10 +1175,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes).suppress_event();
         let GetObjectAttributesInput {
@@ -1440,10 +1404,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold).suppress_event();
         let GetObjectLegalHoldInput {
@@ -1500,10 +1460,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetObjectLockConfigurationInput { bucket, .. } = req.input;
 
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
@@ -1532,10 +1488,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention).suppress_event();
         let GetObjectRetentionInput {
@@ -1584,10 +1536,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let start_time = std::time::Instant::now();
         let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
 
@@ -1627,10 +1575,6 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, S3Operation::CopyObject);
         let CopyObjectInput {
             copy_source,
@@ -1939,10 +1883,6 @@ impl DefaultObjectUsecase {
         &self,
         mut req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
@@ -2244,10 +2184,6 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
         let DeleteObjectInput {
             bucket, key, version_id, ..
@@ -2444,10 +2380,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
@@ -2513,10 +2445,6 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject).suppress_event();
         // mc get 2
         let HeadObjectInput {
@@ -2839,10 +2767,6 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(&req, EventName::ObjectRestorePost, S3Operation::RestoreObject);
         let RestoreObjectInput {
             bucket,
@@ -3032,10 +2956,6 @@ impl DefaultObjectUsecase {
         &self,
         req: S3Request<SelectObjectContentInput>,
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         info!("handle select_object_content");
 
         let input = Arc::new(req.input);
