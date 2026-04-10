@@ -40,58 +40,6 @@ static DIRECT_CHUNK_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock:
 static DIRECT_CHUNK_MULTI_DISK_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static DIRECT_CHUNK_TEST_INIT: Once = Once::new();
 
-async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
-    let GetObjectInput {
-        bucket,
-        key,
-        version_id,
-        part_number,
-        range,
-        ..
-    } = req.input.clone();
-
-    validate_object_key(&key, "GET")?;
-
-    let part_number = part_number.map(|value| value as usize);
-    if let Some(part_number) = part_number
-        && part_number == 0
-    {
-        return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
-    }
-
-    let rs = range.map(|value| match value {
-        Range::Int { first, last } => HTTPRangeSpec {
-            is_suffix_length: false,
-            start: first as i64,
-            end: last.map_or(-1, |last| last as i64),
-        },
-        Range::Suffix { length } => HTTPRangeSpec {
-            is_suffix_length: true,
-            start: length as i64,
-            end: -1,
-        },
-    });
-
-    if rs.is_some() && part_number.is_some() {
-        return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
-    }
-
-    let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
-        .await
-        .map_err(ApiError::from)?;
-
-    Ok(GetObjectRequestContext {
-        bucket,
-        key,
-        part_number,
-        rs,
-        opts,
-        headers: req.headers.clone(),
-        sse_customer_key: req.input.sse_customer_key.clone(),
-        sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
-    })
-}
-
 fn init_direct_chunk_test_tracing() {
     DIRECT_CHUNK_TEST_INIT.call_once(|| {});
 }
