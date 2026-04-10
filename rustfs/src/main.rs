@@ -135,8 +135,7 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 }
 
 fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
-    rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
-        && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
+    rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key) && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
 }
 
 async fn async_main() -> Result<()> {
