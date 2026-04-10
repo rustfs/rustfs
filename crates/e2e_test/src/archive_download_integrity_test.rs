@@ -149,8 +149,7 @@ mod tests {
             let (mut downstream, _) = listener.accept().await?;
             read_proxy_request(&mut downstream).await?;
 
-            let upstream_response: Result<reqwest::Response, reqwest::Error> =
-                local_http_client().get(&target_url).send().await;
+            let upstream_response: Result<reqwest::Response, reqwest::Error> = local_http_client().get(&target_url).send().await;
             let (status, body, content_type) = match upstream_response {
                 Ok(response) => {
                     let status = response.status();
