@@ -132,4 +132,70 @@ mod tests {
         // Stop the RustFS server to ensure proper cleanup
         env.stop_server();
     }
+
+    /// Test ensuring that ListObjectsV2 returns unique keys when an explicit directory marker
+    /// exists under the requested prefix and delimiter is not provided.
+    ///
+    /// Bug Reference: Issue #2439
+    /// When both "marker/subdir/" and "marker/subdir/file.txt" exist, listing with
+    /// Prefix="marker/" must not duplicate "marker/subdir/file.txt" in Contents.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_unique_contents_with_explicit_directory_markers() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 should return unique keys with explicit directory markers");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-list-unique-contents";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        for (key, body) in [
+            ("marker/", ByteStream::from_static(b"")),
+            ("marker/subdir/", ByteStream::from_static(b"")),
+            ("marker/file.txt", ByteStream::from_static(b"content")),
+            ("marker/subdir/file.txt", ByteStream::from_static(b"nested")),
+        ] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create test object {key}: {err}"));
+        }
+
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("marker/")
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let keys: Vec<String> = result
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(ToOwned::to_owned))
+            .collect();
+
+        info!("Contents: {:?}", keys);
+
+        assert_eq!(
+            keys,
+            vec![
+                "marker/".to_string(),
+                "marker/file.txt".to_string(),
+                "marker/subdir/".to_string(),
+                "marker/subdir/file.txt".to_string(),
+            ]
+        );
+        assert_eq!(result.key_count(), Some(4));
+
+        env.stop_server();
+    }
 }
