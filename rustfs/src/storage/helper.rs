@@ -213,7 +213,7 @@ impl OperationHelper {
     /// Complete operational details from S3 results.
     /// This method should be called immediately before the function returns.
     /// It consumes and prepares auxiliary structures for use during `drop`.
-    pub fn complete(mut self, result: &S3Result<S3Response<impl Send + Sync>>) -> Self {
+    pub fn complete<T>(mut self, result: &S3Result<S3Response<T>>) -> Self {
         // Complete audit log
         if let Some(builder) = self.audit_builder.take() {
             let (status, status_code, error_msg) = match result {

@@ -93,19 +93,11 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let info = get_server_info(req.include_pools).await;
         Ok(QueryServerInfoResponse { info })
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -114,10 +106,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -196,10 +184,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
@@ -222,10 +206,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
@@ -254,14 +234,7 @@ impl DefaultAdminUsecase {
     }
 
     pub fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        let iam_ready = self
-            .context
-            .as_ref()
-            .map(|context| {
-                let _ = context.object_store();
-                context.iam().is_ready()
-            })
-            .unwrap_or(false);
+        let iam_ready = self.context.as_ref().map(|context| context.iam().is_ready()).unwrap_or(false);
 
         DependencyReadiness {
             storage_ready: new_object_layer_fn().is_some(),
