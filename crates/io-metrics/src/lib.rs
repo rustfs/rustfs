@@ -193,6 +193,8 @@ impl IoStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     Unknown,
+    FeatureDisabled,
+    ProbeFailed,
     MmapDisabled,
     MmapUnavailable,
     SmallObject,
@@ -213,6 +215,8 @@ impl FallbackReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
+            Self::FeatureDisabled => "feature_disabled",
+            Self::ProbeFailed => "probe_failed",
             Self::MmapDisabled => "mmap_disabled",
             Self::MmapUnavailable => "mmap_unavailable",
             Self::SmallObject => "small_object",
@@ -345,6 +349,59 @@ pub fn record_io_fallback(stage: IoStage, reason: FallbackReason) {
         "reason" => reason.as_str()
     )
     .increment(1);
+}
+
+/// Record a selected GET chunk fast path.
+#[inline(always)]
+pub fn record_get_object_fast_path_selected(path: &'static str, copy_mode: CopyMode, promised_bytes: i64) {
+    counter!(
+        metric_names::data_plane::GET_FAST_PATH_SELECTED_TOTAL,
+        "path" => path.to_string(),
+        "copy_mode" => copy_mode.as_str().to_string()
+    )
+    .increment(1);
+
+    if promised_bytes >= 0 {
+        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
+    }
+}
+
+/// Record a failed GET chunk fast path probe before the response is committed.
+#[inline(always)]
+pub fn record_get_object_fast_path_probe_failed(path: &'static str, copy_mode: CopyMode, promised_bytes: i64) {
+    counter!(
+        metric_names::data_plane::GET_FAST_PATH_PROBE_FAILED_TOTAL,
+        "path" => path.to_string(),
+        "copy_mode" => copy_mode.as_str().to_string()
+    )
+    .increment(1);
+
+    if promised_bytes >= 0 {
+        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
+    }
+}
+
+/// Record a GET chunk fast path mid-stream error after headers have already been committed.
+#[inline(always)]
+pub fn record_get_object_fast_path_midstream_error(
+    path: &'static str,
+    copy_mode: CopyMode,
+    error_kind: &'static str,
+    sent_bytes: usize,
+    promised_bytes: i64,
+) {
+    counter!(
+        metric_names::data_plane::GET_FAST_PATH_MIDSTREAM_ERROR_TOTAL,
+        "path" => path.to_string(),
+        "copy_mode" => copy_mode.as_str().to_string(),
+        "error_kind" => error_kind.to_string()
+    )
+    .increment(1);
+
+    histogram!(metric_names::data_plane::GET_FAST_PATH_MIDSTREAM_SENT_BYTES).record(sent_bytes as f64);
+    if promised_bytes >= 0 {
+        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
+    }
 }
 
 /// Record the currently active mmap bytes held by LocalDisk chunk streams.
@@ -875,6 +932,8 @@ mod tests {
     #[test]
     fn test_fallback_reason_as_str_values_stable() {
         assert_eq!(FallbackReason::Unknown.as_str(), "unknown");
+        assert_eq!(FallbackReason::FeatureDisabled.as_str(), "feature_disabled");
+        assert_eq!(FallbackReason::ProbeFailed.as_str(), "probe_failed");
         assert_eq!(FallbackReason::MmapDisabled.as_str(), "mmap_disabled");
         assert_eq!(FallbackReason::MmapUnavailable.as_str(), "mmap_unavailable");
         assert_eq!(FallbackReason::SmallObject.as_str(), "small_object");
@@ -926,6 +985,13 @@ mod tests {
     #[test]
     fn test_record_local_disk_compat_collect() {
         record_local_disk_compat_collect(3, 16384);
+    }
+
+    #[test]
+    fn test_record_get_object_fast_path_metrics() {
+        record_get_object_fast_path_selected("direct", CopyMode::TrueZeroCopy, 8192);
+        record_get_object_fast_path_probe_failed("bridge", CopyMode::SingleCopy, 4096);
+        record_get_object_fast_path_midstream_error("direct", CopyMode::Reconstructed, "unexpected_eof", 2048, 8192);
     }
 
     #[test]
