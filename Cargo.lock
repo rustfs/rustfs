@@ -3065,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "dial9-tokio-telemetry"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=60502082601b647c4a51962595721f631b7bbce1#60502082601b647c4a51962595721f631b7bbce1"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
 dependencies = [
  "arc-swap",
  "bon",
@@ -3089,7 +3089,7 @@ dependencies = [
 [[package]]
 name = "dial9-trace-format"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=60502082601b647c4a51962595721f631b7bbce1#60502082601b647c4a51962595721f631b7bbce1"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
 dependencies = [
  "dial9-trace-format-derive",
  "serde",
@@ -3098,7 +3098,7 @@ dependencies = [
 [[package]]
 name = "dial9-trace-format-derive"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=60502082601b647c4a51962595721f631b7bbce1#60502082601b647c4a51962595721f631b7bbce1"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
 dependencies = [
  "proc-macro2",
  "quote",
