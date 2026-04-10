@@ -28,7 +28,7 @@ use crate::storage::s3_api::bucket::{
     build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::{acl, encryption, replication, tagging};
+use crate::storage::s3_api::{acl, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -973,7 +973,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
+        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1033,9 +1033,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
+        Ok(S3Response::new(GetBucketEncryptionOutput {
             server_side_encryption_configuration,
-        )))
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1297,9 +1297,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(replication::build_get_bucket_replication_output(
-            replication_configuration,
-        )))
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(replication_configuration),
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1788,7 +1788,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2356,6 +2356,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_get_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketEncryptionInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_encryption(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_bucket_replication_returns_internal_error_when_store_uninitialized() {
         let input = GetBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
@@ -2853,6 +2867,26 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

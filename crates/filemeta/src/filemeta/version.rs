@@ -54,6 +54,62 @@ fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn deserialize_legacy_uuid_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LegacyUuidBytesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for LegacyUuidBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("nil or binary UUID bytes")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut value = Vec::new();
+            while let Some(byte) = seq.next_element()? {
+                value.push(byte);
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(LegacyUuidBytesVisitor)
+}
+
 fn decode_msgp_time_payload(ext_type: i8, payload: &[u8]) -> Result<OffsetDateTime> {
     let (secs, nanos) = match (ext_type, payload.len()) {
         (MSGPACK_TIME_EXT_LEGACY, 12) => {
@@ -179,7 +235,9 @@ struct LegacyMetaV2Version {
 
 #[derive(Debug, Deserialize)]
 struct LegacyMetaV2Object {
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     version_id: Vec<u8>,
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     data_dir: Vec<u8>,
     erasure_algorithm: String,
     erasure_m: usize,
@@ -201,6 +259,7 @@ struct LegacyMetaV2Object {
 
 #[derive(Debug, Deserialize)]
 struct LegacyMetaV2DeleteMarker {
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     version_id: Vec<u8>,
     mod_time: Option<OffsetDateTime>,
     meta_sys: HashMap<String, Vec<u8>>,
