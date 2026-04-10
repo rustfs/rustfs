@@ -18,11 +18,9 @@ mod get_object_flow;
 mod get_object_zero_copy;
 mod put_object_extract;
 mod put_object_flow;
-mod types;
 #[cfg(test)]
 mod zero_copy_tests;
 use self::get_object_flow::GetObjectBootstrap;
-use self::types::*;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::capacity::record_capacity_write;
@@ -139,6 +137,34 @@ use uuid::Uuid;
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
     request_id: String,
+}
+
+#[derive(Clone)]
+pub(super) struct GetObjectRequestContext {
+    pub(super) bucket: String,
+    pub(super) key: String,
+    pub(super) part_number: Option<usize>,
+    pub(super) rs: Option<HTTPRangeSpec>,
+    pub(super) opts: ObjectOptions,
+    pub(super) headers: HeaderMap,
+    pub(super) sse_customer_key: Option<String>,
+    pub(super) sse_customer_key_md5: Option<String>,
+}
+
+pub(super) type PutObjectChecksums = rustfs_object_io::put::PutObjectChecksums;
+
+#[derive(Clone)]
+pub(super) struct PutObjectRequestContext {
+    pub(super) headers: HeaderMap,
+    pub(super) trailing_headers: Option<s3s::TrailingHeaders>,
+    pub(super) uri_query: Option<String>,
+    pub(super) is_post_object: bool,
+    pub(super) method: hyper::Method,
+    pub(super) uri: hyper::Uri,
+    pub(super) extensions: http::Extensions,
+    pub(super) credentials: Option<s3s::auth::Credentials>,
+    pub(super) region: Option<s3s::region::Region>,
+    pub(super) service: Option<String>,
 }
 
 impl DeadlockRequestGuard {
@@ -313,6 +339,58 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 
     let expiry_date = expire_time.format(&Rfc3339).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+}
+
+async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
+    let GetObjectInput {
+        bucket,
+        key,
+        version_id,
+        part_number,
+        range,
+        ..
+    } = req.input.clone();
+
+    validate_object_key(&key, "GET")?;
+
+    let part_number = part_number.map(|value| value as usize);
+    if let Some(part_number) = part_number
+        && part_number == 0
+    {
+        return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
+    }
+
+    let rs = range.map(|value| match value {
+        Range::Int { first, last } => HTTPRangeSpec {
+            is_suffix_length: false,
+            start: first as i64,
+            end: last.map_or(-1, |last| last as i64),
+        },
+        Range::Suffix { length } => HTTPRangeSpec {
+            is_suffix_length: true,
+            start: length as i64,
+            end: -1,
+        },
+    });
+
+    if rs.is_some() && part_number.is_some() {
+        return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+    }
+
+    let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(GetObjectRequestContext {
+        bucket,
+        key,
+        part_number,
+        rs,
+        opts,
+        headers: req.headers.clone(),
+        sse_customer_key: req.input.sse_customer_key.clone(),
+        sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,60 +1143,8 @@ impl DefaultObjectUsecase {
                 _deadlock_request_guard: deadlock_request_guard,
             }
         };
-        let (request_context, version_id_for_event) = {
-            let GetObjectInput {
-                bucket,
-                key,
-                version_id,
-                part_number,
-                range,
-                ..
-            } = req.input.clone();
-
-            validate_object_key(&key, "GET")?;
-
-            let part_number = part_number.map(|value| value as usize);
-            if let Some(part_number) = part_number
-                && part_number == 0
-            {
-                return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
-            }
-
-            let rs = range.map(|value| match value {
-                Range::Int { first, last } => HTTPRangeSpec {
-                    is_suffix_length: false,
-                    start: first as i64,
-                    end: last.map_or(-1, |last| last as i64),
-                },
-                Range::Suffix { length } => HTTPRangeSpec {
-                    is_suffix_length: true,
-                    start: length as i64,
-                    end: -1,
-                },
-            });
-
-            if rs.is_some() && part_number.is_some() {
-                return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
-            }
-
-            let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
-                .await
-                .map_err(ApiError::from)?;
-
-            (
-                GetObjectRequestContext {
-                    bucket,
-                    key,
-                    part_number,
-                    rs,
-                    opts,
-                    headers: req.headers.clone(),
-                    sse_customer_key: req.input.sse_customer_key.clone(),
-                    sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
-                },
-                version_id.unwrap_or_default(),
-            )
-        };
+        let version_id_for_event = req.input.version_id.clone().unwrap_or_default();
+        let request_context = prepare_get_object_request_context(&req).await?;
         let base_buffer_size = self.base_buffer_size();
         let manager = get_concurrency_manager();
         let cors_bucket = request_context.bucket.clone();
