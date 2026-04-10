@@ -28,7 +28,7 @@ use std::io::Error;
 use tracing::{debug, error, info, instrument, warn};
 
 #[instrument]
-pub(crate) fn print_server_info() {
+pub fn print_server_info() {
     let current_year = jiff::Zoned::now().year();
     // Use custom macros to print server information
     info!("RustFS Object Storage Server");
@@ -42,7 +42,7 @@ pub(crate) fn print_server_info() {
 /// This function checks if update checking is enabled via
 /// environment variable or default configuration. If enabled,
 /// it spawns an asynchronous task to check for updates with a timeout.
-pub(crate) fn init_update_check() {
+pub fn init_update_check() {
     let update_check_enable = env::var(ENV_UPDATE_CHECK)
         .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
         .parse::<bool>()
@@ -104,7 +104,7 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 ///  # Arguments
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
-pub(crate) async fn add_bucket_notification_configuration(buckets: Vec<String>) {
+pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     let global_region = rustfs_ecstore::global::get_global_region();
     let region = global_region
         .as_ref()
@@ -196,16 +196,46 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
 
     Ok(rustfs_kms::config::KmsConfig {
-        backend: rustfs_kms::config::KmsBackend::Vault,
-        backend_config: rustfs_kms::config::BackendConfig::Vault(Box::new(rustfs_kms::config::VaultConfig {
+        backend: rustfs_kms::config::KmsBackend::VaultKv2,
+        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(rustfs_kms::config::VaultConfig {
             address: vault_address.clone(),
             auth_method: rustfs_kms::config::VaultAuthMethod::Token {
                 token: vault_token.clone(),
             },
             namespace: None,
-            mount_path: "transit".to_string(),
+            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
             kv_mount: "secret".to_string(),
             key_path_prefix: "rustfs/kms/keys".to_string(),
+            tls: None,
+        })),
+        default_key_id: cfg.kms_default_key_id.clone(),
+        timeout: std::time::Duration::from_secs(30),
+        retry_attempts: 3,
+        enable_cache: true,
+        cache_config: rustfs_kms::config::CacheConfig::default(),
+    })
+}
+
+/// Build KMS configuration for Vault Transit backend
+fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    let vault_address = cfg
+        .kms_vault_address
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault address is required for vault-transit backend"))?;
+    let vault_token = cfg
+        .kms_vault_token
+        .as_ref()
+        .ok_or_else(|| Error::other("Vault token is required for vault-transit backend"))?;
+
+    Ok(rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::VaultTransit,
+        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(rustfs_kms::config::VaultTransitConfig {
+            address: vault_address.clone(),
+            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
+                token: vault_token.clone(),
+            },
+            namespace: None,
+            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
             tls: None,
         })),
         default_key_id: cfg.kms_default_key_id.clone(),
@@ -247,7 +277,7 @@ async fn configure_and_start_kms(
 ///
 /// Returns `std::io::Result<()>` indicating success or failure
 #[instrument(skip(config))]
-pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
+pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = rustfs_kms::init_global_kms_service_manager();
 
@@ -258,7 +288,8 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
         // Create KMS configuration from command line options
         let kms_config = match config.kms_backend.as_str() {
             "local" => build_local_kms_config(config)?,
-            "vault" => build_vault_kms_config(config)?,
+            "vault" | "vault-kv2" | "vault_kv2" => build_vault_kms_config(config)?,
+            "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 
@@ -300,7 +331,7 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 ///
 /// # Arguments
 /// * `config` - The application configuration options
-pub(crate) fn init_buffer_profile_system(config: &config::Config) {
+pub fn init_buffer_profile_system(config: &config::Config) {
     use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'

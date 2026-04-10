@@ -146,7 +146,7 @@ pub use config::{ConcurrencyConfig, ConcurrencyFeatures};
 
 // Manager
 mod manager;
-pub use manager::{ConcurrencyManager, GetObjectCacheEligibility, GetObjectQueueSnapshot};
+pub use manager::{ConcurrencyManager, GetObjectQueueSnapshot};
 
 // Prelude for convenient imports
 pub mod prelude {

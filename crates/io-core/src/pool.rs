@@ -17,7 +17,7 @@
 //! Migrated from rustfs-ecstore to provide unified buffer pooling
 //! across rustfs and rustfs-ecstore without cyclic dependencies.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,7 @@ pub struct BytesPoolMetrics {
 /// A buffer managed by the BytesPool.
 ///
 /// When dropped, the buffer is automatically returned to the pool for reuse.
+#[derive(Debug)]
 pub struct PooledBuffer {
     /// The underlying buffer (ManuallyDrop to allow taking on drop)
     pub buffer: ManuallyDrop<BytesMut>,
@@ -115,6 +116,45 @@ pub struct PooledBuffer {
     tier: Option<Arc<PoolTier>>,
     /// The semaphore permit (must be dropped last to release slot)
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PooledBuffer {
+    /// Create a detached pooled buffer from bytes.
+    ///
+    /// This is primarily used for tests and transitional adapters where the
+    /// chunk abstraction needs a pool-shaped owner before a real pool-backed
+    /// producer exists.
+    #[must_use]
+    pub fn from_bytes(bytes: Bytes) -> Self {
+        Self {
+            buffer: ManuallyDrop::new(BytesMut::from(bytes.as_ref())),
+            tier: None,
+            _permit: None,
+        }
+    }
+
+    /// Current visible length of the underlying buffer.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Total buffer capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Clear the visible contents while preserving capacity.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Returns true when the visible buffer is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
 }
 
 /// BytesPool configuration.

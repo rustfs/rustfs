@@ -1876,10 +1876,28 @@ impl S3Access for FS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{HeaderMap, Method, Uri};
+    use http::{Extensions, HeaderMap, Method, Uri};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use std::collections::HashMap;
     use time::OffsetDateTime;
+
+    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn ensure_req_info<T>(req: &mut S3Request<T>) {
+        req.extensions.insert(ReqInfo::default());
+    }
 
     #[test]
     fn get_bucket_policy_uses_get_bucket_policy_action() {
@@ -2314,5 +2332,75 @@ mod tests {
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
         assert_eq!(req_info.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            AbortMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .build()
+                .unwrap(),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .abort_multipart_upload(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .multipart_upload(Some(CompletedMultipartUpload::default()))
+                .build()
+                .unwrap(),
+            Method::POST,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .complete_multipart_upload(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            UploadPartCopyInput::builder()
+                .bucket("dst-bucket".to_string())
+                .key("dst-object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .copy_source(CopySource::Bucket {
+                    bucket: "src-bucket".into(),
+                    key: "src-object".into(),
+                    version_id: None,
+                })
+                .build()
+                .unwrap(),
+            Method::PUT,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .upload_part_copy(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 }

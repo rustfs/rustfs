@@ -23,9 +23,12 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::s3_api::bucket::{build_list_buckets_output, build_list_objects_v2_output};
+use crate::storage::s3_api::acl;
+use crate::storage::s3_api::bucket::{
+    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+    build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+};
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::{acl, encryption, replication, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -170,18 +173,18 @@ fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType
     }
 }
 
-fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<MinioUserMetadata> {
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadataCollection> {
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| MinioMetadataEntry { key, value })
+        .map(|(key, value)| UserMetadataEntry { key, value })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.key.cmp(&right.key));
 
     if items.is_empty() {
         None
     } else {
-        Some(MinioUserMetadata { items })
+        Some(UserMetadataCollection { items })
     }
 }
 
@@ -970,7 +973,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_delete_bucket_tagging_output()))
+        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1030,9 +1033,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
+        Ok(S3Response::new(GetBucketEncryptionOutput {
             server_side_encryption_configuration,
-        )))
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1294,9 +1297,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(replication::build_get_bucket_replication_output(
-            replication_configuration,
-        )))
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(replication_configuration),
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1330,7 +1333,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(tagging::build_get_bucket_tagging_output(tag_set)))
+        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1436,7 +1439,7 @@ impl DefaultBucketUsecase {
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
         }
-        Ok(S3Response::new(encryption::build_put_bucket_encryption_output()))
+        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1494,10 +1497,7 @@ impl DefaultBucketUsecase {
             && let Some(store) = new_object_layer_fn()
         {
             let bucket_name = bucket.clone();
-            let request_context = req
-                .extensions
-                .get::<crate::storage::request_context::RequestContext>()
-                .cloned();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
             spawn_background_with_context(request_context, async move {
                 if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
@@ -1721,7 +1721,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
-        Ok(S3Response::new(replication::build_put_bucket_replication_output()))
+        Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1788,7 +1788,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
-        Ok(S3Response::new(tagging::build_put_bucket_tagging_output()))
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1844,46 +1844,21 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-
-        // Log debug info for prefixes with special characters to help diagnose encoding issues
-        if prefix.contains([' ', '+', '%', '\n', '\r', '\0']) {
-            debug!("LIST objects with special characters in prefix: {:?}", prefix);
-        }
-
-        let max_keys = max_keys.unwrap_or(1000);
-        if max_keys < 0 {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
-        }
-
-        let delimiter = delimiter.filter(|v| !v.is_empty());
+        let ListObjectsV2Params {
+            prefix,
+            max_keys,
+            delimiter,
+            response_start_after,
+            start_after_for_query,
+            response_continuation_token,
+            decoded_continuation_token,
+        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
         validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
 
-        // Save original start_after for response (per S3 API spec, must echo back if provided)
-        let response_start_after = start_after.clone();
-        let start_after_for_query = start_after.filter(|v| !v.is_empty());
-
-        // Save original continuation_token for response (per S3 API spec, must echo back if provided)
-        // Note: empty string should still be echoed back in the response
-        let response_continuation_token = continuation_token.clone();
-        let continuation_token_for_query = continuation_token.filter(|v| !v.is_empty());
-
-        // Decode continuation_token from base64 for internal use
-        let decoded_continuation_token = continuation_token_for_query
-            .map(|token| {
-                base64_simd::STANDARD
-                    .decode_to_vec(token.as_bytes())
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    })
-            })
-            .transpose()?;
-
         let store = get_validated_store(&bucket).await?;
 
-        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+        let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
 
@@ -1937,33 +1912,20 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
-        if max_keys < 0 {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid max keys".to_string()));
-        }
+        let ListObjectsV2Params {
+            prefix,
+            max_keys,
+            delimiter,
+            response_start_after,
+            start_after_for_query,
+            response_continuation_token,
+            decoded_continuation_token,
+        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        let delimiter = delimiter.filter(|value| !value.is_empty());
         validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
 
-        let response_start_after = start_after.clone();
-        let start_after_for_query = start_after.filter(|value| !value.is_empty());
-        let response_continuation_token = continuation_token.clone();
-        let continuation_token_for_query = continuation_token.filter(|value| !value.is_empty());
-
-        let decoded_continuation_token = continuation_token_for_query
-            .map(|token| {
-                base64_simd::STANDARD
-                    .decode_to_vec(token.as_bytes())
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
-                    })
-            })
-            .transpose()?;
-
         let store = get_validated_store(&bucket).await?;
-        let incl_deleted = rustfs_utils::http::get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
+        let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
             .map(|value| value.as_ref() == "true")
             .unwrap_or_default();
 
@@ -2015,12 +1977,13 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
-
-        let key_marker = key_marker.filter(|v| !v.is_empty());
-        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
-        let delimiter = delimiter.filter(|v| !v.is_empty());
+        let ListObjectVersionsParams {
+            prefix,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -2029,57 +1992,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let objects: Vec<ObjectVersion> = object_infos
-            .objects
-            .iter()
-            .filter(|v| !v.name.is_empty() && !v.delete_marker)
-            .map(|v| ObjectVersion {
-                key: Some(v.name.to_owned()),
-                last_modified: v.mod_time.map(Timestamp::from),
-                size: Some(v.size),
-                version_id: Some(v.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                is_latest: Some(v.is_latest),
-                e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
-                ..Default::default()
-            })
-            .collect();
-
-        let common_prefixes = object_infos
-            .prefixes
-            .into_iter()
-            .map(|v| CommonPrefix { prefix: Some(v) })
-            .collect();
-
-        let delete_markers = object_infos
-            .objects
-            .iter()
-            .filter(|o| o.delete_marker)
-            .map(|o| DeleteMarkerEntry {
-                key: Some(o.name.clone()),
-                version_id: Some(o.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                is_latest: Some(o.is_latest),
-                last_modified: o.mod_time.map(Timestamp::from),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-
-        let next_key_marker = object_infos.next_marker.filter(|v| !v.is_empty());
-        let next_version_id_marker = object_infos.next_version_idmarker.filter(|v| !v.is_empty());
-
-        let output = ListObjectVersionsOutput {
-            is_truncated: Some(object_infos.is_truncated),
-            max_keys: Some(max_keys),
-            delimiter,
-            name: Some(bucket),
-            prefix: Some(prefix),
-            common_prefixes: Some(common_prefixes),
-            versions: Some(objects),
-            delete_markers: Some(delete_markers),
-            next_key_marker,
-            next_version_id_marker,
-            ..Default::default()
-        };
+        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
 
         Ok(S3Response::new(output))
     }
@@ -2104,11 +2017,13 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let prefix = prefix.unwrap_or_default();
-        let max_keys = max_keys.unwrap_or(1000);
-        let key_marker = key_marker.filter(|value| !value.is_empty());
-        let version_id_marker = version_id_marker.filter(|value| !value.is_empty());
-        let delimiter = delimiter.filter(|value| !value.is_empty());
+        let ListObjectVersionsParams {
+            prefix,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
         let object_infos = store
@@ -2441,6 +2356,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_get_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketEncryptionInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_encryption(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_get_bucket_replication_returns_internal_error_when_store_uninitialized() {
         let input = GetBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
@@ -2465,6 +2394,20 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_get_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -2729,7 +2672,7 @@ mod tests {
                 assert_eq!(version.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(
                     version.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![MinioMetadataEntry {
+                    Some(vec![UserMetadataEntry {
                         key: "project".to_string(),
                         value: "alpha".to_string(),
                     }])
@@ -2745,7 +2688,7 @@ mod tests {
                 assert!(marker.user_tags.is_none());
                 assert_eq!(
                     marker.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![MinioMetadataEntry {
+                    Some(vec![UserMetadataEntry {
                         key: "marker".to_string(),
                         value: "true".to_string(),
                     }])
@@ -2840,7 +2783,7 @@ mod tests {
         assert!(object.owner.is_some());
         assert_eq!(
             object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-            Some(vec![MinioMetadataEntry {
+            Some(vec![UserMetadataEntry {
                 key: "project".to_string(),
                 value: "alpha".to_string(),
             }])
@@ -2927,6 +2870,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketEncryptionInput::builder()
+            .bucket("test-bucket".to_string())
+            .server_side_encryption_configuration(ServerSideEncryptionConfiguration::default())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_put_bucket_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some("env".to_string()),
+                    value: Some("prod".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_put_bucket_tagging(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn execute_put_public_access_block_returns_internal_error_when_store_uninitialized() {
         let input = PutPublicAccessBlockInput::builder()
             .bucket("test-bucket".to_string())
@@ -2957,6 +2935,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_list_objects_v2_rejects_invalid_continuation_token_before_store_lookup() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .continuation_token(Some("%%%".to_string()))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("Invalid continuation token"));
+    }
+
+    #[tokio::test]
     async fn execute_list_objects_v2m_rejects_negative_max_keys() {
         let input = ListObjectsV2Input::builder()
             .bucket("test-bucket".to_string())
@@ -2968,6 +2962,52 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_list_objects_v2m_rejects_invalid_continuation_token_before_store_lookup() {
+        let input = ListObjectsV2Input::builder()
+            .bucket("test-bucket".to_string())
+            .continuation_token(Some("%%%".to_string()))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_objects_v2m(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("Invalid continuation token"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_object_versions_rejects_negative_max_keys_before_store_lookup() {
+        let input = ListObjectVersionsInput::builder()
+            .bucket("test-bucket".to_string())
+            .max_keys(Some(-1))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_object_versions(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_list_object_versions_m_rejects_negative_max_keys_before_store_lookup() {
+        let input = ListObjectVersionsInput::builder()
+            .bucket("test-bucket".to_string())
+            .max_keys(Some(-1))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_list_object_versions_m(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }

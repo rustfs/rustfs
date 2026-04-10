@@ -18,19 +18,49 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
-
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt, TryStreamExt};
+use parking_lot::RwLock;
+use tracing::debug;
 
 use crate::{QueryError, QueryResult};
 
 use super::Query;
 use super::logical_planner::Plan;
 use super::session::SessionCtx;
+
+pub struct PhaseTimer {
+    phase_name: &'static str,
+    start_time: Instant,
+}
+
+impl PhaseTimer {
+    pub fn new(phase_name: &'static str) -> Self {
+        Self {
+            phase_name,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        let duration = self.start_time.elapsed();
+
+        if !std::thread::panicking() {
+            metrics::histogram!(
+                "rustfs.s3select.phase.duration.seconds",
+                "phase" => self.phase_name
+            )
+            .record(duration.as_secs_f64());
+        }
+
+        debug!("Phase '{}' took {:?}", self.phase_name, duration);
+    }
+}
 
 pub type QueryExecutionRef = Arc<dyn QueryExecution>;
 
@@ -94,13 +124,13 @@ impl Output {
         }
     }
 
-    /// Returns the number of records affected by the query operation
-    ///
-    /// If it is a select statement, returns the number of rows in the result set
-    ///
-    /// -1 means unknown
-    ///
-    /// panic! when StreamData's number of records greater than i64::Max
+    /// Returns the number of records affected by the query operation  
+    ///  
+    /// If it is a select statement, returns the number of rows in the result set  
+    ///  
+    /// -1 means unknown  
+    ///  
+    /// panic! when StreamData's number of records greater than i64::Max  
     pub async fn affected_rows(self) -> i64 {
         self.num_rows().await as i64
     }
@@ -138,6 +168,20 @@ pub struct QueryStateMachine {
 }
 
 impl QueryStateMachine {
+    fn record_phase_timestamp(&self, phase: &'static str, event: &'static str) {
+        let elapsed = self.start.elapsed();
+        metrics::histogram!(
+            "rustfs.s3select.phase.timestamp.seconds",
+            "phase" => phase,
+            "event" => event
+        )
+        .record(elapsed.as_secs_f64());
+    }
+    #[must_use]
+    pub fn time_phase(&self, phase_name: &'static str) -> PhaseTimer {
+        PhaseTimer::new(phase_name)
+    }
+
     pub fn begin(query: Query, session: SessionCtx) -> Self {
         Self {
             session,
@@ -148,30 +192,30 @@ impl QueryStateMachine {
     }
 
     pub fn begin_analyze(&self) {
-        // TODO record time
+        self.record_phase_timestamp("analyze", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::ANALYZING));
     }
 
     pub fn end_analyze(&self) {
-        // TODO record time
+        self.record_phase_timestamp("analyze", "end");
     }
 
     pub fn begin_optimize(&self) {
-        // TODO record time
+        self.record_phase_timestamp("optimize", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::OPTIMIZING));
     }
 
     pub fn end_optimize(&self) {
-        // TODO
+        self.record_phase_timestamp("optimize", "end");
     }
 
     pub fn begin_schedule(&self) {
-        // TODO
+        self.record_phase_timestamp("schedule", "start");
         self.translate_to(QueryState::RUNNING(RUNNING::SCHEDULING));
     }
 
     pub fn end_schedule(&self) {
-        // TODO
+        self.record_phase_timestamp("schedule", "end");
     }
 
     pub fn finish(&self) {

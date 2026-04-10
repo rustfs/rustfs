@@ -24,7 +24,7 @@ use rustfs_utils::http::headers::{
     AMZ_STORAGE_CLASS,
 };
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
     SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes,
     is_internal_key,
 };
@@ -228,6 +228,10 @@ impl FileMeta {
                                     // Insert into meta_user
                                     obj.meta_user.insert(k.clone(), v.clone());
                                 }
+                            }
+
+                            if let Some(checksum) = fi.checksum.as_ref() {
+                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, checksum.to_vec());
                             }
 
                             if let Some(mod_time) = fi.mod_time {
@@ -1124,6 +1128,32 @@ mod test {
         assert_eq!(
             fi.data_dir.map(|id| id.to_string()).as_deref(),
             Some("fba8e4c3-3f42-4242-94e0-5ab84b83ae97")
+        );
+        assert!(fi.uses_legacy_checksum);
+        assert!(fi.is_latest);
+    }
+
+    #[test]
+    fn test_issue_2434_legacy_meta_v2_pool_compatibility() {
+        let data = create_issue_2434_legacy_meta_v2_pool_xlmeta().expect("Failed to load issue #2434 pool fixture");
+        let (major, minor, header_ver, meta_ver) = FileMeta::read_format_versions(&data).unwrap();
+        assert_eq!((major, minor, header_ver, meta_ver), (1, 3, 3, 2));
+
+        let fm = FileMeta::load(&data).expect("Failed to parse legacy issue #2434 pool xl.meta");
+        assert_eq!(fm.meta_ver, 2);
+        assert_eq!(fm.versions.len(), 1);
+        assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
+
+        let fi = fm
+            .into_fileinfo(".rustfs.sys", "pool.bin", "", true, false, true)
+            .expect("Failed to extract file info from legacy issue #2434 pool xl.meta");
+        assert_eq!(fi.size, 48);
+        assert_eq!(fi.num_versions, 1);
+        assert_eq!(fi.version_id, None);
+        assert_eq!(fi.metadata.get("etag").map(String::as_str), Some("8d270d7a184cfa30cc0bf09ea74fd964"));
+        assert_eq!(
+            fi.data_dir.map(|id| id.to_string()).as_deref(),
+            Some("2bcefaca-44dd-4f01-a79e-63eeb0dda396")
         );
         assert!(fi.uses_legacy_checksum);
         assert!(fi.is_latest);

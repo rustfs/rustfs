@@ -15,7 +15,8 @@
 use crate::config::{KV, KVS};
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
-    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
+    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
+    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, WEBHOOK_AUTH_TOKEN,
     WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
@@ -132,6 +133,36 @@ pub static DEFAULT_NOTIFY_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
             key: MQTT_QUEUE_LIMIT.to_owned(),
             value: DEFAULT_LIMIT.to_string(),
             hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_TLS_POLICY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CLIENT_CERT.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_CLIENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_TLS_TRUST_LEAF_AS_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MQTT_WS_PATH_ALLOWLIST.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
         },
         KV {
             key: COMMENT_KEY.to_owned(),

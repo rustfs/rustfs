@@ -20,7 +20,7 @@
 //! Usage:
 //! 1. Call `TlsMaterialSnapshot::load(tls_path)` once at startup.
 //! 2. Call `snapshot.apply_outbound()` to set global root CAs and mTLS identity.
-//! 3. Call `snapshot.build_tls_acceptor(tls_path)` to build the server TLS acceptor.
+//! 3. TLS acceptor construction is handled internally during server startup.
 
 use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{
@@ -108,7 +108,7 @@ impl TlsMaterialSnapshot {
     /// This is the single place that constructs the server `ServerConfig`,
     /// handling both multi-cert (SNI resolver) and single-cert fallback.
     /// Returns `None` if no TLS certificates are available.
-    pub async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
+    pub(crate) async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
         if tls_path.is_empty() || !self.has_server_certs {
             return Ok(None);
         }
