@@ -208,7 +208,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
         debug!("Putting object data: {}/{} ({} bytes)", bucket, object, data.len());
 
-        let mut reader = rustfs_ecstore::store_api::PutObjReader::from_vec(data.to_vec());
+        let mut reader = rustfs_ecstore::store_api::ChunkNativePutData::from_vec(data.to_vec());
         match (*self.ecstore)
             .put_object(bucket, object, &mut reader, &Default::default())
             .await

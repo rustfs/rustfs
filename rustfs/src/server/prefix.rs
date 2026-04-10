@@ -62,7 +62,7 @@ pub(crate) const RPC_PREFIX: &str = "/rustfs/rpc";
 pub(crate) const TONIC_PREFIX: &str = "/node_service.NodeService";
 
 /// LOGO art for RustFS server.
-pub(crate) const LOGO: &str = r#"
+pub const LOGO: &str = r#"
 
 ░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
 ░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█

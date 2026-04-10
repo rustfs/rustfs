@@ -21,7 +21,9 @@
 /// * `password` - Optional password for authentication
 /// # Returns
 /// * `Ok(())` - If the connection is successful
-/// * `Err(String)` - If the connection fails, contains an error message
+/// * `Err(TargetError)` - If the check fails.
+///   `TargetError::Configuration` indicates a bad configuration (invalid URL, TLS settings, etc.).
+///   Other variants indicate a connectivity or runtime failure.
 ///
 /// # Example
 /// ```rust,no_run
@@ -40,54 +42,53 @@
 ///     }
 ///  }
 /// ```
-/// # Note
-/// Need to add `rumqttc` and `url` dependencies in `Cargo.toml`
-/// ```toml
-/// [dependencies]
-/// rumqttc = "0.25.0"
-/// url = "2.5.7"
-/// tokio = { version = "1", features = ["full"] }
-/// ```
 ///
 pub async fn check_mqtt_broker_available(
     broker_url: &str,
     topic: &str,
     username: Option<&str>,
     password: Option<&str>,
-) -> Result<(), String> {
-    use rumqttc::{AsyncClient, MqttOptions, QoS};
-    let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed:{e}"))?;
+) -> Result<(), crate::TargetError> {
+    use crate::target::mqtt::MQTTTlsConfig;
+
+    check_mqtt_broker_available_with_tls(broker_url, topic, username, password, &MQTTTlsConfig::default()).await
+}
+
+pub async fn check_mqtt_broker_available_with_tls(
+    broker_url: &str,
+    topic: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    tls: &crate::target::mqtt::MQTTTlsConfig,
+) -> Result<(), crate::TargetError> {
+    use crate::target::mqtt::build_mqtt_options;
+    use rumqttc::{AsyncClient, QoS};
+
+    let url = rustfs_utils::parse_url(broker_url)
+        .map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
     let url = url.url();
 
-    match url.scheme() {
-        "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" | "tls" | "tcps" => {}
-        _ => return Err("unsupported broker url scheme".to_string()),
-    }
-
-    let host = url.host_str().ok_or("Broker is missing host")?;
-    let port = url.port().unwrap_or(1883);
-    let mut mqtt_options = MqttOptions::new("rustfs_check", host, port);
-
-    // Set credentials if provided
-    if let Some(user) = username
-        && !user.is_empty()
-    {
-        let pass = password.unwrap_or("");
-        mqtt_options.set_credentials(user, pass);
-    }
-
-    mqtt_options.set_keep_alive(std::time::Duration::from_secs(5));
+    // build_mqtt_options returns TargetError directly; Configuration variants propagate as-is.
+    let mqtt_options = build_mqtt_options(
+        "rustfs_check".to_string(),
+        url,
+        username,
+        password,
+        tls,
+        std::time::Duration::from_secs(5),
+        None,
+    )?;
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
 
     // Try to connect and subscribe
     client
         .subscribe(topic, QoS::AtLeastOnce)
         .await
-        .map_err(|e| format!("MQTT subscription failed:{e}"))?;
+        .map_err(|e| crate::TargetError::Network(format!("MQTT subscription failed: {e}")))?;
     // Wait for eventloop to receive at least one event
     match tokio::time::timeout(std::time::Duration::from_secs(3), eventloop.poll()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("MQTT connection failed:{e}")),
-        Err(_) => Err("MQTT connection timeout".to_string()),
+        Ok(Err(e)) => Err(crate::TargetError::Network(format!("MQTT connection failed: {e}"))),
+        Err(_) => Err(crate::TargetError::Timeout("MQTT connection timed out".to_string())),
     }
 }

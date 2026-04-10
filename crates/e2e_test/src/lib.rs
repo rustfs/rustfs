@@ -56,6 +56,9 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+#[cfg(test)]
+mod archive_download_integrity_test;
+
 // ListObjectsV2 pagination test (Issue #1596)
 #[cfg(test)]
 mod list_objects_v2_pagination_test;
@@ -97,6 +100,10 @@ mod cluster_concurrency_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
+// Range request regression tests
+#[cfg(test)]
+mod range_request_test;
+
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
@@ -108,6 +115,9 @@ mod bucket_logging_test;
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
+
+#[cfg(test)]
+mod stale_multipart_cleanup_cluster_test;
 
 // Object lambda end-to-end regression tests
 #[cfg(test)]

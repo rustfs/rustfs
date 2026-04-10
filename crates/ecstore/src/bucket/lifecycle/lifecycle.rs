@@ -806,6 +806,26 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
     t
 }
 
+pub async fn abort_incomplete_multipart_upload_due(
+    lc: &BucketLifecycleConfiguration,
+    obj: &ObjectOpts,
+) -> Option<(OffsetDateTime, String)> {
+    let initiated = obj.mod_time?;
+    let rules = lc.filter_rules(obj).await?;
+
+    rules
+        .into_iter()
+        .filter_map(|rule| {
+            let days = rule
+                .abort_incomplete_multipart_upload
+                .as_ref()?
+                .days_after_initiation
+                .filter(|days| *days > 0)?;
+            Some((expected_expiry_time(initiated, days), rule.id.clone().unwrap_or_default()))
+        })
+        .min_by_key(|(due, _)| due.unix_timestamp_nanos())
+}
+
 #[derive(Default)]
 pub struct ObjectOpts {
     pub name: String,

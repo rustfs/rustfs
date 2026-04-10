@@ -33,7 +33,7 @@ use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
-use s3s::{S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
@@ -347,6 +347,73 @@ pub(crate) fn normalize_content_encoding_for_storage(value: &str) -> Option<Stri
         .collect::<Vec<_>>()
         .join(", ");
     if normalized.is_empty() { None } else { Some(normalized) }
+}
+
+const ENV_ALLOW_ARCHIVE_CONTENT_ENCODING: &str = "RUSTFS_ALLOW_ARCHIVE_CONTENT_ENCODING";
+
+const ARCHIVE_CONTENT_ENCODING_BLOCKED_SUFFIXES: &[&str] = &[
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+    ".tar.zst",
+    ".tar.zstd",
+    ".tzst",
+];
+
+const ARCHIVE_CONTENT_ENCODING_BLOCKED_CONTENT_TYPES: &[&str] =
+    &["application/zip", "application/x-zip-compressed", "application/x-tar"];
+
+fn is_archive_object_name_for_content_encoding(object_name: &str) -> bool {
+    let object_name = object_name.to_ascii_lowercase();
+    ARCHIVE_CONTENT_ENCODING_BLOCKED_SUFFIXES
+        .iter()
+        .any(|suffix| object_name.ends_with(suffix))
+}
+
+fn is_archive_content_type_for_content_encoding(content_type: &str) -> bool {
+    let main_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+
+    ARCHIVE_CONTENT_ENCODING_BLOCKED_CONTENT_TYPES
+        .iter()
+        .any(|candidate| main_type == *candidate)
+}
+
+pub(crate) fn validate_archive_content_encoding(
+    object_name: &str,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+) -> S3Result<()> {
+    if rustfs_utils::get_env_bool(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, false) {
+        return Ok(());
+    }
+
+    let Some(content_encoding) = content_encoding.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let is_archive_like = is_archive_object_name_for_content_encoding(object_name)
+        || content_type.is_some_and(is_archive_content_type_for_content_encoding);
+    if !is_archive_like {
+        return Ok(());
+    }
+
+    Err(S3Error::with_message(
+        S3ErrorCode::InvalidArgument,
+        format!(
+            "Content-Encoding '{content_encoding}' is not allowed for archive objects by default; set {ENV_ALLOW_ARCHIVE_CONTENT_ENCODING}=true to allow legacy behavior"
+        ),
+    ))
 }
 
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
@@ -692,6 +759,8 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 
 #[cfg(test)]
 mod tests {
+    use temp_env;
+
     use super::*;
     use http::{HeaderMap, HeaderValue};
     use std::collections::HashMap;
@@ -1356,6 +1425,30 @@ mod tests {
 
         // Test files without extension
         assert_eq!(detect_content_type_from_object_name("noextension"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_suffix_by_default() {
+        let err = validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_mime_by_default() {
+        let err = validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_non_archive_precompressed_object() {
+        validate_archive_content_encoding("logs/app.log.zst", Some("text/plain"), Some("zstd")).expect("non-archive");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_legacy_opt_in() {
+        temp_env::with_var(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("gzip")).expect("legacy opt-in");
+        });
     }
 
     #[test]

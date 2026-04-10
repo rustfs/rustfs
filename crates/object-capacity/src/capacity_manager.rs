@@ -14,8 +14,10 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
-use crate::app::admin_usecase::calculate_data_dir_used_capacity;
+use super::scan::refresh_capacity_with_scope;
+use super::types::CapacityDiskRef;
 use futures::FutureExt;
+use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
@@ -26,12 +28,17 @@ use rustfs_config::{
     ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
     ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
-use rustfs_io_metrics::{record_capacity_current_bytes, record_capacity_update_completed, record_capacity_write_operation};
+use rustfs_io_metrics::capacity_metrics::{
+    record_capacity_current_bytes, record_capacity_dirty_disk_count, record_capacity_refresh_inflight,
+    record_capacity_refresh_joiner, record_capacity_refresh_result, record_capacity_update_completed,
+    record_capacity_update_failed, record_capacity_write_operation,
+};
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
@@ -297,6 +304,14 @@ pub struct CapacityUpdate {
     pub file_count: usize,
     /// Whether the value is estimated instead of exact.
     pub is_estimated: bool,
+    /// Per-disk breakdown captured from a successful refresh.
+    pub per_disk: Vec<DiskCapacityUpdate>,
+    /// Expected disk count for a complete disk cache.
+    pub expected_disk_count: Option<usize>,
+    /// Whether this update should replace the current disk cache.
+    pub replaces_disk_cache: bool,
+    /// Dirty disks that can be cleared after the update is committed.
+    pub clear_dirty_disks: Vec<CapacityScopeDisk>,
 }
 
 impl CapacityUpdate {
@@ -306,6 +321,10 @@ impl CapacityUpdate {
             total_used,
             file_count,
             is_estimated: false,
+            per_disk: Vec::new(),
+            expected_disk_count: None,
+            replaces_disk_cache: false,
+            clear_dirty_disks: Vec::new(),
         }
     }
 
@@ -315,6 +334,10 @@ impl CapacityUpdate {
             total_used,
             file_count,
             is_estimated: true,
+            per_disk: Vec::new(),
+            expected_disk_count: None,
+            replaces_disk_cache: false,
+            clear_dirty_disks: Vec::new(),
         }
     }
 
@@ -324,8 +347,25 @@ impl CapacityUpdate {
             total_used,
             file_count: 0,
             is_estimated: true,
+            per_disk: Vec::new(),
+            expected_disk_count: None,
+            replaces_disk_cache: false,
+            clear_dirty_disks: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct DiskCapacityUpdate {
+    pub disk: CapacityScopeDisk,
+    pub used_bytes: u64,
+    pub file_count: usize,
+    pub is_estimated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDiskCapacity {
+    used_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
@@ -342,7 +382,7 @@ pub enum DataSource {
 }
 
 impl DataSource {
-    fn as_metric_label(self) -> &'static str {
+    pub fn as_metric_label(self) -> &'static str {
         match self {
             Self::RealTime => "realtime",
             Self::Scheduled => "scheduled",
@@ -352,15 +392,62 @@ impl DataSource {
     }
 }
 
+const WRITE_WINDOW_SECS: u64 = 60;
+const WRITE_WINDOW_BUCKETS: usize = WRITE_WINDOW_SECS as usize;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WriteBucket {
+    second: u64,
+    count: usize,
+}
+
 /// Write record for tracking write operations
 #[derive(Debug)]
 pub struct WriteRecord {
     /// Last write time
-    pub last_write_time: Instant,
+    pub last_write_time: Option<Instant>,
     /// Write count
     pub write_count: usize,
-    /// Write time window (for frequency calculation)
-    pub write_window: Vec<Instant>,
+    /// Fixed-size time buckets for the recent write window.
+    write_buckets: [WriteBucket; WRITE_WINDOW_BUCKETS],
+}
+
+impl WriteRecord {
+    fn current_unix_second() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+
+    fn recent_write_count(&self, now_second: u64) -> usize {
+        self.write_buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.count > 0 && bucket.second <= now_second && now_second.saturating_sub(bucket.second) < WRITE_WINDOW_SECS
+            })
+            .map(|bucket| bucket.count)
+            .sum()
+    }
+
+    fn record_write(&mut self, now: Instant) -> usize {
+        let now_second = Self::current_unix_second();
+        let bucket_idx = (now_second % WRITE_WINDOW_BUCKETS as u64) as usize;
+        let bucket = &mut self.write_buckets[bucket_idx];
+
+        if bucket.second != now_second {
+            *bucket = WriteBucket {
+                second: now_second,
+                count: 0,
+            };
+        }
+
+        bucket.count = bucket.count.saturating_add(1);
+        self.last_write_time = Some(now);
+        self.write_count = self.write_count.saturating_add(1);
+
+        self.recent_write_count(now_second)
+    }
 }
 
 /// Hybrid strategy configuration
@@ -430,6 +517,12 @@ pub struct HybridCapacityManager {
     cache: Arc<RwLock<Option<CachedCapacity>>>,
     /// Write record
     write_record: Arc<RwLock<WriteRecord>>,
+    /// Dirty disks recorded from write-side scope propagation.
+    dirty_disks: Arc<RwLock<HashSet<CapacityScopeDisk>>>,
+    /// Per-disk cache populated after a successful full refresh and updated by dirty subset refreshes.
+    disk_cache: Arc<RwLock<HashMap<CapacityScopeDisk, CachedDiskCapacity>>>,
+    /// Whether the per-disk cache currently covers all known disks.
+    disk_cache_complete: Arc<RwLock<bool>>,
     /// Configuration
     config: HybridStrategyConfig,
     /// Shared singleflight refresh state
@@ -437,6 +530,17 @@ pub struct HybridCapacityManager {
 }
 
 impl HybridCapacityManager {
+    async fn sync_global_dirty_scopes(&self) {
+        let scopes = drain_global_dirty_scopes();
+        if scopes.is_empty() {
+            return;
+        }
+
+        let mut dirty_disks = self.dirty_disks.write().await;
+        dirty_disks.extend(scopes);
+        record_capacity_dirty_disk_count(dirty_disks.len());
+    }
+
     fn max_stale_age(&self) -> Duration {
         self.config
             .scheduled_update_interval
@@ -448,10 +552,13 @@ impl HybridCapacityManager {
         Self {
             cache: Arc::new(RwLock::new(None)),
             write_record: Arc::new(RwLock::new(WriteRecord {
-                last_write_time: Instant::now(),
+                last_write_time: None,
                 write_count: 0,
-                write_window: Vec::new(),
+                write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
             })),
+            dirty_disks: Arc::new(RwLock::new(HashSet::new())),
+            disk_cache: Arc::new(RwLock::new(HashMap::new())),
+            disk_cache_complete: Arc::new(RwLock::new(false)),
             config,
             refresh_state: Arc::new(Mutex::new(RefreshState::default())),
         }
@@ -471,47 +578,95 @@ impl HybridCapacityManager {
     /// Update capacity
     pub async fn update_capacity(&self, update: CapacityUpdate, source: DataSource) {
         let start = Instant::now();
+        let mut total_used = update.total_used;
+
+        if !update.per_disk.is_empty() {
+            let mut disk_cache = self.disk_cache.write().await;
+            let mut disk_cache_complete = self.disk_cache_complete.write().await;
+
+            if update.replaces_disk_cache && update.expected_disk_count == Some(update.per_disk.len()) {
+                disk_cache.clear();
+                for entry in &update.per_disk {
+                    disk_cache.insert(
+                        entry.disk.clone(),
+                        CachedDiskCapacity {
+                            used_bytes: entry.used_bytes,
+                        },
+                    );
+                }
+                *disk_cache_complete = true;
+                total_used = disk_cache.values().map(|entry| entry.used_bytes).sum();
+            } else if *disk_cache_complete {
+                for entry in &update.per_disk {
+                    disk_cache.insert(
+                        entry.disk.clone(),
+                        CachedDiskCapacity {
+                            used_bytes: entry.used_bytes,
+                        },
+                    );
+                }
+                total_used = disk_cache.values().map(|entry| entry.used_bytes).sum();
+            }
+        }
+
         let mut cache = self.cache.write().await;
         *cache = Some(CachedCapacity {
-            total_used: update.total_used,
+            total_used,
             last_update: Instant::now(),
             file_count: update.file_count,
             is_estimated: update.is_estimated,
             source,
         });
 
+        if !update.clear_dirty_disks.is_empty() {
+            let mut dirty_disks = self.dirty_disks.write().await;
+            for disk in &update.clear_dirty_disks {
+                dirty_disks.remove(disk);
+            }
+            record_capacity_dirty_disk_count(dirty_disks.len());
+        }
+
         debug!(
             "Capacity updated: {} bytes, files={}, estimated={}, source: {:?}",
-            update.total_used, update.file_count, update.is_estimated, source
+            total_used, update.file_count, update.is_estimated, source
         );
-        record_capacity_current_bytes(update.total_used);
-        record_capacity_update_completed(source.as_metric_label(), start.elapsed(), update.total_used, update.is_estimated);
+        record_capacity_current_bytes(total_used);
+        record_capacity_update_completed(source.as_metric_label(), start.elapsed(), total_used, update.is_estimated);
     }
 
     /// Record write operation
     pub async fn record_write_operation(&self) {
         let mut record = self.write_record.write().await;
-        record.last_write_time = Instant::now();
-        record.write_count += 1;
-
-        // Maintain write time window (keep last 1 minute)
-        // Cap the window size to prevent unbounded memory growth at high write rates
-        const MAX_WRITE_WINDOW_SIZE: usize = 10000;
         let now = Instant::now();
-        record
-            .write_window
-            .retain(|&t| now.duration_since(t) < Duration::from_secs(60));
-        // Only push if under the cap to prevent unbounded growth
-        if record.write_window.len() < MAX_WRITE_WINDOW_SIZE {
-            record.write_window.push(now);
-        }
+        let recent_write_count = record.record_write(now);
 
-        record_capacity_write_operation(record.write_window.len());
+        record_capacity_write_operation(recent_write_count);
         debug!(
             "Write operation recorded: total writes = {}, recent writes = {}",
-            record.write_count,
-            record.write_window.len()
+            record.write_count, recent_write_count
         );
+    }
+
+    /// Record write scope propagated from the storage layer.
+    pub async fn mark_dirty_scope(&self, scope: &CapacityScope) {
+        if scope.disks.is_empty() {
+            return;
+        }
+
+        let mut dirty_disks = self.dirty_disks.write().await;
+        dirty_disks.extend(scope.disks.iter().cloned());
+        record_capacity_dirty_disk_count(dirty_disks.len());
+    }
+
+    /// Record a write operation and consume any propagated disk scope bound to the token.
+    pub async fn record_write_operation_with_scope_token(&self, scope_token: Option<uuid::Uuid>) {
+        if let Some(token) = scope_token
+            && let Some(scope) = take_capacity_scope(token)
+        {
+            self.mark_dirty_scope(&scope).await;
+        }
+
+        self.record_write_operation().await;
     }
 
     /// Check if fast update is needed
@@ -529,19 +684,31 @@ impl HybridCapacityManager {
                 return false;
             }
 
-            let write_record = self.write_record.read().await;
-            let time_since_write = write_record.last_write_time.elapsed();
-
-            // Recent write, trigger fast update
-            if time_since_write < self.config.fast_update_threshold {
-                debug!("Recent write detected ({:?} ago), needs fast update", time_since_write);
-                return true;
+            if !self.config.enable_write_trigger {
+                return false;
             }
 
-            // High write frequency, trigger update
-            let write_frequency = write_record.write_window.len();
-            if write_frequency > self.config.write_frequency_threshold {
-                debug!("High write frequency detected ({} writes/min), needs fast update", write_frequency);
+            let write_record = self.write_record.read().await;
+            let write_frequency = write_record.recent_write_count(WriteRecord::current_unix_second());
+            if write_frequency <= self.config.write_frequency_threshold {
+                return false;
+            }
+
+            if let Some(last_write_time) = write_record.last_write_time {
+                let time_since_write = last_write_time.elapsed();
+
+                if time_since_write < self.config.write_trigger_delay {
+                    debug!(
+                        "Write-triggered refresh still debounced ({:?} ago, trigger_delay={:?}, writes/min={})",
+                        time_since_write, self.config.write_trigger_delay, write_frequency
+                    );
+                    return false;
+                }
+
+                debug!(
+                    "Write-triggered refresh eligible after debounce ({:?} ago, trigger_delay={:?}, writes/min={})",
+                    time_since_write, self.config.write_trigger_delay, write_frequency
+                );
                 return true;
             }
         }
@@ -560,7 +727,19 @@ impl HybridCapacityManager {
     #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = self.write_record.read().await;
-        record.write_window.len()
+        record.recent_write_count(WriteRecord::current_unix_second())
+    }
+
+    /// Snapshot the currently dirty disks recorded from write-side scope propagation.
+    pub async fn get_dirty_disks(&self) -> Vec<CapacityScopeDisk> {
+        self.sync_global_dirty_scopes().await;
+        let dirty_disks = self.dirty_disks.read().await;
+        dirty_disks.iter().cloned().collect()
+    }
+
+    /// Returns true if the manager has a complete per-disk cache and can safely refresh only dirty disks.
+    pub async fn can_refresh_dirty_subset(&self) -> bool {
+        *self.disk_cache_complete.read().await
     }
 
     /// Run a singleflight refresh. Callers either join an existing in-flight refresh or become the leader.
@@ -577,6 +756,7 @@ impl HybridCapacityManager {
             if state.running {
                 // Subscribe while holding the lock so the send that completes the current
                 // refresh cycle cannot happen before we are subscribed.
+                record_capacity_refresh_joiner(source.as_metric_label());
                 Some(state.result_tx.subscribe())
             } else {
                 // Become the leader. Create a fresh channel so that joiners from a previous
@@ -584,6 +764,7 @@ impl HybridCapacityManager {
                 let (tx, _) = watch::channel(None);
                 state.result_tx = tx;
                 state.running = true;
+                record_capacity_refresh_inflight(1);
                 None
             }
         };
@@ -603,6 +784,7 @@ impl HybridCapacityManager {
                 .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
         }
 
+        let refresh_start = Instant::now();
         let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
             warn!(error = ?err, "capacity refresh function panicked");
             Err("capacity refresh panicked".to_string())
@@ -610,10 +792,20 @@ impl HybridCapacityManager {
         if let Ok(update) = &result {
             self.update_capacity(update.clone(), source).await;
         }
+        let refresh_duration = refresh_start.elapsed();
+        if result.is_err() {
+            record_capacity_update_failed(source.as_metric_label());
+        }
+        record_capacity_refresh_result(
+            source.as_metric_label(),
+            if result.is_ok() { "success" } else { "error" },
+            refresh_duration,
+        );
 
         {
             let mut state = self.refresh_state.lock().await;
             state.running = false;
+            record_capacity_refresh_inflight(0);
             let _ = state.result_tx.send(Some(result.clone()));
         }
 
@@ -634,6 +826,7 @@ impl HybridCapacityManager {
                 let (tx, _) = watch::channel(None);
                 state.result_tx = tx;
                 state.running = true;
+                record_capacity_refresh_inflight(1);
                 true
             }
         };
@@ -643,6 +836,7 @@ impl HybridCapacityManager {
         }
 
         tokio::spawn(async move {
+            let refresh_start = Instant::now();
             let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
                 warn!(error = ?err, "capacity refresh function panicked");
                 Err("capacity refresh panicked".to_string())
@@ -650,9 +844,19 @@ impl HybridCapacityManager {
             if let Ok(update) = &result {
                 self.update_capacity(update.clone(), source).await;
             }
+            let refresh_duration = refresh_start.elapsed();
+            if result.is_err() {
+                record_capacity_update_failed(source.as_metric_label());
+            }
+            record_capacity_refresh_result(
+                source.as_metric_label(),
+                if result.is_ok() { "success" } else { "error" },
+                refresh_duration,
+            );
 
             let mut state = self.refresh_state.lock().await;
             state.running = false;
+            record_capacity_refresh_inflight(0);
             let _ = state.result_tx.send(Some(result));
         });
 
@@ -670,7 +874,6 @@ impl HybridCapacityManager {
     }
 
     /// Return whether a refresh is currently in flight.
-    #[cfg(test)]
     pub async fn refresh_in_progress(&self) -> bool {
         self.refresh_state.lock().await.running
     }
@@ -692,20 +895,19 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 /// without affecting the global singleton, avoiding test pollution.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// let manager = create_isolated_manager(HybridStrategyConfig::default());
 /// manager
 ///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
 ///     .await;
 /// ```
-#[cfg(test)]
 #[allow(dead_code)]
 pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
     Arc::new(HybridCapacityManager::new(config))
 }
 
 /// Start background update task
-pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
+pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     let manager = get_capacity_manager();
     let mut interval = manager.get_config().scheduled_update_interval;
 
@@ -727,12 +929,10 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
             let disks = disks.clone();
             let started = manager
                 .clone()
-                .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
-                    calculate_data_dir_used_capacity(&disks)
-                        .await
-                        .map(|scan| scan.to_capacity_update())
-                        .map_err(|e| e.to_string())
-                })
+                .spawn_refresh_if_needed(
+                    DataSource::Scheduled,
+                    move || async move { refresh_capacity_with_scope(disks, false).await },
+                )
                 .await;
 
             if started {
@@ -751,11 +951,14 @@ pub async fn start_background_task(disks: Vec<rustfs_madmin::Disk>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
         ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE,
         ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
     };
     use serial_test::serial;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     #[serial]
@@ -894,6 +1097,22 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_update_capacity_preserves_retrieval_metadata() {
+        let manager = HybridCapacityManager::from_env();
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 10), DataSource::RealTime)
+            .await;
+
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 1000);
+        assert_eq!(cached.file_count, 10);
+        assert_eq!(cached.source, DataSource::RealTime);
+        assert!(!cached.is_estimated);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_record_write_operation() {
         let manager = HybridCapacityManager::from_env();
 
@@ -901,6 +1120,37 @@ mod tests {
 
         let frequency = manager.get_write_frequency().await;
         assert_eq!(frequency, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_write_frequency_window() {
+        let manager = HybridCapacityManager::from_env();
+
+        for _ in 0..20 {
+            manager.record_write_operation().await;
+        }
+
+        assert_eq!(manager.get_write_frequency().await, 20);
+    }
+
+    #[test]
+    #[serial]
+    fn test_recent_write_count_ignores_future_buckets() {
+        let mut record = WriteRecord {
+            last_write_time: None,
+            write_count: 1,
+            write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
+        };
+
+        record.write_buckets[0] = WriteBucket { second: 120, count: 3 };
+        record.write_buckets[1] = WriteBucket { second: 90, count: 2 };
+
+        assert_eq!(
+            record.recent_write_count(100),
+            2,
+            "buckets from future seconds should not inflate recent write frequency"
+        );
     }
 
     #[tokio::test]
@@ -918,6 +1168,326 @@ mod tests {
 
         // Fresh cache, should not need update
         assert!(!manager.needs_fast_update().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_cache_age_tracking() {
+        let manager = HybridCapacityManager::from_env();
+
+        assert!(manager.get_cache_age().await.is_none());
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 1), DataSource::RealTime)
+            .await;
+
+        let age = manager.get_cache_age().await.unwrap();
+        assert!(age < Duration::from_secs(1));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let age = manager.get_cache_age().await.unwrap();
+        assert!(age >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_data_source_tracking() {
+        let manager = HybridCapacityManager::from_env();
+
+        for source in [
+            DataSource::RealTime,
+            DataSource::Scheduled,
+            DataSource::WriteTriggered,
+            DataSource::Fallback,
+        ] {
+            manager.update_capacity(CapacityUpdate::exact(1000, 1), source).await;
+            assert_eq!(manager.get_capacity().await.unwrap().source, source);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_needs_fast_update_waits_for_write_trigger_delay() {
+        let manager = create_isolated_manager(HybridStrategyConfig {
+            scheduled_update_interval: Duration::from_secs(60),
+            write_trigger_delay: Duration::from_millis(50),
+            write_frequency_threshold: 1,
+            fast_update_threshold: Duration::from_millis(10),
+            enable_smart_update: true,
+            enable_write_trigger: true,
+        });
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        manager.record_write_operation().await;
+        manager.record_write_operation().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(
+            !manager.needs_fast_update().await,
+            "write-triggered refresh should wait for debounce delay after a qualifying burst"
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(manager.needs_fast_update().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_needs_fast_update_respects_enable_write_trigger() {
+        let manager = create_isolated_manager(HybridStrategyConfig {
+            scheduled_update_interval: Duration::from_secs(60),
+            write_trigger_delay: Duration::from_secs(60),
+            write_frequency_threshold: 1,
+            fast_update_threshold: Duration::from_millis(10),
+            enable_smart_update: true,
+            enable_write_trigger: false,
+        });
+
+        manager
+            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
+            .await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        manager.record_write_operation().await;
+        manager.record_write_operation().await;
+
+        assert!(
+            !manager.needs_fast_update().await,
+            "write-triggered refresh should be disabled when enable_write_trigger is false"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrent_access() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let mgr = manager.clone();
+            handles.push(tokio::spawn(async move {
+                mgr.update_capacity(CapacityUpdate::exact(i as u64 * 100, i), DataSource::RealTime)
+                    .await;
+                mgr.record_write_operation().await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert!(manager.get_capacity().await.is_some());
+        assert_eq!(manager.get_write_frequency().await, 10);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_performance_overhead() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let start = Instant::now();
+
+        for i in 0..1000 {
+            manager
+                .update_capacity(CapacityUpdate::exact(i as u64, i), DataSource::RealTime)
+                .await;
+            manager.record_write_operation().await;
+            let _ = manager.get_capacity().await;
+        }
+
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refresh_or_join_singleflight() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mgr1 = manager.clone();
+        let calls1 = calls.clone();
+        let first = tokio::spawn(async move {
+            mgr1.refresh_or_join(DataSource::Scheduled, move || async move {
+                calls1.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::exact(2048, 8))
+            })
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mgr2 = manager.clone();
+        let calls2 = calls.clone();
+        let second = tokio::spawn(async move {
+            mgr2.refresh_or_join(DataSource::WriteTriggered, move || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(4096, 16))
+            })
+            .await
+        });
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.total_used, 2048);
+        assert_eq!(second.total_used, 2048);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 2048);
+        assert_eq!(cached.file_count, 8);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_refresh_if_needed_deduplicates_background_refresh() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_manager = manager.clone();
+        let first_calls = calls.clone();
+        let started = first_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(CapacityUpdate::estimated(8192, 32))
+            })
+            .await;
+        assert!(started);
+
+        let second_manager = manager.clone();
+        let second_calls = calls.clone();
+        let started = second_manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, move || async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CapacityUpdate::exact(1, 1))
+            })
+            .await;
+        assert!(!started);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!manager.refresh_in_progress().await);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 8192);
+        assert!(cached.is_estimated);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_record_write_operation_with_scope_token_marks_dirty_disks() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        let token = uuid::Uuid::new_v4();
+        record_capacity_scope(
+            token,
+            CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: "node-a".to_string(),
+                    drive_path: "/tmp/disk-a".to_string(),
+                }],
+            },
+        );
+
+        manager.record_write_operation_with_scope_token(Some(token)).await;
+
+        let dirty_disks = manager.get_dirty_disks().await;
+        assert_eq!(dirty_disks.len(), 1);
+        assert_eq!(dirty_disks[0].endpoint, "node-a");
+        assert_eq!(dirty_disks[0].drive_path, "/tmp/disk-a");
+        assert_eq!(manager.get_write_frequency().await, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_dirty_disks_drains_global_dirty_scope_registry() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        record_global_dirty_scope(CapacityScope {
+            disks: vec![CapacityScopeDisk {
+                endpoint: "node-bg".to_string(),
+                drive_path: "/tmp/disk-bg".to_string(),
+            }],
+        });
+
+        let dirty_disks = manager.get_dirty_disks().await;
+        assert_eq!(dirty_disks.len(), 1);
+        assert_eq!(dirty_disks[0].endpoint, "node-bg");
+        assert_eq!(dirty_disks[0].drive_path, "/tmp/disk-bg");
+
+        let second_read = manager.get_dirty_disks().await;
+        assert_eq!(second_read.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_capacity_recomputes_total_from_disk_cache_for_subset_refresh() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 300,
+                    file_count: 3,
+                    is_estimated: false,
+                    per_disk: vec![
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "node-a".to_string(),
+                                drive_path: "/tmp/disk-a".to_string(),
+                            },
+                            used_bytes: 100,
+                            file_count: 1,
+                            is_estimated: false,
+                        },
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "node-b".to_string(),
+                                drive_path: "/tmp/disk-b".to_string(),
+                            },
+                            used_bytes: 200,
+                            file_count: 2,
+                            is_estimated: false,
+                        },
+                    ],
+                    expected_disk_count: Some(2),
+                    replaces_disk_cache: true,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::RealTime,
+            )
+            .await;
+
+        manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 150,
+                    file_count: 1,
+                    is_estimated: false,
+                    per_disk: vec![DiskCapacityUpdate {
+                        disk: CapacityScopeDisk {
+                            endpoint: "node-a".to_string(),
+                            drive_path: "/tmp/disk-a".to_string(),
+                        },
+                        used_bytes: 150,
+                        file_count: 1,
+                        is_estimated: false,
+                    }],
+                    expected_disk_count: Some(1),
+                    replaces_disk_cache: false,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::WriteTriggered,
+            )
+            .await;
+
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 350);
     }
 
     #[tokio::test]

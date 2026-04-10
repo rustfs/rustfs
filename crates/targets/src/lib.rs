@@ -18,7 +18,7 @@ pub mod error;
 pub mod store;
 pub mod target;
 
-pub use check::check_mqtt_broker_available;
+pub use check::{check_mqtt_broker_available, check_mqtt_broker_available_with_tls};
 pub use error::{StoreError, TargetError};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};

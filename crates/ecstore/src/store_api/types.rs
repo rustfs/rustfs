@@ -70,8 +70,10 @@ pub struct ObjectOptions {
 
     pub eval_metadata: Option<HashMap<String, String>>,
 
+    pub resolved_checksum: Option<Bytes>,
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
+    pub capacity_scope_token: Option<Uuid>,
 }
 
 impl ObjectOptions {
@@ -283,7 +285,7 @@ pub struct ObjectInfo {
     pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
-    pub put_object_reader: Option<PutObjReader>,
+    pub put_object_reader: Option<ChunkNativePutData>,
     pub etag: Option<String>,
     pub inlined: bool,
     pub metadata_only: bool,
@@ -509,6 +511,18 @@ impl ObjectInfo {
             })
             .collect();
 
+        let actual_size = fi
+            .parts
+            .iter()
+            .map(|part| {
+                if part.actual_size > 0 {
+                    part.actual_size
+                } else {
+                    i64::try_from(part.size).unwrap_or_default()
+                }
+            })
+            .sum();
+
         // TODO: part checksums
 
         ObjectInfo {
@@ -521,6 +535,7 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
+            actual_size,
             parts,
             is_latest: fi.is_latest,
             user_tags,

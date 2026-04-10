@@ -46,6 +46,8 @@ use rustfs_config::{
     DEFAULT_COMPRESS_ENABLE, DEFAULT_COMPRESS_EXTENSIONS, DEFAULT_COMPRESS_MIME_TYPES, DEFAULT_COMPRESS_MIN_SIZE,
     ENV_COMPRESS_ENABLE, ENV_COMPRESS_EXTENSIONS, ENV_COMPRESS_MIME_TYPES, ENV_COMPRESS_MIN_SIZE, EnableState,
 };
+use rustfs_ecstore::compress::{STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES, STANDARD_EXCLUDE_COMPRESS_EXTENSIONS};
+use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
 use std::str::FromStr;
 use tower_http::compression::predicate::Predicate;
 use tracing::debug;
@@ -196,6 +198,20 @@ impl CompressionConfig {
 
         None
     }
+
+    pub(crate) fn is_excluded_filename(filename: &str) -> bool {
+        has_string_suffix_in_slice(&filename.to_ascii_lowercase(), STANDARD_EXCLUDE_COMPRESS_EXTENSIONS)
+    }
+
+    pub(crate) fn is_excluded_mime_type(content_type: &str) -> bool {
+        let main_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        !main_type.is_empty() && has_pattern(STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES, &main_type)
+    }
 }
 
 impl Default for CompressionConfig {
@@ -299,23 +315,37 @@ impl Predicate for CompressionPredicate {
             return false;
         }
 
-        // Check if the response matches configured extension via Content-Disposition
+        // Hard-stop archive/media/package MIME types even if the whitelist matches.
+        // This includes tar, gzip, bzip2, xz, zstd, zip, rar, 7z, lzip, lzma, lzop variants,
+        // plus video/*, audio/*, image/*, font/*, application/pdf, and application/wasm.
+        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
+            && let Ok(ct) = content_type.to_str()
+        {
+            if CompressionConfig::is_excluded_mime_type(ct) {
+                debug!("Skipping compression for excluded Content-Type '{}'", ct);
+                return false;
+            }
+
+            if self.config.matches_mime_type(ct) {
+                debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
+                return true;
+            }
+        }
+
+        // Hard-stop archive-like attachment downloads even if the whitelist matches.
         if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION)
             && let Ok(cd) = content_disposition.to_str()
             && let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd)
-            && self.config.matches_extension(&filename)
         {
-            debug!("Compressing response: filename '{}' matches configured extension", filename);
-            return true;
-        }
+            if CompressionConfig::is_excluded_filename(&filename) {
+                debug!("Skipping compression for excluded filename '{}'", filename);
+                return false;
+            }
 
-        // Check if the response matches configured MIME type
-        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
-            && let Ok(ct) = content_type.to_str()
-            && self.config.matches_mime_type(ct)
-        {
-            debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
-            return true;
+            if self.config.matches_extension(&filename) {
+                debug!("Compressing response: filename '{}' matches configured extension", filename);
+                return true;
+            }
         }
 
         // Default: don't compress (whitelist approach)
@@ -405,7 +435,11 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
 /// Tower layer that injects `RequestPathCategory` into each response's extensions
-/// based on the incoming request URI path. Must be placed before `CompressionLayer`.
+/// based on the incoming request URI path.
+///
+/// It must be placed inside `CompressionLayer` so the category is available when
+/// the outer compression middleware evaluates its response predicate. With
+/// `tower::ServiceBuilder`, that means adding this layer after `CompressionLayer`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PathCategoryInjectionLayer;
 
@@ -625,6 +659,42 @@ mod tests {
         assert_eq!(predicate.config.extensions.len(), 2);
         assert_eq!(predicate.config.mime_patterns.len(), 2);
         assert_eq!(predicate.config.min_size, 1000);
+    }
+
+    #[test]
+    fn test_compression_predicate_skips_archive_mime_type_even_when_whitelisted() {
+        let predicate = CompressionPredicate::new(CompressionConfig {
+            enabled: true,
+            extensions: vec![],
+            mime_patterns: vec!["application/zip".to_string()],
+            min_size: 0,
+        });
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/zip")
+            .header(http::header::CONTENT_LENGTH, "4096")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("response");
+
+        assert!(!predicate.should_compress(&response));
+    }
+
+    #[test]
+    fn test_compression_predicate_skips_archive_filename_even_when_whitelisted() {
+        let predicate = CompressionPredicate::new(CompressionConfig {
+            enabled: true,
+            extensions: vec![".zip".to_string()],
+            mime_patterns: vec![],
+            min_size: 0,
+        });
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_DISPOSITION, r#"attachment; filename="bundle.zip""#)
+            .header(http::header::CONTENT_LENGTH, "4096")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("response");
+
+        assert!(!predicate.should_compress(&response));
     }
 
     #[test]

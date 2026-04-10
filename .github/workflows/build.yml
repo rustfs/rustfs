@@ -204,6 +204,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Always enable Tokio unstable features (required by dial9-tokio-telemetry).
       # The RUSTFLAGS env var takes precedence over .cargo/config.toml [build] rustflags,
       # so we must include --cfg tokio_unstable here explicitly; otherwise an empty
@@ -320,19 +321,26 @@ jobs:
               ;;
           esac
 
+          # Normalize version used for package filenames
+          PACKAGE_VERSION="${VERSION}"
+          if [[ "$PACKAGE_VERSION" == v* ]]; then
+            PACKAGE_VERSION="${PACKAGE_VERSION#v}"
+          fi
+
           # Generate package name based on build type
           if [[ -n "$VARIANT" ]]; then
             ARCH_WITH_VARIANT="${ARCH}-${VARIANT}"
           else
             ARCH_WITH_VARIANT="${ARCH}"
           fi
+          PACKAGE_BASENAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}"
 
           if [[ "$BUILD_TYPE" == "development" ]]; then
             # Development build: rustfs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
             PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
           else
             # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-v${VERSION}"
+            PACKAGE_NAME="${PACKAGE_BASENAME}-v${PACKAGE_VERSION}"
           fi
 
           # Create zip packages for all platforms
@@ -402,7 +410,7 @@ jobs:
           if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Create latest version filename
             # Convert from rustfs-linux-x86_64-musl-v1.0.0 to rustfs-linux-x86_64-musl-latest
-            LATEST_FILE="${PACKAGE_NAME%-v*}-latest.zip"
+            LATEST_FILE="${PACKAGE_BASENAME}-latest.zip"
 
             echo "🔄 Creating latest version: ${PACKAGE_NAME}.zip -> $LATEST_FILE"
             cp "${PACKAGE_NAME}.zip" "$LATEST_FILE"
@@ -415,7 +423,7 @@ jobs:
             # Development builds (only main branch triggers development builds)
             # Create main-latest version filename
             # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
-            MAIN_LATEST_FILE="${PACKAGE_NAME%-dev-*}-main-latest.zip"
+            MAIN_LATEST_FILE="${PACKAGE_BASENAME}-main-latest.zip"
 
             echo "🔄 Creating main-latest version: ${PACKAGE_NAME}.zip -> $MAIN_LATEST_FILE"
             cp "${PACKAGE_NAME}.zip" "$MAIN_LATEST_FILE"

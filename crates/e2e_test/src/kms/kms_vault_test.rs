@@ -42,7 +42,7 @@ impl VaultKmsTestContext {
         env.setup_vault_transit().await?;
 
         env.start_rustfs_for_vault().await?;
-        env.configure_vault_kms().await?;
+        env.configure_vault_transit_kms().await?;
 
         start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
