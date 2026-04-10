@@ -26,7 +26,7 @@ use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::s3_api::acl;
 use crate::storage::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::*;
@@ -539,10 +539,6 @@ impl DefaultBucketUsecase {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let requester_is_owner = match req_info_ref(&req) {
             Ok(r) => r.is_owner,
@@ -596,10 +592,6 @@ impl DefaultBucketUsecase {
     }
 
     pub async fn execute_put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketAclInput {
             bucket,
             access_control_policy,
@@ -627,10 +619,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
         let input = req.input.clone();
 
@@ -670,10 +658,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -689,10 +673,6 @@ impl DefaultBucketUsecase {
     }
 
     pub async fn execute_get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketAclInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -712,10 +692,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -738,10 +714,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -798,10 +770,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -830,10 +798,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -862,10 +826,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -893,10 +853,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -924,10 +880,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -958,10 +910,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
@@ -981,10 +929,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1007,10 +951,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketEncryptionInput>,
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1040,10 +980,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1079,10 +1015,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1111,10 +1043,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1153,10 +1081,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketPolicyInput>,
     ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1187,10 +1111,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketPolicyStatusInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1268,10 +1188,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1307,10 +1223,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketTaggingInput>,
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1341,10 +1253,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1379,10 +1287,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketVersioningInput { bucket, .. } = req.input;
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1405,10 +1309,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketEncryptionInput {
             bucket,
             server_side_encryption_configuration,
@@ -1447,10 +1347,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketLifecycleConfigurationInput {
             bucket,
             lifecycle_configuration,
@@ -1512,9 +1408,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
         let request_region = req.region.clone();
 
         let PutBucketNotificationConfigurationInput {
@@ -1588,10 +1481,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1649,10 +1538,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketCorsInput {
             bucket,
             cors_configuration,
@@ -1687,10 +1572,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketReplicationInput {
             bucket,
             replication_configuration,
@@ -1729,10 +1610,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutPublicAccessBlockInput {
             bucket,
             public_access_block_configuration,
@@ -1761,10 +1638,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1796,10 +1669,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketVersioningInput {
             bucket,
             versioning_configuration,
@@ -1827,10 +1696,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
             bucket,
@@ -1895,10 +1760,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input.clone();
         let ListObjectsV2Input {
             bucket,
@@ -1963,10 +1824,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -2001,10 +1858,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input.clone();
         let ListObjectVersionsInput {
             bucket,
@@ -2055,61 +1908,10 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let request_marker = req.input.marker.clone();
         let v2_resp = self.execute_list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| {
-            let next_marker = if v2.is_truncated.unwrap_or(false) {
-                let last_key = v2
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.last())
-                    .and_then(|obj| obj.key.as_ref())
-                    .cloned();
-
-                let last_prefix = v2
-                    .common_prefixes
-                    .as_ref()
-                    .and_then(|prefixes| prefixes.last())
-                    .and_then(|prefix| prefix.prefix.as_ref())
-                    .cloned();
-
-                match (last_key, last_prefix) {
-                    (Some(k), Some(p)) => {
-                        if k > p {
-                            Some(k)
-                        } else {
-                            Some(p)
-                        }
-                    }
-                    (Some(k), None) => Some(k),
-                    (None, Some(p)) => Some(p),
-                    (None, None) => None,
-                }
-            } else {
-                None
-            };
-
-            let marker = Some(request_marker.unwrap_or_default());
-
-            ListObjectsOutput {
-                contents: v2.contents,
-                delimiter: v2.delimiter,
-                encoding_type: v2.encoding_type,
-                name: v2.name,
-                prefix: v2.prefix,
-                max_keys: v2.max_keys,
-                common_prefixes: v2.common_prefixes,
-                is_truncated: v2.is_truncated,
-                marker,
-                next_marker,
-                ..Default::default()
-            }
-        }))
+        Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }
 }
 
