@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::DeadlockRequestGuard;
+use super::GetObjectRequestContext;
 use super::get_object_zero_copy::{GetObjectIoPlanning, GetObjectPreparedRead, prepare_get_object_read_execution};
-use super::types::GetObjectRequestContext;
 use crate::error::ApiError;
 use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_buffer_size_opt_in};
 use crate::storage::options::filter_object_metadata;

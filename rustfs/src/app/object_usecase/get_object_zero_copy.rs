@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::types::GetObjectRequestContext;
+use super::GetObjectRequestContext;
 use crate::error::ApiError;
 use crate::storage::concurrency::{self, ConcurrencyManager};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};

@@ -23,12 +23,12 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
+use crate::storage::s3_api::acl;
 use crate::storage::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::{acl, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -1333,7 +1333,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(tagging::build_get_bucket_tagging_output(tag_set)))
+        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2394,6 +2394,20 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_get_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
