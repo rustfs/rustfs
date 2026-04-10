@@ -325,6 +325,16 @@ fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     }
 }
 
+async fn execute_get_object_with_fast_path_enabled(
+    usecase: &DefaultObjectUsecase,
+    req: S3Request<GetObjectInput>,
+) -> S3Result<S3Response<GetObjectOutput>> {
+    temp_env::with_var(rustfs_config::ENV_OBJECT_GET_CHUNK_FAST_PATH_ENABLE, Some("true"), || async move {
+        usecase.execute_get_object(req).await
+    })
+    .await
+}
+
 #[tokio::test]
 async fn execute_get_object_rejects_zero_part_number() {
     let input = GetObjectInput::builder()
@@ -383,7 +393,7 @@ async fn prepare_get_object_chunk_read_marks_direct_path_for_single_disk_store()
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(payload.len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -476,7 +486,7 @@ async fn execute_get_object_range_marks_direct_path_for_single_disk_store() {
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(63 * 1024 + 1));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -552,7 +562,7 @@ async fn execute_get_object_range_marks_direct_path_for_multi_disk_store_without
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -620,7 +630,7 @@ async fn execute_get_object_range_marks_reconstructed_path_for_multi_disk_store_
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -669,7 +679,7 @@ async fn execute_get_object_part_number_marks_direct_path_for_single_disk_store(
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(parts[0].len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -717,7 +727,7 @@ async fn execute_get_object_whole_multipart_marks_direct_path_for_single_disk_st
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(parts.iter().map(|part| part.len() as i64).sum()));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -774,7 +784,7 @@ async fn execute_get_object_part_number_marks_reconstructed_path_for_multi_disk_
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(parts[0].len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -825,7 +835,7 @@ async fn execute_get_object_part_number_marks_reconstructed_path_for_second_mult
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(parts[1].len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -876,7 +886,7 @@ async fn execute_get_object_part_number_marks_reconstructed_path_for_final_multi
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(parts[2].len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -953,7 +963,7 @@ async fn execute_get_object_whole_multipart_marks_reconstructed_path_for_missing
     );
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some(expected.len() as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
@@ -1018,7 +1028,7 @@ async fn execute_get_object_multipart_range_marks_reconstructed_path_for_missing
     }
 
     let usecase = DefaultObjectUsecase::without_context();
-    let response = usecase.execute_get_object(req).await.unwrap();
+    let response = execute_get_object_with_fast_path_enabled(&usecase, req).await.unwrap();
     assert_eq!(response.output.content_length, Some((range_end - range_start + 1) as i64));
     let mut body = response.output.body.expect("expected body");
     let mut collected = Vec::new();
