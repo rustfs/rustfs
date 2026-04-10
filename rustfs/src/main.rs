@@ -134,6 +134,11 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
         .join(", ")
 }
 
+fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
+    rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
+        && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
+}
+
 async fn async_main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -348,6 +353,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     } else {
         None
     };
+
+    if is_using_default_credentials(&config) {
+        warn!(
+            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+            rustfs_credentials::DEFAULT_ACCESS_KEY,
+            rustfs_credentials::DEFAULT_SECRET_KEY
+        );
+    }
 
     let ctx = CancellationToken::new();
 
@@ -745,5 +758,23 @@ mod tests {
             formatted,
             "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
         );
+    }
+
+    #[test]
+    fn is_using_default_credentials_returns_true_for_default_keys() {
+        let mut config = rustfs::config::Config::new("127.0.0.1:9000", Vec::new());
+        config.console_enable = true;
+        config.console_address = "127.0.0.1:9001".to_string();
+
+        assert!(is_using_default_credentials(&config));
+    }
+
+    #[test]
+    fn is_using_default_credentials_returns_false_for_custom_keys() {
+        let mut config = rustfs::config::Config::new("127.0.0.1:9000", Vec::new());
+        config.access_key = "custom-access-key".to_string();
+        config.secret_key = "custom-secret-key".to_string();
+
+        assert!(!is_using_default_credentials(&config));
     }
 }

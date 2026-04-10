@@ -214,16 +214,6 @@ pub async fn start_http_server(
         info!(target: "rustfs::main::startup", "To enable the console, restart the server with --console-enable and a valid --console-address.");
     }
 
-    if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
-        && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
-    {
-        warn!(
-            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-            rustfs_credentials::DEFAULT_ACCESS_KEY,
-            rustfs_credentials::DEFAULT_SECRET_KEY
-        );
-    }
-
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
     let s3_service = {
