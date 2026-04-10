@@ -1061,8 +1061,11 @@ impl LocalDisk {
         }
 
         let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        // Explicit directory markers and real directories can resolve to the same logical path.
         let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
-            if let Some((_, existing_skip_object)) = dir_stack.iter_mut().find(|(name, _)| *name == dir_name) {
+            if let Some((last_dir_name, existing_skip_object)) = dir_stack.last_mut()
+                && *last_dir_name == dir_name
+            {
                 *existing_skip_object |= skip_object;
             } else {
                 dir_stack.push((dir_name, skip_object));
