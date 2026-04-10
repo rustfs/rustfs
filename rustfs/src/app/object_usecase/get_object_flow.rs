@@ -19,9 +19,11 @@ use crate::error::ApiError;
 use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_buffer_size_opt_in};
 use crate::storage::options::filter_object_metadata;
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
+use futures_util::StreamExt;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
+use rustfs_ecstore::store_api::{GetObjectChunkPath, HTTPRangeSpec, ObjectInfo};
+use rustfs_io_core::BoxChunkStream;
 use rustfs_object_io::get::{
     GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodyPlanningInputs as ObjectIoGetObjectBodyPlanningInputs,
     GetObjectBodySource, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
@@ -31,6 +33,7 @@ use rustfs_object_io::get::{
     build_get_object_checksums as object_io_build_get_object_checksums,
     build_get_object_output_context as object_io_build_get_object_output_context,
     chunk_body_data_plane_labels as object_io_chunk_body_data_plane_labels,
+    get_object_chunk_path_label as object_io_get_object_chunk_path_label,
     materialize_get_object_body as object_io_materialize_get_object_body, plan_get_object_body as object_io_plan_get_object_body,
     plan_get_object_strategy_layout as object_io_plan_get_object_strategy_layout,
 };
@@ -46,6 +49,65 @@ pub(super) struct GetObjectBootstrap {
     pub(super) request_start: std::time::Instant,
     pub(super) request_guard: GetObjectGuard,
     pub(super) _deadlock_request_guard: DeadlockRequestGuard,
+}
+
+fn classify_get_object_midstream_error(err: &std::io::Error) -> &'static str {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains("bitrot") {
+        "bitrot"
+    } else if lower.contains("decode") {
+        "decode"
+    } else {
+        match err.kind() {
+            std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => "channel_closed",
+            _ => "io_other",
+        }
+    }
+}
+
+fn instrument_get_object_chunk_stream(
+    request_context: &GetObjectRequestContext,
+    chunk_stream: BoxChunkStream,
+    path: GetObjectChunkPath,
+    copy_mode: rustfs_io_metrics::CopyMode,
+    response_content_length: i64,
+) -> BoxChunkStream {
+    let bucket = request_context.bucket.clone();
+    let key = request_context.key.clone();
+    let version_id = request_context.opts.version_id.clone();
+    let path_label = object_io_get_object_chunk_path_label(path);
+    let mut sent_bytes = 0usize;
+
+    Box::pin(chunk_stream.map(move |result| match result {
+        Ok(chunk) => {
+            sent_bytes = sent_bytes.saturating_add(chunk.len());
+            Ok(chunk)
+        }
+        Err(err) => {
+            let error_kind = classify_get_object_midstream_error(&err);
+            rustfs_io_metrics::record_get_object_fast_path_midstream_error(
+                path_label,
+                copy_mode,
+                error_kind,
+                sent_bytes,
+                response_content_length,
+            );
+            warn!(
+                bucket = %bucket,
+                key = %key,
+                version_id = ?version_id,
+                path = path_label,
+                copy_mode = copy_mode.as_str(),
+                promised_bytes = response_content_length,
+                sent_bytes,
+                error_kind,
+                error = %err,
+                "GetObject chunk fast path failed mid-stream after response commit"
+            );
+            Err(err)
+        }
+    }))
 }
 
 async fn build_get_object_body_adapter<R>(
@@ -300,6 +362,8 @@ pub(super) async fn build_get_object_output_context(
             copy_mode,
         } => {
             let (io_path, copy_mode) = object_io_chunk_body_data_plane_labels(path, copy_mode);
+            let chunk_stream =
+                instrument_get_object_chunk_stream(request_context, chunk_stream, path, copy_mode, response_content_length);
             (
                 object_io_build_chunk_blob(chunk_stream),
                 ObjectIoGetObjectDataPlaneMetricContract::disk(io_path, copy_mode),
@@ -374,6 +438,7 @@ mod tests {
     use super::*;
     use http::HeaderMap;
     use rustfs_ecstore::store_api::ObjectOptions;
+    use rustfs_io_core::IoChunk;
 
     fn sample_range(start: i64, end: i64) -> HTTPRangeSpec {
         HTTPRangeSpec {
@@ -416,5 +481,49 @@ mod tests {
 
         assert_eq!(strategy_range.start, 0);
         assert_eq!(strategy_range.end, 511);
+    }
+
+    #[test]
+    fn classify_get_object_midstream_error_maps_expected_variants() {
+        assert_eq!(
+            classify_get_object_midstream_error(&std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
+            "unexpected_eof"
+        );
+        assert_eq!(
+            classify_get_object_midstream_error(&std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")),
+            "channel_closed"
+        );
+        assert_eq!(
+            classify_get_object_midstream_error(&std::io::Error::other("bitrot verification failed")),
+            "bitrot"
+        );
+        assert_eq!(
+            classify_get_object_midstream_error(&std::io::Error::other("decode chunk failed")),
+            "decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_get_object_chunk_stream_preserves_payload() {
+        let request_context = sample_request_context();
+        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
+            Ok(IoChunk::Shared(bytes::Bytes::from_static(b" world"))),
+        ]));
+
+        let mut instrumented = instrument_get_object_chunk_stream(
+            &request_context,
+            chunk_stream,
+            GetObjectChunkPath::Direct,
+            rustfs_io_metrics::CopyMode::SharedBytes,
+            11,
+        );
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = instrumented.next().await {
+            collected.extend_from_slice(chunk.unwrap().as_bytes().as_ref());
+        }
+
+        assert_eq!(collected, b"hello world");
     }
 }
