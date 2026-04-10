@@ -28,7 +28,7 @@ use crate::storage::s3_api::bucket::{
     build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::s3_api::{acl, encryption, replication, tagging};
+use crate::storage::s3_api::{acl, tagging};
 use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
@@ -1033,9 +1033,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(encryption::build_get_bucket_encryption_output(
+        Ok(S3Response::new(GetBucketEncryptionOutput {
             server_side_encryption_configuration,
-        )))
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1297,9 +1297,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(replication::build_get_bucket_replication_output(
-            replication_configuration,
-        )))
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(replication_configuration),
+        }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2352,6 +2352,20 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_delete_public_access_block(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_encryption_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketEncryptionInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_encryption(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
