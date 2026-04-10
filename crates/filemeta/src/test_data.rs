@@ -145,6 +145,11 @@ pub fn create_issue_2265_legacy_meta_v2_config_xlmeta() -> Result<Vec<u8>> {
     decode_hex_fixture(include_str!("../tests/fixtures/issue_2265_legacy_meta_v2_config.hex"))
 }
 
+/// Legacy pool xl.meta captured in issue #2434. Header/meta versions are 3/2.
+pub fn create_issue_2434_legacy_meta_v2_pool_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/issue_2434_legacy_meta_v2_pool.hex"))
+}
+
 fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
     wr.push(MSGPACK_EXT8);
     wr.push(12);

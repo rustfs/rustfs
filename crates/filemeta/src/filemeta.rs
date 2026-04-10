@@ -1134,6 +1134,32 @@ mod test {
     }
 
     #[test]
+    fn test_issue_2434_legacy_meta_v2_pool_compatibility() {
+        let data = create_issue_2434_legacy_meta_v2_pool_xlmeta().expect("Failed to load issue #2434 pool fixture");
+        let (major, minor, header_ver, meta_ver) = FileMeta::read_format_versions(&data).unwrap();
+        assert_eq!((major, minor, header_ver, meta_ver), (1, 3, 3, 2));
+
+        let fm = FileMeta::load(&data).expect("Failed to parse legacy issue #2434 pool xl.meta");
+        assert_eq!(fm.meta_ver, 2);
+        assert_eq!(fm.versions.len(), 1);
+        assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
+
+        let fi = fm
+            .into_fileinfo(".rustfs.sys", "pool.bin", "", true, false, true)
+            .expect("Failed to extract file info from legacy issue #2434 pool xl.meta");
+        assert_eq!(fi.size, 48);
+        assert_eq!(fi.num_versions, 1);
+        assert_eq!(fi.version_id, None);
+        assert_eq!(fi.metadata.get("etag").map(String::as_str), Some("8d270d7a184cfa30cc0bf09ea74fd964"));
+        assert_eq!(
+            fi.data_dir.map(|id| id.to_string()).as_deref(),
+            Some("2bcefaca-44dd-4f01-a79e-63eeb0dda396")
+        );
+        assert!(fi.uses_legacy_checksum);
+        assert!(fi.is_latest);
+    }
+
+    #[test]
     fn test_legacy_v1_object_xlmeta_compatibility() {
         let data = create_legacy_v1_object_xlmeta().expect("Failed to create legacy v1 object xl.meta");
         let (major, minor, header_ver, meta_ver) = FileMeta::read_format_versions(&data).unwrap();
