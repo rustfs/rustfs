@@ -491,4 +491,24 @@ mod tests {
         let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_extract_sse_kms_key_id_header() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("archive.tar".to_string())
+            .build()
+            .unwrap();
+
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+        req.headers
+            .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, HeaderValue::from_static("test-kms-key-id"));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let fs = FS::new();
+
+        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
 }

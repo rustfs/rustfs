@@ -719,7 +719,23 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&request_context.headers) {
-            return self.execute_put_object_extract(req, request_context).await;
+            let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject).suppress_event();
+            if is_sse_kms_requested(&req.input, &request_context.headers) {
+                return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+            }
+            let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
+            self.check_bucket_quota(&req.input.bucket, quota_operation, resolved_size as u64)
+                .await?;
+            let notify = self
+                .context
+                .as_ref()
+                .map(|context| context.notify())
+                .unwrap_or_else(default_notify_interface);
+            let input = req.input;
+            let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
+            let result = Ok(S3Response::new(output));
+            let _ = helper.complete(&result);
+            return result;
         }
 
         let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
@@ -3025,31 +3041,6 @@ impl DefaultObjectUsecase {
             payload: Some(SelectObjectContentEventStream::new(stream)),
         }))
     }
-
-    #[instrument(level = "debug", skip(self, req, request_context))]
-    async fn execute_put_object_extract(
-        &self,
-        req: S3Request<PutObjectInput>,
-        request_context: PutObjectRequestContext,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
-        if is_sse_kms_requested(&req.input, &request_context.headers) {
-            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
-        }
-        let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
-        self.check_bucket_quota(&req.input.bucket, QuotaOperation::PutObject, resolved_size as u64)
-            .await?;
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
-        let input = req.input;
-        let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
 }
 
 fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
@@ -3095,6 +3086,33 @@ mod tests {
 
         let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[test]
+    fn normalize_delete_objects_version_id_handles_null_uuid_and_empty_values() {
+        let (raw, uuid) = normalize_delete_objects_version_id(Some("null".to_string())).unwrap();
+        assert_eq!(raw.as_deref(), Some("null"));
+        assert_eq!(uuid, Some(Uuid::nil()));
+
+        let (raw, uuid) = normalize_delete_objects_version_id(Some(String::new())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
+        let (raw, uuid) = normalize_delete_objects_version_id(Some("   ".to_string())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
+        let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let (raw, uuid) = normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
+        assert_eq!(raw.as_deref(), Some(valid.as_str()));
+        assert_eq!(uuid, Some(Uuid::parse_str(&valid).unwrap()));
+
+        let err = normalize_delete_objects_version_id(Some("not-a-uuid".to_string())).unwrap_err();
+        assert!(!err.is_empty());
+
+        let (raw, uuid) = normalize_delete_objects_version_id(None).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
     }
 
     #[tokio::test]
