@@ -24,7 +24,7 @@ mod tests {
         process_lambda_configurations, process_queue_configurations, process_topic_configurations,
         validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
-    use http::{HeaderMap, HeaderValue, StatusCode};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
     use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -35,11 +35,26 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-        ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        CORSConfiguration, CORSRule, Delimiter, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput,
+        GetObjectTaggingInput, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
     };
-    use s3s::{S3Error, S3ErrorCode, s3_error};
+    use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::OffsetDateTime;
+
+    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn test_fs_creation() {
@@ -168,6 +183,58 @@ mod tests {
 
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_acl_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_acl(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectLegalHoldInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_legal_hold(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_retention_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectRetentionInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_retention(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_tagging(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]
