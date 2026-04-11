@@ -626,6 +626,11 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        let _ = store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
         validate_bucket_object_lock_enabled(&bucket).await?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
@@ -1034,7 +1039,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
-        let mut helper =
+        let helper =
             OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention).suppress_event();
         let PutObjectRetentionInput {
             bucket,
@@ -1101,7 +1106,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
         opts.eval_metadata = Some(eval_metadata);
 
-        let object_info = store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
+        store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
             error!("put_object_metadata failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
@@ -1109,9 +1114,6 @@ impl S3 for FS {
         let output = PutObjectRetentionOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
-
-        let version_id = req.input.version_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        helper = helper.object(object_info).version_id(version_id);
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
