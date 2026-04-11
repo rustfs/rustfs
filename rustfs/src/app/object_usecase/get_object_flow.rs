@@ -35,17 +35,15 @@ use rustfs_object_io::get::{
     build_cors_wrapped_get_object_flow_result as object_io_build_cors_wrapped_get_object_flow_result,
     build_get_object_checksums as object_io_build_get_object_checksums,
     build_get_object_output_context as object_io_build_get_object_output_context,
-    build_memory_blob as object_io_build_memory_blob, build_reader_blob as object_io_build_reader_blob,
-    chunk_body_data_plane_labels as object_io_chunk_body_data_plane_labels,
+    build_memory_blob as object_io_build_memory_blob, chunk_body_data_plane_labels as object_io_chunk_body_data_plane_labels,
     get_object_chunk_path_label as object_io_get_object_chunk_path_label,
     materialize_get_object_body as object_io_materialize_get_object_body, plan_get_object_body as object_io_plan_get_object_body,
     plan_get_object_strategy_layout as object_io_plan_get_object_strategy_layout,
 };
 use s3s::S3Result;
 use s3s::dto::StreamingBlob;
-use std::io::SeekFrom;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncRead;
 use tracing::{debug, error, info, warn};
 
 pub(super) struct GetObjectBootstrap {
@@ -63,8 +61,14 @@ struct ChunkCommitMaterializationError {
 }
 
 fn build_chunk_materialization_length_error(actual: usize, expected: usize) -> std::io::Error {
+    let error_kind = if actual > expected {
+        std::io::ErrorKind::InvalidData
+    } else {
+        std::io::ErrorKind::UnexpectedEof
+    };
+
     std::io::Error::new(
-        std::io::ErrorKind::UnexpectedEof,
+        error_kind,
         format!("chunk fast path produced {actual} bytes before response commit, expected {expected}"),
     )
 }
@@ -83,42 +87,19 @@ async fn materialize_chunk_stream_before_commit_with_threshold(
         streamed_bytes: 0,
     })?;
 
-    if expected_bytes <= in_memory_threshold_bytes {
-        let mut buf = Vec::with_capacity(expected_bytes);
-        let mut streamed_bytes = 0usize;
-
-        while let Some(result) = chunk_stream.next().await {
-            let chunk = result.map_err(|source| ChunkCommitMaterializationError { source, streamed_bytes })?;
-            let bytes = chunk.as_bytes();
-            streamed_bytes = streamed_bytes.saturating_add(bytes.len());
-            if streamed_bytes > expected_bytes {
-                return Err(ChunkCommitMaterializationError {
-                    source: build_chunk_materialization_length_error(streamed_bytes, expected_bytes),
-                    streamed_bytes,
-                });
-            }
-            buf.extend_from_slice(bytes.as_ref());
-        }
-
-        if streamed_bytes != expected_bytes {
-            return Err(ChunkCommitMaterializationError {
-                source: build_chunk_materialization_length_error(streamed_bytes, expected_bytes),
-                streamed_bytes,
-            });
-        }
-
-        return Ok(object_io_build_memory_blob(
-            Bytes::from(buf),
-            response_content_length,
-            optimal_buffer_size,
-        ));
+    // Objects larger than the in-memory threshold fall back to the legacy reader path
+    // rather than spooling to disk, to avoid exhausting local disk under concurrent large downloads.
+    if expected_bytes > in_memory_threshold_bytes {
+        return Err(ChunkCommitMaterializationError {
+            source: std::io::Error::other(format!(
+                "chunk fast path object size {expected_bytes} exceeds in-memory threshold \
+                 {in_memory_threshold_bytes}; falling back to legacy reader"
+            )),
+            streamed_bytes: 0,
+        });
     }
 
-    let std_file = tempfile::tempfile().map_err(|source| ChunkCommitMaterializationError {
-        source,
-        streamed_bytes: 0,
-    })?;
-    let mut spool_file = tokio::fs::File::from_std(std_file);
+    let mut buf = Vec::with_capacity(expected_bytes);
     let mut streamed_bytes = 0usize;
 
     while let Some(result) = chunk_stream.next().await {
@@ -131,10 +112,7 @@ async fn materialize_chunk_stream_before_commit_with_threshold(
                 streamed_bytes,
             });
         }
-        spool_file
-            .write_all(bytes.as_ref())
-            .await
-            .map_err(|source| ChunkCommitMaterializationError { source, streamed_bytes })?;
+        buf.extend_from_slice(bytes.as_ref());
     }
 
     if streamed_bytes != expected_bytes {
@@ -144,16 +122,11 @@ async fn materialize_chunk_stream_before_commit_with_threshold(
         });
     }
 
-    spool_file
-        .flush()
-        .await
-        .map_err(|source| ChunkCommitMaterializationError { source, streamed_bytes })?;
-    spool_file
-        .seek(SeekFrom::Start(0))
-        .await
-        .map_err(|source| ChunkCommitMaterializationError { source, streamed_bytes })?;
-
-    Ok(object_io_build_reader_blob(spool_file, response_content_length, optimal_buffer_size))
+    Ok(object_io_build_memory_blob(
+        Bytes::from(buf),
+        response_content_length,
+        optimal_buffer_size,
+    ))
 }
 
 async fn materialize_chunk_stream_before_commit(
@@ -594,23 +567,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_spools_large_payload_to_file() {
+    async fn materialize_chunk_stream_before_commit_falls_back_for_large_payload() {
         let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
             Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
             Ok(IoChunk::Shared(bytes::Bytes::from_static(b" world"))),
         ]));
 
-        let mut body = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 4)
+        // When payload exceeds the in-memory threshold an error is returned so the
+        // caller can fall back to the legacy reader path rather than spooling to disk.
+        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 4)
             .await
-            .unwrap()
-            .unwrap();
+            .unwrap_err();
 
-        let mut collected = Vec::new();
-        while let Some(chunk) = body.next().await {
-            collected.extend_from_slice(&chunk.unwrap());
-        }
-
-        assert_eq!(collected, b"hello world");
+        assert_eq!(err.streamed_bytes, 0);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Other);
     }
 
     #[tokio::test]
