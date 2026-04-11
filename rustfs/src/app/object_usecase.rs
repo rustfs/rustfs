@@ -46,7 +46,6 @@ use datafusion::arrow::{
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
-use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
 use rustfs_ecstore::bucket::{
@@ -68,7 +67,7 @@ use rustfs_ecstore::bucket::{
         DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
         schedule_replication_delete,
     },
-    tagging::{decode_tags, encode_tags},
+    tagging::decode_tags,
     utils::serialize,
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
@@ -1002,83 +1001,6 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        result
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_object_tagging(
-        &self,
-        req: S3Request<PutObjectTaggingInput>,
-    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
-        let PutObjectTaggingInput {
-            bucket,
-            key: object,
-            tagging,
-            ..
-        } = req.input.clone();
-
-        crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let tags = encode_tags(tagging.tag_set);
-        debug!("Encoded tags: {}", tags);
-
-        let version_id = req.input.version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id)?.map(Into::into),
-            ..Default::default()
-        };
-
-        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
-            error!("Failed to put object tags: {}", e);
-            counter!("rustfs.put_object_tagging.failure").increment(1);
-            ApiError::from(e)
-        })?;
-
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?req.input.version_id,
-                    error = %err,
-                    "failed to load object info for put-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
-
-        counter!("rustfs.put_object_tagging.success").increment(1);
-
-        let event_version_id = req
-            .input
-            .version_id
-            .as_deref()
-            .filter(|version_id| !version_id.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                event_object_info
-                    .as_ref()
-                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
-            })
-            .unwrap_or_default();
-        if let Some(event_object_info) = event_object_info {
-            helper = helper.object(event_object_info);
-        }
-        helper = helper.version_id(event_version_id);
-
-        let result = Ok(S3Response::new(PutObjectTaggingOutput {
-            version_id: req.input.version_id.clone(),
-        }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
@@ -2230,74 +2152,6 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_object_tagging(
-        &self,
-        req: S3Request<DeleteObjectTaggingInput>,
-    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
-        let DeleteObjectTaggingInput {
-            bucket,
-            key: object,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            error!("Store not initialized");
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let version_id_for_parse = version_id.clone();
-        let opts = ObjectOptions {
-            version_id: parse_object_version_id(version_id_for_parse)?.map(Into::into),
-            ..Default::default()
-        };
-
-        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
-            error!("Failed to delete object tags: {}", e);
-            ApiError::from(e)
-        })?;
-
-        let event_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(
-                    bucket = %bucket,
-                    object = %object,
-                    version_id = ?version_id,
-                    error = %err,
-                    "failed to load object info for delete-object-tagging notification; falling back to request context"
-                );
-                None
-            }
-        };
-
-        counter!("rustfs.delete_object_tagging.success").increment(1);
-
-        let event_version_id = version_id
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                event_object_info
-                    .as_ref()
-                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
-            })
-            .unwrap_or_default();
-        if let Some(event_object_info) = event_object_info {
-            helper = helper.object(event_object_info);
-        }
-        helper = helper.version_id(event_version_id);
-
-        let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
-        let _ = helper.complete(&result);
-        let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
-        result
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject).suppress_event();
         // mc get 2
@@ -2954,51 +2808,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_put_object_tagging_rejects_too_many_tags() {
-        let tag_set = (0..11)
-            .map(|index| Tag {
-                key: Some(format!("k{index}")),
-                value: Some(format!("v{index}")),
-            })
-            .collect();
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging { tag_set })
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
-    }
-
-    #[tokio::test]
-    async fn execute_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: Some(String::new()),
-                    value: Some("v1".to_string()),
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
-        assert!(err.to_string().contains("Tag key cannot be empty"));
-    }
-
-    #[tokio::test]
     async fn execute_copy_object_rejects_self_copy_without_replace_directive() {
         let input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {
@@ -3070,21 +2879,6 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
 
         let err = usecase.execute_delete_objects(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
-        let input = DeleteObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::DELETE);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_delete_object_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -3345,27 +3139,6 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
 
         let err = usecase.execute_put_object_retention(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_put_object_tagging_returns_internal_error_when_store_uninitialized() {
-        let input = PutObjectTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: Some("k".to_string()),
-                    value: Some("v".to_string()),
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
