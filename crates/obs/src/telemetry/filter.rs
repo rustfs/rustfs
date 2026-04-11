@@ -87,6 +87,69 @@ fn should_suppress_noisy_crates(logger_level: &str, default_level: Option<&str>,
     !is_verbose_level(logger_level)
 }
 
+fn directive_applies_to_target(directive_target: &str, target: &str) -> bool {
+    let directive_target = directive_target.trim();
+
+    !directive_target.is_empty()
+        && (directive_target == target
+            || target
+                .strip_prefix(directive_target)
+                .is_some_and(|rest| rest.starts_with("::")))
+}
+
+fn effective_level_for_target<'a>(rust_log: &'a str, target: &str) -> Option<&'a str> {
+    let mut best_match: Option<(usize, usize, &'a str)> = None;
+
+    for (idx, directive) in rust_log.split(',').map(str::trim).filter(|d| !d.is_empty()).enumerate() {
+        if let Some((directive_target, level)) = directive.rsplit_once('=') {
+            let directive_target = directive_target.trim();
+            let level = level.trim();
+            if !is_level_token(level) {
+                continue;
+            }
+
+            let prefix_len = if directive_target.is_empty() {
+                0
+            } else if directive_applies_to_target(directive_target, target) {
+                directive_target.len()
+            } else {
+                continue;
+            };
+
+            if best_match.is_none_or(|(best_prefix_len, best_idx, _)| {
+                prefix_len > best_prefix_len || (prefix_len == best_prefix_len && idx >= best_idx)
+            }) {
+                best_match = Some((prefix_len, idx, level));
+            }
+        } else if is_level_token(directive)
+            && best_match.is_none_or(|(best_prefix_len, best_idx, _)| best_prefix_len == 0 && idx >= best_idx)
+        {
+            best_match = Some((0, idx, directive));
+        }
+    }
+
+    best_match.map(|(_, _, level)| level)
+}
+
+fn should_demote_http_request_logs(logger_level: &str, default_level: Option<&str>, rust_log: Option<&str>) -> bool {
+    if let Some(level) = default_level {
+        let level = level.trim().to_ascii_lowercase();
+        return matches!(level.as_str(), "info" | "warn");
+    }
+
+    if let Some(rust_log) = rust_log {
+        if let Some(level) = effective_level_for_target(rust_log, "rustfs::server::http") {
+            let level = level.trim().to_ascii_lowercase();
+            return matches!(level.as_str(), "info" | "warn");
+        }
+
+        return false;
+    }
+
+    let level = logger_level.trim().to_ascii_lowercase();
+    matches!(level.as_str(), "info" | "warn")
+}
+
 pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     // 1. Determine the base filter source.
     // If `default_level` is set (e.g. forced override), we use it.
@@ -111,15 +174,19 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
     // 2. Apply noisy crate suppression if needed.
     // We only suppress if the effective configuration is NOT verbose (i.e. not debug/trace).
     if should_suppress_noisy_crates(logger_level, default_level, rust_log_env.as_deref()) {
-        let directives = [
+        let mut directives = vec![
             ("hyper", LevelFilter::OFF),
             ("tonic", LevelFilter::OFF),
             ("h2", LevelFilter::OFF),
             ("reqwest", LevelFilter::OFF),
             ("tower", LevelFilter::OFF),
-            // HTTP request logs are demoted to WARN to reduce volume in production.
-            ("rustfs::server::http", LevelFilter::WARN),
         ];
+
+        if should_demote_http_request_logs(logger_level, default_level, rust_log_env.as_deref()) {
+            // HTTP request logs are demoted to WARN to reduce volume in production,
+            // but only when the effective log level is not stricter than WARN.
+            directives.push(("rustfs::server::http", LevelFilter::WARN));
+        }
 
         for (crate_name, level) in directives {
             // We use `add_directive` which effectively appends to the filter.
@@ -189,6 +256,22 @@ mod tests {
     }
 
     #[test]
+    fn test_should_demote_http_request_logs() {
+        assert!(should_demote_http_request_logs("info", None, None));
+        assert!(should_demote_http_request_logs("warn", None, None));
+        assert!(!should_demote_http_request_logs("error", None, None));
+        assert!(!should_demote_http_request_logs("off", None, None));
+        assert!(!should_demote_http_request_logs("info", None, Some("ERROR")));
+        assert!(should_demote_http_request_logs("error", None, Some("WARN")));
+        assert!(!should_demote_http_request_logs("info", None, Some("foo=warn")));
+        assert!(!should_demote_http_request_logs("info", None, Some("rustfs=error")));
+        assert!(!should_demote_http_request_logs("info", None, Some("rustfs::server=error")));
+        assert!(!should_demote_http_request_logs("info", None, Some("rustfs::server::http=error")));
+        assert!(!should_demote_http_request_logs("info", None, Some("WARN,rustfs::server::http=error")));
+        assert!(should_demote_http_request_logs("error", None, Some("WARN,rustfs::server::http=warn")));
+    }
+
+    #[test]
     fn test_build_env_filter_injects_suppressions_without_rust_log() {
         // When RUST_LOG is not set and the base level is non-verbose ("info"),
         // build_env_filter should inject suppression directives for noisy crates.
@@ -255,6 +338,42 @@ mod tests {
             assert!(
                 !filter_str.contains("hyper=off"),
                 "target-only verbose directive must not be overridden by suppression: {filter_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_does_not_promote_http_logs_above_error() {
+        temp_env::with_var("RUST_LOG", Some("ERROR"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string().to_ascii_lowercase();
+
+            assert!(
+                !filter_str.contains("rustfs::server::http=warn"),
+                "http logs must not be promoted above error level when RUST_LOG=ERROR overrides logger_level=info: {filter_str}"
+            );
+        });
+
+        temp_env::with_var("RUST_LOG", Some("rustfs=error"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string().to_ascii_lowercase();
+
+            assert!(
+                !filter_str.contains("rustfs::server::http=warn"),
+                "http logs must not be promoted above error level when RUST_LOG=rustfs=error overrides logger_level=info: {filter_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_does_not_fallback_to_logger_level_for_http_demotion() {
+        temp_env::with_var("RUST_LOG", Some("foo=warn"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string().to_ascii_lowercase();
+
+            assert!(
+                !filter_str.contains("rustfs::server::http=warn"),
+                "http log demotion must not fall back to logger_level when RUST_LOG only defines unrelated targets: {filter_str}"
             );
         });
     }
