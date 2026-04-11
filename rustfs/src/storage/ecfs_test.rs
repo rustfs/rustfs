@@ -35,9 +35,10 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, Delimiter, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput,
-        GetObjectTaggingInput, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        CORSConfiguration, CORSRule, DeleteObjectTaggingInput, Delimiter, GetObjectAclInput, GetObjectLegalHoldInput,
+        GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, PutObjectTaggingInput, QueueConfiguration, Tag,
+        Tagging, TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::OffsetDateTime;
@@ -234,6 +235,82 @@ mod tests {
 
         let fs = FS::new();
         let err = fs.get_object_tagging(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_rejects_too_many_tags() {
+        let tag_set = (0..11)
+            .map(|index| Tag {
+                key: Some(format!("k{index}")),
+                value: Some(format!("v{index}")),
+            })
+            .collect();
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging { tag_set })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some(String::new()),
+                    value: Some("v1".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Tag key cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some("k".to_string()),
+                    value: Some("v".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs
+            .delete_object_tagging(build_request(input, Method::DELETE))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
