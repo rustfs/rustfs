@@ -601,7 +601,8 @@ impl S3 for FS {
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         record_s3_op(S3Operation::GetObjectTagging, &req.input.bucket);
         let start_time = std::time::Instant::now();
-        let GetObjectTaggingInput { bucket, key: object, .. } = req.input.clone();
+        let bucket = req.input.bucket.as_str();
+        let object = req.input.key.as_str();
 
         info!("Starting get_object_tagging for bucket: {}, object: {}", bucket, object);
 
