@@ -21,9 +21,12 @@ sudo mkdir -p /data/rustfs/{vol1,vol2}
 # Create configuration directory
 sudo mkdir -p /etc/rustfs
 
+# Create log directory
+sudo mkdir -p /var/log/rustfs
+
 # Set directory permissions
-sudo chown -R rustfs:rustfs /opt/rustfs /data/rustfs
-sudo chmod 755 /opt/rustfs /data/rustfs
+sudo chown -R rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+sudo chmod 755 /opt/rustfs /data/rustfs /var/log/rustfs
 ```
 
 ## 2. Install RustFS

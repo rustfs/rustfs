@@ -147,8 +147,8 @@ add_ssh_key() {
 
 monitor_logs() {
     for SERVER in "${SERVER_LIST[@]}"; do
-        echo "Monitoring $SERVER:/var/logs/rustfs/rustfs.log ..."
-        ssh "$SERVER" "tail -F /var/logs/rustfs/rustfs.log" |
+        echo "Monitoring $SERVER:/var/log/rustfs/rustfs.log ..."
+        ssh "$SERVER" "tail -F /var/log/rustfs/rustfs.log" |
             sed "s/^/[$SERVER] /" &
     done
     wait
