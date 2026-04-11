@@ -469,7 +469,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
