@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, rustfs_binary_path};
+    use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     use http::header::{CONTENT_TYPE, HOST};
@@ -216,12 +217,129 @@ mod tests {
         Ok(builder.send().await?)
     }
 
+    async fn assert_archive_object_content_encoding(
+        client: &S3Client,
+        bucket: &str,
+        key: &str,
+        expected_content_encoding: Option<&str>,
+        expected_body: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let head_resp = client.head_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(head_resp.content_encoding(), expected_content_encoding);
+
+        let get_resp = client.get_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(get_resp.content_encoding(), expected_content_encoding);
+        let body = get_resp.body.collect().await?.into_bytes();
+        assert_eq!(body.as_ref(), expected_body);
+
+        Ok(())
+    }
+
+    async fn complete_archive_multipart_upload_with_content_encoding(
+        client: &S3Client,
+        bucket: &str,
+        key: &str,
+        content_encoding: Option<&str>,
+    ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let payload = random_bytes(MULTIPART_PART_SIZE + 256 * 1024);
+        let zip_bytes = build_zip_bytes(&[("payload.bin", payload.as_slice())])?;
+        assert!(zip_bytes.len() > MULTIPART_PART_SIZE, "zip payload must exceed multipart threshold");
+
+        let mut create_builder = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .content_type("application/zip");
+        if let Some(content_encoding) = content_encoding {
+            create_builder = create_builder.content_encoding(content_encoding);
+        }
+        let create_output = create_builder.send().await?;
+        let upload_id = create_output.upload_id().expect("multipart upload id");
+
+        let first_part = zip_bytes[..MULTIPART_PART_SIZE].to_vec();
+        let second_part = zip_bytes[MULTIPART_PART_SIZE..].to_vec();
+
+        let upload_part_1 = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(first_part))
+            .send()
+            .await?;
+
+        let upload_part_2 = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(2)
+            .body(ByteStream::from(second_part))
+            .send()
+            .await?;
+
+        let completed_upload = CompletedMultipartUpload::builder()
+            .parts(
+                CompletedPart::builder()
+                    .part_number(1)
+                    .e_tag(upload_part_1.e_tag().unwrap_or_default())
+                    .build(),
+            )
+            .parts(
+                CompletedPart::builder()
+                    .part_number(2)
+                    .e_tag(upload_part_2.e_tag().unwrap_or_default())
+                    .build(),
+            )
+            .build();
+
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await?;
+
+        Ok(zip_bytes)
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_archive_put_rejects_content_encoding_by_default() -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn test_archive_put_allows_content_encoding_by_default() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
-        env.start_rustfs_server_without_cleanup(vec![]).await?;
+        start_rustfs_server_with_env(&mut env, &[]).await?;
+        env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
+        let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
+        let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle.zip");
+        let response =
+            signed_put_request_with_headers(&object_url, &env.access_key, &env.secret_key, zip_bytes, "application/zip", "gzip")
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let client = env.create_s3_client();
+        let head_resp = client
+            .head_object()
+            .bucket(ARCHIVE_TEST_BUCKET)
+            .key("bundle.zip")
+            .send()
+            .await?;
+        assert_eq!(head_resp.content_encoding(), Some("gzip"));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_put_rejects_content_encoding_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING", "true")]).await?;
         env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
         let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
         let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle.zip");
@@ -232,7 +350,145 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.text().await?;
         assert!(
-            body.contains("InvalidArgument") || body.contains("Content-Encoding"),
+            body.contains("InvalidArgument") || body.contains("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING"),
+            "unexpected error body: {body}"
+        );
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_put_with_aws_chunked_does_not_persist_content_encoding_by_default()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[]).await?;
+        env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
+
+        let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
+        let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle-aws-chunked.zip");
+        let response = signed_put_request_with_headers(
+            &object_url,
+            &env.access_key,
+            &env.secret_key,
+            zip_bytes.clone(),
+            "application/zip",
+            "aws-chunked",
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let client = env.create_s3_client();
+        assert_archive_object_content_encoding(
+            &client,
+            ARCHIVE_TEST_BUCKET,
+            "bundle-aws-chunked.zip",
+            None,
+            zip_bytes.as_slice(),
+        )
+        .await?;
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_put_with_aws_chunked_and_effective_encoding_roundtrips_by_default()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[]).await?;
+        env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
+
+        let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
+        let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle-aws-chunked-gzip.zip");
+        let response = signed_put_request_with_headers(
+            &object_url,
+            &env.access_key,
+            &env.secret_key,
+            zip_bytes.clone(),
+            "application/zip",
+            "aws-chunked,gzip",
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let client = env.create_s3_client();
+        assert_archive_object_content_encoding(
+            &client,
+            ARCHIVE_TEST_BUCKET,
+            "bundle-aws-chunked-gzip.zip",
+            Some("gzip"),
+            zip_bytes.as_slice(),
+        )
+        .await?;
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_put_with_aws_chunked_allowed_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING", "true")]).await?;
+        env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
+
+        let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
+        let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle-strict-aws-chunked.zip");
+        let response = signed_put_request_with_headers(
+            &object_url,
+            &env.access_key,
+            &env.secret_key,
+            zip_bytes.clone(),
+            "application/zip",
+            "aws-chunked",
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let client = env.create_s3_client();
+        assert_archive_object_content_encoding(
+            &client,
+            ARCHIVE_TEST_BUCKET,
+            "bundle-strict-aws-chunked.zip",
+            None,
+            zip_bytes.as_slice(),
+        )
+        .await?;
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_put_with_aws_chunked_and_effective_encoding_rejects_when_strict_mode_enabled()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING", "true")]).await?;
+        env.create_test_bucket(ARCHIVE_TEST_BUCKET).await?;
+
+        let zip_bytes = build_zip_bytes(&[("alpha.txt", b"archive-body")])?;
+        let object_url = format!("{}/{}/{}", env.url, ARCHIVE_TEST_BUCKET, "bundle-strict-aws-chunked-gzip.zip");
+        let response = signed_put_request_with_headers(
+            &object_url,
+            &env.access_key,
+            &env.secret_key,
+            zip_bytes,
+            "application/zip",
+            "aws-chunked,gzip",
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.text().await?;
+        assert!(
+            body.contains("InvalidArgument") || body.contains("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING"),
             "unexpected error body: {body}"
         );
 
@@ -393,6 +649,90 @@ mod tests {
             expected_sha256.as_slice(),
             "multipart archive SHA256 mismatch"
         );
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_multipart_with_aws_chunked_and_effective_encoding_roundtrips_by_default()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[]).await?;
+        env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
+
+        let client = env.create_s3_client();
+        let zip_bytes = complete_archive_multipart_upload_with_content_encoding(
+            &client,
+            MULTIPART_ARCHIVE_TEST_BUCKET,
+            "multipart-aws-chunked-gzip.zip",
+            Some("aws-chunked,gzip"),
+        )
+        .await?;
+        assert_archive_object_content_encoding(
+            &client,
+            MULTIPART_ARCHIVE_TEST_BUCKET,
+            "multipart-aws-chunked-gzip.zip",
+            Some("gzip"),
+            zip_bytes.as_slice(),
+        )
+        .await?;
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_multipart_with_aws_chunked_allowed_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING", "true")]).await?;
+        env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
+
+        let client = env.create_s3_client();
+        let zip_bytes = complete_archive_multipart_upload_with_content_encoding(
+            &client,
+            MULTIPART_ARCHIVE_TEST_BUCKET,
+            "multipart-strict-aws-chunked.zip",
+            Some("aws-chunked"),
+        )
+        .await?;
+        assert_archive_object_content_encoding(
+            &client,
+            MULTIPART_ARCHIVE_TEST_BUCKET,
+            "multipart-strict-aws-chunked.zip",
+            None,
+            zip_bytes.as_slice(),
+        )
+        .await?;
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_archive_multipart_with_aws_chunked_and_effective_encoding_rejects_when_strict_mode_enabled()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        start_rustfs_server_with_env(&mut env, &[("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING", "true")]).await?;
+        env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
+
+        let client = env.create_s3_client();
+        let create_result = client
+            .create_multipart_upload()
+            .bucket(MULTIPART_ARCHIVE_TEST_BUCKET)
+            .key("multipart-strict-aws-chunked-gzip.zip")
+            .content_type("application/zip")
+            .content_encoding("aws-chunked,gzip")
+            .send()
+            .await;
+        assert!(create_result.is_err(), "strict mode should reject effective archive content encoding");
 
         env.stop_server();
         Ok(())

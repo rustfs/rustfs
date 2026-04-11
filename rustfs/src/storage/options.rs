@@ -35,8 +35,10 @@ use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
+use std::env;
 use std::sync::LazyLock;
-use tracing::error;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthType;
@@ -350,6 +352,8 @@ pub(crate) fn normalize_content_encoding_for_storage(value: &str) -> Option<Stri
 }
 
 const ENV_ALLOW_ARCHIVE_CONTENT_ENCODING: &str = "RUSTFS_ALLOW_ARCHIVE_CONTENT_ENCODING";
+const ENV_REJECT_ARCHIVE_CONTENT_ENCODING: &str = "RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING";
+static WARNED_DEPRECATED_ALLOW_ARCHIVE_CONTENT_ENCODING: AtomicBool = AtomicBool::new(false);
 
 const ARCHIVE_CONTENT_ENCODING_BLOCKED_SUFFIXES: &[&str] = &[
     ".zip",
@@ -394,11 +398,11 @@ pub(crate) fn validate_archive_content_encoding(
     content_type: Option<&str>,
     content_encoding: Option<&str>,
 ) -> S3Result<()> {
-    if rustfs_utils::get_env_bool(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, false) {
+    if !archive_content_encoding_strict_mode() {
         return Ok(());
     }
 
-    let Some(content_encoding) = content_encoding.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(content_encoding) = content_encoding.and_then(normalize_content_encoding_for_storage) else {
         return Ok(());
     };
 
@@ -411,9 +415,21 @@ pub(crate) fn validate_archive_content_encoding(
     Err(S3Error::with_message(
         S3ErrorCode::InvalidArgument,
         format!(
-            "Content-Encoding '{content_encoding}' is not allowed for archive objects by default; set {ENV_ALLOW_ARCHIVE_CONTENT_ENCODING}=true to allow legacy behavior"
+            "Content-Encoding '{content_encoding}' is not allowed for archive objects when {ENV_REJECT_ARCHIVE_CONTENT_ENCODING}=true"
         ),
     ))
+}
+
+fn archive_content_encoding_strict_mode() -> bool {
+    if env::var_os(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING).is_some()
+        && !WARNED_DEPRECATED_ALLOW_ARCHIVE_CONTENT_ENCODING.swap(true, Ordering::Relaxed)
+    {
+        warn!(
+            "{ENV_ALLOW_ARCHIVE_CONTENT_ENCODING} is deprecated and no longer controls the default behavior; use {ENV_REJECT_ARCHIVE_CONTENT_ENCODING}=true to enable strict archive Content-Encoding rejection"
+        );
+    }
+
+    rustfs_utils::get_env_bool(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, false)
 }
 
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
@@ -1428,15 +1444,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_archive_content_encoding_rejects_archive_suffix_by_default() {
-        let err = validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    fn test_validate_archive_content_encoding_allows_archive_suffix_by_default() {
+        validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).expect("default allow");
     }
 
     #[test]
-    fn test_validate_archive_content_encoding_rejects_archive_mime_by_default() {
-        let err = validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    fn test_validate_archive_content_encoding_allows_archive_mime_by_default() {
+        validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).expect("default allow");
     }
 
     #[test]
@@ -1445,9 +1459,73 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_archive_content_encoding_allows_legacy_opt_in() {
-        temp_env::with_var(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
-            validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("gzip")).expect("legacy opt-in");
+    fn test_validate_archive_content_encoding_allows_archive_sigv4_streaming_encoding_by_default() {
+        validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("aws-chunked"))
+            .expect("aws-chunked is request-side only");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_archive_sigv4_streaming_encoding_case_insensitive() {
+        validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("AWS-CHUNKED"))
+            .expect("aws-chunked stripping should be case-insensitive");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_allows_effective_archive_encoding_after_aws_chunked_stripped_by_default() {
+        validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("aws-chunked, gzip"))
+            .expect("default allow after stripping aws-chunked");
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_suffix_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err = validate_archive_content_encoding("bundle.tar.gz", Some("application/gzip"), Some("gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        });
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_archive_mime_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err = validate_archive_content_encoding("bundle", Some("application/zip"), Some("gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        });
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_rejects_effective_archive_encoding_after_aws_chunked_stripped_in_strict_mode() {
+        temp_env::with_var(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true"), || {
+            let err =
+                validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("aws-chunked, gzip")).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                Some(
+                    "Content-Encoding 'gzip' is not allowed for archive objects when RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING=true"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_strict_mode_takes_precedence_over_deprecated_allow_flag() {
+        temp_env::with_vars(
+            [
+                (ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, Some("true")),
+                (ENV_REJECT_ARCHIVE_CONTENT_ENCODING, Some("true")),
+            ],
+            || {
+                let err = validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("gzip")).unwrap_err();
+                assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            },
+        );
+    }
+
+    #[test]
+    fn test_validate_archive_content_encoding_deprecated_allow_flag_does_not_change_default_allow() {
+        temp_env::with_var(ENV_ALLOW_ARCHIVE_CONTENT_ENCODING, Some("false"), || {
+            validate_archive_content_encoding("bundle.zip", Some("application/zip"), Some("gzip"))
+                .expect("deprecated allow flag should not change default allow");
         });
     }
 
