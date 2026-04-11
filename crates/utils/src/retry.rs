@@ -172,25 +172,28 @@ pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use rand::RngExt;
-    use std::time::UNIX_EPOCH;
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn test_retry() {
-        let req_retry = 10;
-        let random = rand::rng().random_range(0..=100);
+    async fn retry_timer_yields_expected_number_of_retries() {
+        let max_retry = 3;
+        let retry_timer = RetryTimer::new(max_retry, Duration::from_millis(1), Duration::from_millis(2), NO_JITTER, 0);
 
-        let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, random);
-        println!("retry_timer: {retry_timer:?}");
-        while retry_timer.next().await.is_some() {
-            println!(
-                "\ntime: {:?}",
-                std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
-            );
-        }
+        let retries = timeout(Duration::from_secs(1), retry_timer.collect::<Vec<_>>())
+            .await
+            .expect("retry timer should complete")
+            .len();
+
+        assert_eq!(retries, max_retry as usize);
+    }
+
+    #[tokio::test]
+    async fn retry_timer_finishes_immediately_when_retry_count_is_zero() {
+        let mut retry_timer = RetryTimer::new(0, Duration::from_millis(1), Duration::from_millis(2), NO_JITTER, 0);
+
+        assert_eq!(retry_timer.next().await, None);
     }
 }
