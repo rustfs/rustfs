@@ -719,7 +719,23 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&request_context.headers) {
-            return self.execute_put_object_extract(req, request_context).await;
+            let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject).suppress_event();
+            if is_sse_kms_requested(&req.input, &request_context.headers) {
+                return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+            }
+            let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
+            self.check_bucket_quota(&req.input.bucket, quota_operation, resolved_size as u64)
+                .await?;
+            let notify = self
+                .context
+                .as_ref()
+                .map(|context| context.notify())
+                .unwrap_or_else(default_notify_interface);
+            let input = req.input;
+            let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
+            let result = Ok(S3Response::new(output));
+            let _ = helper.complete(&result);
+            return result;
         }
 
         let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
@@ -3024,31 +3040,6 @@ impl DefaultObjectUsecase {
         Ok(S3Response::new(SelectObjectContentOutput {
             payload: Some(SelectObjectContentEventStream::new(stream)),
         }))
-    }
-
-    #[instrument(level = "debug", skip(self, req, request_context))]
-    async fn execute_put_object_extract(
-        &self,
-        req: S3Request<PutObjectInput>,
-        request_context: PutObjectRequestContext,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
-        if is_sse_kms_requested(&req.input, &request_context.headers) {
-            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
-        }
-        let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
-        self.check_bucket_quota(&req.input.bucket, QuotaOperation::PutObject, resolved_size as u64)
-            .await?;
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
-        let input = req.input;
-        let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
     }
 }
 
