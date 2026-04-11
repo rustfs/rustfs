@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! End-to-end regression test for invalid GET object ranges.
+//! End-to-end regression tests for invalid and suffix GET object ranges.
 
 #[cfg(test)]
 mod tests {
@@ -76,5 +76,102 @@ mod tests {
             }
             other_err => panic!("Expected S3 service error, got: {other_err:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_object_suffix_byte_range_returns_correct_body() {
+        init_logging();
+        info!("TEST: GetObject suffix byte-range should return correct body");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-suffix-range";
+        let key = "range-suffix.bin";
+
+        // ~3 MB so the object spans multiple erasure blocks (block_size = 1 MB).
+        // Suffix ranges on single-block objects never hit the bug.
+        let file_size: usize = 3_095_910;
+        let content: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(content.clone()))
+            .send()
+            .await
+            .expect("PutObject should succeed");
+
+        // bytes=-8  — last 8 bytes (parquet footer read)
+        let result = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=-8")
+            .send()
+            .await
+            .expect("bytes=-8 should succeed");
+        let body = result.body.collect().await.expect("bytes=-8 body").into_bytes();
+        assert_eq!(body.len(), 8, "bytes=-8 body length");
+        assert_eq!(&body[..], &content[file_size - 8..], "bytes=-8 body content");
+
+        // bytes=-96 — last 96 bytes
+        let result = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=-96")
+            .send()
+            .await
+            .expect("bytes=-96 should succeed");
+        let body = result.body.collect().await.expect("bytes=-96 body").into_bytes();
+        assert_eq!(body.len(), 96, "bytes=-96 body length");
+        assert_eq!(&body[..], &content[file_size - 96..], "bytes=-96 body content");
+
+        // bytes=-1 — last byte
+        let result = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=-1")
+            .send()
+            .await
+            .expect("bytes=-1 should succeed");
+        let body = result.body.collect().await.expect("bytes=-1 body").into_bytes();
+        assert_eq!(body.len(), 1, "bytes=-1 body length");
+        assert_eq!(body[0], content[file_size - 1], "bytes=-1 body content");
+
+        // bytes=0-7  — absolute range (regression guard)
+        let result = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=0-7")
+            .send()
+            .await
+            .expect("bytes=0-7 should succeed");
+        let body = result.body.collect().await.expect("bytes=0-7 body").into_bytes();
+        assert_eq!(body.len(), 8, "bytes=0-7 body length");
+        assert_eq!(&body[..], &content[0..8], "bytes=0-7 body content");
+
+        // Equivalent absolute range for the same last-8-bytes window
+        let start = file_size - 8;
+        let end = file_size - 1;
+        let range = format!("bytes={start}-{end}");
+        let result = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(&range)
+            .send()
+            .await
+            .expect("absolute tail range should succeed");
+        let body = result.body.collect().await.expect("absolute tail body").into_bytes();
+        assert_eq!(body.len(), 8, "absolute tail body length");
+        assert_eq!(&body[..], &content[start..], "absolute tail body content");
     }
 }
