@@ -419,7 +419,7 @@ async fn build_reconstructed_part_stream(
     skip_verify_bitrot: bool,
     use_zero_copy: bool,
 ) -> Result<Option<BoxChunkStream>> {
-    let shard_length = till_offset - read_offset;
+    let shard_length = till_offset.saturating_sub(read_offset);
     let mut readers = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
     for (idx, disk_op) in disks.iter().enumerate() {
