@@ -103,25 +103,6 @@ impl FS {
         }
         Ok(out)
     }
-
-    #[cfg(test)]
-    pub(crate) fn normalize_delete_objects_version_id(
-        &self,
-        version_id: Option<String>,
-    ) -> std::result::Result<(Option<String>, Option<Uuid>), String> {
-        let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        match version_id {
-            Some(id) => {
-                if id.eq_ignore_ascii_case("null") {
-                    Ok((Some("null".to_string()), Some(Uuid::nil())))
-                } else {
-                    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-                    Ok((Some(id), Some(uuid)))
-                }
-            }
-            None => Ok((None, None)),
-        }
-    }
 }
 
 pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
