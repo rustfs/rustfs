@@ -37,8 +37,8 @@ mod tests {
     use s3s::dto::{
         CORSConfiguration, CORSRule, DeleteObjectTaggingInput, Delimiter, GetObjectAclInput, GetObjectLegalHoldInput,
         GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration, ObjectLockLegalHold,
-        ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, PutObjectTaggingInput, QueueConfiguration, Tag,
-        Tagging, TopicConfiguration,
+        ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, PutObjectLegalHoldInput,
+        PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, Tag, Tagging, TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::OffsetDateTime;
@@ -222,6 +222,32 @@ mod tests {
 
         let fs = FS::new();
         let err = fs.get_object_retention(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectLegalHoldInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_legal_hold(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_retention_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectRetentionInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_retention(build_request(input, Method::PUT)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
