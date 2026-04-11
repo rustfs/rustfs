@@ -617,7 +617,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let tags = store.get_object_tags(&bucket, &object, &opts).await.map_err(|e| {
+        let tags = store.get_object_tags(bucket, object, &opts).await.map_err(|e| {
             if is_err_object_not_found(&e) {
                 error!("Object not found: {}", e);
                 return s3_error!(NoSuchKey);
