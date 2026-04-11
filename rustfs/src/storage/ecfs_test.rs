@@ -856,31 +856,6 @@ mod tests {
         assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
     }
 
-    #[test]
-    fn test_delete_objects_version_id_normalization() {
-        use uuid::Uuid;
-
-        let fs = FS::new();
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some("null".to_string())).unwrap();
-        assert_eq!(raw.as_deref(), Some("null"));
-        assert_eq!(uuid, Some(Uuid::nil()));
-
-        let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
-        assert_eq!(raw.as_deref(), Some(valid.as_str()));
-        assert_eq!(uuid, Some(Uuid::parse_str(&valid).unwrap()));
-
-        let err = fs
-            .normalize_delete_objects_version_id(Some("not-a-uuid".to_string()))
-            .unwrap_err();
-        assert!(!err.is_empty());
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(None).unwrap();
-        assert!(raw.is_none());
-        assert!(uuid.is_none());
-    }
-
     /// Test that ListObjectVersionsOutput markers are correctly set
     /// This verifies the fix for boto3 ParamValidationError
     #[test]

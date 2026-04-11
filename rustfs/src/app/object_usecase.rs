@@ -3088,6 +3088,33 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
+    #[test]
+    fn normalize_delete_objects_version_id_handles_null_uuid_and_empty_values() {
+        let (raw, uuid) = normalize_delete_objects_version_id(Some("null".to_string())).unwrap();
+        assert_eq!(raw.as_deref(), Some("null"));
+        assert_eq!(uuid, Some(Uuid::nil()));
+
+        let (raw, uuid) = normalize_delete_objects_version_id(Some(String::new())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
+        let (raw, uuid) = normalize_delete_objects_version_id(Some("   ".to_string())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
+        let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let (raw, uuid) = normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
+        assert_eq!(raw.as_deref(), Some(valid.as_str()));
+        assert_eq!(uuid, Some(Uuid::parse_str(&valid).unwrap()));
+
+        let err = normalize_delete_objects_version_id(Some("not-a-uuid".to_string())).unwrap_err();
+        assert!(!err.is_empty());
+
+        let (raw, uuid) = normalize_delete_objects_version_id(None).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+    }
+
     #[tokio::test]
     async fn execute_put_object_tagging_rejects_too_many_tags() {
         let tag_set = (0..11)
