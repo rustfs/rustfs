@@ -308,6 +308,7 @@ fn build_list_object_versions_m_output(
         .next_marker
         .filter(|marker| !marker.is_empty())
         .map(|marker| encode_list_versions_value(&marker, encoding_type));
+    let next_version_id_marker = object_infos.next_version_idmarker.filter(|marker| !marker.is_empty());
 
     ListObjectVersionsMOutput {
         common_prefixes: Some(common_prefixes),
@@ -324,7 +325,7 @@ fn build_list_object_versions_m_output(
         max_keys: Some(params.max_keys),
         name: Some(bucket.to_owned()),
         next_key_marker,
-        next_version_id_marker: Some(object_infos.next_version_idmarker.unwrap_or_default()),
+        next_version_id_marker,
         prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
         request_charged: None,
         version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
@@ -2496,7 +2497,7 @@ mod tests {
         assert_eq!(output.key_marker.as_deref(), Some("marker%20value"));
         assert_eq!(output.version_id_marker.as_deref(), Some(""));
         assert_eq!(output.next_key_marker, None);
-        assert_eq!(output.next_version_id_marker.as_deref(), Some(""));
+        assert_eq!(output.next_version_id_marker, None);
 
         match &output.entries[0] {
             ListObjectVersionMEntry::Version(version) => {
