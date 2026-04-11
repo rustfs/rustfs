@@ -308,6 +308,7 @@ fn build_list_object_versions_m_output(
         .next_marker
         .filter(|marker| !marker.is_empty())
         .map(|marker| encode_list_versions_value(&marker, encoding_type));
+    let next_version_id_marker = object_infos.next_version_idmarker.filter(|marker| !marker.is_empty());
 
     ListObjectVersionsMOutput {
         common_prefixes: Some(common_prefixes),
@@ -324,7 +325,7 @@ fn build_list_object_versions_m_output(
         max_keys: Some(params.max_keys),
         name: Some(bucket.to_owned()),
         next_key_marker,
-        next_version_id_marker: Some(object_infos.next_version_idmarker.unwrap_or_default()),
+        next_version_id_marker,
         prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
         request_charged: None,
         version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
@@ -2452,6 +2453,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_list_object_versions_m_output_uses_params_and_hides_metadata_without_permissions() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectVersionsInfo {
+            is_truncated: false,
+            next_marker: Some(String::new()),
+            next_version_idmarker: Some(String::new()),
+            prefixes: vec!["logs and more/".to_string()],
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs and more/object one.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-04 00:00 UTC)),
+                size: 7,
+                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
+                user_tags: "env=prod".to_string(),
+                parity_blocks: 1,
+                data_blocks: 2,
+                ..Default::default()
+            }],
+        };
+
+        let params = ListObjectVersionsParams {
+            prefix: "logs and more/".to_string(),
+            delimiter: Some(" ".to_string()),
+            key_marker: Some("marker value".to_string()),
+            version_id_marker: None,
+            max_keys: 25,
+        };
+
+        let output = build_list_object_versions_m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            &HashMap::new(),
+        );
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more%2F"));
+        assert_eq!(output.delimiter.as_deref(), Some("%20"));
+        assert_eq!(output.key_marker.as_deref(), Some("marker%20value"));
+        assert_eq!(output.version_id_marker.as_deref(), Some(""));
+        assert_eq!(output.next_key_marker, None);
+        assert_eq!(output.next_version_id_marker, None);
+
+        match &output.entries[0] {
+            ListObjectVersionMEntry::Version(version) => {
+                assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
+                assert!(version.user_metadata.is_none());
+                assert!(version.user_tags.is_none());
+                assert!(version.internal.is_none());
+            }
+            other => panic!("expected version entry, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn execute_list_objects_returns_internal_error_when_store_uninitialized() {
         let input = ListObjectsInput::builder().bucket("test-bucket".to_string()).build().unwrap();
@@ -2551,6 +2609,66 @@ mod tests {
 
         let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
+    }
+
+    #[test]
+    fn build_list_objects_v2m_output_uses_params_and_hides_owner_without_fetch_owner() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            next_continuation_token: None,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs and more/object one.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-05 00:00 UTC)),
+                size: 13,
+                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
+                user_tags: "env=prod".to_string(),
+                parity_blocks: 1,
+                data_blocks: 2,
+                ..Default::default()
+            }],
+            prefixes: vec!["logs and more/archive/".to_string()],
+            ..Default::default()
+        };
+
+        let params = ListObjectsV2Params {
+            prefix: "logs and more/".to_string(),
+            max_keys: 25,
+            delimiter: Some("/".to_string()),
+            response_start_after: Some("logs and more/start after".to_string()),
+            start_after_for_query: Some("decoded start after".to_string()),
+            response_continuation_token: Some("opaque token".to_string()),
+            decoded_continuation_token: Some("decoded token".to_string()),
+        };
+
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            false,
+            &HashMap::new(),
+        );
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
+        assert_eq!(output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
+        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
+        assert_eq!(output.key_count, Some(2));
+        assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
+
+        let object = output.contents.as_ref().unwrap().first().unwrap();
+        assert_eq!(object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
+        assert!(object.owner.is_none());
+        assert!(object.user_metadata.is_none());
+        assert!(object.user_tags.is_none());
+        assert!(object.internal.is_none());
+
+        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        assert_eq!(prefix.prefix.as_deref(), Some("logs%20and%20more/archive/"));
     }
 
     #[tokio::test]
