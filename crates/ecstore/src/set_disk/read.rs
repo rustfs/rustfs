@@ -1564,7 +1564,7 @@ impl SetDisks {
 
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
-            let shard_length = till_offset - read_offset;
+            let shard_length = till_offset.saturating_sub(read_offset);
             for (idx, disk_op) in disks.iter().enumerate() {
                 match create_bitrot_reader(
                     files[idx].data.as_deref(),
