@@ -693,6 +693,15 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
         let GetObjectLockConfigurationInput { bucket, .. } = req.input;
 
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
