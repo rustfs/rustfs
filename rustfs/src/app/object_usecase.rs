@@ -3094,6 +3094,14 @@ mod tests {
         assert_eq!(raw.as_deref(), Some("null"));
         assert_eq!(uuid, Some(Uuid::nil()));
 
+        let (raw, uuid) = normalize_delete_objects_version_id(Some(String::new())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
+        let (raw, uuid) = normalize_delete_objects_version_id(Some("   ".to_string())).unwrap();
+        assert!(raw.is_none());
+        assert!(uuid.is_none());
+
         let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
         let (raw, uuid) = normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
         assert_eq!(raw.as_deref(), Some(valid.as_str()));
