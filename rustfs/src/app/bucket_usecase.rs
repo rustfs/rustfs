@@ -2460,7 +2460,7 @@ mod tests {
         let object_infos = ListObjectVersionsInfo {
             is_truncated: false,
             next_marker: Some(String::new()),
-            next_version_idmarker: None,
+            next_version_idmarker: Some(String::new()),
             prefixes: vec!["logs and more/".to_string()],
             objects: vec![ObjectInfo {
                 bucket: "demo-bucket".to_string(),
