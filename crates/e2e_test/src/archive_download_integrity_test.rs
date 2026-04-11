@@ -16,6 +16,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, rustfs_binary_path};
     use aws_sdk_s3::Client as S3Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     use http::header::{CONTENT_TYPE, HOST};
@@ -732,7 +733,16 @@ mod tests {
             .content_encoding("aws-chunked,gzip")
             .send()
             .await;
-        assert!(create_result.is_err(), "strict mode should reject effective archive content encoding");
+        let err = create_result.expect_err("strict mode should reject effective archive content encoding");
+        assert_eq!(err.code(), Some("InvalidArgument"));
+        assert!(
+            err.message().is_some_and(|message| {
+                message.contains("Content-Encoding") && message.contains("RUSTFS_REJECT_ARCHIVE_CONTENT_ENCODING")
+            }),
+            "unexpected error metadata: code={:?}, message={:?}",
+            err.code(),
+            err.message()
+        );
 
         env.stop_server();
         Ok(())
