@@ -130,29 +130,6 @@ struct ObjectMetadataPermissions {
     tags_allowed: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ListObjectVersionsMResponseContext {
-    bucket: String,
-    prefix: String,
-    delimiter: Option<String>,
-    max_keys: i32,
-    encoding_type: Option<EncodingType>,
-    key_marker: Option<String>,
-    version_id_marker: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ListObjectsV2MResponseContext {
-    bucket: String,
-    prefix: String,
-    delimiter: Option<String>,
-    max_keys: i32,
-    encoding_type: Option<EncodingType>,
-    continuation_token: Option<String>,
-    start_after: Option<String>,
-    fetch_owner: bool,
-}
-
 fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
     if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
         encode(value).into_owned()
@@ -250,7 +227,9 @@ async fn collect_list_objects_metadata_permissions<T>(
 
 fn build_list_object_versions_m_output(
     object_infos: ListObjectVersionsInfo,
-    context: &ListObjectVersionsMResponseContext,
+    bucket: &str,
+    params: &ListObjectVersionsParams,
+    encoding_type: Option<&EncodingType>,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectVersionsMOutput {
     let owner = rustfs_owner();
@@ -258,7 +237,7 @@ fn build_list_object_versions_m_output(
         .prefixes
         .into_iter()
         .map(|prefix_value| CommonPrefix {
-            prefix: Some(encode_list_versions_value(&prefix_value, context.encoding_type.as_ref())),
+            prefix: Some(encode_list_versions_value(&prefix_value, encoding_type)),
         })
         .collect::<Vec<_>>();
 
@@ -267,7 +246,7 @@ fn build_list_object_versions_m_output(
         .into_iter()
         .filter(|object| !object.name.is_empty())
         .map(|object| {
-            let object_name = encode_list_versions_value(&object.name, context.encoding_type.as_ref());
+            let object_name = encode_list_versions_value(&object.name, encoding_type);
             let version_id = object
                 .version_id
                 .map(|version| version.to_string())
@@ -328,34 +307,37 @@ fn build_list_object_versions_m_output(
     let next_key_marker = object_infos
         .next_marker
         .filter(|marker| !marker.is_empty())
-        .map(|marker| encode_list_versions_value(&marker, context.encoding_type.as_ref()));
+        .map(|marker| encode_list_versions_value(&marker, encoding_type));
 
     ListObjectVersionsMOutput {
         common_prefixes: Some(common_prefixes),
-        delimiter: context
+        delimiter: params
             .delimiter
             .clone()
-            .map(|value| encode_list_versions_value(&value, context.encoding_type.as_ref())),
-        encoding_type: context.encoding_type.clone(),
+            .map(|value| encode_list_versions_value(&value, encoding_type)),
+        encoding_type: encoding_type.cloned(),
         is_truncated: Some(object_infos.is_truncated),
         key_marker: Some(encode_list_versions_value(
-            context.key_marker.as_deref().unwrap_or_default(),
-            context.encoding_type.as_ref(),
+            params.key_marker.as_deref().unwrap_or_default(),
+            encoding_type,
         )),
-        max_keys: Some(context.max_keys),
-        name: Some(context.bucket.clone()),
+        max_keys: Some(params.max_keys),
+        name: Some(bucket.to_owned()),
         next_key_marker,
         next_version_id_marker: Some(object_infos.next_version_idmarker.unwrap_or_default()),
-        prefix: Some(encode_list_versions_value(&context.prefix, context.encoding_type.as_ref())),
+        prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
         request_charged: None,
-        version_id_marker: Some(context.version_id_marker.clone().unwrap_or_default()),
+        version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
         entries,
     }
 }
 
 fn build_list_objects_v2m_output(
     object_infos: ListObjectsV2Info,
-    context: &ListObjectsV2MResponseContext,
+    bucket: &str,
+    params: &ListObjectsV2Params,
+    encoding_type: Option<&EncodingType>,
+    fetch_owner: bool,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectsV2MOutput {
     let owner = rustfs_owner();
@@ -386,7 +368,7 @@ fn build_list_objects_v2m_output(
             };
 
             ObjectM {
-                key: Some(encode_list_objects_v2_value(&object.name, context.encoding_type.as_ref())),
+                key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                 last_modified: object.mod_time.map(Timestamp::from),
                 size: Some(object.get_actual_size().unwrap_or_default()),
                 e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -396,7 +378,7 @@ fn build_list_objects_v2m_output(
                         .clone()
                         .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
                 )),
-                owner: context.fetch_owner.then_some(owner.clone()),
+                owner: fetch_owner.then_some(owner.clone()),
                 user_metadata,
                 user_tags,
                 internal,
@@ -408,7 +390,7 @@ fn build_list_objects_v2m_output(
         .prefixes
         .into_iter()
         .map(|prefix| CommonPrefix {
-            prefix: Some(encode_list_objects_v2_value(&prefix, context.encoding_type.as_ref())),
+            prefix: Some(encode_list_objects_v2_value(&prefix, encoding_type)),
         })
         .collect::<Vec<_>>();
 
@@ -418,18 +400,18 @@ fn build_list_objects_v2m_output(
         .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
 
     ListObjectsV2MOutput {
-        name: Some(context.bucket.clone()),
-        prefix: Some(context.prefix.clone()),
-        max_keys: Some(context.max_keys),
+        name: Some(bucket.to_owned()),
+        prefix: Some(params.prefix.clone()),
+        max_keys: Some(params.max_keys),
         key_count: Some(key_count),
-        continuation_token: context.continuation_token.clone(),
+        continuation_token: params.response_continuation_token.clone(),
         is_truncated: Some(object_infos.is_truncated),
         next_continuation_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: context.delimiter.clone(),
-        encoding_type: context.encoding_type.clone(),
-        start_after: context.start_after.clone(),
+        delimiter: params.delimiter.clone(),
+        encoding_type: encoding_type.cloned(),
+        start_after: params.response_start_after.clone(),
         ..Default::default()
     }
 }
@@ -1709,17 +1691,9 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let ListObjectsV2Params {
-            prefix,
-            max_keys,
-            delimiter,
-            response_start_after,
-            start_after_for_query,
-            response_continuation_token,
-            decoded_continuation_token,
-        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -1730,12 +1704,12 @@ impl DefaultBucketUsecase {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.decoded_continuation_token.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
                 fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                params.start_after_for_query.clone(),
                 incl_deleted,
             )
             .await
@@ -1744,13 +1718,13 @@ impl DefaultBucketUsecase {
         let output = build_list_objects_v2_output(
             object_infos,
             fetch_owner.unwrap_or_default(),
-            max_keys,
+            params.max_keys,
             bucket,
-            prefix,
-            delimiter,
+            params.prefix,
+            params.delimiter,
             encoding_type,
-            response_continuation_token,
-            response_start_after,
+            params.response_continuation_token,
+            params.response_start_after,
         );
 
         Ok(S3Response::new(output))
@@ -1773,17 +1747,9 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let ListObjectsV2Params {
-            prefix,
-            max_keys,
-            delimiter,
-            response_start_after,
-            start_after_for_query,
-            response_continuation_token,
-            decoded_continuation_token,
-        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
         let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
@@ -1793,29 +1759,26 @@ impl DefaultBucketUsecase {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.decoded_continuation_token.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
                 fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                params.start_after_for_query.clone(),
                 incl_deleted,
             )
             .await
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let context = ListObjectsV2MResponseContext {
-            bucket,
-            prefix,
-            delimiter,
-            max_keys,
-            encoding_type,
-            continuation_token: response_continuation_token,
-            start_after: response_start_after,
-            fetch_owner: fetch_owner.unwrap_or_default(),
-        };
-        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            &bucket,
+            &params,
+            encoding_type.as_ref(),
+            fetch_owner.unwrap_or_default(),
+            &permissions,
+        );
 
         Ok(S3Response::new(output))
     }
@@ -1870,38 +1833,23 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let ListObjectVersionsParams {
-            prefix,
-            delimiter,
-            key_marker,
-            version_id_marker,
-            max_keys,
-        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
         let object_infos = store
             .list_object_versions(
                 &bucket,
-                &prefix,
-                key_marker.clone(),
-                version_id_marker.clone(),
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.key_marker.clone(),
+                params.version_id_marker.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
             )
             .await
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let context = ListObjectVersionsMResponseContext {
-            bucket,
-            prefix,
-            delimiter,
-            max_keys,
-            encoding_type,
-            key_marker,
-            version_id_marker,
-        };
-        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
+        let output = build_list_object_versions_m_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
 
         Ok(S3Response::new(output))
     }
@@ -2448,16 +2396,20 @@ mod tests {
             ),
         ]);
 
-        let context = ListObjectVersionsMResponseContext {
-            bucket: "demo-bucket".to_string(),
+        let params = ListObjectVersionsParams {
             prefix: "pre".to_string(),
             delimiter: Some("/".to_string()),
-            max_keys: 1000,
-            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
             key_marker: Some("start marker".to_string()),
             version_id_marker: Some("vid-1".to_string()),
+            max_keys: 1000,
         };
-        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
+        let output = build_list_object_versions_m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            &permissions,
+        );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("pre"));
@@ -2556,18 +2508,24 @@ mod tests {
             },
         )]);
 
-        let context = ListObjectsV2MResponseContext {
-            bucket: "demo-bucket".to_string(),
+        let params = ListObjectsV2Params {
             prefix: "logs/".to_string(),
-            delimiter: Some("/".to_string()),
             max_keys: 1000,
-            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
-            continuation_token: Some("start token".to_string()),
-            start_after: Some("logs/start after".to_string()),
-            fetch_owner: true,
+            delimiter: Some("/".to_string()),
+            response_start_after: Some("logs/start after".to_string()),
+            start_after_for_query: None,
+            response_continuation_token: Some("start token".to_string()),
+            decoded_continuation_token: None,
         };
 
-        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            true,
+            &permissions,
+        );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("logs/"));
