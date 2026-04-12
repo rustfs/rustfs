@@ -23,7 +23,8 @@ use rustfs_ecstore::{
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
     store_api::{
-        BucketOperations, ChunkNativePutData, CompletePart, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOptions,
+        BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, MakeBucketOptions, MultipartOperations, ObjectIO,
+        ObjectOptions,
     },
 };
 use rustfs_object_io::get::{GetObjectBodySource, GetObjectReadSetup};
