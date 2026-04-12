@@ -13,6 +13,8 @@
 rustfs/static/*
 !rustfs/static/.gitkeep
 vendor
+!vendor/s3s/
+!vendor/s3s/**
 cli/rustfs-gui/embedded-rustfs/rustfs
 *.log
 deploy/certs/*

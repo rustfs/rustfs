@@ -52,6 +52,9 @@ mod anonymous_access_test;
 #[cfg(test)]
 mod special_chars_test;
 
+#[cfg(test)]
+mod signed_get_equals_path_regression_test;
+
 // Content-Encoding header preservation test
 #[cfg(test)]
 mod content_encoding_test;

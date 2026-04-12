@@ -1,0 +1,122 @@
+[workspace]
+members = ["crates/s3s"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/Nugine/s3s"
+license = "Apache-2.0"
+rust-version = "1.92.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# deny
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+self_named_module_files = "deny"
+# warn
+dbg_macro = "warn"
+# allow
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+
+[profile.release]
+debug = "line-tables-only"
+
+[workspace.dependencies]
+# Data structures
+arc-swap = "1.9.1"
+arrayvec = "0.7.6"
+bytes = "1.11.1"
+bytestring = "1.5.0"
+indexmap = "2.13.1"
+once_cell = "1.21.4"
+smallvec = "1.15.1"
+uuid = "1.23.0"
+
+# Text encoding
+atoi = { version = "2.0.0", default-features = false }
+base64-simd = "0.8.0"
+hex-simd = "0.8.0"
+itoa = "1.0.18"
+nom = "8.0.0"
+
+# Date & time
+chrono = { version = "0.4.44", default-features = false }
+time = "0.3.47"
+
+# Utilities
+cfg-if = "1.0.4"
+const-str = "1.1.0"
+memchr = "2.8.0"
+numeric_cast = "0.3.0"
+path-absolutize = "3.1.1"
+std-next = "0.1.9"
+
+# Crypto
+crc-fast = "1.9.0"
+crc32c = "0.6.8"
+hmac = "0.13.0"
+md-5 = "0.11.0"
+openssl = "0.10.76"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+zeroize = "1.8.2"
+
+# Error handling
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+
+# Serialization
+quick-xml = { version = "0.37.5", features = ["serialize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_urlencoded = "0.7.1"
+
+# Async & concurrency
+async-trait = "0.1.89"
+futures = { version = "0.3.32", default-features = false }
+futures-util = "0.3.32"
+pin-project-lite = "0.2.17"
+sync_wrapper = { version = "1.0.2", default-features = false }
+tokio = "1.51.0"
+tokio-util = "0.7.18"
+transform-stream = "0.3.1"
+
+# HTTP
+axum = "0.8.8"
+http = "1.4.0"
+http-body = "1.0.1"
+http-body-util = "0.1.3"
+httparse = "1.10.1"
+hyper = "1.9.0"
+hyper-util = "0.1.20"
+mime = "0.3.17"
+tokio-rustls = "0.26.4"
+tower = { version = "0.5.3", default-features = false }
+url = "2.5.8"
+urlencoding = "2.1.3"
+
+# Logging & observability
+tracing = "0.1.44"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
+
+# CLI
+clap = { version = "4.6.0", features = ["derive"] }
+
+# Storage backends
+opendal = "0.55.0"
+
+# AWS SDK
+aws-config = { version = "1.8.15", default-features = false }
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = { version = "1.128.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+aws-sdk-sts = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-runtime-api = "1.11.6"
+aws-smithy-types = "1.4.7"
+aws-smithy-types-convert = "0.60.14"

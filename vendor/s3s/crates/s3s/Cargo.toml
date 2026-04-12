@@ -1,0 +1,81 @@
+[package]
+name = "s3s"
+version = "0.14.0-dev"
+description = "S3 Service Adapter"
+readme = "../../README.md"
+keywords = ["s3"]
+categories = ["web-programming", "web-programming::http-server"]
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+openssl = ["dep:openssl"]
+minio = []
+
+[target.'cfg(not(windows))'.dependencies]
+openssl = { workspace = true, optional = true }
+
+[dependencies]
+arc-swap.workspace = true
+arrayvec.workspace = true
+async-trait.workspace = true
+atoi.workspace = true
+base64-simd.workspace = true
+bytes.workspace = true
+bytestring.workspace = true
+cfg-if.workspace = true
+chrono = { workspace = true, default-features = false }
+crc-fast.workspace = true
+futures = { workspace = true, features = ["std"] }
+hex-simd.workspace = true
+hmac.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+httparse.workspace = true
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
+itoa.workspace = true
+md-5.workspace = true
+memchr.workspace = true
+mime.workspace = true
+nom.workspace = true
+numeric_cast.workspace = true
+pin-project-lite.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+smallvec.workspace = true
+std-next.workspace = true
+subtle.workspace = true
+sync_wrapper.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing", "macros"] }
+tokio = { workspace = true, features = ["time"] }
+tower.workspace = true
+tracing.workspace = true
+transform-stream.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+clap.workspace = true
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
