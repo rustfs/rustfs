@@ -54,7 +54,6 @@ use rustfs_ecstore::bucket::{
         bucket_lifecycle_ops::{RestoreRequestOps, enqueue_transition_immediate, post_restore_opts},
         lifecycle::{self, Lifecycle, TransitionOptions},
     },
-    metadata::{BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
     object_lock::{
         objectlock::{get_object_legalhold_meta, get_object_retention_meta},
@@ -66,7 +65,6 @@ use rustfs_ecstore::bucket::{
         schedule_replication_delete,
     },
     tagging::decode_tags,
-    utils::serialize,
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
@@ -77,8 +75,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
-    BucketOperations, BucketOptions, ChunkNativePutData, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions,
-    ObjectToDelete,
+    ChunkNativePutData, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
@@ -513,83 +510,6 @@ pub(crate) async fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
-const MAXIMUM_RETENTION_YEARS: i32 = 100;
-
-fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
-    S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
-}
-
-fn invalid_retention_period(message: impl Into<String>) -> S3Error {
-    let mut err = S3Error::with_message(S3ErrorCode::Custom("InvalidRetentionPeriod".into()), message.into());
-    err.set_status_code(StatusCode::BAD_REQUEST);
-    err
-}
-
-fn validate_default_retention_configuration(default_retention: &DefaultRetention) -> S3Result<()> {
-    let Some(mode) = default_retention.mode.as_ref() else {
-        return Err(invalid_object_lock_configuration("retention mode must be specified"));
-    };
-
-    match mode.as_str() {
-        ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => {}
-        _ => {
-            return Err(invalid_object_lock_configuration(format!("unknown retention mode {}", mode.as_str())));
-        }
-    }
-
-    match (default_retention.days, default_retention.years) {
-        (Some(days), None) => {
-            if days <= 0 {
-                return Err(invalid_retention_period(
-                    "Default retention period must be a positive integer value for 'Days'",
-                ));
-            }
-            if days > MAXIMUM_RETENTION_DAYS {
-                return Err(invalid_retention_period(format!("Default retention period too large for 'Days' {days}",)));
-            }
-        }
-        (None, Some(years)) => {
-            if years <= 0 {
-                return Err(invalid_retention_period(
-                    "Default retention period must be a positive integer value for 'Years'",
-                ));
-            }
-            if years > MAXIMUM_RETENTION_YEARS {
-                return Err(invalid_retention_period(format!(
-                    "Default retention period too large for 'Years' {years}",
-                )));
-            }
-        }
-        (Some(_), Some(_)) => {
-            return Err(invalid_object_lock_configuration("either Days or Years must be specified, not both"));
-        }
-        (None, None) => {
-            return Err(invalid_object_lock_configuration("either Days or Years must be specified"));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_object_lock_configuration_input(input_cfg: &ObjectLockConfiguration) -> S3Result<()> {
-    let enabled = input_cfg.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str);
-    if enabled != Some(ObjectLockEnabled::ENABLED) {
-        return Err(invalid_object_lock_configuration(
-            "only 'Enabled' value is allowed to ObjectLockEnabled element",
-        ));
-    }
-
-    if let Some(rule) = input_cfg.rule.as_ref() {
-        let Some(default_retention) = rule.default_retention.as_ref() else {
-            return Err(invalid_object_lock_configuration("Rule must include DefaultRetention"));
-        };
-        validate_default_retention_configuration(default_retention)?;
-    }
-
-    Ok(())
-}
-
 pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo) -> S3Result<()> {
     let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
     if legal_hold
@@ -788,76 +708,6 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(PutObjectAclOutput::default()));
         let _ = helper.complete(&result);
         result
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub async fn execute_put_object_lock_configuration(
-        &self,
-        req: S3Request<PutObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
-        let PutObjectLockConfigurationInput {
-            bucket,
-            object_lock_configuration,
-            ..
-        } = req.input;
-
-        let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        validate_object_lock_configuration_input(&input_cfg)?;
-
-        match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok(_) => {}
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    // AWS S3 allows enabling Object Lock on existing buckets if versioning
-                    // is already enabled. Reject only when versioning is not enabled.
-                    if !BucketVersioningSys::enabled(&bucket).await {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidBucketState,
-                            "Object Lock configuration cannot be enabled on existing buckets".to_string(),
-                        ));
-                    }
-                } else {
-                    warn!("get_object_lock_config err {:?}", err);
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        "Failed to get bucket ObjectLockConfiguration".to_string(),
-                    ));
-                }
-            }
-        };
-
-        let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)))?;
-
-        metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
-            .await
-            .map_err(ApiError::from)?;
-
-        // When Object Lock is enabled, automatically enable versioning if not already enabled.
-        // This matches S3-compatible behavior.
-        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-        if !versioning_config.enabled() {
-            let enable_versioning_config = VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                ..Default::default()
-            };
-            let versioning_data = serialize(&enable_versioning_config)
-                .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)))?;
-            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
-                .await
-                .map_err(ApiError::from)?;
-        }
-
-        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
     #[instrument(
@@ -1174,35 +1024,6 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         result
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub async fn execute_get_object_lock_configuration(
-        &self,
-        req: S3Request<GetObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        let GetObjectLockConfigurationInput { bucket, .. } = req.input;
-
-        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ObjectLockConfigurationNotFoundError,
-                        "Object Lock configuration does not exist for this bucket".to_string(),
-                    ));
-                }
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
-        };
-
-        Ok(S3Response::new(GetObjectLockConfigurationOutput {
-            object_lock_configuration,
-        }))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -2858,114 +2679,6 @@ mod tests {
 
         let err = usecase.execute_put_object_acl(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
-        let input = PutObjectLockConfigurationInput::builder()
-            .bucket("test-bucket".to_string())
-            .object_lock_configuration(Some(ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                rule: None,
-            }))
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_put_object_lock_configuration(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_disabled_status() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from("Disabled".to_string())),
-            rule: None,
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_invalid_default_retention_mode() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from("abc".to_string())),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_days_and_years_together() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(1),
-                    years: Some(1),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_missing_default_retention() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule { default_retention: None }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_zero_days() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(0),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
-    }
-
-    #[test]
-    fn validate_object_lock_configuration_rejects_too_many_years() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: None,
-                    years: Some(MAXIMUM_RETENTION_YEARS + 1),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
     }
 
     #[tokio::test]
