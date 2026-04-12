@@ -219,6 +219,47 @@ rustfs --help
 
 **NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured.html).
 
+### OIDC Roles Claim (Microsoft Entra ID)
+
+RustFS supports mapping an OIDC claim containing role values into the existing
+authorization pipeline. The `roles_claim` setting is **optional**: when unset or
+empty, only the `groups` claim contributes to authorization (same as older
+RustFS releases). For Microsoft Entra ID app roles, set `roles_claim=roles` so
+both console admin checks and bucket IAM policies can evaluate those roles.
+
+Example environment configuration (opt-in roles claim):
+
+```bash
+RUSTFS_IDENTITY_OPENID_ENABLE=on
+RUSTFS_IDENTITY_OPENID_CONFIG_URL="https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration"
+RUSTFS_IDENTITY_OPENID_CLIENT_ID="<client-id>"
+RUSTFS_IDENTITY_OPENID_CLIENT_SECRET="<client-secret>"
+RUSTFS_IDENTITY_OPENID_SCOPES="openid,profile,email"
+RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM="groups"
+RUSTFS_IDENTITY_OPENID_ROLES_CLAIM="roles"
+```
+
+Policy condition example (roles are evaluated through the existing `jwt:groups`
+key path after claim mapping):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*"],
+      "Resource": ["arn:aws:s3:::*"],
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "jwt:groups": ["RustFS.ConsoleAdmin"]
+        }
+      }
+    }
+  ]
+}
+```
+
 ## Documentation
 
 For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).

@@ -622,6 +622,18 @@ pub fn get_condition_values_with_query(
                 args.insert("groups".to_string(), grps);
             }
         }
+
+        if let Some(roles_val) = claims.get("roles")
+            && let Some(roles_is) = roles_val.as_array()
+        {
+            let roles = roles_is
+                .iter()
+                .filter_map(|role| role.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>();
+            if !roles.is_empty() {
+                args.insert("roles".to_string(), roles);
+            }
+        }
     }
 
     if let Some(groups) = &cred.groups
@@ -1206,6 +1218,20 @@ mod tests {
 
         assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
         assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_array() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), json!(["role1", "role2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), Some(&vec!["role1".to_string(), "role2".to_string()]));
     }
 
     #[test]

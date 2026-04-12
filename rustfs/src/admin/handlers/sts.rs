@@ -47,6 +47,35 @@ const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
 
+fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
+    !policies.is_empty() || !groups.is_empty()
+}
+
+fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_name: &str) -> Vec<String> {
+    claims
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(claim_name))
+        .map(|(_, value)| match value {
+            Value::Array(values) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
+            Value::String(value) => value
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
+    rustfs_iam::get_oidc()
+        .as_ref()
+        .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
+        .map(|cfg| cfg.roles_claim.trim().to_string())
+        .filter(|claim| !claim.is_empty())
+}
+
 pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(Method::POST, "/", AdminOperation(&AssumeRoleHandle {}))?;
 
@@ -241,7 +270,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     // Map claims to policies and groups
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
 
-    if policies.is_empty() && groups.is_empty() {
+    if !has_identity_authorization_context(&policies, &groups) {
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
@@ -339,6 +368,12 @@ pub async fn create_oidc_sts_credentials(
             "groups".to_string(),
             Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
         );
+    }
+    if let Some(roles_claim_key) = configured_roles_claim_key(provider_id) {
+        let roles = extract_string_list_claim(&claims.raw, &roles_claim_key);
+        if !roles.is_empty() {
+            token_claims.insert("roles".to_string(), Value::Array(roles.into_iter().map(Value::String).collect()));
+        }
     }
 
     // Set expiration
@@ -483,5 +518,31 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[test]
+    fn test_has_identity_authorization_context() {
+        let empty: Vec<String> = vec![];
+        let groups = vec!["RustFS.ConsoleAdmin".to_string()];
+        let policies = vec!["consoleAdmin".to_string()];
+
+        assert!(!has_identity_authorization_context(&empty, &empty));
+        assert!(has_identity_authorization_context(&policies, &empty));
+        assert!(has_identity_authorization_context(&empty, &groups));
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_supports_array_and_csv() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["admin", "reader"]));
+        claims.insert("groups".to_string(), serde_json::json!("devs, ops"));
+
+        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["admin", "reader"]);
+        assert_eq!(extract_string_list_claim(&claims, "groups"), vec!["devs", "ops"]);
+    }
+
+    #[test]
+    fn test_configured_roles_claim_key_requires_explicit_config() {
+        assert_eq!(configured_roles_claim_key("default"), None);
     }
 }
