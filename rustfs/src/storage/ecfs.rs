@@ -912,6 +912,7 @@ impl S3 for FS {
             access_control_policy,
             ..
         } = req.input;
+        record_s3_op(S3Operation::PutBucketAcl, &bucket);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
