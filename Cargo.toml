@@ -244,7 +244,7 @@ path-clean = "1.0.1"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
-rand = { version = "0.10.0", features = ["serde"] }
+rand = { version = "0.10.1", features = ["serde"] }
 ratelimit = "0.10.1"
 rayon = "1.11.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
@@ -254,7 +254,7 @@ rumqttc = { package = "rumqttc-next", version = "0.29.0", features = ["websocket
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "010ae03bdd8c93a9c046108190987bb0e6cb0692", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "0dd8fcaaa72eda68fafd49c38daea43bb8697558", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"
@@ -288,7 +288,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
-dial9-tokio-telemetry = { version = "0.2", git = "https://github.com/dial9-rs/dial9-tokio-telemetry.git", rev = "2117416f6052fb66edb393f2a8a22c1fdcb91bbd" }
+dial9-tokio-telemetry = { version = "0.2", git = "https://github.com/dial9-rs/dial9-tokio-telemetry.git", rev = "7958b5e6562ff8d3baa944d4316c6ed2d7b73794" }
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }
