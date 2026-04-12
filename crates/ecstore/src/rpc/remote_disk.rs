@@ -21,6 +21,7 @@ use crate::disk::{
         get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
     },
     endpoint::Endpoint,
+    health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
 };
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
@@ -119,8 +120,31 @@ impl RemoteDisk {
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
         };
+        record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
         Ok(disk)
+    }
+
+    pub fn runtime_state(&self) -> RuntimeDriveHealthState {
+        self.health.runtime_state()
+    }
+
+    pub fn offline_duration_secs(&self) -> Option<u64> {
+        self.health.offline_duration().map(|duration| duration.as_secs())
+    }
+
+    fn spawn_recovery_monitor_if_needed(&self) {
+        if !self.health_check {
+            return;
+        }
+
+        let addr = self.addr.clone();
+        let endpoint = self.endpoint.clone();
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+        });
     }
 
     /// Enable health monitoring after disk creation.
@@ -133,27 +157,34 @@ impl RemoteDisk {
         let health = Arc::clone(&self.health);
         let cancel_token = self.cancel_token.clone();
         let addr = self.addr.clone();
+        let endpoint = self.endpoint.clone();
 
         tokio::spawn(async move {
-            Self::monitor_remote_disk_health(addr, health, cancel_token).await;
+            Self::monitor_remote_disk_health(addr, endpoint, health, cancel_token).await;
         });
     }
 
     /// Monitor remote disk health periodically
-    async fn monitor_remote_disk_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
+    async fn monitor_remote_disk_health(
+        addr: String,
+        endpoint: Endpoint,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+    ) {
         let mut interval = time::interval(CHECK_EVERY);
 
         // Perform basic connectivity check
-        if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+        if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
             // Start recovery monitoring
             let health_clone = Arc::clone(&health);
             let addr_clone = addr.clone();
+            let endpoint_clone = endpoint.clone();
             let cancel_clone = cancel_token.clone();
 
             tokio::spawn(async move {
-                Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
             });
         }
 
@@ -186,16 +217,17 @@ impl RemoteDisk {
                     }
 
                     // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+                    if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
                         // Start recovery monitoring
                         let health_clone = Arc::clone(&health);
                         let addr_clone = addr.clone();
+                        let endpoint_clone = endpoint.clone();
                         let cancel_clone = cancel_token.clone();
 
                         tokio::spawn(async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
                         });
                     }
                 }
@@ -204,8 +236,13 @@ impl RemoteDisk {
     }
 
     /// Monitor remote disk recovery and mark as healthy when recovered
-    async fn monitor_remote_disk_recovery(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+    async fn monitor_remote_disk_recovery(
+        addr: String,
+        endpoint: Endpoint,
+        health: Arc<DiskHealthTracker>,
+        cancel_token: CancellationToken,
+    ) {
+        let mut interval = time::interval(get_drive_returning_probe_interval());
 
         loop {
             tokio::select! {
@@ -214,9 +251,14 @@ impl RemoteDisk {
                 }
                 _ = interval.tick() => {
                     if Self::perform_connectivity_check(&addr).await.is_ok() {
-                        info!("Remote disk recovered: {}", addr);
-                        health.set_ok();
-                        return;
+                        let became_online = health.mark_recovery_success(&endpoint, "connectivity_probe_success");
+                        info!("Remote disk recovery probe succeeded: {}", addr);
+                        if became_online {
+                            info!("Remote disk recovered: {}", addr);
+                            return;
+                        }
+                    } else {
+                        health.mark_failure(&endpoint, "connectivity_probe_failed");
                     }
                 }
             }
@@ -333,7 +375,8 @@ impl RemoteDisk {
     }
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
-        if self.health.swap_ok_to_faulty() {
+        if self.health.mark_failure(&self.endpoint, reason) {
+            self.spawn_recovery_monitor_if_needed();
             counter!(
                 "rustfs_drive_faulty_mark_total",
                 "endpoint" => self.endpoint.to_string(),

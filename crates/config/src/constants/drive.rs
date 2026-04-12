@@ -38,3 +38,23 @@ pub const DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS: u64 = 5;
 /// Maximum time without forward progress while consuming a `walk_dir()` stream.
 pub const ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS: &str = "RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS";
 pub const DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS: u64 = 5;
+
+/// Number of consecutive failures before a suspect drive is classified as offline.
+pub const ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD: &str = "RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD";
+pub const DEFAULT_DRIVE_SUSPECT_FAILURE_THRESHOLD: u64 = 2;
+
+/// Number of consecutive successful recovery probes before a returning drive is considered online again.
+pub const ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD: &str = "RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD";
+pub const DEFAULT_DRIVE_RETURNING_SUCCESS_THRESHOLD: u64 = 3;
+
+/// Probe interval in seconds while a drive is in the recovery path.
+pub const ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS: &str = "RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS";
+pub const DEFAULT_DRIVE_RETURNING_PROBE_INTERVAL_SECS: u64 = 2;
+
+/// Duration in seconds for classifying a recovered drive as a short offline event.
+pub const ENV_DRIVE_OFFLINE_GRACE_PERIOD_SECS: &str = "RUSTFS_DRIVE_OFFLINE_GRACE_PERIOD_SECS";
+pub const DEFAULT_DRIVE_OFFLINE_GRACE_PERIOD_SECS: u64 = 30;
+
+/// Duration in seconds after which a recovered drive is classified as long offline.
+pub const ENV_DRIVE_LONG_OFFLINE_THRESHOLD_SECS: &str = "RUSTFS_DRIVE_LONG_OFFLINE_THRESHOLD_SECS";
+pub const DEFAULT_DRIVE_LONG_OFFLINE_THRESHOLD_SECS: u64 = 172_800;

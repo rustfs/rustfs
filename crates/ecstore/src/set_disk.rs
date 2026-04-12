@@ -3903,6 +3903,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
 
     for (i, pool) in disks.iter().enumerate() {
         if let Some(disk) = pool {
+            let runtime_state = disk.runtime_state();
+            let offline_duration_seconds = disk.offline_duration_secs();
             match disk.disk_info(&DiskInfoOptions::default()).await {
                 Ok(res) => ret.push(rustfs_madmin::Disk {
                     endpoint: eps[i].to_string(),
@@ -3916,6 +3918,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     drive_path: res.mount_path.clone(),
                     healing: res.healing,
                     scanning: res.scanning,
+                    runtime_state: Some(runtime_state.as_str().to_string()),
+                    offline_duration_seconds,
 
                     uuid: res.id.map_or("".to_string(), |id| id.to_string()),
                     major: res.major as u32,
@@ -3942,6 +3946,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                     pool_index: eps[i].pool_idx,
                     set_index: eps[i].set_idx,
                     disk_index: eps[i].disk_idx,
+                    runtime_state: Some(runtime_state.as_str().to_string()),
+                    offline_duration_seconds,
                     ..Default::default()
                 }),
             }
@@ -3952,6 +3958,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
                 disk_index: eps[i].disk_idx,
+                runtime_state: None,
+                offline_duration_seconds: None,
                 state: DiskError::DiskNotFound.to_string(),
                 ..Default::default()
             })
