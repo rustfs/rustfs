@@ -2058,9 +2058,9 @@ dependencies = [
 
 [[package]]
 name = "ctr"
-version = "0.10.0-rc.4"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fee683dd898fbd052617b4514bc31f98bc32081a83b69ec46adef3b1ef4ae36f"
+checksum = "17469f8eb9bdbfad10f71f4cfddfd38b01143520c0e717d8796ccb4d44d44e42"
 dependencies = [
  "cipher 0.5.1",
 ]
@@ -2275,7 +2275,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "parquet",
- "rand 0.9.2",
+ "rand 0.9.3",
  "regex",
  "sqlparser",
  "tempfile",
@@ -2397,7 +2397,7 @@ dependencies = [
  "liblzma",
  "log",
  "object_store",
- "rand 0.9.2",
+ "rand 0.9.3",
  "tokio",
  "tokio-util",
  "url",
@@ -2529,7 +2529,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot 0.12.5",
- "rand 0.9.2",
+ "rand 0.9.3",
  "tempfile",
  "url",
 ]
@@ -2595,7 +2595,7 @@ dependencies = [
  "md-5 0.10.6",
  "memchr",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.3",
  "regex",
  "sha2 0.10.9",
  "unicode-segmentation",
@@ -3065,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "dial9-tokio-telemetry"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=7958b5e6562ff8d3baa944d4316c6ed2d7b73794#7958b5e6562ff8d3baa944d4316c6ed2d7b73794"
 dependencies = [
  "arc-swap",
  "bon",
@@ -3076,6 +3076,7 @@ dependencies = [
  "hostname",
  "libc",
  "metrique",
+ "metrique-timesource",
  "metrique-writer",
  "pin-project-lite",
  "serde",
@@ -3089,7 +3090,7 @@ dependencies = [
 [[package]]
 name = "dial9-trace-format"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=7958b5e6562ff8d3baa944d4316c6ed2d7b73794#7958b5e6562ff8d3baa944d4316c6ed2d7b73794"
 dependencies = [
  "dial9-trace-format-derive",
  "serde",
@@ -3098,7 +3099,7 @@ dependencies = [
 [[package]]
 name = "dial9-trace-format-derive"
 version = "0.2.0"
-source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=2117416f6052fb66edb393f2a8a22c1fdcb91bbd#2117416f6052fb66edb393f2a8a22c1fdcb91bbd"
+source = "git+https://github.com/dial9-rs/dial9-tokio-telemetry.git?rev=7958b5e6562ff8d3baa944d4316c6ed2d7b73794#7958b5e6562ff8d3baa944d4316c6ed2d7b73794"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3207,7 +3208,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "md5",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rcgen",
  "reqwest 0.13.2",
  "rmp-serde",
@@ -3859,7 +3860,7 @@ dependencies = [
  "google-cloud-wkt",
  "http 1.4.0",
  "pin-project",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4864,9 +4865,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.94"
+version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e04e2ef80ce82e13552136fabeef8a5ed1f985a96805761cbb9a2c34e7664d9"
+checksum = "2964e92d1d9dc3364cae4d718d93f227e3abb088e747d92e0395bfdedf1c12ca"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -5364,7 +5365,7 @@ dependencies = [
  "ordered-float 5.3.0",
  "quanta",
  "radix_trie",
- "rand 0.9.2",
+ "rand 0.9.3",
  "rand_xoshiro",
  "sketches-ddsketch",
 ]
@@ -5441,7 +5442,7 @@ dependencies = [
  "metrique-core",
  "metrique-writer-core",
  "metrique-writer-macro",
- "rand 0.9.2",
+ "rand 0.9.3",
  "smallvec",
  "tokio",
  "tracing",
@@ -6093,7 +6094,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.3",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -6969,7 +6970,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.2",
+ "rand 0.9.3",
  "ring",
  "rustc-hash",
  "rustls",
@@ -7039,9 +7040,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -7049,9 +7050,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -7703,7 +7704,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rmp-serde",
  "rust-embed",
@@ -7780,7 +7781,7 @@ name = "rustfs-appauth"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rsa 0.10.0-rc.17",
  "serde",
  "serde_json",
@@ -7867,7 +7868,7 @@ name = "rustfs-credentials"
 version = "0.0.5"
 dependencies = [
  "base64-simd",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "time",
@@ -7883,7 +7884,7 @@ dependencies = [
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2 0.13.0-rc.10",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde_json",
  "sha2 0.11.0",
  "test-case",
@@ -7936,7 +7937,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "quick-xml 0.39.2",
- "rand 0.10.0",
+ "rand 0.10.1",
  "ratelimit",
  "reed-solomon-erasure",
  "reed-solomon-simd",
@@ -8048,7 +8049,7 @@ dependencies = [
  "moka",
  "openidconnect",
  "pollster",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rustfs-config",
  "rustfs-credentials",
@@ -8128,7 +8129,7 @@ dependencies = [
  "jiff",
  "md5",
  "moka",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rustfs-utils",
  "serde",
@@ -8426,7 +8427,7 @@ dependencies = [
  "http-body-util",
  "md-5 0.11.0",
  "pin-project-lite",
- "rand 0.10.0",
+ "rand 0.10.1",
  "reqwest 0.13.2",
  "rustfs-common",
  "rustfs-config",
@@ -8505,7 +8506,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "path-clean",
- "rand 0.10.0",
+ "rand 0.10.1",
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",
@@ -8611,7 +8612,7 @@ dependencies = [
  "lz4",
  "md-5 0.11.0",
  "netif",
- "rand 0.10.0",
+ "rand 0.10.1",
  "regex",
  "rustfs-config",
  "rustix 1.1.4",
@@ -8814,7 +8815,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=010ae03bdd8c93a9c046108190987bb0e6cb0692#010ae03bdd8c93a9c046108190987bb0e6cb0692"
+source = "git+https://github.com/rustfs/s3s?rev=0dd8fcaaa72eda68fafd49c38daea43bb8697558#0dd8fcaaa72eda68fafd49c38daea43bb8697558"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10320,7 +10321,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
- "rand 0.9.2",
+ "rand 0.9.3",
  "rustls",
  "rustls-pki-types",
  "sha1 0.10.6",
@@ -10478,7 +10479,7 @@ checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
- "rand 0.10.0",
+ "rand 0.10.1",
  "serde_core",
  "wasm-bindgen",
 ]
@@ -10565,9 +10566,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0551fc1bb415591e3372d0bc4780db7e587d84e2a7e79da121051c5c4b89d0b0"
+checksum = "0bf938a0bacb0469e83c1e148908bd7d5a6010354cf4fb73279b7447422e3a89"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -10578,9 +10579,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.67"
+version = "0.4.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03623de6905b7206edd0a75f69f747f134b7f0a2323392d664448bf2d3c5d87e"
+checksum = "f371d383f2fb139252e0bfac3b81b265689bf45b6874af544ffa4c975ac1ebf8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -10588,9 +10589,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fbdf9a35adf44786aecd5ff89b4563a90325f9da0923236f6104e603c7e86be"
+checksum = "eeff24f84126c0ec2db7a449f0c2ec963c6a49efe0698c4242929da037ca28ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -10598,9 +10599,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca9693ef2bab6d4e6707234500350d8dad079eb508dca05530c85dc3a529ff2"
+checksum = "9d08065faf983b2b80a79fd87d8254c409281cf7de75fc4b773019824196c904"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -10611,9 +10612,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39129a682a6d2d841b6c429d0c51e5cb0ed1a03829d8b3d1e69a011e62cb3d3b"
+checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
 dependencies = [
  "unicode-ident",
 ]
@@ -10667,9 +10668,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.94"
+version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd70027e39b12f0849461e08ffc50b9cd7688d942c1c8e3c7b22273236b4dd0a"
+checksum = "4f2dfbb17949fa2088e5d39408c48368947b86f7834484e87b73de55bc14d97d"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
