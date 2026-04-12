@@ -35,11 +35,12 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, GetObjectAclInput,
+        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, GetBucketAclInput, GetObjectAclInput,
         GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, ObjectLockRule, PutObjectLegalHoldInput, PutObjectLockConfigurationInput,
-        PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, Tag, Tagging, TopicConfiguration,
+        ObjectLockRetentionMode, ObjectLockRule, PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput,
+        PutObjectLockConfigurationInput, PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, Tag, Tagging,
+        TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::OffsetDateTime;
@@ -201,6 +202,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_bucket_acl(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
     async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectLegalHoldInput::builder()
             .bucket("test-bucket".to_string())
@@ -236,6 +249,31 @@ mod tests {
 
         let fs = FS::new();
         let err = fs.put_object_legal_hold(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_bucket_acl(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_acl_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_acl(build_request(input, Method::PUT)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

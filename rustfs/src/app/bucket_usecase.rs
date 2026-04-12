@@ -23,7 +23,6 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::s3_api::acl;
 use crate::storage::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
@@ -574,32 +573,6 @@ impl DefaultBucketUsecase {
         result
     }
 
-    pub async fn execute_put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        let PutBucketAclInput {
-            bucket,
-            access_control_policy,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        if access_control_policy.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
-            ));
-        }
-
-        Ok(S3Response::new(PutBucketAclOutput::default()))
-    }
-
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
@@ -653,21 +626,6 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         Ok(S3Response::new(HeadBucketOutput::default()))
-    }
-
-    pub async fn execute_get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
-        let GetBucketAclInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(acl::build_get_bucket_acl_output()))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -2051,20 +2009,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultBucketUsecase::without_context();
-
-        let err = usecase.execute_get_bucket_acl(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
     async fn execute_get_bucket_location_returns_internal_error_when_store_uninitialized() {
         let input = GetBucketLocationInput::builder()
             .bucket("test-bucket".to_string())
@@ -2730,20 +2674,6 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        let input = PutBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultBucketUsecase::without_context();
-
-        let err = usecase.execute_put_bucket_acl(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
