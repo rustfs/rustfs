@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::{
+    auth::validate_admin_request,
+    router::{AdminOperation, Operation, S3Router},
+};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::ADMIN_PREFIX;
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, StatusCode};
@@ -25,6 +28,7 @@ use rustfs_config::notify::{
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::{TargetError, check_mqtt_broker_available_with_tls, target::mqtt::MQTTTlsConfig};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
@@ -107,12 +111,14 @@ fn normalized_endpoint_key(account_id: &str, service: &str) -> EndpointKey {
 
 // --- Helper Functions ---
 
-async fn check_permissions(req: &S3Request<Body>) -> S3Result<()> {
+async fn authorize_notification_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
     let Some(input_cred) = &req.credentials else {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
     };
-    check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    Ok(())
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
 
 fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
@@ -392,7 +398,7 @@ impl Operation for NotificationTarget {
         let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
-        check_permissions(&req).await?;
+        authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         let ns = get_notification_system()?;
         let config_snapshot = ns.config.read().await.clone();
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
@@ -502,7 +508,7 @@ impl Operation for ListNotificationTargets {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let span = Span::current();
         let _enter = span.enter();
-        check_permissions(&req).await?;
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         let ns = get_notification_system()?;
 
         let targets = ns.get_target_values().await;
@@ -541,7 +547,7 @@ impl Operation for ListTargetsArns {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let span = Span::current();
         let _enter = span.enter();
-        check_permissions(&req).await?;
+        authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         let ns = get_notification_system()?;
 
         let targets = ns.get_target_values().await;
@@ -586,7 +592,7 @@ impl Operation for RemoveNotificationTarget {
         let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
-        check_permissions(&req).await?;
+        authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         let ns = get_notification_system()?;
         let config_snapshot = ns.config.read().await.clone();
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
@@ -895,5 +901,45 @@ mod tests {
                 assert!(target_mutation_block_reason(&config, NOTIFY_WEBHOOK_SUB_SYS, "primarycase").is_none());
             },
         );
+    }
+
+    #[test]
+    fn notification_target_handlers_require_admin_authorization_contract() {
+        let src = include_str!("event.rs");
+        let put_block =
+            extract_block_between_markers(src, "impl Operation for NotificationTarget", "pub struct ListNotificationTargets");
+        let list_block =
+            extract_block_between_markers(src, "impl Operation for ListNotificationTargets", "pub struct ListTargetsArns");
+        let arns_block =
+            extract_block_between_markers(src, "impl Operation for ListTargetsArns", "pub struct RemoveNotificationTarget");
+        let delete_block = extract_block_between_markers(src, "impl Operation for RemoveNotificationTarget", "fn extract_param");
+
+        assert!(
+            put_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
+            "notification target writes should require SetBucketTargetAction"
+        );
+        assert!(
+            list_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
+            "notification target list should require GetBucketTargetAction"
+        );
+        assert!(
+            arns_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
+            "notification target arn listing should require GetBucketTargetAction"
+        );
+        assert!(
+            delete_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
+            "notification target deletion should require SetBucketTargetAction"
+        );
+    }
+
+    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("Expected marker `{start_marker}` in source"));
+        let after_start = &src[start..];
+        let end = after_start
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("Expected end marker `{end_marker}` in source"));
+        &after_start[..end]
     }
 }
