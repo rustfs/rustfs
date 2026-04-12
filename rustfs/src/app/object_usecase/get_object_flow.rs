@@ -595,4 +595,34 @@ mod tests {
         assert_eq!(err.streamed_bytes, 5);
         assert_eq!(err.source.kind(), std::io::ErrorKind::UnexpectedEof);
     }
+
+    #[tokio::test]
+    async fn materialize_chunk_stream_before_commit_rejects_long_body() {
+        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello "))),
+            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"world!"))),
+        ]));
+
+        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.streamed_bytes, 12);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn materialize_chunk_stream_before_commit_preserves_midstream_io_errors() {
+        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer closed")),
+        ]));
+
+        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.streamed_bytes, 5);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::BrokenPipe);
+    }
 }
