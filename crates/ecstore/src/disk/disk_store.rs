@@ -173,6 +173,17 @@ impl DiskHealthTracker {
         self.status.store(DISK_HEALTH_OK, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        self.runtime_state.store(state as u32, Ordering::Release);
+        match state {
+            RuntimeDriveHealthState::Offline => self.set_faulty(),
+            RuntimeDriveHealthState::Online | RuntimeDriveHealthState::Suspect | RuntimeDriveHealthState::Returning => {
+                self.set_ok();
+            }
+        }
+    }
+
     pub fn swap_ok_to_faulty(&self) -> bool {
         self.status
             .compare_exchange(DISK_HEALTH_OK, DISK_HEALTH_FAULTY, Ordering::AcqRel, Ordering::Relaxed)
@@ -393,6 +404,11 @@ impl LocalDiskWrapper {
 
     pub fn offline_duration_secs(&self) -> Option<u64> {
         self.health.offline_duration().map(|duration| duration.as_secs())
+    }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        self.health.force_runtime_state_for_test(state);
     }
 
     /// Enable health monitoring after disk creation.

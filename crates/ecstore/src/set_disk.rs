@@ -3905,51 +3905,55 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
         if let Some(disk) = pool {
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
-            match disk.disk_info(&DiskInfoOptions::default()).await {
-                Ok(res) => ret.push(rustfs_madmin::Disk {
-                    endpoint: eps[i].to_string(),
-                    local: eps[i].is_local,
-                    pool_index: eps[i].pool_idx,
-                    set_index: eps[i].set_idx,
-                    disk_index: eps[i].disk_idx,
-                    state: "ok".to_owned(),
+            if runtime_state.should_probe_for_admin() {
+                match disk.disk_info(&DiskInfoOptions::default()).await {
+                    Ok(res) => ret.push(rustfs_madmin::Disk {
+                        endpoint: eps[i].to_string(),
+                        local: eps[i].is_local,
+                        pool_index: eps[i].pool_idx,
+                        set_index: eps[i].set_idx,
+                        disk_index: eps[i].disk_idx,
+                        state: "ok".to_owned(),
 
-                    root_disk: res.root_disk,
-                    drive_path: res.mount_path.clone(),
-                    healing: res.healing,
-                    scanning: res.scanning,
-                    runtime_state: Some(runtime_state.as_str().to_string()),
-                    offline_duration_seconds,
+                        root_disk: res.root_disk,
+                        drive_path: res.mount_path.clone(),
+                        healing: res.healing,
+                        scanning: res.scanning,
+                        runtime_state: Some(runtime_state.as_str().to_string()),
+                        offline_duration_seconds,
 
-                    uuid: res.id.map_or("".to_string(), |id| id.to_string()),
-                    major: res.major as u32,
-                    minor: res.minor as u32,
-                    model: None,
-                    total_space: res.total,
-                    used_space: res.used,
-                    available_space: res.free,
-                    utilization: {
-                        if res.total > 0 {
-                            res.used as f64 / res.total as f64 * 100_f64
-                        } else {
-                            0_f64
-                        }
-                    },
-                    used_inodes: res.used_inodes,
-                    free_inodes: res.free_inodes,
-                    ..Default::default()
-                }),
-                Err(err) => ret.push(rustfs_madmin::Disk {
-                    state: err.to_string(),
-                    endpoint: eps[i].to_string(),
-                    local: eps[i].is_local,
-                    pool_index: eps[i].pool_idx,
-                    set_index: eps[i].set_idx,
-                    disk_index: eps[i].disk_idx,
-                    runtime_state: Some(runtime_state.as_str().to_string()),
-                    offline_duration_seconds,
-                    ..Default::default()
-                }),
+                        uuid: res.id.map_or("".to_string(), |id| id.to_string()),
+                        major: res.major as u32,
+                        minor: res.minor as u32,
+                        model: None,
+                        total_space: res.total,
+                        used_space: res.used,
+                        available_space: res.free,
+                        utilization: {
+                            if res.total > 0 {
+                                res.used as f64 / res.total as f64 * 100_f64
+                            } else {
+                                0_f64
+                            }
+                        },
+                        used_inodes: res.used_inodes,
+                        free_inodes: res.free_inodes,
+                        ..Default::default()
+                    }),
+                    Err(err) => ret.push(rustfs_madmin::Disk {
+                        state: err.to_string(),
+                        endpoint: eps[i].to_string(),
+                        local: eps[i].is_local,
+                        pool_index: eps[i].pool_idx,
+                        set_index: eps[i].set_idx,
+                        disk_index: eps[i].disk_idx,
+                        runtime_state: Some(runtime_state.as_str().to_string()),
+                        offline_duration_seconds,
+                        ..Default::default()
+                    }),
+                }
+            } else {
+                ret.push(build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds));
             }
         } else {
             ret.push(rustfs_madmin::Disk {
@@ -3967,6 +3971,24 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     }
 
     ret
+}
+
+fn build_runtime_snapshot_disk(
+    endpoint: &Endpoint,
+    runtime_state: crate::disk::health_state::RuntimeDriveHealthState,
+    offline_duration_seconds: Option<u64>,
+) -> rustfs_madmin::Disk {
+    rustfs_madmin::Disk {
+        endpoint: endpoint.to_string(),
+        local: endpoint.is_local,
+        pool_index: endpoint.pool_idx,
+        set_index: endpoint.set_idx,
+        disk_index: endpoint.disk_idx,
+        state: runtime_state.as_str().to_string(),
+        runtime_state: Some(runtime_state.as_str().to_string()),
+        offline_duration_seconds,
+        ..Default::default()
+    }
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;
@@ -4124,14 +4146,17 @@ mod tests {
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
+    use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::store_api::{CompletePart, ObjectInfo};
+    use crate::store_init::save_format_file;
     use rustfs_filemeta::ErasureInfo;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serial_test::serial;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use time::OffsetDateTime;
 
     #[derive(Debug, Default)]
@@ -4230,6 +4255,33 @@ mod tests {
         } else {
             SetupType::Unknown
         }
+    }
+
+    async fn make_formatted_local_disk_for_info_test(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
     }
 
     #[test]
@@ -4695,6 +4747,45 @@ mod tests {
         // Test with part corruption
         let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_uses_runtime_snapshot_for_suspect_and_offline_disks() {
+        let format = FormatV3::new(1, 3);
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+
+        for disk_idx in 0..3 {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        disks[1]
+            .as_ref()
+            .expect("disk 1 should exist")
+            .force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&disks, &endpoints).await;
+        assert_eq!(info.len(), 3);
+
+        assert_eq!(info[0].state, "ok");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
+        assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
+
+        assert_eq!(info[1].state, "suspect");
+        assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
+        assert!(info[1].drive_path.is_empty(), "suspect disk should use runtime snapshot fallback");
+
+        assert_eq!(info[2].state, "offline");
+        assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
+        assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
     }
 
     #[test]

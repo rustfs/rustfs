@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::disk::health_state::DriveMembershipSnapshot;
 
 impl SetDisks {
     pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
@@ -72,41 +73,28 @@ impl SetDisks {
     }
 
     pub(super) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
-        let mut disks = self.get_disks_internal().await;
-
-        // TODO: diskinfo filter online
-
-        let mut new_disk = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            if let Some(d) = disk
-                && d.is_online().await
-            {
-                new_disk.push(disk.clone());
-            }
-        }
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot.strict_online_candidates().into_iter().map(Some).collect::<Vec<_>>();
 
         let mut rng = rand::rng();
-
         disks.shuffle(&mut rng);
 
-        new_disk
-        // let disks = self.get_disks_internal().await;
-        // let (filtered, _) = self.filter_online_disks(disks).await;
-        // filtered.into_iter().filter(|disk| disk.is_some()).collect()
+        disks
     }
 
     pub(super) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
-        let mut disks = self.get_online_disks().await;
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot
+            .strict_online_local_candidates()
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
 
         let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
         disks
-            .into_iter()
-            .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
-            .collect()
     }
 
     pub async fn get_online_disks_with_healing(&self, incl_healing: bool) -> (Vec<DiskStore>, bool) {
@@ -114,8 +102,14 @@ impl SetDisks {
         (disks, healing > 0)
     }
 
+    pub async fn drive_membership_snapshot(&self) -> DriveMembershipSnapshot {
+        let disks = self.get_disks_internal().await;
+        DriveMembershipSnapshot::from_optional_disks(&disks)
+    }
+
     pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
-        let mut disks = self.get_disks_internal().await;
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot.scanner_heal_candidates().into_iter().map(Some).collect::<Vec<_>>();
 
         let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
 
@@ -463,6 +457,73 @@ mod tests {
                 );
             }
         }
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn drive_membership_snapshot_filters_offline_disks_from_candidates() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let all_disks = set_disks.get_disks_internal().await;
+        all_disks[1]
+            .as_ref()
+            .expect("disk 1 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Suspect);
+        all_disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Returning);
+        all_disks[3]
+            .as_ref()
+            .expect("disk 3 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+
+        let snapshot = set_disks.drive_membership_snapshot().await;
+        assert_eq!(snapshot.online.len(), 1);
+        assert_eq!(snapshot.suspect.len(), 1);
+        assert_eq!(snapshot.returning.len(), 1);
+        assert_eq!(snapshot.offline.len(), 1);
+        assert_eq!(snapshot.scanner_heal_candidates().len(), 3);
+
+        let strict_online = set_disks.get_online_disks().await;
+        assert_eq!(strict_online.len(), 1, "strict online selection should exclude suspect/returning/offline");
+
+        let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+        assert_eq!(healing, 0);
+        assert_eq!(online_disks.len(), 3);
+        assert_eq!(infos.len(), 3);
+        assert!(
+            online_disks
+                .iter()
+                .all(|disk| { disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Offline }),
+            "offline disks should be filtered by membership snapshot"
+        );
 
         drop(temp_dirs);
     }

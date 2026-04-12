@@ -133,6 +133,11 @@ impl RemoteDisk {
         self.health.offline_duration().map(|duration| duration.as_secs())
     }
 
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        self.health.force_runtime_state_for_test(state);
+    }
+
     fn spawn_recovery_monitor_if_needed(&self) {
         if !self.health_check {
             return;

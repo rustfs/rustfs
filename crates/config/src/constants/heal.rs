@@ -101,3 +101,40 @@ pub const DEFAULT_HEAL_MAX_CONCURRENT_HEALS: usize = 4;
 /// - Value: 1 concurrent heal operation per set.
 /// - Rationale: Keeps a degraded set from monopolizing the global heal scheduler.
 pub const DEFAULT_HEAL_MAX_CONCURRENT_PER_SET: usize = 1;
+
+/// Environment variable that controls whether low-priority heal requests should merge into
+/// an existing queued request with the same deduplication key.
+pub const ENV_HEAL_LOW_PRIORITY_MERGE_ENABLE: &str = "RUSTFS_HEAL_LOW_PRIORITY_MERGE_ENABLE";
+
+/// Environment variable that allows low-priority heal requests to be dropped when the queue is full.
+pub const ENV_HEAL_LOW_PRIORITY_DROP_WHEN_FULL: &str = "RUSTFS_HEAL_LOW_PRIORITY_DROP_WHEN_FULL";
+
+/// Environment variable that controls concurrent object heals within a single erasure-set page.
+pub const ENV_HEAL_PAGE_OBJECT_CONCURRENCY: &str = "RUSTFS_HEAL_PAGE_OBJECT_CONCURRENCY";
+
+/// Environment variable that toggles notify-driven scheduler wakeups.
+pub const ENV_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE: &str = "RUSTFS_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE";
+
+/// Environment variable that toggles per-set bulkhead scheduling.
+pub const ENV_HEAL_SET_BULKHEAD_ENABLE: &str = "RUSTFS_HEAL_SET_BULKHEAD_ENABLE";
+
+/// Environment variable that toggles page-level parallel object healing for erasure-set repair.
+pub const ENV_HEAL_PAGE_PARALLEL_ENABLE: &str = "RUSTFS_HEAL_PAGE_PARALLEL_ENABLE";
+
+/// Default behavior is to merge duplicate low-priority requests.
+pub const DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE: bool = true;
+
+/// Default behavior is to drop low-priority requests instead of blocking when the queue is full.
+pub const DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL: bool = true;
+
+/// Default per-page object heal concurrency for erasure-set healing.
+pub const DEFAULT_HEAL_PAGE_OBJECT_CONCURRENCY: usize = 8;
+
+/// Default behavior is to keep notify-driven scheduler wakeups enabled.
+pub const DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE: bool = true;
+
+/// Default behavior is to keep per-set bulkhead scheduling enabled.
+pub const DEFAULT_HEAL_SET_BULKHEAD_ENABLE: bool = true;
+
+/// Default behavior is to keep erasure-set page parallelism enabled.
+pub const DEFAULT_HEAL_PAGE_PARALLEL_ENABLE: bool = true;

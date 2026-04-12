@@ -426,6 +426,14 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.offline_duration_secs(),
         }
     }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_runtime_state_for_test(state),
+            Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
+        }
+    }
 }
 
 impl Disk {

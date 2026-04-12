@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::{DiskAPI, DiskStore};
 use crate::disk::endpoint::Endpoint;
 use metrics::{counter, gauge};
 use std::time::Duration;
@@ -42,6 +43,18 @@ impl RuntimeDriveHealthState {
             3 => Self::Returning,
             _ => Self::Online,
         }
+    }
+
+    pub fn is_snapshot_eligible(self) -> bool {
+        matches!(self, Self::Online | Self::Suspect | Self::Returning)
+    }
+
+    pub fn is_strictly_online(self) -> bool {
+        matches!(self, Self::Online)
+    }
+
+    pub fn should_probe_for_admin(self) -> bool {
+        matches!(self, Self::Online | Self::Returning)
     }
 }
 
@@ -167,4 +180,58 @@ pub fn record_drive_offline_duration(endpoint: &Endpoint, duration: Duration) {
         "disk" => endpoint.disk_idx.to_string()
     )
     .set(duration.as_secs_f64());
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DriveMembershipSnapshot {
+    pub online: Vec<DiskStore>,
+    pub suspect: Vec<DiskStore>,
+    pub returning: Vec<DiskStore>,
+    pub offline: Vec<DiskStore>,
+}
+
+impl DriveMembershipSnapshot {
+    pub fn from_optional_disks(disks: &[Option<DiskStore>]) -> Self {
+        let mut snapshot = Self::default();
+
+        for disk in disks.iter().flatten() {
+            match disk.runtime_state() {
+                RuntimeDriveHealthState::Online => snapshot.online.push(disk.clone()),
+                RuntimeDriveHealthState::Suspect => snapshot.suspect.push(disk.clone()),
+                RuntimeDriveHealthState::Returning => snapshot.returning.push(disk.clone()),
+                RuntimeDriveHealthState::Offline => snapshot.offline.push(disk.clone()),
+            }
+        }
+
+        snapshot
+    }
+
+    pub fn scanner_heal_candidates(&self) -> Vec<DiskStore> {
+        let mut disks = Vec::with_capacity(self.online.len() + self.suspect.len() + self.returning.len());
+        disks.extend(self.online.iter().cloned());
+        disks.extend(self.suspect.iter().cloned());
+        disks.extend(self.returning.iter().cloned());
+        disks
+    }
+
+    pub fn strict_online_candidates(&self) -> Vec<DiskStore> {
+        self.online.clone()
+    }
+
+    pub fn strict_online_local_candidates(&self) -> Vec<DiskStore> {
+        self.online.iter().filter(|disk| disk.is_local()).cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_drive_health_state_snapshot_eligibility_matches_membership_policy() {
+        assert!(RuntimeDriveHealthState::Online.is_snapshot_eligible());
+        assert!(RuntimeDriveHealthState::Suspect.is_snapshot_eligible());
+        assert!(RuntimeDriveHealthState::Returning.is_snapshot_eligible());
+        assert!(!RuntimeDriveHealthState::Offline.is_snapshot_eligible());
+    }
 }
