@@ -750,11 +750,10 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_presigned_get_and_reverse_proxy_preserve_multipart_bytes_with_fast_path()
-    -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn test_presigned_get_and_reverse_proxy_preserve_multipart_bytes() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
-        start_rustfs_server_with_env(&mut env, &[("RUSTFS_OBJECT_GET_CHUNK_FAST_PATH_ENABLE", "true")]).await?;
+        env.start_rustfs_server(vec![]).await?;
         env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
 
         let client = env.create_s3_client();

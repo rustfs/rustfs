@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use super::*;
-use crate::store_api::GetObjectChunkResult;
-
 fn select_data_movement_target_pool(
     existing_pool_idx: Result<usize>,
     src_pool_idx: usize,
@@ -211,34 +209,6 @@ impl ECStore {
             .await?;
         self.pools[idx]
             .get_object_reader(bucket, object.as_str(), range, h, &opts)
-            .await
-    }
-
-    #[instrument(level = "debug", skip(self))]
-    pub(super) async fn handle_get_object_chunks(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: Option<HTTPRangeSpec>,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectChunkResult> {
-        check_get_obj_args(bucket, object)?;
-
-        let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_chunks(bucket, object.as_str(), range, h, opts).await;
-        }
-
-        let mut opts = opts.clone();
-        opts.no_lock = true;
-
-        let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
-            .await?;
-        self.pools[idx]
-            .get_object_chunks(bucket, object.as_str(), range, h, &opts)
             .await
     }
 

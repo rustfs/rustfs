@@ -193,7 +193,6 @@ impl IoStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     Unknown,
-    FeatureDisabled,
     ProbeFailed,
     MmapDisabled,
     MmapUnavailable,
@@ -215,7 +214,6 @@ impl FallbackReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
-            Self::FeatureDisabled => "feature_disabled",
             Self::ProbeFailed => "probe_failed",
             Self::MmapDisabled => "mmap_disabled",
             Self::MmapUnavailable => "mmap_unavailable",
@@ -932,7 +930,6 @@ mod tests {
     #[test]
     fn test_fallback_reason_as_str_values_stable() {
         assert_eq!(FallbackReason::Unknown.as_str(), "unknown");
-        assert_eq!(FallbackReason::FeatureDisabled.as_str(), "feature_disabled");
         assert_eq!(FallbackReason::ProbeFailed.as_str(), "probe_failed");
         assert_eq!(FallbackReason::MmapDisabled.as_str(), "mmap_disabled");
         assert_eq!(FallbackReason::MmapUnavailable.as_str(), "mmap_unavailable");

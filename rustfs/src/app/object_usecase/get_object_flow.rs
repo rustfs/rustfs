@@ -14,20 +14,14 @@
 
 use super::DeadlockRequestGuard;
 use super::GetObjectRequestContext;
-use super::get_object_zero_copy::{
-    GetObjectIoPlanning, GetObjectPreparedRead, prepare_get_object_read, prepare_get_object_read_execution,
-};
+use super::get_object_zero_copy::{GetObjectIoPlanning, GetObjectPreparedRead, prepare_get_object_read_execution};
 use crate::error::ApiError;
 use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_buffer_size_opt_in};
-use crate::storage::get_validated_store;
 use crate::storage::options::filter_object_metadata;
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
-use bytes::Bytes;
-use futures_util::StreamExt;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
-use rustfs_io_core::BoxChunkStream;
 use rustfs_object_io::get::{
     GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodyPlanningInputs as ObjectIoGetObjectBodyPlanningInputs,
     GetObjectBodySource, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
@@ -35,8 +29,6 @@ use rustfs_object_io::get::{
     build_cors_wrapped_get_object_flow_result as object_io_build_cors_wrapped_get_object_flow_result,
     build_get_object_checksums as object_io_build_get_object_checksums,
     build_get_object_output_context as object_io_build_get_object_output_context,
-    build_memory_blob as object_io_build_memory_blob, chunk_body_data_plane_labels as object_io_chunk_body_data_plane_labels,
-    get_object_chunk_path_label as object_io_get_object_chunk_path_label,
     materialize_get_object_body as object_io_materialize_get_object_body, plan_get_object_body as object_io_plan_get_object_body,
     plan_get_object_strategy_layout as object_io_plan_get_object_strategy_layout,
 };
@@ -52,95 +44,6 @@ pub(super) struct GetObjectBootstrap {
     pub(super) request_start: std::time::Instant,
     pub(super) request_guard: GetObjectGuard,
     pub(super) _deadlock_request_guard: DeadlockRequestGuard,
-}
-
-#[derive(Debug)]
-struct ChunkCommitMaterializationError {
-    source: std::io::Error,
-    streamed_bytes: usize,
-}
-
-fn build_chunk_materialization_length_error(actual: usize, expected: usize) -> std::io::Error {
-    let error_kind = if actual > expected {
-        std::io::ErrorKind::InvalidData
-    } else {
-        std::io::ErrorKind::UnexpectedEof
-    };
-
-    std::io::Error::new(
-        error_kind,
-        format!("chunk fast path produced {actual} bytes before response commit, expected {expected}"),
-    )
-}
-
-async fn materialize_chunk_stream_before_commit_with_threshold(
-    mut chunk_stream: BoxChunkStream,
-    response_content_length: i64,
-    optimal_buffer_size: usize,
-    in_memory_threshold_bytes: usize,
-) -> Result<Option<StreamingBlob>, ChunkCommitMaterializationError> {
-    let expected_bytes = usize::try_from(response_content_length).map_err(|_| ChunkCommitMaterializationError {
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("negative response content length {response_content_length} for chunk fast path"),
-        ),
-        streamed_bytes: 0,
-    })?;
-
-    // Objects larger than the in-memory threshold fall back to the legacy reader path
-    // rather than spooling to disk, to avoid exhausting local disk under concurrent large downloads.
-    if expected_bytes > in_memory_threshold_bytes {
-        return Err(ChunkCommitMaterializationError {
-            source: std::io::Error::other(format!(
-                "chunk fast path object size {expected_bytes} exceeds in-memory threshold \
-                 {in_memory_threshold_bytes}; falling back to legacy reader"
-            )),
-            streamed_bytes: 0,
-        });
-    }
-
-    let mut buf = Vec::with_capacity(expected_bytes);
-    let mut streamed_bytes = 0usize;
-
-    while let Some(result) = chunk_stream.next().await {
-        let chunk = result.map_err(|source| ChunkCommitMaterializationError { source, streamed_bytes })?;
-        let bytes = chunk.as_bytes();
-        streamed_bytes = streamed_bytes.saturating_add(bytes.len());
-        if streamed_bytes > expected_bytes {
-            return Err(ChunkCommitMaterializationError {
-                source: build_chunk_materialization_length_error(streamed_bytes, expected_bytes),
-                streamed_bytes,
-            });
-        }
-        buf.extend_from_slice(bytes.as_ref());
-    }
-
-    if streamed_bytes != expected_bytes {
-        return Err(ChunkCommitMaterializationError {
-            source: build_chunk_materialization_length_error(streamed_bytes, expected_bytes),
-            streamed_bytes,
-        });
-    }
-
-    Ok(object_io_build_memory_blob(
-        Bytes::from(buf),
-        response_content_length,
-        optimal_buffer_size,
-    ))
-}
-
-async fn materialize_chunk_stream_before_commit(
-    chunk_stream: BoxChunkStream,
-    response_content_length: i64,
-    optimal_buffer_size: usize,
-) -> Result<Option<StreamingBlob>, ChunkCommitMaterializationError> {
-    materialize_chunk_stream_before_commit_with_threshold(
-        chunk_stream,
-        response_content_length,
-        optimal_buffer_size,
-        rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
-    )
-    .await
 }
 
 async fn build_get_object_body_adapter<R>(
@@ -340,14 +243,62 @@ pub(super) async fn build_get_object_output_context(
     let bucket = &request_context.bucket;
     let key = &request_context.key;
     let part_number = request_context.part_number;
-    let mut active_read_setup = read_setup;
+    let GetObjectReadSetup {
+        info,
+        event_info,
+        body_source,
+        rs,
+        content_type,
+        last_modified,
+        response_content_length,
+        content_range,
+        server_side_encryption,
+        sse_customer_algorithm,
+        sse_customer_key_md5,
+        ssekms_key_id,
+        encryption_applied,
+    } = read_setup;
 
-    loop {
-        let GetObjectReadSetup {
+    let optimal_buffer_size = finalize_get_object_strategy_runtime(
+        request_context,
+        rs.as_ref(),
+        manager,
+        base_buffer_size,
+        &info,
+        response_content_length,
+        io_planning,
+    );
+
+    let GetObjectBodySource::Reader(final_stream) = body_source;
+
+    let body = build_get_object_body_adapter(
+        final_stream,
+        bucket,
+        key,
+        response_content_length,
+        optimal_buffer_size,
+        ObjectIoGetObjectBodyPlanningInputs {
+            is_part_request: part_number.is_some(),
+            is_range_request: rs.is_some(),
+            encryption_applied,
+            response_size: response_content_length,
+        },
+    )
+    .await?;
+    let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::disk(
+        rustfs_io_metrics::IoPath::Legacy,
+        rustfs_io_metrics::CopyMode::SingleCopy,
+    );
+
+    let checksums = object_io_build_get_object_checksums(&info, &request_context.headers, part_number, rs.as_ref())
+        .map_err(ApiError::from)?;
+    let filtered_metadata = filter_object_metadata(&info.user_defined);
+
+    Ok((
+        object_io_build_get_object_output_context(
+            body,
             info,
             event_info,
-            body_source,
-            rs,
             content_type,
             last_modified,
             response_content_length,
@@ -356,108 +307,14 @@ pub(super) async fn build_get_object_output_context(
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
-            encryption_applied,
-        } = active_read_setup;
-
-        let optimal_buffer_size = finalize_get_object_strategy_runtime(
-            request_context,
-            rs.as_ref(),
-            manager,
-            base_buffer_size,
-            &info,
-            response_content_length,
-            io_planning,
-        );
-
-        let (body, metric_contract) = match body_source {
-            GetObjectBodySource::Reader(final_stream) => {
-                let body = build_get_object_body_adapter(
-                    final_stream,
-                    bucket,
-                    key,
-                    response_content_length,
-                    optimal_buffer_size,
-                    ObjectIoGetObjectBodyPlanningInputs {
-                        is_part_request: part_number.is_some(),
-                        is_range_request: rs.is_some(),
-                        encryption_applied,
-                        response_size: response_content_length,
-                    },
-                )
-                .await?;
-                let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::disk(
-                    rustfs_io_metrics::IoPath::Legacy,
-                    rustfs_io_metrics::CopyMode::SingleCopy,
-                );
-
-                (body, metric_contract)
-            }
-            GetObjectBodySource::Chunk {
-                stream: chunk_stream,
-                path,
-                copy_mode,
-            } => {
-                let (io_path, copy_mode) = object_io_chunk_body_data_plane_labels(path, copy_mode);
-                match materialize_chunk_stream_before_commit(chunk_stream, response_content_length, optimal_buffer_size).await {
-                    Ok(body) => (body, ObjectIoGetObjectDataPlaneMetricContract::disk(io_path, copy_mode)),
-                    Err(err) => {
-                        let path_label = object_io_get_object_chunk_path_label(path);
-                        rustfs_io_metrics::record_io_fallback(
-                            rustfs_io_metrics::IoStage::ReadSetup,
-                            rustfs_io_metrics::FallbackReason::ProbeFailed,
-                        );
-                        rustfs_io_metrics::record_get_object_fast_path_probe_failed(
-                            path_label,
-                            copy_mode,
-                            response_content_length,
-                        );
-                        warn!(
-                            bucket = %request_context.bucket,
-                            key = %request_context.key,
-                            version_id = ?request_context.opts.version_id,
-                            path = path_label,
-                            copy_mode = copy_mode.as_str(),
-                            promised_bytes = response_content_length,
-                            materialized_bytes = err.streamed_bytes,
-                            error = %err.source,
-                            "GetObject chunk fast path full-body materialization failed before response commit"
-                        );
-
-                        let store = get_validated_store(&request_context.bucket).await?;
-                        active_read_setup =
-                            prepare_get_object_read(request_context, &store, manager, std::time::Instant::now()).await?;
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let checksums = object_io_build_get_object_checksums(&info, &request_context.headers, part_number, rs.as_ref())
-            .map_err(ApiError::from)?;
-        let filtered_metadata = filter_object_metadata(&info.user_defined);
-
-        return Ok((
-            object_io_build_get_object_output_context(
-                body,
-                info,
-                event_info,
-                content_type,
-                last_modified,
-                response_content_length,
-                content_range,
-                server_side_encryption,
-                sse_customer_algorithm,
-                sse_customer_key_md5,
-                ssekms_key_id,
-                &checksums,
-                filtered_metadata,
-                versioned,
-                optimal_buffer_size,
-                Some(metric_contract.copy_mode),
-            ),
-            metric_contract,
-        ));
-    }
+            &checksums,
+            filtered_metadata,
+            versioned,
+            optimal_buffer_size,
+            Some(metric_contract.copy_mode),
+        ),
+        metric_contract,
+    ))
 }
 
 pub(super) async fn run_get_object_flow(
@@ -498,10 +355,8 @@ pub(super) async fn run_get_object_flow(
 mod tests {
     use super::get_object_strategy_range;
     use super::*;
-    use futures_util::StreamExt;
     use http::HeaderMap;
     use rustfs_ecstore::store_api::ObjectOptions;
-    use rustfs_io_core::IoChunk;
 
     fn sample_range(start: i64, end: i64) -> HTTPRangeSpec {
         HTTPRangeSpec {
@@ -544,85 +399,5 @@ mod tests {
 
         assert_eq!(strategy_range.start, 0);
         assert_eq!(strategy_range.end, 511);
-    }
-
-    #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_buffers_small_payload_in_memory() {
-        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b" world"))),
-        ]));
-
-        let mut body = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mut collected = Vec::new();
-        while let Some(chunk) = body.next().await {
-            collected.extend_from_slice(&chunk.unwrap());
-        }
-
-        assert_eq!(collected, b"hello world");
-    }
-
-    #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_falls_back_for_large_payload() {
-        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b" world"))),
-        ]));
-
-        // When payload exceeds the in-memory threshold an error is returned so the
-        // caller can fall back to the legacy reader path rather than spooling to disk.
-        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 4)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.streamed_bytes, 0);
-        assert_eq!(err.source.kind(), std::io::ErrorKind::Other);
-    }
-
-    #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_rejects_short_body() {
-        let chunk_stream: BoxChunkStream =
-            Box::pin(futures_util::stream::iter(vec![Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello")))]));
-
-        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.streamed_bytes, 5);
-        assert_eq!(err.source.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
-    #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_rejects_long_body() {
-        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello "))),
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"world!"))),
-        ]));
-
-        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.streamed_bytes, 12);
-        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn materialize_chunk_stream_before_commit_preserves_midstream_io_errors() {
-        let chunk_stream: BoxChunkStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(IoChunk::Shared(bytes::Bytes::from_static(b"hello"))),
-            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer closed")),
-        ]));
-
-        let err = materialize_chunk_stream_before_commit_with_threshold(chunk_stream, 11, 8 * 1024, 1024)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.streamed_bytes, 5);
-        assert_eq!(err.source.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

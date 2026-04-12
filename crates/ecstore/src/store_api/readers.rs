@@ -189,26 +189,6 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GetObjectChunkPath {
-    Direct,
-    Bridge,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GetObjectChunkCopyMode {
-    TrueZeroCopy,
-    SharedBytes,
-    SingleCopy,
-    Reconstructed,
-}
-
-pub struct GetObjectChunkResult {
-    pub stream: BoxChunkStream,
-    pub path: GetObjectChunkPath,
-    pub copy_mode: GetObjectChunkCopyMode,
-}
-
 impl GetObjectReader {
     #[tracing::instrument(level = "debug", skip(reader, rs, opts, _h))]
     pub fn new(

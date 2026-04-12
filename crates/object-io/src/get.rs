@@ -13,14 +13,10 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use futures_util::StreamExt;
 use http::HeaderMap;
 use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LANGUAGE};
-use rustfs_ecstore::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::{GetObjectChunkCopyMode, GetObjectChunkPath, GetObjectChunkResult, HTTPRangeSpec, ObjectInfo};
-use rustfs_io_core::BoxChunkStream;
+use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
 use rustfs_rio::Reader;
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
@@ -113,55 +109,6 @@ where
     )))
 }
 
-pub fn build_chunk_blob(chunk_stream: BoxChunkStream) -> Option<StreamingBlob> {
-    Some(StreamingBlob::wrap(chunk_stream.map(|result| result.map(|chunk| chunk.as_bytes()))))
-}
-
-/// ADR-facing alias for the chunk-stream to HTTP body bridge.
-pub fn build_chunk_http_body(chunk_stream: BoxChunkStream) -> Option<StreamingBlob> {
-    build_chunk_blob(chunk_stream)
-}
-
-pub fn map_chunk_copy_mode(copy_mode: GetObjectChunkCopyMode) -> rustfs_io_metrics::CopyMode {
-    match copy_mode {
-        GetObjectChunkCopyMode::TrueZeroCopy => rustfs_io_metrics::CopyMode::TrueZeroCopy,
-        GetObjectChunkCopyMode::SharedBytes => rustfs_io_metrics::CopyMode::SharedBytes,
-        GetObjectChunkCopyMode::SingleCopy => rustfs_io_metrics::CopyMode::SingleCopy,
-        GetObjectChunkCopyMode::Reconstructed => rustfs_io_metrics::CopyMode::Reconstructed,
-    }
-}
-
-pub fn chunk_body_data_plane_labels(
-    path: GetObjectChunkPath,
-    copy_mode: rustfs_io_metrics::CopyMode,
-) -> (rustfs_io_metrics::IoPath, rustfs_io_metrics::CopyMode) {
-    (
-        match path {
-            GetObjectChunkPath::Direct | GetObjectChunkPath::Bridge => rustfs_io_metrics::IoPath::Fast,
-        },
-        copy_mode,
-    )
-}
-
-#[must_use]
-pub const fn get_object_chunk_path_label(path: GetObjectChunkPath) -> &'static str {
-    match path {
-        GetObjectChunkPath::Direct => "direct",
-        GetObjectChunkPath::Bridge => "bridge",
-    }
-}
-
-pub fn get_object_chunk_fast_path_guard(
-    has_sse_customer_key: bool,
-    has_sse_customer_key_md5: bool,
-) -> Result<(), ChunkReadFallback> {
-    if has_sse_customer_key || has_sse_customer_key_md5 {
-        return Err(ChunkReadFallback::read_setup(rustfs_io_metrics::FallbackReason::EncryptionEnabled));
-    }
-
-    Ok(())
-}
-
 pub fn get_object_sequential_hint(rs: Option<&HTTPRangeSpec>) -> bool {
     if rs.is_none() {
         true
@@ -196,11 +143,6 @@ pub struct GetObjectBodyPlanningInputs {
 
 pub enum GetObjectBodySource {
     Reader(Box<dyn Reader>),
-    Chunk {
-        stream: BoxChunkStream,
-        path: GetObjectChunkPath,
-        copy_mode: rustfs_io_metrics::CopyMode,
-    },
 }
 
 pub struct GetObjectReadSetup {
@@ -259,11 +201,6 @@ pub struct GetObjectEncryptionState {
     pub ssekms_key_id: Option<SSEKMSKeyId>,
     pub encryption_applied: bool,
     pub response_content_length_override: Option<i64>,
-}
-
-pub struct ChunkReadSetupResult {
-    pub read_setup: GetObjectReadSetup,
-    pub io_path: rustfs_io_metrics::IoPath,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -591,55 +528,6 @@ pub fn build_get_object_output_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_chunk_read_setup(
-    info: ObjectInfo,
-    event_info: ObjectInfo,
-    path: GetObjectChunkPath,
-    copy_mode: rustfs_io_metrics::CopyMode,
-    stream: BoxChunkStream,
-    plan: ChunkReadPlan,
-) -> GetObjectReadSetup {
-    let ChunkReadPlan {
-        rs,
-        content_type,
-        last_modified,
-        response_content_length,
-        content_range,
-    } = plan;
-
-    GetObjectReadSetup {
-        info,
-        event_info,
-        body_source: GetObjectBodySource::Chunk { stream, path, copy_mode },
-        rs,
-        content_type,
-        last_modified,
-        response_content_length,
-        content_range,
-        server_side_encryption: None,
-        sse_customer_algorithm: None,
-        sse_customer_key_md5: None,
-        ssekms_key_id: None,
-        encryption_applied: false,
-    }
-}
-
-pub fn finalize_chunk_read_setup(
-    info: ObjectInfo,
-    event_info: ObjectInfo,
-    chunk_result: GetObjectChunkResult,
-    plan: ChunkReadPlan,
-) -> ChunkReadSetupResult {
-    let copy_mode = map_chunk_copy_mode(chunk_result.copy_mode);
-    let (io_path, _) = chunk_body_data_plane_labels(chunk_result.path, copy_mode);
-
-    ChunkReadSetupResult {
-        io_path,
-        read_setup: build_chunk_read_setup(info, event_info, chunk_result.path, copy_mode, chunk_result.stream, plan),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn build_get_object_output(
     body: Option<StreamingBlob>,
     info: &ObjectInfo,
@@ -684,346 +572,14 @@ pub fn build_get_object_output(
     }
 }
 
-#[derive(Debug)]
-pub struct ChunkReadPlan {
-    pub rs: Option<HTTPRangeSpec>,
-    pub content_type: Option<ContentType>,
-    pub last_modified: Option<Timestamp>,
-    pub response_content_length: i64,
-    pub content_range: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkReadFallback {
-    pub stage: rustfs_io_metrics::IoStage,
-    pub reason: rustfs_io_metrics::FallbackReason,
-}
-
-impl ChunkReadFallback {
-    pub const fn new(stage: rustfs_io_metrics::IoStage, reason: rustfs_io_metrics::FallbackReason) -> Self {
-        Self { stage, reason }
-    }
-
-    pub const fn read_setup(reason: rustfs_io_metrics::FallbackReason) -> Self {
-        Self::new(rustfs_io_metrics::IoStage::ReadSetup, reason)
-    }
-
-    pub const fn range_guard(reason: rustfs_io_metrics::FallbackReason) -> Self {
-        Self::new(rustfs_io_metrics::IoStage::RangeGuard, reason)
-    }
-}
-
-#[derive(Debug)]
-pub enum ChunkReadDecision {
-    Eligible(ChunkReadPlan),
-    Fallback(ChunkReadFallback),
-}
-
-#[derive(Debug)]
-pub enum ChunkReadPlanError {
-    NoSuchKey,
-    MethodNotAllowed,
-    Io(std::io::Error),
-}
-
-impl From<std::io::Error> for ChunkReadPlanError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<StorageError> for ChunkReadPlanError {
-    fn from(value: StorageError) -> Self {
-        Self::Io(std::io::Error::other(value.to_string()))
-    }
-}
-
-pub fn get_object_chunk_range_guard(rs: Option<&HTTPRangeSpec>) -> Result<(), ChunkReadFallback> {
-    let Some(range_spec) = rs else {
-        return Ok(());
-    };
-
-    let unsupported = if range_spec.is_suffix_length {
-        range_spec.end != -1
-    } else {
-        range_spec.start < 0 || range_spec.end < -1 || (range_spec.end != -1 && range_spec.end < range_spec.start)
-    };
-
-    if unsupported {
-        return Err(ChunkReadFallback::range_guard(rustfs_io_metrics::FallbackReason::RangeNotSupported));
-    }
-
-    Ok(())
-}
-
-pub fn plan_chunk_read(
-    info: &ObjectInfo,
-    version_id_missing: bool,
-    rs: Option<HTTPRangeSpec>,
-    part_number: Option<usize>,
-) -> Result<ChunkReadDecision, ChunkReadPlanError> {
-    if info.delete_marker {
-        if version_id_missing {
-            return Err(ChunkReadPlanError::NoSuchKey);
-        }
-        return Err(ChunkReadPlanError::MethodNotAllowed);
-    }
-
-    let (_, is_compressed) = info.is_compressed_ok()?;
-    if is_compressed {
-        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
-            rustfs_io_metrics::FallbackReason::CompressionEnabled,
-        )));
-    }
-
-    if info.transitioned_object.status == TRANSITION_COMPLETE {
-        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
-            rustfs_io_metrics::FallbackReason::NonLocalBackend,
-        )));
-    }
-
-    let has_encryption_metadata = info.user_defined.contains_key("x-rustfs-encryption-key")
-        || info.user_defined.contains_key("x-amz-server-side-encryption")
-        || info
-            .user_defined
-            .contains_key("x-amz-server-side-encryption-customer-algorithm");
-    if has_encryption_metadata {
-        return Ok(ChunkReadDecision::Fallback(ChunkReadFallback::read_setup(
-            rustfs_io_metrics::FallbackReason::EncryptionEnabled,
-        )));
-    }
-
-    let rs = resolve_requested_range(info, rs, part_number);
-    if let Err(fallback) = get_object_chunk_range_guard(rs.as_ref()) {
-        return Ok(ChunkReadDecision::Fallback(fallback));
-    }
-
-    let content_type = info
-        .content_type
-        .as_ref()
-        .and_then(|content_type| ContentType::from_str(content_type).ok());
-    let last_modified = info.mod_time.map(Timestamp::from);
-    let total_size = info.get_actual_size()?;
-    let (rs, response_content_length, content_range) = resolve_response_range(total_size, rs)?;
-
-    Ok(ChunkReadDecision::Eligible(ChunkReadPlan {
-        rs,
-        content_type,
-        last_modified,
-        response_content_length,
-        content_range,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn map_chunk_copy_mode_uses_expected_metric_modes() {
-        assert_eq!(
-            map_chunk_copy_mode(GetObjectChunkCopyMode::TrueZeroCopy),
-            rustfs_io_metrics::CopyMode::TrueZeroCopy
-        );
-        assert_eq!(
-            map_chunk_copy_mode(GetObjectChunkCopyMode::SharedBytes),
-            rustfs_io_metrics::CopyMode::SharedBytes
-        );
-        assert_eq!(
-            map_chunk_copy_mode(GetObjectChunkCopyMode::SingleCopy),
-            rustfs_io_metrics::CopyMode::SingleCopy
-        );
-        assert_eq!(
-            map_chunk_copy_mode(GetObjectChunkCopyMode::Reconstructed),
-            rustfs_io_metrics::CopyMode::Reconstructed
-        );
-    }
-
-    #[test]
-    fn chunk_body_labels_keep_fast_path_and_copy_mode() {
-        let (path, copy_mode) = chunk_body_data_plane_labels(GetObjectChunkPath::Bridge, rustfs_io_metrics::CopyMode::SingleCopy);
-        assert_eq!(path, rustfs_io_metrics::IoPath::Fast);
-        assert_eq!(copy_mode, rustfs_io_metrics::CopyMode::SingleCopy);
-    }
-
-    #[test]
-    fn get_object_chunk_fast_path_guard_rejects_ssec_requests() {
-        let err = get_object_chunk_fast_path_guard(true, false).unwrap_err();
-        assert_eq!(
-            err,
-            ChunkReadFallback {
-                stage: rustfs_io_metrics::IoStage::ReadSetup,
-                reason: rustfs_io_metrics::FallbackReason::EncryptionEnabled,
-            }
-        );
-    }
-
-    #[test]
-    fn get_object_chunk_fast_path_guard_allows_plain_request() {
-        assert!(get_object_chunk_fast_path_guard(false, false).is_ok());
-    }
-
-    #[test]
-    fn get_object_chunk_range_guard_rejects_invalid_suffix_range() {
-        let err = get_object_chunk_range_guard(Some(&HTTPRangeSpec {
-            is_suffix_length: true,
-            start: 4,
-            end: 0,
-        }))
-        .unwrap_err();
-
-        assert_eq!(
-            err,
-            ChunkReadFallback {
-                stage: rustfs_io_metrics::IoStage::RangeGuard,
-                reason: rustfs_io_metrics::FallbackReason::RangeNotSupported,
-            }
-        );
-    }
-
-    #[test]
     fn build_get_object_checksums_returns_default_when_mode_absent() {
         let checksums = build_get_object_checksums(&ObjectInfo::default(), &HeaderMap::new(), None, None).unwrap();
         assert_eq!(checksums, GetObjectChecksums::default());
-    }
-
-    #[test]
-    fn plan_chunk_read_returns_fallback_for_compressed_object() {
-        let mut info = ObjectInfo::default();
-        rustfs_utils::http::insert_str(
-            &mut info.user_defined,
-            rustfs_utils::http::SUFFIX_COMPRESSION,
-            rustfs_utils::CompressionAlgorithm::Zstd.to_string(),
-        );
-
-        let decision = plan_chunk_read(&info, true, None, None).unwrap();
-        assert!(
-            matches!(
-                decision,
-                ChunkReadDecision::Fallback(ChunkReadFallback {
-                    stage: rustfs_io_metrics::IoStage::ReadSetup,
-                    reason: rustfs_io_metrics::FallbackReason::CompressionEnabled,
-                })
-            ),
-            "unexpected decision: {:?}",
-            decision
-        );
-    }
-
-    #[test]
-    fn plan_chunk_read_returns_fallback_for_transitioned_object() {
-        let mut info = ObjectInfo::default();
-        info.transitioned_object.status = TRANSITION_COMPLETE.to_string();
-
-        let decision = plan_chunk_read(&info, true, None, None).unwrap();
-        assert!(matches!(
-            decision,
-            ChunkReadDecision::Fallback(ChunkReadFallback {
-                stage: rustfs_io_metrics::IoStage::ReadSetup,
-                reason: rustfs_io_metrics::FallbackReason::NonLocalBackend,
-            })
-        ));
-    }
-
-    #[test]
-    fn plan_chunk_read_returns_range_guard_fallback_for_invalid_range() {
-        let info = ObjectInfo {
-            size: 16,
-            actual_size: 16,
-            ..Default::default()
-        };
-
-        let decision = plan_chunk_read(
-            &info,
-            true,
-            Some(HTTPRangeSpec {
-                is_suffix_length: false,
-                start: -1,
-                end: 4,
-            }),
-            None,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            decision,
-            ChunkReadDecision::Fallback(ChunkReadFallback {
-                stage: rustfs_io_metrics::IoStage::RangeGuard,
-                reason: rustfs_io_metrics::FallbackReason::RangeNotSupported,
-            })
-        ));
-    }
-
-    #[test]
-    fn plan_chunk_read_allows_suffix_range() {
-        let info = ObjectInfo {
-            size: 16,
-            actual_size: 16,
-            ..Default::default()
-        };
-
-        let decision = plan_chunk_read(
-            &info,
-            true,
-            Some(HTTPRangeSpec {
-                is_suffix_length: true,
-                start: 4,
-                end: -1,
-            }),
-            None,
-        )
-        .unwrap();
-
-        let ChunkReadDecision::Eligible(plan) = decision else {
-            panic!("expected eligible plan");
-        };
-        let rs = plan.rs.expect("suffix range should be preserved");
-        assert!(rs.is_suffix_length);
-        assert_eq!(rs.start, 4);
-        assert_eq!(plan.response_content_length, 4);
-        assert_eq!(plan.content_range.as_deref(), Some("bytes 12-15/16"));
-    }
-
-    #[test]
-    fn plan_chunk_read_uses_part_number_range_when_available() {
-        let mut info = ObjectInfo {
-            size: 12,
-            actual_size: 12,
-            content_type: Some("application/octet-stream".to_string()),
-            ..Default::default()
-        };
-        info.parts = vec![Default::default(), Default::default()];
-        info.parts[0].number = 1;
-        info.parts[0].size = 5;
-        info.parts[0].actual_size = 5;
-        info.parts[1].number = 2;
-        info.parts[1].size = 7;
-        info.parts[1].actual_size = 7;
-
-        let decision = plan_chunk_read(&info, true, None, Some(2)).unwrap();
-        let ChunkReadDecision::Eligible(plan) = decision else {
-            panic!("expected eligible plan");
-        };
-        let rs = plan.rs.expect("range from part number");
-        assert_eq!(rs.start, 5);
-        assert_eq!(rs.end, 11);
-        assert_eq!(plan.response_content_length, 7);
-        assert_eq!(plan.content_range.as_deref(), Some("bytes 5-11/12"));
-        assert!(plan.content_type.is_some());
-    }
-
-    #[test]
-    fn plan_chunk_read_returns_delete_marker_errors() {
-        let info = ObjectInfo {
-            delete_marker: true,
-            ..Default::default()
-        };
-
-        let err = plan_chunk_read(&info, true, None, None).unwrap_err();
-        assert!(matches!(err, ChunkReadPlanError::NoSuchKey));
-
-        let err = plan_chunk_read(&info, false, None, None).unwrap_err();
-        assert!(matches!(err, ChunkReadPlanError::MethodNotAllowed));
     }
 
     #[test]
@@ -1074,7 +630,6 @@ mod tests {
         assert_eq!(setup.response_content_length, 12);
         match setup.body_source {
             GetObjectBodySource::Reader(_) => {}
-            GetObjectBodySource::Chunk { .. } => panic!("expected reader body source"),
         }
     }
 
@@ -1245,38 +800,5 @@ mod tests {
         );
 
         assert_eq!(result.version_id_for_event, "vid");
-    }
-
-    #[test]
-    fn finalize_chunk_read_setup_preserves_body_source_and_io_path() {
-        let chunk_result = GetObjectChunkResult {
-            stream: Box::pin(futures_util::stream::empty::<std::io::Result<rustfs_io_core::IoChunk>>()),
-            path: GetObjectChunkPath::Direct,
-            copy_mode: GetObjectChunkCopyMode::Reconstructed,
-        };
-        let plan = ChunkReadPlan {
-            rs: Some(HTTPRangeSpec {
-                is_suffix_length: false,
-                start: 0,
-                end: 7,
-            }),
-            content_type: None,
-            last_modified: None,
-            response_content_length: 8,
-            content_range: Some("bytes 0-7/8".to_string()),
-        };
-
-        let result = finalize_chunk_read_setup(ObjectInfo::default(), ObjectInfo::default(), chunk_result, plan);
-
-        assert_eq!(result.io_path, rustfs_io_metrics::IoPath::Fast);
-        match result.read_setup.body_source {
-            GetObjectBodySource::Chunk { path, copy_mode, .. } => {
-                assert_eq!(path, GetObjectChunkPath::Direct);
-                assert_eq!(copy_mode, rustfs_io_metrics::CopyMode::Reconstructed);
-            }
-            GetObjectBodySource::Reader(_) => panic!("expected chunk body source"),
-        }
-        assert_eq!(result.read_setup.response_content_length, 8);
-        assert_eq!(result.read_setup.content_range.as_deref(), Some("bytes 0-7/8"));
     }
 }

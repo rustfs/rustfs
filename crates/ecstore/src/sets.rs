@@ -15,7 +15,7 @@
 
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
-use crate::store_api::{GetObjectChunkResult, ListPartsInfo, ObjectInfoOrErr, WalkOptions};
+use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
 use crate::{
     disk::{
         DiskAPI, DiskInfo, DiskOption, DiskStore,
@@ -285,19 +285,6 @@ impl Sets {
 
     pub fn get_disks_by_key(&self, key: &str) -> Arc<SetDisks> {
         self.get_disks(self.get_hashed_set_index(key))
-    }
-
-    pub async fn get_object_chunks(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: Option<HTTPRangeSpec>,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectChunkResult> {
-        self.get_disks_by_key(object)
-            .get_object_chunks(bucket, object, range, h, opts)
-            .await
     }
 
     fn get_hashed_set_index(&self, input: &str) -> usize {
