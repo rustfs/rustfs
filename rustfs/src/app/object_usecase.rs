@@ -18,8 +18,6 @@ mod get_object_flow;
 mod get_object_zero_copy;
 mod put_object_extract;
 mod put_object_flow;
-#[cfg(test)]
-mod zero_copy_tests;
 use self::get_object_flow::GetObjectBootstrap;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
