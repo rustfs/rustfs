@@ -426,8 +426,18 @@ impl S3 for FS {
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
         record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
-        usecase.execute_get_bucket_acl(req).await
+        let GetBucketAclInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        Ok(S3Response::new(acl::build_get_bucket_acl_output()))
     }
 
     async fn get_bucket_accelerate_configuration(
@@ -897,8 +907,30 @@ impl S3 for FS {
     }
 
     async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
-        usecase.execute_put_bucket_acl(req).await
+        let PutBucketAclInput {
+            bucket,
+            access_control_policy,
+            ..
+        } = req.input;
+        record_s3_op(S3Operation::PutBucketAcl, &bucket);
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
+        }
+
+        Ok(S3Response::new(PutBucketAclOutput::default()))
     }
 
     async fn put_bucket_accelerate_configuration(
@@ -1075,8 +1107,35 @@ impl S3 for FS {
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
         record_s3_op(S3Operation::PutObjectAcl, &req.input.bucket);
-        let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_put_object_acl(req).await
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
+        let bucket = &req.input.bucket;
+        let key = &req.input.key;
+        let version_id = req.input.version_id.clone();
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let opts: ObjectOptions = get_opts(bucket, key, version_id.clone(), None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+        let object_info = store.get_object_info(bucket, key, &opts).await.map_err(ApiError::from)?;
+
+        if req.input.access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
+        }
+
+        let event_version_id = version_id
+            .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
+            .unwrap_or_default();
+        helper = helper.object(object_info).version_id(event_version_id);
+
+        let result = Ok(S3Response::new(PutObjectAclOutput::default()));
+        let _ = helper.complete(&result);
+        result
     }
 
     async fn put_object_legal_hold(

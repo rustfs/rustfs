@@ -674,42 +674,6 @@ impl DefaultObjectUsecase {
         result
     }
 
-    pub async fn execute_put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
-        let PutObjectAclInput {
-            bucket,
-            key,
-            access_control_policy,
-            version_id,
-            ..
-        } = req.input.clone();
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
-
-        if access_control_policy.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
-            ));
-        }
-
-        let event_version_id = version_id
-            .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
-            .unwrap_or_default();
-        helper = helper.object(object_info).version_id(event_version_id);
-
-        let result = Ok(S3Response::new(PutObjectAclOutput::default()));
-        let _ = helper.complete(&result);
-        result
-    }
-
     #[instrument(
         level = "debug",
         skip(self, req),
@@ -2664,21 +2628,6 @@ mod tests {
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
-    }
-
-    #[tokio::test]
-    async fn execute_put_object_acl_returns_internal_error_when_store_uninitialized() {
-        let input = PutObjectAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_put_object_acl(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
