@@ -60,9 +60,9 @@ use crate::{
     sets::Sets,
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
-        GetObjectChunkResult, GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions,
-        ObjectToDelete, PartInfo, StorageAPI,
+        GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions,
+        MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
+        StorageAPI,
     },
     store_init,
 };
@@ -268,20 +268,6 @@ impl ObjectIO for ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
-    }
-}
-
-impl ECStore {
-    #[instrument(level = "debug", skip(self))]
-    pub async fn get_object_chunks(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: Option<HTTPRangeSpec>,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectChunkResult> {
-        self.handle_get_object_chunks(bucket, object, range, h, opts).await
     }
 }
 
