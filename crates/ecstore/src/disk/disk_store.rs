@@ -20,6 +20,7 @@ use crate::disk::{
 };
 use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 use bytes::Bytes;
+use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use std::{
     path::PathBuf,
@@ -40,7 +41,6 @@ const DISK_HEALTH_FAULTY: u32 = 1;
 
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
 pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
-pub const ENV_RUSTFS_DRIVE_MAX_TIMEOUT_DURATION: &str = "RUSTFS_DRIVE_MAX_TIMEOUT_DURATION";
 pub const CHECK_EVERY: Duration = Duration::from_secs(15);
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
 pub const CHECK_TIMEOUT_DURATION: Duration = Duration::from_secs(5);
@@ -51,9 +51,52 @@ lazy_static::lazy_static! {
 }
 
 pub fn get_max_timeout_duration() -> Duration {
-    std::env::var(ENV_RUSTFS_DRIVE_MAX_TIMEOUT_DURATION)
-        .map(|v| Duration::from_secs(v.parse::<u64>().unwrap_or(30)))
-        .unwrap_or(Duration::from_secs(30))
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION,
+        rustfs_config::DEFAULT_DRIVE_MAX_TIMEOUT_DURATION_SECS,
+    ))
+}
+
+fn get_drive_timeout_duration(env_key: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(
+        rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION])
+            .unwrap_or(default_secs),
+    )
+}
+
+pub fn get_drive_metadata_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS,
+    )
+}
+
+pub fn get_drive_disk_info_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_DISK_INFO_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_DISK_INFO_TIMEOUT_SECS,
+    )
+}
+
+pub fn get_drive_list_dir_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_LIST_DIR_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_LIST_DIR_TIMEOUT_SECS,
+    )
+}
+
+pub fn get_drive_walkdir_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS,
+    )
+}
+
+pub fn get_drive_walkdir_stall_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
+    )
 }
 
 /// DiskHealthTracker tracks the health status of a disk.
@@ -439,6 +482,19 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.track_disk_health_with_op("unknown", operation, timeout_duration).await
+    }
+
+    pub async fn track_disk_health_with_op<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
         if self.health.is_faulty() {
             warn!("local disk {} health is faulty, returning error", self.to_string());
@@ -479,7 +535,18 @@ impl LocalDiskWrapper {
             Err(_) => {
                 // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
                 self.health.decrement_waiting();
-                warn!("disk operation timeout after {:?}", timeout_duration);
+                counter!(
+                    "rustfs_drive_op_timeout_total",
+                    "endpoint" => self.endpoint().to_string(),
+                    "op" => op.to_string()
+                )
+                .increment(1);
+                warn!(
+                    endpoint = %self.endpoint(),
+                    op,
+                    timeout_ms = timeout_duration.as_millis(),
+                    "Local disk operation timed out"
+                );
                 Err(DiskError::other(format!("disk operation timeout after {timeout_duration:?}")))
             }
         }
@@ -489,8 +556,12 @@ impl LocalDiskWrapper {
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        self.track_disk_health(|| async { self.disk.read_metadata(volume, path).await }, Duration::ZERO)
-            .await
+        self.track_disk_health_with_op(
+            "read_metadata",
+            || async { self.disk.read_metadata(volume, path).await },
+            get_drive_metadata_timeout(),
+        )
+        .await
     }
 
     fn start_scan(&self) -> ScanGuard {
@@ -565,15 +636,22 @@ impl DiskAPI for LocalDiskWrapper {
             return Err(DiskError::FaultyDisk);
         }
 
-        let result = self.disk.disk_info(opts).await?;
+        self.track_disk_health_with_op(
+            "disk_info",
+            || async {
+                let result = self.disk.disk_info(opts).await?;
 
-        if let Some(current_disk_id) = *self.disk_id.read().await
-            && Some(current_disk_id) != result.id
-        {
-            return Err(DiskError::DiskNotFound);
-        };
+                if let Some(current_disk_id) = *self.disk_id.read().await
+                    && Some(current_disk_id) != result.id
+                {
+                    return Err(DiskError::DiskNotFound);
+                };
 
-        Ok(result)
+                Ok(result)
+            },
+            get_drive_disk_info_timeout(),
+        )
+        .await
     }
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
@@ -587,7 +665,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
-        self.track_disk_health(|| async { self.disk.list_volumes().await }, Duration::ZERO)
+        self.track_disk_health_with_op("list_volumes", || async { self.disk.list_volumes().await }, Duration::ZERO)
             .await
     }
 
@@ -602,7 +680,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.walk_dir(opts, wr).await }, Duration::ZERO)
+        self.track_disk_health_with_op("walk_dir", || async { self.disk.walk_dir(opts, wr).await }, get_drive_walkdir_timeout())
             .await
     }
 
@@ -710,9 +788,10 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "list_dir",
             || async { self.disk.list_dir(origvolume, volume, dir_path, count).await },
-            get_max_timeout_duration(),
+            get_drive_list_dir_timeout(),
         )
         .await
     }
@@ -800,5 +879,40 @@ impl DiskAPI for LocalDiskWrapper {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         self.track_disk_health(|| async { self.disk.read_all(volume, path).await }, get_max_timeout_duration())
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_metadata_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                assert_eq!(
+                    get_drive_metadata_timeout(),
+                    Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS)
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn drive_metadata_timeout_uses_legacy_fallback_when_canonical_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(17));
+            });
+        });
+    }
+
+    #[test]
+    fn drive_metadata_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("7"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(7));
+            });
+        });
     }
 }

@@ -117,25 +117,32 @@ impl SetDisks {
     pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
         let mut disks = self.get_disks_internal().await;
 
-        let mut infos = Vec::with_capacity(disks.len());
+        let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
 
         let mut futures = Vec::with_capacity(disks.len());
-        let mut numbers: Vec<usize> = (0..disks.len()).collect();
         {
             let mut rng = rand::rng();
             disks.shuffle(&mut rng);
-
-            numbers.shuffle(&mut rng);
         }
 
-        for &i in numbers.iter() {
-            let disk = disks[i].clone();
+        for (i, disk) in disks.iter().cloned().enumerate() {
             futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.disk_info(&DiskInfoOptions::default()).await
+                let info = if let Some(disk) = disk {
+                    match disk.disk_info(&DiskInfoOptions::default()).await {
+                        Ok(info) => info,
+                        Err(err) => DiskInfo {
+                            error: err.to_string(),
+                            ..Default::default()
+                        },
+                    }
                 } else {
-                    Err(DiskError::DiskNotFound)
-                }
+                    DiskInfo {
+                        error: DiskError::DiskNotFound.to_string(),
+                        ..Default::default()
+                    }
+                };
+
+                Ok((i, info))
             });
         }
 
@@ -143,13 +150,13 @@ impl SetDisks {
         let processor = get_global_processors().metadata_processor();
         let results = processor.execute_batch(futures).await;
 
-        for result in results {
+        for (submitted_idx, result) in results.into_iter().enumerate() {
             match result {
-                Ok(res) => {
-                    infos.push(res);
+                Ok((disk_idx, info)) => {
+                    infos[disk_idx] = Some(info);
                 }
                 Err(err) => {
-                    infos.push(DiskInfo {
+                    infos[submitted_idx] = Some(DiskInfo {
                         error: err.to_string(),
                         ..Default::default()
                     });
@@ -167,8 +174,11 @@ impl SetDisks {
         let mut new_disks = Vec::new();
         let mut new_infos = Vec::new();
 
-        for &i in numbers.iter() {
-            let (info, disk) = (infos[i].clone(), disks[i].clone());
+        for (disk, info) in disks.into_iter().zip(infos.into_iter()) {
+            let Some(info) = info else {
+                continue;
+            };
+
             if !info.error.is_empty() || disk.is_none() {
                 continue;
             }
@@ -365,5 +375,95 @@ impl SetDisks {
         new_infos.extend(healing_infos);
 
         Ok((new_disks, new_infos, healing))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_init::save_format_file;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
+    }
+
+    #[tokio::test]
+    async fn get_online_disks_with_healing_and_info_keeps_disk_and_info_aligned() {
+        let disk_count = 8;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        for _ in 0..32 {
+            let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+            assert_eq!(healing, 0);
+            assert_eq!(online_disks.len(), disk_count);
+            assert_eq!(infos.len(), disk_count);
+
+            for (disk, info) in online_disks.iter().zip(infos.iter()) {
+                assert!(
+                    info.error.is_empty(),
+                    "unexpected disk_info error for {}: {}",
+                    disk.endpoint(),
+                    info.error
+                );
+                assert_eq!(info.endpoint, disk.endpoint().to_string());
+                assert_eq!(
+                    info.id,
+                    disk.get_disk_id().await.expect("disk id lookup should succeed"),
+                    "disk info should stay aligned with disk {}",
+                    disk.endpoint()
+                );
+            }
+        }
+
+        drop(temp_dirs);
     }
 }
