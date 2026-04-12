@@ -22,9 +22,11 @@ use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, Da
 use crate::error::ScannerError;
 use crate::scanner_io::ScannerIODisk as _;
 use crate::sleeper::DynamicSleeper;
-use rustfs_common::heal_channel::{HEAL_DELETE_DANGLING, HealChannelRequest, HealOpts, HealScanMode, send_heal_request};
+use metrics::counter;
+use rustfs_common::heal_channel::{
+    HEAL_DELETE_DANGLING, HealChannelPriority, HealChannelRequest, HealScanMode, send_heal_request,
+};
 use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -84,6 +86,32 @@ pub struct CachedFolder {
 /// Type alias for get size function
 pub type GetSizeFn = Box<dyn Fn(ScannerItem) -> Result<SizeSummary, StorageError> + Send + Sync>;
 
+fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> HealChannelRequest {
+    HealChannelRequest {
+        bucket,
+        priority,
+        ..Default::default()
+    }
+}
+
+fn build_object_heal_request(
+    bucket: String,
+    object: String,
+    version_id: Option<String>,
+    scan_mode: HealScanMode,
+    priority: HealChannelPriority,
+) -> HealChannelRequest {
+    HealChannelRequest {
+        bucket,
+        object_prefix: Some(object),
+        object_version_id: version_id,
+        priority,
+        scan_mode: Some(scan_mode),
+        remove_corrupted: Some(HEAL_DELETE_DANGLING),
+        ..Default::default()
+    }
+}
+
 /// Scanner item representing a file during scanning
 #[derive(Clone, Debug)]
 pub struct ScannerItem {
@@ -126,9 +154,8 @@ impl ScannerItem {
         self.object_name = split.last().unwrap_or(&"").to_string();
     }
 
-    pub async fn apply_actions<S: StorageAPI>(
+    pub async fn apply_actions(
         &mut self,
-        store: Arc<S>,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
         size_summary: &mut SizeSummary,
@@ -158,7 +185,7 @@ impl ScannerItem {
                     }
                 };
 
-                let size = self.heal_actions(store.clone(), oi, actual_size, size_summary).await;
+                let size = self.heal_actions(oi, actual_size, size_summary).await;
 
                 size_summary.actions_accounting(oi, size, actual_size);
 
@@ -245,7 +272,7 @@ impl ScannerItem {
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
-                        size = self.heal_actions(store.clone(), oi, actual_size, size_summary).await;
+                        size = self.heal_actions(oi, actual_size, size_summary).await;
                     }
                 }
 
@@ -261,22 +288,14 @@ impl ScannerItem {
         self.alert_excessive_versions(remaining_versions, cumulative_size);
     }
 
-    async fn heal_actions<S: StorageAPI>(
-        &mut self,
-        store: Arc<S>,
-        oi: &ObjectInfo,
-        actual_size: i64,
-        size_summary: &mut SizeSummary,
-    ) -> i64 {
-        let mut size = actual_size;
-
+    async fn heal_actions(&mut self, oi: &ObjectInfo, actual_size: i64, size_summary: &mut SizeSummary) -> i64 {
         if self.heal_enabled {
-            size = self.apply_heal(store, oi).await;
+            self.enqueue_heal(oi).await;
         }
 
         self.heal_replication(oi, size_summary).await;
 
-        size
+        actual_size
     }
 
     async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
@@ -331,10 +350,10 @@ impl ScannerItem {
         }
     }
 
-    async fn apply_heal<S: StorageAPI>(&mut self, store: Arc<S>, oi: &ObjectInfo) -> i64 {
+    async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
         let done_heal = Metrics::time(Metric::HealAbandonedObject);
         debug!(
-            "apply_heal: bucket: {}, object_path: {}, version_id: {}",
+            "enqueue_heal: bucket: {}, object_path: {}, version_id: {}",
             self.bucket,
             self.object_path(),
             oi.version_id.unwrap_or_default()
@@ -346,36 +365,38 @@ impl ScannerItem {
             HealScanMode::Normal
         };
 
-        let result = match store
-            .clone()
-            .heal_object(
-                self.bucket.as_str(),
-                self.object_path().as_str(),
-                oi.version_id
-                    .map(|v| if v.is_nil() { "".to_string() } else { v.to_string() })
-                    .unwrap_or_default()
-                    .as_str(),
-                &HealOpts {
-                    remove: HEAL_DELETE_DANGLING,
-                    scan_mode,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok((result, err)) => {
-                if let Some(err) = err {
-                    warn!("apply_heal: failed to heal object: {}", err);
-                }
-                result.object_size as i64
+        let result = send_heal_request(build_object_heal_request(
+            self.bucket.clone(),
+            self.object_path(),
+            oi.version_id
+                .and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
+            scan_mode,
+            HealChannelPriority::Low,
+        ))
+        .await;
+
+        match result {
+            Ok(()) => {
+                counter!(
+                    "rustfs_heal_candidate_enqueue_total",
+                    "type" => "object".to_string(),
+                    "priority" => "low".to_string(),
+                    "result" => "submitted".to_string()
+                )
+                .increment(1);
             }
             Err(e) => {
-                warn!("apply_heal: failed to heal object: {}", e);
-                0
+                counter!(
+                    "rustfs_heal_candidate_enqueue_total",
+                    "type" => "object".to_string(),
+                    "priority" => "low".to_string(),
+                    "result" => "failed".to_string()
+                )
+                .increment(1);
+                warn!("enqueue_heal: failed to submit heal request: {}", e);
             }
-        };
+        }
         done_heal();
-        result
     }
 
     fn alert_excessive_versions(&self, _object_infos_length: usize, _cumulative_size: i64) {
@@ -906,12 +927,9 @@ impl FolderScanner {
                 let (bucket, prefix) = path2_bucket_object(name.as_str());
 
                 if bucket != resolver.bucket {
-                    send_heal_request(HealChannelRequest {
-                        bucket: bucket.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| ScannerError::Other(e.to_string()))?;
+                    send_heal_request(build_bucket_heal_request(bucket.clone(), HealChannelPriority::High))
+                        .await
+                        .map_err(|e| ScannerError::Other(e.to_string()))?;
                 }
 
                 resolver.bucket = bucket.clone();
@@ -1017,11 +1035,15 @@ impl FolderScanner {
                             Ok(fivs) => fivs,
                             Err(e) => {
                                 error!("scan_folder: list_path_raw: failed to get file info versions: {}", e);
-                                if let Err(e) = send_heal_request(HealChannelRequest {
-                                    bucket: bucket.clone(),
-                                    object_prefix: Some(entry.name.clone()),
-                                    ..Default::default()
-                                }).await {
+                                if let Err(e) = send_heal_request(build_object_heal_request(
+                                    bucket.clone(),
+                                    entry.name.clone(),
+                                    None,
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                ))
+                                .await
+                                {
                                     error!("scan_folder: list_path_raw: failed to send heal request: {}", e);
                                     continue;
                                 }
@@ -1035,12 +1057,15 @@ impl FolderScanner {
 
                            for fiv in fivs.versions {
 
-                            if let Err(e) = send_heal_request(HealChannelRequest {
-                                bucket: bucket.clone(),
-                                object_prefix: Some(entry.name.clone()),
-                                object_version_id: fiv.version_id.map(|v| v.to_string()),
-                                ..Default::default()
-                            }).await {
+                            if let Err(e) = send_heal_request(build_object_heal_request(
+                                bucket.clone(),
+                                entry.name.clone(),
+                                fiv.version_id.and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
+                                self.scan_mode,
+                                HealChannelPriority::High,
+                            ))
+                            .await
+                            {
                                 error!("scan_folder: list_path_raw: failed to send heal request: {}", e);
                                 continue;
                             }
@@ -1452,5 +1477,51 @@ mod tests {
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
+    }
+
+    #[test]
+    fn test_build_object_heal_request_omits_nil_version_id() {
+        let request = build_object_heal_request(
+            "bucket".to_string(),
+            "path/to/object".to_string(),
+            None,
+            HealScanMode::Deep,
+            HealChannelPriority::Low,
+        );
+
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.object_prefix.as_deref(), Some("path/to/object"));
+        assert!(request.object_version_id.is_none());
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.priority, HealChannelPriority::Low);
+        assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
+    }
+
+    #[tokio::test]
+    async fn test_heal_actions_returns_actual_size_without_inline_heal() {
+        let temp_dir = std::env::temp_dir();
+        let file_type = std::fs::metadata(&temp_dir).unwrap().file_type();
+
+        let mut item = ScannerItem {
+            path: temp_dir.join("object").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: "".to_string(),
+            object_name: "object".to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: true,
+            heal_bitrot: true,
+            debug: false,
+        };
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let mut size_summary = SizeSummary::default();
+
+        let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
+        assert_eq!(size, 123);
     }
 }

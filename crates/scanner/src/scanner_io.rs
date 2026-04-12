@@ -597,13 +597,7 @@ impl ScannerIODisk for Disk {
             Err(_) => None,
         };
 
-        let Some(ecstore) = new_object_layer_fn() else {
-            error!("ECStore not available");
-            return Err(StorageError::other("ECStore not available".to_string()));
-        };
-
-        item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
-            .await;
+        item.apply_actions(object_infos, lock_config, &mut size_summary).await;
 
         if !free_version_infos.is_empty() {
             let mut expiry_state = GLOBAL_ExpiryState.write().await;
