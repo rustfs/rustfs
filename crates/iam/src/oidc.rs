@@ -24,6 +24,7 @@ use openidconnect::{
     AsyncHttpClient, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope,
 };
+use reqwest::Client;
 use rustfs_config::oidc::*;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
@@ -32,13 +33,17 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::RwLock;
 use std::time::{Duration as StdDuration, Instant};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 use url::Url;
 
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
+const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 
 // ---- HTTP Client Adapter ----
 
@@ -68,7 +73,44 @@ impl std::error::Error for OidcHttpError {
 }
 
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
-pub(crate) struct ReqwestHttpClient(reqwest::Client);
+pub(crate) struct ReqwestHttpClient {
+    default: Client,
+    no_proxy: Client,
+}
+
+fn build_oidc_http_client(disable_proxy: bool) -> Client {
+    let mut builder = reqwest::Client::builder();
+    if disable_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build().expect("OIDC reqwest client should build")
+}
+
+fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
+    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+impl ReqwestHttpClient {
+    fn new() -> Self {
+        Self {
+            default: build_oidc_http_client(false),
+            no_proxy: build_oidc_http_client(true),
+        }
+    }
+
+    fn client_for_uri(&self, uri: &str) -> &Client {
+        if should_bypass_proxy_for_oidc_uri(uri) {
+            &self.no_proxy
+        } else {
+            &self.default
+        }
+    }
+}
 
 impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
     type Error = OidcHttpError;
@@ -77,9 +119,10 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
     fn call(&'c self, request: http::Request<Vec<u8>>) -> Self::Future {
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let response = self
-                .0
-                .request(parts.method, parts.uri.to_string())
+            let uri = parts.uri.to_string();
+            let client = self.client_for_uri(&uri);
+            let response = client
+                .request(parts.method, uri)
                 .headers(parts.headers)
                 .body(body)
                 .send()
@@ -192,7 +235,7 @@ pub struct OidcSys {
 impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
-        let http_client = ReqwestHttpClient(reqwest::Client::new());
+        let http_client = ReqwestHttpClient::new();
         let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
@@ -230,7 +273,7 @@ impl OidcSys {
             configs: HashMap::new(),
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient(reqwest::Client::new()),
+            http_client: ReqwestHttpClient::new(),
         }
     }
 
@@ -841,22 +884,40 @@ impl OidcSys {
         for candidate_issuer in candidates.iter() {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
-            match CoreProviderMetadata::discover_async(issuer_url, http_client)
-                .await
-                .map_err(|e| format!("discovery failed: {e}"))
-            {
-                Ok(metadata) => {
-                    return Ok(ProviderState {
-                        metadata,
-                        discovered_at: Instant::now(),
-                    });
-                }
-                Err(error) => {
-                    last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
-                    warn!(
-                        "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
-                        config.id, candidate_issuer, error
-                    );
+            for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
+                match CoreProviderMetadata::discover_async(issuer_url.clone(), http_client)
+                    .await
+                    .map_err(|e| format!("discovery failed: {e}"))
+                {
+                    Ok(metadata) => {
+                        return Ok(ProviderState {
+                            metadata,
+                            discovered_at: Instant::now(),
+                        });
+                    }
+                    Err(error) => {
+                        let is_transient_transport = error.contains("Request failed");
+                        let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
+                        if should_retry {
+                            warn!(
+                                "OIDC provider '{}' discovery transport attempt {}/{} failed for issuer '{}': {}",
+                                config.id,
+                                attempt + 1,
+                                OIDC_DISCOVERY_TRANSPORT_RETRIES,
+                                candidate_issuer,
+                                error
+                            );
+                            sleep(OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY).await;
+                            continue;
+                        }
+
+                        last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
+                        warn!(
+                            "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
+                            config.id, candidate_issuer, error
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -917,7 +978,7 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
 }
 
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-    let http_client = ReqwestHttpClient(reqwest::Client::new());
+    let http_client = ReqwestHttpClient::new();
     let state = OidcSys::discover_provider(config, &http_client).await?;
 
     Ok(OidcProviderValidationResult {
@@ -1261,11 +1322,12 @@ mod tests {
         use std::io::Read;
         use std::io::Write;
         use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         // After the last completed response, exit if no new connection arrives within this window.
-        const IDLE_SHUTDOWN: Duration = Duration::from_millis(100);
-        const ABSOLUTE_CAP: Duration = Duration::from_millis(500);
+        const IDLE_SHUTDOWN: Duration = Duration::from_millis(500);
+        const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1282,11 +1344,13 @@ mod tests {
         })
         .to_string();
         let jwks_body = r#"{"keys":[]}"#;
+        let (ready_tx, ready_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
             listener
                 .set_nonblocking(true)
                 .expect("failed to set discovery mock listener non-blocking");
+            let _ = ready_tx.send(());
 
             let mut seen = 0usize;
             let start = Instant::now();
@@ -1353,6 +1417,9 @@ mod tests {
                 }
             }
         });
+        ready_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("mock OIDC discovery server should become ready");
 
         (base, handle)
     }
@@ -1525,6 +1592,17 @@ mod tests {
         assert!(sys.list_providers().is_empty());
     }
 
+    #[test]
+    fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
+        assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
+        assert!(!should_bypass_proxy_for_oidc_uri(
+            "https://idp.example.com/.well-known/openid-configuration"
+        ));
+        assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
+    }
+
     /// Helper to create an OidcSys with configs only (no provider states needed).
     fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
         let mut config_map = HashMap::new();
@@ -1535,7 +1613,7 @@ mod tests {
             configs: config_map,
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient(reqwest::Client::new()),
+            http_client: ReqwestHttpClient::new(),
         }
     }
 
