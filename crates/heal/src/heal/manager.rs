@@ -27,7 +27,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, Notify, RwLock},
     time::interval,
 };
 use tokio_util::sync::CancellationToken;
@@ -124,8 +124,35 @@ impl PriorityHealQueue {
         stats
     }
 
+    #[cfg(test)]
     fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
+            let key = Self::make_dedup_key(&item.request);
+            self.dedup_keys.remove(&key);
+            item.request
+        })
+    }
+
+    fn pop_runnable<F>(&mut self, can_run: F) -> Option<HealRequest>
+    where
+        F: Fn(&HealRequest) -> bool,
+    {
+        let mut deferred = Vec::new();
+        let mut selected = None;
+
+        while let Some(item) = self.heap.pop() {
+            if can_run(&item.request) {
+                selected = Some(item);
+                break;
+            }
+            deferred.push(item);
+        }
+
+        for item in deferred {
+            self.heap.push(item);
+        }
+
+        selected.map(|item| {
             let key = Self::make_dedup_key(&item.request);
             self.dedup_keys.remove(&key);
             item.request
@@ -187,6 +214,8 @@ pub struct HealConfig {
     pub heal_interval: Duration,
     /// Maximum concurrent heal tasks
     pub max_concurrent_heals: usize,
+    /// Maximum concurrent heal tasks allowed for a single erasure set
+    pub max_concurrent_per_set: usize,
     /// Task timeout
     pub task_timeout: Duration,
     /// Queue size
@@ -211,11 +240,16 @@ impl Default for HealConfig {
             rustfs_config::ENV_HEAL_MAX_CONCURRENT_HEALS,
             rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_HEALS,
         );
+        let max_concurrent_per_set = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAX_CONCURRENT_PER_SET,
+            rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_PER_SET,
+        );
         Self {
             enable_auto_heal,
             heal_interval,        // 10 seconds
             max_concurrent_heals, // max 4,
-            task_timeout,         // 5 minutes
+            max_concurrent_per_set: std::cmp::min(max_concurrent_heals.max(1), max_concurrent_per_set.max(1)),
+            task_timeout, // 5 minutes
             queue_size,
         }
     }
@@ -254,6 +288,8 @@ pub struct HealManager {
     cancel_token: CancellationToken,
     /// Statistics
     statistics: Arc<RwLock<HealStatistics>>,
+    /// Scheduler wake-up notifier for event-driven dispatch
+    notify: Arc<Notify>,
 }
 
 impl HealManager {
@@ -268,6 +304,7 @@ impl HealManager {
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -366,6 +403,7 @@ impl HealManager {
 
         if is_new {
             info!("Submitted heal request: {} with priority: {:?}", request_id, priority);
+            self.notify.notify_one();
         } else {
             info!("Heal request already queued (duplicate): {}", request_id);
         }
@@ -441,6 +479,7 @@ impl HealManager {
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
+        let notify = self.notify.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
@@ -451,8 +490,11 @@ impl HealManager {
                         info!("Heal scheduler received shutdown signal");
                         break;
                     }
+                    _ = notify.notified() => {
+                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage, &notify).await;
+                    }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage).await;
+                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage, &notify).await;
                     }
                 }
             }
@@ -468,6 +510,7 @@ impl HealManager {
         let active_heals = self.active_heals.clone();
         let cancel_token = self.cancel_token.clone();
         let storage = self.storage.clone();
+        let notify = self.notify.clone();
         let mut duration = {
             let config = config.read().await;
             config.heal_interval
@@ -567,8 +610,10 @@ impl HealManager {
                                 HealPriority::Normal,
                             );
                             let mut queue = heal_queue.lock().await;
-                            queue.push(req);
-                            info!("start_auto_disk_scanner: Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
+                            if queue.push(req) {
+                                notify.notify_one();
+                                info!("start_auto_disk_scanner: Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
+                            }
                         }
                     }
                 }
@@ -585,6 +630,7 @@ impl HealManager {
         config: &Arc<RwLock<HealConfig>>,
         statistics: &Arc<RwLock<HealStatistics>>,
         storage: &Arc<dyn HealStorageAPI>,
+        notify: &Arc<Notify>,
     ) {
         let config = config.read().await;
         let mut active_heals_guard = active_heals.lock().await;
@@ -605,24 +651,24 @@ impl HealManager {
             return;
         }
 
-        // Process multiple tasks if:
-        // 1. We have available slots
-        // 2. Queue is not empty
-        // Prioritize urgent/high priority tasks by processing up to 2 tasks per cycle if available
-        let tasks_to_process = if queue_len > 0 {
-            std::cmp::min(available_slots, std::cmp::min(2, queue_len))
-        } else {
-            0
-        };
+        let mut running_per_set = running_erasure_set_counts(&active_heals_guard);
+        let mut tasks_started = 0usize;
 
-        for _ in 0..tasks_to_process {
-            if let Some(request) = queue.pop() {
+        for _ in 0..available_slots {
+            let max_concurrent_per_set = config.max_concurrent_per_set;
+            if let Some(request) =
+                queue.pop_runnable(|request| can_schedule_request(request, &running_per_set, max_concurrent_per_set))
+            {
                 let task_priority = request.priority;
+                if let Some(set_key) = heal_request_set_key(&request) {
+                    *running_per_set.entry(set_key).or_insert(0) += 1;
+                }
                 let task = Arc::new(HealTask::from_request(request, storage.clone()));
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
                 let active_heals_clone = active_heals.clone();
                 let statistics_clone = statistics.clone();
+                let notify_clone = notify.clone();
 
                 // start heal task
                 tokio::spawn(async move {
@@ -650,7 +696,9 @@ impl HealManager {
                         }
                         stats.update_running_tasks(active_heals_guard.len() as u64);
                     }
+                    notify_clone.notify_one();
                 });
+                tasks_started += 1;
             } else {
                 break;
             }
@@ -658,7 +706,8 @@ impl HealManager {
 
         // Update statistics for all started tasks
         let mut stats = statistics.write().await;
-        stats.total_tasks += tasks_to_process as u64;
+        stats.total_tasks += tasks_started as u64;
+        stats.update_running_tasks(active_heals_guard.len() as u64);
 
         // Log queue status if items remain
         if !queue.is_empty() {
@@ -681,10 +730,137 @@ impl std::fmt::Debug for HealManager {
     }
 }
 
+fn heal_request_set_key(request: &HealRequest) -> Option<String> {
+    match &request.heal_type {
+        HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
+        _ => None,
+    }
+}
+
+fn running_erasure_set_counts(active_heals: &HashMap<String, Arc<HealTask>>) -> HashMap<String, usize> {
+    let mut running = HashMap::new();
+    for task in active_heals.values() {
+        if let HealType::ErasureSet { set_disk_id, .. } = &task.heal_type {
+            *running.entry(set_disk_id.clone()).or_insert(0) += 1;
+        }
+    }
+    running
+}
+
+fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String, usize>, max_concurrent_per_set: usize) -> bool {
+    match heal_request_set_key(request) {
+        Some(set_key) => running_per_set.get(&set_key).copied().unwrap_or(0) < max_concurrent_per_set,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::storage::HealStorageAPI;
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
+    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_ecstore::{
+        disk::{DiskStore, endpoint::Endpoint},
+        store_api::BucketInfo,
+    };
+    use rustfs_madmin::heal_commands::HealResultItem;
+
+    struct MockStorage;
+
+    #[async_trait::async_trait]
+    impl HealStorageAPI for MockStorage {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+            Ok(None)
+        }
+
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<crate::heal::storage::DiskStatus> {
+            Ok(crate::heal::storage::DiskStatus::Ok)
+        }
+
+        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
+            Ok(None)
+        }
+
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: Option<&str>,
+            _opts: &HealOpts,
+        ) -> Result<(HealResultItem, Option<Error>)> {
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            Ok(HealResultItem::default())
+        }
+
+        async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> Result<(Vec<String>, Option<String>, bool)> {
+            Ok((Vec::new(), None, false))
+        }
+
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
+            Err(Error::other("not implemented in tests"))
+        }
+    }
 
     #[test]
     fn test_priority_queue_ordering() {
@@ -1008,5 +1184,96 @@ mod tests {
         queue.pop();
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
+        let mut queue = PriorityHealQueue::new();
+
+        let blocked = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Urgent,
+        );
+        let runnable = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-b".to_string()],
+                set_disk_id: "pool_0_set_2".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        assert!(queue.push(blocked));
+        assert!(queue.push(runnable.clone()));
+
+        let mut running = HashMap::new();
+        running.insert("pool_0_set_1".to_string(), 1);
+
+        let popped = queue
+            .pop_runnable(|request| can_schedule_request(request, &running, 1))
+            .expect("should find runnable request");
+
+        match popped.heal_type {
+            HealType::ErasureSet { set_disk_id, .. } => assert_eq!(set_disk_id, "pool_0_set_2"),
+            other => panic!("expected erasure set request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_can_schedule_request_respects_per_set_limit() {
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let mut running = HashMap::new();
+        running.insert("pool_0_set_1".to_string(), 1);
+
+        assert!(!can_schedule_request(&request, &running, 1));
+        assert!(can_schedule_request(&request, &running, 2));
+    }
+
+    #[test]
+    fn test_running_erasure_set_counts_groups_only_erasure_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let erasure_task = Arc::new(HealTask::from_request(
+            HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec!["bucket".to_string()],
+                    set_disk_id: "pool_0_set_1".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        ));
+        let object_task = Arc::new(HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage,
+        ));
+
+        let mut active = HashMap::new();
+        active.insert(erasure_task.id.clone(), erasure_task);
+        active.insert(object_task.id.clone(), object_task);
+
+        let counts = running_erasure_set_counts(&active);
+        assert_eq!(counts.get("pool_0_set_1"), Some(&1));
+        assert_eq!(counts.len(), 1);
     }
 }

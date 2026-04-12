@@ -56,6 +56,15 @@ pub const ENV_HEAL_TASK_TIMEOUT_SECS: &str = "RUSTFS_HEAL_TASK_TIMEOUT_SECS";
 /// - Note: A higher concurrency limit can speed up healing but may lead to resource contention.
 pub const ENV_HEAL_MAX_CONCURRENT_HEALS: &str = "RUSTFS_HEAL_MAX_CONCURRENT_HEALS";
 
+/// Environment variable name that specifies the maximum number of concurrent heal operations
+/// allowed for a single erasure set.
+///
+/// - Purpose: Prevent one degraded set from consuming all global heal slots.
+/// - Unit: number of operations (usize).
+/// - Valid values: any positive integer.
+/// - Example: `export RUSTFS_HEAL_MAX_CONCURRENT_PER_SET=1`
+pub const ENV_HEAL_MAX_CONCURRENT_PER_SET: &str = "RUSTFS_HEAL_MAX_CONCURRENT_PER_SET";
+
 /// Default value for enabling authentication for heal operations if not specified in the environment variable.
 /// - Value: true (authentication enabled).
 /// - Rationale: Enabling authentication by default enhances security for heal operations.
@@ -86,3 +95,9 @@ pub const DEFAULT_HEAL_TASK_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// - Rationale: This default concurrency limit helps balance healing speed with resource usage, preventing system overload.
 /// - Adjustments: Users may modify this value via the `RUSTFS_HEAL_MAX_CONCURRENT_HEALS` environment variable based on their system capacity and expected heal workload.
 pub const DEFAULT_HEAL_MAX_CONCURRENT_HEALS: usize = 4;
+
+/// Default maximum number of concurrent heal operations per erasure set.
+///
+/// - Value: 1 concurrent heal operation per set.
+/// - Rationale: Keeps a degraded set from monopolizing the global heal scheduler.
+pub const DEFAULT_HEAL_MAX_CONCURRENT_PER_SET: usize = 1;
