@@ -8357,6 +8357,7 @@ dependencies = [
  "chrono",
  "futures",
  "http 1.4.0",
+ "metrics",
  "path-clean",
  "rand 0.10.0",
  "rmp-serde",
