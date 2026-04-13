@@ -204,10 +204,11 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     let mut key = vec![0u8; URL_SAFE_NO_PAD.estimated_decoded_length(length)];
     rng.fill_bytes(&mut key);
 
+    // URL_SAFE_NO_PAD uses "-" and "_" instead of "+" and "/", so "/" never
+    // appears in the output. The .replace("/", "+") was a dead no-op.
     let encoded = URL_SAFE_NO_PAD.encode_to_string(&key);
-    let key_str = encoded.replace("/", "+");
 
-    Ok(key_str)
+    Ok(encoded)
 }
 
 /// Get the RPC authentication token from environment variable
