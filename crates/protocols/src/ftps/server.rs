@@ -18,6 +18,7 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
 use libunftp::options::FtpsRequired;
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
@@ -112,8 +113,10 @@ where
                 debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
 
                 // Load all certificates from directory
-                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(cert_dir)
-                    .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
+                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(
+                    rustfs_utils::CertDirectoryLoadOptions::builder(cert_dir, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
+                )
+                .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
 
                 if cert_key_pairs.is_empty() {
                     return Err(FtpsInitError::InvalidConfig("No valid certificates found in directory".into()));

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::get_env_bool;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustls::RootCertStore;
 use rustls::server::{
     ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier, danger::ClientCertVerifier,
@@ -22,10 +20,138 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::io::Error;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io};
 use tracing::{debug, warn};
+
+/// Options for loading certificate/key pairs from a directory tree.
+#[derive(Debug, Clone)]
+pub struct CertDirectoryLoadOptions {
+    dir_path: PathBuf,
+    cert_filename: String,
+    key_filename: String,
+}
+
+impl CertDirectoryLoadOptions {
+    /// Create a builder with explicit certificate and private key filenames.
+    pub fn builder(
+        dir_path: impl Into<PathBuf>,
+        cert_filename: impl Into<String>,
+        key_filename: impl Into<String>,
+    ) -> CertDirectoryLoadOptionsBuilder {
+        CertDirectoryLoadOptionsBuilder {
+            dir_path: dir_path.into(),
+            cert_filename: cert_filename.into(),
+            key_filename: key_filename.into(),
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.cert_filename.is_empty() {
+            return Err(certs_error("certificate filename cannot be empty".to_string()));
+        }
+        if self.key_filename.is_empty() {
+            return Err(certs_error("private key filename cannot be empty".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Builder for [`CertDirectoryLoadOptions`].
+#[derive(Debug, Clone)]
+pub struct CertDirectoryLoadOptionsBuilder {
+    dir_path: PathBuf,
+    cert_filename: String,
+    key_filename: String,
+}
+
+impl CertDirectoryLoadOptionsBuilder {
+    /// Override the certificate filename searched in the directory.
+    pub fn cert_filename(mut self, cert_filename: impl Into<String>) -> Self {
+        self.cert_filename = cert_filename.into();
+        self
+    }
+
+    /// Override the private key filename searched in the directory.
+    pub fn key_filename(mut self, key_filename: impl Into<String>) -> Self {
+        self.key_filename = key_filename.into();
+        self
+    }
+
+    /// Build the load options value.
+    pub fn build(self) -> CertDirectoryLoadOptions {
+        CertDirectoryLoadOptions {
+            dir_path: self.dir_path,
+            cert_filename: self.cert_filename,
+            key_filename: self.key_filename,
+        }
+    }
+}
+
+/// Options for building an mTLS WebPki client verifier.
+#[derive(Debug, Clone)]
+pub struct WebPkiClientVerifierOptions {
+    tls_path: PathBuf,
+    enabled: bool,
+    client_ca_cert_filename: String,
+    fallback_ca_cert_filename: String,
+}
+
+impl WebPkiClientVerifierOptions {
+    /// Create a builder with explicit CA bundle filenames.
+    pub fn builder(
+        tls_path: impl Into<PathBuf>,
+        client_ca_cert_filename: impl Into<String>,
+        fallback_ca_cert_filename: impl Into<String>,
+    ) -> WebPkiClientVerifierOptionsBuilder {
+        WebPkiClientVerifierOptionsBuilder {
+            tls_path: tls_path.into(),
+            enabled: false,
+            client_ca_cert_filename: client_ca_cert_filename.into(),
+            fallback_ca_cert_filename: fallback_ca_cert_filename.into(),
+        }
+    }
+}
+
+/// Builder for [`WebPkiClientVerifierOptions`].
+#[derive(Debug, Clone)]
+pub struct WebPkiClientVerifierOptionsBuilder {
+    tls_path: PathBuf,
+    enabled: bool,
+    client_ca_cert_filename: String,
+    fallback_ca_cert_filename: String,
+}
+
+impl WebPkiClientVerifierOptionsBuilder {
+    /// Set whether mTLS verification should be enabled.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Override the preferred client CA bundle filename.
+    pub fn client_ca_cert_filename(mut self, client_ca_cert_filename: impl Into<String>) -> Self {
+        self.client_ca_cert_filename = client_ca_cert_filename.into();
+        self
+    }
+
+    /// Override the fallback CA bundle filename.
+    pub fn fallback_ca_cert_filename(mut self, fallback_ca_cert_filename: impl Into<String>) -> Self {
+        self.fallback_ca_cert_filename = fallback_ca_cert_filename.into();
+        self
+    }
+
+    /// Build the verifier options value.
+    pub fn build(self) -> WebPkiClientVerifierOptions {
+        WebPkiClientVerifierOptions {
+            tls_path: self.tls_path,
+            enabled: self.enabled,
+            client_ca_cert_filename: self.client_ca_cert_filename,
+            fallback_ca_cert_filename: self.fallback_ca_cert_filename,
+        }
+    }
+}
 
 /// Load public certificate from file.
 /// This function loads a public certificate from the specified file.
@@ -72,24 +198,28 @@ pub fn load_cert_bundle_der_bytes(path: &str) -> io::Result<Vec<Vec<u8>>> {
     Ok(certs.into_iter().map(|c| c.to_vec()).collect())
 }
 
-/// Builds a WebPkiClientVerifier for mTLS if enabled via environment variable.
+/// Builds a WebPkiClientVerifier for mTLS when enabled by the caller.
 ///
 /// # Arguments
-/// * `tls_path` - Directory containing client CA certificates
+/// * `options` - mTLS verifier options, including the TLS directory and CA bundle filenames
 ///
 /// # Returns
 /// * `Ok(Some(verifier))` if mTLS is enabled and CA certs are found
 /// * `Ok(None)` if mTLS is disabled
 /// * `Err` if mTLS is enabled but configuration is invalid
-pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn ClientCertVerifier>>> {
-    if !get_env_bool(rustfs_config::ENV_SERVER_MTLS_ENABLE, rustfs_config::DEFAULT_SERVER_MTLS_ENABLE) {
+pub fn build_webpki_client_verifier(options: WebPkiClientVerifierOptions) -> io::Result<Option<Arc<dyn ClientCertVerifier>>> {
+    if !options.enabled {
         return Ok(None);
     }
 
-    let ca_path = mtls_ca_bundle_path(tls_path).ok_or_else(|| {
+    let tls_path = &options.tls_path;
+    let ca_path = mtls_ca_bundle_path(&options).ok_or_else(|| {
         Error::other(format!(
-            "RUSTFS_SERVER_MTLS_ENABLE=true but missing {}/client_ca.crt (or fallback {}/ca.crt)",
-            tls_path, tls_path
+            "mTLS is enabled but missing {}/{} (or fallback {}/{})",
+            tls_path.display(),
+            options.client_ca_cert_filename,
+            tls_path.display(),
+            options.fallback_ca_cert_filename
         ))
     })?;
 
@@ -114,14 +244,12 @@ pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn
 }
 
 /// Locate the mTLS client CA bundle in the specified TLS path
-fn mtls_ca_bundle_path(tls_path: &str) -> Option<std::path::PathBuf> {
-    use std::path::Path;
-
-    let p1 = Path::new(tls_path).join(rustfs_config::RUSTFS_CLIENT_CA_CERT_FILENAME);
+fn mtls_ca_bundle_path(options: &WebPkiClientVerifierOptions) -> Option<PathBuf> {
+    let p1 = options.tls_path.join(&options.client_ca_cert_filename);
     if p1.exists() {
         return Some(p1);
     }
-    let p2 = Path::new(tls_path).join(rustfs_config::RUSTFS_CA_CERT);
+    let p2 = options.tls_path.join(&options.fallback_ca_cert_filename);
     if p2.exists() {
         return Some(p2);
     }
@@ -166,26 +294,29 @@ pub fn certs_error(err: String) -> Error {
 /// The root directory can also contain a default certificate/private key pair.
 ///
 /// # Arguments
-/// * `dir_path` - A string slice that holds the path to the directory containing the certificates and private keys.
+/// * `options` - Directory and filename options for discovering certificates and private keys.
 ///
 /// # Returns
 /// * An io::Result containing a HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer). If no valid certificate/private key pairs are found, an io::Error is returned.
 ///
 pub fn load_all_certs_from_directory(
-    dir_path: &str,
+    options: CertDirectoryLoadOptions,
 ) -> io::Result<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    options.validate()?;
+
     let mut cert_key_pairs = HashMap::new();
-    let dir = Path::new(dir_path);
+    let dir = options.dir_path.as_path();
 
     if !dir.exists() || !dir.is_dir() {
         return Err(certs_error(format!(
-            "The certificate directory does not exist or is not a directory: {dir_path}"
+            "The certificate directory does not exist or is not a directory: {}",
+            dir.display()
         )));
     }
 
     // 1. First check whether there is a certificate/private key pair in the root directory
-    let root_cert_path = dir.join(RUSTFS_TLS_CERT);
-    let root_key_path = dir.join(RUSTFS_TLS_KEY);
+    let root_cert_path = dir.join(&options.cert_filename);
+    let root_key_path = dir.join(&options.key_filename);
 
     if root_cert_path.exists() && root_key_path.exists() {
         debug!("find the root directory certificate: {:?}", root_cert_path);
@@ -218,8 +349,8 @@ pub fn load_all_certs_from_directory(
                 .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;
 
             // find certificate and private key files
-            let cert_path = path.join(RUSTFS_TLS_CERT); // e.g., rustfs_cert.pem
-            let key_path = path.join(RUSTFS_TLS_KEY); // e.g., rustfs_key.pem
+            let cert_path = path.join(&options.cert_filename); // e.g., rustfs_cert.pem
+            let key_path = path.join(&options.key_filename); // e.g., rustfs_key.pem
 
             if cert_path.exists() && key_path.exists() {
                 debug!("find the domain name certificate: {} in {:?}", domain_name, cert_path);
@@ -253,7 +384,8 @@ pub fn load_all_certs_from_directory(
 
     if cert_key_pairs.is_empty() {
         return Err(certs_error(format!(
-            "No valid certificate/private key pair found in directory {dir_path}"
+            "No valid certificate/private key pair found in directory {}",
+            dir.display()
         )));
     }
 
@@ -341,6 +473,10 @@ mod tests {
     use std::io::ErrorKind;
     use tempfile::TempDir;
 
+    fn default_load_options(path: impl Into<PathBuf>) -> CertDirectoryLoadOptions {
+        CertDirectoryLoadOptions::builder(path, "rustfs_cert.pem", "rustfs_key.pem").build()
+    }
+
     #[test]
     fn test_certs_error_function() {
         let error_msg = "Test error message";
@@ -424,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_load_all_certs_from_directory_not_exists() {
-        let result = load_all_certs_from_directory("/non/existent/directory");
+        let result = load_all_certs_from_directory(default_load_options("/non/existent/directory"));
         assert!(result.is_err());
 
         let error = result.unwrap_err();
@@ -435,7 +571,7 @@ mod tests {
     fn test_load_all_certs_from_directory_empty() {
         let temp_dir = TempDir::new().unwrap();
 
-        let result = load_all_certs_from_directory(temp_dir.path().to_str().unwrap());
+        let result = load_all_certs_from_directory(default_load_options(temp_dir.path()));
         assert!(result.is_err());
 
         let error = result.unwrap_err();
@@ -448,7 +584,7 @@ mod tests {
         let file_path = temp_dir.path().join("not_a_directory.txt");
         fs::write(&file_path, "content").unwrap();
 
-        let result = load_all_certs_from_directory(file_path.to_str().unwrap());
+        let result = load_all_certs_from_directory(default_load_options(&file_path));
         assert!(result.is_err());
 
         let error = result.unwrap_err();
@@ -514,25 +650,10 @@ mod tests {
         ];
 
         for path in path_cases {
-            let result = load_all_certs_from_directory(path);
+            let result = load_all_certs_from_directory(default_load_options(path));
             // All should fail since these are not valid cert directories
             assert!(result.is_err());
         }
-    }
-
-    #[test]
-    fn test_filename_constants_consistency() {
-        // Test that the constants match expected values
-        assert_eq!(RUSTFS_TLS_CERT, "rustfs_cert.pem");
-        assert_eq!(RUSTFS_TLS_KEY, "rustfs_key.pem");
-
-        // Test that constants are not empty
-        assert!(!RUSTFS_TLS_CERT.is_empty());
-        assert!(!RUSTFS_TLS_KEY.is_empty());
-
-        // Test that constants have proper extensions
-        assert!(RUSTFS_TLS_CERT.ends_with(".pem"));
-        assert!(RUSTFS_TLS_KEY.ends_with(".pem"));
     }
 
     #[test]
@@ -544,7 +665,7 @@ mod tests {
         fs::create_dir(&sub_dir).unwrap();
 
         // Should fail because no certificates found
-        let result = load_all_certs_from_directory(temp_dir.path().to_str().unwrap());
+        let result = load_all_certs_from_directory(default_load_options(temp_dir.path()));
         assert!(result.is_err());
         assert!(
             result
@@ -562,7 +683,7 @@ mod tests {
         let unicode_dir = temp_dir.path().join("test_directory");
         fs::create_dir(&unicode_dir).unwrap();
 
-        let result = load_all_certs_from_directory(unicode_dir.to_str().unwrap());
+        let result = load_all_certs_from_directory(default_load_options(&unicode_dir));
         assert!(result.is_err());
         assert!(
             result
@@ -584,7 +705,7 @@ mod tests {
             .map(|_| {
                 let path = Arc::clone(&dir_path);
                 thread::spawn(move || {
-                    let result = load_all_certs_from_directory(&path);
+                    let result = load_all_certs_from_directory(default_load_options(path.as_str()));
                     // All should fail since directory is empty
                     assert!(result.is_err());
                 })
