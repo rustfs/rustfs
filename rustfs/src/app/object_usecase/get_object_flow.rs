@@ -408,7 +408,7 @@ mod tests {
             permit_wait_duration: Duration::ZERO,
             queue_status: crate::storage::concurrency::IoQueueStatus {
                 total_permits: 1,
-                permits_in_use: 0,
+                permits_in_use: 1,
                 high_priority_waiting: 0,
                 normal_priority_waiting: 0,
                 low_priority_waiting: 0,
@@ -417,7 +417,7 @@ mod tests {
                 low_priority_processed: 0,
                 starvation_events: 0,
             },
-            queue_utilization: 0.0,
+            queue_utilization: 100.0,
         };
         let manager = ConcurrencyManager::new();
 
