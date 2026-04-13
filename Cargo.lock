@@ -8372,6 +8372,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml 0.39.2",
  "regex",
+ "rustfs-config",
  "rustfs-credentials",
  "rustfs-ecstore",
  "rustfs-iam",
