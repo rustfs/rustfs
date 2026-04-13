@@ -128,7 +128,7 @@ futures-core = "0.3.32"
 futures-util = "0.3.32"
 pollster = "0.4.0"
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
-hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
+hyper-rustls = { version = "0.27.8", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 http = "1.4.0"
 http-body = "1.0.1"
@@ -173,7 +173,7 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0-rc.10"
 rsa = { version = "0.10.0-rc.17" }
-rustls = { version = "0.23.37", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls = { version = "0.23.38", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = "1.14.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
