@@ -643,7 +643,7 @@ async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambd
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+    let mut builder = reqwest::Client::builder().user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
 
     if let Some(timeout) = config.response_header_timeout {
         builder = builder.timeout(timeout);

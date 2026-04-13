@@ -24,9 +24,10 @@
 
 use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{
-    DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA,
-    ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA,
-    ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT,
+    DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
+    DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_SERVER_MTLS_ENABLE,
+    ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_SYSTEM_CA,
+    RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT,
     RUSTFS_TLS_CERT, RUSTFS_TLS_KEY,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
@@ -113,11 +114,17 @@ impl TlsMaterialSnapshot {
             return Ok(None);
         }
 
-        let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)
-            .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
+        let mtls_verifier = rustfs_utils::build_webpki_client_verifier(
+            rustfs_utils::WebPkiClientVerifierOptions::builder(tls_path, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
+                .enabled(get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE))
+                .build(),
+        )
+        .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
         // Try multi-cert (SNI) first
-        match rustfs_utils::load_all_certs_from_directory(tls_path) {
+        match rustfs_utils::load_all_certs_from_directory(
+            rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
+        ) {
             Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
                 Ok(resolver) => {
                     let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
@@ -210,11 +217,20 @@ fn build_server_config(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
 
-    if rustfs_utils::tls_key_log() {
+    if tls_key_log() {
         config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
     Ok(config)
+}
+
+/// Checks if TLS key logging is enabled.
+///
+/// # Returns
+/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
+///
+fn tls_key_log() -> bool {
+    get_env_bool(ENV_TLS_KEYLOG, DEFAULT_TLS_KEYLOG)
 }
 
 // ── Outbound Material Loading ──
@@ -266,7 +282,11 @@ async fn has_server_certificates(tls_path: &str) -> bool {
         return false;
     }
     // Check for multi-cert directory structure OR single cert files
-    if rustfs_utils::load_all_certs_from_directory(tls_path).is_ok_and(|p| !p.is_empty()) {
+    if rustfs_utils::load_all_certs_from_directory(
+        rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
+    )
+    .is_ok_and(|p| !p.is_empty())
+    {
         return true;
     }
     let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");

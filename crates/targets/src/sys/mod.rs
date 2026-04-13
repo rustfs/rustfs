@@ -12,4 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod user_agent;
+pub mod user_agent;

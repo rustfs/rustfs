@@ -238,9 +238,6 @@ mod tests {
         use std::time::Instant;
         let data = vec![42u8; 1024 * 100]; // 100KB of repetitive data
 
-        // let mut data = vec![0u8; 1024 * 1024];
-        // rand::thread_rng().fill(&mut data[..]);
-
         let start = Instant::now();
 
         let mut times = Vec::new();

@@ -179,7 +179,7 @@ where
     fn build_http_client(args: &WebhookArgs) -> Result<Client, TargetError> {
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+            .user_agent(crate::get_user_agent(crate::ServiceType::Basis));
 
         // 1. Configure server certificate verification
         if args.skip_tls_verify {
