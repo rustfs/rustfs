@@ -290,7 +290,7 @@ pub fn certs_error(err: String) -> Error {
 
 /// Load all certificates and private keys in the directory
 /// This function loads all certificate and private key pairs from the specified directory.
-/// It looks for files named `rustfs_cert.pem` and `rustfs_key.pem` in each subdirectory.
+/// It looks for files named `options.cert_filename` and `options.key_filename` in each subdirectory.
 /// The root directory can also contain a default certificate/private key pair.
 ///
 /// # Arguments
