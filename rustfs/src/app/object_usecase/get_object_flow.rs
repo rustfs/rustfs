@@ -409,13 +409,7 @@ mod tests {
             queue_status: crate::storage::concurrency::IoQueueStatus {
                 total_permits: 1,
                 permits_in_use: 1,
-                high_priority_waiting: 0,
-                normal_priority_waiting: 0,
-                low_priority_waiting: 0,
-                high_priority_processed: 0,
-                normal_priority_processed: 0,
-                low_priority_processed: 0,
-                starvation_events: 0,
+                ..Default::default()
             },
             queue_utilization: 100.0,
         };
