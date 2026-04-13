@@ -334,15 +334,6 @@ pub fn create_multi_cert_resolver(
     })
 }
 
-/// Checks if TLS key logging is enabled.
-///
-/// # Returns
-/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
-///
-pub fn tls_key_log() -> bool {
-    get_env_bool(rustfs_config::ENV_TLS_KEYLOG, rustfs_config::DEFAULT_TLS_KEYLOG)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

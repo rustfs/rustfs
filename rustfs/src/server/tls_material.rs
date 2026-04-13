@@ -24,10 +24,10 @@
 
 use rustfs_common::{MtlsIdentityPem, set_global_mtls_identity, set_global_root_cert};
 use rustfs_config::{
-    DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA,
-    ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA,
-    ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT,
-    RUSTFS_TLS_CERT, RUSTFS_TLS_KEY,
+    DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, DEFAULT_TRUST_LEAF_CERT_AS_CA,
+    DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE,
+    ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_SYSTEM_CA, RUSTFS_CA_CERT, RUSTFS_CLIENT_CERT_FILENAME,
+    RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -210,11 +210,20 @@ fn build_server_config(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
 
-    if rustfs_utils::tls_key_log() {
+    if tls_key_log() {
         config.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
     Ok(config)
+}
+
+/// Checks if TLS key logging is enabled.
+///
+/// # Returns
+/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
+///
+fn tls_key_log() -> bool {
+    get_env_bool(ENV_TLS_KEYLOG, DEFAULT_TLS_KEYLOG)
 }
 
 // ── Outbound Material Loading ──
