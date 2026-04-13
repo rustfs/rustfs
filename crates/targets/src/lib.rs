@@ -16,12 +16,14 @@ pub mod arn;
 mod check;
 pub mod error;
 pub mod store;
+pub mod sys;
 pub mod target;
 
 pub use check::{check_mqtt_broker_available, check_mqtt_broker_available_with_tls};
 pub use error::{StoreError, TargetError};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
+pub use sys::user_agent::*;
 pub use target::Target;
 
 /// Represents a log of events for sending to targets

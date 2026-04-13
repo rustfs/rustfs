@@ -13,7 +13,7 @@ documentation = "https://docs.rs/rustfs-target/latest/rustfs_target/"
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
-rustfs-utils = { workspace = true, features = ["sys", "notify", "tls"] }
+rustfs-utils = { workspace = true, features = ["notify", "tls"] }
 rustfs-s3-common = { workspace = true }
 async-trait = { workspace = true }
 hyper-rustls = { workspace = true }
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+sysinfo = { workspace = true, features = ["multithread"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

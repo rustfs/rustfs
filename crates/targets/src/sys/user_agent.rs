@@ -200,7 +200,6 @@ mod tests {
         let ua1 = UserAgent::new(ServiceType::Basis);
         let ua2 = UserAgent::new(ServiceType::Basis);
         assert_eq!(ua1.os_platform, ua2.os_platform);
-        // Ensure they point to the same static memory
         assert!(std::ptr::eq(ua1.os_platform.as_ptr(), ua2.os_platform.as_ptr()));
     }
 }
