@@ -30,7 +30,10 @@ use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
-use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
+use rustfs_policy::{
+    auth::get_new_credentials_with_metadata,
+    policy::{ClaimLookup, Policy, get_claim_case_insensitive},
+};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -52,20 +55,16 @@ fn has_identity_authorization_context(policies: &[String], groups: &[String]) ->
 }
 
 fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_name: &str) -> Vec<String> {
-    claims
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(claim_name))
-        .map(|(_, value)| match value {
-            Value::Array(values) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
-            Value::String(value) => value
-                .split(',')
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-            _ => Vec::new(),
-        })
-        .unwrap_or_default()
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(Value::Array(values)) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
+        ClaimLookup::Found(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        ClaimLookup::Missing | ClaimLookup::Ambiguous | ClaimLookup::Found(_) => Vec::new(),
+    }
 }
 
 fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
@@ -539,6 +538,24 @@ mod tests {
 
         assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["admin", "reader"]);
         assert_eq!(extract_string_list_claim(&claims, "groups"), vec!["devs", "ops"]);
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_prefers_exact_match() {
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
+        claims.insert("roles".to_string(), serde_json::json!(["exact-match"]));
+
+        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["exact-match"]);
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
+        claims.insert("ROLES".to_string(), serde_json::json!(["upper-case"]));
+
+        assert!(extract_string_list_claim(&claims, "roles").is_empty());
     }
 
     #[test]

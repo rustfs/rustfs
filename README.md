@@ -239,8 +239,9 @@ RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM="groups"
 RUSTFS_IDENTITY_OPENID_ROLES_CLAIM="roles"
 ```
 
-Policy condition example (roles are evaluated through the existing `jwt:groups`
-key path after claim mapping):
+Policy condition example (evaluate app roles directly with `jwt:roles`; when
+`roles_claim` is configured, RustFS also merges those values into `jwt:groups`
+for backward compatibility with older policies):
 
 ```json
 {
@@ -252,7 +253,7 @@ key path after claim mapping):
       "Resource": ["arn:aws:s3:::*"],
       "Condition": {
         "ForAnyValue:StringEquals": {
-          "jwt:groups": ["RustFS.ConsoleAdmin"]
+          "jwt:roles": ["RustFS.ConsoleAdmin"]
         }
       }
     }
