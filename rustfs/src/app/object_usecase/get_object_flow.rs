@@ -355,8 +355,13 @@ pub(super) async fn run_get_object_flow(
 mod tests {
     use super::get_object_strategy_range;
     use super::*;
+    use futures_util::StreamExt;
     use http::HeaderMap;
     use rustfs_ecstore::store_api::ObjectOptions;
+    use rustfs_object_io::get::{GetObjectEncryptionState, LegacyReadPlan, build_reader_read_setup};
+    use rustfs_rio::{Reader, WarpReader};
+    use std::{io::Cursor, sync::Arc, time::Duration};
+    use tokio::sync::Semaphore;
 
     fn sample_range(start: i64, end: i64) -> HTTPRangeSpec {
         HTTPRangeSpec {
@@ -377,6 +382,55 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
         }
+    }
+
+    #[tokio::test]
+    async fn build_get_object_output_context_materializes_reader_payload_with_legacy_metrics() {
+        let payload = b"hello from legacy reader".to_vec();
+        let reader = Box::new(WarpReader::new(Cursor::new(payload.clone()))) as Box<dyn Reader>;
+        let read_setup = build_reader_read_setup(
+            ObjectInfo::default(),
+            ObjectInfo::default(),
+            reader,
+            LegacyReadPlan {
+                rs: None,
+                content_type: None,
+                last_modified: None,
+                response_content_length: payload.len() as i64,
+                content_range: None,
+            },
+            GetObjectEncryptionState::default(),
+        );
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.acquire().await.expect("disk permit");
+        let io_planning = GetObjectIoPlanning {
+            _disk_permit: permit,
+            permit_wait_duration: Duration::ZERO,
+            queue_status: crate::storage::concurrency::IoQueueStatus {
+                total_permits: 1,
+                permits_in_use: 1,
+                ..Default::default()
+            },
+            queue_utilization: 100.0,
+        };
+        let manager = ConcurrencyManager::new();
+
+        let (output_context, metric_contract) =
+            build_get_object_output_context(&sample_request_context(), &manager, read_setup, &io_planning, 8 * 1024, false)
+                .await
+                .expect("reader-backed output context");
+
+        assert_eq!(metric_contract.io_path, rustfs_io_metrics::IoPath::Legacy);
+        assert_eq!(metric_contract.copy_mode, rustfs_io_metrics::CopyMode::SingleCopy);
+        assert_eq!(output_context.output.content_length, Some(payload.len() as i64));
+        assert_eq!(output_context.copy_mode_override, Some(rustfs_io_metrics::CopyMode::SingleCopy));
+
+        let mut body = output_context.output.body.expect("streaming body");
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.expect("body chunk"));
+        }
+        assert_eq!(collected, payload);
     }
 
     #[test]
