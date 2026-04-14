@@ -18,7 +18,7 @@ use crate::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
 };
 use http::StatusCode;
@@ -30,10 +30,7 @@ use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
-use rustfs_policy::{
-    auth::get_new_credentials_with_metadata,
-    policy::{ClaimLookup, Policy, get_claim_case_insensitive},
-};
+use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -54,25 +51,44 @@ fn has_identity_authorization_context(policies: &[String], groups: &[String]) ->
     !policies.is_empty() || !groups.is_empty()
 }
 
-fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_name: &str) -> Vec<String> {
-    match get_claim_case_insensitive(claims, claim_name) {
-        ClaimLookup::Found(Value::Array(values)) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
-        ClaimLookup::Found(Value::String(value)) => value
-            .split(',')
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        ClaimLookup::Missing | ClaimLookup::Ambiguous | ClaimLookup::Found(_) => Vec::new(),
-    }
-}
-
 fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
     rustfs_iam::get_oidc()
         .as_ref()
         .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
         .map(|cfg| cfg.roles_claim.trim().to_string())
         .filter(|claim| !claim.is_empty())
+}
+
+fn build_oidc_token_claims(
+    claims: &OidcClaims,
+    provider_id: &str,
+    groups: &[String],
+    roles_claim_key: Option<&str>,
+) -> HashMap<String, Value> {
+    let mut token_claims: HashMap<String, Value> = HashMap::new();
+    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
+    token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
+    token_claims.insert("oidc_provider".to_string(), Value::String(provider_id.to_string()));
+
+    if !claims.email.is_empty() {
+        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
+    }
+    if !claims.username.is_empty() {
+        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
+    }
+    if !groups.is_empty() {
+        token_claims.insert(
+            "groups".to_string(),
+            Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
+        );
+    }
+    if let Some(roles_claim_key) = roles_claim_key {
+        let roles = extract_string_list_claim(&claims.raw, roles_claim_key);
+        if !roles.is_empty() {
+            token_claims.insert("roles".to_string(), Value::Array(roles.into_iter().map(Value::String).collect()));
+        }
+    }
+    token_claims
 }
 
 pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -351,29 +367,8 @@ pub async fn create_oidc_sts_credentials(
     duration_seconds: usize,
     session_policy: Option<&str>,
 ) -> S3Result<rustfs_credentials::Credentials> {
-    let mut token_claims: HashMap<String, Value> = HashMap::new();
-    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
-    token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
-    token_claims.insert("oidc_provider".to_string(), Value::String(provider_id.to_string()));
-
-    if !claims.email.is_empty() {
-        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
-    }
-    if !claims.username.is_empty() {
-        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
-    }
-    if !groups.is_empty() {
-        token_claims.insert(
-            "groups".to_string(),
-            Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
-        );
-    }
-    if let Some(roles_claim_key) = configured_roles_claim_key(provider_id) {
-        let roles = extract_string_list_claim(&claims.raw, &roles_claim_key);
-        if !roles.is_empty() {
-            token_claims.insert("roles".to_string(), Value::Array(roles.into_iter().map(Value::String).collect()));
-        }
-    }
+    let roles_claim_key = configured_roles_claim_key(provider_id);
+    let mut token_claims = build_oidc_token_claims(claims, provider_id, groups, roles_claim_key.as_deref());
 
     // Set expiration
     let exp = OffsetDateTime::now_utc().saturating_add(Duration::seconds(duration_seconds as i64));
@@ -556,6 +551,20 @@ mod tests {
         claims.insert("ROLES".to_string(), serde_json::json!(["upper-case"]));
 
         assert!(extract_string_list_claim(&claims, "roles").is_empty());
+    }
+
+    #[test]
+    fn test_build_oidc_token_claims_includes_normalized_roles() {
+        let mut raw = HashMap::new();
+        raw.insert("Roles".to_string(), serde_json::json!("admin, reader"));
+        let claims = OidcClaims {
+            sub: "user-sub".to_string(),
+            raw,
+            ..Default::default()
+        };
+        let token_claims = build_oidc_token_claims(&claims, "default", &["devs".to_string()], Some("roles"));
+
+        assert_eq!(token_claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
     }
 
     #[test]
