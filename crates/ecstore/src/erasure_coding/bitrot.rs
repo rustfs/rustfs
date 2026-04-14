@@ -172,52 +172,6 @@ where
     }
 }
 
-impl BitrotWriter<CustomWriter> {
-    fn write_inline_sync(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        if self.finished {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bitrot writer already finished"));
-        }
-
-        if buf.len() > self.shard_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("data size {} exceeds shard size {}", buf.len(), self.shard_size),
-            ));
-        }
-
-        if buf.len() < self.shard_size {
-            self.finished = true;
-        }
-
-        match &mut self.inner {
-            CustomWriter::InlineBuffer(data) => {
-                if self.hash_algo.size() > 0 {
-                    let hash = self.hash_algo.hash_encode(buf);
-                    if hash.as_ref().is_empty() {
-                        error!("bitrot writer write hash error: hash is empty");
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
-                    }
-                    data.extend_from_slice(hash.as_ref());
-                }
-                data.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            CustomWriter::Other(_) => Err(std::io::Error::other("inline sync write requires inline buffer writer")),
-        }
-    }
-
-    fn shutdown_inline_sync(&mut self) -> std::io::Result<()> {
-        match self.inner {
-            CustomWriter::InlineBuffer(_) => Ok(()),
-            CustomWriter::Other(_) => Err(std::io::Error::other("inline sync shutdown requires inline buffer writer")),
-        }
-    }
-}
-
 async fn write_all_vectored<W>(writer: &mut W, hash: &[u8], data: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -325,10 +279,6 @@ impl CustomWriter {
             Self::InlineBuffer(data) => Some(data),
             Self::Other(_) => None,
         }
-    }
-
-    pub fn is_inline_buffer(&self) -> bool {
-        matches!(self, Self::InlineBuffer(_))
     }
 }
 
@@ -445,24 +395,6 @@ impl BitrotWriterWrapper {
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.bitrot_writer.shutdown().await
-    }
-
-    pub fn is_inline_buffer(&self) -> bool {
-        matches!(self.writer_type, WriterType::InlineBuffer)
-    }
-
-    pub fn write_inline_sync(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.is_inline_buffer() {
-            return Err(std::io::Error::other("inline sync write requires inline buffer writer"));
-        }
-        self.bitrot_writer.write_inline_sync(buf)
-    }
-
-    pub fn shutdown_inline_sync(&mut self) -> std::io::Result<()> {
-        if !self.is_inline_buffer() {
-            return Err(std::io::Error::other("inline sync shutdown requires inline buffer writer"));
-        }
-        self.bitrot_writer.shutdown_inline_sync()
     }
 
     /// Extract the inline buffer data, consuming the wrapper
