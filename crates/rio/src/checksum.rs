@@ -29,21 +29,11 @@ pub const RUSTFS_MULTIPART_CHECKSUM: &str = "x-rustfs-multipart-checksum";
 /// RustFS multipart checksum type metadata key  
 pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-type";
 
-const AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
-const AMZ_SDK_CHECKSUM_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
-
 /// Checksum type enumeration with flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
 impl ChecksumType {
-    fn algorithm_from_headers(headers: &HeaderMap) -> Option<&str> {
-        headers
-            .get(AMZ_CHECKSUM_ALGORITHM)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| headers.get(AMZ_SDK_CHECKSUM_ALGORITHM).and_then(|v| v.to_str().ok()))
-    }
-
     /// Checksum will be sent in trailing header
     pub const TRAILING: ChecksumType = ChecksumType(1 << 0);
 
@@ -166,7 +156,10 @@ impl ChecksumType {
 
     pub fn from_header(headers: &HeaderMap) -> Self {
         Self::from_string_with_obj_type(
-            Self::algorithm_from_headers(headers).unwrap_or(""),
+            headers
+                .get("x-amz-checksum-algorithm")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
             headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()).unwrap_or(""),
         )
     }
@@ -580,7 +573,7 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
 fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
     let mut checksum_type = ChecksumType::NONE;
 
-    if let Some(alg) = ChecksumType::algorithm_from_headers(headers) {
+    if let Some(alg) = headers.get("x-amz-checksum-algorithm").and_then(|v| v.to_str().ok()) {
         checksum_type = ChecksumType::from_string_with_obj_type(
             alg,
             headers.get("x-amz-checksum-type").and_then(|s| s.to_str().ok()).unwrap_or(""),
@@ -1139,35 +1132,6 @@ fn crc64_combine(poly: u64, crc1: u64, crc2: u64, len2: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Checksum, ChecksumType};
-    use http::HeaderMap;
-
-    #[test]
-    fn algorithm_from_headers_parses_amz_checksum_algorithm() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-checksum-algorithm", "SHA256".parse().expect("valid header value"));
-        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("SHA256"));
-    }
-
-    #[test]
-    fn algorithm_from_headers_falls_back_to_sdk_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32C".parse().expect("valid header value"));
-        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("CRC32C"));
-    }
-
-    #[test]
-    fn algorithm_from_headers_prefers_amz_over_sdk() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-checksum-algorithm", "SHA256".parse().expect("valid header value"));
-        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32C".parse().expect("valid header value"));
-        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("SHA256"));
-    }
-
-    #[test]
-    fn algorithm_from_headers_returns_none_when_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(ChecksumType::algorithm_from_headers(&headers), None);
-    }
 
     #[test]
     fn crc64_nvme_add_part_matches_full_object_checksum() {

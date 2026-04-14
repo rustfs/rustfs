@@ -32,10 +32,6 @@
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
 
-## 📈 Benchmarks
-
-ECStore ships Criterion benchmarks under [`crates/ecstore/benches/`](./benches/) for the remaining erasure-code and comparison workloads. Re-run benchmarks on your target machine before treating any local measurement as a regression baseline.
-
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.
