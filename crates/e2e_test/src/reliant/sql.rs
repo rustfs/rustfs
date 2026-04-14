@@ -281,8 +281,11 @@ async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
     println!("CSV Limit result: {result_str}");
 
     // Verify only first 2 records are returned
-    let lines: Vec<&str> = result_str.lines().filter(|line| !line.trim().is_empty()).collect();
-    assert_eq!(lines.len(), 2, "Should return exactly 2 records");
+    assert_eq!(
+        result_str.lines().filter(|line| !line.trim().is_empty()).count(),
+        2,
+        "Should return exactly 2 records"
+    );
 
     Ok(())
 }
@@ -321,8 +324,10 @@ async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>>
     println!("CSV Order By result: {result_str}");
 
     // Verify ordered by age descending
-    let lines: Vec<&str> = result_str.lines().filter(|line| !line.trim().is_empty()).collect();
-    assert!(lines.len() >= 2, "Should return at least 2 records");
+    assert!(
+        result_str.lines().filter(|line| !line.trim().is_empty()).count() >= 2,
+        "Should return at least 2 records"
+    );
 
     // Check if contains highest age records
     assert!(result_str.contains("Charlie,35"));
