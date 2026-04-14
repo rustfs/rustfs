@@ -73,7 +73,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
-    ChunkNativePutData, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
@@ -1236,7 +1236,7 @@ impl DefaultObjectUsecase {
             src_info.user_defined.extend(material.metadata);
         }
 
-        src_info.put_object_reader = Some(ChunkNativePutData::new(reader));
+        src_info.put_object_reader = Some(PutObjReader::new(reader));
 
         // check quota
 

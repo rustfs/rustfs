@@ -285,7 +285,7 @@ pub struct ObjectInfo {
     pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
-    pub put_object_reader: Option<ChunkNativePutData>,
+    pub put_object_reader: Option<PutObjReader>,
     pub etag: Option<String>,
     pub inlined: bool,
     pub metadata_only: bool,

@@ -55,7 +55,7 @@ use super::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ChunkNativePutData, ObjectIO, ObjectOperations, ObjectOptions};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::HashReader;
 use std::collections::HashMap;
 use tracing::debug;
@@ -382,7 +382,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // 15. Hand the hash reader to the chunk-native PUT data wrapper
-    let mut put_reader = ChunkNativePutData::new(hash_reader);
+    let mut put_reader = PutObjReader::new(hash_reader);
 
     // 16. Upload object to storage
     let obj_info = store
@@ -465,7 +465,7 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // Hand the hash reader to the chunk-native PUT data wrapper
-    let mut put_reader = ChunkNativePutData::new(hash_reader);
+    let mut put_reader = PutObjReader::new(hash_reader);
 
     // Upload object to storage
     let obj_info = store

@@ -1,101 +1,7 @@
 use super::*;
-use rustfs_rio::TryGetIndex;
-
-pub struct ChunkNativePutData {
-    stream: Option<HashReader>,
-    size: i64,
-    actual_size: i64,
-}
-
-impl Debug for ChunkNativePutData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkNativePutData").finish()
-    }
-}
-
-impl ChunkNativePutData {
-    pub fn new(stream: HashReader) -> Self {
-        let size = stream.size();
-        let actual_size = stream.actual_size();
-        Self {
-            stream: Some(stream),
-            size,
-            actual_size,
-        }
-    }
-
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        use sha2::{Digest, Sha256};
-
-        let content_length = data.len() as i64;
-        let sha256hex = if content_length > 0 {
-            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
-        } else {
-            None
-        };
-        Self::new(HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap())
-    }
-
-    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
-        self.stream
-            .take()
-            .ok_or_else(|| std::io::Error::other("ChunkNativePutData stream already taken"))
-    }
-
-    pub fn restore_stream(&mut self, stream: HashReader) {
-        self.size = stream.size();
-        self.actual_size = stream.actual_size();
-        self.stream = Some(stream);
-    }
-
-    pub fn as_hash_reader(&self) -> Option<&HashReader> {
-        self.stream.as_ref()
-    }
-
-    pub fn as_hash_reader_mut(&mut self) -> Option<&mut HashReader> {
-        self.stream.as_mut()
-    }
-
-    pub fn index_bytes(&self) -> Option<Bytes> {
-        self.as_hash_reader()
-            .and_then(|reader| reader.try_get_index().map(|index| index.clone().into_vec()))
-    }
-
-    pub fn resolve_etag(&mut self) -> Option<String> {
-        self.as_hash_reader_mut()
-            .and_then(rustfs_rio::EtagResolvable::try_resolve_etag)
-    }
-
-    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
-        let Some(reader) = self.as_hash_reader_mut() else {
-            return Ok(None);
-        };
-
-        Ok(reader
-            .finalize_content_hash()?
-            .as_ref()
-            .map(|checksum| checksum.to_bytes(&[])))
-    }
-
-    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
-        self.as_hash_reader().and_then(HashReader::content_crc_type)
-    }
-
-    pub fn content_crc(&self) -> HashMap<String, String> {
-        self.as_hash_reader().map_or_else(HashMap::new, HashReader::content_crc)
-    }
-
-    pub fn size(&self) -> i64 {
-        self.size
-    }
-
-    pub fn actual_size(&self) -> i64 {
-        self.actual_size
-    }
-}
 
 pub struct PutObjReader {
-    data: ChunkNativePutData,
+    pub stream: HashReader,
 }
 
 impl Debug for PutObjReader {
@@ -106,81 +12,32 @@ impl Debug for PutObjReader {
 
 impl PutObjReader {
     pub fn new(stream: HashReader) -> Self {
-        Self {
-            data: ChunkNativePutData::new(stream),
-        }
+        PutObjReader { stream }
     }
 
-    pub fn chunk_native_data(&self) -> &ChunkNativePutData {
-        &self.data
-    }
-
-    pub fn chunk_native_data_mut(&mut self) -> &mut ChunkNativePutData {
-        &mut self.data
-    }
-
-    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
-        self.data.take_stream()
-    }
-
-    pub fn restore_stream(&mut self, stream: HashReader) {
-        self.data.restore_stream(stream);
-    }
-
-    pub fn as_hash_reader(&self) -> Option<&HashReader> {
-        self.data.as_hash_reader()
-    }
-
-    pub fn as_hash_reader_mut(&mut self) -> Option<&mut HashReader> {
-        self.data.as_hash_reader_mut()
-    }
-
-    pub fn index_bytes(&self) -> Option<Bytes> {
-        self.data.index_bytes()
-    }
-
-    pub fn resolve_etag(&mut self) -> Option<String> {
-        self.data.resolve_etag()
-    }
-
-    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
-        self.data.content_hash_bytes()
-    }
-
-    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
-        self.data.content_crc_type()
-    }
-
-    pub fn content_crc(&self) -> HashMap<String, String> {
-        self.data.content_crc()
+    pub fn as_hash_reader(&self) -> &HashReader {
+        &self.stream
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
-        Self {
-            data: ChunkNativePutData::from_vec(data),
+        use sha2::{Digest, Sha256};
+        let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+        PutObjReader {
+            stream: HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap(),
         }
     }
 
     pub fn size(&self) -> i64 {
-        self.data.size()
+        self.stream.size()
     }
 
     pub fn actual_size(&self) -> i64 {
-        self.data.actual_size()
-    }
-}
-
-impl std::ops::Deref for PutObjReader {
-    type Target = ChunkNativePutData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-impl std::ops::DerefMut for PutObjReader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
+        self.stream.actual_size()
     }
 }
 
