@@ -585,18 +585,19 @@ impl SetDisks {
 
         let total_size = fi.size as usize;
 
-        let length = if length < 0 {
-            fi.size as usize - offset
-        } else {
-            length as usize
-        };
+        if offset > total_size {
+            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            return Err(Error::other("offset out of range"));
+        }
+
+        let length = if length < 0 { total_size - offset } else { length as usize };
 
         let Some(end_offset_exclusive) = offset.checked_add(length) else {
             error!("get_object_with_fileinfo offset overflow: {}, length: {}", offset, length);
             return Err(Error::other("offset out of range"));
         };
 
-        if offset > total_size || end_offset_exclusive > total_size {
+        if end_offset_exclusive > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }

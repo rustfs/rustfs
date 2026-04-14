@@ -1139,6 +1139,35 @@ fn crc64_combine(poly: u64, crc1: u64, crc2: u64, len2: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Checksum, ChecksumType};
+    use http::HeaderMap;
+
+    #[test]
+    fn algorithm_from_headers_parses_amz_checksum_algorithm() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-algorithm", "SHA256".parse().expect("valid header value"));
+        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("SHA256"));
+    }
+
+    #[test]
+    fn algorithm_from_headers_falls_back_to_sdk_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32C".parse().expect("valid header value"));
+        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("CRC32C"));
+    }
+
+    #[test]
+    fn algorithm_from_headers_prefers_amz_over_sdk() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-algorithm", "SHA256".parse().expect("valid header value"));
+        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32C".parse().expect("valid header value"));
+        assert_eq!(ChecksumType::algorithm_from_headers(&headers), Some("SHA256"));
+    }
+
+    #[test]
+    fn algorithm_from_headers_returns_none_when_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(ChecksumType::algorithm_from_headers(&headers), None);
+    }
 
     #[test]
     fn crc64_nvme_add_part_matches_full_object_checksum() {

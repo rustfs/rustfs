@@ -116,7 +116,7 @@ where
                     // Header: 8 bytes
                     // 0: type (0 = encrypted, 0xFF = end)
                     // 1-3: length (little endian u24, ciphertext length)
-                    // 4-7: CRC32 of ciphertext (little endian u32)
+                    // 4-7: CRC32 of plaintext (little endian u32)
                     let mut header = [0u8; 8];
                     header[0] = 0x00; // 0 = encrypted
                     header[1] = (clen & 0xFF) as u8;

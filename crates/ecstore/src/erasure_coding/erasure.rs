@@ -489,7 +489,7 @@ impl Erasure {
     ///
     /// # Errors
     /// Returns error if reading from reader fails or if callback returns error
-    pub async fn encode_stream_callback_async<F, Fut, E, R>(
+    pub(crate) async fn encode_stream_callback_async<F, Fut, E, R>(
         self: std::sync::Arc<Self>,
         reader: &mut R,
         mut on_block: F,
