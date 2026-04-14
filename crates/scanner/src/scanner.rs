@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::ScannerSpeed;
-use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
+use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+const ENV_SCANNER_CYCLE: &str = "RUSTFS_SCANNER_CYCLE";
 
 /// Returns the base cycle interval.
 /// Priority order:
