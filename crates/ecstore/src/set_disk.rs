@@ -937,6 +937,9 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
+        let object_size = data.size();
+        let encode_write_start = Instant::now();
+
         let stream = mem::replace(
             &mut data.stream,
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
@@ -945,12 +948,30 @@ impl ObjectIO for SetDisks {
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
             Ok((r, w)) => (r, w),
             Err(e) => {
+                log_put_storage_phase(
+                    bucket,
+                    object,
+                    "encode_write",
+                    encode_write_start.elapsed(),
+                    object_size,
+                    is_inline_buffer,
+                    write_quorum,
+                );
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
         }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
+        log_put_storage_phase(
+            bucket,
+            object,
+            "encode_write",
+            encode_write_start.elapsed(),
+            object_size,
+            is_inline_buffer,
+            write_quorum,
+        );
 
         if (w_size as i64) < data.size() {
             warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
