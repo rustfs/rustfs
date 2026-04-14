@@ -52,9 +52,9 @@ use crate::{
     event_notification::{EventArgs, send_event},
     global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
-        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions,
-        MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartInfo,
+        MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
 };
@@ -790,13 +790,7 @@ impl ObjectIO for SetDisks {
     }
 
     #[tracing::instrument(skip(self, data,))]
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut ChunkNativePutData,
-        opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
@@ -945,8 +939,14 @@ impl ObjectIO for SetDisks {
 
         let object_size = data.size();
         let encode_write_start = Instant::now();
-        let w_size = match Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await {
-            Ok(written) => written,
+
+        let stream = mem::replace(
+            &mut data.stream,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+        );
+
+        let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+            Ok((r, w)) => (r, w),
             Err(e) => {
                 log_put_storage_phase(
                     bucket,
@@ -961,12 +961,14 @@ impl ObjectIO for SetDisks {
                 return Err(e.into());
             }
         }; // TODO: delete temporary directory on error
+
+        let _ = mem::replace(&mut data.stream, reader);
         log_put_storage_phase(
             bucket,
             object,
             "encode_write",
             encode_write_start.elapsed(),
-            data.size(),
+            object_size,
             is_inline_buffer,
             write_quorum,
         );
@@ -984,11 +986,11 @@ impl ObjectIO for SetDisks {
             insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
         }
 
-        let index_op = data.index_bytes();
+        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
 
         //TODO: userDefined
 
-        let etag = data.resolve_etag().unwrap_or_default();
+        let etag = data.stream.try_resolve_etag().unwrap_or_default();
 
         user_defined.insert("etag".to_owned(), etag.clone());
 
@@ -1005,9 +1007,9 @@ impl ObjectIO for SetDisks {
         }
 
         if fi.checksum.is_none()
-            && let Some(content_hash) = data.content_hash_bytes()?
+            && let Some(content_hash) = data.as_hash_reader().content_hash()
         {
-            fi.checksum = Some(content_hash);
+            fi.checksum = Some(content_hash.to_bytes(&[]));
         }
 
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
@@ -2266,7 +2268,7 @@ impl ObjectOperations for SetDisks {
             let gr = gr.unwrap();
             let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
-            let mut p_reader = ChunkNativePutData::new(hash_reader);
+            let mut p_reader = PutObjReader::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
                     send_event(EventArgs {
@@ -2334,7 +2336,7 @@ impl ObjectOperations for SetDisks {
             };
             let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
-            let mut p_reader = ChunkNativePutData::new(hash_reader);
+            let mut p_reader = PutObjReader::new(hash_reader);
             let p_info = self_
                 .clone()
                 .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
@@ -2558,7 +2560,7 @@ impl MultipartOperations for SetDisks {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut ChunkNativePutData,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
@@ -2570,8 +2572,9 @@ impl MultipartOperations for SetDisks {
         if let Some(checksum) = fi.metadata.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
             && !checksum.is_empty()
             && data
+                .as_hash_reader()
                 .content_crc_type()
-                .is_none_or(|v: rustfs_rio::ChecksumType| v.to_string() != *checksum)
+                .is_none_or(|v| v.to_string() != *checksum)
         {
             return Err(Error::other(format!("checksum mismatch: {checksum}")));
         }
@@ -2636,7 +2639,14 @@ impl MultipartOperations for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
-        let w_size = Self::write_chunk_native_put_data(data, Arc::new(erasure), &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
+        let stream = mem::replace(
+            &mut data.stream,
+            HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+        );
+
+        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
+
+        let _ = mem::replace(&mut data.stream, reader);
 
         if (w_size as i64) < data.size() {
             warn!("put_object_part write size < data.size(), w_size={}, data.size={}", w_size, data.size());
@@ -2647,9 +2657,9 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.index_bytes();
+        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
 
-        let mut etag = data.resolve_etag().unwrap_or_default();
+        let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
@@ -2663,7 +2673,7 @@ impl MultipartOperations for SetDisks {
             }
         }
 
-        let checksums = data.content_crc();
+        let checksums = data.as_hash_reader().content_crc();
 
         let part_info = ObjectPartInfo {
             etag: etag.clone(),

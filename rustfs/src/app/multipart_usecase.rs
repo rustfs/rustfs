@@ -45,9 +45,7 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
-use rustfs_ecstore::store_api::{
-    ChunkNativePutData, CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions,
-};
+use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_object_io::put::PutObjectChecksums;
@@ -772,7 +770,7 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = ChunkNativePutData::new(reader);
+        let mut reader = PutObjReader::new(reader);
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
@@ -813,7 +811,7 @@ impl DefaultMultipartUsecase {
                 _ => (),
             }
         }
-        checksums.merge_from_map(&reader.content_crc());
+        checksums.merge_from_map(&reader.as_hash_reader().content_crc());
 
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
@@ -1095,7 +1093,7 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        let mut reader = ChunkNativePutData::new(reader);
+        let mut reader = PutObjReader::new(reader);
 
         let dst_opts = ObjectOptions {
             user_defined: mp_info.user_defined.clone(),

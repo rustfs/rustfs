@@ -539,7 +539,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(encryption_metadata);
         }
 
-        let mut reader = ChunkNativePutData::new(reader);
+        let mut reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
@@ -611,7 +611,7 @@ impl DefaultObjectUsecase {
             &request_context.trailing_headers,
             &mut checksums,
         );
-        checksums.merge_from_map(&reader.content_crc());
+        checksums.merge_from_map(&reader.as_hash_reader().content_crc());
         if let Some(checksum_bytes) = resolved_checksum_bytes(&checksums)
             && obj_info
                 .checksum
