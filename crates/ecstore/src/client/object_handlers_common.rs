@@ -23,6 +23,13 @@ use crate::store_api::{ObjectOperations, ObjectOptions, ObjectToDelete};
 use rustfs_lock::MAX_DELETE_LIST;
 
 pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
+    let version_suspended = match BucketVersioningSys::get(bucket).await {
+        Ok(vc) => vc.suspended(),
+        Err(err) => {
+            warn!(bucket, error = ?err, "failed to get versioning config during lifecycle noncurrent version cleanup");
+            return;
+        }
+    };
     let mut remaining = to_del;
     loop {
         let mut to_del = remaining;
@@ -32,13 +39,6 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
         } else {
             remaining = &[];
         }
-        let version_suspended = match BucketVersioningSys::get(bucket).await {
-            Ok(vc) => vc.suspended(),
-            Err(err) => {
-                warn!(bucket, error = ?err, "failed to get versioning config during lifecycle noncurrent version cleanup");
-                return;
-            }
-        };
         let (_deleted_objs, errors) = api
             .delete_objects(
                 bucket,

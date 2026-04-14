@@ -109,10 +109,11 @@ impl ObjSweeper {
     }
 
     pub async fn sweep(&self) {
-        let je = self.should_remove_remote_object();
-        if !je.is_none() {
+        if let Some(je) = self.should_remove_remote_object() {
             let mut expiry_state = GLOBAL_ExpiryState.write().await;
-            expiry_state.enqueue_tier_journal_entry(&je.expect("journal entry should exist after is_none check"));
+            if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
+                tracing::warn!("failed to enqueue tier journal entry: {err}");
+            }
         }
     }
 }

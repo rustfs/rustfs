@@ -140,8 +140,8 @@ struct ExpiryTask {
 impl ExpiryOp for ExpiryTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(self.obj_info.bucket.to_string().as_bytes());
-        hasher.update(self.obj_info.name.to_string().as_bytes());
+        hasher.update(self.obj_info.bucket.as_bytes());
+        hasher.update(self.obj_info.name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -195,8 +195,8 @@ struct FreeVersionTask(ObjectInfo);
 impl ExpiryOp for FreeVersionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(self.0.transitioned_object.tier.to_string().as_bytes());
-        hasher.update(self.0.transitioned_object.name.to_string().as_bytes());
+        hasher.update(self.0.transitioned_object.tier.as_bytes());
+        hasher.update(self.0.transitioned_object.name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -214,8 +214,8 @@ struct NewerNoncurrentTask {
 impl ExpiryOp for NewerNoncurrentTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(self.bucket.to_string().as_bytes());
-        hasher.update(self.versions[0].object_name.to_string().as_bytes());
+        hasher.update(self.bucket.as_bytes());
+        hasher.update(self.versions[0].object_name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -507,7 +507,7 @@ struct TransitionTask {
 impl ExpiryOp for TransitionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(self.obj_info.bucket.to_string().as_bytes());
+        hasher.update(self.obj_info.bucket.as_bytes());
         // hasher.update(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
@@ -1478,7 +1478,7 @@ impl RestoreRequestOps for RestoreRequest {
         }
 
         // OutputLocation is only valid for SELECT requests
-        if self.type_.is_none() && self.output_location.is_some() {
+        if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.output_location.is_some() {
             return Err(std::io::Error::other("OutputLocation can only be specified with SELECT request type"));
         }
         if let Some(type_) = &self.type_
