@@ -27,8 +27,8 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{
-        BucketOperations, BucketOptions, ChunkNativePutData, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations,
-        ObjectOptions,
+        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
+        PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierType},
@@ -150,7 +150,7 @@ async fn upload_test_object(
     object: &str,
     data: &[u8],
 ) -> rustfs_ecstore::store_api::ObjectInfo {
-    let mut reader = ChunkNativePutData::from_vec(data.to_vec());
+    let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
@@ -448,7 +448,7 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .await
         .expect("Failed to create multipart upload");
 
-    let mut reader = ChunkNativePutData::from_vec(payload.to_vec());
+    let mut reader = PutObjReader::from_vec(payload.to_vec());
     let uploaded_part = ecstore
         .put_object_part(bucket.as_str(), object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
         .await

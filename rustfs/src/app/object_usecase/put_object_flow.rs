@@ -22,7 +22,7 @@ use rustfs_object_io::put::{
     apply_trailing_checksums, build_put_object_ingress_source, build_put_object_legacy_hash_stage,
     build_put_object_plain_hash_stage, plan_put_object_body_with_transforms, resolve_put_transformed_fallback_reason,
 };
-use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, TryGetIndex};
+use rustfs_rio::{EtagResolvable, HashReaderDetector, TryGetIndex};
 use rustfs_utils::http::headers::AMZ_TRAILER;
 
 const DEFAULT_SMALL_PUT_EAGER_MAX_BYTES: i64 = 1024 * 1024;
@@ -142,22 +142,6 @@ impl AsyncRead for PooledBufferReader {
         buf.put_slice(&remaining[..to_copy]);
         self.position += to_copy;
         std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl BlockReadable for PooledBufferReader {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move {
-            let remaining = &self.buffer[self.position..];
-            if remaining.is_empty() {
-                return Ok(0);
-            }
-
-            let to_copy = remaining.len().min(buf.len());
-            buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
-            self.position += to_copy;
-            Ok(to_copy)
-        })
     }
 }
 
@@ -480,10 +464,7 @@ impl DefaultObjectUsecase {
 
             if stage.ingress_kind == PutObjectIngressKind::ReducedCopyCandidate {
                 plain_reduced_copy_stage = true;
-                debug!(
-                    "Plain PUT is using the reduced-copy Reader + BlockReadable hash path (bucket={}, key={})",
-                    bucket, key
-                );
+                debug!("Plain PUT is using the reduced-copy Reader hash path (bucket={}, key={})", bucket, key);
             }
 
             stage
@@ -539,7 +520,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(encryption_metadata);
         }
 
-        let mut reader = ChunkNativePutData::new(reader);
+        let mut reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
@@ -611,7 +592,7 @@ impl DefaultObjectUsecase {
             &request_context.trailing_headers,
             &mut checksums,
         );
-        checksums.merge_from_map(&reader.content_crc());
+        checksums.merge_from_map(&reader.as_hash_reader().content_crc());
         if let Some(checksum_bytes) = resolved_checksum_bytes(&checksums)
             && obj_info
                 .checksum

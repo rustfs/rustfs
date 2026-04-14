@@ -30,10 +30,8 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::lock::Mutex;
-use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_io_core::{BoxChunkStream, IoChunk};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
@@ -42,7 +40,7 @@ use rustfs_protos::proto_gen::node_service::{
     RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     node_service_client::NodeServiceClient,
 };
-use rustfs_rio::{HttpReader, HttpWriter, open_http_byte_stream};
+use rustfs_rio::{HttpReader, HttpWriter};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::Cursor,
@@ -1071,33 +1069,6 @@ impl DiskAPI for RemoteDisk {
         reader.read_to_end(&mut buffer).await?;
 
         Ok(Bytes::from(buffer))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
-        let disk = self.disk_ref().await;
-
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(&disk),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            offset,
-            length
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
-
-        let stream = open_http_byte_stream(url, Method::GET, headers, None)
-            .await?
-            .map(|result| result.map(IoChunk::Shared));
-        Ok(Box::pin(stream))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

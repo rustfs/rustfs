@@ -14,11 +14,9 @@
 
 use crate::error::{Error, Result};
 use crate::store::ECStore;
-use crate::store_api::{
-    ChunkNativePutData, CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions,
-};
+use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
-use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{
@@ -56,11 +54,6 @@ impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedDataMovementRead
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> BlockReadable for IndexedDataMovementReader<R> {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(rustfs_utils::read_full(self, buf))
-    }
-}
 pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     let bytes = index?;
     let mut decoded = Index::new();
@@ -71,7 +64,7 @@ pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     }
 }
 
-pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<ChunkNativePutData> {
+pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
     use sha2::{Digest, Sha256};
 
     let sha256hex = if !chunk.is_empty() {
@@ -82,7 +75,7 @@ pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: O
 
     let reader = IndexedDataMovementReader::new(Cursor::new(chunk), index);
     let hash_reader = HashReader::from_reader(reader, size, actual_size, None, sha256hex, false)?;
-    Ok(ChunkNativePutData::new(hash_reader))
+    Ok(PutObjReader::new(hash_reader))
 }
 
 pub fn new_multipart_abort_flag() -> Arc<AtomicBool> {
@@ -262,7 +255,7 @@ pub(crate) async fn migrate_object(
         .and_then(|part| decode_part_index(part.index.as_ref()));
     let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
     let hrd = HashReader::from_reader(reader, object_info.size, actual_size, object_info.etag.clone(), None, false)?;
-    let mut data = ChunkNativePutData::new(hrd);
+    let mut data = PutObjReader::new(hrd);
 
     if let Err(err) = store
         .put_object(
