@@ -855,6 +855,36 @@ pub fn record_io_latency_p99(latency_ms: f64) {
     gauge!("rustfs.io.latency.p99.ms").set(latency_ms);
 }
 
+// ============================================================================
+// Zero-Copy I/O Metrics
+// ============================================================================
+
+/// Record a successful zero-copy read operation (e.g., mmap).
+///
+/// # Arguments
+///
+/// * `size_bytes` - Size of the data read in bytes
+/// * `duration_ms` - Time taken for the read operation in milliseconds
+#[inline(always)]
+pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
+    counter!("rustfs.zero_copy.reads.total").increment(1);
+    histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
+    histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
+}
+
+/// Record a fallback from zero-copy to regular read.
+///
+/// This happens when zero-copy read fails (e.g., mmap not available,
+/// file too large, etc.) and the system falls back to regular I/O.
+///
+/// # Arguments
+///
+/// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
+#[inline(always)]
+pub fn record_zero_copy_fallback(reason: &str) {
+    counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

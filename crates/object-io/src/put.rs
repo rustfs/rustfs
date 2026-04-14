@@ -17,9 +17,7 @@ use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::store_api::ObjectOptions;
-use rustfs_rio::{
-    BlockReadable, BoxReadBlockFuture, Checksum, EtagResolvable, HashReader, HashReaderDetector, Reader, TryGetIndex, WarpReader,
-};
+use rustfs_rio::{Checksum, EtagResolvable, HashReader, HashReaderDetector, Reader, TryGetIndex, WarpReader};
 use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM;
 use rustfs_utils::http::headers::{
     AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
@@ -244,62 +242,6 @@ impl<S, B> PutObjectReducedCopyReader<S, B> {
         buf.advance(copied);
         copied
     }
-
-    async fn read_into_slice<E>(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
-    where
-        S: Stream<Item = Result<B, E>> + Unpin,
-        B: Buf + Unpin,
-        E: std::fmt::Display,
-    {
-        if let Some(err) = self.pending_error.take() {
-            return Err(err);
-        }
-
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let mut copied = 0;
-
-        loop {
-            if copied == buf.len() {
-                return Ok(copied);
-            }
-
-            if let Some(chunk) = self.current_chunk.as_mut() {
-                if !chunk.has_remaining() {
-                    self.current_chunk = None;
-                    continue;
-                }
-
-                copied += Self::copy_chunk_into_slice(chunk, &mut buf[copied..]);
-                if chunk.has_remaining() || copied == buf.len() {
-                    return Ok(copied);
-                }
-
-                self.current_chunk = None;
-                continue;
-            }
-
-            match self.body.next().await {
-                Some(Ok(chunk)) => {
-                    if chunk.remaining() == 0 {
-                        continue;
-                    }
-                    self.current_chunk = Some(chunk);
-                }
-                Some(Err(err)) => {
-                    let err = std::io::Error::other(err.to_string());
-                    if copied > 0 {
-                        self.pending_error = Some(err);
-                        return Ok(copied);
-                    }
-                    return Err(err);
-                }
-                None => return Ok(copied),
-            }
-        }
-    }
 }
 
 impl<S, B, E> AsyncRead for PutObjectReducedCopyReader<S, B>
@@ -368,17 +310,6 @@ where
                 }
             }
         }
-    }
-}
-
-impl<S, B, E> BlockReadable for PutObjectReducedCopyReader<S, B>
-where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync,
-    B: Buf + Unpin + Send + Sync,
-    E: std::fmt::Display + Send + Sync,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move { self.read_into_slice(buf).await })
     }
 }
 
@@ -1442,62 +1373,6 @@ mod tests {
         let err = reader.read(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(err.to_string().contains("boom"));
-    }
-
-    #[tokio::test]
-    async fn build_put_object_reduced_copy_reader_supports_direct_block_reads() {
-        let stream = futures_util::stream::iter([
-            Ok::<Bytes, &'static str>(Bytes::from_static(b"ab")),
-            Ok::<Bytes, &'static str>(Bytes::from_static(b"cd")),
-            Ok::<Bytes, &'static str>(Bytes::from_static(b"ef")),
-        ]);
-
-        let mut reader = build_put_object_reduced_copy_reader(PutObjectReducedCopyIngress::from_stream(
-            stream,
-            PutObjectCompatIngressPlan {
-                kind: PutObjectCompatIngressKind::BufferedStreamCompat,
-                buffer_size: 16,
-            },
-        ));
-
-        let mut first = [0_u8; 4];
-        let mut second = [0_u8; 4];
-        assert_eq!(reader.read_block(&mut first).await.unwrap(), 4);
-        assert_eq!(&first, b"abcd");
-        assert_eq!(reader.read_block(&mut second).await.unwrap(), 2);
-        assert_eq!(&second[..2], b"ef");
-        assert_eq!(reader.read_block(&mut second).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn build_put_object_plain_hash_stage_reports_reduced_copy_candidate_boundary() {
-        let stream = futures_util::stream::iter([Ok::<Bytes, &'static str>(Bytes::from_static(b"plain"))]);
-        let mut headers = HeaderMap::new();
-        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
-        let plan = plan_put_object_body(2 * 1024 * 1024, &headers, "large.bin", 32);
-
-        let stage = build_put_object_plain_hash_stage(
-            build_put_object_ingress_source(stream, plan),
-            PutObjectLegacyHashValues::default(),
-            PutObjectLegacyHashStagePlan {
-                size: 5,
-                actual_size: 5,
-                apply_s3_checksum: false,
-                ignore_s3_checksum_value: false,
-            },
-            &headers,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(stage.ingress_kind, PutObjectIngressKind::ReducedCopyCandidate);
-
-        let mut reader = stage.reader;
-        let mut buf = [0_u8; 8];
-        let n = reader.read_block(&mut buf).await.unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(&buf[..n], b"plain");
-        assert_eq!(reader.read_block(&mut buf).await.unwrap(), 0);
     }
 
     #[tokio::test]
