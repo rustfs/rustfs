@@ -564,7 +564,9 @@ impl AsyncRead for HashReader {
                     }
 
                     // check content hasher
-                    if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
+                    if let (Some(hasher), Some(expected_content_hash)) =
+                        (this.content_hasher.as_mut(), this.content_hash.as_mut())
+                    {
                         if expected_content_hash.checksum_type.trailing()
                             && let Some(trailer) = this.trailer_s3s.as_ref()
                             && let Some(Some(checksum_str)) = trailer.read(|headers| {
@@ -589,7 +591,7 @@ impl AsyncRead for HashReader {
                         if expected_content_hash.encoded.is_empty() {
                             expected_content_hash.raw = content_hash.clone();
                             expected_content_hash.encoded = general_purpose::STANDARD.encode(&content_hash);
-                            *this.content_hash = Some(expected_content_hash);
+                            *this.content_hash = Some(expected_content_hash.clone());
                         } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
