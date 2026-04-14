@@ -112,7 +112,7 @@ impl ObjSweeper {
         let je = self.should_remove_remote_object();
         if !je.is_none() {
             let mut expiry_state = GLOBAL_ExpiryState.write().await;
-            expiry_state.enqueue_tier_journal_entry(&je.expect("err!"));
+            expiry_state.enqueue_tier_journal_entry(&je.expect("journal entry should exist after is_none check"));
         }
     }
 }

@@ -15,6 +15,7 @@
 use super::DeadlockRequestGuard;
 use super::GetObjectRequestContext;
 use super::get_object_zero_copy::{GetObjectIoPlanning, GetObjectPreparedRead, prepare_get_object_read_execution};
+use super::resolve_put_object_expiration;
 use crate::error::ApiError;
 use crate::storage::concurrency::{ConcurrencyManager, GetObjectGuard, get_buffer_size_opt_in};
 use crate::storage::options::filter_object_metadata;
@@ -22,6 +23,7 @@ use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::store_api::{HTTPRangeSpec, ObjectInfo};
+use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_object_io::get::{
     GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodyPlanningInputs as ObjectIoGetObjectBodyPlanningInputs,
     GetObjectBodySource, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
@@ -34,6 +36,7 @@ use rustfs_object_io::get::{
 };
 use s3s::S3Result;
 use s3s::dto::StreamingBlob;
+use s3s::header::X_AMZ_RESTORE;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tracing::{debug, error, info, warn};
@@ -294,6 +297,15 @@ pub(super) async fn build_get_object_output_context(
         .map_err(ApiError::from)?;
     let filtered_metadata = filter_object_metadata(&info.user_defined);
 
+    // x-amz-restore: extract from object metadata
+    let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+        let rs = parse_restore_obj_status(v).ok()?;
+        Some(rs.to_string2())
+    });
+
+    // x-amz-expiration: predict from lifecycle configuration
+    let expiration = resolve_put_object_expiration(bucket, &info).await;
+
     Ok((
         object_io_build_get_object_output_context(
             body,
@@ -312,6 +324,8 @@ pub(super) async fn build_get_object_output_context(
             versioned,
             optimal_buffer_size,
             Some(metric_contract.copy_mode),
+            restore,
+            expiration,
         ),
         metric_contract,
     ))

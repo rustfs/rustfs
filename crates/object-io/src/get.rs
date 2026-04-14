@@ -500,6 +500,8 @@ pub fn build_get_object_output_context(
     versioned: bool,
     optimal_buffer_size: usize,
     copy_mode_override: Option<rustfs_io_metrics::CopyMode>,
+    restore: Option<String>,
+    expiration: Option<String>,
 ) -> GetObjectOutputContext {
     let output_version_id = build_output_version_id(versioned, info.version_id.as_ref());
     let output = build_get_object_output(
@@ -516,6 +518,8 @@ pub fn build_get_object_output_context(
         checksums,
         output_version_id,
         filtered_metadata,
+        restore,
+        expiration,
     );
 
     GetObjectOutputContext {
@@ -542,6 +546,8 @@ pub fn build_get_object_output(
     checksums: &GetObjectChecksums,
     output_version_id: Option<String>,
     filtered_metadata: Option<HashMap<String, String>>,
+    restore: Option<String>,
+    expiration: Option<String>,
 ) -> GetObjectOutput {
     GetObjectOutput {
         body,
@@ -568,6 +574,8 @@ pub fn build_get_object_output(
         checksum_crc64nvme: checksums.crc64nvme.clone(),
         checksum_type: checksums.checksum_type.clone(),
         version_id: output_version_id,
+        restore,
+        expiration,
         ..Default::default()
     }
 }
@@ -739,6 +747,8 @@ mod tests {
             true,
             4096,
             Some(rustfs_io_metrics::CopyMode::Reconstructed),
+            None,
+            None,
         );
 
         assert_eq!(output_context.output.version_id.as_deref(), Some("null"));
@@ -775,6 +785,8 @@ mod tests {
             None,
             None,
             &GetObjectChecksums::default(),
+            None,
+            None,
             None,
             None,
         );

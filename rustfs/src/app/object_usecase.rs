@@ -539,7 +539,7 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
-async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
+pub(super) async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> Option<String> {
     let Ok((lifecycle_config, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
         debug!("resolve_put_object_expiration: lifecycle config not found for bucket {bucket}");
         return None;
@@ -1910,6 +1910,8 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key_md5.as_ref(),
         )?;
 
+        // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
+        let expiration_header = resolve_put_object_expiration(&bucket, &info).await;
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -2022,6 +2024,13 @@ impl DefaultObjectUsecase {
             checksum_crc64nvme,
             checksum_type,
             storage_class,
+            // x-amz-restore from object metadata
+            restore: metadata_map.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+                let rs = parse_restore_obj_status(v).ok()?;
+                Some(rs.to_string2())
+            }),
+            // x-amz-expiration from lifecycle prediction
+            expiration: expiration_header,
             // metadata: object_metadata,
             ..Default::default()
         };
