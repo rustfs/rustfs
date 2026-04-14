@@ -301,6 +301,18 @@ impl HealTask {
         }
     }
 
+    async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
+        warn!(
+            "Skipping heal for {}/{} due to transient object existence check error: {}",
+            bucket, object, err
+        );
+
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_progress(0, 1, 0, 0);
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
     pub async fn execute(&self) -> Result<()> {
         // update status and timestamps atomically to avoid race conditions
@@ -414,7 +426,13 @@ impl HealTask {
         // Step 1: Check if object exists and get metadata
         warn!("Step 1: Checking object existence and metadata");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             if self.options.recreate_missing {
@@ -676,7 +694,13 @@ impl HealTask {
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {
@@ -836,7 +860,13 @@ impl HealTask {
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {

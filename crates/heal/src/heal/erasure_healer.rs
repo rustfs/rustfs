@@ -261,7 +261,7 @@ impl ErasureSetHealer {
 
     /// heal single bucket with resume
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, _skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
+    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
@@ -271,7 +271,7 @@ impl ErasureSetHealer {
         processed_objects: &mut u64,
         successful_objects: &mut u64,
         failed_objects: &mut u64,
-        _skipped_objects: &mut u64,
+        skipped_objects: &mut u64,
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
@@ -311,7 +311,7 @@ impl ErasureSetHealer {
                     continue;
                 }
 
-                if checkpoint.processed_objects.contains(&object) {
+                if checkpoint.processed_objects.contains(&object) || checkpoint.skipped_objects.contains(&object) {
                     continue;
                 }
 
@@ -345,6 +345,15 @@ impl ErasureSetHealer {
                     } else {
                         let object_exists = match storage.object_exists(&bucket_name, &object_name).await {
                             Ok(exists) => exists,
+                            Err(err @ Error::TransientSkip { .. }) => {
+                                let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+                                gauge!(
+                                    "rustfs_heal_page_concurrency_current",
+                                    "set" => set_label.clone()
+                                )
+                                .set(current as f64);
+                                return (object_name, Err(err));
+                            }
                             Err(err) => {
                                 let object_name_for_error = object_name.clone();
                                 let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -414,6 +423,14 @@ impl ErasureSetHealer {
                         )
                         .set(0.0);
                         return Err(Error::TaskCancelled);
+                    }
+                    Err(Error::TransientSkip { message }) => {
+                        *skipped_objects += 1;
+                        checkpoint_manager.add_skipped_object(object.clone()).await?;
+                        warn!(
+                            "Skipping heal for object {}/{} due to transient existence check error: {}",
+                            bucket, object, message
+                        );
                     }
                     Err(err) => {
                         *failed_objects += 1;
