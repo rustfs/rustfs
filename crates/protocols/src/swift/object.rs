@@ -381,7 +381,7 @@ where
     let hash_reader = HashReader::from_stream(buf_reader, content_length, content_length, None, None, false)
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
-    // 15. Hand the hash reader to the chunk-native PUT data wrapper
+    // 15. Wrap in PutObjReader as expected by storage layer
     let mut put_reader = PutObjReader::new(hash_reader);
 
     // 16. Upload object to storage
@@ -464,7 +464,7 @@ where
     let hash_reader = HashReader::from_stream(buf_reader, content_length, content_length, None, None, false)
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
-    // Hand the hash reader to the chunk-native PUT data wrapper
+    // Wrap in PutObjReader
     let mut put_reader = PutObjReader::new(hash_reader);
 
     // Upload object to storage
