@@ -14,7 +14,7 @@
 
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator,
+    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
     LifecycleRuleFilter, NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
     TransitionStorageClass,
 };
@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use time::macros::{datetime, offset};
+use time::macros::offset;
 use time::{self, Duration, OffsetDateTime};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -656,7 +656,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if now.unix_timestamp() > a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                     && now.unix_timestamp() > b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                     || a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                        == b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                    == b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                 {
                     match a.action {
                         IlmAction::DeleteAllVersionsAction
@@ -696,28 +696,28 @@ impl Lifecycle for BucketLifecycleConfiguration {
         if let Some(filter_rules) = self.filter_rules(obj).await {
             for rule in filter_rules.iter() {
                 if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
-                    if let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions {
+                    return if let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions {
                         if newer_noncurrent_versions == 0 {
                             continue;
                         }
-                        return Event {
+                        Event {
                             action: IlmAction::DeleteVersionAction,
                             rule_id: rule.id.clone().unwrap_or_default(),
                             noncurrent_days: noncurrent_version_expiration.noncurrent_days.unwrap_or(0) as u32,
                             newer_noncurrent_versions: newer_noncurrent_versions as usize,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
-                        };
+                        }
                     } else {
-                        return Event {
+                        Event {
                             action: IlmAction::DeleteVersionAction,
                             rule_id: rule.id.clone().unwrap_or_default(),
                             noncurrent_days: noncurrent_version_expiration.noncurrent_days.unwrap_or(0) as u32,
                             newer_noncurrent_versions: 0,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
-                        };
-                    }
+                        }
+                    };
                 }
             }
         }
@@ -935,6 +935,7 @@ mod tests {
     use s3s::dto::LifecycleRuleFilter;
     use serial_test::serial;
     use std::sync::Arc;
+    use time::macros::datetime;
 
     #[tokio::test]
     #[serial]
@@ -1027,7 +1028,7 @@ mod tests {
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
-                    date: Some(time::OffsetDateTime::from_unix_timestamp(20_000_101).unwrap().into()),
+                    date: Some(OffsetDateTime::from_unix_timestamp(20_000_101).unwrap().into()),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
@@ -1508,8 +1509,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn filter_rules_respects_filter_prefix() {
-        let mut filter = LifecycleRuleFilter::default();
-        filter.prefix = Some("prefix".to_string());
+        let filter = LifecycleRuleFilter {
+            prefix: Some("prefix".to_string()),
+            ..Default::default()
+        };
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1551,11 +1554,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn filter_rules_respects_filter_and_prefix() {
-        let mut filter = LifecycleRuleFilter::default();
-
-        let mut and = LifecycleRuleAndOperator::default();
-        and.prefix = Some("prefix".to_string());
-        filter.and = Some(and);
+        let and = s3s::dto::LifecycleRuleAndOperator {
+            prefix: Some("prefix".to_string()),
+            ..Default::default()
+        };
+        let filter = LifecycleRuleFilter {
+            and: Some(and),
+            ..Default::default()
+        };
 
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1652,20 +1658,22 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn filter_rules_respects_filter_and_tags() {
-        let mut filter = LifecycleRuleFilter::default();
-        filter.and = Some(LifecycleRuleAndOperator {
-            tags: Some(vec![
-                s3s::dto::Tag {
-                    key: Some("env".to_string()),
-                    value: Some("prod".to_string()),
-                },
-                s3s::dto::Tag {
-                    key: Some("team".to_string()),
-                    value: Some("storage".to_string()),
-                },
-            ]),
+        let filter = LifecycleRuleFilter {
+            and: Some(s3s::dto::LifecycleRuleAndOperator {
+                tags: Some(vec![
+                    s3s::dto::Tag {
+                        key: Some("env".to_string()),
+                        value: Some("prod".to_string()),
+                    },
+                    s3s::dto::Tag {
+                        key: Some("team".to_string()),
+                        value: Some("storage".to_string()),
+                    },
+                ]),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
