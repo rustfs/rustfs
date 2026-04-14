@@ -591,7 +591,12 @@ impl SetDisks {
             length as usize
         };
 
-        if offset > total_size || offset + length > total_size {
+        let Some(end_offset_exclusive) = offset.checked_add(length) else {
+            error!("get_object_with_fileinfo offset overflow: {}, length: {}", offset, length);
+            return Err(Error::other("offset out of range"));
+        };
+
+        if offset > total_size || end_offset_exclusive > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
@@ -681,7 +686,7 @@ impl SetDisks {
                     bucket,
                     &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
                     read_offset,
-                    till_offset,
+                    till_offset.saturating_sub(read_offset),
                     erasure.shard_size(),
                     checksum_algo.clone(),
                     skip_verify_bitrot,

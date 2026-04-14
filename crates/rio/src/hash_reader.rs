@@ -586,7 +586,11 @@ impl AsyncRead for HashReader {
 
                         let content_hash = hasher.finalize();
 
-                        if content_hash != expected_content_hash.raw {
+                        if expected_content_hash.encoded.is_empty() {
+                            expected_content_hash.raw = content_hash.clone();
+                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&content_hash);
+                            *this.content_hash = Some(expected_content_hash);
+                        } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
                             error!(

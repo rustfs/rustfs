@@ -29,11 +29,21 @@ pub const RUSTFS_MULTIPART_CHECKSUM: &str = "x-rustfs-multipart-checksum";
 /// RustFS multipart checksum type metadata key  
 pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-type";
 
+const AMZ_CHECKSUM_ALGORITHM: &str = "x-amz-checksum-algorithm";
+const AMZ_SDK_CHECKSUM_ALGORITHM: &str = "x-amz-sdk-checksum-algorithm";
+
 /// Checksum type enumeration with flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
 impl ChecksumType {
+    fn algorithm_from_headers(headers: &HeaderMap) -> Option<&str> {
+        headers
+            .get(AMZ_CHECKSUM_ALGORITHM)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| headers.get(AMZ_SDK_CHECKSUM_ALGORITHM).and_then(|v| v.to_str().ok()))
+    }
+
     /// Checksum will be sent in trailing header
     pub const TRAILING: ChecksumType = ChecksumType(1 << 0);
 
@@ -156,10 +166,7 @@ impl ChecksumType {
 
     pub fn from_header(headers: &HeaderMap) -> Self {
         Self::from_string_with_obj_type(
-            headers
-                .get("x-amz-checksum-algorithm")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or(""),
+            Self::algorithm_from_headers(headers).unwrap_or(""),
             headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()).unwrap_or(""),
         )
     }
@@ -573,7 +580,7 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
 fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
     let mut checksum_type = ChecksumType::NONE;
 
-    if let Some(alg) = headers.get("x-amz-checksum-algorithm").and_then(|v| v.to_str().ok()) {
+    if let Some(alg) = ChecksumType::algorithm_from_headers(headers) {
         checksum_type = ChecksumType::from_string_with_obj_type(
             alg,
             headers.get("x-amz-checksum-type").and_then(|s| s.to_str().ok()).unwrap_or(""),

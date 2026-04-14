@@ -1878,20 +1878,38 @@ impl DiskAPI for LocalDisk {
         {
             use memmap2::MmapOptions;
             let file_path_clone = file_path.clone();
-            let offset_u64 = offset as u64;
 
             let bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                // Create memory map for the specified region
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds.
-                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
+                // mmap offsets on Unix must be page-size aligned. Align the
+                // mapping down to the nearest page boundary, then slice out the
+                // originally requested logical range.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page_size <= 0 {
+                    return Err(DiskError::other("failed to determine system page size"));
+                }
+                let page_size = page_size as u64;
+                let offset_u64 = offset as u64;
+                let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                let logical_offset = (offset_u64 - aligned_offset) as usize;
+                let map_len = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
 
-                // Copy the mapped region into a Bytes buffer. This avoids undefined
-                // behavior from treating OS-managed mmap memory as allocator-managed
-                // Vec storage, at the cost of an extra copy.
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds. The
+                // file offset passed to mmap is page-size aligned as required on Unix.
+                let mmap =
+                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+
+                // Copy only the requested logical range into a Bytes buffer. This
+                // avoids undefined behavior from treating OS-managed mmap memory as
+                // allocator-managed Vec storage, at the cost of an extra copy.
+                let end = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap[logical_offset..end]))
             })
             .await
             .map_err(DiskError::from)??;
