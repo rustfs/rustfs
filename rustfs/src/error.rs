@@ -257,8 +257,24 @@ impl From<StorageError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        // Check if the error is a ChecksumMismatch (BadDigest)
+        // Check if the inner error is a StorageError (e.g. InvalidRangeSpec wrapped by object-io)
         if let Some(inner) = err.get_ref() {
+            if let Some(storage_error) = inner.downcast_ref::<StorageError>() {
+                let code = match storage_error {
+                    StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
+                    _ => S3ErrorCode::InternalError,
+                };
+                let message = if code == S3ErrorCode::InternalError {
+                    storage_error.to_string()
+                } else {
+                    ApiError::error_code_to_message(&code)
+                };
+                return ApiError {
+                    code,
+                    message,
+                    source: Some(Box::new(err)),
+                };
+            }
             if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
