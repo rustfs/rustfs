@@ -14,9 +14,8 @@
 
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
-    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleFilter, NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
-    TransitionStorageClass,
+    BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
+    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition, TransitionStorageClass,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -656,7 +655,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if now.unix_timestamp() > a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                     && now.unix_timestamp() > b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                     || a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                    == b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
+                        == b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
                 {
                     match a.action {
                         IlmAction::DeleteAllVersionsAction
