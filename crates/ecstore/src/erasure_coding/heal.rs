@@ -77,7 +77,7 @@ impl super::Erasure {
             let available_writers = writers.iter().filter(|w| w.is_some()).count();
             let write_quorum = available_writers.max(1); // At least 1 writer must succeed
             let mut writers = MultiWriter::new(writers, write_quorum);
-            writers.write(&shards).await?;
+            writers.write(shards).await?;
         }
 
         Ok(())

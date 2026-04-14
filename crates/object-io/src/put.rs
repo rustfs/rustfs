@@ -17,9 +17,7 @@ use futures_util::{Stream, StreamExt};
 use http::HeaderMap;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
 use rustfs_ecstore::store_api::ObjectOptions;
-use rustfs_rio::{
-    BlockReadable, BoxReadBlockFuture, Checksum, EtagResolvable, HashReader, HashReaderDetector, Reader, TryGetIndex, WarpReader,
-};
+use rustfs_rio::{Checksum, EtagResolvable, HashReader, HashReaderDetector, Reader, TryGetIndex, WarpReader};
 use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM;
 use rustfs_utils::http::headers::{
     AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
@@ -368,17 +366,6 @@ where
                 }
             }
         }
-    }
-}
-
-impl<S, B, E> BlockReadable for PutObjectReducedCopyReader<S, B>
-where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + Sync,
-    B: Buf + Unpin + Send + Sync,
-    E: std::fmt::Display + Send + Sync,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move { self.read_into_slice(buf).await })
     }
 }
 

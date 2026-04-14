@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::store::ECStore;
 use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
 use bytes::Bytes;
-use rustfs_rio::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
+use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{
@@ -54,11 +54,6 @@ impl<R: AsyncRead + Unpin + Send + Sync> TryGetIndex for IndexedDataMovementRead
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> BlockReadable for IndexedDataMovementReader<R> {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(rustfs_utils::read_full(self, buf))
-    }
-}
 pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     let bytes = index?;
     let mut decoded = Index::new();
