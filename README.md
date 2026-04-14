@@ -100,28 +100,28 @@ To get started with RustFS, follow these steps:
 curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 ```
 
-### 2\. Docker Quick Start (Option 2)
+### 2. Docker Quick Start (Option 2)
 
 The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run Docker with `-v` to mount a host directory, please ensure the host directory owner is set to `10001`, otherwise you will encounter permission denied errors.
 
 ```bash
- # Create data and logs directories
- mkdir -p data logs
+# Create data and logs directories
+mkdir -p data logs
 
- # Change the owner of these directories
- chown -R 10001:10001 data logs
+# Change the owner of these directories
+chown -R 10001:10001 data logs
 
- # Using latest version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# Using latest version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
+# Using specific version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
 
 ```bash
- podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
