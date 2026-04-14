@@ -449,7 +449,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         if let Some(restore_expires) = obj.restore_expires
-            && !restore_expires.unix_timestamp() == 0
+            && restore_expires.unix_timestamp() != 0
             && now.unix_timestamp() > restore_expires.unix_timestamp()
         {
             let mut action = IlmAction::DeleteRestoredAction;

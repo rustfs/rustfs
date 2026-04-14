@@ -1479,7 +1479,7 @@ impl RestoreRequestOps for RestoreRequest {
 
         // OutputLocation is only valid for SELECT requests
         if self.type_.is_none() && self.output_location.is_some() {
-            return Err(std::io::Error::other("OutputLocation required only for SELECT request type"));
+            return Err(std::io::Error::other("OutputLocation can only be specified with SELECT request type"));
         }
         if let Some(type_) = &self.type_
             && type_.as_str() == RestoreRequestType::SELECT

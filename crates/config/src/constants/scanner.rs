@@ -61,8 +61,9 @@ pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 /// | `fast`    | 1x     | 100ms     | 1 minute       |
 /// | `default` | 2x     | 1 second  | 1 minute       |
 /// | `slow`    | 10x    | 15 seconds| 1 minute       |
-/// | `slowest` | 100x   | 15 seconds| 30 minutes     ///
-/// The cycle interval can be overridden by `RUSTFS_SCANNER_CYCLE`. |
+/// | `slowest` | 100x   | 15 seconds| 30 minutes     |
+///
+/// The cycle interval can be overridden by `RUSTFS_SCANNER_CYCLE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScannerSpeed {
     Fastest,
