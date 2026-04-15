@@ -17,9 +17,9 @@ use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
-    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -60,6 +60,10 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
+const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -133,8 +137,8 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup {
-            // TODO: remove temporary data
+        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+            warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
         // Use optimized path resolution instead of absolutize_virtually
@@ -251,12 +255,15 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(Duration::from_secs(60 * 5));
+        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
                         error!("cleanup_deleted_objects error: {:?}", err);
+                    }
+                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone()).await {
+                        error!("cleanup_stale_tmp_objects error: {:?}", err);
                     }
                 }
                 _ = exit_rx.recv() => {
@@ -267,13 +274,83 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    fn meta_path(root: &Path, meta_path: &str) -> PathBuf {
         #[cfg(windows)]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        let meta_path = meta_path.replace('/', "\\");
         #[cfg(not(windows))]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+        let meta_path = meta_path.to_string();
 
-        let trash = root.join(trash_path);
+        root.join(meta_path)
+    }
+
+    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+        let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
+        let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
+
+        rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
+            }
+        });
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
+        Ok(())
+    }
+
+    async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, STALE_TMP_OBJECT_EXPIRY).await
+    }
+
+    async fn cleanup_stale_tmp_objects_with_expiry(root: PathBuf, expiry: Duration) -> Result<()> {
+        let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
+        let mut entries = match fs::read_dir(&tmp_path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let Some(age) = entry
+                .metadata()
+                .await?
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+            else {
+                continue;
+            };
+            if age <= expiry {
+                continue;
+            }
+
+            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+        let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
         let mut entries = match fs::read_dir(&trash).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -2719,6 +2796,46 @@ mod test {
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let leftover = tmp.join("leftover").join("data");
+        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
+        fs::write(&leftover, b"temporary").await.unwrap();
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+
+        assert!(!tmp.join("leftover").exists());
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let stale = tmp.join("stale").join("data");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&stale, b"temporary").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!tmp.join("stale").exists());
+        assert!(trash.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_some());
     }
 
     #[tokio::test]
