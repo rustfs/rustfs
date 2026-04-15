@@ -80,7 +80,7 @@ impl KmsManager {
                 return Ok(GenerateDataKeyResponse {
                     key_id: request.key_id.clone(),
                     plaintext_key: cached_key.plaintext.clone(),
-                    ciphertext_blob: cached_key.ciphertext.clone(),
+                    ciphertext_blob: cached_key.ciphertext,
                 });
             }
         }

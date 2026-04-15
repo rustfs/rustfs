@@ -448,7 +448,7 @@ mod tests {
             // Initialize
             let test_ak = "test_access_key".to_string();
             let test_sk = "test_secret_key_123456".to_string();
-            init_global_action_credentials(Some(test_ak.clone()), Some(test_sk.clone())).ok();
+            init_global_action_credentials(Some(test_ak), Some(test_sk)).ok();
         }
 
         // Verify the state after initialization

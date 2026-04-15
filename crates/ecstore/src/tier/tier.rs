@@ -508,7 +508,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         } else {
             ext.version.clone()
         },
-        name: if ext.name.is_empty() { name.clone() } else { ext.name.clone() },
+        name: if ext.name.is_empty() { name } else { ext.name.clone() },
         ..Default::default()
     };
 

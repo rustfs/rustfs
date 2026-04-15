@@ -969,7 +969,7 @@ impl FolderScanner {
                         ..Default::default()
                     })
                     .await
-                    .map_err(|e| ScannerError::Other(e.to_string()))?;
+                    .map_err(ScannerError::Other)?;
                 }
 
                 resolver.bucket = bucket.clone();
@@ -1399,7 +1399,7 @@ mod tests {
     #[serial]
     async fn test_should_skip_failed_respects_ttl() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1421,7 +1421,7 @@ mod tests {
     #[serial]
     async fn test_record_failed_ttl_zero_noop() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir);
 
         scanner.record_failed("path1");
         assert!(scanner.new_cache.info.failed_objects.is_empty());
@@ -1435,7 +1435,7 @@ mod tests {
     #[serial]
     async fn test_record_failed_prunes_to_max_entries() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1467,7 +1467,7 @@ mod tests {
     #[serial]
     async fn test_prune_failed_objects_cache_drops_expired() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1491,7 +1491,7 @@ mod tests {
     #[serial]
     async fn test_prune_failed_objects_max_zero_keeps_fresh() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner

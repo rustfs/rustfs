@@ -1021,7 +1021,7 @@ mod tests {
             "if-modified-since",
             HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
-        let info14 = info3.clone();
+        let info14 = info3;
         assert!(check_preconditions(&headers14, &info14).is_ok());
 
         // [15] If-Match with no ETag → PreconditionFailed

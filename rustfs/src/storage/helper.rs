@@ -60,7 +60,7 @@ where
 {
     match request_context {
         Some(ctx) => {
-            let request_id = ctx.request_id.clone();
+            let request_id = ctx.request_id;
             let span = info_span!("background-task", request_id = %request_id);
             spawn_background(Instrument::instrument(fut, span));
         }
@@ -136,7 +136,7 @@ impl OperationHelper {
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
-            name: object_key.clone(),
+            name: object_key,
             ..Default::default()
         };
 

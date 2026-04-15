@@ -346,7 +346,7 @@ pub fn path_to_bucket_object(s: &str) -> (String, String) {
 /// If the prefix does not contain a separator, or resolves to root/current dir, an empty string is returned.
 /// The result ensures a trailing slash if not empty.
 pub fn base_dir_from_prefix(prefix: &str) -> String {
-    let mut base_dir = dir(prefix).to_owned();
+    let mut base_dir = dir(prefix);
     if base_dir == "." || base_dir == "./" || base_dir == "/" {
         base_dir = "".to_owned();
     }

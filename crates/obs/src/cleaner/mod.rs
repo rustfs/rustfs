@@ -121,7 +121,7 @@ mod tests {
         create_log_file(&dir, "other.log", 1024)?; // not managed
 
         // Total managed = 3 072 bytes; limit = 2 048; keep_files = 2 → must delete 1.
-        let cleaner = make_cleaner(dir.clone(), 2, 2048);
+        let cleaner = make_cleaner(dir, 2, 2048);
         let (deleted, freed) = cleaner.cleanup()?;
 
         assert_eq!(deleted, 1, "should delete exactly one file");
@@ -138,7 +138,7 @@ mod tests {
             create_log_file(&dir, &format!("app.log.2024-01-0{i}"), 1024)?;
         }
 
-        let cleaner = make_cleaner(dir.clone(), 3, 0);
+        let cleaner = make_cleaner(dir, 3, 0);
         let (deleted, _) = cleaner.cleanup()?;
 
         // Updated expectation: keep_files acts as a limit (ceiling), so excess files are deleted.
@@ -213,7 +213,7 @@ mod tests {
         create_log_file(&dir, "2026-03-01-06-22.rustfs.log", 1024)?;
         create_log_file(&dir, "other.log", 1024)?; // not managed
 
-        let cleaner = LogCleaner::builder(dir.clone(), ".rustfs.log".to_string(), "current.log".to_string())
+        let cleaner = LogCleaner::builder(dir, ".rustfs.log".to_string(), "current.log".to_string())
             .match_mode(FileMatchMode::Suffix)
             .keep_files(1)
             .max_total_size_bytes(1024)
