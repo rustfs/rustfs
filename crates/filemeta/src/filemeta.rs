@@ -1493,7 +1493,7 @@ mod test {
         let sorted_order: Vec<_> = fm.versions.iter().map(|v| v.header.version_id).collect();
 
         // Sorting should remain stable for identical timestamps
-        assert_eq!(original_order.len(), sorted_order.len());
+        assert_eq!(original_order, sorted_order);
     }
 
     #[test]
