@@ -79,6 +79,7 @@ impl KeyName {
         KeyName::Jwt(JwtKeyName::JWTName),
         KeyName::Jwt(JwtKeyName::JWTUpn),
         KeyName::Jwt(JwtKeyName::JWTGroups),
+        KeyName::Jwt(JwtKeyName::JWTRoles),
         KeyName::Jwt(JwtKeyName::JWTGivenName),
         KeyName::Jwt(JwtKeyName::JWTFamilyName),
         KeyName::Jwt(JwtKeyName::JWTMiddleName),
@@ -230,6 +231,9 @@ pub enum JwtKeyName {
 
     #[strum(serialize = "jwt:groups")]
     JWTGroups,
+
+    #[strum(serialize = "jwt:roles")]
+    JWTRoles,
 
     #[strum(serialize = "jwt:given_name")]
     JWTGivenName,
@@ -402,5 +406,10 @@ mod tests {
         let except = format!("{{\"data\":\"{except}\"}}");
         let data = serde_json::to_string(&TestCase { data: value }).expect("marshal failed");
         assert_eq!(data, except);
+    }
+
+    #[test]
+    fn key_name_from_str_supports_jwt_roles() {
+        assert!(KeyName::try_from("jwt:roles").is_ok());
     }
 }
