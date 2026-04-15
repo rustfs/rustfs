@@ -14,7 +14,9 @@
 
 //! API types for KMS dynamic configuration
 
-use crate::config::{BackendConfig, CacheConfig, KmsBackend, KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig};
+use crate::config::{
+    BackendConfig, CacheConfig, KmsBackend, KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig,
+};
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
 use serde::{Deserialize, Serialize};
@@ -45,7 +47,7 @@ pub struct ConfigureLocalKmsRequest {
     pub cache_ttl_seconds: Option<u64>,
 }
 
-/// Request to configure KMS with Vault backend
+/// Request to configure KMS with Vault KV v2 + Transit backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureVaultKmsRequest {
     /// Vault server URL
@@ -76,14 +78,52 @@ pub struct ConfigureVaultKmsRequest {
     pub cache_ttl_seconds: Option<u64>,
 }
 
+/// Request to configure KMS with Vault Transit backend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureVaultTransitKmsRequest {
+    /// Vault server URL
+    pub address: String,
+    /// Authentication method
+    pub auth_method: VaultAuthMethod,
+    /// Vault namespace (Vault Enterprise, optional)
+    pub namespace: Option<String>,
+    /// Transit engine mount path
+    pub mount_path: Option<String>,
+    /// Skip TLS verification (insecure, for development only)
+    pub skip_tls_verify: Option<bool>,
+    /// Default master key ID for auto-encryption
+    pub default_key_id: Option<String>,
+    /// Operation timeout in seconds
+    pub timeout_seconds: Option<u64>,
+    /// Number of retry attempts
+    pub retry_attempts: Option<u32>,
+    /// Enable caching
+    pub enable_cache: Option<bool>,
+    /// Maximum number of keys to cache
+    pub max_cached_keys: Option<usize>,
+    /// Cache TTL in seconds
+    pub cache_ttl_seconds: Option<u64>,
+}
+
 /// Generic KMS configuration request
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "backend_type", rename_all = "lowercase")]
+#[serde(tag = "backend_type")]
 pub enum ConfigureKmsRequest {
     /// Configure with Local backend
+    #[serde(alias = "local", alias = "Local")]
     Local(ConfigureLocalKmsRequest),
-    /// Configure with Vault backend
-    Vault(ConfigureVaultKmsRequest),
+    /// Configure with Vault KV v2 + Transit backend
+    #[serde(
+        rename = "VaultKV2",
+        alias = "Vault",
+        alias = "vault",
+        alias = "vault-kv2",
+        alias = "vault_kv2"
+    )]
+    VaultKv2(ConfigureVaultKmsRequest),
+    /// Configure with Vault Transit backend
+    #[serde(rename = "VaultTransit", alias = "vault-transit", alias = "vault_transit")]
+    VaultTransit(ConfigureVaultTransitKmsRequest),
 }
 
 /// KMS configuration response
@@ -152,6 +192,10 @@ pub struct KmsConfigSummary {
     pub retry_attempts: u32,
     /// Whether caching is enabled
     pub enable_cache: bool,
+    /// Maximum number of cached keys
+    pub max_cached_keys: usize,
+    /// Cache TTL in seconds
+    pub cache_ttl_seconds: u64,
     /// Cache configuration summary
     pub cache_summary: Option<CacheSummary>,
     /// Backend-specific summary
@@ -171,7 +215,7 @@ pub struct CacheSummary {
 
 /// Backend-specific configuration summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "backend_type", rename_all = "lowercase")]
+#[serde(tag = "backend_type", rename_all = "kebab-case")]
 pub enum BackendSummary {
     /// Local backend summary
     Local {
@@ -182,12 +226,15 @@ pub enum BackendSummary {
         /// File permissions (octal)
         file_permissions: Option<u32>,
     },
-    /// Vault backend summary  
-    Vault {
+    /// Vault KV v2 + Transit backend summary
+    #[serde(alias = "vault")]
+    VaultKv2 {
         /// Vault server address
         address: String,
         /// Authentication method type
         auth_method_type: String,
+        /// Whether backend credentials are configured
+        has_stored_credentials: bool,
         /// Namespace (if configured)
         namespace: Option<String>,
         /// Transit engine mount path
@@ -196,6 +243,23 @@ pub enum BackendSummary {
         kv_mount: String,
         /// Key path prefix
         key_path_prefix: String,
+        /// Skip TLS verification
+        skip_tls_verify: bool,
+    },
+    /// Vault Transit backend summary
+    VaultTransit {
+        /// Vault server address
+        address: String,
+        /// Authentication method type
+        auth_method_type: String,
+        /// Whether backend credentials are configured
+        has_stored_credentials: bool,
+        /// Namespace (if configured)
+        namespace: Option<String>,
+        /// Transit engine mount path
+        mount_path: String,
+        /// Skip TLS verification
+        skip_tls_verify: bool,
     },
 }
 
@@ -217,16 +281,29 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 has_master_key: local_config.master_key.is_some(),
                 file_permissions: local_config.file_permissions,
             },
-            BackendConfig::Vault(vault_config) => BackendSummary::Vault {
+            BackendConfig::VaultKv2(vault_config) => BackendSummary::VaultKv2 {
                 address: vault_config.address.clone(),
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
                 },
+                has_stored_credentials: true,
                 namespace: vault_config.namespace.clone(),
                 mount_path: vault_config.mount_path.clone(),
                 kv_mount: vault_config.kv_mount.clone(),
                 key_path_prefix: vault_config.key_path_prefix.clone(),
+                skip_tls_verify: vault_config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+            },
+            BackendConfig::VaultTransit(vault_config) => BackendSummary::VaultTransit {
+                address: vault_config.address.clone(),
+                auth_method_type: match &vault_config.auth_method {
+                    VaultAuthMethod::Token { .. } => "token".to_string(),
+                    VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                },
+                has_stored_credentials: true,
+                namespace: vault_config.namespace.clone(),
+                mount_path: vault_config.mount_path.clone(),
+                skip_tls_verify: vault_config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
             },
         };
 
@@ -236,6 +313,8 @@ impl From<&KmsConfig> for KmsConfigSummary {
             timeout_seconds: config.timeout.as_secs(),
             retry_attempts: config.retry_attempts,
             enable_cache: config.enable_cache,
+            max_cached_keys: config.cache_config.max_keys,
+            cache_ttl_seconds: config.cache_config.ttl.as_secs(),
             cache_summary,
             backend_summary,
         }
@@ -269,9 +348,9 @@ impl ConfigureVaultKmsRequest {
     /// Convert to KmsConfig
     pub fn to_kms_config(&self) -> KmsConfig {
         KmsConfig {
-            backend: KmsBackend::Vault,
+            backend: KmsBackend::VaultKv2,
             default_key_id: self.default_key_id.clone(),
-            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
                 address: self.address.clone(),
                 auth_method: self.auth_method.clone(),
                 namespace: self.namespace.clone(),
@@ -301,12 +380,160 @@ impl ConfigureVaultKmsRequest {
     }
 }
 
+impl ConfigureVaultTransitKmsRequest {
+    /// Convert to KmsConfig
+    pub fn to_kms_config(&self) -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            default_key_id: self.default_key_id.clone(),
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: self.address.clone(),
+                auth_method: self.auth_method.clone(),
+                namespace: self.namespace.clone(),
+                mount_path: self.mount_path.clone().unwrap_or_else(|| "transit".to_string()),
+                tls: if self.skip_tls_verify.unwrap_or(false) {
+                    Some(TlsConfig {
+                        ca_cert_path: None,
+                        client_cert_path: None,
+                        client_key_path: None,
+                        skip_verify: true,
+                    })
+                } else {
+                    None
+                },
+            })),
+            timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
+            retry_attempts: self.retry_attempts.unwrap_or(3),
+            enable_cache: self.enable_cache.unwrap_or(true),
+            cache_config: CacheConfig {
+                max_keys: self.max_cached_keys.unwrap_or(1000),
+                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
+                enable_metrics: true,
+            },
+        }
+    }
+}
+
 impl ConfigureKmsRequest {
     /// Convert to KmsConfig
     pub fn to_kms_config(&self) -> KmsConfig {
         match self {
             ConfigureKmsRequest::Local(req) => req.to_kms_config(),
-            ConfigureKmsRequest::Vault(req) => req.to_kms_config(),
+            ConfigureKmsRequest::VaultKv2(req) => req.to_kms_config(),
+            ConfigureKmsRequest::VaultTransit(req) => req.to_kms_config(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_vault_kv2_configure_request_accepts_type_aliases() {
+        let bases = ["VaultKV2", "Vault", "vault", "vault-kv2", "vault_kv2"];
+        for backend_type in bases {
+            let raw = serde_json::json!({
+                "backend_type": backend_type,
+                "address": "http://127.0.0.1:8200",
+                "auth_method": {
+                    "Token": {
+                        "token": "dev-root-token"
+                    }
+                },
+                "mount_path": "transit",
+                "default_key_id": "rustfs-master-key"
+            });
+
+            let request: ConfigureKmsRequest = serde_json::from_value(raw).unwrap_or_else(|e| panic!("{backend_type}: {e}"));
+            let config = request.to_kms_config();
+            assert_eq!(config.backend, KmsBackend::VaultKv2, "backend_type={backend_type}");
+            let vault = config.vault_config().expect("vault-kv2 config");
+            assert_eq!(vault.mount_path, "transit");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_vault_transit_configure_request() {
+        let cases = ["VaultTransit", "vault-transit", "vault_transit"];
+        for raw_backend in cases {
+            let raw = serde_json::json!({
+                "backend_type": raw_backend,
+                "address": "http://127.0.0.1:8200",
+                "auth_method": {
+                    "Token": {
+                        "token": "dev-root-token"
+                    }
+                },
+                "mount_path": "transit",
+                "default_key_id": "rustfs-master-key"
+            });
+            let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("vault-transit request should deserialize");
+            let config = request.to_kms_config();
+            assert_eq!(config.backend, KmsBackend::VaultTransit);
+            let vault = config.vault_transit_config().expect("vault-transit config should be present");
+            assert_eq!(vault.mount_path, "transit");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_local_configure_request() {
+        let raw = serde_json::json!({
+            "backend_type": "local",
+            "key_dir": "./target/kms-key-dir"
+        });
+
+        let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("vault-transit request should deserialize");
+        let config = request.to_kms_config();
+
+        assert_eq!(config.backend, KmsBackend::Local);
+    }
+
+    #[test]
+    fn test_vault_transit_summary_reports_backend_details() {
+        let config = KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            default_key_id: Some("rustfs-master-key".to_string()),
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "http://127.0.0.1:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "dev-root-token".to_string(),
+                },
+                namespace: Some("tenant-a".to_string()),
+                mount_path: "transit".to_string(),
+                tls: None,
+            })),
+            timeout: Duration::from_secs(30),
+            retry_attempts: 3,
+            enable_cache: true,
+            cache_config: CacheConfig::default(),
+        };
+
+        let summary = KmsConfigSummary::from(&config);
+        assert_eq!(summary.backend_type, KmsBackend::VaultTransit);
+        assert_eq!(summary.timeout_seconds, 30);
+        assert_eq!(summary.retry_attempts, 3);
+        assert_eq!(summary.max_cached_keys, 1000);
+        assert_eq!(summary.cache_ttl_seconds, 3600);
+
+        match summary.backend_summary {
+            BackendSummary::VaultTransit {
+                address,
+                auth_method_type,
+                has_stored_credentials,
+                namespace,
+                mount_path,
+                skip_tls_verify,
+                ..
+            } => {
+                assert_eq!(address, "http://127.0.0.1:8200");
+                assert_eq!(auth_method_type, "token");
+                assert!(has_stored_credentials);
+                assert_eq!(namespace.as_deref(), Some("tenant-a"));
+                assert_eq!(mount_path, "transit");
+                assert!(!skip_tls_verify);
+            }
+            other => panic!("expected vault-transit summary, got {other:?}"),
         }
     }
 }

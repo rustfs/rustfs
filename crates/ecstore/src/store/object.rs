@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::*;
-
 fn select_data_movement_target_pool(
     existing_pool_idx: Result<usize>,
     src_pool_idx: usize,

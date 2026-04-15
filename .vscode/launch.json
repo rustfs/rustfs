@@ -197,18 +197,26 @@
                 // "__RUSTFS_SSE_SIMPLE_CMK": "2dfNXGHlsEflGVCxb+5DIdGEl1sIvtwX+QfmYasi5QM=",
 
                 // 2. kms local backend test key
-                "RUSTFS_KMS_ENABLE": "true",
-                "RUSTFS_KMS_BACKEND": "local",
-                "RUSTFS_KMS_KEY_DIR": "./target/kms-key-dir",
-                "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
-                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
+                // "RUSTFS_KMS_ENABLE": "true",
+                // "RUSTFS_KMS_BACKEND": "local",
+                // "RUSTFS_KMS_KEY_DIR": "./target/kms-key-dir",
+                // "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
+                // "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
 
                 // 3. kms vault backend test key
                 // "RUSTFS_KMS_ENABLE": "true",
-                // "RUSTFS_KMS_BACKEND": "vault",
+                // "RUSTFS_KMS_BACKEND": "vault-kv2",
                 // "RUSTFS_KMS_VAULT_ADDRESS": "http://127.0.0.1:8200",
                 // "RUSTFS_KMS_VAULT_TOKEN": "Dev Token",
                 // "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
+
+                // 4. kms vault transit backend test key
+                "RUSTFS_KMS_ENABLE": "true",
+                "RUSTFS_KMS_BACKEND": "vault-transit",
+                "RUSTFS_KMS_VAULT_ADDRESS": "http://127.0.0.1:8200",
+                "RUSTFS_KMS_VAULT_TOKEN": "Dev Token",
+                "RUSTFS_KMS_VAULT_MOUNT_PATH": "transit",
+                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
 
             },
             "sourceLanguages": [

@@ -12,4 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod user_agent;
+pub mod capacity_manager;
+pub mod scan;
+pub mod types;
+
+pub use scan::scan_used_capacity_disks;
+pub use types::{CapacityDiskRef, CapacityScanSummary};

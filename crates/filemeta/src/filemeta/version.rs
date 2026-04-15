@@ -54,6 +54,62 @@ fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn deserialize_legacy_uuid_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LegacyUuidBytesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for LegacyUuidBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("nil or binary UUID bytes")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut value = Vec::new();
+            while let Some(byte) = seq.next_element()? {
+                value.push(byte);
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(LegacyUuidBytesVisitor)
+}
+
 fn decode_msgp_time_payload(ext_type: i8, payload: &[u8]) -> Result<OffsetDateTime> {
     let (secs, nanos) = match (ext_type, payload.len()) {
         (MSGPACK_TIME_EXT_LEGACY, 12) => {
@@ -179,7 +235,9 @@ struct LegacyMetaV2Version {
 
 #[derive(Debug, Deserialize)]
 struct LegacyMetaV2Object {
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     version_id: Vec<u8>,
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     data_dir: Vec<u8>,
     erasure_algorithm: String,
     erasure_m: usize,
@@ -201,6 +259,7 @@ struct LegacyMetaV2Object {
 
 #[derive(Debug, Deserialize)]
 struct LegacyMetaV2DeleteMarker {
+    #[serde(default, deserialize_with = "deserialize_legacy_uuid_bytes")]
     version_id: Vec<u8>,
     mod_time: Option<OffsetDateTime>,
     meta_sys: HashMap<String, Vec<u8>>,
@@ -2738,6 +2797,57 @@ mod tests {
         write_version: u64,
     }
 
+    #[derive(Serialize)]
+    struct LegacyDeleteMarkerNilFixture {
+        version_id: Option<Vec<u8>>,
+        mod_time: Option<OffsetDateTime>,
+        meta_sys: HashMap<String, Vec<u8>>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyDeleteVersionNilFixture {
+        version_type: LegacyDeleteVersionTypeFixture,
+        object: Option<()>,
+        delete_marker: Option<LegacyDeleteMarkerNilFixture>,
+        write_version: u64,
+    }
+
+    #[derive(Serialize)]
+    enum LegacyObjectVersionTypeFixture {
+        #[serde(rename = "Object")]
+        Object,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyObjectFixture {
+        version_id: Option<Vec<u8>>,
+        data_dir: Option<Vec<u8>>,
+        erasure_algorithm: String,
+        erasure_m: usize,
+        erasure_n: usize,
+        erasure_block_size: usize,
+        erasure_index: usize,
+        erasure_dist: Vec<u8>,
+        bitrot_checksum_algo: String,
+        part_numbers: Vec<usize>,
+        part_etags: Vec<String>,
+        part_sizes: Vec<usize>,
+        part_actual_sizes: Vec<i64>,
+        part_indices: Vec<Vec<u8>>,
+        size: i64,
+        mod_time: Option<OffsetDateTime>,
+        meta_sys: HashMap<String, Vec<u8>>,
+        meta_user: HashMap<String, String>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyObjectVersionFixture {
+        version_type: LegacyObjectVersionTypeFixture,
+        object: Option<LegacyObjectFixture>,
+        delete_marker: Option<()>,
+        write_version: u64,
+    }
+
     fn sample_version_id() -> Uuid {
         Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()
     }
@@ -3026,5 +3136,77 @@ mod tests {
         .expect_err("invalid legacy delete-marker version ids should be rejected");
 
         assert!(err.to_string().contains("legacy version_id must be 16 bytes"));
+    }
+
+    #[test]
+    fn legacy_meta_v2_object_accepts_nil_uuid_fields() {
+        let payload = LegacyObjectVersionFixture {
+            version_type: LegacyObjectVersionTypeFixture::Object,
+            object: Some(LegacyObjectFixture {
+                version_id: None,
+                data_dir: None,
+                erasure_algorithm: "ReedSolomon".to_string(),
+                erasure_m: 2,
+                erasure_n: 4,
+                erasure_block_size: 1_048_576,
+                erasure_index: 1,
+                erasure_dist: vec![1, 2, 3, 4, 5, 6],
+                bitrot_checksum_algo: "HighwayHash".to_string(),
+                part_numbers: vec![1],
+                part_etags: vec!["etag-1".to_string()],
+                part_sizes: vec![11],
+                part_actual_sizes: vec![11],
+                part_indices: vec![Vec::new()],
+                size: 11,
+                mod_time: Some(sample_mod_time()),
+                meta_sys: HashMap::new(),
+                meta_user: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            }),
+            delete_marker: None,
+            write_version: 3,
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).unwrap();
+
+        let decoded = FileMetaVersion::try_from(encoded.as_slice()).unwrap();
+        let object = decoded.object.as_ref().expect("object should be decoded");
+
+        assert_eq!(decoded.version_type, VersionType::Object);
+        assert!(decoded.uses_legacy_checksum);
+        assert_eq!(object.version_id, None);
+        assert_eq!(object.data_dir, None);
+
+        let fi = decoded.into_fileinfo("bucket", "legacy-nil.txt", true);
+        assert_eq!(fi.version_id, None);
+        assert_eq!(fi.data_dir, None);
+        assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
+    }
+
+    #[test]
+    fn legacy_meta_v2_delete_marker_accepts_nil_version_id() {
+        let payload = LegacyDeleteVersionNilFixture {
+            version_type: LegacyDeleteVersionTypeFixture::DeleteMarker,
+            object: None,
+            delete_marker: Some(LegacyDeleteMarkerNilFixture {
+                version_id: None,
+                mod_time: Some(sample_mod_time()),
+                meta_sys: HashMap::from([("x-rustfs-test".to_string(), b"gone".to_vec())]),
+            }),
+            write_version: 11,
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).unwrap();
+
+        let decoded = FileMetaVersion::try_from(encoded.as_slice()).unwrap();
+        let delete_marker = decoded.delete_marker.as_ref().expect("delete marker should be decoded");
+
+        assert_eq!(decoded.version_type, VersionType::Delete);
+        assert!(decoded.uses_legacy_checksum);
+        assert_eq!(delete_marker.version_id, None);
+        assert_eq!(delete_marker.mod_time, Some(sample_mod_time()));
+
+        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true);
+        assert!(fi.deleted);
+        assert_eq!(fi.version_id, None);
+        assert_eq!(fi.mod_time, Some(sample_mod_time()));
+        assert_eq!(fi.metadata.get("x-rustfs-test").map(String::as_str), Some("gone"));
     }
 }

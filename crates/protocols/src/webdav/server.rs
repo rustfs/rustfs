@@ -24,6 +24,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -66,8 +67,10 @@ where
             if let Some(cert_dir) = &self.config.cert_dir {
                 debug!("Enabling WebDAV TLS with certificates from: {}", cert_dir);
 
-                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(cert_dir)
-                    .map_err(|e| WebDavInitError::Tls(format!("Failed to load certificates: {}", e)))?;
+                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(
+                    rustfs_utils::CertDirectoryLoadOptions::builder(cert_dir, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
+                )
+                .map_err(|e| WebDavInitError::Tls(format!("Failed to load certificates: {}", e)))?;
 
                 if cert_key_pairs.is_empty() {
                     return Err(WebDavInitError::InvalidConfig("No valid certificates found".into()));

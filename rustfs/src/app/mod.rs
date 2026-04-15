@@ -22,4 +22,6 @@ pub mod multipart_usecase;
 pub mod object_usecase;
 
 #[cfg(test)]
+mod capacity_dirty_scope_test;
+#[cfg(test)]
 mod lifecycle_transition_api_test;

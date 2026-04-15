@@ -16,8 +16,10 @@ use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::error::Error as IamError;
-use rustfs_iam::sys::SESSION_POLICY_NAME;
-use rustfs_iam::sys::get_claims_from_token_with_secret;
+use rustfs_iam::sys::{
+    SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
+};
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::http::ip::get_source_ip_raw;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -353,8 +355,12 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     };
 
     if !token.is_empty() {
-        let claims: HashMap<String, Value> =
-            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?;
+        let claims: HashMap<String, Value> = if cred.is_service_account() {
+            get_claims_from_token_with_secret_allow_missing_exp(token, secret)
+                .map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+        } else {
+            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+        };
         return Ok(claims);
     }
 
@@ -408,6 +414,19 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
     }
 
     token
+}
+
+pub(crate) fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_name: &str) -> Vec<String> {
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(Value::Array(values)) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
+        ClaimLookup::Found(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        ClaimLookup::Missing | ClaimLookup::Ambiguous | ClaimLookup::Found(_) => Vec::new(),
+    }
 }
 
 /// Get condition values for policy evaluation
@@ -606,16 +625,14 @@ pub fn get_condition_values_with_query(
             }
         }
 
-        if let Some(grps_val) = claims.get("groups")
-            && let Some(grps_is) = grps_val.as_array()
-        {
-            let grps = grps_is
-                .iter()
-                .filter_map(|g| g.as_str().map(|s| s.to_string()))
-                .collect::<Vec<String>>();
-            if !grps.is_empty() {
-                args.insert("groups".to_string(), grps);
-            }
+        let grps = extract_string_list_claim(claims, "groups");
+        if !grps.is_empty() {
+            args.insert("groups".to_string(), grps);
+        }
+
+        let roles = extract_string_list_claim(claims, "roles");
+        if !roles.is_empty() {
+            args.insert("roles".to_string(), roles);
         }
     }
 
@@ -1201,6 +1218,49 @@ mod tests {
 
         assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
         assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_array() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), json!(["role1", "role2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), Some(&vec!["role1".to_string(), "role2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_csv_and_case_insensitive() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), json!("role1, role2"));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), Some(&vec!["role1".to_string(), "role2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), json!(["role1"]));
+        claims.insert("ROLES".to_string(), json!(["role2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), None);
     }
 
     #[test]

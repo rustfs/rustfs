@@ -128,10 +128,8 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    if let Err(err) = api
-        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
-        .await
-    {
+    let mut put_data = PutObjReader::from_vec(data);
+    if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
         return Err(err);
     }

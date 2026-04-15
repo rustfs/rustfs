@@ -19,7 +19,9 @@
 
 use super::Opt;
 use crate::apply_external_env_compat;
-use rustfs_config::{ENV_RUSTFS_ROOT_PASSWORD, ENV_RUSTFS_ROOT_USER, RUSTFS_REGION};
+use rustfs_config::{
+    DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ROOT_PASSWORD, ENV_RUSTFS_ROOT_USER, RUSTFS_REGION,
+};
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 
 /// Helper function to resolve credentials from multiple sources with precedence:
@@ -97,6 +99,9 @@ pub struct Config {
     /// Vault token for vault backend
     pub kms_vault_token: Option<String>,
 
+    /// Vault mount path for vault or vault-transit backend
+    pub kms_vault_mount_path: Option<String>,
+
     /// Default KMS key ID for encryption
     pub kms_default_key_id: Option<String>,
 
@@ -108,6 +113,35 @@ pub struct Config {
 }
 
 impl Config {
+    /// Create a `Config` with sensible defaults for the given volumes and address.
+    ///
+    /// This is the programmatic alternative to [`Opt::parse_command`] which reads
+    /// from the CLI / environment. Useful for embedded / integration-test usage.
+    pub fn new(address: impl Into<String>, volumes: Vec<String>) -> Self {
+        Config {
+            volumes,
+            address: address.into(),
+            server_domains: Vec::new(),
+            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: DEFAULT_SECRET_KEY.to_string(),
+            console_enable: DEFAULT_CONSOLE_ENABLE,
+            console_address: DEFAULT_CONSOLE_ADDRESS.to_string(),
+            obs_endpoint: rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
+            tls_path: None,
+            license: None,
+            region: Some(RUSTFS_REGION.to_string()),
+            kms_enable: false,
+            kms_backend: "local".to_string(),
+            kms_key_dir: None,
+            kms_vault_address: None,
+            kms_vault_token: None,
+            kms_vault_mount_path: None,
+            kms_default_key_id: None,
+            buffer_profile_disable: false,
+            buffer_profile: "GeneralPurpose".to_string(),
+        }
+    }
+
     /// Create Config from Opt
     pub(super) fn from_opt(opt: Opt) -> std::io::Result<Self> {
         let Opt {
@@ -129,6 +163,7 @@ impl Config {
             kms_key_dir,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
@@ -157,6 +192,7 @@ impl Config {
             kms_key_dir,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
             buffer_profile_disable,
             buffer_profile,
@@ -197,6 +233,7 @@ impl std::fmt::Debug for Config {
             .field("kms_key_dir", &self.kms_key_dir)
             .field("kms_vault_address", &self.kms_vault_address)
             .field("kms_vault_token", &Masked(self.kms_vault_token.as_deref()))
+            .field("kms_vault_mount_path", &self.kms_vault_mount_path)
             .field("kms_default_key_id", &self.kms_default_key_id)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)

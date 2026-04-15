@@ -558,6 +558,8 @@ impl SetDisks {
                             }
                         }
 
+                        record_capacity_scope_if_needed(None, &out_dated_disks);
+
                         Ok((result, None))
                     }
                     Err(err) => Ok((result, Some(err))),

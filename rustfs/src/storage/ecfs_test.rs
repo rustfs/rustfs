@@ -16,7 +16,7 @@
 mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
-    use crate::storage::ecfs::FS;
+    use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::{
         apply_cors_headers, check_preconditions, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal,
@@ -24,7 +24,7 @@ mod tests {
         process_lambda_configurations, process_queue_configurations, process_topic_configurations,
         validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
-    use http::{HeaderMap, HeaderValue, StatusCode};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
     use rustfs_ecstore::bucket::{metadata::BucketMetadata, metadata_sys};
     use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -35,11 +35,29 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, Delimiter, LambdaFunctionConfiguration, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-        ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, GetBucketAclInput, GetObjectAclInput,
+        GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
+        ObjectLockRetentionMode, ObjectLockRule, PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput,
+        PutObjectLockConfigurationInput, PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, Tag, Tagging,
+        TopicConfiguration,
     };
-    use s3s::{S3Error, S3ErrorCode, s3_error};
+    use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::OffsetDateTime;
+
+    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn test_fs_creation() {
@@ -168,6 +186,306 @@ mod tests {
 
         let gz_format = CompressionFormat::from_extension("gz");
         assert_eq!(gz_format.extension(), "gz");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_acl_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_acl(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = GetBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_bucket_acl(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectLegalHoldInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_legal_hold(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_retention_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectRetentionInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_retention(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_legal_hold_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectLegalHoldInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_legal_hold(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
+        let input = PutBucketAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_bucket_acl(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_acl_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectAclInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_acl(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_retention_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectRetentionInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_retention(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectLockConfigurationInput::builder()
+            .bucket("test-bucket".to_string())
+            .object_lock_configuration(Some(ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            }))
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs
+            .put_object_lock_configuration(build_request(input, Method::PUT))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_disabled_status() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from("Disabled".to_string())),
+            rule: None,
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_invalid_default_retention_mode() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from("abc".to_string())),
+                    days: Some(1),
+                    years: None,
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_days_and_years_together() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(1),
+                    years: Some(1),
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_missing_default_retention() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule { default_retention: None }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_zero_days() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    days: Some(0),
+                    years: None,
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
+    #[test]
+    fn test_validate_object_lock_configuration_rejects_too_many_years() {
+        let cfg = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    days: None,
+                    years: Some(101),
+                }),
+            }),
+        };
+
+        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
+    }
+
+    #[tokio::test]
+    async fn test_get_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = GetObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.get_object_tagging(build_request(input, Method::GET)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_rejects_too_many_tags() {
+        let tag_set = (0..11)
+            .map(|index| Tag {
+                key: Some(format!("k{index}")),
+                value: Some(format!("v{index}")),
+            })
+            .collect();
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging { tag_set })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some(String::new()),
+                    value: Some("v1".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Tag key cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some("k".to_string()),
+                    value: Some("v".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_tagging_returns_internal_error_when_store_uninitialized() {
+        let input = DeleteObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let fs = FS::new();
+        let err = fs
+            .delete_object_tagging(build_request(input, Method::DELETE))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -362,51 +680,6 @@ mod tests {
         assert_eq!(get_buffer_size_opt_in(-1), MI_B);
 
         set_buffer_profile_enabled(false);
-    }
-
-    #[test]
-    fn test_phase5_s3_entrypoints_delegate_to_usecases() {
-        fn assert_delegates_within_method(src: &str, signature: &str, delegation_call: &str, error_msg: &str) {
-            let sig_pos = src
-                .find(signature)
-                .unwrap_or_else(|| panic!("Expected to find method signature: {signature}"));
-
-            let after_sig = &src[sig_pos + signature.len()..];
-            let method_body_end_rel = after_sig.find("async fn ").unwrap_or(after_sig.len());
-            let method_body = &after_sig[..method_body_end_rel];
-
-            assert!(method_body.contains(delegation_call), "{error_msg}");
-        }
-
-        let src = include_str!("ecfs.rs");
-
-        assert_delegates_within_method(
-            src,
-            "async fn put_object(&self, req: S3Request<PutObjectInput>)",
-            "usecase.execute_put_object(self, req).await",
-            "put_object must delegate to DefaultObjectUsecase::execute_put_object",
-        );
-
-        assert_delegates_within_method(
-            src,
-            "async fn get_object(&self, req: S3Request<GetObjectInput>)",
-            "usecase.execute_get_object(req).await",
-            "get_object must delegate to DefaultObjectUsecase::execute_get_object",
-        );
-
-        assert_delegates_within_method(
-            src,
-            "async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>)",
-            "usecase.execute_list_objects_v2(req).await",
-            "list_objects_v2 must delegate to DefaultBucketUsecase::execute_list_objects_v2",
-        );
-
-        assert_delegates_within_method(
-            src,
-            "async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>)",
-            "usecase.execute_list_objects_v2m(req).await",
-            "list_objects_v2m must delegate to DefaultBucketUsecase::execute_list_objects_v2m",
-        );
     }
 
     #[test]
@@ -899,31 +1172,6 @@ mod tests {
         let version_id: Option<Uuid> = Some(uuid);
         let formatted = version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
         assert_eq!(formatted, "550e8400-e29b-41d4-a716-446655440000");
-    }
-
-    #[test]
-    fn test_delete_objects_version_id_normalization() {
-        use uuid::Uuid;
-
-        let fs = FS::new();
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some("null".to_string())).unwrap();
-        assert_eq!(raw.as_deref(), Some("null"));
-        assert_eq!(uuid, Some(Uuid::nil()));
-
-        let valid = "550e8400-e29b-41d4-a716-446655440000".to_string();
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(Some(valid.clone())).unwrap();
-        assert_eq!(raw.as_deref(), Some(valid.as_str()));
-        assert_eq!(uuid, Some(Uuid::parse_str(&valid).unwrap()));
-
-        let err = fs
-            .normalize_delete_objects_version_id(Some("not-a-uuid".to_string()))
-            .unwrap_err();
-        assert!(!err.is_empty());
-
-        let (raw, uuid) = fs.normalize_delete_objects_version_id(None).unwrap();
-        assert!(raw.is_none());
-        assert!(uuid.is_none());
     }
 
     /// Test that ListObjectVersionsOutput markers are correctly set

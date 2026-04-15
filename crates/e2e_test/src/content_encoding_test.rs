@@ -138,4 +138,63 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Issue #2475 / Route A: when aws-chunked is combined with an effective object encoding,
+    /// only the effective encoding should roundtrip through GET/HEAD.
+    #[tokio::test]
+    #[serial]
+    async fn test_content_encoding_aws_chunked_with_effective_encoding_roundtrip() {
+        init_logging();
+        info!("aws-chunked,gzip should persist only gzip");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = env.create_s3_client();
+        let bucket = "content-encoding-aws-chunked-gzip-test";
+        let key = "streamed/object.txt";
+        let content = b"streaming upload body with effective gzip encoding";
+
+        client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type("text/plain")
+            .content_encoding("aws-chunked,gzip")
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .expect("PUT failed");
+
+        let get_resp = client.get_object().bucket(bucket).key(key).send().await.expect("GET failed");
+        assert_eq!(
+            get_resp.content_encoding(),
+            Some("gzip"),
+            "GET must return only the effective content encoding after aws-chunked is stripped"
+        );
+        let body = get_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), content, "Body content mismatch");
+
+        let head_resp = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("HEAD failed");
+        assert_eq!(
+            head_resp.content_encoding(),
+            Some("gzip"),
+            "HEAD must return only the effective content encoding after aws-chunked is stripped"
+        );
+
+        env.stop_server();
+    }
 }

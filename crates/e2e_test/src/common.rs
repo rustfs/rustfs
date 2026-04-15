@@ -622,6 +622,7 @@ pub struct RustFSTestClusterEnvironment {
     pub temp_dir: String,
     pub access_key: String,
     pub secret_key: String,
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -670,7 +671,17 @@ impl RustFSTestClusterEnvironment {
             temp_dir,
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
+            extra_env: Vec::new(),
         })
+    }
+
+    /// Add an extra environment variable applied to every cluster node process.
+    pub fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.extra_env.push((key.into(), value.into()));
     }
 
     /// Build the volumes argument string for RustFS binary (internal helper method).
@@ -703,15 +714,20 @@ impl RustFSTestClusterEnvironment {
         for (i, node) in self.nodes.iter_mut().enumerate() {
             info!("Starting cluster node {} on {}", i, node.address);
 
-            let process = Command::new(&binary_path)
+            let mut command = Command::new(&binary_path);
+            command
                 .env("RUSTFS_VOLUMES", &volumes_arg)
                 .env("RUSTFS_ADDRESS", &node.address)
                 .env("RUSTFS_ACCESS_KEY", &self.access_key)
                 .env("RUSTFS_SECRET_KEY", &self.secret_key)
                 .env("RUSTFS_CONSOLE_ENABLE", "false")
-                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
-                .current_dir(&node.data_dir)
-                .spawn()?;
+                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+
+            for (key, value) in &self.extra_env {
+                command.env(key, value);
+            }
+
+            let process = command.current_dir(&node.data_dir).spawn()?;
 
             node.process = Some(process);
         }

@@ -17,9 +17,9 @@ use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
-    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -60,6 +60,10 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
+const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -133,8 +137,8 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup {
-            // TODO: remove temporary data
+        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+            warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
         // Use optimized path resolution instead of absolutize_virtually
@@ -251,12 +255,15 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(Duration::from_secs(60 * 5));
+        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
                         error!("cleanup_deleted_objects error: {:?}", err);
+                    }
+                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone()).await {
+                        error!("cleanup_stale_tmp_objects error: {:?}", err);
                     }
                 }
                 _ = exit_rx.recv() => {
@@ -267,13 +274,83 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    fn meta_path(root: &Path, meta_path: &str) -> PathBuf {
         #[cfg(windows)]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        let meta_path = meta_path.replace('/', "\\");
         #[cfg(not(windows))]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+        let meta_path = meta_path.to_string();
 
-        let trash = root.join(trash_path);
+        root.join(meta_path)
+    }
+
+    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+        let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
+        let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
+
+        rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
+            }
+        });
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
+        Ok(())
+    }
+
+    async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, STALE_TMP_OBJECT_EXPIRY).await
+    }
+
+    async fn cleanup_stale_tmp_objects_with_expiry(root: PathBuf, expiry: Duration) -> Result<()> {
+        let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
+        let mut entries = match fs::read_dir(&tmp_path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let Some(age) = entry
+                .metadata()
+                .await?
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+            else {
+                continue;
+            };
+            if age <= expiry {
+                continue;
+            }
+
+            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+        let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
         let mut entries = match fs::read_dir(&trash).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -1061,6 +1138,16 @@ impl LocalDisk {
         }
 
         let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        // Explicit directory markers and real directories can resolve to the same logical path.
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
+            if let Some((last_dir_name, existing_skip_object)) = dir_stack.last_mut()
+                && *last_dir_name == dir_name
+            {
+                *existing_skip_object |= skip_object;
+            } else {
+                dir_stack.push((dir_name, skip_object));
+            }
+        };
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1129,7 +1216,7 @@ impl LocalDisk {
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        dir_stack.push((dir_name, true));
+                        schedule_dir(&mut dir_stack, dir_name, true);
                     }
                 }
                 Err(err) => {
@@ -1138,7 +1225,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push((meta.name, false));
+                            schedule_dir(&mut dir_stack, meta.name, false);
                         }
                     }
 
@@ -1868,20 +1955,38 @@ impl DiskAPI for LocalDisk {
         {
             use memmap2::MmapOptions;
             let file_path_clone = file_path.clone();
-            let offset_u64 = offset as u64;
 
             let bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                // Create memory map for the specified region
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds.
-                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
+                // mmap offsets on Unix must be page-size aligned. Align the
+                // mapping down to the nearest page boundary, then slice out the
+                // originally requested logical range.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page_size <= 0 {
+                    return Err(DiskError::other("failed to determine system page size"));
+                }
+                let page_size = page_size as u64;
+                let offset_u64 = offset as u64;
+                let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                let logical_offset = (offset_u64 - aligned_offset) as usize;
+                let map_len = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
 
-                // Copy the mapped region into a Bytes buffer. This avoids undefined
-                // behavior from treating OS-managed mmap memory as allocator-managed
-                // Vec storage, at the cost of an extra copy.
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds. The
+                // file offset passed to mmap is page-size aligned as required on Unix.
+                let mmap =
+                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+
+                // Copy only the requested logical range into a Bytes buffer. This
+                // avoids undefined behavior from treating OS-managed mmap memory as
+                // allocator-managed Vec storage, at the cost of an extra copy.
+                let end = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap[logical_offset..end]))
             })
             .await
             .map_err(DiskError::from)??;
@@ -2694,6 +2799,46 @@ mod test {
     }
 
     #[tokio::test]
+    async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let leftover = tmp.join("leftover").join("data");
+        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
+        fs::write(&leftover, b"temporary").await.unwrap();
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+
+        assert!(!tmp.join("leftover").exists());
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let stale = tmp.join("stale").join("data");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&stale, b"temporary").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!tmp.join("stale").exists());
+        assert!(trash.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -2741,6 +2886,60 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .unwrap();
+
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
+            .await
+            .unwrap();
+        fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "marker/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ pub const OIDC_CLAIM_PREFIX: &str = "claim_prefix";
 pub const OIDC_ROLE_POLICY: &str = "role_policy";
 pub const OIDC_DISPLAY_NAME: &str = "display_name";
 pub const OIDC_GROUPS_CLAIM: &str = "groups_claim";
+pub const OIDC_ROLES_CLAIM: &str = "roles_claim";
 pub const OIDC_EMAIL_CLAIM: &str = "email_claim";
 pub const OIDC_USERNAME_CLAIM: &str = "username_claim";
 
@@ -40,11 +41,12 @@ pub const ENV_IDENTITY_OPENID_CLAIM_PREFIX: &str = "RUSTFS_IDENTITY_OPENID_CLAIM
 pub const ENV_IDENTITY_OPENID_ROLE_POLICY: &str = "RUSTFS_IDENTITY_OPENID_ROLE_POLICY";
 pub const ENV_IDENTITY_OPENID_DISPLAY_NAME: &str = "RUSTFS_IDENTITY_OPENID_DISPLAY_NAME";
 pub const ENV_IDENTITY_OPENID_GROUPS_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM";
+pub const ENV_IDENTITY_OPENID_ROLES_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_ROLES_CLAIM";
 pub const ENV_IDENTITY_OPENID_EMAIL_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM";
 pub const ENV_IDENTITY_OPENID_USERNAME_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM";
 
 /// List of all environment variable keys for an OIDC provider.
-pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 14] = &[
+pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 15] = &[
     ENV_IDENTITY_OPENID_ENABLE,
     ENV_IDENTITY_OPENID_CONFIG_URL,
     ENV_IDENTITY_OPENID_CLIENT_ID,
@@ -57,6 +59,7 @@ pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 14] = &[
     ENV_IDENTITY_OPENID_ROLE_POLICY,
     ENV_IDENTITY_OPENID_DISPLAY_NAME,
     ENV_IDENTITY_OPENID_GROUPS_CLAIM,
+    ENV_IDENTITY_OPENID_ROLES_CLAIM,
     ENV_IDENTITY_OPENID_EMAIL_CLAIM,
     ENV_IDENTITY_OPENID_USERNAME_CLAIM,
 ];
@@ -75,6 +78,7 @@ pub const IDENTITY_OPENID_KEYS: &[&str] = &[
     OIDC_ROLE_POLICY,
     OIDC_DISPLAY_NAME,
     OIDC_GROUPS_CLAIM,
+    OIDC_ROLES_CLAIM,
     OIDC_EMAIL_CLAIM,
     OIDC_USERNAME_CLAIM,
     crate::COMMENT_KEY,
@@ -84,6 +88,8 @@ pub const IDENTITY_OPENID_KEYS: &[&str] = &[
 pub const OIDC_DEFAULT_SCOPES: &str = "openid,profile,email";
 pub const OIDC_DEFAULT_CLAIM_NAME: &str = "groups";
 pub const OIDC_DEFAULT_GROUPS_CLAIM: &str = "groups";
+/// Empty means do not merge a secondary claim into groups (legacy behavior). Set to e.g. `roles` to opt in.
+pub const OIDC_DEFAULT_ROLES_CLAIM: &str = "";
 pub const OIDC_DEFAULT_EMAIL_CLAIM: &str = "email";
 pub const OIDC_DEFAULT_USERNAME_CLAIM: &str = "preferred_username";
 

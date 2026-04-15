@@ -489,7 +489,7 @@ impl Erasure {
     ///
     /// # Errors
     /// Returns error if reading from reader fails or if callback returns error
-    pub async fn encode_stream_callback_async<F, Fut, E, R>(
+    pub(crate) async fn encode_stream_callback_async<F, Fut, E, R>(
         self: std::sync::Arc<Self>,
         reader: &mut R,
         mut on_block: F,
@@ -501,8 +501,8 @@ impl Erasure {
     {
         let block_size = self.block_size;
         let mut total = 0;
+        let mut buf = vec![0u8; block_size];
         loop {
-            let mut buf = vec![0u8; block_size];
             match rustfs_utils::read_full(&mut *reader, &mut buf).await {
                 Ok(n) if n > 0 => {
                     warn!("encode_stream_callback_async read n={}", n);
@@ -524,7 +524,6 @@ impl Erasure {
                     break;
                 }
             }
-            buf.clear();
         }
         Ok(total)
     }

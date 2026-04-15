@@ -14,20 +14,21 @@
 
 use std::collections::HashSet;
 use std::fs::FileType;
+use std::io::ErrorKind;
 use std::sync::{Arc, Once};
 use std::time::{Duration, SystemTime};
 
-use crate::ReplTargetSizeSummary;
-use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
+use crate::data_usage_define::{hash_path, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary};
 use crate::error::ScannerError;
 use crate::scanner_io::ScannerIODisk as _;
 use crate::sleeper::DynamicSleeper;
+use crate::ReplTargetSizeSummary;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
-    HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
-    send_heal_request_with_admission,
+    send_heal_request_with_admission, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
+    HEAL_DELETE_DANGLING,
 };
-use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
+use rustfs_common::metrics::{current_path_updater, IlmAction, Metric, Metrics, UpdateCurrentPathFn};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -35,10 +36,10 @@ use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_ops::apply_transition_rule,
     lifecycle::{Event, Lifecycle, ObjectOpts},
 };
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt as _, queue_replication_heal_internal};
+use rustfs_ecstore::bucket::replication::{queue_replication_heal_internal, ReplicationConfig, ReplicationConfigurationExt as _};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use rustfs_ecstore::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{Disk, DiskAPI as _, DiskInfoOptions};
 use rustfs_ecstore::error::StorageError;
@@ -47,7 +48,7 @@ use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_p
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use rustfs_utils::path::{path_join_buf, SLASH_SEPARATOR};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use tokio::select;
 use tokio::sync::mpsc;
@@ -180,7 +181,7 @@ fn record_high_priority_heal_escalation(
         "result" => result.result_label().to_string(),
         "reason" => result.reason_label().to_string()
     )
-    .increment(1);
+        .increment(1);
 }
 
 fn build_high_priority_heal_admission_error(
@@ -205,14 +206,14 @@ fn record_heal_candidate_admission(candidate_type: &'static str, priority: HealC
         "priority" => heal_priority_label(priority).to_string(),
         "result" => result.result_label().to_string()
     )
-    .increment(1);
+        .increment(1);
 
     if matches!(result, HealAdmissionResult::Merged) {
         counter!(
             "rustfs_heal_candidate_merge_total",
             "type" => candidate_type.to_string()
         )
-        .increment(1);
+            .increment(1);
     }
 
     if let HealAdmissionResult::Dropped(reason) = result {
@@ -221,7 +222,7 @@ fn record_heal_candidate_admission(candidate_type: &'static str, priority: HealC
             "type" => candidate_type.to_string(),
             "reason" => reason.as_str().to_string()
         )
-        .increment(1);
+            .increment(1);
     }
 }
 
@@ -242,7 +243,7 @@ async fn send_scanner_heal_request(
                 "priority" => heal_priority_label(priority).to_string(),
                 "result" => "channel_error".to_string()
             )
-            .increment(1);
+                .increment(1);
             Err(ScannerError::Other(err))
         }
     }
@@ -538,7 +539,7 @@ impl ScannerItem {
                 HealChannelPriority::Low,
             ),
         )
-        .await;
+            .await;
 
         match result {
             Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => {}
@@ -785,15 +786,29 @@ impl FolderScanner {
 
             debug!("scan_folder: dir_path: {:?}", dir_path);
 
-            let mut dir_reader = tokio::fs::read_dir(&dir_path)
-                .await
-                .map_err(|e| ScannerError::Other(e.to_string()))?;
+            let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
+                Ok(dir_reader) => dir_reader,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    warn!("scan_folder: directory disappeared before read {}: {}", dir_path, e);
+                    return Ok(());
+                }
+                Err(e) => return Err(ScannerError::Io(e)),
+            };
 
-            while let Some(entry) = dir_reader
-                .next_entry()
-                .await
-                .map_err(|e| ScannerError::Other(e.to_string()))?
-            {
+            loop {
+                let entry = match dir_reader.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        warn!("scan_folder: directory disappeared during iteration {}: {}", dir_path, e);
+                        break;
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                        warn!("scan_folder: path became non-directory during iteration {}: {}", dir_path, e);
+                        break;
+                    }
+                    Err(e) => return Err(ScannerError::Io(e)),
+                };
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
@@ -809,7 +824,42 @@ impl FolderScanner {
                     continue;
                 }
 
-                let entry_type = entry.file_type().await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                // Ignore entries that disappeared during traversal or hit symlink
+                // loops, but propagate other walk errors.
+                let mut entry_type = match entry.file_type().await {
+                    Ok(entry_type) => entry_type,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        warn!("scan_folder: entry disappeared before type lookup {}: {}", entry_name, e);
+                        continue;
+                    }
+                    Err(e) if e.kind() == ErrorKind::TooManyLinks => {
+                        warn!("scan_folder: entry hit symlink loop before type lookup {}: {}", entry_name, e);
+                        continue;
+                    }
+                    Err(e) => return Err(ScannerError::Io(e)),
+                };
+
+                if entry_type.is_symlink() {
+                    let metadata = match tokio::fs::metadata(&file_path).await {
+                        Ok(metadata) => metadata,
+                        Err(e) if e.kind() == ErrorKind::NotFound => {
+                            warn!("scan_folder: symlink target disappeared before metadata lookup {}: {}", file_path, e);
+                            continue;
+                        }
+                        Err(e) if e.kind() == ErrorKind::TooManyLinks => {
+                            warn!("scan_folder: symlink target hit loop before metadata lookup {}: {}", file_path, e);
+                            continue;
+                        }
+                        Err(e) => return Err(ScannerError::Io(e)),
+                    };
+
+                    if metadata.is_dir() {
+                        warn!("scan_folder: ignoring symlinked directory {}", file_path);
+                        continue;
+                    }
+
+                    entry_type = metadata.file_type();
+                }
 
                 // ok
 
@@ -993,7 +1043,10 @@ impl FolderScanner {
 
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                if let Err(e) = fut.await {
+                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                    continue;
+                }
                 tokio::task::yield_now().await;
 
                 if !into.compacted {
@@ -1042,7 +1095,10 @@ impl FolderScanner {
 
                 // Use Box::pin for recursive async call
                 let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                if let Err(e) = fut.await {
+                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                    continue;
+                }
                 tokio::task::yield_now().await;
 
                 if !into.compacted {
@@ -1089,7 +1145,7 @@ impl FolderScanner {
                         None,
                         build_bucket_heal_request(bucket.clone(), HealChannelPriority::High),
                     )
-                    .await?;
+                        .await?;
                 }
 
                 resolver.bucket = bucket.clone();
@@ -1148,7 +1204,7 @@ impl FolderScanner {
                             ..Default::default()
                         },
                     )
-                    .await
+                        .await
                     {
                         error!("scan_folder: failed to list path: {}/{}: {}", bucket_clone, prefix_clone, e);
                     }
@@ -1258,7 +1314,10 @@ impl FolderScanner {
 
                     // Use Box::pin for recursive async call
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
                     tokio::task::yield_now().await;
 
                     if !into.compacted {
@@ -1446,8 +1505,10 @@ mod tests {
     use crate::SCANNER_SLEEPER;
 
     use super::*;
-    use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
+    use rustfs_ecstore::disk::{endpoint::Endpoint, new_disk, DiskOption};
     use serial_test::serial;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::AtomicBool;
     use uuid::Uuid;
 
@@ -1465,8 +1526,8 @@ mod tests {
                 health_check: false,
             },
         )
-        .await
-        .expect("failed to create disk");
+            .await
+            .expect("failed to create disk");
 
         let update_current_path: UpdateCurrentPathFn = Arc::new(|_: &str| Box::pin(async {}));
 
@@ -1734,5 +1795,70 @@ mod tests {
 
         let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
         assert_eq!(size, 123);
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn test_scan_folder_skips_unreadable_child_directory() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        let good_dir = bucket_dir.join("good");
+        let bad_dir = bucket_dir.join("bad");
+
+        std::fs::create_dir_all(&good_dir).expect("failed to create good dir");
+        std::fs::create_dir_all(&bad_dir).expect("failed to create bad dir");
+        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o000)).expect("failed to remove bad dir permissions");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        let mut into = DataUsageEntry::default();
+        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+        std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to restore bad dir permissions");
+
+        assert!(result.is_ok(), "expected unreadable child directory to be skipped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg(unix)]
+    async fn test_scan_folder_ignores_symlinked_child_directory() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        let target_dir = bucket_dir.join("target");
+        let link_dir = bucket_dir.join("link");
+
+        std::fs::create_dir_all(&target_dir).expect("failed to create target dir");
+        symlink(&target_dir, &link_dir).expect("failed to create symlinked dir");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        let mut into = DataUsageEntry::default();
+        let result = scanner.scan_folder(CancellationToken::new(), folder, &mut into).await;
+
+        assert!(result.is_ok(), "expected symlinked child directory to be ignored");
+        assert_eq!(into.failed_objects, 0, "expected ignored symlink not to count as a failed object");
     }
 }

@@ -263,10 +263,8 @@ async fn migrate_one_if_missing<S: StorageAPI>(
         }
     };
 
-    if let Err(e) = store
-        .put_object(RUSTFS_META_BUCKET, path, &mut PutObjReader::from_vec(data), opts)
-        .await
-    {
+    let mut put_data = PutObjReader::from_vec(data);
+    if let Err(e) = store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, opts).await {
         warn!("write {label}: {e}");
     } else {
         info!("Migrated {label}");
@@ -343,10 +341,8 @@ pub async fn try_migrate_iam_config<S: StorageAPI>(store: Arc<S>) {
                     continue;
                 }
             };
-            if let Err(e) = store
-                .put_object(RUSTFS_META_BUCKET, path, &mut PutObjReader::from_vec(data), &opts)
-                .await
-            {
+            let mut put_data = PutObjReader::from_vec(data);
+            if let Err(e) = store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts).await {
                 warn!("write IAM config {path}: {e}");
             } else {
                 info!("Migrated IAM config: {path}");

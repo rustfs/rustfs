@@ -1046,9 +1046,8 @@ impl TierConfigMgr {
         opts: &ObjectOptions,
     ) -> std::result::Result<(), std::io::Error> {
         debug!("save tier config:{}", file);
-        let _ = api
-            .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data.to_vec()), opts)
-            .await?;
+        let mut put_data = PutObjReader::from_vec(data.to_vec());
+        let _ = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await?;
         Ok(())
     }
 
@@ -1104,11 +1103,12 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 Ok(data) => {
                     let cfg = TierConfigMgr::unmarshal(&data)?;
                     let normalized = encode_external_tiering_config_blob(&cfg)?;
+                    let mut put_data = PutObjReader::from_vec(normalized.to_vec());
                     let _ = api
                         .put_object(
                             RUSTFS_META_BUCKET,
                             &config_file,
-                            &mut PutObjReader::from_vec(normalized.to_vec()),
+                            &mut put_data,
                             &ObjectOptions {
                                 max_parity: true,
                                 ..Default::default()
@@ -1158,10 +1158,11 @@ async fn read_tier_config_from_bucket<S: StorageAPI>(
 }
 
 async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
+    let mut put_data = PutObjReader::from_vec(data.to_vec());
     api.put_object(
         RUSTFS_META_BUCKET,
         path,
-        &mut PutObjReader::from_vec(data.to_vec()),
+        &mut put_data,
         &ObjectOptions {
             max_parity: true,
             ..Default::default()

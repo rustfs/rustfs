@@ -30,8 +30,9 @@ EnvironmentFile=-/etc/default/rustfs
 ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
 # service log configuration
-StandardOutput=append:/data/deploy/rust/logs/rustfs.log
-StandardError=append:/data/deploy/rust/logs/rustfs-err.log
+LogsDirectory=rustfs
+StandardOutput=append:/var/log/rustfs/rustfs.log
+StandardError=append:/var/log/rustfs/rustfs-err.log
 
 # resource constraints
 LimitNOFILE=1048576
@@ -58,7 +59,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
-ReadWritePaths=/data/rustfs
+ReadWritePaths=/data/rustfs /var/log/rustfs
 
 [Install]
 WantedBy=multi-user.target
