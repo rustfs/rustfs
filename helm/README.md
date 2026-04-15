@@ -133,7 +133,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
-| storageclass.pvcAnnotations | map | `{}` | PVC customized annotations. |
+| storageclass.pvcAnnotations.data | map | `{}` | Data pvc customized annotations. |
+| storageclass.pvcAnnotations.logs | map | `{}` | Logs pvc customized annotations. |
 | tolerations | list | `[]` |  |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |

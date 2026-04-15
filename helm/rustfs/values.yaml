@@ -265,9 +265,11 @@ storageclass:
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
   pvcAnnotations: {}
-  # pvcAnnotations:
-    # - name: team
-    #   value: "RustFS"
+    #pvcAnnotations:
+    #  data:
+    #    key: value
+    #  logs:
+    #    key: value
 
 pdb:
   create: false
