@@ -373,8 +373,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_put_object(&fs, build_request(put_input, Method::PUT))
+    Box::pin(usecase.execute_put_object(&fs, build_request(put_input, Method::PUT)))
         .await
         .expect("Failed to put object through usecase");
 
@@ -410,8 +409,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_copy_object(build_request(copy_input, Method::PUT))
+    Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
         .await
         .expect("Failed to copy object through usecase");
 
@@ -468,8 +466,7 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_complete_multipart_upload(build_request(complete_input, Method::POST))
+    Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
         .await
         .expect("Failed to complete multipart upload through usecase");
 
@@ -526,8 +523,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
 
-    usecase
-        .execute_delete_object(req)
+    Box::pin(usecase.execute_delete_object(req))
         .await
         .expect("Failed to delete object through usecase");
 

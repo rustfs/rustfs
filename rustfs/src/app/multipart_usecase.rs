@@ -1258,7 +1258,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
     }
 
@@ -1285,7 +1287,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1312,7 +1316,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1362,7 +1368,9 @@ mod tests {
             let mut req = build_request(input, Method::POST);
             req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
 
-            let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+            let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
         }
     }
@@ -1471,7 +1479,7 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::PUT);
 
-        let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
