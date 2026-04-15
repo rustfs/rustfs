@@ -126,13 +126,7 @@ fn main() -> Result<(), AnyError> {
         Err(_) => "flatc".to_string(),
     };
 
-    match compile_flatbuffers_models(
-        &mut generated_mod_rs,
-        &flatc_path,
-        proto_dir.clone(),
-        flatbuffer_out_dir.clone(),
-        vec!["models"],
-    ) {
+    match compile_flatbuffers_models(&mut generated_mod_rs, &flatc_path, proto_dir, flatbuffer_out_dir, vec!["models"]) {
         Ok(_) => {
             println!("Successfully compiled flatbuffers models.");
         }

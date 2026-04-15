@@ -450,7 +450,7 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy.clone())).collect();
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy)).collect();
 
         let futures: Vec<_> = items.iter().map(|(_, policy)| policy.match_resource(bucket_name)).collect();
 
@@ -516,7 +516,7 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.clone())).collect();
+        let items: Vec<_> = m.into_iter().collect();
 
         let futures: Vec<_> = items
             .iter()
@@ -1876,7 +1876,7 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
 
 pub fn get_token_signing_key() -> Option<String> {
     if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key.clone())
+        Some(s.secret_key)
     } else {
         None
     }
@@ -2201,7 +2201,7 @@ mod tests {
             name: Some("service-account-name".to_string()),
             description: Some("Updated service account".to_string()),
             expiration: None,
-            session_policy: Some(policy.clone()),
+            session_policy: Some(policy),
         };
 
         assert_eq!(opts.secret_key, Some("new-secret-key".to_string()));

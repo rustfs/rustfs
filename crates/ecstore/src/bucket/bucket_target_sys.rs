@@ -593,7 +593,7 @@ impl BucketTargetSys {
         };
 
         if let Some(cli) = cli {
-            return Some(cli.clone());
+            return Some(cli);
         }
 
         // TODO: spawn a task to reload the target

@@ -645,7 +645,7 @@ mod tests {
             mime_patterns: vec!["text/*".to_string()],
             min_size: 0,
         };
-        let predicate = CompressionPredicate::new(config_disabled.clone());
+        let predicate = CompressionPredicate::new(config_disabled);
         assert!(!predicate.config.enabled);
 
         let config_enabled = CompressionConfig {
@@ -654,7 +654,7 @@ mod tests {
             mime_patterns: vec!["text/*".to_string(), "application/json".to_string()],
             min_size: 1000,
         };
-        let predicate = CompressionPredicate::new(config_enabled.clone());
+        let predicate = CompressionPredicate::new(config_enabled);
         assert!(predicate.config.enabled);
         assert_eq!(predicate.config.extensions.len(), 2);
         assert_eq!(predicate.config.mime_patterns.len(), 2);

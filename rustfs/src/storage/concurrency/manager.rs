@@ -119,7 +119,7 @@ impl ConcurrencyManager {
 
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
-        let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics.clone(), 1000));
+        let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics, 1000));
 
         // Build priority queue config
         let queue_config = IoPriorityQueueConfig {

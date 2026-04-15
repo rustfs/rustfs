@@ -224,7 +224,7 @@ pub async fn start_http_server(
         let secret_key = config.secret_key.clone();
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
-        b.set_access(store.clone());
+        b.set_access(store);
         b.set_route(admin::make_admin_route(config.console_enable)?);
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled

@@ -74,6 +74,7 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "warn"
 needless_collect = "warn"
+redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates

@@ -967,7 +967,7 @@ impl<T: Store> IamSys<T> {
             let (effective_groups, groups_source) = match args.groups.as_ref() {
                 Some(g) if !g.is_empty() => (args.groups.clone(), "args"),
                 _ => match self.store.get_user(parent_user).await {
-                    Some(u) => (u.credentials.groups.clone(), "parent_user_credentials"),
+                    Some(u) => (u.credentials.groups, "parent_user_credentials"),
                     None => {
                         tracing::warn!(
                             parent_user = %parent_user,

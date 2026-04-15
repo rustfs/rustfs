@@ -3684,7 +3684,7 @@ mod pools_tests {
     #[test]
     fn test_take_decommission_canceler_takes_and_clears_slot() {
         let token = CancellationToken::new();
-        let mut cancelers = vec![Some(token.clone())];
+        let mut cancelers = vec![Some(token)];
 
         let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
         assert!(taken.is_some());

@@ -724,10 +724,7 @@ mod tests {
         let path = PathBuf::from("/test/path");
         let io_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
 
-        let context_error = FileAccessDeniedWithContext {
-            path: path.clone(),
-            source: io_error,
-        };
+        let context_error = FileAccessDeniedWithContext { path, source: io_error };
 
         let display_str = format!("{context_error}");
         assert!(display_str.contains("/test/path"));
