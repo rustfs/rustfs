@@ -22,9 +22,9 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::oidc::{
     IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
-    OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_SCOPES,
+    OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_ROLES_CLAIM, OIDC_DEFAULT_SCOPES,
     OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_REDIRECT_URI,
-    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
+    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
@@ -132,6 +132,7 @@ struct OidcConfigView {
     claim_prefix: String,
     role_policy: String,
     groups_claim: String,
+    roles_claim: String,
     email_claim: String,
     username_claim: String,
 }
@@ -167,6 +168,7 @@ struct OidcConfigUpsertRequest {
     claim_prefix: String,
     role_policy: String,
     groups_claim: String,
+    roles_claim: String,
     email_claim: String,
     username_claim: String,
 }
@@ -186,6 +188,7 @@ impl Default for OidcConfigUpsertRequest {
             claim_prefix: String::new(),
             role_policy: String::new(),
             groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
         }
@@ -208,6 +211,7 @@ struct OidcConfigValidateRequest {
     claim_prefix: String,
     role_policy: String,
     groups_claim: String,
+    roles_claim: String,
     email_claim: String,
     username_claim: String,
 }
@@ -228,6 +232,7 @@ impl Default for OidcConfigValidateRequest {
             claim_prefix: String::new(),
             role_policy: String::new(),
             groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
         }
@@ -281,6 +286,7 @@ impl Operation for GetOidcConfigHandler {
                 claim_prefix: provider.config.claim_prefix.clone(),
                 role_policy: provider.config.role_policy.clone(),
                 groups_claim: provider.config.groups_claim.clone(),
+                roles_claim: provider.config.roles_claim.clone(),
                 email_claim: provider.config.email_claim.clone(),
                 username_claim: provider.config.username_claim.clone(),
             })
@@ -798,6 +804,11 @@ fn build_provider_config_from_upsert(
         } else {
             request.groups_claim.trim().to_string()
         },
+        roles_claim: if request.roles_claim.trim().is_empty() {
+            OIDC_DEFAULT_ROLES_CLAIM.to_string()
+        } else {
+            request.roles_claim.trim().to_string()
+        },
         email_claim: if request.email_claim.trim().is_empty() {
             OIDC_DEFAULT_EMAIL_CLAIM.to_string()
         } else {
@@ -843,6 +854,11 @@ fn build_provider_config_from_validate(
             OIDC_DEFAULT_GROUPS_CLAIM.to_string()
         } else {
             request.groups_claim.trim().to_string()
+        },
+        roles_claim: if request.roles_claim.trim().is_empty() {
+            OIDC_DEFAULT_ROLES_CLAIM.to_string()
+        } else {
+            request.roles_claim.trim().to_string()
         },
         email_claim: if request.email_claim.trim().is_empty() {
             OIDC_DEFAULT_EMAIL_CLAIM.to_string()
@@ -901,6 +917,7 @@ fn upsert_persisted_provider_config(config: &mut ServerConfig, provider_config: 
     set_kvs_value(&mut kvs, OIDC_ROLE_POLICY, provider_config.role_policy.clone());
     set_kvs_value(&mut kvs, OIDC_DISPLAY_NAME, provider_config.display_name.clone());
     set_kvs_value(&mut kvs, OIDC_GROUPS_CLAIM, provider_config.groups_claim.clone());
+    set_kvs_value(&mut kvs, OIDC_ROLES_CLAIM, provider_config.roles_claim.clone());
     set_kvs_value(&mut kvs, OIDC_EMAIL_CLAIM, provider_config.email_claim.clone());
     set_kvs_value(&mut kvs, OIDC_USERNAME_CLAIM, provider_config.username_claim.clone());
 
@@ -1126,6 +1143,20 @@ mod tests {
             build_provider_config_from_upsert("default", req, Some("existing-secret".to_string())).expect("config should build");
 
         assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
+        assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
+    }
+
+    #[test]
+    fn test_build_provider_config_uses_custom_roles_claim() {
+        let req = OidcConfigUpsertRequest {
+            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            client_id: "client-id".to_string(),
+            roles_claim: "app_roles".to_string(),
+            ..Default::default()
+        };
+
+        let config = build_provider_config_from_upsert("default", req, None).expect("config should build");
+        assert_eq!(config.roles_claim, "app_roles");
     }
 
     #[test]
@@ -1146,6 +1177,7 @@ mod tests {
             role_policy: String::new(),
             display_name: "default".to_string(),
             groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
         };
