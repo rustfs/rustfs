@@ -7730,7 +7730,6 @@ dependencies = [
  "rustfs-metrics",
  "rustfs-notify",
  "rustfs-object-capacity",
- "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
  "rustfs-protocols",
@@ -8074,8 +8073,6 @@ name = "rustfs-io-core"
 version = "0.0.5"
 dependencies = [
  "bytes",
- "futures-core",
- "futures-util",
  "memmap2 0.9.10",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
@@ -8262,29 +8259,6 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "rustfs-object-io"
-version = "0.0.5"
-dependencies = [
- "astral-tokio-tar",
- "atoi",
- "bytes",
- "futures-util",
- "http 1.4.0",
- "rustfs-ecstore",
- "rustfs-io-core",
- "rustfs-io-metrics",
- "rustfs-rio",
- "rustfs-s3select-api",
- "rustfs-utils",
- "s3s",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]

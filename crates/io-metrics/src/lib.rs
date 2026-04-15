@@ -121,128 +121,7 @@ pub use config::{
 
 // Re-exports for convenience
 pub use collector::MetricsCollector;
-pub use metric_names::data_plane;
 pub use performance::PerformanceMetrics;
-
-/// High-level request path selected for an I/O operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoPath {
-    Fast,
-    Legacy,
-}
-
-impl IoPath {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Fast => "fast",
-            Self::Legacy => "legacy",
-        }
-    }
-}
-
-/// Effective copy mode observed for an I/O operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyMode {
-    TrueZeroCopy,
-    SharedBytes,
-    SingleCopy,
-    Reconstructed,
-    Transformed,
-}
-
-impl CopyMode {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::TrueZeroCopy => "true_zero_copy",
-            Self::SharedBytes => "shared_bytes",
-            Self::SingleCopy => "single_copy",
-            Self::Reconstructed => "reconstructed",
-            Self::Transformed => "transformed",
-        }
-    }
-}
-
-/// Stage where a data plane decision or fallback happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoStage {
-    Unknown,
-    ReadSetup,
-    HttpBridge,
-    LocalDiskChunk,
-    RangeGuard,
-    PutTransform,
-}
-
-impl IoStage {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::ReadSetup => "read_setup",
-            Self::HttpBridge => "http_bridge",
-            Self::LocalDiskChunk => "local_disk_chunk",
-            Self::RangeGuard => "range_guard",
-            Self::PutTransform => "put_transform",
-        }
-    }
-}
-
-/// Reason why the data plane fell back from a preferred path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FallbackReason {
-    Unknown,
-    ProbeFailed,
-    MmapDisabled,
-    MmapUnavailable,
-    SmallObject,
-    WindowLimitExceeded,
-    UnalignedWindow,
-    RangeNotSupported,
-    EncryptionEnabled,
-    CompressionEnabled,
-    TransformEncryptionLegacy,
-    TransformCompressionLegacy,
-    TransformCompressionEncryptionLegacy,
-    ChunkBridgeUnavailable,
-    NonLocalBackend,
-}
-
-impl FallbackReason {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::ProbeFailed => "probe_failed",
-            Self::MmapDisabled => "mmap_disabled",
-            Self::MmapUnavailable => "mmap_unavailable",
-            Self::SmallObject => "small_object",
-            Self::WindowLimitExceeded => "window_limit_exceeded",
-            Self::UnalignedWindow => "unaligned_window",
-            Self::RangeNotSupported => "range_not_supported",
-            Self::EncryptionEnabled => "encryption_enabled",
-            Self::CompressionEnabled => "compression_enabled",
-            Self::TransformEncryptionLegacy => "transform_encryption_legacy",
-            Self::TransformCompressionLegacy => "transform_compression_legacy",
-            Self::TransformCompressionEncryptionLegacy => "transform_compression_encryption_legacy",
-            Self::ChunkBridgeUnavailable => "chunk_bridge_unavailable",
-            Self::NonLocalBackend => "non_local_backend",
-        }
-    }
-}
-
-#[inline(always)]
-fn put_size_bucket_label(size_bytes: i64) -> &'static str {
-    match size_bytes {
-        ..=0 => "unknown",
-        1..=16_384 => "le_16kib",
-        16_385..=65_536 => "le_64kib",
-        65_537..=262_144 => "le_256kib",
-        262_145..=1_048_576 => "le_1mib",
-        _ => "gt_1mib",
-    }
-}
 
 /// Record GetObject request start.
 #[inline(always)]
@@ -316,138 +195,40 @@ pub fn record_get_object_io_state(
     counter!("rustfs_io_strategy_selected_total", "level" => load_level.to_string()).increment(1);
 }
 
-/// Record which request path was selected for an operation.
+/// Record a zero-copy read operation.
+///
+/// # Arguments
+///
+/// * `size_bytes` - Size of the data read in bytes
+/// * `duration_ms` - Time taken for the read operation in milliseconds
 #[inline(always)]
-pub fn record_io_path_selected(operation: &'static str, io_path: IoPath) {
-    counter!(
-        metric_names::data_plane::PATH_SELECTED_TOTAL,
-        "path" => operation,
-        "mode" => io_path.as_str()
-    )
-    .increment(1);
+pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
+    counter!("rustfs.zero_copy.reads.total").increment(1);
+    histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
+    histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
 }
 
-/// Record the effective copy mode for an operation.
+/// Record memory copies avoided by using zero-copy.
+///
+/// # Arguments
+///
+/// * `bytes_saved` - Number of bytes that would have been copied without zero-copy
 #[inline(always)]
-pub fn record_io_copy_mode(operation: &'static str, copy_mode: CopyMode, size_bytes: usize) {
-    counter!(
-        metric_names::data_plane::COPY_MODE_BYTES_TOTAL,
-        "path" => operation,
-        "mode" => copy_mode.as_str()
-    )
-    .increment(size_bytes as u64);
+pub fn record_memory_copy_saved(bytes_saved: usize) {
+    counter!("rustfs.zero_copy.memory.saved.bytes").increment(bytes_saved as u64);
 }
 
-/// Record a data plane fallback decision.
+/// Record a fallback from zero-copy to regular read.
+///
+/// This happens when zero-copy read fails (e.g., mmap not available,
+/// file too large, etc.) and the system falls back to regular I/O.
+///
+/// # Arguments
+///
+/// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
 #[inline(always)]
-pub fn record_io_fallback(stage: IoStage, reason: FallbackReason) {
-    counter!(
-        metric_names::data_plane::FALLBACK_TOTAL,
-        "stage" => stage.as_str(),
-        "reason" => reason.as_str()
-    )
-    .increment(1);
-}
-
-/// Record the currently active mmap bytes held by LocalDisk chunk streams.
-#[inline(always)]
-pub fn record_local_disk_active_mmap_bytes(active_bytes: usize) {
-    gauge!(metric_names::data_plane::LOCAL_DISK_ACTIVE_MMAP_BYTES).set(active_bytes as f64);
-}
-
-/// Record pooled chunk usage in LocalDisk compatibility paths.
-#[inline(always)]
-pub fn record_local_disk_pooled_chunk(source: &'static str, size_bytes: usize) {
-    counter!(
-        metric_names::data_plane::LOCAL_DISK_POOLED_CHUNKS_TOTAL,
-        "source" => source
-    )
-    .increment(1);
-    counter!(
-        metric_names::data_plane::LOCAL_DISK_POOLED_BYTES_TOTAL,
-        "source" => source
-    )
-    .increment(size_bytes as u64);
-}
-
-/// Record a compatibility chunk-stream aggregation performed by `read_file_zero_copy()`.
-#[inline(always)]
-pub fn record_local_disk_compat_collect(chunk_count: usize, total_bytes: usize) {
-    counter!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_TOTAL).increment(1);
-    histogram!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_CHUNKS).record(chunk_count as f64);
-    histogram!(metric_names::data_plane::LOCAL_DISK_COMPAT_COLLECT_BYTES).record(total_bytes as f64);
-}
-
-/// Record an attempted PUT fast path.
-#[inline(always)]
-pub fn record_put_object_attempted_fast_path(size_bytes: i64) {
-    counter!(metric_names::data_plane::PUT_FAST_PATH_ATTEMPTS_TOTAL).increment(1);
-
-    if size_bytes > 0 {
-        histogram!(metric_names::data_plane::PUT_FAST_PATH_ATTEMPT_SIZE_BYTES).record(size_bytes as f64);
-    }
-}
-
-/// Record which transformed PUT pipeline was selected.
-#[inline(always)]
-pub fn record_put_transform_selected(kind: &'static str, io_path: IoPath, size_bytes: usize) {
-    counter!(
-        metric_names::data_plane::PUT_TRANSFORM_SELECTED_TOTAL,
-        "kind" => kind,
-        "mode" => io_path.as_str()
-    )
-    .increment(1);
-
-    histogram!(
-        metric_names::data_plane::PUT_TRANSFORM_SIZE_BYTES,
-        "kind" => kind,
-        "mode" => io_path.as_str()
-    )
-    .record(size_bytes as f64);
-}
-
-/// Record PUT path selection with size-bucket context.
-#[inline(always)]
-pub fn record_put_path_selected(size_bytes: i64, io_path: IoPath) {
-    counter!(
-        "rustfs.s3.put_object.path.selected.total",
-        "mode" => io_path.as_str(),
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .increment(1);
-}
-
-/// Record PUT copy mode with size-bucket context.
-#[inline(always)]
-pub fn record_put_copy_mode(size_bytes: i64, copy_mode: CopyMode) {
-    counter!(
-        "rustfs.s3.put_object.copy_mode.total",
-        "mode" => copy_mode.as_str(),
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .increment(1);
-}
-
-/// Record PUT fallback with size-bucket context.
-#[inline(always)]
-pub fn record_put_fallback(size_bytes: i64, reason: FallbackReason) {
-    counter!(
-        "rustfs.s3.put_object.fallback.total",
-        "reason" => reason.as_str(),
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .increment(1);
-}
-
-/// Record inline-object selection for PUT with size-bucket context.
-#[inline(always)]
-pub fn record_put_inline_selected(size_bytes: i64, versioned: bool) {
-    counter!(
-        "rustfs.s3.put_object.inline.selected.total",
-        "versioned" => if versioned { "true" } else { "false" },
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .increment(1);
+pub fn record_zero_copy_fallback(reason: &str) {
+    counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
 }
 
 // ============================================================================
@@ -505,6 +286,41 @@ pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
     gauge!("rustfs.bytes.pool.hit.rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
 }
 
+/// Record zero-copy write operation.
+///
+/// # Arguments
+///
+/// * `size_bytes` - Size of the data written in bytes
+/// * `duration_ms` - Time taken for the write operation in milliseconds
+#[inline(always)]
+pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
+    counter!("rustfs.zero_copy.write.total").increment(1);
+    histogram!("rustfs.zero_copy.write.size.bytes").record(size_bytes as f64);
+    histogram!("rustfs.zero_copy.write.duration.ms").record(duration_ms);
+}
+
+/// Record zero-copy write fallback.
+///
+/// This happens when zero-copy write fails and the system falls back to regular I/O.
+///
+/// # Arguments
+///
+/// * `reason` - Reason for the fallback
+#[inline(always)]
+pub fn record_zero_copy_write_fallback(reason: &str) {
+    counter!("rustfs.zero_copy.write.fallback.total", "reason" => reason.to_string()).increment(1);
+}
+
+/// Record bytes saved from zero-copy.
+///
+/// # Arguments
+///
+/// * `size_bytes` - Number of bytes saved from zero-copy
+#[inline(always)]
+pub fn record_bytes_saved(size_bytes: usize) {
+    counter!("rustfs.zero_copy.bytes.saved.total").increment(size_bytes as u64);
+}
+
 // ============================================================================
 // S3 Operation Metrics (GetObject, PutObject, etc.)
 // ============================================================================
@@ -534,33 +350,14 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
 ///
 /// * `duration_ms` - Operation duration in milliseconds
 /// * `size_bytes` - Object size in bytes
-/// * `zero_copy_enabled` - Legacy aggregate flag preserved for compatibility
-///
-/// Note: this function records aggregate S3 PUT metrics only. The definitive
-/// outcome of request-level fast-path attempts must be tracked separately via
-/// ADR 0001 data-plane helpers.
+/// * `zero_copy_enabled` - Whether zero-copy was enabled for this operation
 #[inline(always)]
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_enabled: bool) {
     counter!("rustfs.s3.put_object.total").increment(1);
     histogram!("rustfs.s3.put_object.duration.ms").record(duration_ms);
-    counter!(
-        "rustfs.s3.put_object.bucketed.total",
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .increment(1);
-    histogram!(
-        "rustfs.s3.put_object.bucketed.duration.ms",
-        "size_bucket" => put_size_bucket_label(size_bytes)
-    )
-    .record(duration_ms);
 
     if size_bytes > 0 {
         histogram!("rustfs.s3.put_object.size.bytes").record(size_bytes as f64);
-        histogram!(
-            "rustfs.s3.put_object.bucketed.size.bytes",
-            "size_bucket" => put_size_bucket_label(size_bytes)
-        )
-        .record(size_bytes as f64);
     }
 
     if zero_copy_enabled {
@@ -855,146 +652,15 @@ pub fn record_io_latency_p99(latency_ms: f64) {
     gauge!("rustfs.io.latency.p99.ms").set(latency_ms);
 }
 
-// ============================================================================
-// Zero-Copy I/O Metrics
-// ============================================================================
-
-/// Record a successful zero-copy read operation (e.g., mmap).
-///
-/// # Arguments
-///
-/// * `size_bytes` - Size of the data read in bytes
-/// * `duration_ms` - Time taken for the read operation in milliseconds
-#[inline(always)]
-pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
-    counter!("rustfs.zero_copy.reads.total").increment(1);
-    histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
-    histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
-}
-
-/// Record a fallback from zero-copy to regular read.
-///
-/// This happens when zero-copy read fails (e.g., mmap not available,
-/// file too large, etc.) and the system falls back to regular I/O.
-///
-/// # Arguments
-///
-/// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
-#[inline(always)]
-pub fn record_zero_copy_fallback(reason: &str) {
-    counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_io_path_as_str_values_stable() {
-        assert_eq!(IoPath::Fast.as_str(), "fast");
-        assert_eq!(IoPath::Legacy.as_str(), "legacy");
-    }
-
-    #[test]
-    fn test_copy_mode_as_str_values_stable() {
-        assert_eq!(CopyMode::TrueZeroCopy.as_str(), "true_zero_copy");
-        assert_eq!(CopyMode::SharedBytes.as_str(), "shared_bytes");
-        assert_eq!(CopyMode::SingleCopy.as_str(), "single_copy");
-        assert_eq!(CopyMode::Reconstructed.as_str(), "reconstructed");
-        assert_eq!(CopyMode::Transformed.as_str(), "transformed");
-    }
-
-    #[test]
-    fn test_fallback_reason_as_str_values_stable() {
-        assert_eq!(FallbackReason::Unknown.as_str(), "unknown");
-        assert_eq!(FallbackReason::ProbeFailed.as_str(), "probe_failed");
-        assert_eq!(FallbackReason::MmapDisabled.as_str(), "mmap_disabled");
-        assert_eq!(FallbackReason::MmapUnavailable.as_str(), "mmap_unavailable");
-        assert_eq!(FallbackReason::SmallObject.as_str(), "small_object");
-        assert_eq!(FallbackReason::WindowLimitExceeded.as_str(), "window_limit_exceeded");
-        assert_eq!(FallbackReason::UnalignedWindow.as_str(), "unaligned_window");
-        assert_eq!(FallbackReason::RangeNotSupported.as_str(), "range_not_supported");
-        assert_eq!(FallbackReason::EncryptionEnabled.as_str(), "encryption_enabled");
-        assert_eq!(FallbackReason::CompressionEnabled.as_str(), "compression_enabled");
-        assert_eq!(FallbackReason::TransformEncryptionLegacy.as_str(), "transform_encryption_legacy");
-        assert_eq!(FallbackReason::TransformCompressionLegacy.as_str(), "transform_compression_legacy");
-        assert_eq!(
-            FallbackReason::TransformCompressionEncryptionLegacy.as_str(),
-            "transform_compression_encryption_legacy"
-        );
-        assert_eq!(FallbackReason::ChunkBridgeUnavailable.as_str(), "chunk_bridge_unavailable");
-        assert_eq!(FallbackReason::NonLocalBackend.as_str(), "non_local_backend");
-    }
-
-    #[test]
-    fn test_record_io_path_selected() {
-        record_io_path_selected("get", IoPath::Fast);
-        record_io_path_selected("put", IoPath::Legacy);
-    }
-
-    #[test]
-    fn test_record_io_copy_mode() {
-        record_io_copy_mode("get", CopyMode::SharedBytes, 1024);
-        record_io_copy_mode("put", CopyMode::Transformed, 2048);
-    }
-
-    #[test]
-    fn test_record_io_fallback() {
-        record_io_fallback(IoStage::ReadSetup, FallbackReason::MmapUnavailable);
-        record_io_fallback(IoStage::HttpBridge, FallbackReason::ChunkBridgeUnavailable);
-    }
-
-    #[test]
-    fn test_record_local_disk_active_mmap_bytes() {
-        record_local_disk_active_mmap_bytes(4096);
-        record_local_disk_active_mmap_bytes(0);
-    }
-
-    #[test]
-    fn test_record_local_disk_pooled_chunk() {
-        record_local_disk_pooled_chunk("fallback", 4096);
-        record_local_disk_pooled_chunk("compat_collect", 8192);
-    }
-
-    #[test]
-    fn test_record_local_disk_compat_collect() {
-        record_local_disk_compat_collect(3, 16384);
-    }
-
-    #[test]
-    fn test_record_put_object_attempted_fast_path() {
-        record_put_object_attempted_fast_path(1024 * 1024);
-        record_put_object_attempted_fast_path(0);
-    }
-
-    #[test]
-    fn test_record_put_transform_selected() {
-        record_put_transform_selected("compression", IoPath::Fast, 2048);
-        record_put_transform_selected("compression_encryption", IoPath::Legacy, 4096);
-    }
-
-    #[test]
-    fn test_record_put_path_selected() {
-        record_put_path_selected(8 * 1024, IoPath::Fast);
-        record_put_path_selected(2 * 1024 * 1024, IoPath::Legacy);
-    }
-
-    #[test]
-    fn test_record_put_copy_mode() {
-        record_put_copy_mode(8 * 1024, CopyMode::SingleCopy);
-        record_put_copy_mode(512 * 1024, CopyMode::Transformed);
-    }
-
-    #[test]
-    fn test_record_put_fallback() {
-        record_put_fallback(32 * 1024, FallbackReason::CompressionEnabled);
-        record_put_fallback(2 * 1024 * 1024, FallbackReason::EncryptionEnabled);
-    }
-
-    #[test]
-    fn test_record_put_inline_selected() {
-        record_put_inline_selected(8 * 1024, false);
-        record_put_inline_selected(32 * 1024, true);
+    fn test_record_zero_copy_read() {
+        record_zero_copy_read(1024, 10.5);
+        record_memory_copy_saved(1024);
+        record_zero_copy_fallback("test");
     }
 
     #[test]
@@ -1003,6 +669,13 @@ mod tests {
         record_bytes_pool_return("small");
         record_bytes_pool_allocated("small", 4096);
         record_bytes_pool_hit_rate("small", 0.85);
+    }
+
+    #[test]
+    fn test_record_zero_copy_write() {
+        record_zero_copy_write(1024, 10.5);
+        record_zero_copy_write_fallback("test");
+        record_bytes_saved(1024);
     }
 
     // S3 Operation Metrics Tests
@@ -1109,6 +782,157 @@ mod tests {
     }
 }
 
+// ============================================================================
+// Zero-Copy Optimization Metrics (Phase 1 Extension)
+// ============================================================================
+
 pub mod bandwidth;
 pub mod global_metrics;
 pub mod metric_names;
+
+pub use metric_names::zero_copy;
+
+/// Record a zero-copy buffer operation.
+///
+/// This function records metrics for zero-copy buffer operations,
+/// including the operation type and size.
+#[inline(always)]
+pub fn record_zero_copy_buffer_operation(operation: &str, size: usize) {
+    counter!(
+        zero_copy::BUFFER_OPERATIONS_TOTAL,
+        "operation" => operation.to_string()
+    )
+    .increment(1);
+
+    counter!(
+        zero_copy::BUFFER_BYTES_TOTAL,
+        "operation" => operation.to_string()
+    )
+    .increment(size as u64);
+}
+
+/// Record memory copy operations.
+///
+/// This function tracks the number and size of memory copies,
+/// which should be minimized in zero-copy paths.
+#[inline(always)]
+pub fn record_memory_copy(count: u32, size: usize) {
+    counter!(zero_copy::MEMORY_COPY_TOTAL).increment(count as u64);
+
+    counter!(zero_copy::MEMORY_COPY_BYTES_TOTAL).increment(size as u64);
+
+    histogram!("rustfs_memory_copy_size_bytes").record(size as f64);
+}
+
+/// Record a shared reference operation.
+///
+/// This function tracks operations that create or use shared references
+/// for zero-copy data sharing.
+#[inline(always)]
+pub fn record_shared_ref_operation(operation: &str) {
+    counter!(
+        zero_copy::SHARED_REF_OPERATIONS_TOTAL,
+        "operation" => operation.to_string()
+    )
+    .increment(1);
+}
+
+/// Record BufReader optimization.
+///
+/// This function tracks BufReader layer elimination and buffer size
+/// adjustments.
+#[inline(always)]
+pub fn record_bufreader_optimization(layers_eliminated: u32, buffer_size: usize) {
+    counter!(zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL).increment(layers_eliminated as u64);
+
+    histogram!(zero_copy::BUFREADER_BUFFER_SIZE_BYTES).record(buffer_size as f64);
+}
+
+/// Record Direct I/O operation.
+///
+/// This function tracks Direct I/O operations and their success/fallback
+/// status.
+#[inline(always)]
+pub fn record_direct_io_operation(operation: &str, size: usize, success: bool) {
+    let status = if success { "success" } else { "fallback" };
+
+    counter!(
+        zero_copy::DIRECT_IO_OPERATIONS_TOTAL,
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    counter!(
+        zero_copy::DIRECT_IO_BYTES_TOTAL,
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(size as u64);
+}
+
+/// Update zero-copy performance metrics.
+///
+/// This function updates gauge metrics for overall zero-copy performance.
+#[inline(always)]
+pub fn update_zero_copy_performance_metrics(copy_count: u32, throughput_mbps: f64, memory_saved: u64) {
+    gauge!(zero_copy::AVG_COPY_COUNT).set(copy_count as f64);
+
+    gauge!(zero_copy::THROUGHPUT_MBPS).set(throughput_mbps);
+
+    gauge!(zero_copy::MEMORY_SAVED_BYTES).set(memory_saved as f64);
+}
+
+// ============================================================================
+// Zero-Copy Metrics Tests
+// ============================================================================
+
+#[cfg(test)]
+mod zero_copy_tests {
+    use super::*;
+
+    #[test]
+    fn test_record_zero_copy_buffer_operation() {
+        // This test verifies the function compiles and runs
+        // Actual metric verification requires a metrics recorder
+        record_zero_copy_buffer_operation("read", 1024);
+        record_zero_copy_buffer_operation("write", 2048);
+    }
+
+    #[test]
+    fn test_record_memory_copy() {
+        record_memory_copy(1, 1024);
+        record_memory_copy(2, 2048);
+    }
+
+    #[test]
+    fn test_record_shared_ref_operation() {
+        record_shared_ref_operation("create");
+        record_shared_ref_operation("share");
+    }
+
+    #[test]
+    fn test_record_bufreader_optimization() {
+        record_bufreader_optimization(1, 8192);
+        record_bufreader_optimization(2, 65536);
+    }
+
+    #[test]
+    fn test_record_direct_io_operation() {
+        record_direct_io_operation("read", 4096, true);
+        record_direct_io_operation("write", 8192, false);
+    }
+
+    #[test]
+    fn test_update_zero_copy_performance_metrics() {
+        update_zero_copy_performance_metrics(2, 150.5, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_metric_names() {
+        // Verify metric names are defined
+        assert!(!zero_copy::BUFFER_OPERATIONS_TOTAL.is_empty());
+        assert!(!zero_copy::MEMORY_COPY_TOTAL.is_empty());
+        assert!(!zero_copy::THROUGHPUT_MBPS.is_empty());
+    }
+}

@@ -46,10 +46,8 @@
 //! let mut buffer = pool.acquire_buffer(8192).await;
 //! ```
 
-pub mod adapter;
 pub mod backpressure;
 pub mod bufreader_optimizer;
-pub mod chunk;
 pub mod config;
 pub mod deadlock_detector;
 pub mod direct_io;
@@ -70,9 +68,7 @@ pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
 pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
 
 // BufReader optimizer exports
-pub use adapter::ChunkStreamReader;
 pub use bufreader_optimizer::{BufReaderConfig, BufReaderOptimizer, BufReaderStats, BufferedSource};
-pub use chunk::{BoxChunkStream, ChunkSource, IoChunk, MappedChunk, PooledChunk};
 
 // Shared memory exports
 pub use shared_memory::{ArcData, ArcMetadata, SharedMemoryConfig, SharedMemoryPool, SharedMemoryStats};
