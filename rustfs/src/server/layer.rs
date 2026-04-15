@@ -454,8 +454,11 @@ impl ConditionalCorsLayer {
         let allowed_origin = match (origin, &self.cors_origins) {
             (Some(orig), Some(config)) if config == "*" => Some(orig),
             (Some(orig), Some(config)) => {
-                let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
-                if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+                if config.split(',').map(|s| s.trim()).any(|x| x == orig.as_str()) {
+                    Some(orig)
+                } else {
+                    None
+                }
             }
             (Some(orig), None) => Some(orig), // Default: allow all if not configured
             _ => None,

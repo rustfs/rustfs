@@ -293,8 +293,7 @@ where
 
         if !self.args.auth_token.is_empty() {
             // Split auth_token string to check if the authentication type is included
-            let tokens: Vec<&str> = self.args.auth_token.split_whitespace().collect();
-            match tokens.len() {
+            match self.args.auth_token.split_whitespace().count() {
                 2 => {
                     // Already include authentication type and token, such as "Bearer token123"
                     req_builder = req_builder.header("Authorization", &self.args.auth_token);
