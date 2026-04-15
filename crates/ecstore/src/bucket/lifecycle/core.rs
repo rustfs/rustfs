@@ -36,7 +36,8 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
     "The XML you provided was not well-formed or did not validate against our published schema";
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str = "ExpiredObjectDeleteMarker is not allowed on a bucket with Object Lock enabled";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
-const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must be greater than 0";
+const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must not be negative";
+const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str = "Lifecycle noncurrent expiration days must not be negative";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT: &str = "Expiration.Date must be at midnight UTC";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
@@ -134,7 +135,7 @@ impl RuleValidate for LifecycleRule {
             .noncurrent_version_expiration
             .as_ref()
             .and_then(|e| e.noncurrent_days)
-            .is_some_and(|d| d != 0);
+            .is_some();
         let has_noncurrent_transition = self
             .noncurrent_version_transitions
             .as_ref()
@@ -231,7 +232,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
             if let Some(rule_noncurrent_version_expiration) = &rule.noncurrent_version_expiration {
                 if let Some(noncurrent_days) = rule_noncurrent_version_expiration.noncurrent_days
-                    && noncurrent_days > 0
+                    && noncurrent_days >= 0
                 {
                     return true;
                 }
@@ -251,6 +252,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     return true;
                 }
                 if rule_expiration.date.is_some() {
+                    return true;
+                }
+                if rule_expiration.days.is_some() {
                     return true;
                 }
                 if let Some(expired_object_delete_marker) = rule_expiration.expired_object_delete_marker
@@ -297,10 +301,16 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     }
                 }
                 if let Some(days) = expiration.days
-                    && days <= 0
+                    && days < 0
                 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS));
                 }
+            }
+            if let Some(noncurrent_version_expiration) = &r.noncurrent_version_expiration
+                && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
+                && noncurrent_days < 0
+            {
+                return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS));
             }
             if let Some(id) = &r.id
                 && id.len() > 255
@@ -520,7 +530,6 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
                     && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
-                    && noncurrent_days != 0
                     && let Some(successor_mod_time) = obj.successor_mod_time
                 {
                     let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
@@ -851,7 +860,7 @@ pub struct ObjectOpts {
 
 impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
-        self.delete_marker && self.num_versions == 1
+        self.delete_marker && self.is_latest
     }
 
     pub fn from_object_info(oi: &ObjectInfo) -> Self {
@@ -938,13 +947,40 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_rejects_non_positive_expiration_days() {
+    async fn validate_accepts_zero_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
                     days: Some(0),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("zero-day expiration should be accepted");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_negative_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(-1),
                     ..Default::default()
                 }),
                 abort_incomplete_multipart_upload: None,
@@ -991,6 +1027,88 @@ mod tests {
         lc.validate(&ObjectLockConfiguration::default())
             .await
             .expect("expected validation to pass");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn has_active_rules_accepts_zero_day_expiration() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(0),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("zero-day-active".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        assert!(lc.has_active_rules("test/"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_accepts_zero_noncurrent_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(0),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("zero-day noncurrent expiration should be accepted");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_negative_noncurrent_expiration_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(-1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("expected validation error");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS);
     }
 
     #[tokio::test]
@@ -1403,6 +1521,44 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn eval_inner_expires_noncurrent_version_immediately_when_zero_days() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-expire-immediate".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(0),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            successor_mod_time: Some(base_time),
+            is_latest: false,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time, 0).await;
+
+        assert_eq!(event.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event.rule_id, "noncurrent-expire-immediate");
+        assert_eq!(event.due, Some(expected_expiry_time(base_time, 0)));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1720,7 +1876,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn expired_object_delete_marker_requires_single_version() {
+    async fn expired_object_delete_marker_applies_with_noncurrent_versions_present() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1754,7 +1910,8 @@ mod tests {
 
         let now = base_time + Duration::days(2);
         let event = lc.eval_inner(&opts, now, 0).await;
-        assert_eq!(event.action, IlmAction::NoneAction);
+        assert_eq!(event.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
     }
 
     #[tokio::test]

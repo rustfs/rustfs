@@ -13,12 +13,16 @@
 // limitations under the License.
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
+use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
 use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
+use crate::bucket::replication::{
+    DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
+};
 use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -43,7 +47,10 @@ use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
-use rustfs_filemeta::{FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, get_file_info, is_restored_object_on_disk};
+use rustfs_filemeta::{
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState,
+    RestoreStatusOps, VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
+};
 use rustfs_s3_common::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
@@ -1108,6 +1115,104 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
+pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
+    let Some(lifecycle) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
+        return;
+    };
+    let Some(api) = crate::new_object_layer_fn() else {
+        return;
+    };
+
+    let mut marker = None;
+    let mut version_marker = None;
+    let mut object_infos = Vec::new();
+
+    loop {
+        let Ok(page) = api
+            .clone()
+            .list_object_versions(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
+            .await
+        else {
+            return;
+        };
+
+        object_infos.extend(page.objects.into_iter().filter(|object| object.name == oi.name));
+
+        if !page.is_truncated {
+            break;
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+
+    if object_infos.is_empty() {
+        object_infos.push(oi.clone());
+    }
+
+    let lock_config = match metadata_sys::get_object_lock_config(&oi.bucket).await {
+        Ok((cfg, _)) => Some(Arc::new(cfg)),
+        Err(_) => None,
+    };
+    let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(ReplicationConfig::new(Some(cfg), None))),
+        _ => None,
+    };
+
+    let object_opts = object_infos
+        .iter()
+        .map(|object| object.to_lifecycle_opts())
+        .collect::<Vec<ObjectOpts>>();
+    let Ok(events) = Evaluator::new(Arc::new(lifecycle))
+        .with_lock_retention(lock_config)
+        .with_replication_config(replication)
+        .eval(&object_opts)
+        .await
+    else {
+        return;
+    };
+
+    let mut to_delete_objs = Vec::new();
+    let mut noncurrent_event = None;
+
+    for (object, event) in object_infos.iter().zip(events.iter()) {
+        if event.due != Some(OffsetDateTime::UNIX_EPOCH) {
+            continue;
+        }
+
+        match event.action {
+            IlmAction::DeleteAction
+            | IlmAction::DeleteRestoredAction
+            | IlmAction::DeleteRestoredVersionAction
+            | IlmAction::DeleteAllVersionsAction
+            | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                apply_expiry_rule(event, &src, object).await;
+            }
+            IlmAction::DeleteVersionAction => {
+                to_delete_objs.push(ObjectToDelete {
+                    object_name: object.name.clone(),
+                    version_id: object.version_id,
+                    ..Default::default()
+                });
+                if noncurrent_event.is_none() {
+                    noncurrent_event = Some(event.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !to_delete_objs.is_empty()
+        && let Some(event) = noncurrent_event
+    {
+        GLOBAL_ExpiryState
+            .write()
+            .await
+            .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event)
+            .await;
+    }
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
         return Ok(());
@@ -1124,6 +1229,60 @@ pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: 
 
         for object in &page.objects {
             enqueue_transition_with_lifecycle(object, &lc, &src).await;
+        }
+
+        if !page.is_truncated {
+            return Ok(());
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+}
+
+pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let Ok((lc, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+        return Ok(());
+    };
+    let lock_retention = metadata_sys::get_object_lock_config(bucket)
+        .await
+        .ok()
+        .and_then(|(cfg, _)| cfg.rule.and_then(|rule| rule.default_retention));
+    let replication_config = metadata_sys::get_replication_config(bucket).await.ok();
+    let mut marker = None;
+    let mut version_marker = None;
+    let src = LcEventSrc::Scanner;
+
+    loop {
+        let page = api
+            .clone()
+            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .await?;
+
+        for object in &page.objects {
+            let event = eval_action_from_lifecycle(&lc, lock_retention.clone(), replication_config.clone(), object).await;
+            match event.action {
+                IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteRestoredAction
+                | IlmAction::DeleteRestoredVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                    if event
+                        .due
+                        .is_some_and(|due| due.unix_timestamp() <= OffsetDateTime::now_utc().unix_timestamp())
+                    {
+                        if object.is_remote() {
+                            apply_expiry_on_transitioned_object(api.clone(), object, &event, &src).await;
+                        } else {
+                            apply_expiry_on_non_transitioned_objects(api.clone(), object, &event, &src).await;
+                        }
+                    } else {
+                        apply_expiry_rule(&event, &src, object).await;
+                    }
+                }
+                _ => {}
+            }
         }
 
         if !page.is_truncated {
@@ -1194,6 +1353,8 @@ pub async fn expire_transitioned_object(
             oi.clone()
         }
     };
+
+    schedule_lifecycle_replication_delete_if_needed(oi).await;
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
@@ -1619,6 +1780,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
             return false;
         }
     };
+    schedule_lifecycle_replication_delete_if_needed(oi).await;
     //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
@@ -1657,6 +1819,70 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
     let mut expiry_state = GLOBAL_ExpiryState.write().await;
     expiry_state.enqueue_by_days(oi, event, src).await;
     true
+}
+
+async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo) {
+    if !oi.delete_marker || oi.version_id.is_none() {
+        return;
+    }
+
+    let replication_state = lifecycle_delete_replication_state(oi).await;
+    if replication_state.is_none() {
+        return;
+    }
+
+    schedule_replication_delete(DeletedObjectReplicationInfo {
+        delete_object: crate::store_api::DeletedObject {
+            object_name: oi.name.clone(),
+            delete_marker_version_id: oi.version_id,
+            delete_marker: false,
+            delete_marker_mtime: oi.mod_time,
+            replication_state,
+            ..Default::default()
+        },
+        bucket: oi.bucket.clone(),
+        event_type: REPLICATE_INCOMING_DELETE.to_string(),
+        ..Default::default()
+    })
+    .await;
+}
+
+async fn lifecycle_delete_replication_state(oi: &ObjectInfo) -> Option<ReplicationState> {
+    if !oi.replication_decision.is_empty() || oi.version_purge_status == VersionPurgeStatusType::Pending {
+        return Some(oi.replication_state());
+    }
+
+    let dsc = check_replicate_delete(
+        &oi.bucket,
+        &ObjectToDelete {
+            object_name: oi.name.clone(),
+            version_id: oi.version_id,
+            ..Default::default()
+        },
+        oi,
+        &ObjectOptions {
+            version_id: oi.version_id.map(|v| v.to_string()),
+            versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    if !dsc.replicate_any() {
+        return None;
+    }
+
+    Some(replication_state_for_version_delete(dsc))
+}
+
+fn replication_state_for_version_delete(dsc: ReplicateDecision) -> ReplicationState {
+    let pending_status = dsc.pending_status();
+    ReplicationState {
+        replicate_decision_str: dsc.to_string(),
+        version_purge_status_internal: pending_status.clone(),
+        purge_targets: rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default()),
+        ..Default::default()
+    }
 }
 
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {

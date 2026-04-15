@@ -487,6 +487,89 @@ async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usi
         .len()
 }
 
+async fn object_version_count(disk_path: &Path, bucket: &str, object: &str) -> usize {
+    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
+    let disk = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("failed to open local disk");
+    let data = disk
+        .read_metadata(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
+        .await
+        .expect("failed to read object metadata");
+    let meta = FileMeta::load(&data).expect("failed to load file metadata");
+    meta.get_file_info_versions(bucket, object, false)
+        .expect("failed to decode file info versions")
+        .versions
+        .len()
+}
+
+async fn wait_for_version_count(disk_path: &Path, bucket: &str, object: &str, expected: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if object_version_count(disk_path, bucket, object).await == expected {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str) {
+    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
+    let disk = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("failed to open local disk");
+    let metadata_path = disk_path.join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+    let relative_path = metadata_path.to_string_lossy().to_string();
+    let (_, scanner_path) = path2_bucket_object_with_base_path(disk_path.to_string_lossy().as_ref(), relative_path.as_str());
+    let file_type = fs::metadata(&metadata_path)
+        .await
+        .expect("failed to stat object metadata")
+        .file_type();
+    let lifecycle = metadata_sys::get(bucket)
+        .await
+        .expect("failed to load bucket metadata")
+        .lifecycle_config
+        .clone()
+        .map(Arc::new);
+    let item = ScannerItem {
+        path: scanner_path.clone(),
+        bucket: bucket.to_string(),
+        prefix: object.to_string(),
+        object_name: STORAGE_FORMAT_FILE.to_string(),
+        file_type,
+        lifecycle,
+        replication: None,
+        heal_enabled: false,
+        heal_bitrot: false,
+        debug: false,
+    };
+    disk.get_size(item).await.expect("scanner get_size should succeed");
+}
+
 async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
     let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
     endpoint.set_pool_index(0);
@@ -1130,5 +1213,254 @@ mod serial_tests {
             wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(1)).await,
             "deleted object should remain absent after scanner cleanup"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_scanner_expires_zero_day_current_version() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-zero-day-expire-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle(bucket_name.as_str())
+            .await
+            .expect("Failed to set lifecycle configuration");
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
+
+        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(3)).await,
+            "scanner should delete zero-day current version after enqueueing expiry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_put_object_immediately_enqueues_zero_day_current_expiry() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-put-zero-day-expire-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "expire-now.txt";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>{object_name}</Prefix>
+        </Filter>
+        <Expiration>
+            <Days>0</Days>
+        </Expiration>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
+
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(2)).await,
+            "put_object should enqueue zero-day current expiry without waiting for scanner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_scanner_expires_zero_day_noncurrent_version() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-zero-day-noncurrent-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#;
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+            .await
+            .expect("Failed to set noncurrent lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+        let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v2");
+
+        assert_eq!(object_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await, 2);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_version_count(&disk_paths[0], bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
+            "scanner should delete zero-day noncurrent versions after enqueueing expiry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_put_object_immediately_enqueues_zero_day_noncurrent_expiry() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-put-zero-day-noncurrent-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#;
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+            .await
+            .expect("Failed to set noncurrent lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+        let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v2");
+
+        assert!(
+            wait_for_version_count(&disk_paths[0], bucket_name.as_str(), object_name, 1, Duration::from_secs(2)).await,
+            "put_object should enqueue zero-day noncurrent expiry without waiting for scanner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_background_scanner_expires_zero_day_current_version() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-bg-zero-day-expire-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle(bucket_name.as_str())
+            .await
+            .expect("Failed to set lifecycle configuration");
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
+
+        let ctx = CancellationToken::new();
+        init_data_scanner(ctx.clone(), ecstore.clone()).await;
+
+        let deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(12)).await;
+
+        ctx.cancel();
+
+        assert!(deleted, "background scanner should delete zero-day current version after startup delay");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn test_background_scanner_expires_zero_day_current_version_for_exact_key_prefix() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let bucket_name = format!("test-bg-zero-day-exact-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "expire-now.txt";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>{object_name}</Prefix>
+        </Filter>
+        <Expiration>
+            <Days>0</Days>
+        </Expiration>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
+
+        let ctx = CancellationToken::new();
+        init_data_scanner(ctx.clone(), ecstore.clone()).await;
+
+        let deleted = wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(12)).await;
+
+        ctx.cancel();
+
+        assert!(deleted, "background scanner should delete zero-day exact-key lifecycle targets");
     }
 }

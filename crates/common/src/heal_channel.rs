@@ -450,7 +450,7 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
         }
 
         if let Some(e) = &rule.noncurrent_version_expiration {
-            if let Some(true) = e.noncurrent_days.map(|d| d > 0) {
+            if e.noncurrent_days.is_some() {
                 return true;
             }
             if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {

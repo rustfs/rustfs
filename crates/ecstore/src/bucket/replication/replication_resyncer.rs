@@ -1653,7 +1653,9 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     }
 
-    let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+
+    let (replication_status, prev_status) = if !is_version_purge {
         (
             rinfos.replication_status(),
             dobj.delete_object
@@ -1924,6 +1926,10 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
     }
 }
 
+fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
+    dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
+}
+
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
@@ -1941,7 +1947,9 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo.endpoint = tgt_client.endpoint.clone();
     rinfo.secure = tgt_client.secure;
 
-    if dobj.delete_object.version_id.is_none()
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+
+    if !is_version_purge
         && rinfo.prev_replication_status == ReplicationStatusType::Completed
         && dobj.op_type != ReplicationType::ExistingObject
     {
@@ -1949,12 +1957,12 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if dobj.delete_object.version_id.is_some() && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+    if is_version_purge && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
         return rinfo;
     }
 
     if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
-        if dobj.delete_object.version_id.is_none() {
+        if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
             rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -1999,7 +2007,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
-            if dobj.delete_object.version_id.is_none() {
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
@@ -2007,7 +2015,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         }
         Err(e) => {
             rinfo.error = Some(e.to_string());
-            if dobj.delete_object.version_id.is_none() {
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -3447,6 +3455,34 @@ mod tests {
         assert!(
             heal_should_use_check_replicate_delete(&oi),
             "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            is_version_delete_replication(&dobj),
+            "delete-marker version purges must be tracked as version purge replication, not delete-marker creation replication"
+        );
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            !is_version_delete_replication(&dobj),
+            "delete-marker creation should remain on the delete-marker replication path"
         );
     }
 

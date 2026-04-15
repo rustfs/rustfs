@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
+use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::storage::ecfs::FS;
 use bytes::Bytes;
 use futures::stream;
@@ -182,6 +183,40 @@ async fn set_bucket_lifecycle_transition_with_tier(
     Ok(())
 }
 
+fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            expiration: Some(LifecycleExpiration {
+                date: Some(Timestamp::from(
+                    time::OffsetDateTime::now_utc()
+                        .replace_time(time::Time::MIDNIGHT)
+                        .saturating_sub(time::Duration::days(1)),
+                )),
+                days: None,
+                expired_object_delete_marker: None,
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                and: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
+                prefix: Some(prefix.to_string()),
+                tag: None,
+                ..Default::default()
+            }),
+            id: Some("expire-existing".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    }
+}
+
 #[derive(Clone, Default)]
 struct MockWarmBackend {
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -314,6 +349,24 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .is_err()
+        {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if let Ok(info) = ecstore.get_object_info(bucket, object, &ObjectOptions::default()).await
+            && info.delete_marker
         {
             return true;
         }
@@ -586,4 +639,38 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(actual_paths, expected_paths);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::without_context();
+
+    let bucket = format!("test-api-expire-existing-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/existing.txt";
+    let payload = b"expire existing object after lifecycle update";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(expiration_lifecycle_configuration("test/")))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect("Failed to update lifecycle configuration");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "existing object should be lifecycle-deleted after lifecycle update"
+    );
 }
