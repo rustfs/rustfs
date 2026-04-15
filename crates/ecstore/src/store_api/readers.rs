@@ -675,4 +675,58 @@ mod tests {
         assert_eq!(n2, 1);
         assert_eq!(&buf2[..1], b"e");
     }
+
+    #[test]
+    fn test_get_object_reader_range_uses_stored_size_for_encrypted_metadata() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string())]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 8,
+            end: -1,
+        };
+
+        let (_, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(b"0123456789".to_vec())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(offset, 8);
+        assert_eq!(length, 2);
+    }
+
+    #[test]
+    fn test_get_object_reader_suffix_range_uses_stored_size_for_encrypted_metadata() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([("x-rustfs-encryption-original-size".to_string(), "20".to_string())]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 4,
+            end: -1,
+        };
+
+        let (_, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(b"0123456789".to_vec())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(offset, 6);
+        assert_eq!(length, 4);
+    }
 }
