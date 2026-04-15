@@ -17,6 +17,7 @@ use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group}
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
+    keyring,
     manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policyes},
 };
 use futures::future::join_all;
@@ -133,25 +134,44 @@ impl ObjectStore {
             return Ok(data.to_vec());
         }
 
-        let cred = get_global_action_cred().unwrap_or_default();
-        let secret_key = cred.secret_key;
-        let mut keys: Vec<(Vec<u8>, bool)> = vec![(secret_key.clone().into_bytes(), false)];
-        if !cred.access_key.is_empty() && !secret_key.is_empty() {
-            keys.push((format!("{}:{secret_key}", cred.access_key).into_bytes(), true));
-        }
-
         const STREAM_IO_HEADER_LEN: usize = 41;
+        let cred = get_global_action_cred().unwrap_or_default();
         let mut last_err = None;
-        for (key, is_access_secret) in keys {
-            if is_access_secret
-                && data.len() >= STREAM_IO_HEADER_LEN
-                && let Ok(plain) = rustfs_crypto::decrypt_stream_io(&key, data)
+
+        let mut try_decrypt_with_key = |key: &[u8]| -> Option<Vec<u8>> {
+            if data.len() >= STREAM_IO_HEADER_LEN
+                && let Ok(plain) = rustfs_crypto::decrypt_stream_io(key, data)
             {
+                return Some(plain);
+            }
+
+            match rustfs_crypto::decrypt_data(key, data) {
+                Ok(plain) => Some(plain),
+                Err(err) => {
+                    last_err = Some(err);
+                    None
+                }
+            }
+        };
+
+        for key in keyring::decrypt_keys() {
+            if let Some(plain) = try_decrypt_with_key(&key) {
                 return Ok(plain);
             }
-            match rustfs_crypto::decrypt_data(&key, data) {
-                Ok(plain) => return Ok(plain),
-                Err(err) => last_err = Some(err),
+        }
+
+        let secret_key = cred.secret_key;
+        let mut legacy_keys = Vec::new();
+        if !secret_key.is_empty() {
+            legacy_keys.push(secret_key.clone().into_bytes());
+        }
+        if !cred.access_key.is_empty() && !secret_key.is_empty() {
+            legacy_keys.push(format!("{}:{secret_key}", cred.access_key).into_bytes());
+        }
+
+        for key in legacy_keys {
+            if let Some(plain) = try_decrypt_with_key(&key) {
+                return Ok(plain);
             }
         }
 
@@ -159,6 +179,11 @@ impl ObjectStore {
     }
 
     fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+        if let Some(master_key) = keyring::encrypt_key() {
+            let encrypted = rustfs_crypto::encrypt_stream_io(&master_key, data)?;
+            return Ok(encrypted);
+        }
+
         let cred = get_global_action_cred().unwrap_or_default();
         let password = if !cred.access_key.is_empty() && !cred.secret_key.is_empty() {
             format!("{}:{}", cred.access_key, cred.secret_key).into_bytes()
