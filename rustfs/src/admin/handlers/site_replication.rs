@@ -1779,6 +1779,10 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     Ok(())
 }
 
+fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
+    !update.is_remove
+}
+
 async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let Some(iam_sys) = get_global_iam_sys() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -1811,17 +1815,9 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                 return Err(s3_error!(InvalidRequest, "groupInfo is required"));
             };
             let update = group_info.update_req;
-            if update.is_remove {
+            if !group_info_requires_upsert(&update) {
                 iam_sys
                     .remove_users_from_group(&update.group, update.members)
-                    .await
-                    .map_err(ApiError::from)?;
-                return Ok(());
-            }
-
-            if update.members.is_empty() {
-                iam_sys
-                    .set_group_status(&update.group, matches!(update.status, GroupStatus::Enabled))
                     .await
                     .map_err(ApiError::from)?;
                 return Ok(());
@@ -2972,5 +2968,17 @@ mod tests {
         ];
 
         assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_group_info_with_empty_members_still_requires_group_upsert() {
+        let update = rustfs_madmin::GroupAddRemove {
+            group: "empty-group".to_string(),
+            members: vec![],
+            status: GroupStatus::Enabled,
+            is_remove: false,
+        };
+
+        assert!(group_info_requires_upsert(&update));
     }
 }
