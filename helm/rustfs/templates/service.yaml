@@ -4,6 +4,10 @@ kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-headless
   namespace: {{ .Release.Namespace }}
+  {{- with (include "rustfs.headlessServiceAnnotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
     {{- with .Values.commonLabels }}
@@ -29,13 +33,9 @@ kind: Service
 metadata:
   name: {{ include "rustfs.fullname" . }}-svc
   namespace: {{ .Release.Namespace }}
-  {{- if and .Values.mode.distributed.enabled (eq .Values.ingress.className "traefik")}}
+  {{- with (include "rustfs.serviceAnnotations" .) }}
   annotations:
-    {{- toYaml .Values.ingress.traefikAnnotations | nindent 4 }}
-    {{- if and .Values.mtls.enabled (eq .Values.ingress.className "traefik") }}
-    traefik.ingress.kubernetes.io/service.serversscheme: https
-    traefik.ingress.kubernetes.io/service.serverstransport: {{ .Release.Namespace }}-{{ include "rustfs.fullname" . }}-transport@kubernetescrd
-    {{- end }}
+    {{- . | nindent 4 }}
   {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
