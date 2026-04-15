@@ -754,7 +754,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         buckets: Vec<String>,
     ) -> Result<(), EcstoreError> {
         // Load bucket metadata system in background
-        let pool_clone = self.clone();
+        let pool_clone = self;
 
         tokio::spawn(async move {
             pool_clone.start_resync_routine(buckets, cancellation_token).await;

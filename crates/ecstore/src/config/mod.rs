@@ -144,7 +144,7 @@ impl KVS {
     pub fn insert(&mut self, key: String, value: String) {
         for kv in self.0.iter_mut() {
             if kv.key == key {
-                kv.value = value.clone();
+                kv.value = value;
                 return;
             }
         }

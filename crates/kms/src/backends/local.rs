@@ -267,7 +267,7 @@ impl KmsClient for LocalKmsClient {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
             key_spec: request.key_spec.clone(),
-            encrypted_key: encrypted_key.clone(),
+            encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),

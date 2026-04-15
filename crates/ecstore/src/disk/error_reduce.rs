@@ -67,7 +67,7 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
     let (best_err, best_count) = err_counts
         .into_iter()
         .max_by(|(_, c1), (_, c2)| c1.cmp(c2))
-        .unwrap_or((nil_error.clone(), 0));
+        .unwrap_or((nil_error, 0));
 
     // Compare nil errors with the top non-nil error and prefer the nil error
     if nil_count > best_count || (nil_count == best_count && nil_count > 0) {
@@ -112,7 +112,7 @@ mod tests {
     fn test_reduce_errs_basic() {
         let e1 = err_io("a");
         let e2 = err_io("b");
-        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2.clone()), None];
+        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2), None];
         let ignored = vec![];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);
@@ -124,7 +124,7 @@ mod tests {
         let e1 = err_io("a");
         let e2 = err_io("b");
         let errors = vec![Some(e1.clone()), Some(e2.clone()), Some(e1.clone()), Some(e2.clone()), None];
-        let ignored = vec![e2.clone()];
+        let ignored = vec![e2];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);
         assert_eq!(err, Some(e1));
@@ -134,7 +134,7 @@ mod tests {
     fn test_reduce_quorum_errs() {
         let e1 = err_io("a");
         let e2 = err_io("b");
-        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2.clone()), None];
+        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2), None];
         let ignored = vec![];
         let quorum_err = Error::FaultyDisk;
         // quorum = 2, should return e1
@@ -167,7 +167,7 @@ mod tests {
     fn test_reduce_errs_nil_tiebreak() {
         // Error::Nil and another error have the same count, should prefer Nil
         let e1 = err_io("a");
-        let errors = vec![Some(e1.clone()), None, Some(e1.clone()), None]; // e1:2, Nil:2
+        let errors = vec![Some(e1.clone()), None, Some(e1), None]; // e1:2, Nil:2
         let ignored = vec![];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);

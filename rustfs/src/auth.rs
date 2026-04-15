@@ -168,7 +168,7 @@ impl S3Auth for IAMAuth {
                 Ok((Some(id), _valid)) => {
                     // Return secret key for signature verification regardless of user status.
                     // Authorization will be checked separately in the authorization phase.
-                    return Ok(SecretKey::from(id.credentials.secret_key.clone()));
+                    return Ok(SecretKey::from(id.credentials.secret_key));
                 }
                 Ok((None, _)) => {
                     warn!("get_secret_key failed: no such user, access_key: {access_key}");

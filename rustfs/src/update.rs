@@ -206,7 +206,7 @@ mod tests {
         let result = UpdateCheckResult {
             update_available: true,
             current_version: "1.1.0".to_string(),
-            latest_version: Some(version_info.clone()),
+            latest_version: Some(version_info),
             check_time: check_time.clone(),
         };
 

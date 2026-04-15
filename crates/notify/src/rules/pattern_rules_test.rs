@@ -83,7 +83,7 @@ mod pattern_rules_tests {
         let target_id = TargetID::new("prefix-target".to_string(), "webhook".to_string());
 
         rules.add("uploads/*".to_string(), target_id.clone());
-        rules.add("images/*".to_string(), target_id.clone());
+        rules.add("images/*".to_string(), target_id);
 
         assert!(rules.match_simple("uploads/test.csv"));
         assert!(rules.match_simple("uploads/subdir/test.csv"));
@@ -153,7 +153,7 @@ mod pattern_rules_tests {
         let target2 = TargetID::new("target2".to_string(), "webhook".to_string());
 
         rules1.add("*.csv".to_string(), target1.clone());
-        rules2.add("*.jpg".to_string(), target2.clone());
+        rules2.add("*.jpg".to_string(), target2);
 
         let combined = rules1.union(&rules2);
 
@@ -177,10 +177,10 @@ mod pattern_rules_tests {
         // Add same target to multiple patterns in rules1
         rules1.add("*.csv".to_string(), target1.clone());
         rules1.add("*.jpg".to_string(), target1.clone());
-        rules1.add("*.txt".to_string(), target1.clone());
+        rules1.add("*.txt".to_string(), target1);
 
         // Add different target to .jpg pattern in rules2
-        rules2.add("*.jpg".to_string(), target2.clone());
+        rules2.add("*.jpg".to_string(), target2);
 
         let diff = rules1.difference(&rules2);
 
@@ -207,7 +207,7 @@ mod pattern_rules_tests {
         rules1.add("*.txt".to_string(), target1.clone());
 
         // Add same target to .jpg pattern in rules2
-        rules2.add("*.jpg".to_string(), target1.clone());
+        rules2.add("*.jpg".to_string(), target1);
 
         let diff = rules1.difference(&rules2);
 
@@ -227,7 +227,7 @@ mod pattern_rules_tests {
         let target_id = TargetID::new("test-target".to_string(), "webhook".to_string());
 
         rules.add("*.csv".to_string(), target_id.clone());
-        rules.add("*.jpg".to_string(), target_id.clone());
+        rules.add("*.jpg".to_string(), target_id);
 
         assert!(rules.match_simple("test.csv"));
         assert!(rules.match_simple("test.jpg"));

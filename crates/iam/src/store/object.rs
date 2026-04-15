@@ -163,7 +163,7 @@ impl ObjectStore {
         let password = if !cred.access_key.is_empty() && !cred.secret_key.is_empty() {
             format!("{}:{}", cred.access_key, cred.secret_key).into_bytes()
         } else {
-            cred.secret_key.clone().into_bytes()
+            cred.secret_key.into_bytes()
         };
         let en = rustfs_crypto::encrypt_stream_io(&password, data)?;
         Ok(en)

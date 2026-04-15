@@ -85,8 +85,8 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
 
-    let ctx_clone = ctx.clone();
-    let storeapi_clone = storeapi.clone();
+    let ctx_clone = ctx;
+    let storeapi_clone = storeapi;
     tokio::spawn(async move {
         let sleep_time = initial_scanner_delay();
         tokio::time::sleep(sleep_time).await;
