@@ -64,7 +64,7 @@ pub async fn create_bitrot_reader(
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
-        if use_zero_copy {
+        if use_zero_copy && disk.is_local() {
             // Try zero-copy read first (uses mmap on Unix)
             let start = Instant::now();
             match disk.read_file_zero_copy(bucket, path, offset, length).await {
