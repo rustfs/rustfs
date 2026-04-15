@@ -49,34 +49,6 @@ pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
 /// to regular I/O without errors.
 pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = true;
 
-/// Environment variable for zero-copy read operating mode.
-///
-/// Supported values:
-/// - `off`: disable mmap-backed chunk fast path and always use the compatibility path
-/// - `conservative`: allow a single mmap window per request
-/// - `balanced`: allow multiple mmap windows with the default size guardrails
-/// - `aggressive`: allow multi-window mmap and relax the small-object cutoff
-pub const ENV_OBJECT_ZERO_COPY_MODE: &str = "RUSTFS_OBJECT_ZERO_COPY_MODE";
-
-/// Default zero-copy read mode.
-pub const DEFAULT_OBJECT_ZERO_COPY_MODE: &str = "balanced";
-
-/// Environment variable for the maximum mmap window size used by the chunk fast path.
-///
-/// This controls the visible bytes per mapped chunk before the implementation emits a new window.
-pub const ENV_OBJECT_ZERO_COPY_MMAP_WINDOW_BYTES: &str = "RUSTFS_OBJECT_ZERO_COPY_MMAP_WINDOW_BYTES";
-
-/// Default mmap window size for chunk fast path reads: 8 MiB.
-pub const DEFAULT_OBJECT_ZERO_COPY_MMAP_WINDOW_BYTES: usize = 8 * 1024 * 1024;
-
-/// Environment variable for the maximum total active mmap bytes.
-///
-/// Requests that would exceed this active window budget fall back to the compatibility path.
-pub const ENV_OBJECT_ZERO_COPY_MAX_ACTIVE_MMAP_BYTES: &str = "RUSTFS_OBJECT_ZERO_COPY_MAX_ACTIVE_MMAP_BYTES";
-
-/// Default maximum active mmap bytes across concurrent local chunk fast-path reads: 256 MiB.
-pub const DEFAULT_OBJECT_ZERO_COPY_MAX_ACTIVE_MMAP_BYTES: usize = 256 * 1024 * 1024;
-
 // =============================================================================
 // Direct I/O Configuration
 // =============================================================================

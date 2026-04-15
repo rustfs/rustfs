@@ -230,12 +230,12 @@ impl FileMeta {
                                 }
                             }
 
-                            if let Some(checksum) = fi.checksum.as_ref() {
-                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, checksum.to_vec());
-                            }
-
                             if let Some(mod_time) = fi.mod_time {
                                 obj.mod_time = Some(mod_time);
+                            }
+
+                            if let Some(content_hash) = fi.checksum.as_ref() {
+                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, content_hash.to_vec());
                             }
                         }
 
@@ -1723,6 +1723,30 @@ mod test {
 
         let after = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
         assert_eq!(after, Some(Bytes::from_static(b"inline").to_vec()));
+    }
+
+    #[test]
+    fn test_update_object_version_persists_checksum_metadata() {
+        let mut fm = FileMeta::new();
+        let version_id = Some(Uuid::new_v4());
+
+        let mut fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        fi.version_id = version_id;
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fm.add_version(fi).unwrap();
+
+        let checksum = Bytes::from_static(b"resolved-checksum");
+        let mut update = crate::fileinfo::FileInfo::new("test", 2, 1);
+        update.version_id = version_id;
+        update.metadata.insert("x-amz-meta-owner".to_string(), "alice".to_string());
+        update.checksum = Some(checksum.clone());
+
+        fm.update_object_version(update).unwrap();
+
+        let (_, version) = fm.find_version(version_id).unwrap();
+        let stored = version.into_fileinfo("bucket", "test", true);
+        assert_eq!(stored.metadata.get("x-amz-meta-owner"), Some(&"alice".to_string()));
+        assert_eq!(stored.checksum, Some(checksum));
     }
 
     #[test]

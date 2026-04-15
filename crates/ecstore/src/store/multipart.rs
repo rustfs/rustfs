@@ -176,7 +176,7 @@ impl ECStore {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut ChunkNativePutData,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;

@@ -349,59 +349,6 @@ pub fn record_io_fallback(stage: IoStage, reason: FallbackReason) {
     .increment(1);
 }
 
-/// Record a selected GET chunk fast path.
-#[inline(always)]
-pub fn record_get_object_fast_path_selected(path: &'static str, copy_mode: CopyMode, promised_bytes: i64) {
-    counter!(
-        metric_names::data_plane::GET_FAST_PATH_SELECTED_TOTAL,
-        "path" => path.to_string(),
-        "copy_mode" => copy_mode.as_str().to_string()
-    )
-    .increment(1);
-
-    if promised_bytes >= 0 {
-        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
-    }
-}
-
-/// Record a failed GET chunk fast path probe before the response is committed.
-#[inline(always)]
-pub fn record_get_object_fast_path_probe_failed(path: &'static str, copy_mode: CopyMode, promised_bytes: i64) {
-    counter!(
-        metric_names::data_plane::GET_FAST_PATH_PROBE_FAILED_TOTAL,
-        "path" => path.to_string(),
-        "copy_mode" => copy_mode.as_str().to_string()
-    )
-    .increment(1);
-
-    if promised_bytes >= 0 {
-        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
-    }
-}
-
-/// Record a GET chunk fast path mid-stream error after headers have already been committed.
-#[inline(always)]
-pub fn record_get_object_fast_path_midstream_error(
-    path: &'static str,
-    copy_mode: CopyMode,
-    error_kind: &'static str,
-    sent_bytes: usize,
-    promised_bytes: i64,
-) {
-    counter!(
-        metric_names::data_plane::GET_FAST_PATH_MIDSTREAM_ERROR_TOTAL,
-        "path" => path.to_string(),
-        "copy_mode" => copy_mode.as_str().to_string(),
-        "error_kind" => error_kind.to_string()
-    )
-    .increment(1);
-
-    histogram!(metric_names::data_plane::GET_FAST_PATH_MIDSTREAM_SENT_BYTES).record(sent_bytes as f64);
-    if promised_bytes >= 0 {
-        histogram!(metric_names::data_plane::GET_FAST_PATH_PROMISED_BYTES).record(promised_bytes as f64);
-    }
-}
-
 /// Record the currently active mmap bytes held by LocalDisk chunk streams.
 #[inline(always)]
 pub fn record_local_disk_active_mmap_bytes(active_bytes: usize) {
@@ -908,6 +855,36 @@ pub fn record_io_latency_p99(latency_ms: f64) {
     gauge!("rustfs.io.latency.p99.ms").set(latency_ms);
 }
 
+// ============================================================================
+// Zero-Copy I/O Metrics
+// ============================================================================
+
+/// Record a successful zero-copy read operation (e.g., mmap).
+///
+/// # Arguments
+///
+/// * `size_bytes` - Size of the data read in bytes
+/// * `duration_ms` - Time taken for the read operation in milliseconds
+#[inline(always)]
+pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
+    counter!("rustfs.zero_copy.reads.total").increment(1);
+    histogram!("rustfs.zero_copy.read.size.bytes").record(size_bytes as f64);
+    histogram!("rustfs.zero_copy.read.duration.ms").record(duration_ms);
+}
+
+/// Record a fallback from zero-copy to regular read.
+///
+/// This happens when zero-copy read fails (e.g., mmap not available,
+/// file too large, etc.) and the system falls back to regular I/O.
+///
+/// # Arguments
+///
+/// * `reason` - Reason for the fallback (e.g., "mmap_unavailable", "file_too_large")
+#[inline(always)]
+pub fn record_zero_copy_fallback(reason: &str) {
+    counter!("rustfs.zero_copy.fallback.total", "reason" => reason.to_string()).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,13 +959,6 @@ mod tests {
     #[test]
     fn test_record_local_disk_compat_collect() {
         record_local_disk_compat_collect(3, 16384);
-    }
-
-    #[test]
-    fn test_record_get_object_fast_path_metrics() {
-        record_get_object_fast_path_selected("direct", CopyMode::TrueZeroCopy, 8192);
-        record_get_object_fast_path_probe_failed("bridge", CopyMode::SingleCopy, 4096);
-        record_get_object_fast_path_midstream_error("direct", CopyMode::Reconstructed, "unexpected_eof", 2048, 8192);
     }
 
     #[test]

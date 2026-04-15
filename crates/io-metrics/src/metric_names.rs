@@ -54,19 +54,4 @@ pub mod data_plane {
 
     /// Size distribution for transformed PUT selections.
     pub const PUT_TRANSFORM_SIZE_BYTES: &str = "rustfs.io.put.transform.size.bytes";
-
-    /// Total number of selected GET chunk fast paths.
-    pub const GET_FAST_PATH_SELECTED_TOTAL: &str = "rustfs.io.get.fast_path.selected_total";
-
-    /// Total number of GET chunk fast path probe failures before response commit.
-    pub const GET_FAST_PATH_PROBE_FAILED_TOTAL: &str = "rustfs.io.get.fast_path.probe_failed_total";
-
-    /// Total number of GET chunk fast path mid-stream errors after response commit.
-    pub const GET_FAST_PATH_MIDSTREAM_ERROR_TOTAL: &str = "rustfs.io.get.fast_path.midstream_error_total";
-
-    /// Byte distribution promised by GET chunk fast path selections or failures.
-    pub const GET_FAST_PATH_PROMISED_BYTES: &str = "rustfs.io.get.fast_path.promised.bytes";
-
-    /// Byte distribution already sent when a GET chunk fast path fails mid-stream.
-    pub const GET_FAST_PATH_MIDSTREAM_SENT_BYTES: &str = "rustfs.io.get.fast_path.midstream_sent.bytes";
 }

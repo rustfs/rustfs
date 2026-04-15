@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{BlockReadable, BoxReadBlockFuture, Reader};
 use pin_project_lite::pin_project;
 use std::io::{Error, Result};
 use std::pin::Pin;
@@ -62,51 +61,11 @@ where
 
 delegate_reader_capabilities_generic!(HardLimitReader<R>, inner);
 
-impl<R> BlockReadable for HardLimitReader<R>
-where
-    R: Reader,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move {
-            if self.remaining < 0 {
-                return Err(Error::other("input provided more bytes than specified"));
-            }
-
-            let max_len = match usize::try_from(self.remaining) {
-                Ok(remaining) => remaining.min(buf.len()),
-                Err(_) => buf.len(),
-            };
-
-            if max_len == 0 {
-                let mut probe = [0_u8; 1];
-                match self.inner.read_block(&mut probe).await {
-                    Ok(0) => return Ok(0),
-                    Ok(n) => {
-                        self.remaining -= n as i64;
-                        return Err(Error::other("input provided more bytes than specified"));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
-                    Err(err) => return Err(err),
-                }
-            }
-
-            let n = self.inner.read_block(&mut buf[..max_len]).await?;
-            self.remaining -= n as i64;
-            if self.remaining < 0 {
-                return Err(Error::other("input provided more bytes than specified"));
-            }
-
-            Ok(n)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::vec;
 
     use super::*;
-    use crate::{BlockReadable, WarpReader};
     use rustfs_utils::read_full;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -168,21 +127,5 @@ mod tests {
         let n = r.read_to_end(&mut buf).await.unwrap();
         assert_eq!(n, 0);
         assert_eq!(&buf, data);
-    }
-
-    #[tokio::test]
-    async fn test_hardlimit_reader_read_block_enforces_limit() {
-        let data = b"abcdef";
-        let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
-        let mut hardlimit = HardLimitReader::new(reader, 3);
-
-        let mut buf = [0_u8; 8];
-        let n = hardlimit.read_block(&mut buf).await.unwrap();
-        assert_eq!(n, 3);
-        assert_eq!(&buf[..n], b"abc");
-
-        let err = hardlimit.read_block(&mut buf).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 }

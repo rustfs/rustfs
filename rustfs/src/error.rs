@@ -257,10 +257,23 @@ impl From<StorageError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        // Check if the error is a ChecksumMismatch (BadDigest)
+        // Check if the inner error is a StorageError (e.g. InvalidRangeSpec wrapped by object-io)
         if let Some(inner) = err.get_ref() {
             if let Some(storage_error) = inner.downcast_ref::<StorageError>() {
-                return storage_error.clone().into();
+                let code = match storage_error {
+                    StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
+                    _ => S3ErrorCode::InternalError,
+                };
+                let message = if code == S3ErrorCode::InternalError {
+                    storage_error.to_string()
+                } else {
+                    ApiError::error_code_to_message(&code)
+                };
+                return ApiError {
+                    code,
+                    message,
+                    source: Some(Box::new(err)),
+                };
             }
             if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
                 return ApiError {
@@ -554,16 +567,5 @@ mod tests {
         // ApiError doesn't implement Error::source() properly, so this would be None
         // This is expected because ApiError is not a typical Error implementation
         assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn test_api_error_from_io_error_unwraps_invalid_range_storage_error() {
-        let io_error = std::io::Error::from(StorageError::InvalidRangeSpec("range invalid".to_string()));
-
-        let api_error: ApiError = io_error.into();
-
-        assert_eq!(api_error.code, S3ErrorCode::InvalidRange);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InvalidRange));
-        assert!(api_error.source.is_some());
     }
 }

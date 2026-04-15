@@ -475,6 +475,16 @@ mod tests {
     }
 
     #[test]
+    fn test_gen_secret_key_uses_url_safe_base64_without_padding() {
+        let key = gen_secret_key(32).expect("secret key should generate");
+
+        assert_eq!(key.len(), 32);
+        assert!(!key.contains('/'));
+        assert!(!key.contains('+'));
+        assert!(!key.contains('='));
+    }
+
+    #[test]
     fn test_masked_debug() {
         // Test None
         assert_eq!(format!("{:?}", Masked(None)), "");

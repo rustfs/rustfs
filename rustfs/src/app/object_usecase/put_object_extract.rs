@@ -295,7 +295,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(metadata);
             let capacity_scope_token = Uuid::new_v4();
             opts.capacity_scope_token = Some(capacity_scope_token);
-            let mut reader = ChunkNativePutData::new(hrd);
+            let mut reader = PutObjReader::new(hrd);
 
             let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,
