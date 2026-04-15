@@ -18,17 +18,17 @@ use std::io::ErrorKind;
 use std::sync::{Arc, Once};
 use std::time::{Duration, SystemTime};
 
-use crate::data_usage_define::{hash_path, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary};
+use crate::ReplTargetSizeSummary;
+use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
 use crate::scanner_io::ScannerIODisk as _;
 use crate::sleeper::DynamicSleeper;
-use crate::ReplTargetSizeSummary;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
-    send_heal_request_with_admission, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
-    HEAL_DELETE_DANGLING,
+    HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
+    send_heal_request_with_admission,
 };
-use rustfs_common::metrics::{current_path_updater, IlmAction, Metric, Metrics, UpdateCurrentPathFn};
+use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -36,10 +36,10 @@ use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_ops::apply_transition_rule,
     lifecycle::{Event, Lifecycle, ObjectOpts},
 };
-use rustfs_ecstore::bucket::replication::{queue_replication_heal_internal, ReplicationConfig, ReplicationConfigurationExt as _};
+use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt as _, queue_replication_heal_internal};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
+use rustfs_ecstore::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{Disk, DiskAPI as _, DiskInfoOptions};
 use rustfs_ecstore::error::StorageError;
@@ -48,7 +48,7 @@ use rustfs_ecstore::pools::{path2_bucket_object, path2_bucket_object_with_base_p
 use rustfs_ecstore::store_api::{ObjectInfo, ObjectToDelete};
 use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
-use rustfs_utils::path::{path_join_buf, SLASH_SEPARATOR};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use tokio::select;
 use tokio::sync::mpsc;
@@ -181,7 +181,7 @@ fn record_high_priority_heal_escalation(
         "result" => result.result_label().to_string(),
         "reason" => result.reason_label().to_string()
     )
-        .increment(1);
+    .increment(1);
 }
 
 fn build_high_priority_heal_admission_error(
@@ -206,14 +206,14 @@ fn record_heal_candidate_admission(candidate_type: &'static str, priority: HealC
         "priority" => heal_priority_label(priority).to_string(),
         "result" => result.result_label().to_string()
     )
-        .increment(1);
+    .increment(1);
 
     if matches!(result, HealAdmissionResult::Merged) {
         counter!(
             "rustfs_heal_candidate_merge_total",
             "type" => candidate_type.to_string()
         )
-            .increment(1);
+        .increment(1);
     }
 
     if let HealAdmissionResult::Dropped(reason) = result {
@@ -222,7 +222,7 @@ fn record_heal_candidate_admission(candidate_type: &'static str, priority: HealC
             "type" => candidate_type.to_string(),
             "reason" => reason.as_str().to_string()
         )
-            .increment(1);
+        .increment(1);
     }
 }
 
@@ -243,7 +243,7 @@ async fn send_scanner_heal_request(
                 "priority" => heal_priority_label(priority).to_string(),
                 "result" => "channel_error".to_string()
             )
-                .increment(1);
+            .increment(1);
             Err(ScannerError::Other(err))
         }
     }
@@ -539,7 +539,7 @@ impl ScannerItem {
                 HealChannelPriority::Low,
             ),
         )
-            .await;
+        .await;
 
         match result {
             Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => {}
@@ -1145,7 +1145,7 @@ impl FolderScanner {
                         None,
                         build_bucket_heal_request(bucket.clone(), HealChannelPriority::High),
                     )
-                        .await?;
+                    .await?;
                 }
 
                 resolver.bucket = bucket.clone();
@@ -1204,7 +1204,7 @@ impl FolderScanner {
                             ..Default::default()
                         },
                     )
-                        .await
+                    .await
                     {
                         error!("scan_folder: failed to list path: {}/{}: {}", bucket_clone, prefix_clone, e);
                     }
@@ -1505,10 +1505,10 @@ mod tests {
     use crate::SCANNER_SLEEPER;
 
     use super::*;
-    use rustfs_ecstore::disk::{endpoint::Endpoint, new_disk, DiskOption};
+    use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
     use serial_test::serial;
     #[cfg(unix)]
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::AtomicBool;
     use uuid::Uuid;
 
@@ -1526,8 +1526,8 @@ mod tests {
                 health_check: false,
             },
         )
-            .await
-            .expect("failed to create disk");
+        .await
+        .expect("failed to create disk");
 
         let update_current_path: UpdateCurrentPathFn = Arc::new(|_: &str| Box::pin(async {}));
 
