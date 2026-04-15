@@ -64,7 +64,7 @@ pub fn decode_part_index(index: Option<&Bytes>) -> Option<Index> {
     }
 }
 
-pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
+pub fn put_obj_reader_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: Option<Index>) -> Result<PutObjReader> {
     use sha2::{Digest, Sha256};
 
     let sha256hex = if !chunk.is_empty() {
@@ -74,7 +74,7 @@ pub fn put_data_from_chunk(chunk: Vec<u8>, size: i64, actual_size: i64, index: O
     };
 
     let reader = IndexedDataMovementReader::new(Cursor::new(chunk), index);
-    let hash_reader = HashReader::from_reader(reader, size, actual_size, None, sha256hex, false)?;
+    let hash_reader = HashReader::from_stream(reader, size, actual_size, None, sha256hex, false)?;
     Ok(PutObjReader::new(hash_reader))
 }
 
@@ -172,7 +172,7 @@ pub(crate) async fn migrate_object(
                 let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
                 let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
                 let index = decode_part_index(part.index.as_ref());
-                let mut data = put_data_from_chunk(chunk, part_size, part_actual_size, index)?;
+                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
 
                 let pi = match store
                     .put_object_part(
@@ -254,7 +254,7 @@ pub(crate) async fn migrate_object(
         .first()
         .and_then(|part| decode_part_index(part.index.as_ref()));
     let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
-    let hrd = HashReader::from_reader(reader, object_info.size, actual_size, object_info.etag.clone(), None, false)?;
+    let hrd = HashReader::from_stream(reader, object_info.size, actual_size, object_info.etag.clone(), None, false)?;
     let mut data = PutObjReader::new(hrd);
 
     if let Err(err) = store
