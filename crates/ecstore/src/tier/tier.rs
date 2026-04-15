@@ -51,7 +51,7 @@ use crate::{
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     global::is_first_cluster_node_local,
     store::ECStore,
-    store_api::{ChunkNativePutData, ObjectIO as _, ObjectOptions},
+    store_api::{ObjectIO as _, ObjectOptions, PutObjReader},
 };
 use rustfs_rio::HashReader;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
@@ -1046,7 +1046,7 @@ impl TierConfigMgr {
         opts: &ObjectOptions,
     ) -> std::result::Result<(), std::io::Error> {
         debug!("save tier config:{}", file);
-        let mut put_data = ChunkNativePutData::from_vec(data.to_vec());
+        let mut put_data = PutObjReader::from_vec(data.to_vec());
         let _ = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await?;
         Ok(())
     }
@@ -1103,7 +1103,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 Ok(data) => {
                     let cfg = TierConfigMgr::unmarshal(&data)?;
                     let normalized = encode_external_tiering_config_blob(&cfg)?;
-                    let mut put_data = ChunkNativePutData::from_vec(normalized.to_vec());
+                    let mut put_data = PutObjReader::from_vec(normalized.to_vec());
                     let _ = api
                         .put_object(
                             RUSTFS_META_BUCKET,
@@ -1158,7 +1158,7 @@ async fn read_tier_config_from_bucket<S: StorageAPI>(
 }
 
 async fn write_tier_config_to_rustfs<S: StorageAPI>(api: Arc<S>, path: &str, data: Bytes) -> io::Result<()> {
-    let mut put_data = ChunkNativePutData::from_vec(data.to_vec());
+    let mut put_data = PutObjReader::from_vec(data.to_vec());
     api.put_object(
         RUSTFS_META_BUCKET,
         path,

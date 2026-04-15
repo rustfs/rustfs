@@ -18,9 +18,7 @@ use rustfs_ecstore::{
     disk::endpoint::Endpoint,
     endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     store::ECStore,
-    store_api::{
-        BucketOperations, BucketOptions, ChunkNativePutData, HealOperations, MakeBucketOptions, ObjectIO, ObjectOptions,
-    },
+    store_api::{BucketOperations, BucketOptions, HealOperations, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader},
 };
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
@@ -137,7 +135,7 @@ async fn data_movement_put_object_marks_dirty_disks_for_capacity_manager() {
     let _ = manager.get_dirty_disks().await;
 
     let payload = b"data-movement-dirty-scope".to_vec();
-    let mut reader = ChunkNativePutData::from_vec(payload);
+    let mut reader = PutObjReader::from_vec(payload);
     let opts = ObjectOptions {
         data_movement: true,
         src_pool_idx: 0,
@@ -179,7 +177,7 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
 
     let payload_len = 3 * 1024 * 1024 + 137;
     let payload: Vec<u8> = (0..payload_len).map(|idx| (idx % 251) as u8).collect();
-    let mut reader = ChunkNativePutData::from_vec(payload);
+    let mut reader = PutObjReader::from_vec(payload);
     let object_name = "test/heal.bin";
     let put_info = ecstore
         .put_object(&bucket_name, object_name, &mut reader, &ObjectOptions::default())
