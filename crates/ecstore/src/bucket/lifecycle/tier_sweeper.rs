@@ -109,11 +109,19 @@ impl ObjSweeper {
     }
 
     pub async fn sweep(&self) {
-        if let Some(je) = self.should_remove_remote_object() {
-            let mut expiry_state = GLOBAL_ExpiryState.write().await;
-            if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
-                tracing::warn!("failed to enqueue tier journal entry: {err}");
-            }
+        let Some(je) = self.should_remove_remote_object() else {
+            return;
+        };
+        let hash = je.op_hash();
+        // Grab the sender under a short read lock, then release the lock so we
+        // don't hold it across the async send.
+        let wrkr = GLOBAL_ExpiryState.read().await.get_worker_ch(hash);
+        let Some(wrkr) = wrkr else {
+            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            return;
+        };
+        if wrkr.send(Some(Box::new(je))).await.is_err() {
+            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
         }
     }
 }

@@ -261,8 +261,9 @@ impl ExpiryState {
         let wrkr = self.get_worker_ch(je.op_hash());
         if wrkr.is_none() {
             *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
+            return Ok(());
         }
-        let wrkr = wrkr.expect("worker channel should exist");
+        let wrkr = wrkr.expect("worker channel should exist after None check");
         select! {
             //_ -> GlobalContext.Done() => ()
             _ = wrkr.send(Some(Box::new(je.clone()))) => (),
@@ -341,6 +342,10 @@ impl ExpiryState {
             return None;
         }
         Some(self.tasks_tx[h as usize % self.tasks_tx.len()].clone())
+    }
+
+    pub fn increment_missed_tier_journal_tasks(&mut self) {
+        *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
