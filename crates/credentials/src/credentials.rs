@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Error;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use time::OffsetDateTime;
 
 /// Global active credentials
@@ -314,6 +314,17 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// Returns a reference to this credential's claims, or a shared empty map
+    /// when the credential has no claims attached. Avoids per-call allocation
+    /// at call sites that need an `&HashMap<String, Value>`.
+    pub fn claims_or_empty(&self) -> &HashMap<String, Value> {
+        static EMPTY: LazyLock<HashMap<String, Value>> = LazyLock::new(HashMap::new);
+        match &self.claims {
+            Some(c) => c,
+            None => &EMPTY,
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
         if self.expiration.is_none() {
             return false;

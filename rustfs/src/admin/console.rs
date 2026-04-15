@@ -419,7 +419,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
     let cors_allowed_origins = std::env::var(rustfs_config::ENV_CONSOLE_CORS_ALLOWED_ORIGINS)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string())
         .parse::<String>()
-        .unwrap_or(rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string());
+        .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS.to_string());
 
     (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
 }

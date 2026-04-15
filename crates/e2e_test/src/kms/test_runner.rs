@@ -453,7 +453,7 @@ impl KMSTestSuite {
                 warn!(
                     "  - {}: {}",
                     result.test_name,
-                    result.error_message.as_ref().unwrap_or(&"Unknown error".to_string())
+                    result.error_message.as_deref().unwrap_or("Unknown error")
                 );
             }
         }

@@ -38,7 +38,7 @@ impl SetDisks {
         let upload_uuid = base64_simd::URL_SAFE_NO_PAD
             .decode_to_vec(upload_id.as_bytes())
             .and_then(|v| {
-                String::from_utf8(v).map_or(Ok(upload_id.to_owned()), |v| {
+                String::from_utf8(v).map_or_else(|_| Ok(upload_id.to_owned()), |v| {
                     let parts: Vec<_> = v.splitn(2, '.').collect();
                     if parts.len() == 2 {
                         Ok(parts[1].to_string())

@@ -73,7 +73,9 @@ impl TargetFactory for WebhookTargetFactory {
             enable: true, // If we are here, it's already enabled.
             endpoint: endpoint_url,
             auth_token: config.lookup(WEBHOOK_AUTH_TOKEN).unwrap_or_default(),
-            queue_dir: config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
+            queue_dir: config
+                .lookup(WEBHOOK_QUEUE_DIR)
+                .unwrap_or_else(|| EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(WEBHOOK_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
@@ -111,7 +113,9 @@ impl TargetFactory for WebhookTargetFactory {
             ));
         }
 
-        let queue_dir = config.lookup(WEBHOOK_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string());
+        let queue_dir = config
+            .lookup(WEBHOOK_QUEUE_DIR)
+            .unwrap_or_else(|| EVENT_DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
             return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
         }
@@ -178,7 +182,9 @@ impl TargetFactory for MQTTTargetFactory {
                 config.lookup(MQTT_TLS_TRUST_LEAF_AS_CA).as_deref(),
                 config.lookup(MQTT_WS_PATH_ALLOWLIST).as_deref(),
             )?,
-            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or(EVENT_DEFAULT_DIR.to_string()),
+            queue_dir: config
+                .lookup(MQTT_QUEUE_DIR)
+                .unwrap_or_else(|| EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
