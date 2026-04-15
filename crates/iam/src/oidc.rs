@@ -119,6 +119,7 @@ pub struct OidcProviderConfig {
     pub role_policy: String,
     pub display_name: String,
     pub groups_claim: String,
+    pub roles_claim: String,
     pub email_claim: String,
     pub username_claim: String,
 }
@@ -385,7 +386,7 @@ impl OidcSys {
             sub: extract_string_claim(&raw, "sub"),
             email: extract_string_claim(&raw, &config.email_claim),
             username: extract_string_claim(&raw, &config.username_claim),
-            groups: extract_groups_claim(&raw, &config.groups_claim),
+            groups: extract_canonical_group_values(&raw, &config.groups_claim, &config.roles_claim),
             raw,
         };
 
@@ -509,7 +510,7 @@ impl OidcSys {
             sub: extract_string_claim(&raw_claims, "sub"),
             email: extract_string_claim(&raw_claims, &config.email_claim),
             username: extract_string_claim(&raw_claims, &config.username_claim),
-            groups: extract_groups_claim(&raw_claims, &config.groups_claim),
+            groups: extract_canonical_group_values(&raw_claims, &config.groups_claim, &config.roles_claim),
             raw: raw_claims,
         };
 
@@ -719,6 +720,7 @@ impl OidcSys {
                 v
             }
         };
+        let roles_claim = get_env(ENV_IDENTITY_OPENID_ROLES_CLAIM);
         let email_claim = {
             let v = get_env(ENV_IDENTITY_OPENID_EMAIL_CLAIM);
             if v.is_empty() {
@@ -762,6 +764,7 @@ impl OidcSys {
             role_policy: get_env(ENV_IDENTITY_OPENID_ROLE_POLICY),
             display_name,
             groups_claim,
+            roles_claim,
             email_claim,
             username_claim,
         })
@@ -800,6 +803,9 @@ impl OidcSys {
         let groups_claim = kvs
             .lookup(OIDC_GROUPS_CLAIM)
             .unwrap_or_else(|| OIDC_DEFAULT_GROUPS_CLAIM.to_string());
+        let roles_claim = kvs
+            .lookup(OIDC_ROLES_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_ROLES_CLAIM.to_string());
         let email_claim = kvs
             .lookup(OIDC_EMAIL_CLAIM)
             .unwrap_or_else(|| OIDC_DEFAULT_EMAIL_CLAIM.to_string());
@@ -824,6 +830,7 @@ impl OidcSys {
             role_policy: kvs.get(OIDC_ROLE_POLICY),
             display_name,
             groups_claim,
+            roles_claim,
             email_claim,
             username_claim,
         })
@@ -1025,6 +1032,21 @@ fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) 
     }
 }
 
+fn extract_canonical_group_values(
+    claims: &HashMap<String, serde_json::Value>,
+    groups_claim: &str,
+    roles_claim: &str,
+) -> Vec<String> {
+    let mut groups = extract_groups_claim(claims, groups_claim);
+    if !roles_claim.is_empty() && roles_claim != groups_claim {
+        groups.extend(extract_groups_claim(claims, roles_claim));
+    }
+    groups.retain(|g| !g.is_empty());
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1093,34 @@ mod tests {
         claims.insert("groups".to_string(), serde_json::json!(42));
         let groups = extract_groups_claim(&claims, "groups");
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_merges_groups_and_roles() {
+        let mut claims = HashMap::new();
+        claims.insert("groups".to_string(), serde_json::json!(["devs", "admins"]));
+        claims.insert("roles".to_string(), serde_json::json!(["admins", "consoleAdmin"]));
+
+        let merged = extract_canonical_group_values(&claims, "groups", "roles");
+        assert_eq!(merged, vec!["admins", "consoleAdmin", "devs"]);
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_skips_duplicate_claim_name() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["consoleAdmin"]));
+
+        let merged = extract_canonical_group_values(&claims, "roles", "roles");
+        assert_eq!(merged, vec!["consoleAdmin"]);
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_roles_only() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["consoleAdmin", "bucket-reader"]));
+
+        let merged = extract_canonical_group_values(&claims, "groups", "roles");
+        assert_eq!(merged, vec!["bucket-reader", "consoleAdmin"]);
     }
 
     #[test]
@@ -1246,6 +1296,7 @@ mod tests {
             role_policy: String::new(),
             display_name: "mock-oidc".to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "username".to_string(),
         }
@@ -1491,6 +1542,7 @@ mod tests {
         );
         kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
         kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kvs.insert(OIDC_ROLES_CLAIM.to_string(), "app_roles".to_string());
 
         cfg.0
             .entry(IDENTITY_OPENID_SUB_SYS.to_string())
@@ -1502,6 +1554,44 @@ mod tests {
         assert_eq!(parsed[0].id, "default");
         assert_eq!(parsed[0].client_id, "console");
         assert!(parsed[0].enabled);
+        assert_eq!(parsed[0].roles_claim, "app_roles");
+    }
+
+    #[test]
+    fn test_parse_persisted_provider_config_omitted_roles_claim_is_empty() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::Off.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].roles_claim, "");
     }
 
     #[test]
@@ -1554,6 +1644,7 @@ mod tests {
             role_policy: "".to_string(),
             display_name: id.to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
         }
@@ -1647,6 +1738,7 @@ mod tests {
             role_policy: "readwrite".to_string(),
             display_name: "Test Provider".to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
         };
