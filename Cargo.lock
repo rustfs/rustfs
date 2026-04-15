@@ -4383,9 +4383,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.8"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http 1.4.0",
  "hyper",
@@ -4671,6 +4671,17 @@ name = "integer-encoding"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
+
+[[package]]
+name = "io-uring"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd7bddefd0a8833b88a4b68f90dae22c7450d11b354198baee3874fd811b344"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "ipnet"
@@ -7730,7 +7741,6 @@ dependencies = [
  "rustfs-metrics",
  "rustfs-notify",
  "rustfs-object-capacity",
- "rustfs-object-io",
  "rustfs-obs",
  "rustfs-policy",
  "rustfs-protocols",
@@ -8074,8 +8084,6 @@ name = "rustfs-io-core"
 version = "0.0.5"
 dependencies = [
  "bytes",
- "futures-core",
- "futures-util",
  "memmap2 0.9.10",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
@@ -8262,29 +8270,6 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "rustfs-object-io"
-version = "0.0.5"
-dependencies = [
- "astral-tokio-tar",
- "atoi",
- "bytes",
- "futures-util",
- "http 1.4.0",
- "rustfs-ecstore",
- "rustfs-io-core",
- "rustfs-io-metrics",
- "rustfs-rio",
- "rustfs-s3select-api",
- "rustfs-utils",
- "s3s",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "uuid",
 ]
 
 [[package]]
@@ -9982,16 +9967,18 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.51.1"
+version = "1.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
  "bytes",
+ "io-uring",
  "libc",
  "mio",
  "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
+ "slab",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

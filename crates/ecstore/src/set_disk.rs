@@ -119,19 +119,18 @@ use tokio::{
     time::{interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::error;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-const ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES: &str = "RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES";
-const ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE: &str = "RUSTFS_PUT_FORCE_DISABLE_INLINE";
-const SLOW_PUT_STORAGE_PHASE_DEBUG_THRESHOLD_MS: u64 = 100;
-const SLOW_PUT_STORAGE_PHASE_WARN_THRESHOLD_MS: u64 = 1_000;
-const SLOW_PUT_STORAGE_PHASE_ERROR_THRESHOLD_MS: u64 = 5_000;
+pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
+pub const MAX_PARTS_COUNT: usize = 10000;
+pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
+pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 
-fn env_flag_enabled(name: &str) -> bool {
-    rustfs_utils::get_env_bool(name, false)
-}
-
-fn env_non_negative_usize(name: &str) -> Option<usize> {
-    rustfs_utils::get_env_opt_usize(name)
+pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
+    metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
 }
 
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
@@ -162,65 +161,6 @@ fn record_capacity_scope_if_needed(scope_token: Option<Uuid>, disks: &[Option<Di
     if let Some(token) = scope_token {
         record_capacity_scope(token, scope);
     }
-}
-
-fn resolved_put_inline_buffer_enabled(object_size: i64, inline_by_topology: bool) -> bool {
-    if !inline_by_topology || object_size < 0 {
-        return false;
-    }
-
-    if env_flag_enabled(ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE) {
-        return false;
-    }
-
-    env_non_negative_usize(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES)
-        .map(|value| usize::try_from(object_size).is_ok_and(|size| size <= value))
-        .unwrap_or(inline_by_topology)
-}
-
-fn log_put_storage_phase(
-    bucket: &str,
-    object: &str,
-    phase: &str,
-    elapsed: Duration,
-    object_size: i64,
-    inline_selected: bool,
-    write_quorum: usize,
-) {
-    let duration_ms = elapsed.as_millis() as u64;
-    if duration_ms < SLOW_PUT_STORAGE_PHASE_DEBUG_THRESHOLD_MS {
-        return;
-    }
-
-    if duration_ms >= SLOW_PUT_STORAGE_PHASE_ERROR_THRESHOLD_MS {
-        error!(
-            phase,
-            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase is critically slow"
-        );
-    } else if duration_ms >= SLOW_PUT_STORAGE_PHASE_WARN_THRESHOLD_MS {
-        warn!(
-            phase,
-            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase is slow"
-        );
-    } else {
-        debug!(
-            phase,
-            duration_ms, object_size, inline_selected, write_quorum, bucket, object, "PUT storage phase exceeded debug threshold"
-        );
-    }
-}
-use tracing::error;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
-
-pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
-pub const MAX_PARTS_COUNT: usize = 10000;
-pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
-pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
-
-pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
-    metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
-    metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
 }
 
 /// Get the duplex buffer size from environment variable or use default.
@@ -872,18 +812,13 @@ impl ObjectIO for SetDisks {
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
-            let inline_by_topology = if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
                 false
-            };
-            resolved_put_inline_buffer_enabled(data.size(), inline_by_topology)
+            }
         };
-        if is_inline_buffer {
-            rustfs_io_metrics::record_put_inline_selected(data.size(), opts.versioned);
-        }
 
-        let writer_setup_start = Instant::now();
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
@@ -917,15 +852,6 @@ impl ObjectIO for SetDisks {
                 writers.push(None);
             }
         }
-        log_put_storage_phase(
-            bucket,
-            object,
-            "writer_setup",
-            writer_setup_start.elapsed(),
-            data.size(),
-            is_inline_buffer,
-            write_quorum,
-        );
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
@@ -937,9 +863,6 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
-        let object_size = data.size();
-        let encode_write_start = Instant::now();
-
         let stream = mem::replace(
             &mut data.stream,
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
@@ -948,30 +871,15 @@ impl ObjectIO for SetDisks {
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
             Ok((r, w)) => (r, w),
             Err(e) => {
-                log_put_storage_phase(
-                    bucket,
-                    object,
-                    "encode_write",
-                    encode_write_start.elapsed(),
-                    object_size,
-                    is_inline_buffer,
-                    write_quorum,
-                );
                 error!("encode err {:?}", e);
                 return Err(e.into());
             }
         }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
-        log_put_storage_phase(
-            bucket,
-            object,
-            "encode_write",
-            encode_write_start.elapsed(),
-            object_size,
-            is_inline_buffer,
-            write_quorum,
-        );
+        // if let Err(err) = close_bitrot_writers(&mut writers).await {
+        //     error!("close_bitrot_writers err {:?}", err);
+        // }
 
         if (w_size as i64) < data.size() {
             warn!("put_object write size < data.size(), w_size={}, data.size={}", w_size, data.size());
@@ -1047,7 +955,6 @@ impl ObjectIO for SetDisks {
 
         drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
-        let post_write_lock_start = Instant::now();
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
@@ -1057,17 +964,7 @@ impl ObjectIO for SetDisks {
                 ))
             })?);
         }
-        log_put_storage_phase(
-            bucket,
-            object,
-            "post_write_lock",
-            post_write_lock_start.elapsed(),
-            data.size(),
-            is_inline_buffer,
-            write_quorum,
-        );
 
-        let finalize_start = Instant::now();
         let (online_disks, _, op_old_dir) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_TMP_BUCKET,
@@ -1077,18 +974,7 @@ impl ObjectIO for SetDisks {
             object,
             write_quorum,
         )
-        .await
-        .inspect_err(|_| {
-            log_put_storage_phase(
-                bucket,
-                object,
-                "finalize",
-                finalize_start.elapsed(),
-                data.size(),
-                is_inline_buffer,
-                write_quorum,
-            );
-        })?;
+        .await?;
 
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
@@ -1098,15 +984,6 @@ impl ObjectIO for SetDisks {
         drop(object_lock_guard); // drop object lock guard to release the lock
 
         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
-        log_put_storage_phase(
-            bucket,
-            object,
-            "finalize",
-            finalize_start.elapsed(),
-            data.size(),
-            is_inline_buffer,
-            write_quorum,
-        );
 
         for (i, op_disk) in online_disks.iter().enumerate() {
             if let Some(disk) = op_disk
@@ -2036,9 +1913,6 @@ impl ObjectOperations for SetDisks {
         }
         if let Some(ref version_id) = opts.version_id {
             fi.version_id = Uuid::parse_str(version_id).ok();
-        }
-        if let Some(checksum) = &opts.resolved_checksum {
-            fi.checksum = Some(checksum.clone());
         }
 
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)
@@ -4401,31 +4275,6 @@ mod tests {
                 });
             });
         }
-    }
-
-    #[test]
-    #[serial]
-    fn resolved_put_inline_buffer_enabled_honors_disable_env() {
-        temp_env::with_var(ENV_RUSTFS_PUT_FORCE_DISABLE_INLINE, Some("true"), || {
-            assert!(!resolved_put_inline_buffer_enabled(4096, true));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn resolved_put_inline_buffer_enabled_honors_max_bytes_override() {
-        temp_env::with_var(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES, Some("4096"), || {
-            assert!(resolved_put_inline_buffer_enabled(4096, true));
-            assert!(!resolved_put_inline_buffer_enabled(4097, true));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn resolved_put_inline_buffer_enabled_ignores_invalid_override() {
-        temp_env::with_var(ENV_RUSTFS_PUT_INLINE_OBJECT_MAX_BYTES, Some("invalid"), || {
-            assert!(resolved_put_inline_buffer_enabled(4096, true));
-        });
     }
 
     async fn current_setup_type() -> SetupType {
