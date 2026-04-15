@@ -5,7 +5,7 @@ kind: PersistentVolumeClaim
 metadata:
   annotations:
     helm.sh/resource-policy: keep
-    {{- with .pvcAnnotations }}
+    {{- with .pvcAnnotations.data }}
     {{- toYaml .| nindent 4  }}
     {{- end }}
   name: {{ include "rustfs.fullname" $ }}-data
@@ -31,7 +31,7 @@ kind: PersistentVolumeClaim
 metadata:
   annotations:
     helm.sh/resource-policy: keep
-    {{- with .pvcAnnotations }}
+    {{- with .pvcAnnotations.logs }}
     {{- toYaml .| nindent 4  }}
     {{- end }}
   name: {{ include "rustfs.fullname" $ }}-logs

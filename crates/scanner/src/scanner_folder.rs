@@ -1035,21 +1035,22 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let mut dst = if !into.compacted {
-                    DataUsageEntry::default()
+                if into.compacted {
+                    // In compacted mode child totals are accumulated directly into the parent entry.
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    tokio::task::yield_now().await;
                 } else {
-                    into.clone()
-                };
+                    let mut dst = DataUsageEntry::default();
 
-                // Use Box::pin for recursive async call
-                let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                if let Err(e) = fut.await {
-                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                    continue;
-                }
-                tokio::task::yield_now().await;
+                    // Use Box::pin for recursive async call
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
+                    tokio::task::yield_now().await;
 
-                if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
                     // We scanned a folder, optionally send update.
@@ -1087,21 +1088,22 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let mut dst = if !into.compacted {
-                    DataUsageEntry::default()
+                if into.compacted {
+                    // In compacted mode child totals are accumulated directly into the parent entry.
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    tokio::task::yield_now().await;
                 } else {
-                    into.clone()
-                };
+                    let mut dst = DataUsageEntry::default();
 
-                // Use Box::pin for recursive async call
-                let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                if let Err(e) = fut.await {
-                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                    continue;
-                }
-                tokio::task::yield_now().await;
+                    // Use Box::pin for recursive async call
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
+                    tokio::task::yield_now().await;
 
-                if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
                     // We scanned a folder, optionally send update.
@@ -1306,21 +1308,22 @@ impl FolderScanner {
                         object_heal_prob_div: 1,
                     };
 
-                    let mut dst = if !into.compacted {
-                        DataUsageEntry::default()
+                    if into.compacted {
+                        // In compacted mode child totals are accumulated directly into the parent entry.
+                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                        fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                        tokio::task::yield_now().await;
                     } else {
-                        into.clone()
-                    };
+                        let mut dst = DataUsageEntry::default();
 
-                    // Use Box::pin for recursive async call
-                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    if let Err(e) = fut.await {
-                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                        continue;
-                    }
-                    tokio::task::yield_now().await;
+                        // Use Box::pin for recursive async call
+                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                        if let Err(e) = fut.await {
+                            warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                            continue;
+                        }
+                        tokio::task::yield_now().await;
 
-                    if !into.compacted {
                         let h = DataUsageHash(folder_item.name.clone());
                         into.add_child(&h);
                         // We scanned a folder, optionally send update.
