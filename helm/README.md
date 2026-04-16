@@ -102,7 +102,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |
 | mode.standalone.existingClaim.logsClaim |string |`""` |Whether to use existing pvc claim for logs storage. |
 | mtls.enabled | bool | `false` | Enable mtls betweens pods. |
-| mtls.serverOnly | bool | `false` | Only enable server https. |
+| mtls.clientCertPath | string | `/opt/tls/client_cert.pem` | The path for client cert. |
+| mtls.clientKeyPath | string | `/opt/tls/client_key.pem` | The path for client key. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
