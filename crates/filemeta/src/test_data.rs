@@ -104,7 +104,7 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.versions.push(legacy_shallow);
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
+    fm.versions.sort_by_key(|b| std::cmp::Reverse(b.header.mod_time));
 
     fm.marshal_msg()
 }
@@ -263,11 +263,11 @@ pub fn create_legacy_v1_object_xlmeta() -> Result<Vec<u8>> {
     wr.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
 
     let offset = wr.len();
-    rmp::encode::write_uint(&mut wr, 1).unwrap();
-    rmp::encode::write_uint(&mut wr, 1).unwrap();
-    rmp::encode::write_sint(&mut wr, 1).unwrap();
-    rmp::encode::write_bin(&mut wr, &header).unwrap();
-    rmp::encode::write_bin(&mut wr, &body).unwrap();
+    rmp::encode::write_uint(&mut wr, 1)?;
+    rmp::encode::write_uint(&mut wr, 1)?;
+    rmp::encode::write_sint(&mut wr, 1)?;
+    rmp::encode::write_bin(&mut wr, &header)?;
+    rmp::encode::write_bin(&mut wr, &body)?;
 
     let data_len = (wr.len() - offset) as u32;
     wr[offset - 4..offset].copy_from_slice(&data_len.to_be_bytes());
@@ -350,7 +350,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     }
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by(|a, b| b.header.mod_time.cmp(&a.header.mod_time));
+    fm.versions.sort_by_key(|b| std::cmp::Reverse(b.header.mod_time));
 
     fm.marshal_msg()
 }
