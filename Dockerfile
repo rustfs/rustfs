@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.23 AS build
+FROM alpine:3.23.4 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -54,7 +54,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.23
+FROM alpine:3.23.4
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -73,7 +73,7 @@ LABEL name="RustFS" \
       license="Apache-2.0"
 
 RUN apk update && \
-    apk add --no-cache ca-certificates coreutils curl "zlib>=1.3.2-r0"
+    apk add --no-cache ca-certificates coreutils curl
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
