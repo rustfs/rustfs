@@ -3086,7 +3086,7 @@ impl MultipartOperations for SetDisks {
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
-        let mod_time = opts.mod_time.unwrap_or(OffsetDateTime::now_utc());
+        let mod_time = opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc);
 
         for f in parts_metadatas.iter_mut() {
             f.metadata = user_defined.clone();
@@ -4107,7 +4107,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         runtime_state: Some(runtime_state.as_str().to_string()),
                         offline_duration_seconds,
 
-                        uuid: res.id.map_or("".to_string(), |id| id.to_string()),
+                        uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
                         major: res.major as u32,
                         minor: res.minor as u32,
                         model: None,

@@ -140,7 +140,7 @@ impl ProxyChainAnalyzer {
             return (client_ip, chain.to_vec(), chain.len());
         }
 
-        let client_ip = chain.first().copied().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let client_ip = chain.first().copied().unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
         (client_ip, Vec::new(), 0)
     }
 
@@ -156,7 +156,7 @@ impl ProxyChainAnalyzer {
             }
         }
 
-        let client_ip = chain.first().copied().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let client_ip = chain.first().copied().unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
         Ok((client_ip, chain.to_vec(), chain.len()))
     }
 

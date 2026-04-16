@@ -629,7 +629,7 @@ impl ScannerIODisk for Disk {
 
         let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
             .await
-            .unwrap_or((BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+            .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
 
         if lifecycle_config.has_active_rules("") {
             cache.info.lifecycle = Some(Arc::new(lifecycle_config));

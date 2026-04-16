@@ -245,7 +245,7 @@ async fn handle_assume_role(
             expiration: Timestamp::from(
                 new_cred
                     .expiration
-                    .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
+                    .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
             ),
             secret_access_key: new_cred.secret_key,
             session_token: new_cred.session_token,
@@ -326,7 +326,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     // Build XML response (AssumeRoleWithWebIdentityResponse)
     let expiration = new_cred
         .expiration
-        .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
+        .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
     let exp_str = expiration
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();

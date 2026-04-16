@@ -1538,7 +1538,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -1587,7 +1587,7 @@ impl DiskAPI for LocalDisk {
                 self.get_object_path(
                     bucket,
                     path_join_buf(&[
-                        path.parent().unwrap_or(Path::new("")).to_string_lossy().as_ref(),
+                        path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
                         &format!("part.{num}"),
                     ])
                     .as_str(),
@@ -1648,7 +1648,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -2497,7 +2497,7 @@ impl DiskAPI for LocalDisk {
                     let part_path = format!("part.{}", part.number);
                     let part_path = path_join_buf(&[
                         path,
-                        fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                        fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                         part_path.as_str(),
                     ]);
                     let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2514,7 +2514,7 @@ impl DiskAPI for LocalDisk {
             if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
                 let part_path = path_join_buf(&[
                     path,
-                    fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                    fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                     format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
