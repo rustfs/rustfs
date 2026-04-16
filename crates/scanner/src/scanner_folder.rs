@@ -96,7 +96,7 @@ fn ensure_scanner_inline_heal_metric_registered() {
     SCANNER_INLINE_HEAL_METRICS_ONCE.call_once(|| {
         describe_counter!(
             METRIC_SCANNER_INLINE_HEAL_TOTAL,
-            "Total number of inline heal operations executed directly by scanner; Patch 3 should keep this at 0."
+            "Total number of inline heal operations executed directly by scanner."
         );
         counter!(METRIC_SCANNER_INLINE_HEAL_TOTAL).increment(0);
     });
@@ -1147,8 +1147,7 @@ impl FolderScanner {
                         None,
                         build_bucket_heal_request(bucket.clone(), HealChannelPriority::High),
                     )
-                    .await
-                    .map_err(ScannerError::Other)?;
+                    .await?;
                 }
 
                 resolver.bucket = bucket.clone();

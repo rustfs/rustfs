@@ -100,7 +100,7 @@ pub async fn init_oidc_sys() -> Result<()> {
         }
         Err(e) => {
             warn!("OIDC initialization failed (non-fatal): {}", e);
-            OidcSys::empty()
+            OidcSys::empty().map_err(Error::StringError)?
         }
     };
 

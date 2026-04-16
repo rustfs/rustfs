@@ -885,7 +885,7 @@ impl DiskAPI for RemoteDisk {
         let file_info_bin = encode_msgpack(&fi)?;
 
         self.execute_with_timeout_for_op(
-            "read_metadata",
+            "write_metadata",
             || async {
                 let disk = self.disk_ref().await;
                 let mut client = self
@@ -915,7 +915,7 @@ impl DiskAPI for RemoteDisk {
 
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         self.execute_with_timeout_for_op(
-            "list_dir",
+            "read_metadata",
             || async {
                 let disk = self.disk_ref().await;
                 let mut client = self
@@ -950,7 +950,7 @@ impl DiskAPI for RemoteDisk {
         let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout_for_op(
-            "walk_dir",
+            "update_metadata",
             || async {
                 let disk = self.disk_ref().await;
                 let mut client = self

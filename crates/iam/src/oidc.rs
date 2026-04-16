@@ -78,12 +78,14 @@ pub(crate) struct ReqwestHttpClient {
     no_proxy: Client,
 }
 
-fn build_oidc_http_client(disable_proxy: bool) -> Client {
+fn build_oidc_http_client(disable_proxy: bool) -> Result<Client, String> {
     let mut builder = reqwest::Client::builder();
     if disable_proxy {
         builder = builder.no_proxy();
     }
-    builder.build().expect("OIDC reqwest client should build")
+    builder
+        .build()
+        .map_err(|err| format!("failed to build OIDC reqwest client: {err}"))
 }
 
 fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
@@ -96,11 +98,11 @@ fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
 }
 
 impl ReqwestHttpClient {
-    fn new() -> Self {
-        Self {
-            default: build_oidc_http_client(false),
-            no_proxy: build_oidc_http_client(true),
-        }
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            default: build_oidc_http_client(false)?,
+            no_proxy: build_oidc_http_client(true)?,
+        })
     }
 
     fn client_for_uri(&self, uri: &str) -> &Client {
@@ -236,7 +238,7 @@ pub struct OidcSys {
 impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
-        let http_client = ReqwestHttpClient::new();
+        let http_client = ReqwestHttpClient::new()?;
         let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
@@ -269,13 +271,13 @@ impl OidcSys {
     }
 
     /// Create an OidcSys with no providers (useful for when OIDC is not configured).
-    pub fn empty() -> Self {
-        Self {
+    pub fn empty() -> Result<Self, String> {
+        Ok(Self {
             configs: HashMap::new(),
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient::new(),
-        }
+            http_client: ReqwestHttpClient::new()?,
+        })
     }
 
     /// Return true if any OIDC providers are configured and enabled.
@@ -985,7 +987,7 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
 }
 
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-    let http_client = ReqwestHttpClient::new();
+    let http_client = ReqwestHttpClient::new()?;
     let state = OidcSys::discover_provider(config, &http_client).await?;
 
     Ok(OidcProviderValidationResult {
@@ -1518,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_map_claims_to_policies_no_provider() {
-        let sys = OidcSys::empty();
+        let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
 
         let claims = OidcClaims {
             sub: "user123".to_string(),
@@ -1677,7 +1679,7 @@ mod tests {
 
     #[test]
     fn test_oidc_sys_empty() {
-        let sys = OidcSys::empty();
+        let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
         assert!(!sys.has_providers());
         assert!(sys.list_providers().is_empty());
     }
@@ -1703,7 +1705,7 @@ mod tests {
             configs: config_map,
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient::new(),
+            http_client: ReqwestHttpClient::new().expect("failed to initialize OIDC HTTP clients"),
         }
     }
 

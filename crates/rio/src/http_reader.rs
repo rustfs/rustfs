@@ -247,18 +247,6 @@ impl AsyncRead for HttpReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
 
-        if let Some(timer) = this.stall_timer.as_mut()
-            && timer.as_mut().poll(cx).is_ready()
-        {
-            if *this.track_internode_metrics {
-                global_internode_metrics().record_error();
-            }
-            return Poll::Ready(Err(Error::new(
-                io::ErrorKind::TimedOut,
-                "HttpReader stall timeout: no data received before deadline",
-            )));
-        }
-
         let filled_before = buf.filled().len();
         match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
@@ -274,6 +262,21 @@ impl AsyncRead for HttpReader {
                     *this.stall_timer = None;
                 }
                 Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                if let Some(timer) = this.stall_timer.as_mut()
+                    && timer.as_mut().poll(cx).is_ready()
+                {
+                    if *this.track_internode_metrics {
+                        global_internode_metrics().record_error();
+                    }
+                    Poll::Ready(Err(Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HttpReader stall timeout: no data received before deadline",
+                    )))
+                } else {
+                    Poll::Pending
+                }
             }
             other => other,
         }
