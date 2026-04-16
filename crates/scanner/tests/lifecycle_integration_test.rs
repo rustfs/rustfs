@@ -1279,29 +1279,12 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn test_scanner_expires_zero_day_noncurrent_version() {
-        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
         let bucket_name = format!("test-zero-day-noncurrent-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/object.txt";
 
         create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
-
-        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<LifecycleConfiguration>
-    <Rule>
-        <ID>test-rule</ID>
-        <Status>Enabled</Status>
-        <Filter>
-            <Prefix>test/</Prefix>
-        </Filter>
-        <NoncurrentVersionExpiration>
-            <NoncurrentDays>0</NoncurrentDays>
-        </NoncurrentVersionExpiration>
-    </Rule>
-</LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
-            .await
-            .expect("Failed to set noncurrent lifecycle configuration");
 
         let mut reader = PutObjReader::from_vec(b"v1".to_vec());
         ecstore
@@ -1331,6 +1314,25 @@ mod serial_tests {
             .expect("failed to upload v2");
 
         assert_eq!(object_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await, 2);
+
+        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#;
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+            .await
+            .expect("Failed to set noncurrent lifecycle configuration");
+
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
