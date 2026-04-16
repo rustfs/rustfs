@@ -429,7 +429,7 @@ impl FileInfo {
         if self.deleted {
             return "delete-marker".to_string();
         }
-        self.data_dir.map_or("".to_string(), |dir| dir.to_string())
+        self.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string())
     }
 
     /// Read quorum returns expected read quorum for this FileInfo

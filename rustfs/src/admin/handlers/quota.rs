@@ -103,7 +103,7 @@ fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, 
         quota: request
             .size
             .filter(|quota| *quota > 0)
-            .or(request.quota.filter(|quota| *quota > 0)),
+            .or_else(|| request.quota.filter(|quota| *quota > 0)),
         quota_type: request.quota_type.unwrap_or_else(default_quota_type),
     })
 }

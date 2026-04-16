@@ -20,7 +20,6 @@ use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
 use s3s::{S3Result, s3_error};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -79,7 +78,7 @@ async fn check_admin_request_auth(
             action,
             conditions: &conditions,
             is_owner: ctx.is_owner,
-            claims: ctx.cred.claims.as_ref().unwrap_or(&HashMap::new()),
+            claims: ctx.cred.claims_or_empty(),
             deny_only: ctx.deny_only,
             bucket,
             object,

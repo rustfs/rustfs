@@ -2186,7 +2186,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
             let usecase = DefaultObjectUsecase::from_global();
-            let get_resp = usecase.execute_get_object(get_req).await?;
+            let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {
@@ -2386,7 +2386,7 @@ where
             return handle_replication_extension_request(&mut req, &ext_req).await;
         }
         if let Some(ext_req) = parse_misc_extension_request(&req.method, &req.uri) {
-            return handle_misc_extension_request(&mut req, &ext_req).await;
+            return Box::pin(handle_misc_extension_request(&mut req, &ext_req)).await;
         }
 
         // Console requests should be handled by console router first (including OPTIONS)

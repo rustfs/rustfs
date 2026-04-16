@@ -250,7 +250,7 @@ impl Operation for AddServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false, // Always require explicit Allow permission
             })
             .await
@@ -546,7 +546,7 @@ impl Operation for UpdateServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -662,7 +662,7 @@ impl Operation for InfoServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -729,7 +729,7 @@ impl Operation for TemporaryAccountInfo {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -803,7 +803,7 @@ impl Operation for InfoAccessKey {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -940,7 +940,7 @@ impl Operation for ListServiceAccount {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1076,7 +1076,7 @@ impl Operation for ListAccessKeysBulk {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1099,7 +1099,7 @@ impl Operation for ListAccessKeysBulk {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: self_only,
             })
             .await
@@ -1268,7 +1268,7 @@ impl Operation for DeleteServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await

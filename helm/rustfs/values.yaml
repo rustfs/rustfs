@@ -97,6 +97,16 @@ config:
       profiling:
         enabled: false
         endpoint: "" # If specified, rustfs will export profiling data to this endpoint. e.g. "http://localhost:6060/debug/pprof/profile"
+    kms:
+      enabled: false
+      type: "vault" # Only Support vault currently.
+      vault:
+        vault_backend: "" # Only support vault kv2 and vault transit. 
+        vault_address: ""
+        vault_token: ""
+        vault_mount_path: ""
+        default_key: ""
+
 
 extraEnv: [] # This is for setting extra environment variables in the rustfs container. It should be a list of key value pairs. For example:
 # extraEnv:
@@ -216,8 +226,8 @@ gatewayApi:
 
 mtls:
   enabled: false
-  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
-  # This is for setting up mTLS for ingress.
+  clientCertPath: "/opt/tls/client_cert.pem"
+  clientKeyPath: "/opt/tls/client_key.pem"
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
@@ -236,8 +246,9 @@ livenessProbe:
   enabled: true # omitted
   httpGet:
     path: /health
-    port: endpoint
-  initialDelaySeconds: 10
+    port: 9000
+    scheme: HTTP
+  initialDelaySeconds: 30
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1
@@ -248,7 +259,8 @@ readinessProbe:
   httpGet:
     path: /health/ready
     port: endpoint
-  initialDelaySeconds: 30
+    scheme: HTTP
+  initialDelaySeconds: 10
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1

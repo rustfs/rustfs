@@ -96,14 +96,14 @@ impl AllTierStats {
     pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
         for (tier, st) in tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
     pub fn merge(&mut self, other: AllTierStats) {
         for (tier, st) in other.tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
@@ -251,7 +251,7 @@ impl SizeSummary {
             return;
         }
 
-        let mut tier = oi.storage_class.clone().unwrap_or(storageclass::STANDARD.to_string());
+        let mut tier = oi.storage_class.clone().unwrap_or_else(|| storageclass::STANDARD.to_string());
         if oi.transitioned_object.status == TRANSITION_COMPLETE {
             tier = oi.transitioned_object.tier.clone();
         }

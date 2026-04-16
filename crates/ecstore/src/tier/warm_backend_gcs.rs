@@ -107,11 +107,12 @@ impl WarmBackend for WarmBackendGCS {
             ReaderImpl::Body(content_body) => content_body.to_vec(),
             ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
         };
-        let Ok(res) = self
-            .client
-            .write_object(&self.bucket, &self.get_dest(object), Bytes::from(d))
-            .send_buffered()
-            .await
+        let Ok(res) = Box::pin(
+            self.client
+                .write_object(&self.bucket, &self.get_dest(object), Bytes::from(d))
+                .send_buffered(),
+        )
+        .await
         else {
             return Err(std::io::Error::other("write_object error"));
         };

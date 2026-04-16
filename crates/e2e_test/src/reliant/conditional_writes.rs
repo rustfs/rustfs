@@ -259,7 +259,7 @@ async fn test_conditional_multi_part_upload() -> Result<(), Box<dyn std::error::
 
     let upload_id = initiate_response
         .upload_id()
-        .ok_or(std::io::Error::other("No upload ID returned"))?;
+        .ok_or_else(|| std::io::Error::other("No upload ID returned"))?;
 
     // Upload parts
     for part_number in 1..=num_parts {
@@ -277,7 +277,7 @@ async fn test_conditional_multi_part_upload() -> Result<(), Box<dyn std::error::
 
         let part_etag = upload_part_response
             .e_tag()
-            .ok_or(std::io::Error::other("Do not have etag"))?
+            .ok_or_else(|| std::io::Error::other("Do not have etag"))?
             .to_string();
 
         let completed_part = CompletedPart::builder().part_number(part_number).e_tag(part_etag).build();
