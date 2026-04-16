@@ -59,6 +59,18 @@ Current guidance:
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 
+## Drive timeout environment variables
+
+- `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_DISK_INFO_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_LIST_DIR_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_WALKDIR_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`
+
+Legacy compatibility fallback:
+- `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION`
+  This legacy variable is treated as a deprecated fallback for the operation-specific drive timeout variables above when a canonical variable is unset.
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.

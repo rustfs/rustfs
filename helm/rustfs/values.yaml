@@ -226,8 +226,8 @@ gatewayApi:
 
 mtls:
   enabled: false
-  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
-  # This is for setting up mTLS for ingress.
+  clientCertPath: "/opt/tls/client_cert.pem"
+  clientKeyPath: "/opt/tls/client_key.pem"
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
@@ -246,8 +246,9 @@ livenessProbe:
   enabled: true # omitted
   httpGet:
     path: /health
-    port: endpoint
-  initialDelaySeconds: 10
+    port: 9000
+    scheme: HTTP
+  initialDelaySeconds: 30
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1
@@ -258,7 +259,8 @@ readinessProbe:
   httpGet:
     path: /health/ready
     port: endpoint
-  initialDelaySeconds: 30
+    scheme: HTTP
+  initialDelaySeconds: 10
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1

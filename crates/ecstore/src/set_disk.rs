@@ -1032,57 +1032,163 @@ impl SetDisks {
             1
         };
 
-        let client_results = join_all(self.lockers.iter().cloned().enumerate().map(|(client_idx, client)| {
-            let requests = requests.clone();
-            async move { (client_idx, client.acquire_locks_batch(&requests).await) }
-        }))
-        .await;
-
         let mut lock_ids_by_object: Vec<Vec<(usize, rustfs_lock::LockId)>> = vec![Vec::new(); requests.len()];
         let mut errors_by_object: Vec<Option<String>> = vec![None; requests.len()];
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ObjectLockResolution {
+            Pending,
+            Succeeded,
+            Failed,
+        }
 
-        for (client_idx, result) in client_results {
-            match result {
-                Ok(responses) => {
+        let mut resolution_by_object = vec![ObjectLockResolution::Pending; requests.len()];
+        let mut pending_clients = self.lockers.len();
+        let mut unresolved_objects = requests.len();
+        let mut cleanup_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
+
+        let mut pending = tokio::task::JoinSet::new();
+        for (client_idx, client) in self.lockers.iter().cloned().enumerate() {
+            let requests = requests.clone();
+            pending.spawn(async move { (client_idx, client.acquire_locks_batch(&requests).await) });
+        }
+
+        while unresolved_objects > 0 {
+            let Some(join_result) = pending.join_next().await else {
+                break;
+            };
+            pending_clients = pending_clients.saturating_sub(1);
+
+            match join_result {
+                Ok((client_idx, Ok(responses))) => {
                     for (req_idx, request) in requests.iter().enumerate() {
-                        match responses.get(req_idx) {
-                            Some(response) if response.success => {
-                                if let Some(lock_info) = response.lock_info.as_ref() {
-                                    lock_ids_by_object[req_idx].push((client_idx, lock_info.id.clone()));
-                                } else if errors_by_object[req_idx].is_none() {
-                                    errors_by_object[req_idx] = Some(format!(
-                                        "missing distributed lock id for {}/{}",
-                                        request.resource.bucket, request.resource.object
-                                    ));
+                        let response = responses.get(req_idx);
+                        match resolution_by_object[req_idx] {
+                            ObjectLockResolution::Pending => match response {
+                                Some(response) if response.success => {
+                                    let lock_id = response
+                                        .lock_info
+                                        .as_ref()
+                                        .map(|lock_info| lock_info.id.clone())
+                                        .unwrap_or_else(|| request.lock_id.clone());
+                                    lock_ids_by_object[req_idx].push((client_idx, lock_id));
                                 }
-                            }
-                            Some(response) => {
-                                if errors_by_object[req_idx].is_none() {
-                                    errors_by_object[req_idx] = Some(
-                                        response
-                                            .error
-                                            .clone()
-                                            .unwrap_or_else(|| "distributed lock acquisition failed".to_string()),
-                                    );
+                                Some(response) => {
+                                    if errors_by_object[req_idx].is_none() {
+                                        errors_by_object[req_idx] = Some(
+                                            response
+                                                .error
+                                                .clone()
+                                                .unwrap_or_else(|| "distributed lock acquisition failed".to_string()),
+                                        );
+                                    }
                                 }
-                            }
-                            None => {
-                                if errors_by_object[req_idx].is_none() {
-                                    errors_by_object[req_idx] =
-                                        Some(format!("client {client_idx} returned incomplete batch lock response"));
+                                None => {
+                                    if errors_by_object[req_idx].is_none() {
+                                        errors_by_object[req_idx] =
+                                            Some(format!("client {client_idx} returned incomplete batch lock response"));
+                                    }
+                                }
+                            },
+                            ObjectLockResolution::Succeeded | ObjectLockResolution::Failed => {
+                                if let Some(response) = response
+                                    && response.success
+                                {
+                                    let lock_id = response
+                                        .lock_info
+                                        .as_ref()
+                                        .map(|lock_info| lock_info.id.clone())
+                                        .unwrap_or_else(|| request.lock_id.clone());
+                                    cleanup_lock_ids_by_client[client_idx].push(lock_id);
                                 }
                             }
                         }
                     }
                 }
-                Err(err) => {
-                    for error in errors_by_object.iter_mut().take(requests.len()) {
-                        if error.is_none() {
+                Ok((client_idx, Err(err))) => {
+                    for (req_idx, error) in errors_by_object.iter_mut().enumerate().take(requests.len()) {
+                        if resolution_by_object[req_idx] == ObjectLockResolution::Pending && error.is_none() {
                             *error = Some(format!("client {client_idx} batch lock request failed: {err}"));
                         }
                     }
                 }
+                Err(err) => {
+                    for (req_idx, error) in errors_by_object.iter_mut().enumerate().take(requests.len()) {
+                        if resolution_by_object[req_idx] == ObjectLockResolution::Pending && error.is_none() {
+                            *error = Some(format!("batch lock task join failed: {err}"));
+                        }
+                    }
+                }
             }
+
+            for req_idx in 0..requests.len() {
+                if resolution_by_object[req_idx] != ObjectLockResolution::Pending {
+                    continue;
+                }
+
+                let success_count = lock_ids_by_object[req_idx].len();
+                if success_count >= write_quorum {
+                    resolution_by_object[req_idx] = ObjectLockResolution::Succeeded;
+                    unresolved_objects -= 1;
+                } else if success_count + pending_clients < write_quorum {
+                    resolution_by_object[req_idx] = ObjectLockResolution::Failed;
+                    unresolved_objects -= 1;
+                }
+            }
+        }
+
+        if !pending.is_empty() {
+            let cleanup_requests = requests.clone();
+            let lockers = self.lockers.clone();
+            let handle = tokio::spawn(async move {
+                let mut late_lock_ids_by_client = vec![Vec::new(); lockers.len()];
+                let mut pending = pending;
+                while let Some(join_result) = pending.join_next().await {
+                    match join_result {
+                        Ok((client_idx, Ok(responses))) => {
+                            for (req_idx, request) in cleanup_requests.iter().enumerate() {
+                                if let Some(response) = responses.get(req_idx)
+                                    && response.success
+                                {
+                                    let lock_id = response
+                                        .lock_info
+                                        .as_ref()
+                                        .map(|lock_info| lock_info.id.clone())
+                                        .unwrap_or_else(|| request.lock_id.clone());
+                                    if let Some(client_locks) = late_lock_ids_by_client.get_mut(client_idx) {
+                                        client_locks.push(lock_id);
+                                    }
+                                }
+                            }
+                        }
+                        Ok((_client_idx, Err(err))) => {
+                            tracing::warn!("late distributed delete lock batch request failed: {}", err);
+                        }
+                        Err(err) => {
+                            tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                        }
+                    }
+                }
+
+                join_all(lockers.iter().cloned().enumerate().filter_map(|(client_idx, client)| {
+                    let lock_ids = late_lock_ids_by_client.get(client_idx).cloned().unwrap_or_default();
+                    if lock_ids.is_empty() {
+                        None
+                    } else {
+                        Some(async move {
+                            if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                                tracing::warn!(
+                                    client_idx,
+                                    lock_count = lock_ids.len(),
+                                    "failed to cleanup late distributed delete locks in batch: {}",
+                                    err
+                                );
+                            }
+                        })
+                    }
+                }))
+                .await;
+            });
+            drop(handle);
         }
 
         let mut failed_map = HashMap::new();
@@ -1092,22 +1198,29 @@ impl SetDisks {
 
         for (req_idx, req) in batch.requests.iter().enumerate() {
             let success_count = lock_ids_by_object[req_idx].len();
-            if success_count >= write_quorum {
-                for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
-                    held_lock_ids_by_client[client_idx].push(lock_id);
+            match resolution_by_object[req_idx] {
+                ObjectLockResolution::Succeeded => {
+                    for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
+                        held_lock_ids_by_client[client_idx].push(lock_id);
+                    }
+                    locked_objects.insert(req.key.object.as_ref().to_string());
                 }
-                locked_objects.insert(req.key.object.as_ref().to_string());
-            } else {
-                for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
-                    rollback_lock_ids_by_client[client_idx].push(lock_id);
+                ObjectLockResolution::Pending | ObjectLockResolution::Failed => {
+                    for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
+                        rollback_lock_ids_by_client[client_idx].push(lock_id);
+                    }
+                    failed_map.insert(
+                        (req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()),
+                        errors_by_object[req_idx].clone().unwrap_or_else(|| {
+                            format!("failed to acquire distributed delete lock quorum: {success_count}/{write_quorum}")
+                        }),
+                    );
                 }
-                failed_map.insert(
-                    (req.key.bucket.as_ref().to_string(), req.key.object.as_ref().to_string()),
-                    errors_by_object[req_idx].clone().unwrap_or_else(|| {
-                        format!("failed to acquire distributed delete lock quorum: {success_count}/{write_quorum}")
-                    }),
-                );
             }
+        }
+
+        for (client_idx, cleanup_ids) in cleanup_lock_ids_by_client.into_iter().enumerate() {
+            rollback_lock_ids_by_client[client_idx].extend(cleanup_ids);
         }
 
         self.release_dist_delete_object_locks_batch(rollback_lock_ids_by_client).await;
@@ -4000,47 +4113,57 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
 
     for (i, pool) in disks.iter().enumerate() {
         if let Some(disk) = pool {
-            match disk.disk_info(&DiskInfoOptions::default()).await {
-                Ok(res) => ret.push(rustfs_madmin::Disk {
-                    endpoint: eps[i].to_string(),
-                    local: eps[i].is_local,
-                    pool_index: eps[i].pool_idx,
-                    set_index: eps[i].set_idx,
-                    disk_index: eps[i].disk_idx,
-                    state: "ok".to_owned(),
+            let runtime_state = disk.runtime_state();
+            let offline_duration_seconds = disk.offline_duration_secs();
+            if runtime_state.should_probe_for_admin() {
+                match disk.disk_info(&DiskInfoOptions::default()).await {
+                    Ok(res) => ret.push(rustfs_madmin::Disk {
+                        endpoint: eps[i].to_string(),
+                        local: eps[i].is_local,
+                        pool_index: eps[i].pool_idx,
+                        set_index: eps[i].set_idx,
+                        disk_index: eps[i].disk_idx,
+                        state: "ok".to_owned(),
 
-                    root_disk: res.root_disk,
-                    drive_path: res.mount_path.clone(),
-                    healing: res.healing,
-                    scanning: res.scanning,
+                        root_disk: res.root_disk,
+                        drive_path: res.mount_path.clone(),
+                        healing: res.healing,
+                        scanning: res.scanning,
+                        runtime_state: Some(runtime_state.as_str().to_string()),
+                        offline_duration_seconds,
 
-                    uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
-                    major: res.major as u32,
-                    minor: res.minor as u32,
-                    model: None,
-                    total_space: res.total,
-                    used_space: res.used,
-                    available_space: res.free,
-                    utilization: {
-                        if res.total > 0 {
-                            res.used as f64 / res.total as f64 * 100_f64
-                        } else {
-                            0_f64
-                        }
-                    },
-                    used_inodes: res.used_inodes,
-                    free_inodes: res.free_inodes,
-                    ..Default::default()
-                }),
-                Err(err) => ret.push(rustfs_madmin::Disk {
-                    state: err.to_string(),
-                    endpoint: eps[i].to_string(),
-                    local: eps[i].is_local,
-                    pool_index: eps[i].pool_idx,
-                    set_index: eps[i].set_idx,
-                    disk_index: eps[i].disk_idx,
-                    ..Default::default()
-                }),
+                        uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
+                        major: res.major as u32,
+                        minor: res.minor as u32,
+                        model: None,
+                        total_space: res.total,
+                        used_space: res.used,
+                        available_space: res.free,
+                        utilization: {
+                            if res.total > 0 {
+                                res.used as f64 / res.total as f64 * 100_f64
+                            } else {
+                                0_f64
+                            }
+                        },
+                        used_inodes: res.used_inodes,
+                        free_inodes: res.free_inodes,
+                        ..Default::default()
+                    }),
+                    Err(err) => ret.push(rustfs_madmin::Disk {
+                        state: err.to_string(),
+                        endpoint: eps[i].to_string(),
+                        local: eps[i].is_local,
+                        pool_index: eps[i].pool_idx,
+                        set_index: eps[i].set_idx,
+                        disk_index: eps[i].disk_idx,
+                        runtime_state: Some(runtime_state.as_str().to_string()),
+                        offline_duration_seconds,
+                        ..Default::default()
+                    }),
+                }
+            } else {
+                ret.push(build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds));
             }
         } else {
             ret.push(rustfs_madmin::Disk {
@@ -4049,6 +4172,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
                 disk_index: eps[i].disk_idx,
+                runtime_state: None,
+                offline_duration_seconds: None,
                 state: DiskError::DiskNotFound.to_string(),
                 ..Default::default()
             })
@@ -4056,6 +4181,24 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
     }
 
     ret
+}
+
+fn build_runtime_snapshot_disk(
+    endpoint: &Endpoint,
+    runtime_state: crate::disk::health_state::RuntimeDriveHealthState,
+    offline_duration_seconds: Option<u64>,
+) -> rustfs_madmin::Disk {
+    rustfs_madmin::Disk {
+        endpoint: endpoint.to_string(),
+        local: endpoint.is_local,
+        pool_index: endpoint.pool_idx,
+        set_index: endpoint.set_idx,
+        disk_index: endpoint.disk_idx,
+        state: runtime_state.as_str().to_string(),
+        runtime_state: Some(runtime_state.as_str().to_string()),
+        offline_duration_seconds,
+        ..Default::default()
+    }
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;
@@ -4213,15 +4356,18 @@ mod tests {
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
+    use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::store_api::{CompletePart, ObjectInfo};
+    use crate::store_init::save_format_file;
     use rustfs_filemeta::ErasureInfo;
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serial_test::serial;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use time::OffsetDateTime;
 
     #[derive(Debug, Default)]
@@ -4263,6 +4409,60 @@ mod tests {
 
         async fn is_local(&self) -> bool {
             false
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedBatchClient {
+        inner: Arc<dyn LockClient>,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for DelayedBatchClient {
+        async fn acquire_lock(&self, request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            self.inner.acquire_lock(request).await
+        }
+
+        async fn acquire_locks_batch(&self, requests: &[rustfs_lock::LockRequest]) -> rustfs_lock::Result<Vec<LockResponse>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.acquire_locks_batch(requests).await
+        }
+
+        async fn release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            self.inner.release(lock_id).await
+        }
+
+        async fn release_locks_batch(&self, lock_ids: &[rustfs_lock::LockId]) -> rustfs_lock::Result<Vec<bool>> {
+            self.inner.release_locks_batch(lock_ids).await
+        }
+
+        async fn refresh(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            self.inner.refresh(lock_id).await
+        }
+
+        async fn force_release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            self.inner.force_release(lock_id).await
+        }
+
+        async fn check_status(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            self.inner.check_status(lock_id).await
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            self.inner.get_stats().await
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            self.inner.close().await
+        }
+
+        async fn is_online(&self) -> bool {
+            self.inner.is_online().await
+        }
+
+        async fn is_local(&self) -> bool {
+            self.inner.is_local().await
         }
     }
 
@@ -4320,6 +4520,33 @@ mod tests {
         } else {
             SetupType::Unknown
         }
+    }
+
+    async fn make_formatted_local_disk_for_info_test(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
     }
 
     #[test]
@@ -4699,6 +4926,113 @@ mod tests {
         drop(guard);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_acquire_dist_delete_object_locks_batch_returns_after_quorum_without_waiting_for_slow_lockers() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager_fast_1 = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager_fast_2 = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager_fast_3 = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager_slow = Arc::new(rustfs_lock::GlobalLockManager::new());
+
+        let client_fast_1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast_1));
+        let client_fast_2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast_2));
+        let client_fast_3: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast_3));
+        let client_slow: Arc<dyn LockClient> = Arc::new(DelayedBatchClient {
+            inner: Arc::new(LocalClient::with_manager(manager_slow.clone())),
+            delay: Duration::from_millis(250),
+        });
+
+        let set_disks = make_test_set_disks(vec![client_fast_1, client_fast_2, client_fast_3, client_slow]).await;
+
+        let batch = rustfs_lock::BatchLockRequest::new(set_disks.locker_owner.as_str())
+            .with_all_or_nothing(false)
+            .add_write_lock(ObjectKey::new("bucket", "object-a"))
+            .add_write_lock(ObjectKey::new("bucket", "object-b"));
+
+        let started = Instant::now();
+        let (failed_map, locked_objects, held_lock_ids_by_client) =
+            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "batch distributed delete locks should return once quorum is satisfied"
+        );
+        assert!(failed_map.is_empty());
+        assert_eq!(locked_objects.len(), 2);
+
+        set_disks
+            .release_dist_delete_object_locks_batch(held_lock_ids_by_client)
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let slow_lock = NamespaceLock::with_local_manager("slow-node".to_string(), manager_slow);
+        let guard_a = slow_lock
+            .get_write_lock(ObjectKey::new("bucket", "object-a"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("late successful batch lock should be cleaned up for object-a");
+        let guard_b = slow_lock
+            .get_write_lock(ObjectKey::new("bucket", "object-b"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("late successful batch lock should be cleaned up for object-b");
+
+        drop(guard_a);
+        drop(guard_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_acquire_dist_delete_object_locks_batch_fails_early_and_cleans_up_late_successes() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager_fast = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let manager_slow = Arc::new(rustfs_lock::GlobalLockManager::new());
+
+        let client_fast: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast));
+        let client_fail_1: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let client_fail_2: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let client_slow: Arc<dyn LockClient> = Arc::new(DelayedBatchClient {
+            inner: Arc::new(LocalClient::with_manager(manager_slow.clone())),
+            delay: Duration::from_millis(250),
+        });
+
+        let set_disks = make_test_set_disks(vec![client_fast, client_fail_1, client_fail_2, client_slow]).await;
+        let batch = rustfs_lock::BatchLockRequest::new(set_disks.locker_owner.as_str())
+            .with_all_or_nothing(false)
+            .add_write_lock(ObjectKey::new("bucket", "object-a"))
+            .add_write_lock(ObjectKey::new("bucket", "object-b"));
+
+        let started = Instant::now();
+        let (failed_map, locked_objects, held_lock_ids_by_client) =
+            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "batch distributed delete locks should fail as soon as quorum becomes impossible"
+        );
+        assert!(locked_objects.is_empty());
+        assert!(failed_map.contains_key(&("bucket".to_string(), "object-a".to_string())));
+        assert!(failed_map.contains_key(&("bucket".to_string(), "object-b".to_string())));
+        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let slow_lock = NamespaceLock::with_local_manager("slow-node".to_string(), manager_slow);
+        let guard_a = slow_lock
+            .get_write_lock(ObjectKey::new("bucket", "object-a"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("late successful batch failure cleanup should release object-a");
+        let guard_b = slow_lock
+            .get_write_lock(ObjectKey::new("bucket", "object-b"), "owner-b", Duration::from_millis(100))
+            .await
+            .expect("late successful batch failure cleanup should release object-b");
+
+        drop(guard_a);
+        drop(guard_b);
+    }
+
     #[test]
     fn test_common_parity() {
         // Test common parity calculation
@@ -4916,6 +5250,45 @@ mod tests {
         // Test with part corruption
         let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_uses_runtime_snapshot_for_suspect_and_offline_disks() {
+        let format = FormatV3::new(1, 3);
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+
+        for disk_idx in 0..3 {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        disks[1]
+            .as_ref()
+            .expect("disk 1 should exist")
+            .force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
+        disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&disks, &endpoints).await;
+        assert_eq!(info.len(), 3);
+
+        assert_eq!(info[0].state, "ok");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
+        assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
+
+        assert_eq!(info[1].state, "suspect");
+        assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
+        assert!(info[1].drive_path.is_empty(), "suspect disk should use runtime snapshot fallback");
+
+        assert_eq!(info[2].state, "offline");
+        assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
+        assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
     }
 
     #[test]

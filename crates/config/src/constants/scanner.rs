@@ -48,6 +48,15 @@ pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 /// Default scanner idle mode.
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 
+/// Compatibility flag kept for Patch 3 rollback windows.
+///
+/// Inline scanner heal execution has been removed in favor of heal-candidate enqueue.
+/// When this flag is enabled, RustFS logs a warning and continues to use enqueue-based heal.
+pub const ENV_SCANNER_INLINE_HEAL_ENABLE: &str = "RUSTFS_SCANNER_INLINE_HEAL_ENABLE";
+
+/// Default inline scanner heal compatibility mode.
+pub const DEFAULT_SCANNER_INLINE_HEAL_ENABLE: bool = false;
+
 /// Scanner speed preset controlling throttling behavior.
 ///
 /// Each preset defines three parameters:
