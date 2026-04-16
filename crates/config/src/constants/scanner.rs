@@ -25,6 +25,12 @@ pub const ENV_SCANNER_START_DELAY_SECS: &str = "RUSTFS_SCANNER_START_DELAY_SECS"
 #[deprecated(note = "Use RUSTFS_SCANNER_START_DELAY_SECS instead")]
 pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
+/// Environment variable that specifies the scanner cycle interval in seconds.
+/// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CYCLE=3600` (1 hour)
+pub const ENV_SCANNER_CYCLE: &str = "RUSTFS_SCANNER_CYCLE";
+
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
@@ -65,6 +71,8 @@ pub const DEFAULT_SCANNER_INLINE_HEAL_ENABLE: bool = false;
 /// | `default` | 2x     | 1 second  | 1 minute       |
 /// | `slow`    | 10x    | 15 seconds| 1 minute       |
 /// | `slowest` | 100x   | 15 seconds| 30 minutes     |
+///
+/// The cycle interval can be overridden by `RUSTFS_SCANNER_CYCLE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScannerSpeed {
     Fastest,

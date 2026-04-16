@@ -446,6 +446,11 @@ impl ObjectInfo {
             .replication_state_internal
             .as_ref()
             .and_then(|v| v.version_purge_status_internal.clone());
+        let replication_decision = fi
+            .replication_state_internal
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default();
 
         let mut replication_status = fi.replication_status();
         if replication_status.is_empty()
@@ -542,6 +547,7 @@ impl ObjectInfo {
             replication_status,
             version_purge_status_internal,
             version_purge_status,
+            replication_decision,
             ..Default::default()
         }
     }
@@ -1010,6 +1016,7 @@ pub struct ObjectInfoOrErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_filemeta::ReplicationState;
 
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
@@ -1057,6 +1064,21 @@ mod tests {
         };
 
         assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    #[test]
+    fn from_file_info_preserves_replication_decision() {
+        let fi = rustfs_filemeta::FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn=true;false;arn:replication::1:dest;rule-id".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
+
+        assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
     }
 
     #[test]

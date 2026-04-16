@@ -58,8 +58,8 @@ use rustfs_ecstore::bucket::{
     },
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate, schedule_replication,
-        schedule_replication_delete,
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, ReplicationConfigurationExt, check_replicate_delete,
+        get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
     },
     tagging::decode_tags,
     versioning::VersioningApi,
@@ -75,8 +75,9 @@ use rustfs_ecstore::store_api::{
     HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
 };
 use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicationStatusType, ReplicationType, RestoreStatusOps, VersionPurgeStatusType,
-    parse_restore_obj_status,
+    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
+    ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
+    version_purge_statuses_map,
 };
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
@@ -458,6 +459,100 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 
     let expiry_date = expire_time.format(&Rfc3339).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+}
+
+fn delete_replication_state_from_config(
+    config: &ReplicationConfiguration,
+    obj_info: &ObjectInfo,
+    version_id: Option<Uuid>,
+    replica: bool,
+) -> Option<ReplicationState> {
+    let opts = ReplicationObjectOpts {
+        name: obj_info.name.clone(),
+        user_tags: obj_info.user_tags.clone(),
+        version_id,
+        delete_marker: obj_info.delete_marker,
+        op_type: ReplicationType::Delete,
+        replica,
+        ..Default::default()
+    };
+    let target_arns = config.filter_target_arns(&opts);
+    if target_arns.is_empty() {
+        return None;
+    }
+
+    let mut decision = ReplicateDecision::new();
+    for target_arn in target_arns {
+        let mut target_opts = opts.clone();
+        target_opts.target_arn = target_arn.clone();
+        decision.set(ReplicateTargetDecision::new(target_arn, config.replicate(&target_opts), false));
+    }
+    if !decision.replicate_any() {
+        return None;
+    }
+
+    let pending_status = decision.pending_status();
+    let mut state = ReplicationState {
+        replicate_decision_str: decision.to_string(),
+        ..Default::default()
+    };
+    if version_id.is_some() {
+        state.version_purge_status_internal = pending_status.clone();
+        state.purge_targets = version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+    } else {
+        state.replication_status_internal = pending_status.clone();
+        state.targets = replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+    }
+    Some(state)
+}
+
+async fn enrich_delete_replication_state_if_needed(
+    bucket: &str,
+    delete_object: &mut rustfs_ecstore::store_api::DeletedObject,
+    obj_info: &ObjectInfo,
+) {
+    let Some(replication_state) = delete_object.replication_state.as_ref() else {
+        return;
+    };
+    if !replication_state.replicate_decision_str.is_empty()
+        && (!replication_state.targets.is_empty() || !replication_state.purge_targets.is_empty())
+    {
+        return;
+    }
+
+    let Ok((config, _)) = metadata_sys::get_replication_config(bucket).await else {
+        return;
+    };
+    let version_id = if delete_object.delete_marker {
+        None
+    } else if delete_object.delete_marker_version_id.is_some() {
+        delete_object.delete_marker_version_id
+    } else {
+        delete_object.version_id
+    };
+    if let Some(local_state) = delete_replication_state_from_config(
+        &config,
+        obj_info,
+        version_id,
+        obj_info.replication_status == ReplicationStatusType::Replica,
+    ) {
+        delete_object.replication_state = Some(local_state);
+    }
+}
+
+fn should_schedule_delete_replication(
+    opts: &ObjectOptions,
+    replication_source: &ObjectInfo,
+    deleted_delete_marker_version: bool,
+) -> bool {
+    if opts.replication_request {
+        return false;
+    }
+
+    replication_source.replication_status == ReplicationStatusType::Replica
+        || replication_source.replication_status == ReplicationStatusType::Pending
+        || replication_source.version_purge_status == VersionPurgeStatusType::Pending
+        || (deleted_delete_marker_version && replication_source.replication_status == ReplicationStatusType::Completed)
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
@@ -1904,6 +1999,15 @@ impl DefaultObjectUsecase {
             None
         };
 
+        // x-amz-restore: extract from object metadata
+        let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+            let rs = parse_restore_obj_status(v).ok()?;
+            Some(rs.to_string2())
+        });
+
+        // x-amz-expiration: predict from lifecycle configuration
+        let expiration = resolve_put_object_expiration(bucket, &info).await;
+
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -1925,6 +2029,8 @@ impl DefaultObjectUsecase {
             checksum_crc64nvme: checksums.crc64nvme,
             checksum_type: checksums.checksum_type,
             version_id: output_version_id,
+            restore,
+            expiration,
             ..Default::default()
         };
 
@@ -3126,25 +3232,35 @@ impl DefaultObjectUsecase {
             return result;
         }
 
-        if obj_info.replication_status == ReplicationStatusType::Replica
-            || obj_info.replication_status == ReplicationStatusType::Pending
-            || obj_info.version_purge_status == VersionPurgeStatusType::Pending
-        {
-            schedule_replication_delete(DeletedObjectReplicationInfo {
+        let deleted_replication_info = existing_object_info.as_ref().filter(|_| opts.version_id.is_some());
+        let replication_source = deleted_replication_info.unwrap_or(&obj_info);
+        let deleted_delete_marker_version = deleted_replication_info.is_some_and(|info| info.delete_marker);
+
+        if should_schedule_delete_replication(&opts, replication_source, deleted_delete_marker_version) {
+            let mut deleted_object = DeletedObjectReplicationInfo {
                 delete_object: rustfs_ecstore::store_api::DeletedObject {
-                    delete_marker: obj_info.delete_marker,
-                    delete_marker_version_id: if obj_info.delete_marker { obj_info.version_id } else { None },
+                    delete_marker: replication_source.delete_marker && !deleted_delete_marker_version,
+                    delete_marker_version_id: if replication_source.delete_marker {
+                        replication_source.version_id
+                    } else {
+                        None
+                    },
                     object_name: key.clone(),
-                    version_id: if obj_info.delete_marker { None } else { obj_info.version_id },
-                    delete_marker_mtime: obj_info.mod_time,
-                    replication_state: Some(obj_info.replication_state()),
+                    version_id: if replication_source.delete_marker {
+                        None
+                    } else {
+                        replication_source.version_id
+                    },
+                    delete_marker_mtime: replication_source.mod_time,
+                    replication_state: Some(replication_source.replication_state()),
                     ..Default::default()
                 },
                 bucket: bucket.clone(),
                 event_type: REPLICATE_INCOMING_DELETE.to_string(),
                 ..Default::default()
-            })
-            .await;
+            };
+            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object.delete_object, replication_source).await;
+            schedule_replication_delete(deleted_object).await;
         }
 
         let delete_marker = obj_info.delete_marker;
@@ -3299,6 +3415,8 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key_md5.as_ref(),
         )?;
 
+        // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
+        let expiration_header = resolve_put_object_expiration(&bucket, &info).await;
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -3411,6 +3529,13 @@ impl DefaultObjectUsecase {
             checksum_crc64nvme,
             checksum_type,
             storage_class,
+            // x-amz-restore from object metadata
+            restore: metadata_map.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
+                let rs = parse_restore_obj_status(v).ok()?;
+                Some(rs.to_string2())
+            }),
+            // x-amz-expiration from lifecycle prediction
+            expiration: expiration_header,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -4197,6 +4322,10 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
+    use s3s::dto::{
+        DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
+        ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
+    };
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4606,6 +4735,44 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
+    #[test]
+    fn should_schedule_delete_replication_skips_replica_requests() {
+        let opts = ObjectOptions {
+            replication_request: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let replication_source = ObjectInfo {
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        assert!(
+            !should_schedule_delete_replication(&opts, &replication_source, true),
+            "replica delete requests on target sites must not enqueue a second replication delete task"
+        );
+    }
+
+    #[test]
+    fn should_schedule_delete_replication_keeps_delete_marker_version_purge_from_source() {
+        let opts = ObjectOptions {
+            replication_request: false,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let replication_source = ObjectInfo {
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        assert!(
+            should_schedule_delete_replication(&opts, &replication_source, true),
+            "source-side delete-marker version purge still needs replication scheduling"
+        );
+    }
+
     #[tokio::test]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
@@ -4771,5 +4938,90 @@ mod tests {
 
         let err = usecase.execute_restore_object(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn delete_replication_state_from_config_tracks_downstream_delete_marker_targets() {
+        let arn = "arn:aws:s3:::target-bucket".to_string();
+        let config = ReplicationConfiguration {
+            role: arn.clone(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: Some(DeleteMarkerReplication {
+                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                }),
+                delete_replication: None,
+                destination: Destination {
+                    bucket: arn.clone(),
+                    ..Default::default()
+                },
+                existing_object_replication: Some(ExistingObjectReplication {
+                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                }),
+                filter: None,
+                id: Some("rule-1".to_string()),
+                prefix: Some("test/".to_string()),
+                priority: Some(1),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        };
+        let obj_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "test/object.txt".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let state = delete_replication_state_from_config(&config, &obj_info, None, true)
+            .expect("replica delete marker should be forwarded to downstream targets");
+        let pending = format!("{arn}=PENDING;");
+
+        assert_eq!(state.replication_status_internal.as_deref(), Some(pending.as_str()));
+        assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
+        assert!(state.targets.contains_key(&arn));
+    }
+
+    #[test]
+    fn delete_replication_state_from_config_tracks_delete_marker_version_purges() {
+        let arn = "arn:aws:s3:::target-bucket".to_string();
+        let config = ReplicationConfiguration {
+            role: arn.clone(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: Some(DeleteMarkerReplication {
+                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                }),
+                delete_replication: None,
+                destination: Destination {
+                    bucket: arn.clone(),
+                    ..Default::default()
+                },
+                existing_object_replication: Some(ExistingObjectReplication {
+                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                }),
+                filter: None,
+                id: Some("rule-1".to_string()),
+                prefix: Some("test/".to_string()),
+                priority: Some(1),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        };
+        let obj_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "test/object.txt".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        let version_id = Some(Uuid::new_v4());
+        let state = delete_replication_state_from_config(&config, &obj_info, version_id, false)
+            .expect("delete-marker version purge should honor delete-marker replication rules");
+        let pending = format!("{arn}=PENDING;");
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
+        assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
+        assert!(state.purge_targets.contains_key(&arn));
     }
 }

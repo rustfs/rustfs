@@ -34,7 +34,9 @@ use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
-    lifecycle::bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, validate_transition_tier},
+    lifecycle::bucket_lifecycle_ops::{
+        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
+    },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
         BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
@@ -491,6 +493,13 @@ fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool
                         .is_some_and(|storage_class| !storage_class.as_str().is_empty())
                 })
             }))
+    })
+}
+
+fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
+    config.rules.iter().any(|rule| {
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
 }
 
@@ -1338,6 +1347,18 @@ impl DefaultBucketUsecase {
             spawn_background_with_context(request_context, async move {
                 if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
+                }
+            });
+        }
+
+        if lifecycle_has_expiry_rules(&input_cfg)
+            && let Some(store) = new_object_layer_fn()
+        {
+            let bucket_name = bucket.clone();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+            spawn_background_with_context(request_context, async move {
+                if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
+                    warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
                 }
             });
         }

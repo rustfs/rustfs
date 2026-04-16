@@ -1771,13 +1771,7 @@ impl ObjectOperations for SetDisks {
             ..Default::default()
         };
 
-        let dsc = if opts
-            .delete_replication
-            .as_ref()
-            .map(|v| v.replica_status == ReplicationStatusType::Replica)
-            == Some(true)
-            || opts.version_purge_status() == VersionPurgeStatusType::Complete
-        {
+        let dsc = if should_preserve_delete_replication_state(&opts) {
             ReplicateDecision::default()
         } else {
             check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
@@ -1792,33 +1786,7 @@ impl ObjectOperations for SetDisks {
                 .unwrap_or_default();
         }
 
-        let mut mark_delete = goi.version_id.is_some();
-
-        let mut delete_marker = opts.versioned;
-
-        if opts.version_id.is_some() {
-            // Decommission/rebalance may recreate a delete marker on a new pool before that
-            // exact version exists there, so we must still treat it as a mark-delete write.
-            if opts.data_movement && opts.delete_marker && !version_found {
-                mark_delete = true;
-            }
-
-            if version_found && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                mark_delete = false;
-            }
-
-            if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
-                mark_delete = false;
-            }
-
-            if opts.version_purge_status() == VersionPurgeStatusType::Complete {
-                mark_delete = false;
-            }
-
-            if version_found && (!goi.version_purge_status.is_empty() || !goi.delete_marker) {
-                delete_marker = false;
-            }
-        }
+        let (mark_delete, mut delete_marker) = resolve_delete_version_state(&opts, &goi, version_found);
 
         let mod_time = if let Some(mt) = opts.mod_time {
             mt
@@ -2425,6 +2393,63 @@ impl ObjectOperations for SetDisks {
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
         Ok(())
     }
+}
+
+fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
+    opts.delete_replication.as_ref().is_some_and(|state| {
+        state.replica_status == ReplicationStatusType::Replica
+            || (!state.replicate_decision_str.is_empty()
+                && (!state.composite_replication_status().is_empty() || !state.composite_version_purge_status().is_empty()))
+    }) || opts.version_purge_status() == VersionPurgeStatusType::Complete
+}
+
+fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
+    let mut mark_delete = goi.version_id.is_some();
+    let mut delete_marker = opts.versioned;
+
+    if opts.version_id.is_some() {
+        // Decommission/rebalance may recreate a delete marker on a new pool before that
+        // exact version exists there, so we must still treat it as a mark-delete write.
+        if opts.data_movement && opts.delete_marker && !version_found {
+            mark_delete = true;
+        }
+
+        let delete_marker_version_purge = version_found && goi.delete_marker && !opts.version_purge_status().is_empty();
+
+        if version_found && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
+            mark_delete = false;
+        }
+
+        if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
+            mark_delete = false;
+        }
+
+        if opts.version_purge_status() == VersionPurgeStatusType::Complete {
+            mark_delete = false;
+        }
+
+        let replica_delete_marker_version_purge =
+            version_found && goi.delete_marker && opts.delete_marker_replication_status() == ReplicationStatusType::Replica;
+
+        if delete_marker_version_purge {
+            mark_delete = false;
+        }
+
+        if !version_found && !opts.delete_marker && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
+            delete_marker = false;
+        }
+
+        if version_found
+            && (!goi.version_purge_status.is_empty()
+                || !goi.delete_marker
+                || replica_delete_marker_version_purge
+                || delete_marker_version_purge)
+        {
+            delete_marker = false;
+        }
+    }
+
+    (mark_delete, delete_marker)
 }
 
 impl SetDisks {
@@ -4337,6 +4362,7 @@ mod tests {
     use crate::store_api::{CompletePart, ObjectInfo};
     use crate::store_init::save_format_file;
     use rustfs_filemeta::ErasureInfo;
+    use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serial_test::serial;
@@ -4562,6 +4588,137 @@ mod tests {
         assert!(is_min_allowed_part_size(5 * 1024 * 1024)); // 5MB - minimum allowed
         assert!(is_min_allowed_part_size(10 * 1024 * 1024)); // 10MB - allowed
         assert!(is_min_allowed_part_size(100 * 1024 * 1024)); // 100MB - allowed
+    }
+
+    #[test]
+    fn resolve_delete_version_state_clears_delete_marker_for_replica_marker_version_purge() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &current, true);
+
+        assert!(!mark_delete);
+        assert!(
+            !delete_marker,
+            "replica purge of an existing delete marker version must remove that version, not preserve delete-marker semantics"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_version_state_keeps_delete_marker_for_replica_marker_creation() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_marker: true,
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(!mark_delete);
+        assert!(delete_marker);
+    }
+
+    #[test]
+    fn resolve_delete_version_state_skips_marker_creation_for_replica_purge_when_version_missing() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(
+            !mark_delete,
+            "replica delete-marker purges should not schedule mark-delete writes when the target version is absent"
+        );
+        assert!(
+            !delete_marker,
+            "replica delete-marker purges must become no-ops when the marker version has not arrived on the target yet"
+        );
+    }
+
+    #[test]
+    fn should_preserve_delete_replication_state_for_completed_delete_marker_replication_update() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                replicate_decision_str: "target=true;false;target;".to_string(),
+                replication_status_internal: Some("target=COMPLETED;".to_string()),
+                targets: rustfs_filemeta::replication_statuses_map("target=COMPLETED;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            should_preserve_delete_replication_state(&opts),
+            "source delete-marker replication status updates must not be re-evaluated as fresh delete replication requests"
+        );
+    }
+
+    #[test]
+    fn should_not_preserve_delete_replication_state_for_new_version_delete_request() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            !should_preserve_delete_replication_state(&opts),
+            "fresh versioned deletes still need replication eligibility checks"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_version_state_removes_source_delete_marker_version_during_purge_replication() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".to_string()),
+                purge_targets: rustfs_filemeta::version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &current, true);
+
+        assert!(
+            !mark_delete,
+            "source delete-marker version purge should delete the local marker instead of rewriting it with purge metadata"
+        );
+        assert!(
+            !delete_marker,
+            "source delete-marker version purge should not leave delete-marker semantics behind locally"
+        );
     }
 
     #[test]

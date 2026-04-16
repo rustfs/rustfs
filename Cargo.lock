@@ -8507,6 +8507,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "temp-env",
  "thiserror 2.0.18",
  "time",
  "tokio",
