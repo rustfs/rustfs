@@ -91,19 +91,21 @@ impl ServiceStateManager {
     }
 
     pub fn update(&self, new_state: ServiceState) {
-        let current_state = self.current_state();
-        if service_state_rank(new_state) < service_state_rank(current_state) {
-            warn!(
-                current = ?current_state,
-                attempted = ?new_state,
-                "Ignoring regressive service state transition"
-            );
-            return;
-        }
-
-        self.state.store(new_state, Ordering::SeqCst);
+        // Serialize transition check + state write + publish dedupe as one critical section.
         let should_publish = {
             let mut published_state = self.published_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current_state = self.current_state();
+            if service_state_rank(new_state) < service_state_rank(current_state) {
+                warn!(
+                    current = ?current_state,
+                    attempted = ?new_state,
+                    "Ignoring regressive service state transition"
+                );
+                return;
+            }
+
+            self.state.store(new_state, Ordering::SeqCst);
+
             if *published_state == Some(new_state) {
                 false
             } else {

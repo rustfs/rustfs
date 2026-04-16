@@ -163,7 +163,7 @@ impl RustFSServerBuilder {
     ///
     /// Defaults:
     /// - address: `"127.0.0.1:9000"`
-    /// - access_key / secret_key: `"minioadmin"`
+    /// - access_key / secret_key: `"rustfsadmin"`
     /// - region: `"us-east-1"`
     /// - A temporary directory is created automatically for data storage
     ///
@@ -172,10 +172,10 @@ impl RustFSServerBuilder {
     pub fn new() -> Self {
         Self {
             address: "127.0.0.1:9000".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
             volumes: Vec::new(),
-            region: "us-east-1".to_string(),
+            region: rustfs_config::RUSTFS_REGION.to_string(),
         }
     }
 
@@ -193,13 +193,13 @@ impl RustFSServerBuilder {
         self
     }
 
-    /// Set the S3 access key (default: `"minioadmin"`).
+    /// Set the S3 access key (default: `"rustfsadmin"`).
     pub fn access_key(mut self, key: impl Into<String>) -> Self {
         self.access_key = key.into();
         self
     }
 
-    /// Set the S3 secret key (default: `"minioadmin"`).
+    /// Set the S3 secret key (default: `"rustfsadmin"`).
     pub fn secret_key(mut self, key: impl Into<String>) -> Self {
         self.secret_key = key.into();
         self
