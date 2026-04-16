@@ -14,8 +14,8 @@
 
 use super::capacity_manager::{
     CapacityUpdate, DiskCapacityUpdate, HybridCapacityManager, get_enable_dynamic_timeout, get_follow_symlinks,
-    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout,
-    get_stat_timeout,
+    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_scan_concurrency,
+    get_stall_timeout, get_stat_timeout,
 };
 use super::types::{CapacityDiskRef, CapacityScanResult, CapacityScanSummary};
 use futures::{StreamExt, stream};
@@ -30,7 +30,6 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-const MAX_CAPACITY_SCAN_CONCURRENCY: usize = 4;
 const CAPACITY_PROGRESS_CHECK_STRIDE: usize = 512;
 
 #[derive(Debug)]
@@ -123,7 +122,7 @@ async fn calculate_data_dir_used_capacity_report(
     let mut is_estimated = false;
     let mut per_disk = Vec::with_capacity(disks.len());
 
-    let concurrency_limit = disks.len().clamp(1, MAX_CAPACITY_SCAN_CONCURRENCY);
+    let concurrency_limit = disks.len().clamp(1, get_scan_concurrency());
     let mut scans = stream::iter(disks.iter().cloned().map(scan_disk_used_capacity)).buffer_unordered(concurrency_limit);
 
     while let Some(outcome) = scans.next().await {

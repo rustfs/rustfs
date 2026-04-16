@@ -20,13 +20,14 @@ use futures::FutureExt;
 use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
-    DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
-    DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
-    DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
-    ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS,
-    ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_SYMLINK_DEPTH, ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_MIN_TIMEOUT,
-    ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
-    ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_SCAN_CONCURRENCY,
+    DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE,
+    DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD,
+    DEFAULT_WRITE_TRIGGER_DELAY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
+    ENV_CAPACITY_FOLLOW_SYMLINKS, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_SYMLINK_DEPTH, ENV_CAPACITY_MAX_TIMEOUT,
+    ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCAN_CONCURRENCY, ENV_CAPACITY_SCHEDULED_INTERVAL,
+    ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+    ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_current_bytes, record_capacity_dirty_disk_count, record_capacity_refresh_inflight,
@@ -75,6 +76,8 @@ struct CachedCapacityConfig {
     max_timeout: Duration,
     /// Stall timeout
     stall_timeout: Duration,
+    /// Concurrent disk walk tasks per capacity scan
+    scan_concurrency: usize,
 }
 
 impl CachedCapacityConfig {
@@ -103,6 +106,7 @@ impl CachedCapacityConfig {
             min_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS)),
             max_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS)),
             stall_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_STALL_TIMEOUT, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS)),
+            scan_concurrency: get_env_usize(ENV_CAPACITY_SCAN_CONCURRENCY, DEFAULT_CAPACITY_SCAN_CONCURRENCY).max(1),
         }
     }
 }
@@ -274,6 +278,22 @@ pub fn get_stall_timeout() -> Duration {
 #[cfg(test)]
 pub fn get_stall_timeout() -> Duration {
     get_cached_config().stall_timeout
+}
+
+/// Get per-scan disk walk concurrency from environment or default.
+///
+/// Lower values reduce peak iowait when multiple data directories share the
+/// same physical disk (e.g. `/data/rustfs{0..3}` on a single PVC). The scan
+/// loop always clamps the effective value to `[1, number_of_disks]`.
+#[cfg(not(test))]
+pub fn get_scan_concurrency() -> usize {
+    get_cached_config().scan_concurrency
+}
+
+/// Get per-scan disk walk concurrency from environment or default (test mode)
+#[cfg(test)]
+pub fn get_scan_concurrency() -> usize {
+    get_cached_config().scan_concurrency
 }
 
 // ============================================================================
@@ -954,7 +974,8 @@ mod tests {
     use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
         ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE,
-        ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        ENV_CAPACITY_SCAN_CONCURRENCY, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+        ENV_CAPACITY_WRITE_TRIGGER_DELAY,
     };
     use serial_test::serial;
     use std::sync::Arc;
@@ -1069,6 +1090,32 @@ mod tests {
         temp_env::with_var(ENV_CAPACITY_SAMPLE_RATE, Some("200"), || {
             let rate = get_sample_rate();
             assert_eq!(rate, 200);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_scan_concurrency_default() {
+        let concurrency = get_scan_concurrency();
+        assert_eq!(concurrency, 4);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_override_scan_concurrency() {
+        temp_env::with_var(ENV_CAPACITY_SCAN_CONCURRENCY, Some("1"), || {
+            assert_eq!(get_scan_concurrency(), 1);
+        });
+        temp_env::with_var(ENV_CAPACITY_SCAN_CONCURRENCY, Some("8"), || {
+            assert_eq!(get_scan_concurrency(), 8);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_concurrency_clamps_zero_to_one() {
+        temp_env::with_var(ENV_CAPACITY_SCAN_CONCURRENCY, Some("0"), || {
+            assert_eq!(get_scan_concurrency(), 1, "0 must be clamped to 1 to avoid buffer_unordered panic");
         });
     }
 
