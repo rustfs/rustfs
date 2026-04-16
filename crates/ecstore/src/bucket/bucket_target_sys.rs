@@ -1588,4 +1588,26 @@ mod tests {
             "replication delete requests must preserve the version id in internal headers"
         );
     }
+
+    #[test]
+    fn build_remove_object_headers_omits_delete_marker_flag_for_marker_version_purge() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: false,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
+            "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
 }

@@ -2322,6 +2322,10 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
             mark_delete = false;
         }
 
+        if !version_found && !opts.delete_marker && opts.delete_marker_replication_status() == ReplicationStatusType::Replica {
+            delete_marker = false;
+        }
+
         if version_found
             && (!goi.version_purge_status.is_empty()
                 || !goi.delete_marker
@@ -4402,6 +4406,30 @@ mod tests {
 
         assert!(!mark_delete);
         assert!(delete_marker);
+    }
+
+    #[test]
+    fn resolve_delete_version_state_skips_marker_creation_for_replica_purge_when_version_missing() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(
+            !mark_delete,
+            "replica delete-marker purges should not schedule mark-delete writes when the target version is absent"
+        );
+        assert!(
+            !delete_marker,
+            "replica delete-marker purges must become no-ops when the marker version has not arrived on the target yet"
+        );
     }
 
     #[test]
