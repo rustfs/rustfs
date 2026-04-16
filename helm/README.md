@@ -47,6 +47,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
 | config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
 | config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
+| config.rustfs.kms.enabled | bool | `false`| Whether to enable kms. |
+| config.rustfs.kms.type | string | `vault`| The kms type that RustFS supported. |
+| config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
+| config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
+| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. |
+| config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
+| config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
