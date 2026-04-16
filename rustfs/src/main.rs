@@ -340,14 +340,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let s3_shutdown_tx = {
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let (s3_shutdown_tx, _) = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
+        let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
     let console_shutdown_tx = if config.console_enable && !config.console_address.is_empty() {
         let mut console_config = config.clone();
         console_config.address = console_config.console_address.clone();
-        let (console_shutdown_tx, _) = start_http_server(&console_config, state_manager.clone(), readiness.clone()).await?;
+        let (console_shutdown_tx, _) = start_http_server(&console_config, readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
@@ -576,11 +576,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     );
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
-    // Update service status to Ready
-    state_manager.update(ServiceState::Ready);
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
+    // Publish ready only after all critical bootstrap metadata is in place
+    state_manager.update(ServiceState::Ready);
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
