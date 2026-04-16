@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+use tracing::warn;
+
 use crate::bucket::lifecycle::lifecycle;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -19,7 +22,14 @@ use crate::store::ECStore;
 use crate::store_api::{ObjectOperations, ObjectOptions, ObjectToDelete};
 use rustfs_lock::MAX_DELETE_LIST;
 
-pub async fn delete_object_versions(api: ECStore, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
+pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
+    let version_suspended = match BucketVersioningSys::get(bucket).await {
+        Ok(vc) => vc.suspended(),
+        Err(err) => {
+            warn!(bucket, error = ?err, "failed to get versioning config during lifecycle noncurrent version cleanup");
+            return;
+        }
+    };
     let mut remaining = to_del;
     loop {
         let mut to_del = remaining;
@@ -29,15 +39,29 @@ pub async fn delete_object_versions(api: ECStore, bucket: &str, to_del: &[Object
         } else {
             remaining = &[];
         }
-        let vc = BucketVersioningSys::get(bucket).await.expect("err!");
-        let _deleted_objs = api.delete_objects(
-            bucket,
-            to_del.to_vec(),
-            ObjectOptions {
-                //prefix_enabled_fn:  vc.prefix_enabled(""),
-                version_suspended: vc.suspended(),
-                ..Default::default()
-            },
-        );
+        let (_deleted_objs, errors) = api
+            .delete_objects(
+                bucket,
+                to_del.to_vec(),
+                ObjectOptions {
+                    version_suspended,
+                    ..Default::default()
+                },
+            )
+            .await;
+        for (i, err) in errors.iter().enumerate() {
+            if let Some(e) = err {
+                let obj_name = to_del.get(i).map(|o| o.object_name.as_str()).unwrap_or("<unknown>");
+                let vid = to_del
+                    .get(i)
+                    .and_then(|o| o.version_id)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                warn!(bucket, object = obj_name, version_id = %vid, error = ?e, "failed to delete noncurrent version during lifecycle cleanup");
+            }
+        }
+        if remaining.is_empty() {
+            break;
+        }
     }
 }

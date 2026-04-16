@@ -30,7 +30,7 @@ use rustfs_common::heal_channel::{
 };
 use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_rule;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
 use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_ops::apply_transition_rule,
@@ -444,8 +444,14 @@ impl ScannerItem {
             }
         }
 
-        if !to_delete_objs.is_empty() {
-            // TODO: enqueueNoncurrentVersions
+        if !to_delete_objs.is_empty()
+            && let Some(event) = noncurrent_events.first().cloned()
+        {
+            GLOBAL_ExpiryState
+                .write()
+                .await
+                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event)
+                .await;
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
     }

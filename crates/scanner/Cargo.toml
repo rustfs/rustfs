@@ -55,6 +55,7 @@ metrics = { workspace = true }
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
+temp-env = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { workspace = true, features = ["test-util"] }
 

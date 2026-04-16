@@ -53,8 +53,11 @@ Current guidance:
 
 ## Scanner environment aliases
 
+- `RUSTFS_SCANNER_SPEED` (canonical, also accepts `MINIO_SCANNER_SPEED`)
+- `RUSTFS_SCANNER_CYCLE` (canonical, also accepts `MINIO_SCANNER_CYCLE`)
 - `RUSTFS_SCANNER_START_DELAY_SECS` (canonical)
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
+- `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 
 ## Drive timeout environment variables
 
