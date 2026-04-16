@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::disk_store::get_drive_walkdir_stall_timeout;
 use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
+use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
+use tokio::io::AsyncRead;
 use tokio::spawn;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -25,6 +29,21 @@ pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+
+#[derive(Debug)]
+enum PeekOutcome {
+    Ready(Option<MetaCacheEntry>),
+    Error(rustfs_filemeta::Error),
+    TimedOut,
+}
+
+async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>, timeout_duration: Duration) -> PeekOutcome {
+    match timeout(timeout_duration, reader.peek()).await {
+        Ok(Ok(entry)) => PeekOutcome::Ready(entry),
+        Ok(Err(err)) => PeekOutcome::Error(err),
+        Err(_) => PeekOutcome::TimedOut,
+    }
+}
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
@@ -160,6 +179,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let revjob = spawn(async move {
+        let peek_timeout = get_drive_walkdir_stall_timeout();
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
@@ -191,8 +211,8 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     continue;
                 }
 
-                let entry = match r.peek().await {
-                    Ok(res) => {
+                let entry = match peek_with_timeout(r, peek_timeout).await {
+                    PeekOutcome::Ready(res) => {
                         if let Some(entry) = res {
                             // info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
@@ -203,7 +223,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             continue;
                         }
                     }
-                    Err(err) => {
+                    PeekOutcome::Error(err) => {
                         if err == rustfs_filemeta::Error::Unexpected {
                             at_eof += 1;
                             // warn!("list_path_raw: peek err eof, disk: {}", i);
@@ -235,6 +255,31 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             // warn!("list_path_raw: peek err, disk: {}", i);
                             continue;
                         }
+                    }
+                    PeekOutcome::TimedOut => {
+                        has_err += 1;
+                        errs[i] = Some(DiskError::Timeout);
+                        let endpoint = opts
+                            .disks
+                            .get(i)
+                            .and_then(|disk| disk.as_ref().map(|disk| disk.endpoint().to_string()))
+                            .unwrap_or_else(|| "missing".to_string());
+                        counter!(
+                            "rustfs_list_path_raw_stall_total",
+                            "drive" => endpoint.clone()
+                        )
+                        .increment(1);
+                        warn!(
+                            drive = %endpoint,
+                            bucket = %opts.bucket,
+                            path = %opts.path,
+                            timeout_ms = peek_timeout.as_millis(),
+                            "list_path_raw reader peek timed out; excluding drive from current merge"
+                        );
+                        let (detached_rd, write_half) = tokio::io::duplex(1);
+                        drop(write_half);
+                        *r = MetacacheReader::new(detached_rd);
+                        continue;
                     }
                 };
 
@@ -363,4 +408,43 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     // warn!("list_path_raw: done");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_filemeta::MetacacheWriter;
+
+    #[tokio::test]
+    async fn peek_with_timeout_times_out_on_silent_reader() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut reader = MetacacheReader::new(reader);
+
+        let outcome = peek_with_timeout(&mut reader, Duration::from_millis(20)).await;
+        assert!(matches!(outcome, PeekOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn peek_with_timeout_reads_entry_before_deadline() {
+        let (reader, writer) = tokio::io::duplex(256);
+        let mut metacache_reader = MetacacheReader::new(reader);
+
+        tokio::spawn(async move {
+            let mut writer = MetacacheWriter::new(writer);
+            let entry = MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: vec![1, 2, 3],
+                cached: None,
+                reusable: false,
+            };
+            writer.write(&[entry]).await.expect("entry should be written");
+            writer.close().await.expect("writer should close");
+        });
+
+        let outcome = peek_with_timeout(&mut metacache_reader, Duration::from_secs(1)).await;
+        match outcome {
+            PeekOutcome::Ready(Some(entry)) => assert_eq!(entry.name, "bucket/object"),
+            other => panic!("expected ready entry, got {other:?}"),
+        }
+    }
 }
