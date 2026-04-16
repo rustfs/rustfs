@@ -98,7 +98,7 @@ config:
         enabled: false
         endpoint: "" # If specified, rustfs will export profiling data to this endpoint. e.g. "http://localhost:6060/debug/pprof/profile"
     kms:
-      enabled: true
+      enabled: false
       type: "vault" # Only Support vault currently.
       vault:
         vault_backend: "" # Only support vault kv2 and vault transit. 
