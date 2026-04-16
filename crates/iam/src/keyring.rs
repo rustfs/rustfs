@@ -78,6 +78,17 @@ pub fn decrypt_keys() -> Vec<Vec<u8>> {
     load_keyring().decrypt_keys
 }
 
+pub fn current_key_and_old_keys() -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+    let keyring = load_keyring();
+    let current = keyring.current_key.clone();
+    let old_keys = if current.is_some() {
+        keyring.decrypt_keys.into_iter().skip(1).collect()
+    } else {
+        keyring.decrypt_keys
+    };
+    (current, old_keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_keyring, parse_old_keys};
