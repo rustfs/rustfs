@@ -601,7 +601,7 @@ impl Operation for ListAuditTargets {
                         Ok(Ok(true)) => "online",
                         _ => "offline",
                     };
-                    ((target.id().id.clone(), target.id().name.to_string()), status.to_string())
+                    ((target.id().id, target.id().name), status.to_string())
                 });
             }
 

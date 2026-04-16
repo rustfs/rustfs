@@ -193,9 +193,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "access key has spaces"));
         }
 
-        create_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let session_policy = if let Some(policy) = &create_req.policy {
             let policy_bytes =
@@ -528,9 +526,7 @@ impl Operation for UpdateServiceAccount {
         let update_req: UpdateServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
 
-        update_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        update_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;

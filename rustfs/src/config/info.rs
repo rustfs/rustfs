@@ -549,7 +549,7 @@ fn collect_config_info_json() -> ConfigInfoJson {
             let profile = config.workload_profile();
             let buffer_config = profile.config();
             Some(WorkloadProfileJson {
-                name: config.workload_name().to_string(),
+                name: config.workload_name(),
                 buffer_min_size: buffer_config.min_size,
                 buffer_max_size: buffer_config.max_size,
                 default_unknown: buffer_config.default_unknown,

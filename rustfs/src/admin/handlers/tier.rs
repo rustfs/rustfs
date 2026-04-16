@@ -265,7 +265,7 @@ impl Operation for AddTier {
                     "tier connect error!",
                 ))
             } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
-                Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message.clone()))
+                Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message))
             } else {
                 warn!("tier_config_mgr add failed, e: {:?}", err);
                 Err(S3Error::with_message(

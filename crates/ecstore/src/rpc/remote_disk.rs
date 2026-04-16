@@ -113,7 +113,7 @@ impl RemoteDisk {
 
         let disk = Self {
             id: Mutex::new(None),
-            addr: addr.clone(),
+            addr,
             endpoint: ep.clone(),
             scanning: Arc::new(AtomicU32::new(0)),
             health_check: opt.health_check && env_health_check,

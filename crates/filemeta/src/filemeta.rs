@@ -1986,6 +1986,7 @@ async fn test_read_xl_meta_no_data() {
     let mut file = File::create(&filepath).await.unwrap();
     // Write string data
     file.write_all(&buff).await.unwrap();
+    file.flush().await.unwrap();
 
     let mut f = File::open(&filepath).await.unwrap();
 

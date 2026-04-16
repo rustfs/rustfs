@@ -678,7 +678,7 @@ impl BucketMetadata {
                 // let x = data.clone();
                 // let str = std::str::from_utf8(&x).expect("Invalid UTF-8");
                 // println!("update config:{}", str);
-                self.bucket_targets_config_json = data.clone();
+                self.bucket_targets_config_json = data;
                 self.bucket_targets_config_updated_at = updated;
             }
             BUCKET_CORS_CONFIG => {
