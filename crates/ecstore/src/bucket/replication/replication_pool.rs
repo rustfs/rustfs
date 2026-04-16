@@ -754,7 +754,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         buckets: Vec<String>,
     ) -> Result<(), EcstoreError> {
         // Load bucket metadata system in background
-        let pool_clone = self.clone();
+        let pool_clone = self;
 
         tokio::spawn(async move {
             pool_clone.start_resync_routine(buckets, cancellation_token).await;
@@ -824,10 +824,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         let cancel_token = CancellationToken::new();
         resyncer.register_cancel_token(&opts, cancel_token.clone()).await;
         tokio::spawn(async move {
-            resyncer
-                .clone()
-                .resync_bucket(cancel_token, storage, false, opts.clone())
-                .await;
+            Box::pin(resyncer.clone().resync_bucket(cancel_token, storage, false, opts.clone())).await;
             resyncer.clear_cancel_token(&opts).await;
         });
 
@@ -914,7 +911,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         };
                         tokio::spawn(async move {
                             resync.register_cancel_token(&opts, ctx.clone()).await;
-                            resync.clone().resync_bucket(ctx, storage, true, opts.clone()).await;
+                            Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
                             resync.clear_cancel_token(&opts).await;
                         });
                     }

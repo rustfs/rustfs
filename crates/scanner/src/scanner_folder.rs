@@ -864,21 +864,22 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let mut dst = if !into.compacted {
-                    DataUsageEntry::default()
+                if into.compacted {
+                    // In compacted mode child totals are accumulated directly into the parent entry.
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    tokio::task::yield_now().await;
                 } else {
-                    into.clone()
-                };
+                    let mut dst = DataUsageEntry::default();
 
-                // Use Box::pin for recursive async call
-                let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                if let Err(e) = fut.await {
-                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                    continue;
-                }
-                tokio::task::yield_now().await;
+                    // Use Box::pin for recursive async call
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
+                    tokio::task::yield_now().await;
 
-                if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
                     // We scanned a folder, optionally send update.
@@ -916,21 +917,22 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let mut dst = if !into.compacted {
-                    DataUsageEntry::default()
+                if into.compacted {
+                    // In compacted mode child totals are accumulated directly into the parent entry.
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    tokio::task::yield_now().await;
                 } else {
-                    into.clone()
-                };
+                    let mut dst = DataUsageEntry::default();
 
-                // Use Box::pin for recursive async call
-                let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                if let Err(e) = fut.await {
-                    warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                    continue;
-                }
-                tokio::task::yield_now().await;
+                    // Use Box::pin for recursive async call
+                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                    if let Err(e) = fut.await {
+                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                        continue;
+                    }
+                    tokio::task::yield_now().await;
 
-                if !into.compacted {
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
                     // We scanned a folder, optionally send update.
@@ -973,7 +975,7 @@ impl FolderScanner {
                         ..Default::default()
                     })
                     .await
-                    .map_err(|e| ScannerError::Other(e.to_string()))?;
+                    .map_err(ScannerError::Other)?;
                 }
 
                 resolver.bucket = bucket.clone();
@@ -1130,21 +1132,22 @@ impl FolderScanner {
                         object_heal_prob_div: 1,
                     };
 
-                    let mut dst = if !into.compacted {
-                        DataUsageEntry::default()
+                    if into.compacted {
+                        // In compacted mode child totals are accumulated directly into the parent entry.
+                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
+                        fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                        tokio::task::yield_now().await;
                     } else {
-                        into.clone()
-                    };
+                        let mut dst = DataUsageEntry::default();
 
-                    // Use Box::pin for recursive async call
-                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    if let Err(e) = fut.await {
-                        warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
-                        continue;
-                    }
-                    tokio::task::yield_now().await;
+                        // Use Box::pin for recursive async call
+                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
+                        if let Err(e) = fut.await {
+                            warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
+                            continue;
+                        }
+                        tokio::task::yield_now().await;
 
-                    if !into.compacted {
                         let h = DataUsageHash(folder_item.name.clone());
                         into.add_child(&h);
                         // We scanned a folder, optionally send update.
@@ -1402,7 +1405,7 @@ mod tests {
     #[serial]
     async fn test_should_skip_failed_respects_ttl() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1424,7 +1427,7 @@ mod tests {
     #[serial]
     async fn test_record_failed_ttl_zero_noop() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir);
 
         scanner.record_failed("path1");
         assert!(scanner.new_cache.info.failed_objects.is_empty());
@@ -1438,7 +1441,7 @@ mod tests {
     #[serial]
     async fn test_record_failed_prunes_to_max_entries() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1470,7 +1473,7 @@ mod tests {
     #[serial]
     async fn test_prune_failed_objects_cache_drops_expired() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner
@@ -1494,7 +1497,7 @@ mod tests {
     #[serial]
     async fn test_prune_failed_objects_max_zero_keeps_fresh() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
-        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());
+        let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
         let now = FolderScanner::now_secs();
 
         scanner

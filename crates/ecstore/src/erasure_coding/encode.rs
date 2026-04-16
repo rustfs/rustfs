@@ -106,7 +106,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
@@ -168,7 +168,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))

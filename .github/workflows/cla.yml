@@ -17,6 +17,8 @@ name: CLA Check
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
   issue_comment:
     types: [created, edited]
 
@@ -31,7 +33,26 @@ jobs:
     if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
+      - name: Report CLA result for merge queue
+        if: github.event_name == 'merge_group'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'CLA Check',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: 'success',
+              output: {
+                title: 'CLA requirements satisfied for merge queue',
+                summary: 'Queued pull requests must satisfy the required CLA check before they enter the merge queue. This reports the existing CLA result on the merge-group SHA.'
+              }
+            });
+
       - name: Create token for rustfs/cla
+        if: github.event_name != 'merge_group'
         id: registry-token
         uses: actions/create-github-app-token@v3
         with:
@@ -42,6 +63,7 @@ jobs:
           permission-contents: write
 
       - name: Run CLA Bot
+        if: github.event_name != 'merge_group'
         uses: overtrue/cla-bot@v0.0.9
         with:
           github-token: ${{ github.token }}

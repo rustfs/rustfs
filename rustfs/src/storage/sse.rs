@@ -934,7 +934,7 @@ async fn apply_ssec_encryption_material(
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
         algorithm,
-        key: sse_key.to_string(),
+        key: sse_key,
         key_md5: sse_key_md5,
     };
 
@@ -1058,7 +1058,7 @@ async fn apply_managed_encryption_material(
     }
 
     // Determine KMS key ID to use for internal key wrapping.
-    let mut kms_key_candidate = kms_key_id.clone().map(|s| s.to_string());
+    let mut kms_key_candidate = kms_key_id.clone();
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
         if let Some(service) = get_global_encryption_service().await {

@@ -231,7 +231,7 @@ pub fn init_metrics_collectors(token: CancellationToken) {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_SYSTEM_METRICS_INTERVAL);
 
-    let token_clone = token.clone();
+    let token_clone = token;
     tokio::spawn(async move {
         // Get current process PID
         let pid = match sysinfo::get_current_pid() {

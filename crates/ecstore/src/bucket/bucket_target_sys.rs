@@ -593,7 +593,7 @@ impl BucketTargetSys {
         };
 
         if let Some(cli) = cli {
-            return Some(cli.clone());
+            return Some(cli);
         }
 
         // TODO: spawn a task to reload the target
@@ -786,7 +786,10 @@ impl BucketTargetSys {
                         && tgt
                             .credentials
                             .as_ref()
-                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .map(|c| {
+                                let default_creds = Credentials::default();
+                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                            })
                             .unwrap_or(false)
                     {
                         return (tgt.arn.clone(), true);

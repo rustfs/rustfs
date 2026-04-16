@@ -51,14 +51,14 @@ impl AllTierStats {
     pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
         for (tier, st) in tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
     pub fn merge(&mut self, other: AllTierStats) {
         for (tier, st) in other.tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
@@ -1097,7 +1097,7 @@ impl DataUsageInfo {
 
     /// Add bucket usage info
     pub fn add_bucket_usage(&mut self, bucket: String, usage: BucketUsageInfo) {
-        self.buckets_usage.insert(bucket.clone(), usage);
+        self.buckets_usage.insert(bucket, usage);
         self.buckets_count = self.buckets_usage.len() as u64;
         self.last_update = Some(SystemTime::now());
     }

@@ -365,7 +365,7 @@ mod deadlock_request_guard_tests {
         assert_eq!(detector.tracked_count(), 1);
 
         {
-            let _guard = DeadlockRequestGuard::new(Arc::clone(&detector), request_id.clone());
+            let _guard = DeadlockRequestGuard::new(Arc::clone(&detector), request_id);
             // `_guard` is dropped at the end of this scope, which should unregister the request.
         }
 
@@ -713,10 +713,10 @@ fn apply_put_request_metadata(
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
     if let Some(cache_control) = cache_control {
-        metadata.insert("cache-control".to_string(), cache_control.to_string());
+        metadata.insert("cache-control".to_string(), cache_control);
     }
     if let Some(content_disposition) = content_disposition {
-        metadata.insert("content-disposition".to_string(), content_disposition.to_string());
+        metadata.insert("content-disposition".to_string(), content_disposition);
     }
     if let Some(content_encoding) = content_encoding
         && let Some(normalized_content_encoding) = normalize_content_encoding_for_storage(&content_encoding)
@@ -724,10 +724,10 @@ fn apply_put_request_metadata(
         metadata.insert("content-encoding".to_string(), normalized_content_encoding);
     }
     if let Some(content_language) = content_language {
-        metadata.insert("content-language".to_string(), content_language.to_string());
+        metadata.insert("content-language".to_string(), content_language);
     }
     if let Some(content_type) = content_type {
-        metadata.insert("content-type".to_string(), content_type.to_string());
+        metadata.insert("content-type".to_string(), content_type);
     }
     if let Some(expires) = expires {
         let mut formatted = Vec::new();
@@ -737,10 +737,10 @@ fn apply_put_request_metadata(
         metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
     }
     if let Some(website_redirect_location) = website_redirect_location {
-        metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location.to_string());
+        metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location);
     }
     if let Some(tags) = tagging {
-        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
+        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
     }
     if let Some(storage_class) = storage_class {
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storage_class.as_str().to_string());
@@ -1512,7 +1512,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&req.headers) {
-            return self.execute_put_object_extract(req).await;
+            return Box::pin(self.execute_put_object_extract(req)).await;
         }
 
         let input = std::mem::take(&mut req.input);
@@ -4545,7 +4545,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4564,7 +4564,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4583,7 +4583,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4603,7 +4603,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4623,7 +4623,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4640,7 +4640,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4656,7 +4656,7 @@ mod tests {
         let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_get_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -4676,7 +4676,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_copy_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -4691,7 +4691,7 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_delete_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 

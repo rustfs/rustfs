@@ -685,7 +685,7 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
     };
 
     let done_fn: CloseDiskFn = {
-        let disk = disk_name.clone();
+        let disk = disk_name;
         Arc::new(move || {
             let disk = disk.clone();
             Box::pin(async move {
