@@ -104,7 +104,8 @@ pub fn create_real_xlmeta() -> Result<Vec<u8>> {
     fm.versions.push(legacy_shallow);
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by_key(|b| std::cmp::Reverse(b.header.mod_time));
+    fm.versions
+        .sort_by_key(|v| (v.header.mod_time.is_none(), std::cmp::Reverse(v.header.mod_time)));
 
     fm.marshal_msg()
 }
@@ -350,7 +351,8 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     }
 
     // Sort by modification time (newest first)
-    fm.versions.sort_by_key(|b| std::cmp::Reverse(b.header.mod_time));
+    fm.versions
+        .sort_by_key(|v| (v.header.mod_time.is_none(), std::cmp::Reverse(v.header.mod_time)));
 
     fm.marshal_msg()
 }

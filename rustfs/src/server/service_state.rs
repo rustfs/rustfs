@@ -127,19 +127,19 @@ impl ServiceStateManager {
         match state {
             ServiceState::Starting => {
                 info!("RustFS Service is starting...");
-                notify_systemd(state);
+                notify_systemd_daemon(state);
             }
             ServiceState::Ready => {
                 info!("RustFS Service is running");
-                notify_systemd(state);
+                notify_systemd_daemon(state);
             }
             ServiceState::Stopping => {
                 info!("RustFS Service is stopping...");
-                notify_systemd(state);
+                notify_systemd_daemon(state);
             }
             ServiceState::Stopped => {
                 info!("RustFS Service has stopped");
-                notify_systemd(state);
+                notify_systemd_daemon(state);
             }
         }
     }
@@ -164,7 +164,7 @@ fn systemd_status_text(state: ServiceState) -> &'static str {
 }
 
 #[cfg(target_os = "linux")]
-fn notify_systemd(state: ServiceState) {
+fn notify_systemd_daemon(state: ServiceState) {
     use libsystemd::daemon::{NotifyState, notify};
     use tracing::{debug, error};
 
@@ -184,7 +184,7 @@ fn notify_systemd(state: ServiceState) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn notify_systemd(state: ServiceState) {
+fn notify_systemd_daemon(state: ServiceState) {
     info!(
         status = systemd_status_text(state),
         ?state,
