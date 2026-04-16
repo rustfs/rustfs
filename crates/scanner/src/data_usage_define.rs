@@ -251,10 +251,7 @@ impl SizeSummary {
             return;
         }
 
-        let mut tier = oi
-            .storage_class
-            .clone()
-            .unwrap_or_else(|| storageclass::STANDARD.to_string());
+        let mut tier = oi.storage_class.clone().unwrap_or_else(|| storageclass::STANDARD.to_string());
         if oi.transitioned_object.status == TRANSITION_COMPLETE {
             tier = oi.transitioned_object.tier.clone();
         }

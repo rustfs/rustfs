@@ -182,9 +182,7 @@ impl TargetFactory for MQTTTargetFactory {
                 config.lookup(MQTT_TLS_TRUST_LEAF_AS_CA).as_deref(),
                 config.lookup(MQTT_WS_PATH_ALLOWLIST).as_deref(),
             )?,
-            queue_dir: config
-                .lookup(MQTT_QUEUE_DIR)
-                .unwrap_or_else(|| EVENT_DEFAULT_DIR.to_string()),
+            queue_dir: config.lookup(MQTT_QUEUE_DIR).unwrap_or_else(|| EVENT_DEFAULT_DIR.to_string()),
             queue_limit: config
                 .lookup(MQTT_QUEUE_LIMIT)
                 .and_then(|v| v.parse::<u64>().ok())
