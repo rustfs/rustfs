@@ -832,7 +832,7 @@ pub async fn abort_incomplete_multipart_upload_due(
                 .as_ref()?
                 .days_after_initiation
                 .filter(|days| *days > 0)?;
-            Some((expected_expiry_time(initiated, days), rule.id.clone().unwrap_or_default()))
+            Some((expected_expiry_time(initiated, days), rule.id.unwrap_or_default()))
         })
         .min_by_key(|(due, _)| due.unix_timestamp_nanos())
 }
