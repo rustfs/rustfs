@@ -276,9 +276,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             timeout_ms = peek_timeout.as_millis(),
                             "list_path_raw reader peek timed out; excluding drive from current merge"
                         );
-                        let (closed_rd, closed_wr) = tokio::io::duplex(1);
-                        drop(closed_wr);
-                        *r = MetacacheReader::new(closed_rd);
+                        let (detached_rd, write_half) = tokio::io::duplex(1);
+                        drop(write_half);
+                        *r = MetacacheReader::new(detached_rd);
                         continue;
                     }
                 };
