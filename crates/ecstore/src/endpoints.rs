@@ -554,7 +554,7 @@ impl EndpointServerPools {
 
         for pool in self.0.iter() {
             for ep in pool.endpoints.as_ref() {
-                let n = node_map.entry(ep.host_port()).or_insert(Node {
+                let n = node_map.entry(ep.host_port()).or_insert_with(|| Node {
                     url: ep.url.clone(),
                     pools: vec![],
                     is_local: ep.is_local,

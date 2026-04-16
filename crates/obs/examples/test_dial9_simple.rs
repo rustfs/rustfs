@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Test 1: Check dial9 state");
     println!(
         "  RUSTFS_RUNTIME_DIAL9_ENABLED: {}",
-        std::env::var("RUSTFS_RUNTIME_DIAL9_ENABLED").unwrap_or("not set".to_string())
+        std::env::var("RUSTFS_RUNTIME_DIAL9_ENABLED").unwrap_or_else(|_| "not set".to_string())
     );
     println!("  is_enabled(): {}", is_enabled());
     println!("  ✓ Dial9 state check complete");

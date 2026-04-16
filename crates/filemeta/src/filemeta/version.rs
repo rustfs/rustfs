@@ -517,16 +517,20 @@ impl FileMetaVersion {
                     }
                 }
             }
-            VersionType::Object => self
-                .object
-                .as_ref()
-                .unwrap_or(&MetaObject::default())
-                .into_fileinfo(volume, path, all_parts),
-            VersionType::Delete => self
-                .delete_marker
-                .as_ref()
-                .unwrap_or(&MetaDeleteMarker::default())
-                .into_fileinfo(volume, path, all_parts),
+            VersionType::Object => {
+                let default_object = MetaObject::default();
+                self.object
+                    .as_ref()
+                    .unwrap_or(&default_object)
+                    .into_fileinfo(volume, path, all_parts)
+            }
+            VersionType::Delete => {
+                let default_marker = MetaDeleteMarker::default();
+                self.delete_marker
+                    .as_ref()
+                    .unwrap_or(&default_marker)
+                    .into_fileinfo(volume, path, all_parts)
+            }
         };
         fi.uses_legacy_checksum = self.uses_legacy_checksum;
         fi
