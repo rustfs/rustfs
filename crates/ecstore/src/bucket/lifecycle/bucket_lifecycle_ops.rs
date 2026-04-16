@@ -1539,11 +1539,11 @@ pub async fn put_restore_opts(
             if !strings_has_prefix_fold(&v.name.clone().unwrap(), "x-amz-meta") {
                 meta.insert(
                     format!("x-amz-meta-{}", v.name.as_ref().unwrap()),
-                    v.value.clone().unwrap_or("".to_string()),
+                    v.value.clone().unwrap_or_else(|| "".to_string()),
                 );
                 continue;
             }
-            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or("".to_string()));
+            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or_else(|| "".to_string()));
         }
         if let Some(output_location) = rreq.output_location.as_ref()
             && let Some(s3) = &output_location.s3
@@ -1551,7 +1551,7 @@ pub async fn put_restore_opts(
         {
             meta.insert(
                 AMZ_OBJECT_TAGGING.to_string(),
-                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or("".to_string()),
+                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
             );
         }
         if let Some(output_location) = rreq.output_location.as_ref()

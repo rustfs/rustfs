@@ -647,7 +647,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 storage_class: transitions[0]
                                     .storage_class
                                     .clone()
-                                    .unwrap_or(TransitionStorageClass::from_static(""))
+                                    .unwrap_or_else(|| TransitionStorageClass::from_static(""))
                                     .as_str()
                                     .to_string(),
                                 noncurrent_days: 0,
