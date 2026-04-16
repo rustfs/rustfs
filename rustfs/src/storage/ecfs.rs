@@ -228,14 +228,14 @@ impl S3 for FS {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let usecase = DefaultMultipartUsecase::from_global();
-        usecase.execute_complete_multipart_upload(req).await
+        Box::pin(usecase.execute_complete_multipart_upload(req)).await
     }
 
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_copy_object(req).await
+        Box::pin(usecase.execute_copy_object(req)).await
     }
 
     #[instrument(
@@ -345,7 +345,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_delete_object(req).await
+        Box::pin(usecase.execute_delete_object(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -611,7 +611,7 @@ impl S3 for FS {
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_get_object(req).await
+        Box::pin(usecase.execute_get_object(req)).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -1102,7 +1102,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_put_object(self, req).await
+        Box::pin(usecase.execute_put_object(self, req)).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1447,6 +1447,6 @@ impl S3 for FS {
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
-        usecase.execute_upload_part_copy(req).await
+        Box::pin(usecase.execute_upload_part_copy(req)).await
     }
 }
