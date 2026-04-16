@@ -1417,7 +1417,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&req.headers) {
-            return self.execute_put_object_extract(req).await;
+            return Box::pin(self.execute_put_object_extract(req)).await;
         }
 
         let input = std::mem::take(&mut req.input);
@@ -4416,7 +4416,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4435,7 +4435,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4454,7 +4454,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4474,7 +4474,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4494,7 +4494,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -4511,7 +4511,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
         let fs = FS::new();
 
-        let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -4527,7 +4527,7 @@ mod tests {
         let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_get_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -4547,7 +4547,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_copy_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -4562,7 +4562,7 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_delete_object(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_delete_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
