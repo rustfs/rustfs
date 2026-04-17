@@ -220,6 +220,9 @@ pub enum MetricName {
     NotificationEventsErrorsTotal,
     NotificationEventsSentTotal,
     NotificationEventsSkippedTotal,
+    NotificationTargetFailedMessages,
+    NotificationTargetQueueLength,
+    NotificationTargetTotalMessages,
 
     // Metrics related to the usage of cluster objects
     UsageSinceLastUpdateSeconds,
@@ -246,11 +249,6 @@ pub enum MetricName {
     IlmTransitionPendingTasks,
     IlmTransitionMissedImmediateTasks,
     IlmVersionsScanned,
-
-    // Webhook logs
-    WebhookQueueLength,
-    WebhookTotalMessages,
-    WebhookFailedMessages,
 
     // Copy the relevant metrics
     ReplicationAverageActiveWorkers,
@@ -558,6 +556,9 @@ impl MetricName {
             Self::NotificationEventsErrorsTotal => "events_errors_total".to_string(),
             Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
             Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
+            Self::NotificationTargetFailedMessages => "failed_messages".to_string(),
+            Self::NotificationTargetQueueLength => "target_queue_length".to_string(),
+            Self::NotificationTargetTotalMessages => "total_messages".to_string(),
 
             // Metrics related to the usage of cluster objects
             Self::UsageSinceLastUpdateSeconds => "since_last_update_seconds".to_string(),
@@ -584,11 +585,6 @@ impl MetricName {
             Self::IlmTransitionPendingTasks => "transition_pending_tasks".to_string(),
             Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
             Self::IlmVersionsScanned => "versions_scanned".to_string(),
-
-            // Webhook logs
-            Self::WebhookQueueLength => "queue_length".to_string(),
-            Self::WebhookTotalMessages => "total_messages".to_string(),
-            Self::WebhookFailedMessages => "failed_messages".to_string(),
 
             // Copy the relevant metrics
             Self::ReplicationAverageActiveWorkers => "average_active_workers".to_string(),

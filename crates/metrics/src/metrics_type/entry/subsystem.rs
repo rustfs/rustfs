@@ -47,7 +47,6 @@ pub enum MetricSubsystem {
     // other service related subsystems
     Ilm,
     Audit,
-    LoggerWebhook,
     Replication,
     Notification,
     Scanner,
@@ -89,7 +88,6 @@ impl MetricSubsystem {
             // other service related subsystems
             Self::Ilm => "/ilm",
             Self::Audit => "/audit",
-            Self::LoggerWebhook => "/logger/webhook",
             Self::Replication => "/replication",
             Self::Notification => "/notification",
             Self::Scanner => "/scanner",
@@ -137,7 +135,6 @@ impl MetricSubsystem {
             // Other service-related subsystems
             "/ilm" => Self::Ilm,
             "/audit" => Self::Audit,
-            "/logger/webhook" => Self::LoggerWebhook,
             "/replication" => Self::Replication,
             "/notification" => Self::Notification,
             "/scanner" => Self::Scanner,
@@ -199,7 +196,6 @@ pub mod subsystems {
     pub const CLUSTER_CONFIG: MetricSubsystem = MetricSubsystem::ClusterConfig;
     pub const ILM: MetricSubsystem = MetricSubsystem::Ilm;
     pub const AUDIT: MetricSubsystem = MetricSubsystem::Audit;
-    pub const LOGGER_WEBHOOK: MetricSubsystem = MetricSubsystem::LoggerWebhook;
     pub const REPLICATION: MetricSubsystem = MetricSubsystem::Replication;
     pub const NOTIFICATION: MetricSubsystem = MetricSubsystem::Notification;
     pub const SCANNER: MetricSubsystem = MetricSubsystem::Scanner;

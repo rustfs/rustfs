@@ -41,6 +41,16 @@ pub const ENV_RESOURCE_METRICS_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVA
 /// Default interval for collecting system resource metrics (CPU, memory).
 pub const DEFAULT_RESOURCE_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Environment variable key for audit target metrics interval (seconds).
+pub const ENV_AUDIT_METRICS_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL_SEC";
+/// Default interval for collecting audit target delivery metrics.
+pub const DEFAULT_AUDIT_METRICS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Environment variable key for notification metrics interval (seconds).
+pub const ENV_NOTIFICATION_METRICS_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL_SEC";
+/// Default interval for collecting notification delivery metrics.
+pub const DEFAULT_NOTIFICATION_METRICS_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Environment variable key for replication bandwidth metrics interval (seconds).
 pub const ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL_SEC";
 /// Default interval for collecting replication bandwidth metrics.

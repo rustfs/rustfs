@@ -25,31 +25,41 @@
 
 use crate::collectors::stats_collector::{
     collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats, collect_disk_stats,
-    collect_process_stats,
+    collect_process_resource_and_system_stats,
 };
 use crate::collectors::{
+    AuditTargetStats,
+    NotificationStats,
+    NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
     ProcessNetworkStats,
+    collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
     collect_cluster_metrics,
     collect_node_metrics,
+    collect_notification_metrics,
+    collect_notification_target_metrics,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
     collect_process_memory_metrics,
+    collect_process_metrics,
     collect_process_network_metrics,
     collect_resource_metrics,
 };
 use crate::constants::{
-    DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, DEFAULT_CLUSTER_METRICS_INTERVAL,
-    DEFAULT_NODE_METRICS_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL, ENV_BUCKET_METRICS_INTERVAL,
+    DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
+    DEFAULT_CLUSTER_METRICS_INTERVAL, DEFAULT_NODE_METRICS_INTERVAL, DEFAULT_NOTIFICATION_METRICS_INTERVAL,
+    DEFAULT_RESOURCE_METRICS_INTERVAL, ENV_AUDIT_METRICS_INTERVAL, ENV_BUCKET_METRICS_INTERVAL,
     ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
-    ENV_NODE_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
+    ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
 use crate::format::report_metrics;
+use rustfs_audit::audit_target_metrics;
+use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
 use std::time::Duration;
@@ -94,6 +104,8 @@ pub fn init_metrics_collectors(token: CancellationToken) {
     const LEGACY_NODE_INTERVAL: &str = "RUSTFS_METRICS_NODE_INTERVAL";
     const LEGACY_REPLICATION_BANDWIDTH_INTERVAL: &str = "RUSTFS_METRICS_BUCKET_REPLICATION_BANDWIDTH_INTERVAL";
     const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
+    const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
+    const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
     const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
 
     /// Parse metrics interval from environment variables with fallback to default.
@@ -126,6 +138,13 @@ pub fn init_metrics_collectors(token: CancellationToken) {
 
     let resource_interval =
         parse_metrics_interval(ENV_RESOURCE_METRICS_INTERVAL, LEGACY_RESOURCE_INTERVAL, DEFAULT_RESOURCE_METRICS_INTERVAL);
+    let audit_interval =
+        parse_metrics_interval(ENV_AUDIT_METRICS_INTERVAL, LEGACY_AUDIT_INTERVAL, DEFAULT_AUDIT_METRICS_INTERVAL);
+    let notification_interval = parse_metrics_interval(
+        ENV_NOTIFICATION_METRICS_INTERVAL,
+        LEGACY_NOTIFICATION_INTERVAL,
+        DEFAULT_NOTIFICATION_METRICS_INTERVAL,
+    );
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();
@@ -210,13 +229,76 @@ pub fn init_metrics_collectors(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Resource stats collection is synchronous but fast
-                    let stats = collect_process_stats();
-                    let metrics = collect_resource_metrics(&stats);
+                    let (resource_stats, process_stats) = collect_process_resource_and_system_stats();
+                    let mut metrics = collect_resource_metrics(&resource_stats);
+                    metrics.extend(collect_process_metrics(&process_stats));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
                     warn!("Metrics collection for resource stats cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for audit target delivery metrics
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(audit_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let stats = audit_target_metrics().await
+                        .into_iter()
+                        .map(|snapshot| AuditTargetStats {
+                            failed_messages: snapshot.failed_messages,
+                            queue_length: snapshot.queue_length,
+                            target_id: snapshot.target_id,
+                            total_messages: snapshot.total_messages,
+                        })
+                        .collect::<Vec<_>>();
+                    let metrics = collect_audit_metrics(&stats);
+                    report_metrics(&metrics);
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("Metrics collection for audit target stats cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for notification delivery metrics
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(notification_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let snapshot = notification_metrics_snapshot();
+                    let mut metrics = collect_notification_metrics(&NotificationStats {
+                        current_send_in_progress: snapshot.current_send_in_progress,
+                        events_errors_total: snapshot.events_errors_total,
+                        events_sent_total: snapshot.events_sent_total,
+                        events_skipped_total: snapshot.events_skipped_total,
+                    });
+
+                    let target_stats = notification_target_metrics().await
+                        .into_iter()
+                        .map(|snapshot| NotificationTargetStats {
+                            failed_messages: snapshot.failed_messages,
+                            queue_length: snapshot.queue_length,
+                            target_id: snapshot.target_id,
+                            target_type: snapshot.target_type,
+                            total_messages: snapshot.total_messages,
+                        })
+                        .collect::<Vec<_>>();
+                    metrics.extend(collect_notification_target_metrics(&target_stats));
+                    report_metrics(&metrics);
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("Metrics collection for notification stats cancelled.");
                     return;
                 }
             }

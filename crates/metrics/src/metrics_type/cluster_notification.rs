@@ -14,11 +14,11 @@
 
 #![allow(dead_code)]
 
-use crate::{MetricDescriptor, MetricName, new_counter_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub static NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_counter_md(
+    new_gauge_md(
         MetricName::NotificationCurrentSendInProgress,
         "Number of concurrent async Send calls active to all targets",
         &[],
@@ -47,7 +47,7 @@ pub static NOTIFICATION_EVENTS_SENT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyL
 pub static NOTIFICATION_EVENTS_SKIPPED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::NotificationEventsSkippedTotal,
-        "Events that were skipped to be sent to the targets due to the in-memory queue being full",
+        "Notification dispatch attempts skipped before delivery",
         &[],
         subsystems::NOTIFICATION,
     )
