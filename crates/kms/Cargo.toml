@@ -30,7 +30,7 @@ workspace = true
 [dependencies]
 # Core dependencies
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full","io-uring"] }
 uuid = { workspace = true, features = ["serde"] }
 jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

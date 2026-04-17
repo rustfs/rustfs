@@ -33,7 +33,7 @@ workspace = true
 rustfs-config = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-utils = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["fs","sync","rt","time","io-uring","macros"] }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
