@@ -8542,7 +8542,6 @@ dependencies = [
  "lz4",
  "md-5 0.11.0",
  "netif",
- "rand 0.10.1",
  "regex",
  "rustix 1.1.4",
  "rustls",

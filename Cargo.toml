@@ -157,7 +157,6 @@ rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.2.1"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
@@ -317,7 +316,7 @@ jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp"]
+ignored = ["rustfs"]
 
 [profile.release]
 opt-level = 3
