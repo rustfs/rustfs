@@ -218,7 +218,6 @@ impl ObjectStore {
         Err(last_err.unwrap_or(rustfs_crypto::Error::ErrUnexpectedHeader).into())
     }
 
-
     fn encrypt_data_with_master_key(data: &[u8]) -> Result<Vec<u8>> {
         let Some(master_key) = keyring::encrypt_key() else {
             return Err(Error::other("iam master key is not configured"));
