@@ -786,7 +786,10 @@ impl BucketTargetSys {
                         && tgt
                             .credentials
                             .as_ref()
-                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .map(|c| {
+                                let default_creds = Credentials::default();
+                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                            })
                             .unwrap_or(false)
                     {
                         return (tgt.arn.clone(), true);
@@ -892,6 +895,41 @@ pub struct RemoveObjectOptions {
     pub replication_status: ReplicationStatusType,
     pub replication_request: bool,
     pub replication_validity_check: bool,
+}
+
+fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOptions) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if opts.force_delete {
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
+    }
+    if opts.governance_bypass {
+        headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
+    }
+
+    if opts.replication_delete_marker {
+        insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
+    }
+
+    if let Some(t) = opts.replication_mtime {
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
+    }
+
+    if !opts.replication_status.is_empty() {
+        headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
+    }
+
+    if let Some(version_id) = version_id {
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, version_id);
+    }
+
+    if opts.replication_request {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    }
+    if opts.replication_validity_check {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+    }
+
+    headers
 }
 
 #[derive(Debug, Clone)]
@@ -1424,39 +1462,15 @@ impl TargetClient {
         version_id: Option<String>,
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let mut headers = HeaderMap::new();
-        if opts.force_delete {
-            insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
-        }
-        if opts.governance_bypass {
-            headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
-        }
-
-        if opts.replication_delete_marker {
-            insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
-        }
-
-        if let Some(t) = opts.replication_mtime {
-            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
-        }
-
-        if !opts.replication_status.is_empty() {
-            headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
-        }
-
-        if opts.replication_request {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        }
-        if opts.replication_validity_check {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
-        }
+        let headers = build_remove_object_headers(version_id.as_deref(), &opts);
+        let api_version_id = if opts.replication_request { None } else { version_id };
 
         match self
             .client
             .delete_object()
             .bucket(bucket)
             .key(object)
-            .set_version_id(version_id)
+            .set_version_id(api_version_id)
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
@@ -1550,3 +1564,53 @@ impl From<std::io::Error> for BucketTargetError {
 }
 
 impl Error for BucketTargetError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: true,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_VERSION_ID).as_deref(),
+            Some(version_id.as_str()),
+            "replication delete requests must preserve the version id in internal headers"
+        );
+    }
+
+    #[test]
+    fn build_remove_object_headers_omits_delete_marker_flag_for_marker_version_purge() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: false,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
+            "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
+}

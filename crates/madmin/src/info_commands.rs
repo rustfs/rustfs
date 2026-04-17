@@ -86,6 +86,10 @@ pub struct Disk {
     pub write_latency: f64,
     pub utilization: f64,
     pub metrics: Option<DiskMetrics>,
+    #[serde(rename = "runtimeState", default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub offline_duration_seconds: Option<u64>,
     pub heal_info: Option<HealingDisk>,
     pub used_inodes: u64,
     pub free_inodes: u64,
@@ -465,6 +469,8 @@ mod tests {
             write_latency: 7.8,
             utilization: 50.0,
             metrics: Some(DiskMetrics::default()),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
@@ -485,6 +491,8 @@ mod tests {
         assert_eq!(disk.total_space, 1000000000000);
         assert_eq!(disk.utilization, 50.0);
         assert!(disk.metrics.is_some());
+        assert_eq!(disk.runtime_state.as_deref(), Some("online"));
+        assert_eq!(disk.offline_duration_seconds, Some(0));
         assert!(disk.local);
     }
 

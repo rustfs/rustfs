@@ -154,7 +154,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
             match response.next().await {
                 Some(Ok(resp)) => {
                     if !resp.success {
-                        println!("{}", resp.error_info.unwrap_or("".to_string()));
+                        println!("{}", resp.error_info.unwrap_or_else(|| "".to_string()));
                     }
                     let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
                         .map_err(|_e| std::io::Error::other(format!("Unexpected response: {response:?}")))

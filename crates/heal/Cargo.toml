@@ -42,6 +42,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -50,6 +51,7 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 http = { workspace = true }
+temp-env = { workspace = true }
 
 [lib]
 doctest = false

@@ -277,10 +277,12 @@ mod serial_tests {
             HealPriority::Normal,
         );
 
-        let task_id = heal_manager
+        let task_id = heal_request.id.clone();
+        let admission = heal_manager
             .submit_heal_request(heal_request)
             .await
             .expect("Failed to submit bucket heal request");
+        assert!(admission.is_admitted(), "bucket heal request should be admitted");
 
         info!("Submitted bucket heal request with task ID: {}", task_id);
 

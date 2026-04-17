@@ -15,7 +15,9 @@
 #![allow(clippy::map_entry)]
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{enqueue_transition_immediate, init_background_expiry};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+    enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
+};
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -134,7 +136,8 @@ async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEvent
     match result {
         Ok(oi) => {
             if should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src).await;
+                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_immediate_expiry(&oi, src).await;
             }
             Ok(oi)
         }

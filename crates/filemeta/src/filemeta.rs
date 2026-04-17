@@ -382,6 +382,11 @@ impl FileMeta {
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
+        let target_is_delete_marker = self
+            .versions
+            .iter()
+            .find(|ver| ver.header.version_id == vid)
+            .is_some_and(|ver| ver.header.version_type == VersionType::Delete);
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -414,6 +419,10 @@ impl FileMeta {
             if !fi.version_purge_status().is_empty() && fi.version_purge_status() != VersionPurgeStatusType::Complete {
                 update_version = true;
             }
+        }
+
+        if target_is_delete_marker && !fi.deleted && !fi.version_purge_status().is_empty() {
+            update_version = false;
         }
 
         if fi.deleted {
@@ -1657,6 +1666,45 @@ mod test {
         for (v1, v2) in fm.versions.iter().zip(fm2.versions.iter()) {
             assert_eq!(v1.header.version_id, v2.header.version_id);
         }
+    }
+
+    #[test]
+    fn delete_version_removes_delete_marker_during_version_purge_replication() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Delete,
+            legacy_object: None,
+            object: None,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(version_id),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                meta_sys: HashMap::new(),
+            }),
+            write_version: 1,
+            uses_legacy_checksum: false,
+        })
+        .unwrap();
+
+        let fi = FileInfo {
+            deleted: false,
+            mark_deleted: false,
+            version_id: Some(version_id),
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = fm.delete_version(&fi).unwrap();
+
+        assert!(result.is_none());
+        assert!(
+            fm.versions.is_empty(),
+            "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
+        );
     }
 
     #[test]

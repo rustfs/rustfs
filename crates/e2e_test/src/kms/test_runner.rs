@@ -450,11 +450,7 @@ impl KMSTestSuite {
         if failed > 0 {
             warn!("❌ Failing tests:");
             for result in results.iter().filter(|r| !r.success) {
-                warn!(
-                    "  - {}: {}",
-                    result.test_name,
-                    result.error_message.as_ref().unwrap_or(&"Unknown error".to_string())
-                );
+                warn!("  - {}: {}", result.test_name, result.error_message.as_deref().unwrap_or("Unknown error"));
             }
         }
     }

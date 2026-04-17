@@ -192,3 +192,65 @@ Render RUSTFS_SERVER_DOMAINS
 {{- end -}}
 {{- join "," $domains -}}
 {{- end -}}
+
+{{/* Render probe command for liveness and readiness
+*/}}
+
+{{- define "rustfs.probeCommand" -}}
+{{- $endpoint_port := .Values.service.endpoint.port | default 9000 -}}
+{{- $console_port := .Values.service.console.port | default 9001 -}}
+{{- $args := "-skf" -}}
+
+{{- if and .Values.mtls.enabled -}}
+  {{- $args = printf "%s --cert %s --key %s" $args .Values.mtls.clientCertPath .Values.mtls.clientKeyPath -}}
+{{- end -}}
+- /bin/sh
+- -c
+- |
+  curl {{ $args }} https://127.0.0.1:{{ $endpoint_port }}/health/ready && \
+  curl {{ $args }} https://127.0.0.1:{{ $console_port }}/rustfs/console/health
+{{- end -}}
+
+{{/*
+Render liveness and readiness probe for http and https
+*/}}
+
+{{- define "rustfs.probes" -}}
+{{- if .Values.livenessProbe.enabled }}
+livenessProbe:
+  {{- if .Values.mtls.enabled }}
+  exec:
+    command:
+{{ include "rustfs.probeCommand" . | nindent 6 }}
+  {{- else }}
+  httpGet:
+    path: /health
+    port: {{ .Values.service.endpoint.port | default 9000 }}
+    scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+  {{- end }}
+  initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 60 }}
+  periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 5 }}
+  timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds | default 3 }}
+  successThreshold: {{ .Values.livenessProbe.successThreshold | default 1 }}
+  failureThreshold: {{ .Values.livenessProbe.failureThreshold | default 3 }}
+{{- end }}
+
+{{- if .Values.readinessProbe.enabled }}
+readinessProbe:
+  {{- if .Values.mtls.enabled }}
+  exec:
+    command:
+{{ include "rustfs.probeCommand" . | nindent 6 }}
+  {{- else }}
+  httpGet:
+    path: /health/ready
+    port: {{ .Values.service.endpoint.port | default 9000 }}
+    scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+  {{- end }}
+  initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 60 }}
+  periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 5 }}
+  timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds | default 3 }}
+  successThreshold: {{ .Values.readinessProbe.successThreshold | default 1 }}
+  failureThreshold: {{ .Values.readinessProbe.failureThreshold | default 3 }}
+{{- end }}
+{{- end -}}

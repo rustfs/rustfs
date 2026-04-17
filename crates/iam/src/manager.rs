@@ -429,7 +429,7 @@ where
                 p.update(policy.clone());
                 p
             })
-            .unwrap_or(PolicyDoc::new(policy));
+            .unwrap_or_else(|| PolicyDoc::new(policy));
 
         self.api.save_policy_doc(name, policy_doc.clone()).await?;
 
@@ -797,7 +797,7 @@ where
                         Cache::add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
                     }
 
-                    m.get(name).cloned().ok_or(Error::NoSuchGroup(name.to_string()))?
+                    m.get(name).cloned().ok_or_else(|| Error::NoSuchGroup(name.to_string()))?
                 }
             };
 
@@ -1452,7 +1452,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::NoSuchGroup(name.to_string()))?;
+            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         let mapped_policy = if let Some(policy) = self.cache.group_policies.load().get(name).cloned() {
             Some(policy)
@@ -1511,7 +1511,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::NoSuchGroup(name.to_string()))?;
+            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
@@ -1556,14 +1556,14 @@ where
             // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
             let mut m = HashMap::new();
             self.api.load_group(group, &mut m).await?;
-            m.get(group).cloned().ok_or(Error::NoSuchGroup(group.to_string()))?
+            m.get(group).cloned().ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
         } else {
             self.cache
                 .groups
                 .load()
                 .get(group)
                 .cloned()
-                .ok_or(Error::NoSuchGroup(group.to_string()))?
+                .ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
         };
 
         if members.is_empty() && !gi.members.is_empty() {

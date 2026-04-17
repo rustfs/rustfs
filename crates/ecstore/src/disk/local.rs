@@ -1538,7 +1538,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -1587,7 +1587,7 @@ impl DiskAPI for LocalDisk {
                 self.get_object_path(
                     bucket,
                     path_join_buf(&[
-                        path.parent().unwrap_or(Path::new("")).to_string_lossy().as_ref(),
+                        path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
                         &format!("part.{num}"),
                     ])
                     .as_str(),
@@ -1648,7 +1648,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -2497,7 +2497,7 @@ impl DiskAPI for LocalDisk {
                     let part_path = format!("part.{}", part.number);
                     let part_path = path_join_buf(&[
                         path,
-                        fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                        fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                         part_path.as_str(),
                     ]);
                     let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2514,7 +2514,7 @@ impl DiskAPI for LocalDisk {
             if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
                 let part_path = path_join_buf(&[
                     path,
-                    fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                    fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                     format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2836,6 +2836,32 @@ mod test {
 
         let mut entries = fs::read_dir(&trash).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_keeps_fresh_dirs_and_regular_files() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let fresh_dir = tmp.join("fresh").join("data");
+        let regular_file = tmp.join("note.txt");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+
+        fs::create_dir_all(fresh_dir.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&fresh_dir, b"temporary").await.unwrap();
+        fs::write(&regular_file, b"keep").await.unwrap();
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(tmp.join("fresh").exists());
+        assert!(regular_file.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
     }
 
     #[tokio::test]
