@@ -603,11 +603,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
         } else if file_count > max_files_threshold {
             let overflow_count = file_count - max_files_threshold;
             let exact_prefix_count = file_count.min(max_files_threshold) as u64;
-            let avg_prefix_size = if exact_prefix_count > 0 {
-                exact_prefix_bytes / exact_prefix_count
-            } else {
-                0
-            };
+            let avg_prefix_size = exact_prefix_bytes.checked_div(exact_prefix_count).unwrap_or(0);
             let estimated_overflow = avg_prefix_size.saturating_mul(overflow_count as u64);
             let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
             info!(
