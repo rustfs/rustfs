@@ -148,9 +148,17 @@ impl ProxyValidator {
 
     /// Internal logic for request validation.
     fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
-        // Fallback to unspecified address if peer address is missing.
-        let peer_addr = peer_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
+        let Some(peer_addr) = peer_addr else {
+            debug!("SocketAddr extension is missing; skipping trusted proxy evaluation");
+            return Ok(ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
+        };
+
         let peer_ip = peer_addr.ip();
+        if peer_ip.is_unspecified() {
+            debug!("Peer address is unspecified; skipping trusted proxy evaluation");
+            return Ok(ClientInfo::direct(peer_addr));
+        }
+
         let is_trusted_proxy = self
             .validation_cache
             .is_trusted(&peer_ip, |ip| self.chain_analyzer.is_ip_trusted(ip));

@@ -105,9 +105,30 @@ fn test_validator_caches_untrusted_direct_peer_decision() {
 
     let first = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(!first.is_from_trusted_proxy);
-    assert_eq!(validator.cache_stats().size, 1);
+    assert_eq!(validator.cache_stats().size, 0);
 
     let second = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(!second.is_from_trusted_proxy);
-    assert_eq!(validator.cache_stats().size, 1);
+    assert_eq!(validator.cache_stats().size, 0);
+}
+
+#[test]
+fn test_validator_skips_cache_when_peer_addr_is_missing() {
+    let validator = ProxyValidator::with_cache_config(create_test_config(), CacheConfig::default(), None);
+    let headers = HeaderMap::new();
+
+    let client_info = validator.validate_request(None, &headers).unwrap();
+    assert!(!client_info.is_from_trusted_proxy);
+    assert_eq!(validator.cache_stats().size, 0);
+}
+
+#[test]
+fn test_validator_skips_cache_for_unspecified_peer_addr() {
+    let validator = ProxyValidator::with_cache_config(create_test_config(), CacheConfig::default(), None);
+    let peer_addr = Some(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
+    let headers = HeaderMap::new();
+
+    let client_info = validator.validate_request(peer_addr, &headers).unwrap();
+    assert!(!client_info.is_from_trusted_proxy);
+    assert_eq!(validator.cache_stats().size, 0);
 }

@@ -59,12 +59,14 @@ impl IpValidationCache {
             return is_trusted;
         }
 
-        // Cache miss: perform validation and update cache.
+        // Cache miss: perform validation. Only positive trust decisions are cached
+        // to avoid polluting the cache with one-off untrusted client IPs.
         self.record_cache_miss();
         let is_trusted = validator(ip);
-        self.cache.insert(*ip, is_trusted);
-        self.cache.run_pending_tasks();
-        self.update_cache_size_metric();
+        if is_trusted {
+            self.cache.insert(*ip, is_trusted);
+            self.update_cache_size_metric();
+        }
 
         is_trusted
     }
@@ -88,6 +90,10 @@ impl IpValidationCache {
 
     /// Returns statistics about the current state of the cache.
     pub fn stats(&self) -> CacheStats {
+        if self.enabled {
+            self.cache.run_pending_tasks();
+        }
+
         let entry_count = self.cache.entry_count();
 
         CacheStats {
@@ -103,13 +109,13 @@ impl IpValidationCache {
 
     fn record_cache_hit(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_cache_hit(self.cache.entry_count() as usize);
+            metrics.record_cache_hit();
         }
     }
 
     fn record_cache_miss(&self) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_cache_miss(self.cache.entry_count() as usize);
+            metrics.record_cache_miss();
         }
     }
 
