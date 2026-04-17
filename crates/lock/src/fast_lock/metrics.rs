@@ -170,11 +170,10 @@ impl MetricsSnapshot {
     }
 
     pub fn avg_wait_time(&self) -> Duration {
-        if self.slow_path_success == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.total_wait_time_ns / self.slow_path_success)
-        }
+        self.total_wait_time_ns
+            .checked_div(self.slow_path_success)
+            .map(Duration::from_nanos)
+            .unwrap_or(Duration::ZERO)
     }
 
     pub fn max_wait_time(&self) -> Duration {
