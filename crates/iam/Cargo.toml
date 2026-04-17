@@ -58,6 +58,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
+serial_test = { workspace = true }
+temp-env = { workspace = true }
 
 [lib]
 doctest = false
