@@ -147,10 +147,7 @@ impl LockStats {
     pub fn avg_hold_time(&self) -> Duration {
         let total = self.total_hold_time_us.load(Ordering::Relaxed);
         let count = self.locks_released_early.load(Ordering::Relaxed);
-        total
-            .checked_div(count)
-            .map(Duration::from_micros)
-            .unwrap_or(Duration::ZERO)
+        total.checked_div(count).map(Duration::from_micros).unwrap_or(Duration::ZERO)
     }
 
     /// Get maximum hold time.

@@ -640,7 +640,9 @@ fn build_policy_mappings(
         }
     }
 
-    let mut results: Vec<PolicyEntities> = policy_map.into_values().filter_map(|mut mapping| {
+    let mut results: Vec<PolicyEntities> = policy_map
+        .into_values()
+        .filter_map(|mut mapping| {
             if !requested_policies.is_empty() && !requested_policies.iter().any(|policy| policy == &mapping.policy) {
                 return None;
             }

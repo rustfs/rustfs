@@ -1263,10 +1263,7 @@ impl IoLoadMetrics {
     pub(crate) fn lifetime_average_wait(&self) -> Duration {
         let total = self.total_wait_ns.load(Ordering::Relaxed);
         let count = self.observation_count.load(Ordering::Relaxed);
-        total
-            .checked_div(count)
-            .map(Duration::from_nanos)
-            .unwrap_or(Duration::ZERO)
+        total.checked_div(count).map(Duration::from_nanos).unwrap_or(Duration::ZERO)
     }
 
     /// Get the total observation count

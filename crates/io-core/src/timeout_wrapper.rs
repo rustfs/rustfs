@@ -342,10 +342,7 @@ impl TimeoutStats {
     pub fn avg_wait_time(&self) -> Duration {
         let total = self.total_wait_time_ns.load(Ordering::Relaxed);
         let count = self.total_operations.load(Ordering::Relaxed);
-        total
-            .checked_div(count)
-            .map(Duration::from_nanos)
-            .unwrap_or(Duration::ZERO)
+        total.checked_div(count).map(Duration::from_nanos).unwrap_or(Duration::ZERO)
     }
 
     /// Reset statistics.

@@ -1687,10 +1687,9 @@ pub async fn eval_action_from_lifecycle(
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
 
     match event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction
-            if lock_enabled => {
-                return lifecycle::Event::default();
-            }
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled => {
+            return lifecycle::Event::default();
+        }
         IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
             if oi.version_id.is_none() {
                 return lifecycle::Event::default();
