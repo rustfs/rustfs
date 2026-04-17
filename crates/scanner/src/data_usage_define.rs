@@ -765,7 +765,7 @@ impl DataUsageCache {
         let mut leaves = Vec::new();
         let mut remove = total - limit;
         add(self, path, &mut leaves);
-        leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
+        leaves.sort_by_key(|a| a.objects);
 
         while remove > 0 && !leaves.is_empty() {
             let e = leaves.first().unwrap();
