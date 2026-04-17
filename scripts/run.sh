@@ -241,9 +241,6 @@ export RUSTFS_SCANNER_ENABLED=true
 
 export RUSTFS_HEAL_ENABLED=true
 
-# Object cache configuration
-export RUSTFS_OBJECT_CACHE_ENABLE=true
-
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false
 # Memory profiling periodic dump

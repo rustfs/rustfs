@@ -159,9 +159,6 @@ $env:RUSTFS_NS_SCANNER_INTERVAL = "60"
 $env:RUSTFS_SCANNER_ENABLED = "false"
 $env:RUSTFS_HEAL_ENABLED = "false"
 
-# Object cache configuration
-$env:RUSTFS_OBJECT_CACHE_ENABLE = "true"
-
 # Profiling configuration
 $env:RUSTFS_ENABLE_PROFILING = "false"
 

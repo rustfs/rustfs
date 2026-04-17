@@ -237,15 +237,6 @@ println!("最大并发读: {}", config.scheduler.max_concurrent_reads);
 
 ## 🔧 配置
 
-### 环境变量
-
-| 变量名 | 描述 | 默认值 |
-|--------|------|--------|
-| `RUSTFS_CACHE_MAX_CAPACITY` | 缓存最大容量 | 10000 |
-| `RUSTFS_CACHE_TTL_SECS` | 缓存 TTL 秒数 | 300 |
-| `RUSTFS_CACHE_MAX_MEMORY` | 缓存最大内存 | 104857600 |
-| `RUSTFS_ADAPTIVE_TTL_ENABLED` | 启用自适应 TTL | true |
-
 ### 代码配置
 
 ```rust
