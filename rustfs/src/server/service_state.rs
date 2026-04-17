@@ -91,30 +91,23 @@ impl ServiceStateManager {
     }
 
     pub fn update(&self, new_state: ServiceState) {
-        // Serialize transition check + state write + publish dedupe as one critical section.
-        let should_publish = {
-            let mut published_state = self.published_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let current_state = self.current_state();
-            if service_state_rank(new_state) < service_state_rank(current_state) {
-                warn!(
-                    current = ?current_state,
-                    attempted = ?new_state,
-                    "Ignoring regressive service state transition"
-                );
-                return;
-            }
+        // Serialize transition check + state write + publish dedupe + notify as one
+        // critical section to keep notification order monotonic under concurrency.
+        let mut published_state = self.published_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_state = self.current_state();
+        if service_state_rank(new_state) < service_state_rank(current_state) {
+            warn!(
+                current = ?current_state,
+                attempted = ?new_state,
+                "Ignoring regressive service state transition"
+            );
+            return;
+        }
 
-            self.state.store(new_state, Ordering::SeqCst);
+        self.state.store(new_state, Ordering::SeqCst);
 
-            if *published_state == Some(new_state) {
-                false
-            } else {
-                *published_state = Some(new_state);
-                true
-            }
-        };
-
-        if should_publish {
+        if *published_state != Some(new_state) {
+            *published_state = Some(new_state);
             self.notify_systemd(new_state);
         }
     }
