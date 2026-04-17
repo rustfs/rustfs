@@ -31,6 +31,7 @@
 - **带宽监控**：实时带宽观测和分析
 - **性能指标**：I/O 性能指标收集
 - **统一配置**：集中式配置管理
+- **导出边界**：通过 `metrics` 主动上报，由 `rustfs-obs` 负责 OTEL 导出，不提供 Prometheus HTTP 端点
 
 ## ✨ 核心功能
 
@@ -280,7 +281,7 @@ cargo test --package rustfs-io-metrics
 cargo test --package rustfs-io-metrics --lib adaptive_ttl
 
 # 运行基准测试
-cargo bench --package rustfs-io-metrics
+cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 ```
 
 ## 📚 文档

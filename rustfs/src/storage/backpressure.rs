@@ -24,7 +24,7 @@
 //!
 //! - Configurable buffer size with high/low watermarks
 //! - Backpressure state monitoring and events
-//! - Prometheus metrics for backpressure events
+//! - Backpressure metrics emitted through the shared metrics pipeline
 //! - Graceful handling of slow consumers
 //!
 //! # Architecture
