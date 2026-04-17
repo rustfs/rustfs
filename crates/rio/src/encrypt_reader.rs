@@ -306,9 +306,8 @@ where
                 }
 
                 let typ = this.header_buf[0];
-                let len = (this.header_buf[1] as usize)
-                    | ((this.header_buf[2] as usize) << 8)
-                    | ((this.header_buf[3] as usize) << 16);
+                let len =
+                    (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
                 *this.header_read = 0;
                 *this.header_done = false;
 

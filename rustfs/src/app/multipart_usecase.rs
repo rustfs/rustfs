@@ -1242,18 +1242,9 @@ mod tests {
 
         let merged = merge_part_encryption_metadata(&multipart_metadata, &part_metadata);
 
-        assert_eq!(
-            multipart_metadata.get("x-rustfs-encryption-iv").map(String::as_str),
-            Some("base-nonce")
-        );
-        assert_eq!(
-            merged.get("x-rustfs-encryption-iv").map(String::as_str),
-            Some("part-nonce")
-        );
-        assert_eq!(
-            merged.get("x-rustfs-encryption-key").map(String::as_str),
-            Some("base-key")
-        );
+        assert_eq!(multipart_metadata.get("x-rustfs-encryption-iv").map(String::as_str), Some("base-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-iv").map(String::as_str), Some("part-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-key").map(String::as_str), Some("base-key"));
     }
 
     #[tokio::test]
