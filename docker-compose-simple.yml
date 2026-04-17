@@ -35,9 +35,6 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_TLS_PATH=/opt/tls
-      # Object Cache
-      - RUSTFS_OBJECT_CACHE_ENABLE=true
-      - RUSTFS_OBJECT_CACHE_TTL_SECS=300
 
     volumes:
       - rustfs_data_0:/data/rustfs0
