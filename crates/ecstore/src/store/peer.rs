@@ -15,6 +15,15 @@
 use super::*;
 use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 
+async fn remember_local_disk_id(disk: &DiskStore) -> Option<Uuid> {
+    let disk_id = disk.get_disk_id().await.ok().flatten()?;
+    GLOBAL_LOCAL_DISK_ID_MAP
+        .write()
+        .await
+        .insert(disk_id, disk.endpoint().to_string());
+    Some(disk_id)
+}
+
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
     let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
 
@@ -27,6 +36,7 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
 
 pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     if let Some(disk) = find_local_disk(&disk_ref.to_string()).await {
+        let _ = remember_local_disk_id(&disk).await;
         return Some(disk);
     }
 
@@ -34,8 +44,19 @@ pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
         return None;
     };
 
-    let disk_path = GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned()?;
-    find_local_disk(&disk_path).await
+    if let Some(disk_path) = GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned()
+        && let Some(disk) = find_local_disk(&disk_path).await
+    {
+        return Some(disk);
+    }
+
+    for disk in all_local_disk().await {
+        if remember_local_disk_id(&disk).await == Some(disk_id) {
+            return Some(disk);
+        }
+    }
+
+    None
 }
 
 pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
@@ -68,6 +89,17 @@ pub async fn all_local_disk() -> Vec<DiskStore> {
         .filter(|v| v.is_some())
         .map(|v| v.as_ref().unwrap().clone())
         .collect()
+}
+
+pub async fn prewarm_local_disk_id_map() {
+    for disk in all_local_disk().await {
+        if let Err(err) = disk.get_disk_id().await {
+            warn!("prewarm_local_disk_id_map: failed to load disk id for {}: {}", disk.endpoint(), err);
+            continue;
+        }
+
+        let _ = remember_local_disk_id(&disk).await;
+    }
 }
 
 pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
