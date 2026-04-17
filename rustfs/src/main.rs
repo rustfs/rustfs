@@ -44,6 +44,7 @@ use rustfs_ecstore::{
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store::prewarm_local_disk_id_map,
     store_api::BucketOperations,
     store_api::BucketOptions,
     update_erasure_type,
@@ -295,6 +296,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    prewarm_local_disk_id_map().await;
     // Initialize the lock clients
 
     init_lock_clients(endpoint_pools.clone());
