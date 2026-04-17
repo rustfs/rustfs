@@ -61,6 +61,7 @@ pub mod deadlock_metrics;
 pub mod io_metrics;
 pub mod lock_metrics;
 pub mod performance;
+pub mod process_lock_metrics;
 pub mod timeout_metrics;
 
 pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
@@ -106,6 +107,12 @@ pub use deadlock_metrics::{
 pub use lock_metrics::{
     LockMetricsSummary, record_contention_event, record_early_release, record_lock_hold_time, record_lock_optimization_enabled,
     record_spin_attempt, record_spin_count_change,
+};
+
+pub use process_lock_metrics::{
+    ProcessLockSnapshot, ProcessPlatformSnapshot, record_read_lock_held_acquire, record_read_lock_held_release,
+    record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts,
+    snapshot_process_platform_stats,
 };
 
 // Timeout metrics exports

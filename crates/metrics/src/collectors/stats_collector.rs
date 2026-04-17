@@ -20,13 +20,16 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
-use crate::collectors::{BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, ResourceStats};
+use crate::collectors::{
+    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, ProcessStats, ProcessStatusType, ResourceStats,
+};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
+use rustfs_io_metrics::{snapshot_process_lock_counts, snapshot_process_platform_stats};
 use std::sync::OnceLock;
 use std::time::Instant;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -39,6 +42,66 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 #[inline]
 fn get_process_start() -> &'static Instant {
     PROCESS_START.get_or_init(Instant::now)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProcessPlatformStats {
+    io_rchar_bytes: Option<u64>,
+    io_read_bytes: Option<u64>,
+    io_wchar_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProcSelfIoStats {
+    rchar_bytes: Option<u64>,
+    read_bytes: Option<u64>,
+    wchar_bytes: Option<u64>,
+    write_bytes: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn collect_process_platform_stats() -> ProcessPlatformStats {
+    let io_stats = std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .map(|content| parse_proc_self_io(&content))
+        .unwrap_or_default();
+
+    ProcessPlatformStats {
+        io_rchar_bytes: io_stats.rchar_bytes,
+        io_read_bytes: io_stats.read_bytes,
+        io_wchar_bytes: io_stats.wchar_bytes,
+        io_write_bytes: io_stats.write_bytes,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_process_platform_stats() -> ProcessPlatformStats {
+    ProcessPlatformStats::default()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_self_io(content: &str) -> ProcSelfIoStats {
+    let mut stats = ProcSelfIoStats::default();
+
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+
+        match key.trim() {
+            "rchar" => stats.rchar_bytes = Some(value),
+            "read_bytes" => stats.read_bytes = Some(value),
+            "wchar" => stats.wchar_bytes = Some(value),
+            "write_bytes" => stats.write_bytes = Some(value),
+            _ => {}
+        }
+    }
+
+    stats
 }
 
 /// Collect cluster statistics from the storage layer.
@@ -197,37 +260,90 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
         .collect()
 }
 
-/// Collect resource statistics for the current process.
-///
-/// Collects:
-/// - Uptime: Calculated from process start time
-/// - Memory: Process resident set size from sysinfo
-/// - CPU: Process CPU usage percentage from sysinfo
+/// Collect resource and process statistics for the current process in one sysinfo refresh.
 #[inline]
-pub fn collect_process_stats() -> ResourceStats {
+pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessStats) {
     let uptime_seconds = get_process_start().elapsed().as_secs();
+    let platform_stats = collect_process_platform_stats();
+    let platform_process_stats = snapshot_process_platform_stats();
+    let lock_snapshot = snapshot_process_lock_counts();
 
-    // Use sysinfo for process metrics
+    // Collect both resource and process metrics in one refresh to avoid duplicate sysinfo work.
     let mut sys = System::new();
     let pid = Pid::from_u32(std::process::id());
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing().with_cpu().with_memory(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
 
     if let Some(process) = sys.process(pid) {
-        ResourceStats {
+        let disk_usage = process.disk_usage();
+        let status = ProcessStatusType::from(process.status());
+        let resource_stats = ResourceStats {
             cpu_percent: process.cpu_usage() as f64,
             memory_bytes: process.memory(),
             uptime_seconds,
-        }
-    } else {
-        // Fallback if process info unavailable
-        ResourceStats {
-            cpu_percent: 0.0,
-            memory_bytes: 0,
+        };
+        let process_stats = ProcessStats {
+            locks_read_total: lock_snapshot.read_locks_held,
+            locks_write_total: lock_snapshot.write_locks_held,
+            cpu_total_seconds: process.accumulated_cpu_time() as f64 / 1000.0,
+            file_descriptor_limit_total: process.open_files_limit().map_or(0, |value| value as u64),
+            file_descriptor_open_total: process.open_files().map_or(0, |value| value as u64),
+            go_routine_total: process.tasks().map_or(0, |tasks| tasks.len() as u64),
+            io_rchar_bytes: platform_stats.io_rchar_bytes.unwrap_or(disk_usage.total_read_bytes),
+            io_read_bytes: platform_stats.io_read_bytes.unwrap_or(disk_usage.total_read_bytes),
+            io_wchar_bytes: platform_stats.io_wchar_bytes.unwrap_or(disk_usage.total_written_bytes),
+            io_write_bytes: platform_stats.io_write_bytes.unwrap_or(disk_usage.total_written_bytes),
+            resident_memory_bytes: process.memory(),
+            start_time_seconds: process.start_time(),
+            status,
+            status_value: status as i64,
+            syscall_read_total: platform_process_stats.syscall_read_total.unwrap_or(0),
+            syscall_write_total: platform_process_stats.syscall_write_total.unwrap_or(0),
             uptime_seconds,
-        }
+            virtual_memory_bytes: process.virtual_memory(),
+            virtual_memory_max_bytes: platform_process_stats.virtual_memory_max_bytes.unwrap_or(0),
+            ..Default::default()
+        };
+        (resource_stats, process_stats)
+    } else {
+        (
+            ResourceStats {
+                cpu_percent: 0.0,
+                memory_bytes: 0,
+                uptime_seconds,
+            },
+            ProcessStats {
+                uptime_seconds,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// Collect resource statistics for the current process.
+#[inline]
+pub fn collect_process_stats() -> ResourceStats {
+    collect_process_resource_and_system_stats().0
+}
+
+/// Collect process statistics for the current process.
+#[inline]
+pub fn collect_process_system_stats() -> ProcessStats {
+    collect_process_resource_and_system_stats().1
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::parse_proc_self_io;
+
+    #[test]
+    fn parse_proc_self_io_extracts_expected_fields() {
+        let stats = parse_proc_self_io(
+            "rchar: 11\nwchar: 22\nsyscr: 33\nsyscw: 44\nread_bytes: 55\nwrite_bytes: 66\ncancelled_write_bytes: 77\n",
+        );
+
+        assert_eq!(stats.rchar_bytes, Some(11));
+        assert_eq!(stats.wchar_bytes, Some(22));
+        assert_eq!(stats.read_bytes, Some(55));
+        assert_eq!(stats.write_bytes, Some(66));
     }
 }
