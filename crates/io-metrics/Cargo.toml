@@ -28,8 +28,11 @@ categories = ["development-tools", "filesystem"]
 metrics = { workspace = true }
 num_cpus = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "full"] }
+tokio = { workspace = true, features = ["sync","rt"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

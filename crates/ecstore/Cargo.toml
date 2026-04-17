@@ -86,7 +86,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
