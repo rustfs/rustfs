@@ -18,21 +18,32 @@ use moka::future::Cache;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::ProxyMetrics;
+
 /// Cache for storing IP validation results.
 #[derive(Debug, Clone)]
 pub struct IpValidationCache {
     /// The underlying Moka cache.
     cache: Cache<IpAddr, bool>,
+    /// Configured capacity.
+    capacity: usize,
     /// Whether the cache is enabled.
     enabled: bool,
+    /// Optional metrics collector for cache activity.
+    metrics: Option<ProxyMetrics>,
 }
 
 impl IpValidationCache {
     /// Creates a new `IpValidationCache` using Moka.
-    pub fn new(capacity: usize, ttl: Duration, enabled: bool) -> Self {
+    pub fn new(capacity: usize, ttl: Duration, enabled: bool, metrics: Option<ProxyMetrics>) -> Self {
         let cache = Cache::builder().max_capacity(capacity as u64).time_to_live(ttl).build();
 
-        Self { cache, enabled }
+        Self {
+            cache,
+            capacity,
+            enabled,
+            metrics,
+        }
     }
 
     /// Checks if an IP is trusted, using the cache if available.
@@ -43,14 +54,16 @@ impl IpValidationCache {
 
         // Attempt to get the result from cache.
         if let Some(is_trusted) = self.cache.get(ip).await {
-            metrics::counter!("rustfs_trusted_proxy_cache_hits").increment(1);
+            self.record_cache_hit();
             return is_trusted;
         }
 
         // Cache miss: perform validation and update cache.
-        metrics::counter!("rustfs_trusted_proxy_cache_misses").increment(1);
+        self.record_cache_miss();
         let is_trusted = validator(ip);
         self.cache.insert(*ip, is_trusted).await;
+        self.cache.run_pending_tasks().await;
+        self.update_cache_size_metric();
 
         is_trusted
     }
@@ -58,7 +71,18 @@ impl IpValidationCache {
     /// Clears all entries from the cache.
     pub async fn clear(&self) {
         self.cache.invalidate_all();
-        metrics::gauge!("rustfs_trusted_proxy_cache_size").set(0.0);
+        self.cache.run_pending_tasks().await;
+        self.update_cache_size_metric();
+    }
+
+    /// Runs pending cache maintenance tasks and refreshes size metrics.
+    pub async fn run_maintenance(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        self.cache.run_pending_tasks().await;
+        self.update_cache_size_metric();
     }
 
     /// Returns statistics about the current state of the cache.
@@ -67,9 +91,30 @@ impl IpValidationCache {
 
         CacheStats {
             size: entry_count as usize,
-            // Moka doesn't expose max_capacity directly in a simple way after build,
-            // but we can track it if needed.
-            capacity: 0,
+            capacity: self.capacity,
+        }
+    }
+
+    /// Returns whether the cache is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn record_cache_hit(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_cache_hit(self.cache.entry_count() as usize);
+        }
+    }
+
+    fn record_cache_miss(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_cache_miss(self.cache.entry_count() as usize);
+        }
+    }
+
+    fn update_cache_size_metric(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.set_cache_size(self.cache.entry_count() as usize);
         }
     }
 }

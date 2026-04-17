@@ -19,7 +19,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use crate::{ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode};
+use crate::{
+    CacheConfig, CacheStats, IpValidationCache, ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode,
+};
 
 /// Information about the client extracted from the request and proxy headers.
 #[derive(Debug, Clone)]
@@ -95,6 +97,8 @@ pub struct ProxyValidator {
     config: TrustedProxyConfig,
     /// Analyzer for verifying the integrity of the proxy chain.
     chain_analyzer: ProxyChainAnalyzer,
+    /// Cache for repeated direct-peer trusted proxy decisions.
+    validation_cache: std::sync::Arc<IpValidationCache>,
     /// Metrics collector for observability.
     metrics: Option<ProxyMetrics>,
 }
@@ -102,24 +106,37 @@ pub struct ProxyValidator {
 impl ProxyValidator {
     /// Creates a new `ProxyValidator` with the given configuration and metrics.
     pub fn new(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>) -> Self {
+        Self::with_cache_config(config, CacheConfig::default(), metrics)
+    }
+
+    /// Creates a new `ProxyValidator` with explicit cache configuration.
+    pub fn with_cache_config(config: TrustedProxyConfig, cache_config: CacheConfig, metrics: Option<ProxyMetrics>) -> Self {
         let chain_analyzer = ProxyChainAnalyzer::new(config.clone());
+        let cache_enabled = cache_config.capacity > 0 && cache_config.ttl_seconds > 0;
+        let validation_cache = std::sync::Arc::new(IpValidationCache::new(
+            cache_config.capacity,
+            cache_config.ttl_duration(),
+            cache_enabled,
+            metrics.clone(),
+        ));
 
         Self {
             config,
             chain_analyzer,
+            validation_cache,
             metrics,
         }
     }
 
     /// Validates an incoming request and extracts client information.
-    pub fn validate_request(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
+    pub async fn validate_request(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         let start_time = Instant::now();
 
         // Record the start of the validation attempt.
         self.record_metric_start();
 
         // Perform the internal validation logic.
-        let result = self.validate_request_internal(peer_addr, headers);
+        let result = self.validate_request_internal(peer_addr, headers).await;
 
         // Record the result and duration.
         let duration = start_time.elapsed();
@@ -129,28 +146,46 @@ impl ProxyValidator {
     }
 
     /// Internal logic for request validation.
-    fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
+    async fn validate_request_internal(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> Result<ClientInfo, ProxyError> {
         // Fallback to unspecified address if peer address is missing.
         let peer_addr = peer_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
+        let peer_ip = peer_addr.ip();
+        let is_trusted_proxy = self
+            .validation_cache
+            .is_trusted(&peer_ip, |ip| self.chain_analyzer.is_ip_trusted(ip))
+            .await;
 
         // Check if the direct peer is a trusted proxy.
-        if self.config.is_trusted(&peer_addr) {
-            debug!("Request received from trusted proxy: {}", peer_addr.ip());
+        if is_trusted_proxy {
+            debug!("Request received from trusted proxy: {}", peer_ip);
 
             // Parse and validate headers from the trusted proxy.
             self.validate_trusted_proxy_request(&peer_addr, headers)
         } else {
             // Log a warning if the request is from a private network but not trusted.
-            if self.config.is_private_network(&peer_addr.ip()) {
+            if self.config.is_private_network(&peer_ip) {
                 warn!(
                     "Request from private network but not trusted: {}. This might indicate a configuration issue.",
-                    peer_addr.ip()
+                    peer_ip
                 );
             }
 
             // Treat as a direct connection if the peer is not trusted.
             Ok(ClientInfo::direct(peer_addr))
         }
+    }
+
+    /// Returns cache statistics for direct-peer validation decisions.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.validation_cache.stats()
+    }
+
+    pub(crate) fn validation_cache(&self) -> std::sync::Arc<IpValidationCache> {
+        self.validation_cache.clone()
     }
 
     /// Validates a request that originated from a trusted proxy.

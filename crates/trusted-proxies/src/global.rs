@@ -64,7 +64,7 @@ pub fn init() {
         .expect("Trusted proxy metrics already initialized");
 
     // Initialize the trusted proxy layer.
-    let layer = TrustedProxyLayer::new(config.proxy.clone(), metrics, enabled);
+    let layer = TrustedProxyLayer::with_cache_config(config.proxy.clone(), config.cache.clone(), metrics, enabled);
     PROXY_LAYER.set(layer).expect("Trusted proxy layer already initialized");
 
     tracing::info!("Trusted Proxies module initialized");

@@ -178,6 +178,35 @@ impl ProxyMetrics {
         });
     }
 
+    /// Records a cache hit and updates the cache size gauge.
+    pub fn record_cache_hit(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        counter!("rustfs_trusted_proxy_cache_hits_total", "app" => self.app_name.clone()).increment(1);
+        gauge!("rustfs_trusted_proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
+    }
+
+    /// Records a cache miss and updates the cache size gauge.
+    pub fn record_cache_miss(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        counter!("rustfs_trusted_proxy_cache_misses_total", "app" => self.app_name.clone()).increment(1);
+        gauge!("rustfs_trusted_proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
+    }
+
+    /// Updates only the cache size gauge.
+    pub fn set_cache_size(&self, size: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        gauge!("rustfs_trusted_proxy_cache_size", "app" => self.app_name.clone()).set(size as f64);
+    }
+
     /// Records cache performance metrics.
     pub fn record_cache_metrics(&self, hits: u64, misses: u64, size: usize) {
         if !self.enabled {
