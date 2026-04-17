@@ -86,7 +86,7 @@ Crates are organized in a dependency DAG with 9 depth levels (0 = leaf, 8 = top)
 ```
 Depth 0 — LEAF (no internal deps):
   appauth, checksums, config, credentials, crypto, io-metrics,
-  madmin, mcp, s3-common, workers, zip
+  madmin, s3-common, workers, zip
 
 Depth 1:
   io-core (→ io-metrics)
@@ -195,7 +195,6 @@ Depth 8 — TOP:
 | `trusted-proxies` | 4.0K | Trusted proxy / IP forwarding |
 | `zip` | 986 | ZIP archive support for bulk downloads |
 | `workers` | 136 | Simple worker abstraction |
-| `mcp` | 2.0K | Model Context Protocol server (AI tooling) |
 
 ## Architecture Invariants
 
@@ -224,7 +223,7 @@ Depth 8 — TOP:
 6. **Error types use `thiserror` with descriptive names** (e.g., `StorageError`,
    not bare `Error`).
    - ⚠️ VIOLATED: 6 crates use `pub enum Error`; 2 crates use `snafu`;
-     `mcp` and `heal` use `anyhow` in library code.
+      `heal` use `anyhow` in library code.
 
 ## Known Structural Issues
 
