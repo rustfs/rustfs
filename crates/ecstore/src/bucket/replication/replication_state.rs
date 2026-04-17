@@ -832,8 +832,8 @@ impl ReplicationStats {
         let mut rs = ReplStat::new();
 
         match status {
-            ReplicationStatusType::Pending => {
-                if ri.op_type.is_data_replication() && prev_status != status {
+            ReplicationStatusType::Pending
+                if ri.op_type.is_data_replication() && prev_status != status => {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -845,9 +845,8 @@ impl ReplicationStats {
                         ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
                     );
                 }
-            }
-            ReplicationStatusType::Completed => {
-                if ri.op_type.is_data_replication() {
+            ReplicationStatusType::Completed
+                if ri.op_type.is_data_replication() => {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -859,9 +858,8 @@ impl ReplicationStats {
                         ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
                     );
                 }
-            }
-            ReplicationStatusType::Failed => {
-                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending {
+            ReplicationStatusType::Failed
+                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending => {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -873,9 +871,8 @@ impl ReplicationStats {
                         ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
                     );
                 }
-            }
-            ReplicationStatusType::Replica => {
-                if ri.op_type == ReplicationType::Object {
+            ReplicationStatusType::Replica
+                if ri.op_type == ReplicationType::Object => {
                     rs.set(
                         ri.arn.clone(),
                         ri.size,
@@ -887,7 +884,6 @@ impl ReplicationStats {
                         ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
                     );
                 }
-            }
             _ => {}
         }
 

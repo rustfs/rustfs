@@ -162,11 +162,10 @@ impl ListPathOptions {
                     }
 
                     match kv[0] {
-                        "rustfs_cache" => {
-                            if kv[1] != MARKER_TAG_VERSION {
+                        "rustfs_cache"
+                            if kv[1] != MARKER_TAG_VERSION => {
                                 continue;
                             }
-                        }
                         "id" => self.id = Some(kv[1].to_owned()),
                         "return" => {
                             self.id = Some(Uuid::new_v4().to_string());
