@@ -786,8 +786,9 @@ where
 
 fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
     ServerProperties {
-        uptime: SystemTime::now()
-            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+        uptime: GLOBAL_BOOT_TIME
+            .get()
+            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
             .unwrap_or_default()
             .as_secs(),
         version: get_commit_id(),
