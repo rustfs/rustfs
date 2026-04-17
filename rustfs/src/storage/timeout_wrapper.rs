@@ -34,7 +34,7 @@
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
 //! - Resource cleanup on timeout (locks, memory, file handles)
-//! - Prometheus metrics for timeout monitoring
+//! - Timeout metrics emitted through `rustfs-io-metrics`
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
@@ -42,7 +42,7 @@
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
 //! - Resource cleanup on timeout (locks, memory, file handles)
-//! - Prometheus metrics for timeout monitoring
+//! - Timeout metrics emitted through `rustfs-io-metrics`
 //!
 //! # Usage
 //!

@@ -23,6 +23,8 @@
 //! - **PerformanceMetrics**: Shared atomic counter struct for advanced use cases
 //! - **MetricsCollector**: I/O operation tracking with percentile calculation
 //! - **AutoTuner**: Automatic performance optimization based on metrics
+//! - **No HTTP metrics endpoint**: consumers emit metrics through the `metrics` crate;
+//!   `rustfs-obs` owns OTEL initialization and export
 //!
 //! # Usage
 //!
