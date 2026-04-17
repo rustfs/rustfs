@@ -255,7 +255,7 @@ impl AccessTracker {
     /// Get keys sorted by access count (descending).
     pub fn top_keys(&self, n: usize) -> Vec<(&String, &AccessRecord)> {
         let mut entries: Vec<_> = self.records.iter().collect();
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.count));
         entries.into_iter().take(n).collect()
     }
 

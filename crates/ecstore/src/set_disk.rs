@@ -1627,7 +1627,7 @@ impl ObjectOperations for SetDisks {
         let mut vers = Vec::with_capacity(vers_map.len());
 
         for (_, mut fi_vers) in vers_map {
-            fi_vers.versions.sort_by(|a, b| a.deleted.cmp(&b.deleted));
+            fi_vers.versions.sort_by_key(|a| a.deleted);
 
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
                 fi_vers.versions.truncate(index + 1);
@@ -2961,7 +2961,7 @@ impl MultipartOperations for SetDisks {
             populated_upload_ids.insert(upload_id);
         }
 
-        uploads.sort_by(|a, b| a.initiated.cmp(&b.initiated));
+        uploads.sort_by_key(|a| a.initiated);
 
         let mut upload_idx = 0;
         if let Some(upload_id_marker) = &upload_id_marker {
@@ -4212,7 +4212,7 @@ async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rust
     //     },
     // }
     let mut disks = get_disks_info(disks, eps).await;
-    disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
+    disks.sort_by_key(|a| a.total_space);
 
     // Provide minimal backend shape for callers. Do NOT guess parity here since it belongs to higher-level config.
     // Missing/empty standard_sc_data will be handled by capacity fallback logic.

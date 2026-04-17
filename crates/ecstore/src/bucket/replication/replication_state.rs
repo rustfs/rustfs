@@ -832,61 +832,55 @@ impl ReplicationStats {
         let mut rs = ReplStat::new();
 
         match status {
-            ReplicationStatusType::Pending => {
-                if ri.op_type.is_data_replication() && prev_status != status {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        Duration::default(),
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Pending if ri.op_type.is_data_replication() && prev_status != status => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    Duration::default(),
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Completed => {
-                if ri.op_type.is_data_replication() {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        ri.duration,
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Completed if ri.op_type.is_data_replication() => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    ri.duration,
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Failed => {
-                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        ri.duration,
-                        status,
-                        ri.op_type,
-                        ri.endpoint.clone(),
-                        ri.secure,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Failed
+                if ri.op_type.is_data_replication() && prev_status == ReplicationStatusType::Pending =>
+            {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    ri.duration,
+                    status,
+                    ri.op_type,
+                    ri.endpoint.clone(),
+                    ri.secure,
+                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                );
             }
-            ReplicationStatusType::Replica => {
-                if ri.op_type == ReplicationType::Object {
-                    rs.set(
-                        ri.arn.clone(),
-                        ri.size,
-                        Duration::default(),
-                        status,
-                        ri.op_type,
-                        String::new(),
-                        false,
-                        ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
-                    );
-                }
+            ReplicationStatusType::Replica if ri.op_type == ReplicationType::Object => {
+                rs.set(
+                    ri.arn.clone(),
+                    ri.size,
+                    Duration::default(),
+                    status,
+                    ri.op_type,
+                    String::new(),
+                    false,
+                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                );
             }
             _ => {}
         }
