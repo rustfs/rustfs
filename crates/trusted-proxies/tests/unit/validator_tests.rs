@@ -80,34 +80,34 @@ fn test_proxy_chain_too_long() {
     }
 }
 
-#[tokio::test]
-async fn test_validator_caches_trusted_direct_peer_decision() {
+#[test]
+fn test_validator_caches_trusted_direct_peer_decision() {
     let validator = ProxyValidator::with_cache_config(create_test_config(), CacheConfig::default(), None);
     let peer_addr = Some(SocketAddr::new(IpAddr::from_str("192.168.1.100").unwrap(), 8080));
     let headers = HeaderMap::new();
 
     assert_eq!(validator.cache_stats().size, 0);
 
-    let first = validator.validate_request(peer_addr, &headers).await.unwrap();
+    let first = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(first.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 
-    let second = validator.validate_request(peer_addr, &headers).await.unwrap();
+    let second = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(second.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 }
 
-#[tokio::test]
-async fn test_validator_caches_untrusted_direct_peer_decision() {
+#[test]
+fn test_validator_caches_untrusted_direct_peer_decision() {
     let validator = ProxyValidator::with_cache_config(create_test_config(), CacheConfig::default(), None);
     let peer_addr = Some(SocketAddr::new(IpAddr::from_str("203.0.113.8").unwrap(), 8080));
     let headers = HeaderMap::new();
 
-    let first = validator.validate_request(peer_addr, &headers).await.unwrap();
+    let first = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(!first.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 
-    let second = validator.validate_request(peer_addr, &headers).await.unwrap();
+    let second = validator.validate_request(peer_addr, &headers).unwrap();
     assert!(!second.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 }

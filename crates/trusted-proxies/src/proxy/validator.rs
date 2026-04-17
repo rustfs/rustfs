@@ -16,7 +16,8 @@
 
 use axum::http::HeaderMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::{
@@ -98,7 +99,7 @@ pub struct ProxyValidator {
     /// Analyzer for verifying the integrity of the proxy chain.
     chain_analyzer: ProxyChainAnalyzer,
     /// Cache for repeated direct-peer trusted proxy decisions.
-    validation_cache: std::sync::Arc<IpValidationCache>,
+    validation_cache: Arc<IpValidationCache>,
     /// Metrics collector for observability.
     metrics: Option<ProxyMetrics>,
 }
@@ -113,7 +114,7 @@ impl ProxyValidator {
     pub fn with_cache_config(config: TrustedProxyConfig, cache_config: CacheConfig, metrics: Option<ProxyMetrics>) -> Self {
         let chain_analyzer = ProxyChainAnalyzer::new(config.clone());
         let cache_enabled = cache_config.capacity > 0 && cache_config.ttl_seconds > 0;
-        let validation_cache = std::sync::Arc::new(IpValidationCache::new(
+        let validation_cache = Arc::new(IpValidationCache::new(
             cache_config.capacity,
             cache_config.ttl_duration(),
             cache_enabled,
@@ -129,14 +130,14 @@ impl ProxyValidator {
     }
 
     /// Validates an incoming request and extracts client information.
-    pub async fn validate_request(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
+    pub fn validate_request(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         let start_time = Instant::now();
 
         // Record the start of the validation attempt.
         self.record_metric_start();
 
         // Perform the internal validation logic.
-        let result = self.validate_request_internal(peer_addr, headers).await;
+        let result = self.validate_request_internal(peer_addr, headers);
 
         // Record the result and duration.
         let duration = start_time.elapsed();
@@ -146,18 +147,13 @@ impl ProxyValidator {
     }
 
     /// Internal logic for request validation.
-    async fn validate_request_internal(
-        &self,
-        peer_addr: Option<SocketAddr>,
-        headers: &HeaderMap,
-    ) -> Result<ClientInfo, ProxyError> {
+    fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
         // Fallback to unspecified address if peer address is missing.
         let peer_addr = peer_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
         let peer_ip = peer_addr.ip();
         let is_trusted_proxy = self
             .validation_cache
-            .is_trusted(&peer_ip, |ip| self.chain_analyzer.is_ip_trusted(ip))
-            .await;
+            .is_trusted(&peer_ip, |ip| self.chain_analyzer.is_ip_trusted(ip));
 
         // Check if the direct peer is a trusted proxy.
         if is_trusted_proxy {
@@ -184,8 +180,24 @@ impl ProxyValidator {
         self.validation_cache.stats()
     }
 
-    pub(crate) fn validation_cache(&self) -> std::sync::Arc<IpValidationCache> {
-        self.validation_cache.clone()
+    pub(crate) fn spawn_cache_maintenance_task(self: &Arc<Self>, cleanup_interval: Duration) {
+        if cleanup_interval.is_zero() || !self.validation_cache.is_enabled() {
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("No Tokio runtime available; trusted proxy cache maintenance is disabled");
+            return;
+        };
+
+        let cache = self.validation_cache.clone();
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            loop {
+                interval.tick().await;
+                cache.run_maintenance();
+            }
+        });
     }
 
     /// Validates a request that originated from a trusted proxy.

@@ -14,7 +14,7 @@
 
 //! High-performance cache implementation for proxy validation results using Moka.
 
-use moka::future::Cache;
+use moka::sync::Cache;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -37,23 +37,24 @@ impl IpValidationCache {
     /// Creates a new `IpValidationCache` using Moka.
     pub fn new(capacity: usize, ttl: Duration, enabled: bool, metrics: Option<ProxyMetrics>) -> Self {
         let cache = Cache::builder().max_capacity(capacity as u64).time_to_live(ttl).build();
-
-        Self {
+        let this = Self {
             cache,
             capacity,
             enabled,
             metrics,
-        }
+        };
+        this.update_cache_size_metric();
+        this
     }
 
     /// Checks if an IP is trusted, using the cache if available.
-    pub async fn is_trusted(&self, ip: &IpAddr, validator: impl FnOnce(&IpAddr) -> bool) -> bool {
+    pub fn is_trusted(&self, ip: &IpAddr, validator: impl FnOnce(&IpAddr) -> bool) -> bool {
         if !self.enabled {
             return validator(ip);
         }
 
         // Attempt to get the result from cache.
-        if let Some(is_trusted) = self.cache.get(ip).await {
+        if let Some(is_trusted) = self.cache.get(ip) {
             self.record_cache_hit();
             return is_trusted;
         }
@@ -61,27 +62,27 @@ impl IpValidationCache {
         // Cache miss: perform validation and update cache.
         self.record_cache_miss();
         let is_trusted = validator(ip);
-        self.cache.insert(*ip, is_trusted).await;
-        self.cache.run_pending_tasks().await;
+        self.cache.insert(*ip, is_trusted);
+        self.cache.run_pending_tasks();
         self.update_cache_size_metric();
 
         is_trusted
     }
 
     /// Clears all entries from the cache.
-    pub async fn clear(&self) {
+    pub fn clear(&self) {
         self.cache.invalidate_all();
-        self.cache.run_pending_tasks().await;
+        self.cache.run_pending_tasks();
         self.update_cache_size_metric();
     }
 
     /// Runs pending cache maintenance tasks and refreshes size metrics.
-    pub async fn run_maintenance(&self) {
+    pub fn run_maintenance(&self) {
         if !self.enabled {
             return;
         }
 
-        self.cache.run_pending_tasks().await;
+        self.cache.run_pending_tasks();
         self.update_cache_size_metric();
     }
 

@@ -15,7 +15,6 @@
 //! Tower layer implementation for the trusted proxy middleware.
 
 use std::sync::Arc;
-use std::time::Duration;
 use tower::Layer;
 
 use crate::ProxyValidator;
@@ -47,7 +46,7 @@ impl TrustedProxyLayer {
     ) -> Self {
         let validator = Arc::new(ProxyValidator::with_cache_config(config, cache_config.clone(), metrics));
         if enabled {
-            Self::spawn_cache_maintenance_task(validator.clone(), cache_config.cleanup_interval());
+            validator.spawn_cache_maintenance_task(cache_config.cleanup_interval());
         }
 
         Self { validator, enabled }
@@ -56,11 +55,6 @@ impl TrustedProxyLayer {
     /// Creates a new `TrustedProxyLayer` that is enabled by default.
     pub fn enabled(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>) -> Self {
         Self::new(config, metrics, true)
-    }
-
-    /// Creates a new `TrustedProxyLayer` that is enabled with explicit cache configuration.
-    pub fn enabled_with_cache(config: TrustedProxyConfig, cache_config: CacheConfig, metrics: Option<ProxyMetrics>) -> Self {
-        Self::with_cache_config(config, cache_config, metrics, true)
     }
 
     /// Creates a new `TrustedProxyLayer` that is disabled.
@@ -75,26 +69,6 @@ impl TrustedProxyLayer {
     /// Returns true if the middleware is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
-    }
-
-    fn spawn_cache_maintenance_task(validator: Arc<ProxyValidator>, cleanup_interval: Duration) {
-        if cleanup_interval.is_zero() || !validator.validation_cache().is_enabled() {
-            return;
-        }
-
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!("No Tokio runtime available; trusted proxy cache maintenance is disabled");
-            return;
-        };
-
-        let cache = validator.validation_cache();
-        handle.spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-                cache.run_maintenance().await;
-            }
-        });
     }
 }
 
