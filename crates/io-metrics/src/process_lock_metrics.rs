@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -29,6 +29,10 @@ pub struct ProcessLockSnapshot {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessPlatformSnapshot {
+    pub io_rchar_bytes: Option<u64>,
+    pub io_read_bytes: Option<u64>,
+    pub io_wchar_bytes: Option<u64>,
+    pub io_write_bytes: Option<u64>,
     pub syscall_read_total: Option<u64>,
     pub syscall_write_total: Option<u64>,
     pub virtual_memory_max_bytes: Option<u64>,
@@ -95,12 +99,52 @@ mod platform {
     pub(super) fn snapshot() -> ProcessPlatformSnapshot {
         let io = fs::read_to_string("/proc/self/io").ok();
         let status = fs::read_to_string("/proc/self/status").ok();
+        let io_stats = io.as_deref().map(parse_proc_self_io).unwrap_or_default();
 
         ProcessPlatformSnapshot {
-            syscall_read_total: io.as_deref().and_then(|v| parse_kv_u64(v, "syscr")),
-            syscall_write_total: io.as_deref().and_then(|v| parse_kv_u64(v, "syscw")),
+            io_rchar_bytes: io_stats.rchar_bytes,
+            io_read_bytes: io_stats.read_bytes,
+            io_wchar_bytes: io_stats.wchar_bytes,
+            io_write_bytes: io_stats.write_bytes,
+            syscall_read_total: io_stats.syscall_read_total,
+            syscall_write_total: io_stats.syscall_write_total,
             virtual_memory_max_bytes: status.as_deref().and_then(parse_vm_peak_bytes),
         }
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct ProcSelfIoStats {
+        rchar_bytes: Option<u64>,
+        read_bytes: Option<u64>,
+        syscall_read_total: Option<u64>,
+        syscall_write_total: Option<u64>,
+        wchar_bytes: Option<u64>,
+        write_bytes: Option<u64>,
+    }
+
+    fn parse_proc_self_io(content: &str) -> ProcSelfIoStats {
+        let mut stats = ProcSelfIoStats::default();
+
+        for line in content.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(value) = value.trim().parse::<u64>() else {
+                continue;
+            };
+
+            match key.trim() {
+                "rchar" => stats.rchar_bytes = Some(value),
+                "read_bytes" => stats.read_bytes = Some(value),
+                "wchar" => stats.wchar_bytes = Some(value),
+                "write_bytes" => stats.write_bytes = Some(value),
+                "syscr" => stats.syscall_read_total = Some(value),
+                "syscw" => stats.syscall_write_total = Some(value),
+                _ => {}
+            }
+        }
+
+        stats
     }
 
     fn parse_vm_peak_bytes(content: &str) -> Option<u64> {
@@ -128,6 +172,20 @@ mod platform {
             let status = "Name:\trustfs\nVmPeak:\t  2048 kB\nVmRSS:\t 1024 kB\n";
             assert_eq!(parse_vm_peak_bytes(status), Some(2048 * 1024));
         }
+
+        #[test]
+        fn parse_proc_self_io_extracts_expected_fields() {
+            let stats = parse_proc_self_io(
+                "rchar: 11\nwchar: 22\nsyscr: 33\nsyscw: 44\nread_bytes: 55\nwrite_bytes: 66\ncancelled_write_bytes: 77\n",
+            );
+
+            assert_eq!(stats.rchar_bytes, Some(11));
+            assert_eq!(stats.wchar_bytes, Some(22));
+            assert_eq!(stats.syscall_read_total, Some(33));
+            assert_eq!(stats.syscall_write_total, Some(44));
+            assert_eq!(stats.read_bytes, Some(55));
+            assert_eq!(stats.write_bytes, Some(66));
+        }
     }
 }
 
@@ -147,6 +205,7 @@ mod platform {
             syscall_read_total: output.as_deref().and_then(|v| parse_kv_u64(v, "ReadOperationCount")),
             syscall_write_total: output.as_deref().and_then(|v| parse_kv_u64(v, "WriteOperationCount")),
             virtual_memory_max_bytes: output.as_deref().and_then(|v| parse_kv_u64(v, "PeakVirtualSize")),
+            ..Default::default()
         }
     }
 }
@@ -179,6 +238,7 @@ mod platform {
             syscall_read_total: inblock,
             syscall_write_total: oublock,
             virtual_memory_max_bytes: vsz_kb.map(|v| v.saturating_mul(1024)),
+            ..Default::default()
         }
     }
 
@@ -224,6 +284,7 @@ mod platform {
             syscall_read_total: inblock,
             syscall_write_total: oublock,
             virtual_memory_max_bytes: vsz_kb.map(|v| v.saturating_mul(1024)),
+            ..Default::default()
         }
     }
 }

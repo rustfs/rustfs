@@ -44,66 +44,6 @@ fn get_process_start() -> &'static Instant {
     PROCESS_START.get_or_init(Instant::now)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ProcessPlatformStats {
-    io_rchar_bytes: Option<u64>,
-    io_read_bytes: Option<u64>,
-    io_wchar_bytes: Option<u64>,
-    io_write_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ProcSelfIoStats {
-    rchar_bytes: Option<u64>,
-    read_bytes: Option<u64>,
-    wchar_bytes: Option<u64>,
-    write_bytes: Option<u64>,
-}
-
-#[cfg(target_os = "linux")]
-fn collect_process_platform_stats() -> ProcessPlatformStats {
-    let io_stats = std::fs::read_to_string("/proc/self/io")
-        .ok()
-        .map(|content| parse_proc_self_io(&content))
-        .unwrap_or_default();
-
-    ProcessPlatformStats {
-        io_rchar_bytes: io_stats.rchar_bytes,
-        io_read_bytes: io_stats.read_bytes,
-        io_wchar_bytes: io_stats.wchar_bytes,
-        io_write_bytes: io_stats.write_bytes,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn collect_process_platform_stats() -> ProcessPlatformStats {
-    ProcessPlatformStats::default()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_self_io(content: &str) -> ProcSelfIoStats {
-    let mut stats = ProcSelfIoStats::default();
-
-    for line in content.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let Ok(value) = value.trim().parse::<u64>() else {
-            continue;
-        };
-
-        match key.trim() {
-            "rchar" => stats.rchar_bytes = Some(value),
-            "read_bytes" => stats.read_bytes = Some(value),
-            "wchar" => stats.wchar_bytes = Some(value),
-            "write_bytes" => stats.write_bytes = Some(value),
-            _ => {}
-        }
-    }
-
-    stats
-}
-
 /// Collect cluster statistics from the storage layer.
 #[instrument]
 pub async fn collect_cluster_stats() -> ClusterStats {
@@ -264,8 +204,7 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
 #[inline]
 pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessStats) {
     let uptime_seconds = get_process_start().elapsed().as_secs();
-    let platform_stats = collect_process_platform_stats();
-    let platform_process_stats = snapshot_process_platform_stats();
+    let platform_stats = snapshot_process_platform_stats();
     let lock_snapshot = snapshot_process_lock_counts();
 
     // Collect both resource and process metrics in one refresh to avoid duplicate sysinfo work.
@@ -296,11 +235,11 @@ pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessSta
             start_time_seconds: process.start_time(),
             status,
             status_value: status as i64,
-            syscall_read_total: platform_process_stats.syscall_read_total.unwrap_or(0),
-            syscall_write_total: platform_process_stats.syscall_write_total.unwrap_or(0),
+            syscall_read_total: platform_stats.syscall_read_total.unwrap_or(0),
+            syscall_write_total: platform_stats.syscall_write_total.unwrap_or(0),
             uptime_seconds,
             virtual_memory_bytes: process.virtual_memory(),
-            virtual_memory_max_bytes: platform_process_stats.virtual_memory_max_bytes.unwrap_or(0),
+            virtual_memory_max_bytes: platform_stats.virtual_memory_max_bytes.unwrap_or(0),
             ..Default::default()
         };
         (resource_stats, process_stats)
@@ -329,21 +268,4 @@ pub fn collect_process_stats() -> ResourceStats {
 #[inline]
 pub fn collect_process_system_stats() -> ProcessStats {
     collect_process_resource_and_system_stats().1
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::parse_proc_self_io;
-
-    #[test]
-    fn parse_proc_self_io_extracts_expected_fields() {
-        let stats = parse_proc_self_io(
-            "rchar: 11\nwchar: 22\nsyscr: 33\nsyscw: 44\nread_bytes: 55\nwrite_bytes: 66\ncancelled_write_bytes: 77\n",
-        );
-
-        assert_eq!(stats.rchar_bytes, Some(11));
-        assert_eq!(stats.wchar_bytes, Some(22));
-        assert_eq!(stats.read_bytes, Some(55));
-        assert_eq!(stats.write_bytes, Some(66));
-    }
 }
