@@ -339,22 +339,28 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
                     _ = ticker.tick() => {
+                        let cache_snapshot = {
+                            let cache = cache_mutex_clone.lock().await;
+                            if cache.info.last_update == last_update {
+                                None
+                            } else {
+                                Some(cache.clone())
+                            }
+                        };
 
-                       let cache = cache_mutex_clone.lock().await;
-                       if cache.info.last_update == last_update {
-                        continue;
-                       }
+                        let Some(cache_snapshot) = cache_snapshot else {
+                            continue;
+                        };
 
-                       if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
-                           error!("Failed to save data usage cache: {}", e);
-                       }
+                        if let Err(e) = cache_snapshot.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
+                            error!("Failed to save data usage cache: {}", e);
+                        }
 
-                       if let Err(e) = updates.send(cache.clone()).await {
-                           error!("Failed to send data usage cache: {}", e);
+                        if let Err(e) = updates.send(cache_snapshot.clone()).await {
+                            error!("Failed to send data usage cache: {}", e);
+                        }
 
-                       }
-
-                       last_update = cache.info.last_update;
+                        last_update = cache_snapshot.info.last_update;
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
@@ -363,17 +369,19 @@ impl ScannerIOCache for SetDisks {
                             cache.info.last_update = Some(SystemTime::now());
 
                         } else {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.info.next_cycle =want_cycle;
-                            cache.info.last_update = Some(SystemTime::now());
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                cache.info.next_cycle = want_cycle;
+                                cache.info.last_update = Some(SystemTime::now());
+                                cache.clone()
+                            };
 
-                            if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
+                            if let Err(e) = cache_snapshot.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
                                 error!("Failed to save data usage cache: {}", e);
                             }
 
-                            if let Err(e) = updates.send(cache.clone()).await {
+                            if let Err(e) = updates.send(cache_snapshot).await {
                                 error!("Failed to send data usage cache: {}", e);
-
                             }
 
                             return;

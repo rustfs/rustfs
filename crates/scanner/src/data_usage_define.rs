@@ -19,11 +19,12 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Once},
     time::SystemTime,
 };
 
 use http::HeaderMap;
+use metrics::{counter, describe_counter, describe_histogram, histogram};
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
@@ -33,7 +34,7 @@ use rustfs_ecstore::{
     store_api::{ObjectInfo, ObjectOptions},
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{error, warn};
 
 // Data usage constants
@@ -44,6 +45,14 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
+const DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT: u64 = 30;
+const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
+const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
+const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
+const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
+const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
+static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 
 // Data usage paths (computed at runtime)
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
@@ -595,6 +604,31 @@ pub struct DataUsageCache {
 }
 
 impl DataUsageCache {
+    fn ensure_cache_save_metrics_registered() {
+        CACHE_SAVE_METRICS_ONCE.call_once(|| {
+            describe_counter!(
+                METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                "Total scanner data usage cache save attempts by result and cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_TIMEOUT_TOTAL,
+                "Total scanner data usage cache save timeouts by cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_RETRY_TOTAL,
+                "Total scanner data usage cache save retries by cache type."
+            );
+            describe_histogram!(
+                METRIC_CACHE_SAVE_DURATION_SECONDS,
+                "Duration of scanner data usage cache save attempts in seconds."
+            );
+        });
+    }
+
+    fn cache_path_type(path: &str) -> &'static str {
+        if path.ends_with(".bkp") { "backup" } else { "main" }
+    }
+
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
         self.cache.insert(hash.key(), e);
@@ -1094,39 +1128,94 @@ impl DataUsageCache {
         }
     }
 
+    fn cache_save_timeout() -> Duration {
+        Duration::from_secs(
+            rustfs_utils::get_env_u64(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT).max(1),
+        )
+    }
+
+    async fn save_path_with_retry<S: StorageAPI>(
+        store: Arc<S>,
+        path: &str,
+        buf: &[u8],
+        timeout_duration: Duration,
+    ) -> StorageResult<()> {
+        Self::ensure_cache_save_metrics_registered();
+
+        let mut last_err: Option<StorageError> = None;
+        let path_type = Self::cache_path_type(path);
+
+        for attempt in 0..=DATA_USAGE_CACHE_SAVE_RETRIES {
+            let store_clone = store.clone();
+            let path_clone = path.to_string();
+            let buf_clone = buf.to_vec();
+            let attempt_start = Instant::now();
+
+            let timeout_res = timeout(timeout_duration, async move {
+                save_config(store_clone, &path_clone, buf_clone).await?;
+                Ok::<(), StorageError>(())
+            })
+            .await;
+
+            histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(attempt_start.elapsed().as_secs_f64());
+
+            match timeout_res {
+                Ok(Ok(())) => {
+                    counter!(
+                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                        "cache" => path_type,
+                        "result" => "success"
+                    )
+                    .increment(1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    counter!(
+                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                        "cache" => path_type,
+                        "result" => "timeout"
+                    )
+                    .increment(1);
+                    counter!(METRIC_CACHE_SAVE_TIMEOUT_TOTAL, "cache" => path_type).increment(1);
+                    last_err = Some(StorageError::other(format!("Failed to save data usage cache: {e}")));
+                }
+                Ok(Err(e)) => {
+                    counter!(
+                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                        "cache" => path_type,
+                        "result" => "error"
+                    )
+                    .increment(1);
+                    last_err = Some(e);
+                }
+            }
+
+            if last_err.is_some()
+                && attempt < DATA_USAGE_CACHE_SAVE_RETRIES {
+                    counter!(METRIC_CACHE_SAVE_RETRY_TOTAL, "cache" => path_type).increment(1);
+                    let backoff_ms = 50_u64 * (1_u64 << attempt) + (rand::random::<u64>() % 100);
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                }
+        }
+
+        Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
+    }
+
     pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+        let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-
-        let store_clone = store.clone();
-        let buf_clone = buf.clone();
-        let path_clone = path.clone();
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &path_clone, buf_clone).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-
-        if let Err(e) = res {
+        if let Err(e) = Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration).await {
             error!("Failed to save data usage cache: {e}");
             return Err(e);
         }
 
-        let store_clone = store.clone();
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &backup_path, buf).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-        if let Err(e) = res {
-            error!("Failed to save data usage cache backup: {e}");
-            return Err(e);
+        if let Err(e) = Self::save_path_with_retry(store, &backup_path, &buf, timeout_duration).await {
+            warn!("Failed to save data usage cache backup: {e}");
         }
         Ok(())
     }
@@ -1541,6 +1630,7 @@ impl SizeSummary {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use temp_env::{with_var, with_var_unset};
 
     #[test]
     fn test_data_usage_info_creation() {
@@ -1618,5 +1708,32 @@ mod tests {
 
         let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
         assert_eq!(decoded.failed_objects, 0);
+    }
+
+    #[test]
+    fn test_cache_path_type_distinguishes_main_and_backup() {
+        assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin"), "main");
+        assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin.bkp"), "backup");
+    }
+
+    #[test]
+    fn test_cache_save_timeout_uses_default_when_env_missing() {
+        with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+            assert_eq!(
+                DataUsageCache::cache_save_timeout(),
+                Duration::from_secs(DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT)
+            );
+        });
+    }
+
+    #[test]
+    fn test_cache_save_timeout_respects_env_and_minimum_bound() {
+        with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+            assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(7));
+        });
+
+        with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
+            assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
+        });
     }
 }
