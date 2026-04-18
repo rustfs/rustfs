@@ -31,6 +31,9 @@ pub mod stream;
 
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder};
-pub use global::{initialize, is_notification_system_initialized, notification_system, notifier_global};
-pub use integration::NotificationSystem;
+pub use global::{
+    initialize, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
+    notification_target_metrics, notifier_global,
+};
+pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
 pub use rules::BucketNotificationConfig;
