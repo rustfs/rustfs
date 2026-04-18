@@ -62,6 +62,7 @@ pub mod io_metrics;
 pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;
+pub mod sampler;
 pub mod timeout_metrics;
 
 pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
@@ -113,6 +114,10 @@ pub use process_lock_metrics::{
     ProcessLockSnapshot, ProcessPlatformSnapshot, record_read_lock_held_acquire, record_read_lock_held_release,
     record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts,
     snapshot_process_platform_stats,
+};
+pub use sampler::{
+    ProcessResourceSnapshot, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform, snapshot_process_resource,
+    snapshot_process_resource_and_system, snapshot_process_system,
 };
 
 // Timeout metrics exports
