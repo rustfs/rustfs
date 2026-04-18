@@ -49,6 +49,8 @@ const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT: u64 = 30;
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
@@ -1135,6 +1137,10 @@ impl DataUsageCache {
         )
     }
 
+    fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
+        timeout_duration.min(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX))
+    }
+
     fn record_save_attempt(path_type: &'static str, result: &'static str, duration: Duration) {
         histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(duration.as_secs_f64());
         counter!(
@@ -1148,14 +1154,19 @@ impl DataUsageCache {
         }
     }
 
-    async fn retry_save_op<F, Fut>(path_type: &'static str, timeout_duration: Duration, mut save_op: F) -> StorageResult<()>
+    async fn retry_save_op<F, Fut>(
+        path_type: &'static str,
+        timeout_duration: Duration,
+        max_retries: u32,
+        mut save_op: F,
+    ) -> StorageResult<()>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = StorageResult<()>>,
     {
         let mut last_err: Option<StorageError> = None;
 
-        for attempt in 0..=DATA_USAGE_CACHE_SAVE_RETRIES {
+        for attempt in 0..=max_retries {
             let attempt_start = Instant::now();
             let timeout_res = timeout(timeout_duration, save_op()).await;
             let duration = attempt_start.elapsed();
@@ -1175,7 +1186,7 @@ impl DataUsageCache {
                 }
             }
 
-            if last_err.is_some() && attempt < DATA_USAGE_CACHE_SAVE_RETRIES {
+            if last_err.is_some() && attempt < max_retries {
                 counter!(METRIC_CACHE_SAVE_RETRY_TOTAL, "cache" => path_type).increment(1);
                 let backoff_ms = 50_u64 * (1_u64 << attempt) + (rand::random::<u64>() % 100);
                 sleep(Duration::from_millis(backoff_ms)).await;
@@ -1190,12 +1201,13 @@ impl DataUsageCache {
         path: &str,
         buf: &[u8],
         timeout_duration: Duration,
+        max_retries: u32,
     ) -> StorageResult<()> {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
 
-        Self::retry_save_op(path_type, timeout_duration, move || {
+        Self::retry_save_op(path_type, timeout_duration, max_retries, move || {
             let store_clone = store.clone();
             let path_clone = path.clone();
             let buf_clone = buf.to_vec();
@@ -1213,11 +1225,15 @@ impl DataUsageCache {
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-        Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration).await?;
+        Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration, DATA_USAGE_CACHE_SAVE_RETRIES).await?;
 
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        if let Err(e) = Self::save_path_with_retry(store, &backup_path, &buf, timeout_duration).await {
+        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration);
+        if let Err(e) =
+            Self::save_path_with_retry(store, &backup_path, &buf, backup_timeout_duration, DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES)
+                .await
+        {
             warn!("Failed to save data usage cache backup: {e}");
         }
         Ok(())
@@ -1747,17 +1763,18 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(200), move || {
-            let attempts = attempts_clone.clone();
-            async move {
-                let current = attempts.fetch_add(1, Ordering::SeqCst);
-                if current < 2 {
-                    return Err(StorageError::other("transient".to_string()));
+        let result =
+            DataUsageCache::retry_save_op("main", Duration::from_millis(200), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let current = attempts.fetch_add(1, Ordering::SeqCst);
+                    if current < 2 {
+                        return Err(StorageError::other("transient".to_string()));
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
-        .await;
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
@@ -1768,7 +1785,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(10), move || {
+        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(10), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
             let attempts = attempts_clone.clone();
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
