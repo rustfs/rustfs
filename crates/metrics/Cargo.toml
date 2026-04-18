@@ -27,7 +27,7 @@ authors.workspace = true
 
 [features]
 default = []
-gpu = ["dep:nvml-wrapper"]
+gpu = ["dep:nvml-wrapper", "rustfs-obs/gpu"]
 full = ["gpu"]
 
 [dependencies]

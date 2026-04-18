@@ -25,6 +25,10 @@ keywords = ["observability", "metrics", "logging", "tracing", "RustFS"]
 categories = ["web-programming", "development-tools::profiling", "asynchronous", "api-bindings", "development-tools::debugging"]
 documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 
+[features]
+default = []
+gpu = ["dep:nvml-wrapper"]
+
 [lints]
 workspace = true
 
@@ -55,6 +59,8 @@ tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "
 dial9-tokio-telemetry = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
+sysinfo = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
