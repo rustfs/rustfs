@@ -17,6 +17,7 @@ use s3s::dto::BucketLifecycleConfiguration;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     path::Path,
     sync::{Arc, LazyLock, Once},
@@ -1134,28 +1135,16 @@ impl DataUsageCache {
         )
     }
 
-    async fn save_path_with_retry<S: StorageAPI>(
-        store: Arc<S>,
-        path: &str,
-        buf: &[u8],
-        timeout_duration: Duration,
-    ) -> StorageResult<()> {
-        Self::ensure_cache_save_metrics_registered();
-
+    async fn retry_save_op<F, Fut>(path_type: &'static str, timeout_duration: Duration, mut save_op: F) -> StorageResult<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = StorageResult<()>>,
+    {
         let mut last_err: Option<StorageError> = None;
-        let path_type = Self::cache_path_type(path);
 
         for attempt in 0..=DATA_USAGE_CACHE_SAVE_RETRIES {
-            let store_clone = store.clone();
-            let path_clone = path.to_string();
-            let buf_clone = buf.to_vec();
             let attempt_start = Instant::now();
-
-            let timeout_res = timeout(timeout_duration, async move {
-                save_config(store_clone, &path_clone, buf_clone).await?;
-                Ok::<(), StorageError>(())
-            })
-            .await;
+            let timeout_res = timeout(timeout_duration, save_op()).await;
 
             histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(attempt_start.elapsed().as_secs_f64());
 
@@ -1190,15 +1179,37 @@ impl DataUsageCache {
                 }
             }
 
-            if last_err.is_some()
-                && attempt < DATA_USAGE_CACHE_SAVE_RETRIES {
-                    counter!(METRIC_CACHE_SAVE_RETRY_TOTAL, "cache" => path_type).increment(1);
-                    let backoff_ms = 50_u64 * (1_u64 << attempt) + (rand::random::<u64>() % 100);
-                    sleep(Duration::from_millis(backoff_ms)).await;
-                }
+            if last_err.is_some() && attempt < DATA_USAGE_CACHE_SAVE_RETRIES {
+                counter!(METRIC_CACHE_SAVE_RETRY_TOTAL, "cache" => path_type).increment(1);
+                let backoff_ms = 50_u64 * (1_u64 << attempt) + (rand::random::<u64>() % 100);
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
         }
 
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
+    }
+
+    async fn save_path_with_retry<S: StorageAPI>(
+        store: Arc<S>,
+        path: &str,
+        buf: &[u8],
+        timeout_duration: Duration,
+    ) -> StorageResult<()> {
+        Self::ensure_cache_save_metrics_registered();
+        let path_type = Self::cache_path_type(path);
+        let path = path.to_string();
+        let buf = buf.to_vec();
+
+        Self::retry_save_op(path_type, timeout_duration, move || {
+            let store_clone = store.clone();
+            let path_clone = path.clone();
+            let buf_clone = buf.clone();
+            async move {
+                save_config(store_clone, &path_clone, buf_clone).await?;
+                Ok::<(), StorageError>(())
+            }
+        })
+        .await
     }
 
     pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
@@ -1630,6 +1641,8 @@ impl SizeSummary {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
 
     #[test]
@@ -1735,5 +1748,45 @@ mod tests {
         with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
             assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
         });
+    }
+
+    #[tokio::test]
+    async fn test_retry_save_op_retries_on_error_then_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(200), move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                let current = attempts.fetch_add(1, Ordering::SeqCst);
+                if current < 2 {
+                    return Err(StorageError::other("transient".to_string()));
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(10), move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
     }
 }
