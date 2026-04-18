@@ -8778,7 +8778,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0-dev"
-source = "git+https://github.com/rustfs/s3s?rev=0dd8fcaaa72eda68fafd49c38daea43bb8697558#0dd8fcaaa72eda68fafd49c38daea43bb8697558"
+source = "git+https://github.com/rustfs/s3s?rev=a3b16608df35aaeed8fff08b4988d03f4ca9445b#a3b16608df35aaeed8fff08b4988d03f4ca9445b"
 dependencies = [
  "arc-swap",
  "arrayvec",
