@@ -3067,20 +3067,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "dial9-tokio-telemetry"
-version = "0.2.1"
+name = "dial9-macro"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35c8348045a09a7dee69d000124d42f773f59f85737d3212ae65aa64ac0b4e3e"
+checksum = "877b67d2a742d9c722961c468e8b9cfe87d78e53f2e1d61125c8d388bb8a3bba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "dial9-tokio-telemetry"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edba70ebc611e0ebc889d7f6b3d08ce742e48cb188da1f298ec6378b0b4f86b"
 dependencies = [
  "arc-swap",
  "bon",
  "crossbeam-queue",
+ "dial9-macro",
  "dial9-trace-format",
  "flate2",
  "futures-util",
  "hostname",
  "libc",
  "metrique",
+ "metrique-timesource",
  "metrique-writer",
  "pin-project-lite",
  "serde",
@@ -3093,9 +3106,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80e0ee560b05f09bf817602d57644947e31e83c521d4e0277f723a6e64d44f92"
+checksum = "8c9d20951a4584f9ea544ff27143709821c4709f27d30b52395300f020392475"
 dependencies = [
  "dial9-trace-format-derive",
  "serde",
@@ -3103,9 +3116,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format-derive"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dbbd8126d4d6613931317cfe2a7275c1cd487e41c961e42456ab5f956570030"
+checksum = "5800a5a155746fe428681cdc30570f33d961a31ed800e6df41b78d0af64529ed"
 dependencies = [
  "proc-macro2",
  "quote",
