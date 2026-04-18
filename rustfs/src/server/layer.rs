@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
+use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
@@ -27,6 +28,7 @@ use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+use s3s::S3ErrorCode;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -273,6 +275,68 @@ fn is_empty_body_admin_put_path(path: &str) -> bool {
 }
 
 #[derive(Clone)]
+pub struct S3ErrorMessageCompatLayer;
+
+impl<S> Layer<S> for S3ErrorMessageCompatLayer {
+    type Service = S3ErrorMessageCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        S3ErrorMessageCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct S3ErrorMessageCompatService<S> {
+    inner: S,
+}
+
+impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for S3ErrorMessageCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let should_fix = parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
+
+            let response = match body {
+                HybridBody::Rest { rest_body } => {
+                    if !should_fix {
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    } else {
+                        let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
+                        let mut parts = parts;
+                        if changed {
+                            parts.headers.remove(http::header::CONTENT_LENGTH);
+                        }
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    }
+                }
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct ObjectAttributesEtagFixLayer;
 
 impl<S> Layer<S> for ObjectAttributesEtagFixLayer {
@@ -362,6 +426,30 @@ where
     let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
     let fixed = strip_quotes_from_first_etag(xml);
     Ok(RestBody::from(Bytes::from(fixed)))
+}
+
+async fn fix_s3_error_message_in_xml<RestBody>(body: RestBody) -> Result<(RestBody, bool), RestBody::Error>
+where
+    RestBody: Body<Data = Bytes> + From<Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+    let (fixed, changed) = insert_missing_signature_error_message(xml);
+    Ok((RestBody::from(Bytes::from(fixed)), changed))
+}
+
+fn insert_missing_signature_error_message(mut xml: String) -> (String, bool) {
+    if !xml.contains("<Code>SignatureDoesNotMatch</Code>") || xml.contains("<Message>") {
+        return (xml, false);
+    }
+
+    let Some(code_end) = xml.find("</Code>") else {
+        return (xml, false);
+    };
+
+    let message = ApiError::error_code_to_message(&S3ErrorCode::SignatureDoesNotMatch);
+    xml.insert_str(code_end + "</Code>".len(), &format!("<Message>{message}</Message>"));
+    (xml, true)
 }
 
 fn strip_quotes_from_first_etag(xml: String) -> String {
@@ -781,6 +869,24 @@ mod tests {
                 b"<GetObjectAttributesOutput><ETag>abc</ETag><Checksum>CRC32C</Checksum></GetObjectAttributesOutput>",
             ),
         );
+    }
+
+    #[test]
+    fn test_insert_missing_signature_error_message() {
+        let (fixed, changed) =
+            insert_missing_signature_error_message("<Error><Code>SignatureDoesNotMatch</Code></Error>".to_string());
+
+        assert!(changed);
+        assert!(fixed.contains("<Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided."));
+    }
+
+    #[test]
+    fn test_insert_missing_signature_error_message_preserves_existing_message() {
+        let input = "<Error><Code>SignatureDoesNotMatch</Code><Message>custom</Message></Error>".to_string();
+        let (fixed, changed) = insert_missing_signature_error_message(input.clone());
+
+        assert!(!changed);
+        assert_eq!(fixed, input);
     }
 
     #[test]

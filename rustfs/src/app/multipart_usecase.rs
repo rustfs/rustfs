@@ -1136,6 +1136,28 @@ impl DefaultMultipartUsecase {
             None => (None, None, mp_info.user_defined.clone()),
         };
 
+        if let Some(checksum_algorithm) = mp_info
+            .user_defined
+            .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            .filter(|checksum_algorithm| !checksum_algorithm.is_empty())
+        {
+            let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(
+                checksum_algorithm,
+                mp_info
+                    .user_defined
+                    .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            if !checksum_type.is_set() {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid multipart checksum type: {checksum_algorithm}"
+                )))
+                .into());
+            }
+            reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
+        }
+
         let mut reader = PutObjReader::new(reader);
 
         let dst_opts = ObjectOptions {
@@ -1148,10 +1170,17 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let copy_checksums = reader.as_hash_reader().content_crc();
+        let checksum_value = |checksum_type: rustfs_rio::ChecksumType| copy_checksums.get(&checksum_type.to_string()).cloned();
+
         let copy_part_result = CopyPartResult {
+            checksum_crc32: checksum_value(rustfs_rio::ChecksumType::CRC32),
+            checksum_crc32c: checksum_value(rustfs_rio::ChecksumType::CRC32C),
+            checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
+            checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
+            checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
             e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
         };
 
         let output = UploadPartCopyOutput {

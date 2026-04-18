@@ -23,7 +23,7 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
-        RequestContextLayer,
+        RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -589,9 +589,10 @@ fn process_connection(
         // 11. PropagateRequestIdLayer                — X-Request-ID → response
         // 12. CompressionLayer                       — response compression (whitelist, path-aware)
         // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 15. ConditionalCorsLayer                   — S3 API CORS
-        // 16. RedirectLayer                          — console redirect (conditional)
+        // 14. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -725,6 +726,7 @@ fn process_connection(
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
+            .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
