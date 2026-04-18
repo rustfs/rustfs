@@ -224,7 +224,6 @@ pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessSta
         uptime_seconds: process_snapshot.uptime_seconds,
         virtual_memory_bytes: process_snapshot.virtual_memory_bytes,
         virtual_memory_max_bytes: process_snapshot.virtual_memory_max_bytes,
-        ..Default::default()
     };
 
     (resource_stats, process_stats)

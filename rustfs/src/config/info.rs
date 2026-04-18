@@ -603,7 +603,7 @@ fn feature_specs() -> [FeatureSpec; 9] {
             name: "metrics-gpu",
             enabled: cfg!(feature = "metrics-gpu"),
             description: "Metrics GPU support",
-            dependencies: "rustfs-metrics/gpu",
+            dependencies: "rustfs-obs/gpu",
             default_enabled: false,
         },
         FeatureSpec {

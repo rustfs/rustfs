@@ -31,7 +31,6 @@ members = [
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
-    "crates/metrics", # Metrics collection and reporting
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
     "crates/object-capacity", # Capacity scan and refresh core
@@ -94,7 +93,6 @@ rustfs-keystone = { path = "crates/keystone", version = "0.0.5" }
 rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-lock = { path = "crates/lock", version = "0.0.5" }
 rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
-rustfs-metrics = { path = "crates/metrics", version = "0.0.5" }
 rustfs-notify = { path = "crates/notify", version = "0.0.5" }
 rustfs-io-metrics = { path = "crates/io-metrics", version = "0.0.5" }
 rustfs-io-core = { path = "crates/io-core", version = "0.0.5" }
