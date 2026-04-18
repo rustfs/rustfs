@@ -36,7 +36,7 @@ use rustfs_ecstore::{
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
-use tracing::{error, warn};
+use tracing::warn;
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -1167,7 +1167,7 @@ impl DataUsageCache {
                 }
                 Err(e) => {
                     Self::record_save_attempt(path_type, "timeout", duration);
-                    last_err = Some(StorageError::other(format!("Failed to save data usage cache: {e}")));
+                    last_err = Some(StorageError::other(format!("{e} after {timeout_duration:?}")));
                 }
                 Ok(Err(e)) => {
                     Self::record_save_attempt(path_type, "error", duration);
@@ -1194,12 +1194,11 @@ impl DataUsageCache {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
-        let buf = buf.to_vec();
 
         Self::retry_save_op(path_type, timeout_duration, move || {
             let store_clone = store.clone();
             let path_clone = path.clone();
-            let buf_clone = buf.clone();
+            let buf_clone = buf.to_vec();
             async move {
                 save_config(store_clone, &path_clone, buf_clone).await?;
                 Ok::<(), StorageError>(())
@@ -1215,7 +1214,6 @@ impl DataUsageCache {
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
         if let Err(e) = Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration).await {
-            error!("Failed to save data usage cache: {e}");
             return Err(e);
         }
 
