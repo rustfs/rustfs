@@ -45,6 +45,12 @@ pub const DEFAULT_SCANNER_SPEED: &str = "default";
 /// - Example: `export RUSTFS_SCANNER_IDLE_MODE=false`
 pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 
+/// Environment variable that controls scanner cache save timeout in seconds.
+/// The scanner enforces a minimum value of `1`.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=30`
+pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
+
 /// Default scanner idle mode.
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 
