@@ -144,9 +144,11 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
 - `MAXFAIL`: Stop after N failures (default: `1`)
 - `XDIST`: Enable parallel execution with N workers (default: `0`, disabled)
 - `MARKEXPR`: pytest marker expression for filtering tests
-  - Default: `not lifecycle and not versioning and not s3website and not bucket_logging and not encryption`
-  - Excludes features not yet supported by RustFS to reduce test execution time
-  - Can be customized to test specific features or remove exclusions
+  - Default: no marker filtering; file-based test lists control the selected tests
+  - Can be customized to test specific marker groups
+- `TESTEXPR`: optional pytest `-k` expression for custom runs
+  - Default: exact pytest node ids loaded from `implemented_tests.txt`
+  - Setting `TESTEXPR` overrides the implemented test list
 
 ### Configuration Files
 
@@ -182,9 +184,6 @@ DATA_ROOT=/tmp ./scripts/s3-tests/run.sh
 
 # Run specific test markers (e.g., test multipart uploads only)
 MARKEXPR="multipart" ./scripts/s3-tests/run.sh
-
-# Remove feature exclusions (test all features, including unsupported ones)
-MARKEXPR="" ./scripts/s3-tests/run.sh
 ```
 
 ### Binary File Mode

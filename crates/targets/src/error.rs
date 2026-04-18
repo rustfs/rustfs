@@ -82,6 +82,9 @@ pub enum TargetError {
     #[error("Target is disabled")]
     Disabled,
 
+    #[error("Queued payload dropped: {0}")]
+    Dropped(String),
+
     #[error("Configuration parsing error: {0}")]
     ParseError(String),
 
