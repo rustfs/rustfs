@@ -369,8 +369,31 @@ pub fn init_metrics_collectors(token: CancellationToken) {
 }
 
 fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
-    while *deadline <= now {
+    if *deadline > now {
+        return;
+    }
+
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return;
+    }
+
+    let elapsed = now.duration_since(*deadline);
+    let missed_intervals = (elapsed.as_nanos() / interval_nanos) + 1;
+    let mut remaining = missed_intervals;
+
+    while remaining > 0 {
+        let chunk_u128 = remaining.min(u128::from(u32::MAX));
+        let chunk_u32 = chunk_u128 as u32;
+
+        if let Some(advance_by) = interval.checked_mul(chunk_u32) {
+            *deadline += advance_by;
+            remaining -= chunk_u128;
+            continue;
+        }
+
         *deadline += interval;
+        remaining -= 1;
     }
 }
 
@@ -417,4 +440,27 @@ fn collect_system_monitoring_metrics(
     // Interface counters are host-wide, so keep these metrics free of process labels.
     metrics.extend(collect_host_network_metrics(&network_stats, None));
     metrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_deadline;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn advance_deadline_keeps_future_deadline_unchanged() {
+        let base = Instant::now();
+        let mut deadline = base + Duration::from_secs(10);
+        advance_deadline(&mut deadline, Duration::from_secs(5), base);
+        assert_eq!(deadline, base + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn advance_deadline_moves_to_first_tick_after_now() {
+        let base = Instant::now();
+        let mut deadline = base;
+        advance_deadline(&mut deadline, Duration::from_secs(5), base + Duration::from_secs(12));
+        assert_eq!(deadline, base + Duration::from_secs(15));
+    }
 }
