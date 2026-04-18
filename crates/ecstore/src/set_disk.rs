@@ -4296,15 +4296,21 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
 }
 
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
+    let if_none_match = if_none_match
+        .as_deref()
+        .map(str::trim)
+        .filter(|condition| !condition.is_empty());
+    let if_match = if_match.as_deref().map(str::trim).filter(|condition| !condition.is_empty());
+
     match &oi.etag {
         Some(etag) => {
             if let Some(if_none_match) = if_none_match
-                && e_tag_matches(etag, &if_none_match)
+                && e_tag_matches(etag, if_none_match)
             {
                 return true;
             }
             if let Some(if_match) = if_match
-                && !e_tag_matches(etag, &if_match)
+                && !e_tag_matches(etag, if_match)
             {
                 return true;
             }
@@ -5513,6 +5519,10 @@ mod tests {
 
         let if_none_match = None;
         let if_match = None;
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some(String::new());
+        let if_match = Some(" ".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
     }
 

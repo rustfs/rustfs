@@ -603,7 +603,9 @@ impl SetDisks {
                 if oi.delete_marker {
                     return None;
                 }
-                if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
+                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
+                let if_match = http_preconditions.if_match_value().map(str::to_owned);
+                if should_prevent_write(&oi, if_none_match, if_match) {
                     return Some(StorageError::PreconditionFailed);
                 }
             }
@@ -614,7 +616,7 @@ impl SetDisks {
                 // When the object is not found,
                 // - if If-Match is set, we should return 404 NotFound
                 // - if If-None-Match is set, we should be able to proceed with the request
-                if http_preconditions.if_match.is_some() {
+                if http_preconditions.if_match_value().is_some() {
                     return Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()));
                 }
             }

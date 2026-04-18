@@ -33,6 +33,16 @@ pub struct HTTPPreconditions {
     pub if_unmodified_since: Option<OffsetDateTime>,
 }
 
+impl HTTPPreconditions {
+    pub(crate) fn if_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_match.as_deref())
+    }
+
+    pub(crate) fn if_none_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_none_match.as_deref())
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -146,7 +156,10 @@ impl ObjectOptions {
         }
 
         if let Some(pre) = &self.http_preconditions {
-            if let Some(if_none_match) = &pre.if_none_match
+            let if_none_match = pre.if_none_match_value();
+            let if_match = pre.if_match_value();
+
+            if let Some(if_none_match) = if_none_match
                 && let Some(etag) = &obj_info.etag
                 && is_etag_equal(etag, if_none_match)
             {
@@ -161,7 +174,7 @@ impl ObjectOptions {
                 return Err(Error::NotModified);
             }
 
-            if let Some(if_match) = &pre.if_match {
+            if let Some(if_match) = if_match {
                 if let Some(etag) = &obj_info.etag {
                     if !is_etag_equal(etag, if_match) {
                         return Err(Error::PreconditionFailed);
@@ -171,7 +184,7 @@ impl ObjectOptions {
                 }
             }
             if has_valid_mod_time
-                && pre.if_match.is_none()
+                && if_match.is_none()
                 && let Some(if_unmodified_since) = &pre.if_unmodified_since
                 && let Some(mod_time) = &obj_info.mod_time
                 && is_modified_since(mod_time, if_unmodified_since)
@@ -182,6 +195,10 @@ impl ObjectOptions {
 
         Ok(())
     }
+}
+
+fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
@@ -1064,6 +1081,25 @@ mod tests {
         };
 
         assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    #[test]
+    fn precondition_check_ignores_empty_etag_conditions() {
+        let opts = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(String::new()),
+                if_none_match: Some(" ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            etag: Some("\"abc\"".to_string()),
+            ..Default::default()
+        };
+
+        assert!(opts.precondition_check(&info).is_ok());
     }
 
     #[test]
