@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod bucket;
+pub mod bucket_replication;
+pub mod cluster;
+pub mod cluster_config;
+pub mod cluster_erasure_set;
+pub mod cluster_health;
+pub mod cluster_iam;
+pub mod cluster_usage;
+pub mod ilm;
+pub mod node;
+pub mod replication;
+pub mod request;
+pub mod scanner;
 pub mod system_cpu;
 pub mod system_drive;
 #[cfg(feature = "gpu")]
@@ -20,6 +33,19 @@ pub mod system_memory;
 pub mod system_network;
 pub mod system_process;
 
+pub use bucket::{BucketStats, collect_bucket_metrics};
+pub use bucket_replication::{BucketReplicationBandwidthStats, collect_bucket_replication_bandwidth_metrics};
+pub use cluster::{ClusterStats, collect_cluster_metrics};
+pub use cluster_config::{ClusterConfigStats, collect_cluster_config_metrics};
+pub use cluster_erasure_set::{ErasureSetStats, collect_erasure_set_metrics};
+pub use cluster_health::{ClusterHealthStats, collect_cluster_health_metrics};
+pub use cluster_iam::{IamStats, collect_iam_metrics};
+pub use cluster_usage::{BucketUsageStats, ClusterUsageStats, collect_bucket_usage_metrics, collect_cluster_usage_metrics};
+pub use ilm::{IlmStats, collect_ilm_metrics};
+pub use node::{DiskStats, collect_node_metrics};
+pub use replication::{ReplicationStats, collect_replication_metrics};
+pub use request::{ApiRequestStats, collect_request_metrics};
+pub use scanner::{ScannerStats, collect_scanner_metrics};
 pub use system_cpu::{CpuStats, ProcessCpuStats, collect_cpu_metrics, collect_process_cpu_metrics};
 pub use system_drive::{
     DriveCountStats, DriveDetailedStats, ProcessDiskStats, collect_drive_count_metrics, collect_drive_detailed_metrics,
