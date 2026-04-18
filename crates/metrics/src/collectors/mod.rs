@@ -99,6 +99,9 @@ pub use cluster_health::{ClusterHealthStats, collect_cluster_health_metrics};
 pub use cluster_iam::{IamStats, collect_iam_metrics};
 pub use cluster_usage::{BucketUsageStats, ClusterUsageStats, collect_bucket_usage_metrics, collect_cluster_usage_metrics};
 pub use dial9::{Dial9Stats, collect_dial9_metrics, is_dial9_enabled};
+#[deprecated(
+    note = "use rustfs_obs::init_metrics_runtime(token) or rustfs_metrics::init_metrics_runtime(token) instead; this alias is scheduled for removal after the metrics migration"
+)]
 pub use global::init_metrics_collectors;
 pub use ilm::{IlmStats, collect_ilm_metrics};
 pub use node::{DiskStats, collect_node_metrics};

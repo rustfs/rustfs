@@ -33,6 +33,9 @@ use tracing::info;
 /// token.cancel();
 /// ```
 /// Note: This function should only be called once during the application's lifecycle. Calling it multiple times may lead to unexpected behavior.
+#[deprecated(
+    note = "use rustfs_obs::init_metrics_runtime(token) or rustfs_metrics::init_metrics_runtime(token) instead; this alias is scheduled for removal after the metrics migration"
+)]
 pub fn init_metrics_system(token: CancellationToken) {
     info!("init metrics system start");
     crate::collectors::init_metrics_collectors(token);

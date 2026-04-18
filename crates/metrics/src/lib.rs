@@ -12,6 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Compatibility facade for RustFS metrics migration.
+//!
+//! Preferred new APIs:
+//! - Runtime entry: `rustfs_obs::init_metrics_runtime(token)`
+//! - Metrics schema/report/collectors: `rustfs_obs::metrics::*`
+//! - Sampler and low-level process/system snapshots: `rustfs_io_metrics::*`
+//!
+//! Old to new import mapping examples:
+//! - `rustfs_metrics::init_metrics_system` -> `rustfs_obs::init_metrics_runtime`
+//! - `rustfs_metrics::collectors::*` -> `rustfs_obs::metrics::collectors::*`
+//! - `rustfs_metrics::MetricDescriptor` -> `rustfs_obs::metrics::schema::MetricDescriptor`
+
 pub mod collectors;
 pub mod constants;
 pub mod format;
@@ -21,4 +33,6 @@ mod metrics_type;
 pub use format::report_metrics;
 pub use global::init_metrics_system;
 pub use metrics_type::*;
+pub use rustfs_io_metrics as io_metrics;
+pub use rustfs_obs::init_metrics_runtime;
 pub use rustfs_obs::metrics as obs_metrics;
