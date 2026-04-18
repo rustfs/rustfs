@@ -248,7 +248,7 @@ rumqttc = { package = "rumqttc-next", version = "0.30.0", features = ["websocket
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "0dd8fcaaa72eda68fafd49c38daea43bb8697558", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "a3b16608df35aaeed8fff08b4988d03f4ca9445b", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"

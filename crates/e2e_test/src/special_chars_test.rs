@@ -26,10 +26,16 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, init_logging};
+    use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
+    use http::StatusCode;
+    use http::header::HOST;
+    use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+    use rustfs_signer::sign_v4;
+    use s3s::Body;
     use serial_test::serial;
+    use std::error::Error;
     use tracing::{debug, info};
 
     /// Helper function to create an S3 client for testing
@@ -54,6 +60,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn signed_get(
+        url: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+        let uri = url.parse::<http::Uri>()?;
+        let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .header(HOST, authority)
+            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
+            .body(Body::empty())?;
+
+        let signed = sign_v4(request, 0, access_key, secret_key, "", "us-east-1");
+        let client = local_http_client();
+        let mut request_builder = client.get(url);
+        for (name, value) in signed.headers() {
+            request_builder = request_builder.header(name, value);
+        }
+
+        Ok(request_builder.send().await?)
     }
 
     /// Test PUT and GET with space character in path
@@ -272,6 +302,35 @@ mod tests {
         // Cleanup
         env.stop_server();
         info!("Test completed successfully");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_signed_get_missing_object_with_trailing_equals_returns_no_such_key() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = create_s3_client(&env);
+        let bucket = "test-missing-equals-key";
+        create_bucket(&client, bucket).await?;
+
+        let url = format!("{}/{}/path/sitemap.xmlage=", env.url, bucket);
+        let response = signed_get(&url, &env.access_key, &env.secret_key).await?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "missing object key ending with '=' should pass signature validation before object lookup"
+        );
+
+        let body = response.text().await?;
+        assert!(body.contains("<Code>NoSuchKey</Code>"), "expected NoSuchKey XML response, got: {body}");
+
+        env.stop_server();
+        Ok(())
     }
 
     /// Test DELETE operation with special characters
