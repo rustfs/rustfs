@@ -29,20 +29,8 @@ use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
-use rustfs_io_metrics::{snapshot_process_lock_counts, snapshot_process_platform_stats};
-use std::sync::OnceLock;
-use std::time::Instant;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use tracing::{instrument, warn};
-
-/// Process start time for calculating uptime.
-static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-
-/// Get the process start time, initializing it on first call.
-#[inline]
-fn get_process_start() -> &'static Instant {
-    PROCESS_START.get_or_init(Instant::now)
-}
 
 /// Collect cluster statistics from the storage layer.
 #[instrument]
@@ -203,59 +191,43 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
 /// Collect resource and process statistics for the current process in one sysinfo refresh.
 #[inline]
 pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessStats) {
-    let uptime_seconds = get_process_start().elapsed().as_secs();
-    let platform_stats = snapshot_process_platform_stats();
-    let lock_snapshot = snapshot_process_lock_counts();
+    let (resource_snapshot, process_snapshot) = snapshot_process_resource_and_system();
+    let status = match process_snapshot.status {
+        ProcessStatusSnapshot::Running => ProcessStatusType::Running,
+        ProcessStatusSnapshot::Sleeping => ProcessStatusType::Sleeping,
+        ProcessStatusSnapshot::Zombie => ProcessStatusType::Zombie,
+        ProcessStatusSnapshot::Other => ProcessStatusType::Other,
+    };
 
-    // Collect both resource and process metrics in one refresh to avoid duplicate sysinfo work.
-    let mut sys = System::new();
-    let pid = Pid::from_u32(std::process::id());
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+    let resource_stats = ResourceStats {
+        cpu_percent: resource_snapshot.cpu_percent,
+        memory_bytes: resource_snapshot.memory_bytes,
+        uptime_seconds: resource_snapshot.uptime_seconds,
+    };
+    let process_stats = ProcessStats {
+        locks_read_total: process_snapshot.locks_read_total,
+        locks_write_total: process_snapshot.locks_write_total,
+        cpu_total_seconds: process_snapshot.cpu_total_seconds,
+        file_descriptor_limit_total: process_snapshot.file_descriptor_limit_total,
+        file_descriptor_open_total: process_snapshot.file_descriptor_open_total,
+        go_routine_total: process_snapshot.go_routine_total,
+        io_rchar_bytes: process_snapshot.io_rchar_bytes,
+        io_read_bytes: process_snapshot.io_read_bytes,
+        io_wchar_bytes: process_snapshot.io_wchar_bytes,
+        io_write_bytes: process_snapshot.io_write_bytes,
+        resident_memory_bytes: process_snapshot.resident_memory_bytes,
+        start_time_seconds: process_snapshot.start_time_seconds,
+        status,
+        status_value: process_snapshot.status_value,
+        syscall_read_total: process_snapshot.syscall_read_total,
+        syscall_write_total: process_snapshot.syscall_write_total,
+        uptime_seconds: process_snapshot.uptime_seconds,
+        virtual_memory_bytes: process_snapshot.virtual_memory_bytes,
+        virtual_memory_max_bytes: process_snapshot.virtual_memory_max_bytes,
+        ..Default::default()
+    };
 
-    if let Some(process) = sys.process(pid) {
-        let disk_usage = process.disk_usage();
-        let status = ProcessStatusType::from(process.status());
-        let resource_stats = ResourceStats {
-            cpu_percent: process.cpu_usage() as f64,
-            memory_bytes: process.memory(),
-            uptime_seconds,
-        };
-        let process_stats = ProcessStats {
-            locks_read_total: lock_snapshot.read_locks_held,
-            locks_write_total: lock_snapshot.write_locks_held,
-            cpu_total_seconds: process.accumulated_cpu_time() as f64 / 1000.0,
-            file_descriptor_limit_total: process.open_files_limit().map_or(0, |value| value as u64),
-            file_descriptor_open_total: process.open_files().map_or(0, |value| value as u64),
-            go_routine_total: process.tasks().map_or(0, |tasks| tasks.len() as u64),
-            io_rchar_bytes: platform_stats.io_rchar_bytes.unwrap_or(disk_usage.total_read_bytes),
-            io_read_bytes: platform_stats.io_read_bytes.unwrap_or(disk_usage.total_read_bytes),
-            io_wchar_bytes: platform_stats.io_wchar_bytes.unwrap_or(disk_usage.total_written_bytes),
-            io_write_bytes: platform_stats.io_write_bytes.unwrap_or(disk_usage.total_written_bytes),
-            resident_memory_bytes: process.memory(),
-            start_time_seconds: process.start_time(),
-            status,
-            status_value: status as i64,
-            syscall_read_total: platform_stats.syscall_read_total.unwrap_or(0),
-            syscall_write_total: platform_stats.syscall_write_total.unwrap_or(0),
-            uptime_seconds,
-            virtual_memory_bytes: process.virtual_memory(),
-            virtual_memory_max_bytes: platform_stats.virtual_memory_max_bytes.unwrap_or(0),
-            ..Default::default()
-        };
-        (resource_stats, process_stats)
-    } else {
-        (
-            ResourceStats {
-                cpu_percent: 0.0,
-                memory_bytes: 0,
-                uptime_seconds,
-            },
-            ProcessStats {
-                uptime_seconds,
-                ..Default::default()
-            },
-        )
-    }
+    (resource_stats, process_stats)
 }
 
 /// Collect resource statistics for the current process.
