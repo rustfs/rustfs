@@ -39,6 +39,20 @@ done < <(
     --glob '!docs/**' || true
 )
 
+while IFS= read -r line; do
+  MATCHES+=("$line")
+done < <(
+  cd "$ROOT_DIR"
+  rg -n --no-heading \
+    -e 'rustfs-metrics' \
+    -e 'crates/metrics' \
+    Cargo.toml rustfs crates \
+    --glob '**/*.toml' \
+    --glob '**/*.rs' \
+    --glob '!**/tests/**' \
+    --glob '!docs/**' || true
+)
+
 VIOLATIONS=()
 
 for hit in "${MATCHES[@]}"; do
