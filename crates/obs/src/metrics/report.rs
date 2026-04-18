@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus text exposition format renderer.
-//!
-//! This module renders metrics in the standard Prometheus text format.
-//! Optimized for minimal allocations and fast rendering.
-
-use crate::MetricType;
-use rustfs_obs::metrics::{self, PrometheusMetric as ObsPrometheusMetric};
+use crate::metrics::schema::{MetricDescriptor, MetricType};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+static NAME_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
 static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
 
 fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
@@ -38,41 +34,50 @@ fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: 
     }
 }
 
-/// Report metrics using the `metrics` crate.
-///
-/// This function iterates over the provided metrics and reports them using
-/// the `metrics` crate's API. This allows integration with various metrics
-/// exporters (e.g., Prometheus) that are configured globally.
-///
-pub fn report_metrics(metrics: &[PrometheusMetric]) {
-    let mapped = metrics.iter().map(PrometheusMetric::to_obs_metric).collect::<Vec<_>>();
-    metrics::report_metrics(&mapped);
+fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
+    intern_string(cache, value)
 }
 
-/// A single Prometheus metric with labels and value.
-///
-/// This struct is optimized for performance by using `Cow<'static, str>` for
-/// the name and help text, which allows both static strings and owned strings.
-/// Labels use `Cow<'static, str>` to avoid allocations when possible.
+pub fn report_metrics(metrics: &[PrometheusMetric]) {
+    for metric in metrics {
+        let name = into_static_str(&NAME_CACHE, &metric.name);
+        let help = into_static_str(&HELP_CACHE, &metric.help);
+
+        match metric.metric_type {
+            MetricType::Counter => describe_counter!(name, help),
+            MetricType::Gauge => describe_gauge!(name, help),
+            MetricType::Histogram => describe_histogram!(name, help),
+        }
+
+        let labels: Vec<(String, String)> = metric.labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+
+        match metric.metric_type {
+            MetricType::Counter => {
+                let counter = counter!(name, &labels);
+                counter.absolute(metric.value as u64);
+            }
+            MetricType::Gauge => {
+                let gauge = gauge!(name, &labels);
+                gauge.set(metric.value);
+            }
+            MetricType::Histogram => {
+                let histogram = metrics::histogram!(name, &labels);
+                histogram.record(metric.value);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PrometheusMetric {
-    /// The metric name (e.g., "http_requests_total").
     pub name: Cow<'static, str>,
-    /// The type of this metric (counter, gauge, or histogram).
     pub metric_type: MetricType,
-    /// Human-readable description shown in Prometheus UI.
     pub help: Cow<'static, str>,
-    /// Key-value label pairs for this metric instance.
-    /// Uses Cow to avoid allocations for static label keys.
     pub labels: Vec<(&'static str, Cow<'static, str>)>,
-    /// The numeric value of this metric.
     pub value: f64,
 }
 
 impl PrometheusMetric {
-    /// Creates a new metric with the given name, type, help text, and value.
-    ///
-    /// Uses static strings to avoid heap allocations for metric metadata.
     #[inline]
     pub const fn new(name: &'static str, metric_type: MetricType, help: &'static str, value: f64) -> Self {
         Self {
@@ -84,9 +89,6 @@ impl PrometheusMetric {
         }
     }
 
-    /// Creates a new metric with owned strings for name and help.
-    ///
-    /// Use this when the metric name or help text is dynamically generated.
     #[inline]
     pub fn new_owned(name: String, metric_type: MetricType, help: String, value: f64) -> Self {
         Self {
@@ -98,12 +100,8 @@ impl PrometheusMetric {
         }
     }
 
-    /// Creates a new metric from a MetricDescriptor.
-    ///
-    /// This is the recommended way to create metrics when using MetricDescriptor
-    /// from the metrics_type module.
     #[inline]
-    pub fn from_descriptor(descriptor: &crate::MetricDescriptor, value: f64) -> Self {
+    pub fn from_descriptor(descriptor: &MetricDescriptor, value: f64) -> Self {
         let help = intern_string(&HELP_CACHE, &descriptor.help);
         Self {
             name: Cow::Owned(descriptor.get_full_metric_name()),
@@ -114,7 +112,6 @@ impl PrometheusMetric {
         }
     }
 
-    /// Adds a single label with a static value to this metric.
     #[inline]
     #[allow(dead_code)]
     pub fn with_label(mut self, key: &'static str, value: impl Into<Cow<'static, str>>) -> Self {
@@ -122,9 +119,6 @@ impl PrometheusMetric {
         self
     }
 
-    /// Adds a label with an owned string value.
-    ///
-    /// Use this when the label value is dynamically generated.
     #[inline]
     #[allow(dead_code)]
     pub fn with_label_owned(mut self, key: &'static str, value: String) -> Self {
@@ -132,36 +126,18 @@ impl PrometheusMetric {
         self
     }
 
-    /// Sets all labels for this metric, replacing any existing labels.
     #[inline]
     #[allow(dead_code)]
     pub fn with_labels(mut self, labels: Vec<(&'static str, Cow<'static, str>)>) -> Self {
         self.labels = labels;
         self
     }
-
-    #[inline]
-    fn to_obs_metric(&self) -> ObsPrometheusMetric {
-        let metric_type = match self.metric_type {
-            MetricType::Counter => rustfs_obs::MetricType::Counter,
-            MetricType::Gauge => rustfs_obs::MetricType::Gauge,
-            MetricType::Histogram => rustfs_obs::MetricType::Histogram,
-        };
-
-        ObsPrometheusMetric {
-            name: self.name.clone(),
-            metric_type,
-            help: self.help.clone(),
-            labels: self.labels.clone(),
-            value: self.value,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MetricDescriptor, MetricName, MetricNamespace, MetricSubsystem};
+    use crate::metrics::schema::{MetricName, MetricNamespace, MetricSubsystem};
 
     #[test]
     fn from_descriptor_uses_prometheus_metric_names_for_all_types() {

@@ -12,4 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod report;
 pub mod schema;
+
+pub use report::{PrometheusMetric, report_metrics};
