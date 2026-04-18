@@ -2843,14 +2843,12 @@ mod tests {
     async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
         use rustfs_kms::config::KmsConfig;
         use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
-        use std::sync::{Mutex, OnceLock};
+        use std::sync::OnceLock;
         use tempfile::TempDir;
+        use tokio::sync::Mutex;
 
         static KMS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = KMS_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("kms test lock should not be poisoned");
+        let _guard = KMS_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
 
         let manager = rustfs_kms::init_global_kms_service_manager();
 
