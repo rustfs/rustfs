@@ -102,6 +102,42 @@ jobs:
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
 
+  metrics-contract-snapshot:
+    name: Metrics Contract Snapshot
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-metrics-contract-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Verify metrics contract snapshot
+        run: cargo test -p rustfs-metrics --test metric_contract_snapshot
+
+  metrics-migration-ref-scan:
+    name: Metrics Migration Ref Scan
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check migration references
+        run: ./scripts/check_metrics_migration_refs.sh
+
   test-and-lint:
     name: Test and Lint
     needs: skip-check

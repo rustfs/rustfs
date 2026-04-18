@@ -8189,6 +8189,8 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-notify",
  "rustfs-utils",
+ "serde",
+ "serde_json",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
