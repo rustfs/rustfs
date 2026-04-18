@@ -36,6 +36,7 @@ pub mod system_drive;
 pub mod system_gpu;
 pub mod system_memory;
 pub mod system_network;
+pub mod system_network_host;
 pub mod system_process;
 
 pub use entry::descriptor::MetricDescriptor;
