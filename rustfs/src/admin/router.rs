@@ -271,6 +271,7 @@ fn is_valid_filter_rule_value(value: &str) -> bool {
 
 fn extract_bucket_for_bucket_level_path(path: &str) -> Option<String> {
     let bucket = path.strip_prefix('/')?;
+    let bucket = bucket.strip_suffix('/').unwrap_or(bucket);
     if bucket.is_empty() || bucket.contains('/') {
         return None;
     }
@@ -3099,6 +3100,7 @@ mod tests {
             .parse()
             .expect("uri should parse");
         let listen_bucket: Uri = "/demo-bucket?events=s3:ObjectCreated:*".parse().expect("uri should parse");
+        let listen_bucket_trailing_slash: Uri = "/demo-bucket/?events=s3:ObjectCreated:*".parse().expect("uri should parse");
         let listen_root: Uri = "/?events=s3:ObjectRemoved:*".parse().expect("uri should parse");
 
         let object_route = parse_misc_extension_request(&Method::GET, &object_lambda).expect("object lambda route should parse");
@@ -3114,6 +3116,15 @@ mod tests {
             parse_misc_extension_request(&Method::GET, &listen_bucket).expect("bucket listen route should parse");
         assert_eq!(
             listen_bucket_route,
+            MiscExtRoute::ListenNotification {
+                bucket: Some("demo-bucket".to_string())
+            }
+        );
+
+        let listen_bucket_trailing_slash_route = parse_misc_extension_request(&Method::GET, &listen_bucket_trailing_slash)
+            .expect("bucket listen route with trailing slash should parse");
+        assert_eq!(
+            listen_bucket_trailing_slash_route,
             MiscExtRoute::ListenNotification {
                 bucket: Some("demo-bucket".to_string())
             }
