@@ -19,6 +19,12 @@
 
 **RustFS FileMeta** provides advanced file metadata management and indexing capabilities for the [RustFS](https://rustfs.com) distributed object storage system. For the complete RustFS experience, please visit the [main RustFS repository](https://github.com/rustfs/rustfs).
 
+## Quick Use
+
+```
+cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
+```
+
 ## ✨ Features
 
 - High-performance metadata storage and retrieval
