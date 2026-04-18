@@ -7722,7 +7722,6 @@ dependencies = [
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
- "rustfs-metrics",
  "rustfs-notify",
  "rustfs-object-capacity",
  "rustfs-obs",

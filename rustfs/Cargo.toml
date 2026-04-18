@@ -44,7 +44,7 @@ required-features = ["manual-test-runners"]
 
 [features]
 default = ["direct-io"]
-metrics-gpu = ["rustfs-metrics/gpu"]
+metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
@@ -74,7 +74,6 @@ rustfs-keystone = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }
-rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }

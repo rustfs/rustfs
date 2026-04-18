@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use rustfs_metrics::collectors::{GpuCollector, collect_gpu_metrics};
+//! use rustfs_obs::metrics::collectors::{GpuCollector, collect_gpu_metrics};
 //! use sysinfo::Pid;
 //!
 //! let pid = sysinfo::get_current_pid().unwrap();
@@ -98,7 +98,7 @@ impl GpuCollector {
     /// # Example
     ///
     /// ```ignore
-    /// use rustfs_metrics::collectors::GpuCollector;
+    /// use rustfs_obs::metrics::collectors::GpuCollector;
     /// use sysinfo::Pid;
     ///
     /// let pid = sysinfo::get_current_pid().unwrap();
@@ -163,7 +163,7 @@ impl GpuCollector {
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_metrics::collectors::{GpuStats, collect_gpu_metrics};
+/// use rustfs_obs::metrics::collectors::{GpuStats, collect_gpu_metrics};
 ///
 /// let stats = GpuStats { memory_usage: 1024 };
 /// let labels = vec![("process_pid", Cow::Borrowed("1234"))];
