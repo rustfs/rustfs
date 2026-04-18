@@ -1213,9 +1213,7 @@ impl DataUsageCache {
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-        if let Err(e) = Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration).await {
-            return Err(e);
-        }
+        Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration).await?;
 
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
