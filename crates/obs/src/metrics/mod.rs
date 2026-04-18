@@ -13,8 +13,13 @@
 // limitations under the License.
 
 pub mod collectors;
+pub mod config;
 pub mod report;
+pub mod scheduler;
 pub mod schema;
+pub mod stats_collector;
 
 pub use collectors::*;
+pub use config::*;
 pub use report::{PrometheusMetric, report_metrics};
+pub use scheduler::{init_metrics_collectors, init_metrics_runtime};

@@ -28,6 +28,7 @@ pub mod notification;
 pub mod notification_target;
 pub mod replication;
 pub mod request;
+pub mod resource;
 pub mod scanner;
 pub mod system_cpu;
 pub mod system_drive;
@@ -53,6 +54,7 @@ pub use notification::{NotificationStats, collect_notification_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
 pub use replication::{ReplicationStats, collect_replication_metrics};
 pub use request::{ApiRequestStats, collect_request_metrics};
+pub use resource::{ResourceStats, collect_resource_metrics};
 pub use scanner::{ScannerStats, collect_scanner_metrics};
 pub use system_cpu::{CpuStats, ProcessCpuStats, collect_cpu_metrics, collect_process_cpu_metrics};
 pub use system_drive::{
