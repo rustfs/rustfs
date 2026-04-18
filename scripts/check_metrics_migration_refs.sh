@@ -7,14 +7,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Allowed references during migration bootstrap (T00 baseline).
 # Keep entries minimal and remove them as callsites are migrated.
 ALLOWLIST=(
-  "rustfs/src/main.rs"
   "crates/metrics/src/lib.rs"
   "crates/metrics/src/global.rs"
   "crates/metrics/src/collectors/mod.rs"
   "crates/metrics/src/collectors/global.rs"
   "crates/metrics/src/collectors/system_gpu.rs"
   "crates/obs/src/lib.rs"
-  "crates/obs/src/global.rs"
+  "crates/obs/src/metrics/mod.rs"
+  "crates/obs/src/metrics/scheduler.rs"
 )
 
 is_allowed_path() {
