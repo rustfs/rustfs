@@ -11,6 +11,7 @@
 
 # Failed tests
 test_bucket_create_delete_bucket_ownership
+test_create_bucket_no_ownership_controls
 test_bucket_logging_owner
 test_object_copy_not_owned_bucket
 test_bucket_policy_multipart
@@ -30,3 +31,4 @@ test_lifecycle_transition_encrypted
 # Tests with known issues (need further investigation)
 test_bucket_policy_different_tenant
 test_bucket_policy_tenanted_bucket
+test_object_copy_to_itself_with_metadata

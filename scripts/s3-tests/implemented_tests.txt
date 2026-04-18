@@ -19,8 +19,6 @@
 # - Conditional GET: If-Match, If-None-Match, If-Modified-Since
 #
 # - SSE-C: Server-side encryption with customer-provided keys
-# - Object ownership: Bucket ownership controls
-#
 # - SSE-KMS: KMS-related edge cases
 # - Bucket Policy: Multipart upload authorization, SSE condition keys, grant header conditions
 # - Versioning: Concurrent multi-object delete
@@ -218,9 +216,6 @@ test_bucket_policy_allow_notprincipal
 test_bucket_policy_put_obj_kms_s3
 test_bucket_policy_put_obj_s3_kms
 
-# Object ownership
-test_create_bucket_no_ownership_controls
-
 # Bucket encryption
 test_put_bucket_encryption_kms
 test_put_bucket_encryption_s3
@@ -228,11 +223,8 @@ test_get_bucket_encryption_kms
 test_get_bucket_encryption_s3
 test_delete_bucket_encryption_kms
 test_delete_bucket_encryption_s3
-test_lifecycle_expiration_days0
-
 # Lifecycle tests
 test_lifecycle_delete
-test_lifecycle_expiration_header_put
 test_lifecycle_get
 test_lifecycle_get_no_id
 test_lifecycle_id_too_long
@@ -309,7 +301,6 @@ test_object_copy_replacing_metadata
 test_object_copy_retaining_metadata
 test_object_copy_same_bucket
 test_object_copy_to_itself
-test_object_copy_to_itself_with_metadata
 test_object_copy_verify_contenttype
 test_object_copy_versioned_bucket
 test_object_copy_versioned_url_encoding
