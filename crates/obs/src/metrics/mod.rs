@@ -12,13 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod collectors;
-pub mod constants;
-pub mod format;
-mod global;
-mod metrics_type;
-
-pub use format::report_metrics;
-pub use global::init_metrics_system;
-pub use metrics_type::*;
-pub use rustfs_obs::metrics as obs_metrics;
+pub mod schema;

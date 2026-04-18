@@ -36,6 +36,7 @@ rustfs-config = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
+rustfs-obs = { workspace = true }
 rustfs-utils = { workspace = true }
 metrics = { workspace = true }
 sysinfo = { workspace = true }

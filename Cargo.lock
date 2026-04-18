@@ -8189,6 +8189,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-io-metrics",
  "rustfs-notify",
+ "rustfs-obs",
  "rustfs-utils",
  "serde",
  "serde_json",

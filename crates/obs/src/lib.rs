@@ -63,12 +63,14 @@ mod cleaner;
 mod config;
 mod error;
 mod global;
+pub mod metrics;
 mod telemetry;
 
 pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
+pub use metrics::schema::*;
 pub use telemetry::{OtelGuard, Recorder};
 
 // Dial9 Tokio runtime telemetry

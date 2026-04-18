@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod collectors;
-pub mod constants;
-pub mod format;
-mod global;
-mod metrics_type;
+/// The metric namespace, which represents the top-level grouping of the metric
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricNamespace {
+    RustFS,
+}
 
-pub use format::report_metrics;
-pub use global::init_metrics_system;
-pub use metrics_type::*;
-pub use rustfs_obs::metrics as obs_metrics;
+impl MetricNamespace {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RustFS => "rustfs",
+        }
+    }
+}
