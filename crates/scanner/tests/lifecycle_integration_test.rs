@@ -1219,7 +1219,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn test_scanner_expires_zero_day_current_version() {
-        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
         let bucket_name = format!("test-zero-day-expire-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/object.txt";
@@ -1232,6 +1232,7 @@ mod serial_tests {
 
         assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
 
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
