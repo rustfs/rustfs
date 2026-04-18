@@ -311,8 +311,14 @@ async fn process_batch(
                         let backoff = 1u32 << retry_count as u32;
                         tokio::time::sleep(base_delay * backoff + jitter).await;
                     }
+                    TargetError::Dropped(reason) => {
+                        warn!("Dropped queued payload for target {}: {}", target.name(), reason);
+                        metrics.increment_failed();
+                        break;
+                    }
                     _ => {
                         error!("Permanent error for target {}: {}", target.name(), e);
+                        target.record_final_failure();
                         metrics.increment_failed();
                         break;
                     }
@@ -322,6 +328,7 @@ async fn process_batch(
 
         if retry_count >= max_retries && !success {
             warn!("Max retries exceeded for event {}, target: {}, skipping", key.to_string(), target.name());
+            target.record_final_failure();
             metrics.increment_failed();
         }
     }

@@ -284,9 +284,9 @@ anyhow::Result<T>             // in library code (OK in tests/CLI)
 
 ### Metrics
 
-- Prometheus-style metrics via `rustfs-metrics` crate
+- Prometheus-style metrics via `rustfs-obs` runtime and schema
 - I/O-specific counters via `rustfs-io-metrics`
-- Registration happens at crate level, collection in `metrics` crate
+- Registration happens at crate level, collection/reporting in `rustfs-obs`
 
 ### Testing
 
@@ -368,7 +368,7 @@ The binary (`main.rs`) boots in this order:
   Add handler in `admin/handlers/`, register in `admin/router.rs`
 
 - **"Where do I add a new metric?"**
-  Define in `crates/metrics/`, register collector, expose via `/minio/v2/metrics`
+  Define descriptor/collector in `crates/obs/src/metrics/`, expose via `/minio/v2/metrics`
 
 ---
 

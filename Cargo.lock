@@ -830,9 +830,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.101.0"
+version = "1.102.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab41ad64e4051ecabeea802d6a17845a91e83287e1dd249e6963ea1ba78c428a"
+checksum = "0fc35b7a14cabdad13795fbbbd26d5ddec0882c01492ceedf2af575aad5f37dd"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -3067,20 +3067,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "dial9-tokio-telemetry"
-version = "0.2.1"
+name = "dial9-macro"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35c8348045a09a7dee69d000124d42f773f59f85737d3212ae65aa64ac0b4e3e"
+checksum = "877b67d2a742d9c722961c468e8b9cfe87d78e53f2e1d61125c8d388bb8a3bba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "dial9-tokio-telemetry"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edba70ebc611e0ebc889d7f6b3d08ce742e48cb188da1f298ec6378b0b4f86b"
 dependencies = [
  "arc-swap",
  "bon",
  "crossbeam-queue",
+ "dial9-macro",
  "dial9-trace-format",
  "flate2",
  "futures-util",
  "hostname",
  "libc",
  "metrique",
+ "metrique-timesource",
  "metrique-writer",
  "pin-project-lite",
  "serde",
@@ -3093,9 +3106,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80e0ee560b05f09bf817602d57644947e31e83c521d4e0277f723a6e64d44f92"
+checksum = "8c9d20951a4584f9ea544ff27143709821c4709f27d30b52395300f020392475"
 dependencies = [
  "dial9-trace-format-derive",
  "serde",
@@ -3103,9 +3116,9 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format-derive"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dbbd8126d4d6613931317cfe2a7275c1cd487e41c961e42456ab5f956570030"
+checksum = "5800a5a155746fe428681cdc30570f33d961a31ed800e6df41b78d0af64529ed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5018,9 +5031,9 @@ dependencies = [
 
 [[package]]
 name = "libbz2-rs-sys"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c4a545a15244c7d945065b5d392b2d2d7f21526fba56ce51467b06ed445e8f7"
+checksum = "b3a6a8c165077efc8f3a971534c50ea6a1a18b329ef4a66e897a7e3a1494565f"
 
 [[package]]
 name = "libc"
@@ -7722,7 +7735,6 @@ dependencies = [
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
- "rustfs-metrics",
  "rustfs-notify",
  "rustfs-object-capacity",
  "rustfs-obs",
@@ -8082,8 +8094,10 @@ dependencies = [
 name = "rustfs-io-metrics"
 version = "0.0.5"
 dependencies = [
+ "criterion",
  "metrics",
  "num_cpus",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8151,6 +8165,7 @@ dependencies = [
  "crossbeam-queue",
  "futures",
  "parking_lot 0.12.5",
+ "rustfs-io-metrics",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -8173,22 +8188,6 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
-]
-
-[[package]]
-name = "rustfs-metrics"
-version = "0.0.5"
-dependencies = [
- "metrics",
- "nvml-wrapper",
- "rustfs-config",
- "rustfs-ecstore",
- "rustfs-utils",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -8255,6 +8254,7 @@ dependencies = [
  "jiff",
  "metrics",
  "num_cpus",
+ "nvml-wrapper",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -8262,13 +8262,19 @@ dependencies = [
  "opentelemetry-stdout",
  "opentelemetry_sdk",
  "pyroscope",
+ "rustfs-audit",
  "rustfs-config",
+ "rustfs-ecstore",
+ "rustfs-io-metrics",
+ "rustfs-notify",
  "rustfs-utils",
  "serde",
+ "sysinfo",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-error",
@@ -9569,9 +9575,9 @@ dependencies = [
 
 [[package]]
 name = "symbolic-common"
-version = "12.18.0"
+version = "12.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aba7211a1803a826f108af9f4d86d25abe880712f2a6449479279e861b293f8"
+checksum = "b1f3cdeaae6779ecba2567f20bf7716718b8c4ce6717c9def4ced18786bb11ea"
 dependencies = [
  "debugid",
  "memmap2 0.9.10",
@@ -9581,14 +9587,20 @@ dependencies = [
 
 [[package]]
 name = "symbolic-demangle"
-version = "12.18.0"
+version = "12.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595bddd9d363c2ef6fc9fb33b98416ff209c5aae8bdca89a7dbbf2ef5e0ecc45"
+checksum = "672c6ad9cb8fce6a1283cc9df9070073cccad00ae241b80e3686328a64e3523b"
 dependencies = [
  "cpp_demangle",
  "rustc-demangle",
  "symbolic-common",
 ]
+
+[[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
@@ -10129,11 +10141,12 @@ dependencies = [
 
 [[package]]
 name = "tracing-appender"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
+ "symlink",
  "thiserror 2.0.18",
  "time",
  "tracing-subscriber",
@@ -10482,11 +10495,11 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
-version = "1.0.2+wasi-0.2.9"
+version = "1.0.3+wasi-0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9517f9239f02c069db75e65f174b3da828fe5f5b945c4dd26bd25d89c03ebcf5"
+checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -10495,7 +10508,7 @@ version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -11050,6 +11063,12 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 dependencies = [
  "wit-bindgen-rust-macro",
 ]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wit-bindgen-core"
