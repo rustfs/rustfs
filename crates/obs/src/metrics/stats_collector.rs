@@ -21,7 +21,7 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, ProcessNetworkStats, ProcessStats, ProcessStatusType,
+    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, HostNetworkStats, ProcessStats, ProcessStatusType,
     ResourceStats,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
@@ -263,12 +263,14 @@ pub fn collect_process_system_stats() -> ProcessStats {
     collect_process_metric_bundle().process
 }
 
-/// Collect process network statistics from the current network interface snapshot.
-pub fn collect_process_network_stats() -> ProcessNetworkStats {
+/// Collect host network statistics from the current network interface snapshot.
+///
+/// These counters come from system interfaces and are host-wide, not process-scoped.
+pub fn collect_host_network_stats() -> HostNetworkStats {
     let networks = Networks::new_with_refreshed_list();
     let mut total_received = 0u64;
     let mut total_transmitted = 0u64;
-    let mut per_interface = Vec::with_capacity(networks.iter().count());
+    let mut per_interface = Vec::with_capacity(networks.len());
 
     for (interface_name, data) in &networks {
         let received = data.received();
@@ -278,7 +280,7 @@ pub fn collect_process_network_stats() -> ProcessNetworkStats {
         per_interface.push((interface_name.to_string(), received, transmitted));
     }
 
-    ProcessNetworkStats {
+    HostNetworkStats {
         total_received,
         total_transmitted,
         per_interface,

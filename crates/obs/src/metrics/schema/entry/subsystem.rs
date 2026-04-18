@@ -27,7 +27,7 @@ pub enum MetricSubsystem {
 
     // system related subsystems
     SystemNetworkInternode,
-    SystemNetworkProcess,
+    SystemNetworkHost,
     SystemDrive,
     SystemMemory,
     SystemCpu,
@@ -69,7 +69,7 @@ impl MetricSubsystem {
 
             // system related subsystems
             Self::SystemNetworkInternode => "/system/network/internode",
-            Self::SystemNetworkProcess => "/system/network/process",
+            Self::SystemNetworkHost => "/system/network/host",
             Self::SystemDrive => "/system/drive",
             Self::SystemMemory => "/system/memory",
             Self::SystemCpu => "/system/cpu",
@@ -117,7 +117,7 @@ impl MetricSubsystem {
 
             // System-related subsystems
             "/system/network/internode" => Self::SystemNetworkInternode,
-            "/system/network/process" => Self::SystemNetworkProcess,
+            "/system/network/host" => Self::SystemNetworkHost,
             "/system/drive" => Self::SystemDrive,
             "/system/memory" => Self::SystemMemory,
             "/system/cpu" => Self::SystemCpu,
@@ -186,7 +186,7 @@ pub mod subsystems {
     pub const BUCKET_REPLICATION: MetricSubsystem = MetricSubsystem::BucketReplication;
     pub const SYSTEM_GPU: MetricSubsystem = MetricSubsystem::SystemGpu;
     pub const SYSTEM_NETWORK_INTERNODE: MetricSubsystem = MetricSubsystem::SystemNetworkInternode;
-    pub const SYSTEM_NETWORK_PROCESS: MetricSubsystem = MetricSubsystem::SystemNetworkProcess;
+    pub const SYSTEM_NETWORK_HOST: MetricSubsystem = MetricSubsystem::SystemNetworkHost;
     pub const SYSTEM_DRIVE: MetricSubsystem = MetricSubsystem::SystemDrive;
     pub const SYSTEM_MEMORY: MetricSubsystem = MetricSubsystem::SystemMemory;
     pub const SYSTEM_CPU: MetricSubsystem = MetricSubsystem::SystemCpu;
@@ -214,7 +214,7 @@ mod tests {
     fn test_metric_subsystem_formatting() {
         assert_eq!(MetricSubsystem::ApiRequests.as_str(), "api_requests");
         assert_eq!(MetricSubsystem::SystemNetworkInternode.as_str(), "system_network_internode");
-        assert_eq!(MetricSubsystem::SystemNetworkProcess.as_str(), "system_network_process");
+        assert_eq!(MetricSubsystem::SystemNetworkHost.as_str(), "system_network_host");
         assert_eq!(MetricSubsystem::BucketApi.as_str(), "bucket_api");
         assert_eq!(MetricSubsystem::ClusterHealth.as_str(), "cluster_health");
 

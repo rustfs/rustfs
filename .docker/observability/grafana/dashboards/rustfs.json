@@ -2670,7 +2670,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(rustfs_system_network_process_network_io{job=~\"$job\", direction=\"received\"}[5m]))",
+          "expr": "sum by (job) (rate(rustfs_system_network_host_network_io{job=~\"$job\", direction=\"received\"}[5m]))",
           "legendFormat": "RX - {{job}}",
           "range": true,
           "refId": "C"
@@ -2681,7 +2681,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rate(rustfs_system_network_process_network_io{job=~\"$job\", direction=\"transmitted\"}[5m]))",
+          "expr": "sum by (job) (rate(rustfs_system_network_host_network_io{job=~\"$job\", direction=\"transmitted\"}[5m]))",
           "legendFormat": "TX - {{job}}",
           "range": true,
           "refId": "D"
@@ -2779,7 +2779,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job, interface) (rate(rustfs_system_network_process_network_io_per_interface{job=~\"$job\", direction=\"received\"}[5m]))",
+          "expr": "sum by (job, interface) (rate(rustfs_system_network_host_network_io_per_interface{job=~\"$job\", direction=\"received\"}[5m]))",
           "legendFormat": "RX {{interface}} - {{job}}",
           "range": true,
           "refId": "E"
@@ -2790,7 +2790,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job, interface) (rate(rustfs_system_network_process_network_io_per_interface{job=~\"$job\", direction=\"transmitted\"}[5m]))",
+          "expr": "sum by (job, interface) (rate(rustfs_system_network_host_network_io_per_interface{job=~\"$job\", direction=\"transmitted\"}[5m]))",
           "legendFormat": "TX {{interface}} - {{job}}",
           "range": true,
           "refId": "F"

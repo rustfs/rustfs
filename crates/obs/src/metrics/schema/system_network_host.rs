@@ -17,22 +17,22 @@
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
-/// Process network I/O bytes.
-pub static PROCESS_NETWORK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+/// Host network I/O bytes collected from system network interfaces.
+pub static HOST_NETWORK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
-        MetricName::ProcessNetworkIO,
-        "Network bytes transferred by the process",
+        MetricName::HostNetworkIO,
+        "Network bytes transferred across system network interfaces",
         &[],
-        subsystems::SYSTEM_NETWORK_PROCESS,
+        subsystems::SYSTEM_NETWORK_HOST,
     )
 });
 
-/// Process network I/O bytes per interface.
-pub static PROCESS_NETWORK_IO_PER_INTERFACE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+/// Host network I/O bytes collected from system network interfaces, grouped per interface.
+pub static HOST_NETWORK_IO_PER_INTERFACE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
-        MetricName::ProcessNetworkIOPerInterface,
-        "Network bytes transferred by the process (per interface)",
+        MetricName::HostNetworkIOPerInterface,
+        "Network bytes transferred across system network interfaces (per interface)",
         &[],
-        subsystems::SYSTEM_NETWORK_PROCESS,
+        subsystems::SYSTEM_NETWORK_HOST,
     )
 });

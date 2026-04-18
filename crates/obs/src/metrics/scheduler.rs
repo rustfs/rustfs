@@ -21,7 +21,7 @@
 //! - Process CPU metrics
 //! - Process memory metrics
 //! - Process disk I/O metrics
-//! - Process network I/O metrics
+//! - Host network I/O metrics
 
 use crate::metrics::collectors::{
     AuditTargetStats,
@@ -36,6 +36,7 @@ use crate::metrics::collectors::{
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
     collect_cluster_metrics,
+    collect_host_network_metrics,
     collect_node_metrics,
     collect_notification_metrics,
     collect_notification_target_metrics,
@@ -44,7 +45,6 @@ use crate::metrics::collectors::{
     collect_process_disk_metrics,
     collect_process_memory_metrics,
     collect_process_metrics,
-    collect_process_network_metrics,
     collect_resource_metrics,
 };
 use crate::metrics::config::{
@@ -57,13 +57,14 @@ use crate::metrics::config::{
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats,
-    collect_disk_stats, collect_process_metric_bundle, collect_process_network_stats,
+    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -385,7 +386,10 @@ fn current_process_metric_labels() -> Vec<(&'static str, Cow<'static, str>)> {
 
 fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
     warn!("Failed to collect process attributes for metrics labels: {}", err);
-    vec![("process_pid", Cow::Owned(std::process::id().to_string()))]
+    vec![
+        ("process_pid", Cow::Owned(std::process::id().to_string())),
+        ("process_executable_name", Cow::Borrowed("unknown")),
+    ]
 }
 
 fn collect_system_monitoring_metrics(
@@ -404,12 +408,13 @@ fn collect_system_monitoring_metrics(
         read_bytes: bundle.disk_read_bytes,
         written_bytes: bundle.disk_write_bytes,
     };
-    let network_stats = collect_process_network_stats();
+    let network_stats = collect_host_network_stats();
 
     let mut metrics = Vec::new();
     metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
     metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
     metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));
-    metrics.extend(collect_process_network_metrics(&network_stats, Some(labels)));
+    // Interface counters are host-wide, so keep these metrics free of process labels.
+    metrics.extend(collect_host_network_metrics(&network_stats, None));
     metrics
 }
