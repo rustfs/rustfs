@@ -26,6 +26,7 @@ use std::{
 
 use http::HeaderMap;
 use metrics::{counter, describe_counter, describe_histogram, histogram};
+use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
@@ -46,7 +47,6 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
-const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
 const DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT: u64 = 30;
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
