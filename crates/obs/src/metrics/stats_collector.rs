@@ -21,7 +21,8 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, ProcessStats, ProcessStatusType, ResourceStats,
+    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, HostNetworkStats, ProcessStats, ProcessStatusType,
+    ResourceStats,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -30,7 +31,16 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use sysinfo::Networks;
 use tracing::{instrument, warn};
+
+#[derive(Debug, Clone, Default)]
+pub struct ProcessMetricBundle {
+    pub resource: ResourceStats,
+    pub process: ProcessStats,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+}
 
 /// Collect cluster statistics from the storage layer.
 #[instrument]
@@ -190,7 +200,7 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
 
 /// Collect resource and process statistics for the current process in one sysinfo refresh.
 #[inline]
-pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessStats) {
+pub fn collect_process_metric_bundle() -> ProcessMetricBundle {
     let (resource_snapshot, process_snapshot) = snapshot_process_resource_and_system();
     let status = match process_snapshot.status {
         ProcessStatusSnapshot::Running => ProcessStatusType::Running,
@@ -226,17 +236,53 @@ pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessSta
         virtual_memory_max_bytes: process_snapshot.virtual_memory_max_bytes,
     };
 
-    (resource_stats, process_stats)
+    ProcessMetricBundle {
+        resource: resource_stats,
+        process: process_stats,
+        disk_read_bytes: process_snapshot.disk_read_bytes,
+        disk_write_bytes: process_snapshot.disk_write_bytes,
+    }
+}
+
+/// Collect resource and process statistics for the current process in one sysinfo refresh.
+#[inline]
+pub fn collect_process_resource_and_system_stats() -> (ResourceStats, ProcessStats) {
+    let bundle = collect_process_metric_bundle();
+    (bundle.resource, bundle.process)
 }
 
 /// Collect resource statistics for the current process.
 #[inline]
 pub fn collect_process_stats() -> ResourceStats {
-    collect_process_resource_and_system_stats().0
+    collect_process_metric_bundle().resource
 }
 
 /// Collect process statistics for the current process.
 #[inline]
 pub fn collect_process_system_stats() -> ProcessStats {
-    collect_process_resource_and_system_stats().1
+    collect_process_metric_bundle().process
+}
+
+/// Collect host network statistics from the current network interface snapshot.
+///
+/// These counters come from system interfaces and are host-wide, not process-scoped.
+pub fn collect_host_network_stats() -> HostNetworkStats {
+    let networks = Networks::new_with_refreshed_list();
+    let mut total_received = 0u64;
+    let mut total_transmitted = 0u64;
+    let mut per_interface = Vec::with_capacity(networks.len());
+
+    for (interface_name, data) in &networks {
+        let received = data.received();
+        let transmitted = data.transmitted();
+        total_received += received;
+        total_transmitted += transmitted;
+        per_interface.push((interface_name.to_string(), received, transmitted));
+    }
+
+    HostNetworkStats {
+        total_received,
+        total_transmitted,
+        per_interface,
+    }
 }
