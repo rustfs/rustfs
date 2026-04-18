@@ -34,6 +34,7 @@ num_cpus = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync","rt"] }
 tracing = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

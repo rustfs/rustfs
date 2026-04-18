@@ -53,8 +53,7 @@ use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_iam::{init_iam_sys, init_oidc_sys};
-use rustfs_metrics::init_metrics_system;
-use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{
     ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
@@ -563,7 +562,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
-        init_metrics_system(ctx.clone());
+        init_metrics_runtime(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
         rustfs::init::init_auto_tuner(ctx.clone()).await;

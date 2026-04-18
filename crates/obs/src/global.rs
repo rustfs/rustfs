@@ -116,8 +116,7 @@ pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError
 /// ```
 pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, GlobalError> {
     let otel_guard = init_telemetry(config)?;
-    // Note: System monitoring has been migrated to rustfs-metrics
-    // Use rustfs_metrics::init_metrics_collectors() for system metrics
+    // Metrics runtime scheduling is exposed by rustfs_obs::init_metrics_runtime().
     Ok(otel_guard)
 }
 
