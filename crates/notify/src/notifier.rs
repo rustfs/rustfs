@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::NotificationError, event::Event, rules::RulesMap};
+use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rules::RulesMap};
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
 use rustfs_s3_common::EventName;
@@ -26,6 +26,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
+    metrics: Arc<NotificationMetrics>,
     target_list: Arc<RwLock<TargetList>>,
     bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
     send_limiter: Arc<Semaphore>,
@@ -33,7 +34,7 @@ pub struct EventNotifier {
 
 impl Default for EventNotifier {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(NotificationMetrics::new()))
     }
 }
 
@@ -42,9 +43,10 @@ impl EventNotifier {
     ///
     /// # Returns
     /// Returns a new instance of EventNotifier.
-    pub fn new() -> Self {
+    pub fn new(metrics: Arc<NotificationMetrics>) -> Self {
         let max_inflight = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
         EventNotifier {
+            metrics,
             target_list: Arc::new(RwLock::new(TargetList::new())),
             bucket_rules_map: Arc::new(AsyncShardedHashMap::new(0)),
             send_limiter: Arc::new(Semaphore::new(max_inflight)),
@@ -182,12 +184,14 @@ impl EventNotifier {
 
         let Some(rules) = self.bucket_rules_map.get(bucket_name).await else {
             debug!("No rules found for bucket: {}", bucket_name);
+            self.metrics.increment_skipped();
             return;
         };
 
         let target_ids = rules.match_rules(event_name, object_key);
         if target_ids.is_empty() {
             debug!("No matching targets for event in bucket: {}", bucket_name);
+            self.metrics.increment_skipped();
             return;
         }
         let target_ids_len = target_ids.len();
@@ -207,7 +211,9 @@ impl EventNotifier {
                     continue;
                 }
                 let limiter = self.send_limiter.clone();
+                let metrics = self.metrics.clone();
                 let event_clone = event.clone();
+                let is_deferred = target_for_task.store().is_some();
                 let target_name_for_task = target_for_task.name(); // Get the name before generating the task
                 debug!("Preparing to send event to target: {}", target_name_for_task);
                 // Use cloned data in closures to avoid borrowing conflicts
@@ -219,22 +225,31 @@ impl EventNotifier {
                     data: event_clone.as_ref().clone(),
                 });
                 let handle = tokio::spawn(async move {
+                    metrics.increment_processing();
                     let _permit = match limiter.acquire_owned().await {
                         Ok(p) => p,
                         Err(e) => {
                             error!("Failed to acquire send permit for target {}: {}", target_name_for_task, e);
+                            metrics.increment_failed();
                             return;
                         }
                     };
                     if let Err(e) = target_for_task.save(entity_target.clone()).await {
+                        metrics.increment_failed();
                         error!("Failed to send event to target {}: {}", target_name_for_task, e);
                     } else {
+                        if is_deferred {
+                            metrics.decrement_processing();
+                        } else {
+                            metrics.increment_processed();
+                        }
                         debug!("Successfully saved event to target {}", target_name_for_task);
                     }
                 });
                 handles.push(handle);
             } else {
                 warn!("Target ID {:?} found in rules but not in target list.", target_id);
+                self.metrics.increment_skipped();
             }
         }
         // target_list is automatically released here
@@ -470,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_skips_disabled_target() {
-        let notifier = EventNotifier::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()));
 
         let enabled_target = TestTarget::new("enabled-target", "webhook", true);
         let disabled_target = TestTarget::new("disabled-target", "webhook", false);

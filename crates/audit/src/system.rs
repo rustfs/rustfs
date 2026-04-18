@@ -24,6 +24,14 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditTargetMetricSnapshot {
+    pub failed_messages: u64,
+    pub queue_length: u64,
+    pub target_id: String,
+    pub total_messages: u64,
+}
+
 /// State of the audit system
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditSystemState {
@@ -537,8 +545,14 @@ impl AuditSystem {
                                     TargetError::Timeout(_) => {
                                         warn!("Timeout sending to target {}, retrying...", target.id());
                                     }
+                                    TargetError::Dropped(reason) => {
+                                        warn!("Dropped queued payload for target {}: {}", target.id(), reason);
+                                        observability::record_target_failure();
+                                        break;
+                                    }
                                     _ => {
                                         error!("Permanent error for target {}: {}", target.id(), e);
+                                        target.record_final_failure();
                                         observability::record_target_failure();
                                         break;
                                     }
@@ -552,6 +566,7 @@ impl AuditSystem {
 
                     if retries >= MAX_RETRIES && !success {
                         warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
+                        target.record_final_failure();
                         observability::record_target_failure();
                     }
                 }
@@ -662,6 +677,25 @@ impl AuditSystem {
     pub async fn get_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
         let registry = self.registry.lock().await;
         registry.list_target_values()
+    }
+
+    /// Returns per-target delivery metrics for Prometheus collection.
+    pub async fn snapshot_target_metrics(&self) -> Vec<AuditTargetMetricSnapshot> {
+        let targets = self.get_target_values().await;
+        let mut snapshots = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let delivery = target.delivery_snapshot();
+            snapshots.push(AuditTargetMetricSnapshot {
+                failed_messages: delivery.failed_messages,
+                queue_length: delivery.queue_length,
+                target_id: target.id().to_string(),
+                total_messages: delivery.total_messages,
+            });
+        }
+
+        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        snapshots
     }
 
     /// Gets information about a specific target

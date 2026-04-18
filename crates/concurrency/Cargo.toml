@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["test-util","macros","rt-multi-thread"] }
 
 [features]
 default = ["timeout", "lock", "deadlock", "backpressure", "scheduler"]

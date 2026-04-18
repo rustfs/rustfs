@@ -228,7 +228,7 @@ impl ProxyChainAnalyzer {
     }
 
     /// Checks if an IP address is trusted based on the configuration.
-    fn is_ip_trusted(&self, ip: &IpAddr) -> bool {
+    pub(crate) fn is_ip_trusted(&self, ip: &IpAddr) -> bool {
         if self.trusted_ip_cache.contains(ip) {
             return true;
         }

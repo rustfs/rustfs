@@ -43,16 +43,15 @@ bench = false
 required-features = ["manual-test-runners"]
 
 [features]
-default = ["direct-io"]
-metrics-gpu = ["rustfs-metrics/gpu"]
+default = []
+metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
 license = []
-direct-io = []  # Aligned direct I/O reader support (uses aligned pread, does not set O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
+full = ["metrics-gpu", "ftps", "swift", "webdav"]
 manual-test-runners = []
 
 [lints]
@@ -74,7 +73,6 @@ rustfs-keystone = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }
-rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
@@ -107,7 +105,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util","io-uring"] }
 tokio-rustls = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tokio-stream.workspace = true

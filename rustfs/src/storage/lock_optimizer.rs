@@ -37,7 +37,7 @@
 //! - Early lock release after metadata read
 //! - Lock hold time monitoring
 //! - Configurable optimization (can be disabled for debugging)
-//! - Prometheus metrics for lock contention analysis
+//! - Lock contention metrics emitted through the shared metrics pipeline
 //!
 //! # Architecture
 //!

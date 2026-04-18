@@ -43,7 +43,6 @@ local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
@@ -65,7 +64,6 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 temp-env = { workspace = true }
 

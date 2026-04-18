@@ -2077,7 +2077,6 @@ impl DefaultObjectUsecase {
             opts,
         } = request_context;
 
-        // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
 
         let prepared_read = Self::prepare_get_object_read_execution(

@@ -1683,7 +1683,7 @@ impl<T> IoPriorityQueue<T> {
 
 /// Global metrics for I/O priority queue monitoring.
 ///
-/// These metrics are exposed for Prometheus scraping and provide
+/// These metrics are emitted through the shared metrics pipeline and provide
 /// visibility into the priority queue behavior.
 #[allow(dead_code)]
 pub struct IoPriorityMetrics {

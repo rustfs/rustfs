@@ -34,7 +34,7 @@
 //! - Request resource tracking (locks, memory, file handles)
 //! - Lock wait graph analysis for cycle detection
 //! - Configurable detection interval and hang threshold
-//! - Prometheus metrics for deadlock events
+//! - Deadlock metrics emitted through the shared metrics pipeline
 //! - Detailed diagnostic logging
 //!
 //! # Usage

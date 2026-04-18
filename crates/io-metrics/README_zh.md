@@ -31,6 +31,7 @@
 - **带宽监控**：实时带宽观测和分析
 - **性能指标**：I/O 性能指标收集
 - **统一配置**：集中式配置管理
+- **导出边界**：通过 `metrics` 主动上报，由 `rustfs-obs` 负责 OTEL 导出，不提供 Prometheus HTTP 端点
 
 ## ✨ 核心功能
 
@@ -237,15 +238,6 @@ println!("最大并发读: {}", config.scheduler.max_concurrent_reads);
 
 ## 🔧 配置
 
-### 环境变量
-
-| 变量名 | 描述 | 默认值 |
-|--------|------|--------|
-| `RUSTFS_CACHE_MAX_CAPACITY` | 缓存最大容量 | 10000 |
-| `RUSTFS_CACHE_TTL_SECS` | 缓存 TTL 秒数 | 300 |
-| `RUSTFS_CACHE_MAX_MEMORY` | 缓存最大内存 | 104857600 |
-| `RUSTFS_ADAPTIVE_TTL_ENABLED` | 启用自适应 TTL | true |
-
 ### 代码配置
 
 ```rust
@@ -289,7 +281,7 @@ cargo test --package rustfs-io-metrics
 cargo test --package rustfs-io-metrics --lib adaptive_ttl
 
 # 运行基准测试
-cargo bench --package rustfs-io-metrics
+cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 ```
 
 ## 📚 文档
