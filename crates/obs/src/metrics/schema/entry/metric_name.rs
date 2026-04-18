@@ -355,10 +355,10 @@ pub enum MetricName {
     ProcessCPUUtilization,
     /// Process disk I/O bytes
     ProcessDiskIO,
-    /// Process network I/O bytes
-    ProcessNetworkIO,
-    /// Process network I/O bytes per interface
-    ProcessNetworkIOPerInterface,
+    /// Host network I/O bytes
+    HostNetworkIO,
+    /// Host network I/O bytes per interface
+    HostNetworkIOPerInterface,
     /// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
     ProcessStatus,
     /// Process GPU memory usage in bytes
@@ -688,8 +688,8 @@ impl MetricName {
             Self::ProcessCPUUsage => "cpu_usage".to_string(),
             Self::ProcessCPUUtilization => "cpu_utilization".to_string(),
             Self::ProcessDiskIO => "disk_io".to_string(),
-            Self::ProcessNetworkIO => "network_io".to_string(),
-            Self::ProcessNetworkIOPerInterface => "network_io_per_interface".to_string(),
+            Self::HostNetworkIO => "network_io".to_string(),
+            Self::HostNetworkIOPerInterface => "network_io_per_interface".to_string(),
             Self::ProcessGpuMemoryUsage => "gpu_memory_usage".to_string(),
             Self::ProcessStatus => "status".to_string(),
 

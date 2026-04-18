@@ -36,6 +36,7 @@ pub mod system_drive;
 pub mod system_gpu;
 pub mod system_memory;
 pub mod system_network;
+pub mod system_network_host;
 pub mod system_process;
 
 pub use audit::{AuditTargetStats, collect_audit_metrics};
@@ -64,7 +65,8 @@ pub use system_drive::{
 #[cfg(feature = "gpu")]
 pub use system_gpu::{GpuCollector, GpuError, GpuStats, collect_gpu_metrics};
 pub use system_memory::{MemoryStats, ProcessMemoryStats, collect_memory_metrics, collect_process_memory_metrics};
-pub use system_network::{NetworkStats, ProcessNetworkStats, collect_network_metrics, collect_process_network_metrics};
+pub use system_network::{NetworkStats, collect_network_metrics};
+pub use system_network_host::{HostNetworkStats, collect_host_network_metrics};
 pub use system_process::{
     ProcessAttributeError, ProcessAttributes, ProcessStats, ProcessStatusType, collect_process_attributes,
     collect_process_metrics,
