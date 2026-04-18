@@ -1135,6 +1135,19 @@ impl DataUsageCache {
         )
     }
 
+    fn record_save_attempt(path_type: &'static str, result: &'static str, duration: Duration) {
+        histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(duration.as_secs_f64());
+        counter!(
+            METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+            "cache" => path_type,
+            "result" => result
+        )
+        .increment(1);
+        if result == "timeout" {
+            counter!(METRIC_CACHE_SAVE_TIMEOUT_TOTAL, "cache" => path_type).increment(1);
+        }
+    }
+
     async fn retry_save_op<F, Fut>(path_type: &'static str, timeout_duration: Duration, mut save_op: F) -> StorageResult<()>
     where
         F: FnMut() -> Fut,
@@ -1145,36 +1158,19 @@ impl DataUsageCache {
         for attempt in 0..=DATA_USAGE_CACHE_SAVE_RETRIES {
             let attempt_start = Instant::now();
             let timeout_res = timeout(timeout_duration, save_op()).await;
-
-            histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(attempt_start.elapsed().as_secs_f64());
+            let duration = attempt_start.elapsed();
 
             match timeout_res {
                 Ok(Ok(())) => {
-                    counter!(
-                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
-                        "cache" => path_type,
-                        "result" => "success"
-                    )
-                    .increment(1);
+                    Self::record_save_attempt(path_type, "success", duration);
                     return Ok(());
                 }
                 Err(e) => {
-                    counter!(
-                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
-                        "cache" => path_type,
-                        "result" => "timeout"
-                    )
-                    .increment(1);
-                    counter!(METRIC_CACHE_SAVE_TIMEOUT_TOTAL, "cache" => path_type).increment(1);
+                    Self::record_save_attempt(path_type, "timeout", duration);
                     last_err = Some(StorageError::other(format!("Failed to save data usage cache: {e}")));
                 }
                 Ok(Err(e)) => {
-                    counter!(
-                        METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
-                        "cache" => path_type,
-                        "result" => "error"
-                    )
-                    .increment(1);
+                    Self::record_save_attempt(path_type, "error", duration);
                     last_err = Some(e);
                 }
             }
