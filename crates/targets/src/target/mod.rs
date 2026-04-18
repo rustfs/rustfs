@@ -21,11 +21,48 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 pub mod mqtt;
 pub mod webhook;
+
+/// A read-only snapshot of delivery counters for a target.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetDeliverySnapshot {
+    pub failed_messages: u64,
+    pub queue_length: u64,
+    pub total_messages: u64,
+}
+
+/// Shared target delivery counters.
+#[derive(Debug, Default)]
+pub struct TargetDeliveryCounters {
+    failed_messages: AtomicU64,
+    total_messages: AtomicU64,
+}
+
+impl TargetDeliveryCounters {
+    #[inline]
+    pub fn record_success(&self) {
+        self.total_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_final_failure(&self) {
+        self.failed_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn snapshot(&self, queue_length: u64) -> TargetDeliverySnapshot {
+        TargetDeliverySnapshot {
+            failed_messages: self.failed_messages.load(Ordering::Relaxed),
+            queue_length,
+            total_messages: self.total_messages.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Trait for notification targets
 #[async_trait]
@@ -70,8 +107,9 @@ where
                         "Failed to delete invalid queued payload {key} after decode error '{err}': {delete_err}"
                     ))
                 })?;
+                self.record_final_failure();
                 warn!("Dropped invalid queued payload {key}: {err}");
-                return Ok(());
+                return Err(TargetError::Dropped(format!("Dropped invalid queued payload {key}: {err}")));
             }
         };
 
@@ -96,6 +134,17 @@ where
 
     /// Check if the target is enabled
     fn is_enabled(&self) -> bool;
+
+    /// Returns a read-only delivery snapshot for metrics collection.
+    fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
+        TargetDeliverySnapshot {
+            queue_length: self.store().map_or(0, |store| store.len() as u64),
+            ..TargetDeliverySnapshot::default()
+        }
+    }
+
+    /// Records a final, non-retryable delivery failure for metrics collection.
+    fn record_final_failure(&self) {}
 }
 
 #[derive(Debug, Serialize, Clone, Deserialize)]

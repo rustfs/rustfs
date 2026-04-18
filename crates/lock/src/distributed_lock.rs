@@ -19,6 +19,9 @@ use crate::{
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 use futures::future::join_all;
+use rustfs_io_metrics::{
+    record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
+};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -82,6 +85,7 @@ pub struct DistributedLockGuard {
     /// All underlying (LockId, client) entries that should be released when the
     /// guard is dropped.
     entries: Vec<(LockId, Arc<dyn LockClient>)>,
+    lock_type: LockType,
     /// If true, Drop will not try to release (used if user manually released).
     disarmed: bool,
 }
@@ -92,10 +96,12 @@ impl DistributedLockGuard {
     /// - `lock_id` is the id returned to the caller (`lock_id()`).
     /// - `entries` is the full list of underlying (LockId, client) pairs
     ///   that should be released when this guard is dropped.
-    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>) -> Self {
+    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>, lock_type: LockType) -> Self {
+        record_lock_held_acquire(lock_type);
         Self {
             lock_id,
             entries,
+            lock_type,
             disarmed: false,
         }
     }
@@ -108,6 +114,9 @@ impl DistributedLockGuard {
     /// Manually disarm the guard so dropping it won't release the lock.
     /// Call this if you explicitly released the lock elsewhere.
     pub fn disarm(&mut self) {
+        if !self.disarmed {
+            record_lock_held_release(self.lock_type);
+        }
         self.disarmed = true;
     }
 
@@ -156,6 +165,7 @@ impl DistributedLockGuard {
 
         // Disarm to prevent double-release on drop
         self.disarmed = true;
+        record_lock_held_release(self.lock_type);
         success
     }
 }
@@ -248,7 +258,7 @@ impl DistributedLock {
                 .map(|info| info.id.clone())
                 .unwrap_or_else(|| LockId::new_unique(&request.resource));
 
-            Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks)))
+            Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks, request.lock_type)))
         } else {
             // Check if it's a timeout or quorum failure
             if let Some(error_msg) = &resp.error {
@@ -521,5 +531,21 @@ impl DistributedLock {
             Duration::ZERO,
         );
         Ok((resp, individual_locks))
+    }
+}
+
+#[inline(always)]
+fn record_lock_held_acquire(lock_type: LockType) {
+    match lock_type {
+        LockType::Shared => record_read_lock_held_acquire(),
+        LockType::Exclusive => record_write_lock_held_acquire(),
+    }
+}
+
+#[inline(always)]
+fn record_lock_held_release(lock_type: LockType) {
+    match lock_type {
+        LockType::Shared => record_read_lock_held_release(),
+        LockType::Exclusive => record_write_lock_held_release(),
     }
 }

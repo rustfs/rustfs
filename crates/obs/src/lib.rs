@@ -47,28 +47,30 @@
 //! # }
 //! ```
 //!
-//! ## System Monitoring Migration
+//! ## Metrics Runtime
 //!
-//! The system monitoring functionality has been migrated to `rustfs-metrics`.
-//! Use `rustfs_metrics::init_metrics_collectors()` for system metrics collection.
+//! Start metrics scheduling with `rustfs_obs::init_metrics_runtime()`.
 //!
 //! ```ignore
 //! use tokio_util::sync::CancellationToken;
-//! use rustfs_metrics::init_metrics_collectors;
+//! use rustfs_obs::init_metrics_runtime;
 //!
 //! let token = CancellationToken::new();
-//! init_metrics_collectors(token.clone());
+//! init_metrics_runtime(token.clone());
 //! ```
 mod cleaner;
 mod config;
 mod error;
 mod global;
+pub mod metrics;
 mod telemetry;
 
 pub use cleaner::*;
 pub use config::*;
 pub use error::*;
 pub use global::*;
+pub use metrics::schema::*;
+pub use metrics::{init_metrics_collectors, init_metrics_runtime};
 pub use telemetry::{OtelGuard, Recorder};
 
 // Dial9 Tokio runtime telemetry
