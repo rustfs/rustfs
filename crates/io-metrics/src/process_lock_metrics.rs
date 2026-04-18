@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+use std::process::Command;
 
 static READ_LOCKS_HELD: AtomicU64 = AtomicU64::new(0);
 static WRITE_LOCKS_HELD: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +79,14 @@ pub fn snapshot_process_platform_stats() -> ProcessPlatformSnapshot {
     platform::snapshot()
 }
 
+#[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 fn run_command(command: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(command).args(args).output().ok()?;
     if !output.status.success() {
@@ -81,10 +97,12 @@ fn run_command(command: &str, args: &[&str]) -> Option<String> {
     if stdout.is_empty() { None } else { Some(stdout) }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
+#[cfg(any(target_os = "windows", test))]
 fn parse_kv_u64(content: &str, key: &str) -> Option<u64> {
     for line in content.lines() {
-        let (k, v) = line.split_once(':')?;
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.trim().eq_ignore_ascii_case(key) {
             return v.trim().parse::<u64>().ok();
         }

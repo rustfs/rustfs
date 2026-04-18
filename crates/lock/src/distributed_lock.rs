@@ -114,6 +114,9 @@ impl DistributedLockGuard {
     /// Manually disarm the guard so dropping it won't release the lock.
     /// Call this if you explicitly released the lock elsewhere.
     pub fn disarm(&mut self) {
+        if !self.disarmed {
+            record_lock_held_release(self.lock_type);
+        }
         self.disarmed = true;
     }
 
