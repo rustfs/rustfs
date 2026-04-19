@@ -1225,10 +1225,11 @@ mod serial_tests {
         let object_name = "test/object.txt";
 
         create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
+
         set_bucket_lifecycle(bucket_name.as_str())
             .await
             .expect("Failed to set lifecycle configuration");
-        upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
 
         assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
 
