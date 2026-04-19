@@ -905,9 +905,10 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
         if let Some(config) = replication_config.as_ref()
-            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await {
-                warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
-            }
+            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await
+        {
+            warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
+        }
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
