@@ -333,6 +333,44 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_signed_get_existing_object_with_trailing_equals_returns_content() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = create_s3_client(&env);
+        let bucket = "test-existing-equals-key";
+        create_bucket(&client, bucket).await?;
+
+        let key = "path/sitemap.xmlage=";
+        let content = b"object content for raw signed URL with trailing equals";
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await?;
+
+        let url = format!("{}/{}/{}", env.url, bucket, key);
+        let response = signed_get(&url, &env.access_key, &env.secret_key).await?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "existing object key ending with '=' should pass signature validation and return content"
+        );
+
+        let body = response.bytes().await?;
+        assert_eq!(body.as_ref(), content);
+
+        env.stop_server();
+        Ok(())
+    }
+
     /// Test DELETE operation with special characters
     #[tokio::test]
     #[serial]
