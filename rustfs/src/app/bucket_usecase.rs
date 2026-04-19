@@ -106,6 +106,7 @@ fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String>
 
     if !config.role.trim().is_empty() {
         arns.insert(config.role.clone());
+        return arns;
     }
 
     for rule in &config.rules {
@@ -903,9 +904,10 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
             .map_err(ApiError::from)?;
-        if let Some(config) = replication_config.as_ref() {
-            remove_replication_targets_for_config(&bucket, config).await?;
-        }
+        if let Some(config) = replication_config.as_ref()
+            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await {
+                warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
+            }
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1928,6 +1930,52 @@ mod tests {
         let mut req = build_request(input, method);
         req.extensions.insert(req_info);
         req
+    }
+
+    fn replication_rule_for_target(arn: &str) -> ReplicationRule {
+        ReplicationRule {
+            delete_marker_replication: None,
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: None,
+            filter: None,
+            id: Some("rule-1".to_string()),
+            prefix: None,
+            priority: Some(1),
+            source_selection_criteria: None,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    #[test]
+    fn replication_target_arns_use_role_when_present() {
+        let role = "arn:rustfs:replication:us-east-1:source:bucket";
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![replication_rule_for_target(destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(role));
+        assert!(!arns.contains(destination));
+    }
+
+    #[test]
+    fn replication_target_arns_use_rule_destinations_without_role() {
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(destination));
     }
 
     #[test]
