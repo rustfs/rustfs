@@ -57,6 +57,9 @@ pub const ENV_CAPACITY_MAX_TIMEOUT: &str = "RUSTFS_CAPACITY_MAX_TIMEOUT";
 /// Environment variable for progress stall detection timeout
 pub const ENV_CAPACITY_STALL_TIMEOUT: &str = "RUSTFS_CAPACITY_STALL_TIMEOUT";
 
+/// Environment variable for per-scan disk walk concurrency
+pub const ENV_CAPACITY_SCAN_CONCURRENCY: &str = "RUSTFS_CAPACITY_SCAN_CONCURRENCY";
+
 // ============================================================================
 // Default Values
 // ============================================================================
@@ -113,6 +116,12 @@ pub const DEFAULT_CAPACITY_MAX_TIMEOUT_SECS: u64 = 15;
 /// Default: 20 seconds
 pub const DEFAULT_CAPACITY_STALL_TIMEOUT_SECS: u64 = 20;
 
+/// Concurrent disk walk tasks per capacity scan
+/// Default: 4. Lower values reduce peak iowait on shared/slow storage; higher
+/// values finish scans faster when disks are independent. The effective value
+/// is always clamped to `[1, number_of_disks]`.
+pub const DEFAULT_CAPACITY_SCAN_CONCURRENCY: usize = 4;
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -136,6 +145,7 @@ mod tests {
         assert_eq!(ENV_CAPACITY_MIN_TIMEOUT, "RUSTFS_CAPACITY_MIN_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");
         assert_eq!(ENV_CAPACITY_STALL_TIMEOUT, "RUSTFS_CAPACITY_STALL_TIMEOUT");
+        assert_eq!(ENV_CAPACITY_SCAN_CONCURRENCY, "RUSTFS_CAPACITY_SCAN_CONCURRENCY");
     }
 
     #[test]
@@ -151,5 +161,6 @@ mod tests {
         assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 2);
         assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 15);
         assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 20);
+        assert_eq!(DEFAULT_CAPACITY_SCAN_CONCURRENCY, 4);
     }
 }
