@@ -23,8 +23,8 @@ use matchit::Params;
 use rustfs_config::oidc::{
     IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
     OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_ROLES_CLAIM, OIDC_DEFAULT_SCOPES,
-    OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_REDIRECT_URI,
-    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_OTHER_AUDIENCES, OIDC_USERNAME_CLAIM,
+    OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_OTHER_AUDIENCES, OIDC_REDIRECT_URI,
+    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
@@ -126,6 +126,7 @@ struct OidcConfigView {
     client_id: String,
     client_secret_configured: bool,
     scopes: Vec<String>,
+    other_audiences: Vec<String>,
     redirect_uri: Option<String>,
     redirect_uri_dynamic: bool,
     claim_name: String,
@@ -284,6 +285,7 @@ impl Operation for GetOidcConfigHandler {
                 client_id: provider.config.client_id.clone(),
                 client_secret_configured: provider.config.client_secret.is_some(),
                 scopes: provider.config.scopes.clone(),
+                other_audiences: provider.config.other_audiences.clone(),
                 redirect_uri: provider.config.redirect_uri.clone(),
                 redirect_uri_dynamic: provider.config.redirect_uri_dynamic,
                 claim_name: provider.config.claim_name.clone(),
