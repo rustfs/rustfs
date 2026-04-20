@@ -262,11 +262,7 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     Ok(())
 }
 
-async fn validate_nats_request(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-    domain: TargetDomain,
-) -> S3Result<()> {
+async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
