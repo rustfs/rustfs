@@ -897,7 +897,7 @@ impl DiskAPI for RemoteDisk {
                     volume: volume.to_string(),
                     path: path.to_string(),
                     file_info: file_info.clone(),
-                    file_info_bin: file_info_bin.clone(),
+                    file_info_bin: file_info_bin.clone().into(),
                 });
 
                 let response = client.write_metadata(request).await?.into_inner();
@@ -963,8 +963,8 @@ impl DiskAPI for RemoteDisk {
                     path: path.to_string(),
                     file_info: file_info.clone(),
                     opts: opts_str.clone(),
-                    file_info_bin: file_info_bin.clone(),
-                    opts_bin: opts_bin.clone(),
+                    file_info_bin: file_info_bin.clone().into(),
+                    opts_bin: opts_bin.clone().into(),
                 });
 
                 let response = client.update_metadata(request).await?.into_inner();
@@ -1006,7 +1006,7 @@ impl DiskAPI for RemoteDisk {
                     path: path.to_string(),
                     version_id: version_id.to_string(),
                     opts: opts_str.clone(),
-                    opts_bin: opts_bin.clone(),
+                    opts_bin: opts_bin.clone().into(),
                 });
 
                 let response = client.read_version(request).await?.into_inner();
@@ -1480,7 +1480,7 @@ impl DiskAPI for RemoteDisk {
                 let request = Request::new(ReadMultipleRequest {
                     disk,
                     read_multiple_req,
-                    read_multiple_req_bin,
+                    read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
                 let response = client.read_multiple(request).await?.into_inner();
