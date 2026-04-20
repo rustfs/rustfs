@@ -761,7 +761,12 @@ impl OidcSys {
         };
 
         let other_audiences_str = get_env(ENV_IDENTITY_OPENID_OTHER_AUDIENCES);
-        let other_audiences = other_audiences_str.split(',').map(|s| s.trim().to_string()).collect();
+        let other_audiences = other_audiences_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
 
         let redirect_uri_dynamic_str = get_env(ENV_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC);
         let redirect_uri_dynamic = redirect_uri_dynamic_str.is_empty()
@@ -858,7 +863,12 @@ impl OidcSys {
         };
 
         let other_audiences_str = kvs.get(OIDC_OTHER_AUDIENCES);
-        let other_audiences = other_audiences_str.split(',').map(|s| s.trim().to_string()).collect();
+        let other_audiences = other_audiences_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
 
         let redirect_uri_dynamic = kvs
             .lookup(OIDC_REDIRECT_URI_DYNAMIC)
