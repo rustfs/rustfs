@@ -20,7 +20,7 @@ use crate::bucket::replication::{DeletedObjectReplicationInfo, check_replicate_d
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::store::ECStore;
-use crate::store_api::{ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
+use crate::store_api::{ObjectOperations, ObjectOptions, ObjectToDelete};
 use rustfs_filemeta::{REPLICATE_INCOMING_DELETE, ReplicationState, version_purge_statuses_map};
 use rustfs_lock::MAX_DELETE_LIST;
 
@@ -54,7 +54,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             remaining = &[];
         }
 
-        let mut replication_candidates: Vec<Option<(ObjectInfo, ReplicationState)>> = Vec::with_capacity(to_del.len());
+        let mut replication_candidates: Vec<Option<ReplicationState>> = Vec::with_capacity(to_del.len());
         for object in to_del.iter() {
             let version_id = object.version_id.map(|vid| vid.to_string());
             let opts = ObjectOptions {
@@ -66,12 +66,19 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             let candidate = match api.get_object_info(bucket, &object.object_name, &opts).await {
                 Ok(info) => {
                     let dsc = check_replicate_delete(bucket, object, &info, &opts, None).await;
-                    dsc.replicate_any().then(|| {
-                        let state = lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status());
-                        (info, state)
-                    })
+                    dsc.replicate_any()
+                        .then(|| lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status()))
                 }
-                Err(_) => None,
+                Err(err) => {
+                    warn!(
+                        bucket,
+                        object = %object.object_name,
+                        version_id = ?version_id,
+                        error = ?err,
+                        "failed to get object info during lifecycle noncurrent version cleanup; skipping delete replication scheduling"
+                    );
+                    None
+                }
             };
             replication_candidates.push(candidate);
         }
@@ -91,7 +98,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             if errors.get(i).and_then(|err| err.as_ref()).is_some() {
                 continue;
             }
-            let Some((_, replication_state)) = replication_candidates.get(i).and_then(|c| c.clone()) else {
+            let Some(replication_state) = replication_candidates.get(i).and_then(|c| c.clone()) else {
                 continue;
             };
             deleted_obj.replication_state = Some(replication_state);

@@ -85,7 +85,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
@@ -2161,7 +2161,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
-            warn!(
+            debug!(
                 bucket = tgt_client.bucket,
                 object = dobj.delete_object.object_name,
                 version_id = ?version_id,

@@ -596,11 +596,7 @@ fn delete_replication_state_source<'a>(
     existing_object_info: Option<&'a ObjectInfo>,
     deleted_object_info: &'a ObjectInfo,
 ) -> &'a ObjectInfo {
-    if opts.replication_request
-        && opts.version_id.is_none()
-        && deleted_object_info.delete_marker
-        && let Some(existing) = existing_object_info
-    {
+    if opts.replication_request && deleted_object_info.delete_marker && let Some(existing) = existing_object_info {
         return existing;
     }
 
@@ -5183,6 +5179,7 @@ mod tests {
     fn delete_replication_state_source_prefers_existing_replica_for_replication_delete_marker_creation() {
         let opts = ObjectOptions {
             replication_request: true,
+            version_id: Some(Uuid::new_v4().to_string()),
             ..Default::default()
         };
         let existing = ObjectInfo {
