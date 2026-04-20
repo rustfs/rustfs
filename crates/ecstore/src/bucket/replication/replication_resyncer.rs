@@ -1272,15 +1272,7 @@ pub async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
-    let opts = ObjectOpts {
-        name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
-        user_tags: oi.user_tags.clone(),
-        delete_marker: oi.delete_marker,
-        version_id: dobj.version_id,
-        op_type: ReplicationType::Delete,
-        ..Default::default()
-    };
+    let opts = delete_replication_object_opts(dobj, oi);
 
     let tgt_arns = rcfg.filter_target_arns(&opts);
     let mut dsc = ReplicateDecision::new();
@@ -1330,6 +1322,19 @@ pub async fn check_replicate_delete(
     }
 
     dsc
+}
+
+fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
+    ObjectOpts {
+        name: dobj.object_name.clone(),
+        ssec: is_ssec_encrypted(&oi.user_defined),
+        user_tags: oi.user_tags.clone(),
+        delete_marker: oi.delete_marker,
+        version_id: dobj.version_id,
+        op_type: ReplicationType::Delete,
+        replica: oi.replication_status == ReplicationStatusType::Replica,
+        ..Default::default()
+    }
 }
 
 /// Check if the user-defined metadata contains SSEC encryption headers
@@ -1703,7 +1708,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
-    if !is_version_purge && dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+    if should_retry_delete_marker_purge(&dobj.delete_object) {
         let bucket_clone = bucket.clone();
         let dobj_clone = dobj.clone();
         let dsc_clone = dsc.clone();
@@ -2061,6 +2066,10 @@ fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
     dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
 }
 
+fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker_version_id.is_some()
+}
+
 fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
     !is_not_found && !matches!(code, Some("MethodNotAllowed" | "405"))
 }
@@ -2152,6 +2161,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
+            warn!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                "replicate_delete_to_target succeeded"
+            );
             if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
@@ -2159,6 +2176,15 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             }
         }
         Err(e) => {
+            warn!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                error = %e,
+                "replicate_delete_to_target failed"
+            );
             rinfo.error = Some(e.to_string());
             if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
@@ -3604,6 +3630,49 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_replication_object_opts_marks_replica_deletes() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(
+            opts.replica,
+            "replica deletes must preserve replica status for downstream ReplicaModifications rules"
+        );
+        assert_eq!(opts.version_id, dobj.version_id);
+        assert_eq!(opts.name, dobj.object_name);
+        assert_eq!(opts.op_type, ReplicationType::Delete);
+    }
+
+    #[test]
+    fn test_delete_replication_object_opts_keeps_non_replica_deletes_local() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(!opts.replica, "source-originated deletes should not be treated as replica modifications");
+    }
+
+    #[test]
     fn test_is_version_delete_replication_for_delete_marker_version_purge() {
         let dobj = DeletedObject {
             delete_marker: false,
@@ -3628,6 +3697,34 @@ mod tests {
         assert!(
             !is_version_delete_replication(&dobj),
             "delete-marker creation should remain on the delete-marker replication path"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker version purge should schedule delayed target cleanup in case the target marker arrives late"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker creation should keep the late-arrival cleanup path so downstream purges can catch up"
         );
     }
 

@@ -152,6 +152,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
 
             if obj.op_type == ReplicationType::Delete {
+                if !rule.metadata_replicate(obj) {
+                    return false;
+                }
+
                 if obj.version_id.is_some() {
                     if obj.delete_marker {
                         return rule.delete_marker_replication.clone().is_some_and(|d| {
