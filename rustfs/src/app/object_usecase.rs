@@ -596,7 +596,10 @@ fn delete_replication_state_source<'a>(
     existing_object_info: Option<&'a ObjectInfo>,
     deleted_object_info: &'a ObjectInfo,
 ) -> &'a ObjectInfo {
-    if opts.replication_request && deleted_object_info.delete_marker && let Some(existing) = existing_object_info {
+    if opts.replication_request
+        && deleted_object_info.delete_marker
+        && let Some(existing) = existing_object_info
+    {
         return existing;
     }
 
