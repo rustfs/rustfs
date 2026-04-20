@@ -871,6 +871,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_fix_s3_error_message_in_xml_reports_changed_body() {
+        let body = Full::from(Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>"));
+
+        let (fixed, changed) = fix_s3_error_message_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert!(changed);
+        assert!(bytes.starts_with(b"<Error><Code>SignatureDoesNotMatch</Code><Message>"));
+        assert!(bytes.ends_with(b"</Message></Error>"));
+    }
+
+    #[tokio::test]
+    async fn test_fix_s3_error_message_in_xml_reports_unchanged_body() {
+        let input = Bytes::from_static(b"<Error><Code>AccessDenied</Code></Error>");
+        let body = Full::from(input.clone());
+
+        let (fixed, changed) = fix_s3_error_message_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert!(!changed);
+        assert_eq!(bytes, input);
+    }
+
     #[test]
     fn test_insert_missing_signature_error_message() {
         let (fixed, changed) =
