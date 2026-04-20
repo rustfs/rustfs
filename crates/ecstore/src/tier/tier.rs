@@ -808,14 +808,19 @@ impl TierConfigMgr {
             }
         }
         if !force {
-            let inuse = d.expect("err").in_use().await;
-            if let Err(err) = inuse {
-                let mut e = ERR_TIER_PERM_ERR.clone();
-                e.message.push('.');
-                e.message.push_str(&err.to_string());
-                return Err(e);
-            } else if inuse.expect("err") {
-                return Err(ERR_TIER_BACKEND_NOT_EMPTY.clone());
+            if let Ok(driver) = d {
+                match driver.in_use().await {
+                    Err(err) => {
+                        let mut e = ERR_TIER_PERM_ERR.clone();
+                        e.message.push('.');
+                        e.message.push_str(&err.to_string());
+                        return Err(e);
+                    }
+                    Ok(in_use) if in_use => {
+                        return Err(ERR_TIER_BACKEND_NOT_EMPTY.clone());
+                    }
+                    _ => {}
+                }
             }
         }
         self.tiers.remove(tier_name);
@@ -842,11 +847,11 @@ impl TierConfigMgr {
     }
 
     pub fn tier_type(&self, tier_name: &str) -> String {
-        let cfg = self.tiers.get(tier_name);
-        if cfg.is_none() {
-            return "internal".to_string();
+        if let Some(cfg) = self.tiers.get(tier_name) {
+            cfg.tier_type.as_lowercase()
+        } else {
+            "internal".to_string()
         }
-        cfg.expect("err").tier_type.as_lowercase()
     }
 
     pub fn list_tiers(&self) -> Vec<TierConfig> {
@@ -876,81 +881,90 @@ impl TierConfigMgr {
         let mut tier_config = self.tiers[tier_name].clone();
         match tier_type {
             TierType::S3 => {
-                let mut s3 = tier_config.s3.as_mut().expect("err");
-                if creds.aws_role {
-                    s3.aws_role = true
-                }
-                if creds.aws_role_web_identity_token_file != "" && creds.aws_role_arn != "" {
-                    s3.aws_role_arn = creds.aws_role_arn;
-                    s3.aws_role_web_identity_token_file = creds.aws_role_web_identity_token_file;
-                }
-                if creds.access_key != "" && creds.secret_key != "" {
-                    s3.access_key = creds.access_key;
-                    s3.secret_key = creds.secret_key;
+                if let Some(s3) = tier_config.s3.as_mut() {
+                    if creds.aws_role {
+                        s3.aws_role = true
+                    }
+                    if creds.aws_role_web_identity_token_file != "" && creds.aws_role_arn != "" {
+                        s3.aws_role_arn = creds.aws_role_arn;
+                        s3.aws_role_web_identity_token_file = creds.aws_role_web_identity_token_file;
+                    }
+                    if creds.access_key != "" && creds.secret_key != "" {
+                        s3.access_key = creds.access_key;
+                        s3.secret_key = creds.secret_key;
+                    }
                 }
             }
             TierType::RustFS => {
-                let mut rustfs = tier_config.rustfs.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(rustfs) = tier_config.rustfs.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    rustfs.access_key = creds.access_key;
+                    rustfs.secret_key = creds.secret_key;
                 }
-                rustfs.access_key = creds.access_key;
-                rustfs.secret_key = creds.secret_key;
             }
             TierType::MinIO => {
-                let compatible_backend = tier_config.minio.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(compatible_backend) = tier_config.minio.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    compatible_backend.access_key = creds.access_key;
+                    compatible_backend.secret_key = creds.secret_key;
                 }
-                compatible_backend.access_key = creds.access_key;
-                compatible_backend.secret_key = creds.secret_key;
             }
             TierType::Aliyun => {
-                let mut aliyun = tier_config.aliyun.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(aliyun) = tier_config.aliyun.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    aliyun.access_key = creds.access_key;
+                    aliyun.secret_key = creds.secret_key;
                 }
-                aliyun.access_key = creds.access_key;
-                aliyun.secret_key = creds.secret_key;
             }
             TierType::Tencent => {
-                let mut tencent = tier_config.tencent.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(tencent) = tier_config.tencent.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    tencent.access_key = creds.access_key;
+                    tencent.secret_key = creds.secret_key;
                 }
-                tencent.access_key = creds.access_key;
-                tencent.secret_key = creds.secret_key;
             }
             TierType::Huaweicloud => {
-                let mut huaweicloud = tier_config.huaweicloud.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(huaweicloud) = tier_config.huaweicloud.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    huaweicloud.access_key = creds.access_key;
+                    huaweicloud.secret_key = creds.secret_key;
                 }
-                huaweicloud.access_key = creds.access_key;
-                huaweicloud.secret_key = creds.secret_key;
             }
             TierType::Azure => {
-                let mut azure = tier_config.azure.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(azure) = tier_config.azure.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    azure.access_key = creds.access_key;
+                    azure.secret_key = creds.secret_key;
                 }
-                azure.access_key = creds.access_key;
-                azure.secret_key = creds.secret_key;
             }
             TierType::GCS => {
-                let mut gcs = tier_config.gcs.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(gcs) = tier_config.gcs.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    gcs.creds = creds.access_key; //creds.creds_json
                 }
-                gcs.creds = creds.access_key; //creds.creds_json
             }
             TierType::R2 => {
-                let mut r2 = tier_config.r2.as_mut().expect("err");
-                if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                if let Some(r2) = tier_config.r2.as_mut() {
+                    if creds.access_key == "" || creds.secret_key == "" {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    r2.access_key = creds.access_key;
+                    r2.secret_key = creds.secret_key;
                 }
-                r2.access_key = creds.access_key;
-                r2.secret_key = creds.secret_key;
             }
             _ => (),
         }
@@ -964,7 +978,7 @@ impl TierConfigMgr {
     pub async fn get_driver<'a>(&'a mut self, tier_name: &str) -> std::result::Result<&'a WarmBackendImpl, AdminError> {
         // Return cached driver if present
         if self.driver_cache.contains_key(tier_name) {
-            return Ok(self.driver_cache.get(tier_name).unwrap());
+            return Ok(self.driver_cache.get(tier_name).expect("Driver not found in cache"));
         }
 
         // Get tier configuration and create new driver
@@ -974,7 +988,7 @@ impl TierConfigMgr {
 
         // Insert and return reference
         self.driver_cache.insert(tier_name.to_string(), driver);
-        Ok(self.driver_cache.get(tier_name).unwrap())
+        Ok(self.driver_cache.get(tier_name).expect("Driver not found in cache after insertion"))
     }
 
     pub async fn reload(&mut self, api: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
@@ -989,9 +1003,12 @@ impl TierConfigMgr {
         }
         self.driver_cache.clear();
         self.tiers.clear();
-        let new_config = new_config.expect("err");
-        for (tier, cfg) in new_config.tiers {
-            self.tiers.insert(tier, cfg);
+        if let Ok(config) = new_config {
+            for (tier, cfg) in config.tiers {
+                self.tiers.insert(tier, cfg);
+            }
+        } else {
+            return Err(std::io::Error::other("Failed to load tier configuration"));
         }
         self.last_refreshed_at = OffsetDateTime::now_utc();
         Ok(())

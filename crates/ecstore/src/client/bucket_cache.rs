@@ -70,10 +70,10 @@ impl TransitionClient {
 
         let mut location;
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            let ret = bucket_loc_cache.get(bucket_name);
-            if let Some(location) = ret {
-                return Ok(location);
+            if let Ok(bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                if let Some(location) = bucket_loc_cache.get(bucket_name) {
+                    return Ok(location);
+                }
             }
             //location = ret?;
         }
@@ -83,8 +83,9 @@ impl TransitionClient {
         let mut resp = self.doit(req).await?;
         location = process_bucket_location_response(resp, bucket_name, &self.tier_type).await?;
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.set(bucket_name, &location);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.set(bucket_name, &location);
+            }
         }
         Ok(location)
     }
@@ -108,7 +109,7 @@ impl TransitionClient {
             url_str.push_str("://");
             url_str.push_str(bucket_name);
             url_str.push_str(".");
-            url_str.push_str(target_url.host_str().expect("err"));
+            url_str.push_str(target_url.host_str().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "host is none"))?);
             url_str.push_str("/?location");
         } else {
             let mut path = bucket_name.to_string();
@@ -135,13 +136,16 @@ impl TransitionClient {
 
         let value;
         {
-            let mut creds_provider = self.creds_provider.lock().unwrap();
-            value = match creds_provider.get_with_context(Some(self.cred_context())) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Err(std::io::Error::other(err));
-                }
-            };
+            if let Ok(mut creds_provider) = self.creds_provider.lock() {
+                value = match creds_provider.get_with_context(Some(self.cred_context())) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Err(std::io::Error::other(err));
+                    }
+                };
+            } else {
+                return Err(std::io::Error::other("Failed to acquire credentials provider lock"));
+            }
         }
 
         let mut signer_type = value.signer_type.clone();
@@ -171,8 +175,9 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        req.headers_mut()
-            .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
+        if let Ok(content_sha256_value) = content_sha256.parse() {
+            req.headers_mut().insert("X-Amz-Content-Sha256", content_sha256_value);
+        }
         let req = rustfs_signer::sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
         Ok(req)
     }
@@ -228,13 +233,18 @@ async fn process_bucket_location_response(
     }
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
-        let d = quick_xml::de::from_str::<CreateBucketConfiguration>(&String::from_utf8(body_vec).unwrap()).unwrap();
-        location = d.location_constraint;
+        if let Ok(body_str) = String::from_utf8(body_vec) {
+            if let Ok(d) = quick_xml::de::from_str::<CreateBucketConfiguration>(&body_str) {
+                location = d.location_constraint;
+            }
+        }
     } else {
-        if let Ok(LocationConstraint { field }) =
-            quick_xml::de::from_str::<LocationConstraint>(&String::from_utf8(body_vec).unwrap())
-        {
-            location = field;
+        if let Ok(body_str) = String::from_utf8(body_vec) {
+            if let Ok(LocationConstraint { field }) =
+                quick_xml::de::from_str::<LocationConstraint>(&body_str)
+            {
+                location = field;
+            }
         }
     }
     //debug!("location: {}", location);

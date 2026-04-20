@@ -18,6 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use std::io::Error;
 use bytes::Bytes;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -152,7 +153,10 @@ impl TransitionClient {
 
             if opts.send_content_md5 {
                 let mut md5_hasher = self.md5_hasher.lock().unwrap();
-                let md5_hash = md5_hasher.as_mut().expect("err");
+                let md5_hash = match md5_hasher.as_mut() {
+                    Some(hasher) => hasher,
+                    None => return Err(std::io::Error::other("MD5 hasher not initialized")),
+                };
                 let hash = md5_hash.hash_encode(&buf[..length]);
                 md5_base64 = base64_encode(hash.as_ref());
             } else {
@@ -161,7 +165,11 @@ impl TransitionClient {
                 let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
+                    if let Ok(header_value) = base64_encode(csum.as_ref()).parse() {
+                        custom_header.insert(header_name, header_value);
+                    } else {
+                        warn!("Failed to parse checksum value");
+                    }
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
@@ -275,11 +283,14 @@ impl TransitionClient {
         for part_number in 1..=total_parts_count {
             let mut buf = Vec::<u8>::new();
             select! {
-                buf = bufs_rx.recv() => {}
+                buf1 = bufs_rx.recv() => {
+                    if let Some(buf1) = buf1 {
+                        buf = buf1;
+                    }
+                }
                 err = err_rx.recv() => {
                     //cancel_token.cancel();
-                    //wg.Wait()
-                    return Err(err.expect("err"));
+                    return Err(err.unwrap_or_else(|| std::io::Error::other("Unknown error received from channel")));
                 }
                 else => (),
             }
@@ -309,7 +320,11 @@ impl TransitionClient {
                 let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
+                    if let Ok(header_value) = base64_encode(csum.as_ref()).parse() {
+                        custom_header.insert(header_name, header_value);
+                    } else {
+                        warn!("Failed to parse checksum value");
+                    }
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
@@ -319,12 +334,19 @@ impl TransitionClient {
             let clone_parts_info = parts_info.clone();
             let clone_upload_id = upload_id.clone();
             let clone_self = self.clone();
+            let err_tx_clone = err_tx.clone();
             futures.push(async move {
                 let mut md5_base64: String = "".to_string();
 
                 if opts.send_content_md5 {
                     let mut md5_hasher = clone_self.md5_hasher.lock().unwrap();
-                    let md5_hash = md5_hasher.as_mut().expect("err");
+                    let md5_hash = match md5_hasher.as_mut() {
+                        Some(hasher) => hasher,
+                        None => {
+                            //let _ = err_tx_clone.send(std::io::Error::other("MD5 hasher not initialized")).await;
+                            return Ok::<(), Error>(());
+                        },
+                    };
                     let hash = md5_hash.hash_encode(&buf[..length]);
                     md5_base64 = base64_encode(hash.as_ref());
                 }
@@ -344,12 +366,21 @@ impl TransitionClient {
                     sha256_hex: "".to_string(),
                     trailer: HeaderMap::new(),
                 };
-                let obj_part = clone_self.upload_part(&mut p).await.expect("err");
+                let obj_part = match clone_self.upload_part(&mut p).await {
+                    Ok(part) => part,
+                    Err(err) => {
+                        let _ = err_tx_clone.send(std::io::Error::other(err.to_string())).await;
+                        return Err::<(), Error>(err);
+                    }
+                };
 
-                let mut clone_parts_info = clone_parts_info.write().unwrap();
-                clone_parts_info.entry(part_number).or_insert(obj_part);
+                {
+                    let mut clone_parts_info = clone_parts_info.write().unwrap();
+                    clone_parts_info.entry(part_number).or_insert(obj_part);
+                }
 
-                clone_bufs_tx.send(buf);
+                let _ = clone_bufs_tx.send(buf).await;
+                Ok::<(), Error>(())
             });
 
             total_uploaded_size += length as i64;
@@ -359,7 +390,7 @@ impl TransitionClient {
 
         select! {
             err = err_rx.recv() => {
-                return Err(err.expect("err"));
+                return Err(err.unwrap_or_else(|| std::io::Error::other("Unknown error received from channel")));
             }
             else => (),
         }
@@ -504,9 +535,10 @@ impl TransitionClient {
         Ok(UploadInfo {
             bucket: bucket_name.to_string(),
             key: object_name.to_string(),
-            etag: trim_etag(h.get("ETag").expect("err").to_str().expect("err")),
+            etag: trim_etag(h.get("ETag").and_then(|v| v.to_str().ok()).unwrap_or("")),
+
             version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
-                h_x_amz_version_id.to_str().expect("err").to_string()
+                h_x_amz_version_id.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
@@ -514,27 +546,27 @@ impl TransitionClient {
             expiration: exp_time,
             expiration_rule_id: rule_id,
             checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
-                h_checksum_crc32.to_str().expect("err").to_string()
+                h_checksum_crc32.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
-                h_checksum_crc32c.to_str().expect("err").to_string()
+                h_checksum_crc32c.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
-                h_checksum_sha1.to_str().expect("err").to_string()
+                h_checksum_sha1.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
-                h_checksum_sha256.to_str().expect("err").to_string()
+                h_checksum_sha256.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
             checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
-                h_checksum_crc64nvme.to_str().expect("err").to_string()
+                h_checksum_crc64nvme.to_str().unwrap_or("").to_string()
             } else {
                 "".to_string()
             },
