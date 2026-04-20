@@ -38,7 +38,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
-    "crates/concurrency", # Rust I/O utilities and abstractions
+    "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-common", # Common utilities and data structures for S3 compatibility
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
