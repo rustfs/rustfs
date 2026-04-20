@@ -18,14 +18,13 @@ use crate::{
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use hashbrown::{HashMap, HashSet};
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, audit::AUDIT_ROUTE_PREFIX};
+use hashbrown::HashMap;
+use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{Target, TargetError, target::ChannelTargetType};
-use std::str::FromStr;
+use rustfs_targets::{Target, TargetError, config::collect_target_configs, target::ChannelTargetType};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 /// Registry for managing audit targets
 pub struct AuditRegistry {
@@ -105,143 +104,22 @@ impl AuditRegistry {
         &self,
         config: &Config,
     ) -> AuditResult<Vec<Box<dyn Target<AuditEntry> + Send + Sync>>> {
-        // Collect only environment variables with the relevant prefix to reduce memory usage
-        let all_env: Vec<(String, String)> = std::env::vars().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
-        // A collection of asynchronous tasks for concurrently executing target creation
         let mut tasks = FuturesUnordered::new();
-        // 1. Traverse all registered plants and process them by target type
         for (target_type, factory) in &self.factories {
             tracing::Span::current().record("target_type", target_type.as_str());
             info!("Start working on target types...");
-
-            // 2. Prepare the configuration source
-            // 2.1. Get the configuration segment in the file, e.g. 'audit_webhook'
-            let section_name = format!("{AUDIT_ROUTE_PREFIX}{target_type}").to_lowercase();
-            let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
-            // 2.2. Get the default configuration for that type
-            let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
-            debug!(?default_cfg, "Get the default configuration");
-
-            // *** Optimization point 1: Get all legitimate fields of the current target type ***
             let valid_fields = factory.get_valid_fields();
-            debug!(?valid_fields, "Get the legitimate configuration fields");
-
-            // 3. Resolve instance IDs and configuration overrides from environment variables
-            let mut instance_ids_from_env = HashSet::new();
-            // 3.1. Instance discovery: Based on the '..._ENABLE_INSTANCEID' format
-            let enable_prefix =
-                format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}")
-                    .to_uppercase();
-            for (key, value) in &all_env {
-                if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false)
-                    && let Some(id) = key.strip_prefix(&enable_prefix)
-                    && !id.is_empty()
-                {
-                    instance_ids_from_env.insert(id.to_lowercase());
-                }
-            }
-
-            // 3.2. Parse all relevant environment variable configurations
-            // 3.2.1. Build environment variable prefixes such as 'RUSTFS_AUDIT_WEBHOOK_'
-            let env_prefix = format!("{ENV_PREFIX}{AUDIT_ROUTE_PREFIX}{target_type}{DEFAULT_DELIMITER}").to_uppercase();
-            // 3.2.2. 'env_overrides' is used to store configurations parsed from environment variables in the format: {instance id -> {field -> value}}
-            let mut env_overrides: HashMap<String, HashMap<String, String>> = HashMap::new();
-            for (key, value) in &all_env {
-                if let Some(rest) = key.strip_prefix(&env_prefix) {
-                    // Use rsplitn to split from the right side to properly extract the INSTANCE_ID at the end
-                    // Format: <FIELD_NAME>_<INSTANCE_ID> or <FIELD_NAME>
-                    let mut parts = rest.rsplitn(2, DEFAULT_DELIMITER);
-
-                    // The first part from the right is INSTANCE_ID
-                    let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
-                    // The remaining part is FIELD_NAME
-                    let field_name_part = parts.next();
-
-                    let (field_name, instance_id) = match field_name_part {
-                        // Case 1: The format is <FIELD_NAME>_<INSTANCE_ID>
-                        // e.g., rest = "ENDPOINT_PRIMARY" -> field_name="ENDPOINT", instance_id="PRIMARY"
-                        Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
-                        // Case 2: The format is <FIELD_NAME> (without INSTANCE_ID)
-                        // e.g., rest = "ENABLE" -> field_name="ENABLE", instance_id="" (Universal configuration `_ DEFAULT_DELIMITER`)
-                        None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
-                    };
-
-                    // *** Optimization point 2: Verify whether the parsed field_name is legal ***
-                    if !field_name.is_empty() && valid_fields.contains(&field_name) {
-                        debug!(
-                            instance_id = %if instance_id.is_empty() { DEFAULT_DELIMITER } else { &instance_id },
-                            %field_name,
-                            %value,
-                            "Parsing to environment variables"
-                        );
-                        env_overrides
-                            .entry(instance_id)
-                            .or_default()
-                            .insert(field_name, value.clone());
-                    } else {
-                        // Ignore illegal field names
-                        warn!(
-                            field_name = %field_name,
-                            "Ignore environment variable fields, not found in the list of valid fields for target type {}",
-                            target_type
-                        );
-                    }
-                }
-            }
-            debug!(?env_overrides, "Complete the environment variable analysis");
-
-            // 4. Determine all instance IDs that need to be processed
-            let mut all_instance_ids: HashSet<String> =
-                file_configs.keys().filter(|k| *k != DEFAULT_DELIMITER).cloned().collect();
-            all_instance_ids.extend(instance_ids_from_env);
-            debug!(?all_instance_ids, "Determine all instance IDs");
-
-            // 5. Merge configurations and create tasks for each instance
-            for id in all_instance_ids {
-                // 5.1. Merge configuration, priority: Environment variables > File instance configuration > File default configuration
-                let mut merged_config = default_cfg.clone();
-                // Instance-specific configuration in application files
-                if let Some(file_instance_cfg) = file_configs.get(&id) {
-                    merged_config.extend(file_instance_cfg.clone());
-                }
-                // Application instance-specific environment variable configuration
-                if let Some(env_instance_cfg) = env_overrides.get(&id) {
-                    // Convert HashMap<String, String> to KVS
-                    let mut kvs_from_env = KVS::new();
-                    for (k, v) in env_instance_cfg {
-                        kvs_from_env.insert(k.clone(), v.clone());
-                    }
-                    merged_config.extend(kvs_from_env);
-                }
-                debug!(instance_id = %id, ?merged_config, "Complete configuration merge");
-
-                // 5.2. Check if the instance is enabled
-                let enabled = merged_config
-                    .lookup(ENABLE_KEY)
-                    .map(|v| {
-                        EnableState::from_str(v.as_str())
-                            .ok()
-                            .map(|s| s.is_enabled())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-
-                if enabled {
-                    info!(instance_id = %id, "Target is enabled, ready to create a task");
-                    // 5.3. Create asynchronous tasks for enabled instances
-                    let tid = id.clone();
-                    let merged_config_arc = Arc::new(merged_config);
-                    tasks.push(async move {
-                        let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                        (tid, result)
-                    });
-                } else {
-                    info!(instance_id = %id, "Skip disabled target");
-                }
+            for (id, merged_config) in collect_target_configs(config, AUDIT_ROUTE_PREFIX, target_type, &valid_fields) {
+                info!(instance_id = %id, "Target is enabled, ready to create a task");
+                let tid = id.clone();
+                let merged_config_arc = Arc::new(merged_config);
+                tasks.push(async move {
+                    let result = factory.create_target(tid.clone(), &merged_config_arc).await;
+                    (tid, result)
+                });
             }
         }
 
-        // 6. Concurrently execute all creation tasks and collect results
         let mut successful_targets = Vec::new();
         while let Some((id, result)) = tasks.next().await {
             match result {

@@ -14,6 +14,7 @@
 
 pub mod arn;
 mod check;
+pub mod config;
 pub mod error;
 pub mod store;
 pub mod sys;

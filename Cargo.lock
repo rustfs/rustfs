@@ -8516,6 +8516,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rumqttc-next",
  "rustfs-config",
+ "rustfs-ecstore",
  "rustfs-s3-common",
  "rustfs-utils",
  "rustls",

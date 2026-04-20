@@ -13,6 +13,7 @@ documentation = "https://docs.rs/rustfs-target/latest/rustfs_target/"
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
+rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true, features = ["notify", "tls"] }
 rustfs-s3-common = { workspace = true }
 async-trait = { workspace = true }
