@@ -3293,8 +3293,9 @@ impl DefaultObjectUsecase {
             return result;
         }
 
-        let deleted_replication_info =
-            existing_object_info.as_ref().filter(|_| should_use_existing_delete_replication_info(&opts));
+        let deleted_replication_info = existing_object_info
+            .as_ref()
+            .filter(|_| should_use_existing_delete_replication_info(&opts));
         let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
         let replication_state_source =
             delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
@@ -5198,7 +5199,10 @@ mod tests {
         let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
 
         assert_eq!(source.replication_status, ReplicationStatusType::Completed);
-        assert!(!source.delete_marker, "downstream fanout should inherit replica identity from the pre-delete object");
+        assert!(
+            !source.delete_marker,
+            "downstream fanout should inherit replica identity from the pre-delete object"
+        );
     }
 
     #[test]
@@ -5217,7 +5221,10 @@ mod tests {
 
         let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
 
-        assert!(source.delete_marker, "source-originated deletes should keep using the new delete marker state");
+        assert!(
+            source.delete_marker,
+            "source-originated deletes should keep using the new delete marker state"
+        );
     }
 
     #[test]
@@ -5236,14 +5243,11 @@ mod tests {
             ..Default::default()
         };
 
-        let should_keep_existing = delete_object
-            .replication_state
-            .as_ref()
-            .is_some_and(|state| {
-                obj_info.replication_status != ReplicationStatusType::Replica
-                    && !state.replicate_decision_str.is_empty()
-                    && (!state.targets.is_empty() || !state.purge_targets.is_empty())
-            });
+        let should_keep_existing = delete_object.replication_state.as_ref().is_some_and(|state| {
+            obj_info.replication_status != ReplicationStatusType::Replica
+                && !state.replicate_decision_str.is_empty()
+                && (!state.targets.is_empty() || !state.purge_targets.is_empty())
+        });
 
         assert!(
             !should_keep_existing,

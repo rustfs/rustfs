@@ -16,19 +16,18 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::bucket::lifecycle::lifecycle;
-use crate::bucket::replication::{
-    DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete,
-};
+use crate::bucket::replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::store::ECStore;
 use crate::store_api::{ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete};
+use rustfs_filemeta::{REPLICATE_INCOMING_DELETE, ReplicationState, version_purge_statuses_map};
 use rustfs_lock::MAX_DELETE_LIST;
-use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicationState, version_purge_statuses_map,
-};
 
-fn lifecycle_version_delete_replication_state(replicate_decision_str: String, pending_status: Option<String>) -> ReplicationState {
+fn lifecycle_version_delete_replication_state(
+    replicate_decision_str: String,
+    pending_status: Option<String>,
+) -> ReplicationState {
     ReplicationState {
         replicate_decision_str,
         version_purge_status_internal: pending_status.clone(),
@@ -68,8 +67,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                 Ok(info) => {
                     let dsc = check_replicate_delete(bucket, object, &info, &opts, None).await;
                     dsc.replicate_any().then(|| {
-                        let state =
-                            lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status());
+                        let state = lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status());
                         (info, state)
                     })
                 }
@@ -134,14 +132,8 @@ mod tests {
             Some("arn:aws:s3:::target=PENDING;".to_string()),
         );
 
-        assert_eq!(
-            state.version_purge_status_internal.as_deref(),
-            Some("arn:aws:s3:::target=PENDING;")
-        );
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
         assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
-        assert_eq!(
-            state.replicate_decision_str,
-            "arn:aws:s3:::target=true;false;arn:aws:s3:::target;"
-        );
+        assert_eq!(state.replicate_decision_str, "arn:aws:s3:::target=true;false;arn:aws:s3:::target;");
     }
 }

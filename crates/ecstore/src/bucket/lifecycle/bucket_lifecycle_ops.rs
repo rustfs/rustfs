@@ -1894,10 +1894,7 @@ fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Opti
         return None;
     }
 
-    let pending_status = targets
-        .keys()
-        .map(|arn| format!("{arn}=PENDING;"))
-        .collect::<String>();
+    let pending_status = targets.keys().map(|arn| format!("{arn}=PENDING;")).collect::<String>();
 
     Some(ReplicationState {
         replicate_decision_str: oi.replication_decision.clone(),
@@ -2162,10 +2159,7 @@ mod tests {
         let state = lifecycle_version_purge_state_from_completed_targets(&oi)
             .expect("completed replication targets should be convertible into version-purge targets");
 
-        assert_eq!(
-            state.version_purge_status_internal.as_deref(),
-            Some("arn:aws:s3:::target=PENDING;")
-        );
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
         assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
         assert_eq!(state.replicate_decision_str, oi.replication_decision);
     }
