@@ -118,11 +118,13 @@ async-channel = "2.5.0"
 async-compression = { version = "0.4.41" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
+async-nats = "0.47.0"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 pollster = "0.4.0"
+pulsar = { version = "6.7.2", default-features = false, features = ["tokio-rustls-runtime"] }
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }

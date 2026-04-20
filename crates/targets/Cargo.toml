@@ -17,7 +17,9 @@ rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true, features = ["notify", "tls"] }
 rustfs-s3-common = { workspace = true }
 async-trait = { workspace = true }
+async-nats = { workspace = true }
 hyper-rustls = { workspace = true }
+pulsar = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
 rustls = { workspace = true }

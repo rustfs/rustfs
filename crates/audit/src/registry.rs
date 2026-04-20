@@ -14,7 +14,7 @@
 
 use crate::{
     AuditEntry, AuditError, AuditResult,
-    factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
+    factory::{MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory},
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -51,6 +51,8 @@ impl AuditRegistry {
         // Register built-in factories
         registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
+        registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
+        registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
 
         registry
     }

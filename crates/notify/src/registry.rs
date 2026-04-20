@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::Event;
-use crate::factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory};
+use crate::factory::{MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
@@ -43,6 +43,8 @@ impl TargetRegistry {
         // Register built-in factories
         registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
+        registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
+        registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
 
         registry
     }
