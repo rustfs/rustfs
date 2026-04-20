@@ -24,7 +24,7 @@ use rustfs_config::oidc::{
     IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
     OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_ROLES_CLAIM, OIDC_DEFAULT_SCOPES,
     OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_REDIRECT_URI,
-    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
+    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_OTHER_AUDIENCES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
@@ -908,6 +908,7 @@ fn upsert_persisted_provider_config(config: &mut ServerConfig, provider_config: 
     set_kvs_value(&mut kvs, OIDC_CLIENT_ID, provider_config.client_id.clone());
     set_kvs_value(&mut kvs, OIDC_CLIENT_SECRET, provider_config.client_secret.clone().unwrap_or_default());
     set_kvs_value(&mut kvs, OIDC_SCOPES, provider_config.scopes.join(","));
+    set_kvs_value(&mut kvs, OIDC_OTHER_AUDIENCES, provider_config.other_audiences.join(","));
     set_kvs_value(&mut kvs, OIDC_REDIRECT_URI, provider_config.redirect_uri.clone().unwrap_or_default());
     set_kvs_value(
         &mut kvs,
