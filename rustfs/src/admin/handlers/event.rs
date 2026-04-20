@@ -335,7 +335,9 @@ impl Operation for NotificationTarget {
         let kv_map = collect_validated_key_values(&notification_body.key_values, &allowed_keys, target_type)?;
         let spec = target_spec(&specs, target_type)
             .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
-        validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR).await?;
+        timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR))
+            .await
+            .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
 
         let mut kvs = rustfs_ecstore::config::KVS::new();
         for (key, value) in kv_map {

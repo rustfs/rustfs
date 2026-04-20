@@ -265,10 +265,6 @@ where
             .publish(self.args.subject.clone(), body.into())
             .await
             .map_err(|e| TargetError::Request(format!("Failed to publish NATS message: {e}")))?;
-        client
-            .flush()
-            .await
-            .map_err(|e| TargetError::Network(format!("Failed to flush NATS message: {e}")))?;
         self.delivery_counters.record_success();
         Ok(())
     }

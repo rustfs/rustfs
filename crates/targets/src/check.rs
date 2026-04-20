@@ -94,23 +94,37 @@ pub async fn check_mqtt_broker_available_with_tls(
 }
 
 pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -> Result<(), crate::TargetError> {
-    let client = crate::target::nats::connect_nats(args).await?;
-    client
-        .flush()
-        .await
-        .map_err(|e| crate::TargetError::Network(format!("NATS connection check failed: {e}")))?;
-    client
-        .drain()
-        .await
-        .map_err(|e| crate::TargetError::Network(format!("Failed to close NATS check connection: {e}")))?;
-    Ok(())
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = crate::target::nats::connect_nats(args).await?;
+        client
+            .flush()
+            .await
+            .map_err(|e| crate::TargetError::Network(format!("NATS connection check failed: {e}")))?;
+        client
+            .drain()
+            .await
+            .map_err(|e| crate::TargetError::Network(format!("Failed to close NATS check connection: {e}")))?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("NATS connection timed out".to_string())),
+    }
 }
 
 pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarArgs) -> Result<(), crate::TargetError> {
-    let client = crate::target::pulsar::connect_pulsar(args).await?;
-    client
-        .lookup_partitioned_topic(args.topic.clone())
-        .await
-        .map_err(|e| crate::TargetError::Network(format!("Pulsar topic lookup failed: {e}")))?;
-    Ok(())
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = crate::target::pulsar::connect_pulsar(args).await?;
+        client
+            .lookup_partitioned_topic(args.topic.clone())
+            .await
+            .map_err(|e| crate::TargetError::Network(format!("Pulsar topic lookup failed: {e}")))?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())),
+    }
 }

@@ -181,7 +181,7 @@ pub fn validate_mqtt_config(config: &KVS) -> Result<(), TargetError> {
             && qos_str == "0"
         {
             return Err(TargetError::Configuration(
-                "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queueDir is set".to_string(),
+                "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queue_dir is set".to_string(),
             ));
         }
     }

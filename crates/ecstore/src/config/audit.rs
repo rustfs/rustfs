@@ -197,7 +197,6 @@ pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 pub static DEFAULT_AUDIT_NATS_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
