@@ -29,6 +29,8 @@ pub mod mqtt;
 pub mod nats;
 pub mod pulsar;
 pub mod webhook;
+pub mod kafka;
+
 
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
