@@ -23,6 +23,7 @@ use tracing::{error, info, instrument, warn};
 
 pub mod cache;
 pub mod error;
+pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;

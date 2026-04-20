@@ -30,7 +30,7 @@ axum = { workspace = true }
 http = { workspace = true }
 ipnetwork = { workspace = true }
 metrics = { workspace = true }
-moka = { workspace = true, features = ["future"] }
+moka = { workspace = true, features = ["future", "sync"] }
 reqwest = { workspace = true }
 rustfs-config = { workspace = true }
 rustfs-utils = { workspace = true, features = ["net"] }

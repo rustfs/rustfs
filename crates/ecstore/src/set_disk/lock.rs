@@ -168,7 +168,7 @@ impl SetDisks {
         let mut new_disks = Vec::new();
         let mut new_infos = Vec::new();
 
-        for (disk, info) in disks.into_iter().zip(infos.into_iter()) {
+        for (disk, info) in disks.into_iter().zip(infos) {
             let Some(info) = info else {
                 continue;
             };

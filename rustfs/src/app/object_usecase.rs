@@ -67,6 +67,7 @@ use rustfs_ecstore::bucket::{
 };
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::{MIN_COMPRESSIBLE_SIZE, is_compressible};
+use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
@@ -799,6 +800,14 @@ fn apply_put_request_metadata(
 
     extract_metadata_from_mime_with_object_name(headers, metadata, true, Some(object_name));
     Ok(())
+}
+
+fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+    info.storage_class
+        .clone()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
+        .filter(|storage_class| !storage_class.is_empty() && storage_class != storageclass::STANDARD)
+        .map(StorageClass::from)
 }
 
 async fn apply_put_request_object_lock_opts(
@@ -2058,6 +2067,7 @@ impl DefaultObjectUsecase {
 
         // x-amz-expiration: predict from lifecycle configuration
         let expiration = resolve_put_object_expiration(bucket, &info).await;
+        let storage_class = response_storage_class(&info, &info.user_defined);
 
         let output = GetObjectOutput {
             body,
@@ -2082,6 +2092,7 @@ impl DefaultObjectUsecase {
             version_id: output_version_id,
             restore,
             expiration,
+            storage_class,
             ..Default::default()
         };
 
@@ -2128,7 +2139,6 @@ impl DefaultObjectUsecase {
             opts,
         } = request_context;
 
-        // Try to get from cache for small, frequently accessed objects
         let manager = get_concurrency_manager();
 
         let prepared_read = Self::prepare_get_object_read_execution(
@@ -3511,13 +3521,7 @@ impl DefaultObjectUsecase {
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
-        // Prefer explicit storage_class from object info; fall back to persisted metadata header.
-        let storage_class = info
-            .storage_class
-            .clone()
-            .or_else(|| metadata_map.get("x-amz-storage-class").cloned())
-            .filter(|s| !s.is_empty())
-            .map(StorageClass::from);
+        let storage_class = response_storage_class(&info, &metadata_map);
         let mut checksum_crc32 = None;
         let mut checksum_crc32c = None;
         let mut checksum_sha1 = None;
@@ -4703,6 +4707,31 @@ mod tests {
 
         let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[test]
+    fn response_storage_class_omits_standard_and_keeps_non_default() {
+        let metadata = HashMap::new();
+        let standard_info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD.to_string()),
+            user_defined: metadata.clone(),
+            ..Default::default()
+        };
+        assert!(response_storage_class(&standard_info, &metadata).is_none());
+
+        let mut metadata = HashMap::new();
+        metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
+        let infrequent_access_info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD_IA.to_string()),
+            user_defined: metadata.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            response_storage_class(&infrequent_access_info, &metadata)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD_IA)
+        );
     }
 
     #[tokio::test]

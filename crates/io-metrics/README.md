@@ -31,6 +31,7 @@
 - **Bandwidth Monitoring**: Real-time bandwidth observation and analysis
 - **Performance Metrics**: I/O performance metrics collection
 - **Unified Configuration**: Centralized configuration management
+- **Exporter Boundary**: Emit via `metrics`, export via `rustfs-obs`, no Prometheus HTTP endpoint
 
 ## Features
 
@@ -199,7 +200,7 @@ cargo test --package rustfs-io-metrics
 cargo test --package rustfs-io-metrics --lib adaptive_ttl
 
 # Run benchmarks
-cargo bench --package rustfs-io-metrics
+cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 ```
 
 ## Documentation

@@ -31,8 +31,6 @@ members = [
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
     "crates/madmin", # Management dashboard and admin API interface
-    "crates/mcp", # MCP server for S3 operations
-    "crates/metrics", # Metrics collection and reporting
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
     "crates/object-capacity", # Capacity scan and refresh core
@@ -95,8 +93,6 @@ rustfs-keystone = { path = "crates/keystone", version = "0.0.5" }
 rustfs-kms = { path = "crates/kms", version = "0.0.5" }
 rustfs-lock = { path = "crates/lock", version = "0.0.5" }
 rustfs-madmin = { path = "crates/madmin", version = "0.0.5" }
-rustfs-mcp = { path = "crates/mcp", version = "0.0.5" }
-rustfs-metrics = { path = "crates/metrics", version = "0.0.5" }
 rustfs-notify = { path = "crates/notify", version = "0.0.5" }
 rustfs-io-metrics = { path = "crates/io-metrics", version = "0.0.5" }
 rustfs-io-core = { path = "crates/io-core", version = "0.0.5" }
@@ -104,6 +100,7 @@ rustfs-object-capacity = { path = "crates/object-capacity", version = "0.0.5" }
 rustfs-obs = { path = "crates/obs", version = "0.0.5" }
 rustfs-policy = { path = "crates/policy", version = "0.0.5" }
 rustfs-protos = { path = "crates/protos", version = "0.0.5" }
+rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 rustfs-rio = { path = "crates/rio", version = "0.0.5" }
 rustfs-s3-common = { path = "crates/s3-common", version = "0.0.5" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "0.0.5" }
@@ -115,7 +112,6 @@ rustfs-targets = { path = "crates/targets", version = "0.0.5" }
 rustfs-utils = { path = "crates/utils", version = "0.0.5" }
 rustfs-workers = { path = "crates/workers", version = "0.0.5" }
 rustfs-zip = { path = "./crates/zip", version = "0.0.5" }
-rustfs-protocols = { path = "crates/protocols", version = "0.0.5" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -135,7 +131,7 @@ http-body = "1.0.1"
 http-body-util = "0.1.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 socket2 = { version = "0.6.3", features = ["all"] }
-tokio = { version = "1.52.0", features = ["fs", "rt-multi-thread", "io-uring"] }
+tokio = { version = "1.52.1", features = ["fs", "rt-multi-thread"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
@@ -154,18 +150,16 @@ flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
 quick-xml = "0.39.2"
-rmcp = { version = "1.4.0" }
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
-schemars = "1.2.1"
 
 # Cryptography and Security
 aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.8" }
-blake2 = "0.11.0-rc.5"
+blake2 = "0.11.0-rc.6"
 chacha20poly1305 = { version = "0.11.0-rc.3" }
 crc-fast = "1.9.0"
 hmac = { version = "0.13.0" }
@@ -202,7 +196,7 @@ base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
 cfg-if = "1.0.4"
-clap = { version = "4.6.0", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -210,7 +204,7 @@ crossbeam-queue = "0.3.12"
 crossbeam-channel = "0.5.15"
 crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
-datafusion = "53.0.0"
+datafusion = "53.1.0"
 derive_builder = "0.20.2"
 enumset = "1.1.10"
 faster-hex = "0.10.0"
@@ -250,11 +244,11 @@ rayon = "1.12.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
-rumqttc = { package = "rumqttc-next", version = "0.29.0", features = ["websocket"] }
+rumqttc = { package = "rumqttc-next", version = "0.30.0", features = ["websocket"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "0dd8fcaaa72eda68fafd49c38daea43bb8697558", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "a3b16608df35aaeed8fff08b4988d03f4ca9445b", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"
@@ -270,14 +264,14 @@ tempfile = "3.27.0"
 test-case = "3.3.1"
 thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 tracing-error = "0.2.1"
 tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.23.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.23.1", features = ["v4", "fast-rng", "macro-diagnostics"] }
 vaultrs = { version = "0.8.0" }
 walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
@@ -288,7 +282,7 @@ zstd = "0.13.3"
 
 # Observability and Metrics
 metrics = "0.24.3"
-dial9-tokio-telemetry = "0.2"
+dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
 opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }
@@ -320,7 +314,7 @@ jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.metadata.cargo-shear]
-ignored = ["rustfs", "rustfs-mcp"]
+ignored = ["rustfs"]
 
 [profile.release]
 opt-level = 3

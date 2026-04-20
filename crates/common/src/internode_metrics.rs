@@ -101,11 +101,7 @@ impl InternodeMetrics {
     pub fn snapshot(&self) -> InternodeMetricsSnapshot {
         let dial_samples_total = self.dial_samples_total.load(Ordering::Relaxed);
         let dial_total_time_nanos = self.dial_total_time_nanos.load(Ordering::Relaxed);
-        let dial_avg_time_nanos = if dial_samples_total == 0 {
-            0
-        } else {
-            dial_total_time_nanos / dial_samples_total
-        };
+        let dial_avg_time_nanos = dial_total_time_nanos.checked_div(dial_samples_total).unwrap_or(0);
 
         InternodeMetricsSnapshot {
             sent_bytes_total: self.sent_bytes_total.load(Ordering::Relaxed),

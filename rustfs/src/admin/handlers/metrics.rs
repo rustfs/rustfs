@@ -12,22 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Console realtime metrics API.
+//!
+//! This preserves the console's fixed `/admin/v3/metrics` contract while
+//! keeping the response format explicitly NDJSON. It is not a Prometheus text
+//! exposition endpoint.
+
 use crate::admin::router::Operation;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use http::Uri;
+use http::{HeaderMap, HeaderValue, Uri};
 use hyper::StatusCode;
 use matchit::Params;
 use rustfs_ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::utils::parse_duration;
+use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration as std_Duration;
+use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio::{select, spawn};
@@ -36,6 +43,7 @@ use tracing::{debug, error, warn};
 
 const DEFAULT_METRICS_SAMPLES: u64 = 1;
 const MAX_METRICS_SAMPLES: u64 = 120;
+const CONSOLE_METRICS_CONTENT_TYPE: &str = "application/x-ndjson";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MetricsParams {
@@ -173,14 +181,15 @@ pub struct MetricsHandler {}
 impl Operation for MetricsHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("handle MetricsHandler, uri: {:?}, params: {:?}", req.uri, params);
-        let Some(_cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-        debug!("validated metrics request credentials");
+        let Some(_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+        debug!("validated console metrics request credentials");
 
         let mp = extract_metrics_init_params(&req.uri);
         debug!("mp: {:?}", mp);
 
-        let tick = parse_duration(&mp.tick).unwrap_or_else(|_| std_Duration::from_secs(3));
-
+        let tick = parse_duration(&mp.tick).unwrap_or_else(|_| StdDuration::from_secs(3));
         let mut n = resolve_sample_count(&mp);
 
         let types = if mp.types != 0 {
@@ -193,53 +202,43 @@ impl Operation for MetricsHandler {
             s.split(',').filter(|part| !part.is_empty()).map(String::from).collect()
         }
 
-        let disks = parse_comma_separated(&mp.disks);
         let by_disk = mp.by_disk == "true";
-        let disk_map = disks;
-
-        let job_id = mp.by_job_id;
-        let hosts = parse_comma_separated(&mp.hosts);
         let by_host = mp.by_host == "true";
-        let host_map = hosts;
-
-        let d_id = mp.by_dep_id;
         let mut interval = interval(tick);
-
         let opts = CollectMetricsOpts {
-            hosts: host_map,
-            disks: disk_map,
-            job_id,
-            dep_id: d_id,
+            hosts: parse_comma_separated(&mp.hosts),
+            disks: parse_comma_separated(&mp.disks),
+            job_id: mp.by_job_id,
+            dep_id: mp.by_dep_id,
         };
         let (tx, rx) = mpsc::channel(10);
         let in_stream: DynByteStream = Box::pin(MetricsStream {
             inner: ReceiverStream::new(rx),
         });
         let body = Body::from(in_stream);
+
         spawn(async move {
             while n > 0 {
-                let mut m = RealtimeMetrics::default();
-                let m_local = collect_local_metrics(types, &opts).await;
-                m.merge(m_local);
+                let mut metrics = RealtimeMetrics::default();
+                let local_metrics = collect_local_metrics(types, &opts).await;
+                metrics.merge(local_metrics);
 
                 if !by_host {
-                    m.by_host = HashMap::new();
+                    metrics.by_host = HashMap::new();
                 }
                 if !by_disk {
-                    m.by_disk = HashMap::new();
+                    metrics.by_disk = HashMap::new();
                 }
 
-                m.finally = n <= 1;
+                metrics.finally = n <= 1;
 
-                // todo write resp
-                match serde_json::to_vec(&m) {
-                    Ok(mut re) => {
-                        // NDJSON framing allows stream clients to parse incremental records.
-                        re.push(b'\n');
-                        let _ = tx.send(Ok(Bytes::from(re))).await;
+                match serde_json::to_vec(&metrics) {
+                    Ok(mut encoded) => {
+                        encoded.push(b'\n');
+                        let _ = tx.send(Ok(Bytes::from(encoded))).await;
                     }
-                    Err(e) => {
-                        error!("MetricsHandler: json encode failed, err: {:?}", e);
+                    Err(err) => {
+                        error!("MetricsHandler: json encode failed, err: {:?}", err);
                         return;
                     }
                 }
@@ -256,13 +255,19 @@ impl Operation for MetricsHandler {
             }
         });
 
-        Ok(S3Response::new((StatusCode::OK, body)))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static(CONSOLE_METRICS_CONTENT_TYPE));
+
+        Ok(S3Response::with_headers((StatusCode::OK, body), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, extract_metrics_init_params, resolve_sample_count};
+    use super::{
+        CONSOLE_METRICS_CONTENT_TYPE, DEFAULT_METRICS_SAMPLES, MAX_METRICS_SAMPLES, extract_metrics_init_params,
+        resolve_sample_count,
+    };
     use http::Uri;
 
     #[test]
@@ -287,5 +292,10 @@ mod tests {
         let mp = extract_metrics_init_params(&uri);
 
         assert_eq!(resolve_sample_count(&mp), MAX_METRICS_SAMPLES);
+    }
+
+    #[test]
+    fn metrics_handler_uses_ndjson_content_type() {
+        assert_eq!(CONSOLE_METRICS_CONTENT_TYPE, "application/x-ndjson");
     }
 }

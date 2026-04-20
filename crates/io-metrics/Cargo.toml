@@ -24,12 +24,21 @@ description = "Metrics collection and reporting for RustFS (using metrics crate 
 keywords = ["metrics", "zero-copy", "rustfs", "otel", "performance"]
 categories = ["development-tools", "filesystem"]
 
+[[bench]]
+name = "metrics_pipeline"
+harness = false
+
 [dependencies]
 metrics = { workspace = true }
 num_cpus = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "full"] }
+tokio = { workspace = true, features = ["sync","rt"] }
 tracing = { workspace = true }
+sysinfo = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["test-util","rt","macros"] }
 
 [lints]
 workspace = true

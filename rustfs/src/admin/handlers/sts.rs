@@ -91,6 +91,18 @@ fn build_oidc_token_claims(
     token_claims
 }
 
+fn resolve_oidc_session_identity(claims: &OidcClaims) -> String {
+    if !claims.username.is_empty() {
+        claims.username.clone()
+    } else if !claims.email.is_empty() {
+        claims.email.clone()
+    } else if !claims.sub.is_empty() {
+        claims.sub.clone()
+    } else {
+        "oidc-user-unknown".to_string()
+    }
+}
+
 pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(Method::POST, "/", AdminOperation(&AssumeRoleHandle {}))?;
 
@@ -313,15 +325,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     )
     .await?;
 
-    let subject = if !claims.email.is_empty() {
-        claims.email.clone()
-    } else if !claims.username.is_empty() {
-        claims.username.clone()
-    } else if !claims.sub.is_empty() {
-        claims.sub.clone()
-    } else {
-        "oidc-user-unknown".to_string()
-    };
+    let subject = resolve_oidc_session_identity(&claims);
 
     // Build XML response (AssumeRoleWithWebIdentityResponse)
     let expiration = new_cred
@@ -374,16 +378,8 @@ pub async fn create_oidc_sts_credentials(
     let exp = OffsetDateTime::now_utc().saturating_add(Duration::seconds(duration_seconds as i64));
     token_claims.insert("exp".to_string(), Value::Number(serde_json::Number::from(exp.unix_timestamp())));
 
-    // Set the parent user: prefer email, then username, then sub
-    let parent_user = if !claims.email.is_empty() {
-        claims.email.clone()
-    } else if !claims.username.is_empty() {
-        claims.username.clone()
-    } else if !claims.sub.is_empty() {
-        claims.sub.clone()
-    } else {
-        "oidc-user-unknown".to_string()
-    };
+    // Set the parent user: prefer username, then email, then sub
+    let parent_user = resolve_oidc_session_identity(claims);
     info!(
         "OIDC STS credential: parent_user='{}' (email='{}', username='{}', sub='{}')",
         parent_user, claims.email, claims.username, claims.sub
@@ -570,5 +566,38 @@ mod tests {
     #[test]
     fn test_configured_roles_claim_key_requires_explicit_config() {
         assert_eq!(configured_roles_claim_key("default"), None);
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_prefers_username_over_email() {
+        let claims = OidcClaims {
+            username: "john".to_string(),
+            email: "john@example.com".to_string(),
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_oidc_session_identity(&claims), "john");
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_falls_back_to_email_then_sub() {
+        let claims_with_email = OidcClaims {
+            email: "john@example.com".to_string(),
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_oidc_session_identity(&claims_with_email), "john@example.com");
+
+        let claims_with_sub = OidcClaims {
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_oidc_session_identity(&claims_with_sub), "sub-1");
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_uses_unknown_when_all_empty() {
+        assert_eq!(resolve_oidc_session_identity(&OidcClaims::default()), "oidc-user-unknown");
     }
 }

@@ -68,6 +68,15 @@ use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
 
+fn merge_part_encryption_metadata(
+    metadata: &HashMap<String, String>,
+    part_metadata: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = metadata.clone();
+    merged.extend(part_metadata.clone());
+    merged
+}
+
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
 fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_size: i64) -> S3Result<()> {
@@ -644,7 +653,7 @@ impl DefaultMultipartUsecase {
         };
 
         let opts = ObjectOptions::default();
-        let mut fi = store
+        let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
@@ -752,8 +761,6 @@ impl DefaultMultipartUsecase {
                 reader =
                     HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                         .map_err(ApiError::from)?;
-
-                fi.user_defined.extend(material.metadata);
 
                 (requested_sse, requested_kms_key_id)
             }
@@ -924,7 +931,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut mp_info = store
+        let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
@@ -1113,7 +1120,7 @@ impl DefaultMultipartUsecase {
 
         encryption_request.check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
 
-        let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
+        let (requested_sse, requested_kms_key_id, dst_user_defined) = match sse_encryption(encryption_request).await? {
             Some(material) => {
                 let requested_sse = Some(material.server_side_encryption.clone());
                 let requested_kms_key_id = material.kms_key_id.clone();
@@ -1122,18 +1129,39 @@ impl DefaultMultipartUsecase {
                 reader =
                     HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                         .map_err(ApiError::from)?;
+                let dst_user_defined = merge_part_encryption_metadata(&mp_info.user_defined, &material.metadata);
 
-                mp_info.user_defined.extend(material.metadata);
-
-                (requested_sse, requested_kms_key_id)
+                (requested_sse, requested_kms_key_id, dst_user_defined)
             }
-            None => (None, None),
+            None => (None, None, mp_info.user_defined.clone()),
         };
+
+        if let Some(checksum_algorithm) = mp_info
+            .user_defined
+            .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            .filter(|checksum_algorithm| !checksum_algorithm.is_empty())
+        {
+            let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(
+                checksum_algorithm,
+                mp_info
+                    .user_defined
+                    .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            if !checksum_type.is_set() {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid multipart checksum type: {checksum_algorithm}"
+                )))
+                .into());
+            }
+            reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
+        }
 
         let mut reader = PutObjReader::new(reader);
 
         let dst_opts = ObjectOptions {
-            user_defined: mp_info.user_defined.clone(),
+            user_defined: dst_user_defined,
             ..Default::default()
         };
 
@@ -1142,10 +1170,17 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let copy_checksums = reader.as_hash_reader().content_crc();
+        let checksum_value = |checksum_type: rustfs_rio::ChecksumType| copy_checksums.get(&checksum_type.to_string()).cloned();
+
         let copy_part_result = CopyPartResult {
+            checksum_crc32: checksum_value(rustfs_rio::ChecksumType::CRC32),
+            checksum_crc32c: checksum_value(rustfs_rio::ChecksumType::CRC32C),
+            checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
+            checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
+            checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
             e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
         };
 
         let output = UploadPartCopyOutput {
@@ -1166,6 +1201,9 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
+    use rustfs_filemeta::ObjectPartInfo;
+    use std::{collections::HashMap, io::Cursor};
+    use tokio::io::AsyncReadExt;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -1218,6 +1256,161 @@ mod tests {
         let location = build_complete_multipart_location(&HeaderMap::new(), &Uri::from_static("/"), "bucket", "nested/object");
 
         assert_eq!(location, "/bucket/nested/object");
+    }
+
+    #[test]
+    fn merge_part_encryption_metadata_keeps_source_metadata_unchanged() {
+        let multipart_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "base-nonce".to_string()),
+            ("x-rustfs-encryption-key".to_string(), "base-key".to_string()),
+        ]);
+        let part_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "part-nonce".to_string()),
+            ("x-rustfs-encryption-original-size".to_string(), "1024".to_string()),
+        ]);
+
+        let merged = merge_part_encryption_metadata(&multipart_metadata, &part_metadata);
+
+        assert_eq!(multipart_metadata.get("x-rustfs-encryption-iv").map(String::as_str), Some("base-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-iv").map(String::as_str), Some("part-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-key").map(String::as_str), Some("base-key"));
+    }
+
+    #[tokio::test]
+    async fn managed_multipart_roundtrip_preserves_session_nonce_between_parts() {
+        let prepare_request = PrepareEncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: None,
+        };
+        let session_material = sse_prepare_encryption(prepare_request)
+            .await
+            .expect("prepare multipart encryption")
+            .expect("managed multipart session material");
+        let session_metadata = session_material.metadata.clone();
+        let session_nonce = session_metadata
+            .get("x-rustfs-encryption-iv")
+            .cloned()
+            .expect("session nonce metadata");
+        let part_key = session_metadata.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = Some(session_nonce.clone());
+
+        let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
+        let part_two_plaintext = vec![0x32; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+
+        let part_one_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_one_plaintext.len() as i64,
+            part_number: Some(1),
+            part_key: part_key.clone(),
+            part_nonce: part_nonce.clone(),
+        })
+        .await
+        .expect("encrypt part one")
+        .expect("part one material");
+        let part_one_metadata = merge_part_encryption_metadata(&session_metadata, &part_one_material.metadata);
+        let mut encrypted_one = Vec::new();
+        part_one_material
+            .wrap_reader(Cursor::new(part_one_plaintext.clone()))
+            .read_to_end(&mut encrypted_one)
+            .await
+            .expect("read encrypted part one");
+
+        let part_two_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_two_plaintext.len() as i64,
+            part_number: Some(2),
+            part_key,
+            part_nonce,
+        })
+        .await
+        .expect("encrypt part two")
+        .expect("part two material");
+        let part_two_metadata = merge_part_encryption_metadata(&session_metadata, &part_two_material.metadata);
+        let mut encrypted_two = Vec::new();
+        part_two_material
+            .wrap_reader(Cursor::new(part_two_plaintext.clone()))
+            .read_to_end(&mut encrypted_two)
+            .await
+            .expect("read encrypted part two");
+
+        assert_eq!(
+            session_metadata.get("x-rustfs-encryption-iv").map(String::as_str),
+            Some(session_nonce.as_str())
+        );
+        assert_ne!(
+            part_one_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+        assert_ne!(
+            part_two_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: encrypted_one.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: encrypted_two.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let mut encrypted_stream = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        encrypted_stream.extend_from_slice(&encrypted_one);
+        encrypted_stream.extend_from_slice(&encrypted_two);
+
+        let decryption_material = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &session_metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            part_number: None,
+            parts: &parts,
+            etag: Some("multipart-etag"),
+        })
+        .await
+        .expect("decrypt multipart")
+        .expect("managed decryption material");
+
+        let (mut decrypted_reader, plaintext_size) = decryption_material
+            .wrap_reader(Cursor::new(encrypted_stream), -1)
+            .await
+            .expect("wrap multipart reader");
+
+        let mut decrypted = Vec::new();
+        decrypted_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("read decrypted multipart data");
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
     }
 
     #[tokio::test]

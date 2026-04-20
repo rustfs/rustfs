@@ -81,6 +81,8 @@ config:
       start_delay_secs: ""
       # Enable/disable scanner sleeps for throttling
       idle_mode: ""
+      # Timeout for scanner cache saves in seconds (minimum 1 second)
+      cache_save_timeout_secs: ""
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318

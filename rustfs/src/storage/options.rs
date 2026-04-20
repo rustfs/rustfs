@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
@@ -170,29 +171,39 @@ pub async fn get_opts(
 }
 
 fn fill_conditional_writes_opts_from_header(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) -> std::io::Result<()> {
-    if headers.contains_key("If-None-Match") || headers.contains_key("If-Match") {
-        let mut preconditions = HTTPPreconditions::default();
-        if let Some(if_none_match) = headers.get("If-None-Match") {
-            preconditions.if_none_match = Some(
-                if_none_match
-                    .to_str()
-                    .map_err(|_| std::io::Error::other("Invalid If-None-Match header"))?
-                    .to_string(),
-            );
-        }
-        if let Some(if_match) = headers.get("If-Match") {
-            preconditions.if_match = Some(
-                if_match
-                    .to_str()
-                    .map_err(|_| std::io::Error::other("Invalid If-Match header"))?
-                    .to_string(),
-            );
-        }
+    let if_none_match = conditional_etag_header(headers, IF_NONE_MATCH, "If-None-Match")?;
+    let if_match = conditional_etag_header(headers, IF_MATCH, "If-Match")?;
 
-        opts.http_preconditions = Some(preconditions);
+    if if_none_match.is_some() || if_match.is_some() {
+        opts.http_preconditions = Some(HTTPPreconditions {
+            if_match,
+            if_none_match,
+            ..Default::default()
+        });
     }
 
     Ok(())
+}
+
+fn conditional_etag_header(
+    headers: &HeaderMap<HeaderValue>,
+    name: http::header::HeaderName,
+    display_name: &str,
+) -> std::io::Result<Option<String>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+
+    let value = value
+        .to_str()
+        .map_err(|_| std::io::Error::other(format!("Invalid {display_name} header")))?
+        .trim();
+
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_owned()))
+    }
 }
 
 /// Creates options for putting an object in a bucket.
@@ -915,6 +926,32 @@ mod tests {
         let opts = result.unwrap();
         assert_eq!(opts.part_number, None);
         assert_eq!(opts.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_opts_ignores_empty_conditional_headers() {
+        let mut headers = create_test_headers();
+        headers.insert(http::header::IF_MATCH, HeaderValue::from_static(""));
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static(" "));
+
+        let result = get_opts("test-bucket", "test-object", None, None, &headers).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().http_preconditions.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_opts_keeps_non_empty_conditional_headers() {
+        let mut headers = create_test_headers();
+        headers.insert(http::header::IF_MATCH, HeaderValue::from_static(" \"etag-a\" "));
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag-b\""));
+
+        let result = get_opts("test-bucket", "test-object", None, None, &headers).await;
+
+        assert!(result.is_ok());
+        let preconditions = result.unwrap().http_preconditions.expect("conditional headers");
+        assert_eq!(preconditions.if_match.as_deref(), Some("\"etag-a\""));
+        assert_eq!(preconditions.if_none_match.as_deref(), Some("\"etag-b\""));
     }
 
     #[tokio::test]

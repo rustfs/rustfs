@@ -44,6 +44,7 @@ use rustfs_ecstore::{
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store::prewarm_local_disk_id_map,
     store_api::BucketOperations,
     store_api::BucketOptions,
     update_erasure_type,
@@ -52,8 +53,7 @@ use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
 use rustfs_iam::{init_iam_sys, init_oidc_sys};
-use rustfs_metrics::init_metrics_system;
-use rustfs_obs::{init_obs, set_global_guard};
+use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{
     ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
@@ -295,6 +295,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    prewarm_local_disk_id_map().await;
     // Initialize the lock clients
 
     init_lock_clients(endpoint_pools.clone());
@@ -340,14 +341,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let s3_shutdown_tx = {
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let (s3_shutdown_tx, _) = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
+        let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
     let console_shutdown_tx = if config.console_enable && !config.console_address.is_empty() {
         let mut console_config = config.clone();
         console_config.address = console_config.console_address.clone();
-        let (console_shutdown_tx, _) = start_http_server(&console_config, state_manager.clone(), readiness.clone()).await?;
+        let (console_shutdown_tx, _) = start_http_server(&console_config, readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
@@ -561,7 +562,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
-        init_metrics_system(ctx.clone());
+        init_metrics_runtime(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
         rustfs::init::init_auto_tuner(ctx.clone()).await;
@@ -576,11 +577,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     );
     // 4. Mark as Full Ready now that critical components are warm
     readiness.mark_stage(SystemStage::FullReady);
-    // Update service status to Ready
-    state_manager.update(ServiceState::Ready);
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
+    // Publish ready only after all critical bootstrap metadata is in place
+    state_manager.update(ServiceState::Ready);
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

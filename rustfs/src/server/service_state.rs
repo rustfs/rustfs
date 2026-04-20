@@ -13,39 +13,18 @@
 // limitations under the License.
 
 use atomic_enum::atomic_enum;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 // a configurable shutdown timeout
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[cfg(target_os = "linux")]
-fn notify_systemd(state: &str) {
-    use libsystemd::daemon::{NotifyState, notify};
-    use tracing::{debug, error};
-    let notify_state = match state {
-        "ready" => NotifyState::Ready,
-        "stopping" => NotifyState::Stopping,
-        _ => {
-            info!("Unsupported state passed to notify_systemd: {}", state);
-            return;
-        }
-    };
-
-    if let Err(e) = notify(false, &[notify_state]) {
-        error!("Failed to notify systemd: {}", e);
-    } else {
-        debug!("Successfully notified systemd: {}", state);
-    }
-    info!("Systemd notifications are enabled on linux (state: {})", state);
-}
-
-#[cfg(not(target_os = "linux"))]
-fn notify_systemd(state: &str) {
-    info!("Systemd notifications are not available on this platform not linux (state: {})", state);
-}
+const SERVICE_STATUS_STARTING: &str = "Starting";
+const SERVICE_STATUS_RUNNING: &str = "Running";
+const SERVICE_STATUS_STOPPING: &str = "Stopping";
+const SERVICE_STATUS_STOPPED: &str = "Stopped";
 
 #[derive(Debug)]
 pub enum ShutdownSignal {
@@ -100,54 +79,110 @@ pub async fn wait_for_shutdown() -> ShutdownSignal {
 #[derive(Clone)]
 pub struct ServiceStateManager {
     state: Arc<AtomicServiceState>,
+    published_state: Arc<Mutex<Option<ServiceState>>>,
 }
 
 impl ServiceStateManager {
     pub fn new() -> Self {
         Self {
             state: Arc::new(AtomicServiceState::new(ServiceState::Starting)),
+            published_state: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn update(&self, new_state: ServiceState) {
+        // Serialize transition check + state write + publish dedupe + notify as one
+        // critical section to keep notification order monotonic under concurrency.
+        let mut published_state = self.published_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_state = self.current_state();
+        if service_state_rank(new_state) < service_state_rank(current_state) {
+            warn!(
+                current = ?current_state,
+                attempted = ?new_state,
+                "Ignoring regressive service state transition"
+            );
+            return;
+        }
+
         self.state.store(new_state, Ordering::SeqCst);
-        self.notify_systemd(&new_state);
+
+        if *published_state != Some(new_state) {
+            *published_state = Some(new_state);
+            self.notify_systemd(new_state);
+        }
     }
 
     pub fn current_state(&self) -> ServiceState {
         self.state.load(Ordering::SeqCst)
     }
 
-    fn notify_systemd(&self, state: &ServiceState) {
+    fn notify_systemd(&self, state: ServiceState) {
         match state {
             ServiceState::Starting => {
                 info!("RustFS Service is starting...");
-                #[cfg(target_os = "linux")]
-                if let Err(e) =
-                    libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...".to_string())])
-                {
-                    tracing::error!("Failed to notify systemd of starting state: {}", e);
-                }
+                notify_systemd_daemon(state);
             }
             ServiceState::Ready => {
-                info!("RustFS Service is ready");
-                notify_systemd("ready");
+                info!("RustFS Service is running");
+                notify_systemd_daemon(state);
             }
             ServiceState::Stopping => {
                 info!("RustFS Service is stopping...");
-                notify_systemd("stopping");
+                notify_systemd_daemon(state);
             }
             ServiceState::Stopped => {
                 info!("RustFS Service has stopped");
-                #[cfg(target_os = "linux")]
-                if let Err(e) =
-                    libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped".to_string())])
-                {
-                    tracing::error!("Failed to notify systemd of stopped state: {}", e);
-                }
+                notify_systemd_daemon(state);
             }
         }
     }
+}
+
+fn service_state_rank(state: ServiceState) -> u8 {
+    match state {
+        ServiceState::Starting => 0,
+        ServiceState::Ready => 1,
+        ServiceState::Stopping => 2,
+        ServiceState::Stopped => 3,
+    }
+}
+
+fn systemd_status_text(state: ServiceState) -> &'static str {
+    match state {
+        ServiceState::Starting => SERVICE_STATUS_STARTING,
+        ServiceState::Ready => SERVICE_STATUS_RUNNING,
+        ServiceState::Stopping => SERVICE_STATUS_STOPPING,
+        ServiceState::Stopped => SERVICE_STATUS_STOPPED,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn notify_systemd_daemon(state: ServiceState) {
+    use libsystemd::daemon::{NotifyState, notify};
+    use tracing::{debug, error};
+
+    let status = systemd_status_text(state);
+    let result = match state {
+        ServiceState::Starting => notify(false, &[NotifyState::Status(status.to_string())]),
+        ServiceState::Ready => notify(false, &[NotifyState::Ready, NotifyState::Status(status.to_string())]),
+        ServiceState::Stopping => notify(false, &[NotifyState::Stopping, NotifyState::Status(status.to_string())]),
+        ServiceState::Stopped => notify(false, &[NotifyState::Status(status.to_string())]),
+    };
+
+    if let Err(e) = result {
+        error!(%status, ?state, "Failed to notify systemd: {}", e);
+    } else {
+        debug!(%status, ?state, "Successfully notified systemd");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_systemd_daemon(state: ServiceState) {
+    info!(
+        status = systemd_status_text(state),
+        ?state,
+        "Systemd notifications are not available on this platform"
+    );
 }
 
 impl Default for ServiceStateManager {
@@ -179,5 +214,24 @@ mod tests {
         // Update the status to Stopped
         manager.update(ServiceState::Stopped);
         assert_eq!(manager.current_state(), ServiceState::Stopped);
+    }
+
+    #[test]
+    fn test_service_state_manager_ignores_regression() {
+        let manager = ServiceStateManager::new();
+
+        manager.update(ServiceState::Starting);
+        manager.update(ServiceState::Ready);
+        manager.update(ServiceState::Starting);
+        assert_eq!(manager.current_state(), ServiceState::Ready);
+
+        manager.update(ServiceState::Stopping);
+        manager.update(ServiceState::Ready);
+        assert_eq!(manager.current_state(), ServiceState::Stopping);
+    }
+
+    #[test]
+    fn test_ready_maps_to_running_status() {
+        assert_eq!(systemd_status_text(ServiceState::Ready), SERVICE_STATUS_RUNNING);
     }
 }

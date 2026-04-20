@@ -28,8 +28,8 @@
 //!     let port = find_available_port()?;
 //!     let server = RustFSServerBuilder::new()
 //!         .address(format!("127.0.0.1:{port}"))
-//!         .access_key("minioadmin")
-//!         .secret_key("minioadmin")
+//!         .access_key("rustfsadmin")
+//!         .secret_key("rustfsadmin")
 //!         .build()
 //!         .await?;
 //!
@@ -49,10 +49,7 @@
 use crate::app::context::{AppContext, init_global_app_context};
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{
-    ServiceState, ServiceStateManager, init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server,
-    stop_audit_system,
-};
+use crate::server::{init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -166,7 +163,7 @@ impl RustFSServerBuilder {
     ///
     /// Defaults:
     /// - address: `"127.0.0.1:9000"`
-    /// - access_key / secret_key: `"minioadmin"`
+    /// - access_key / secret_key: `"rustfsadmin"`
     /// - region: `"us-east-1"`
     /// - A temporary directory is created automatically for data storage
     ///
@@ -175,10 +172,10 @@ impl RustFSServerBuilder {
     pub fn new() -> Self {
         Self {
             address: "127.0.0.1:9000".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: rustfs_credentials::DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: rustfs_credentials::DEFAULT_SECRET_KEY.to_string(),
             volumes: Vec::new(),
-            region: "us-east-1".to_string(),
+            region: rustfs_config::RUSTFS_REGION.to_string(),
         }
     }
 
@@ -196,13 +193,13 @@ impl RustFSServerBuilder {
         self
     }
 
-    /// Set the S3 access key (default: `"minioadmin"`).
+    /// Set the S3 access key (default: `"rustfsadmin"`).
     pub fn access_key(mut self, key: impl Into<String>) -> Self {
         self.access_key = key.into();
         self
     }
 
-    /// Set the S3 secret key (default: `"minioadmin"`).
+    /// Set the S3 secret key (default: `"rustfsadmin"`).
     pub fn secret_key(mut self, key: impl Into<String>) -> Self {
         self.secret_key = key.into();
         self
@@ -355,13 +352,11 @@ impl RustFSServerBuilder {
 
         // Service state.
         let readiness = Arc::new(GlobalReadiness::new());
-        let state_manager = ServiceStateManager::new();
-        state_manager.update(ServiceState::Starting);
 
         // Start HTTP server.
         let mut s3_config = config.clone();
         s3_config.console_enable = false;
-        let (shutdown_tx, bound_addr) = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
+        let (shutdown_tx, bound_addr) = start_http_server(&s3_config, readiness.clone()).await?;
         let ctx = CancellationToken::new();
         let shutdown_embedded_server = || {
             let _ = shutdown_tx.send(());
@@ -599,15 +594,15 @@ impl Drop for RustFSServer {
 /// ```rust,no_run
 /// use rustfs::embedded::{find_available_port, RustFSServerBuilder};
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// let port = find_available_port()?;
-/// let server = RustFSServerBuilder::new()
-///     .address(format!("127.0.0.1:{port}"))
-///     .build()
-///     .await?;
-/// println!("Listening on port {port}");
-/// # Ok(())
-/// # }
+/// async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let port = find_available_port()?;
+///     let server = RustFSServerBuilder::new()
+///         .address(format!("127.0.0.1:{port}"))
+///         .build()
+///         .await?;
+///     println!("Listening on port {port}");
+///      Ok(())
+///  }
 /// ```
 pub fn find_available_port() -> Result<u16, std::io::Error> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

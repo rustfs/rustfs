@@ -190,6 +190,14 @@ async fn put_bucket_replication(
     Ok(())
 }
 
+async fn delete_bucket_replication(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{bucket}?replication", env.url);
+    signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
 async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = env.create_s3_client();
     client
@@ -1080,6 +1088,54 @@ async fn test_remove_remote_target_rejects_target_used_by_replication() -> Resul
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
     assert!(body.to_ascii_lowercase().contains("removal disallowed"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-delete-config-src";
+    let target_bucket = "replication-delete-config-dst";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let delete_response = delete_bucket_replication(&source_env, source_bucket).await?;
+    assert!(
+        delete_response.status().is_success(),
+        "unexpected delete status: {}",
+        delete_response.status()
+    );
+
+    let targets_response = list_replication_targets_request(&source_env, Some(source_bucket)).await?;
+    assert_eq!(targets_response.status(), StatusCode::OK);
+    let targets: Vec<serde_json::Value> = targets_response.json().await?;
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.get("arn").and_then(|arn| arn.as_str()) != Some(target_arn.as_str())),
+        "deleted replication config left stale target {target_arn}: {targets:?}"
+    );
+
+    let recreated_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &recreated_arn).await?;
 
     Ok(())
 }

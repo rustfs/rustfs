@@ -58,6 +58,7 @@ Current guidance:
 - `RUSTFS_SCANNER_START_DELAY_SECS` (canonical)
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
+- `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
 
 ## Drive timeout environment variables
 

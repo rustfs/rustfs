@@ -162,10 +162,8 @@ impl ListPathOptions {
                     }
 
                     match kv[0] {
-                        "rustfs_cache" => {
-                            if kv[1] != MARKER_TAG_VERSION {
-                                continue;
-                            }
+                        "rustfs_cache" if kv[1] != MARKER_TAG_VERSION => {
+                            continue;
                         }
                         "id" => self.id = Some(kv[1].to_owned()),
                         "return" => {

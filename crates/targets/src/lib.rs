@@ -24,7 +24,7 @@ pub use error::{StoreError, TargetError};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;
-pub use target::Target;
+pub use target::{Target, TargetDeliverySnapshot};
 
 /// Represents a log of events for sending to targets
 #[derive(Debug, Clone, Serialize, Deserialize)]

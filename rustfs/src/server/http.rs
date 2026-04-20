@@ -18,12 +18,12 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    ReadinessGateLayer, RemoteAddr,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
         AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
-        RequestContextLayer,
+        RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -68,7 +68,6 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
     config: &config::Config,
-    worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<(tokio::sync::broadcast::Sender<()>, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
@@ -161,12 +160,12 @@ pub async fn start_http_server(
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| Error::other(e.to_string()))?;
 
     let tls_acceptor = tls_snapshot
         .build_tls_acceptor(tls_path)
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| Error::other(e.to_string()))?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
@@ -357,10 +356,6 @@ pub async fn start_http_server(
         let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
 
-        // service ready
-        worker_state_manager.update(ServiceState::Ready);
-        // tls_acceptor is already Option<Arc<TlsAcceptorHolder>>, clone for the loop
-
         loop {
             debug!("Waiting for new connection...");
             let (socket, _) = {
@@ -458,7 +453,6 @@ pub async fn start_http_server(
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
-        worker_state_manager.update(ServiceState::Stopping);
         match Arc::try_unwrap(graceful) {
             Ok(g) => {
                 tokio::select! {
@@ -476,7 +470,6 @@ pub async fn start_http_server(
                 debug!("Timeout reached, forcing shutdown");
             }
         }
-        worker_state_manager.update(ServiceState::Stopped);
     });
 
     Ok((shutdown_tx, local_addr))
@@ -490,7 +483,7 @@ struct ConnectionContext {
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
-    keystone_auth: Option<std::sync::Arc<rustfs_keystone::KeystoneAuthProvider>>,
+    keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
     /// Pre-computed trusted proxy layer (avoids per-connection is_enabled() check).
     trusted_proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
 }
@@ -596,9 +589,10 @@ fn process_connection(
         // 11. PropagateRequestIdLayer                — X-Request-ID → response
         // 12. CompressionLayer                       — response compression (whitelist, path-aware)
         // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 15. ConditionalCorsLayer                   — S3 API CORS
-        // 16. RedirectLayer                          — console redirect (conditional)
+        // 14. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -732,6 +726,7 @@ fn process_connection(
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
+            .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs

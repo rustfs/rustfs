@@ -30,7 +30,7 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync","io-uring"] }
 memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 

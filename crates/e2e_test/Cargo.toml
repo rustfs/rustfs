@@ -41,7 +41,6 @@ serde_json.workspace = true
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-clap = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
@@ -53,8 +52,6 @@ async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
-http-body.workspace = true
-http-body-util.workspace = true
 reqwest = { workspace = true }
 rustfs-signer.workspace = true
 tracing = { workspace = true }

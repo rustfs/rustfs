@@ -31,4 +31,4 @@ pub use error::{AuditError, AuditResult};
 pub use global::*;
 pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
 pub use registry::AuditRegistry;
-pub use system::AuditSystem;
+pub use system::{AuditSystem, AuditTargetMetricSnapshot};

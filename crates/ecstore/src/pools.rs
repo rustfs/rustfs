@@ -1405,7 +1405,8 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;

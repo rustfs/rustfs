@@ -106,8 +106,27 @@ pub struct NotificationMetrics {
     processed_events: AtomicUsize,
     /// Number of events that failed to handle
     failed_events: AtomicUsize,
+    /// Number of dispatch attempts skipped before delivery
+    skipped_events: AtomicUsize,
     /// System startup time
     start_time: Instant,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationMetricSnapshot {
+    pub current_send_in_progress: u64,
+    pub events_errors_total: u64,
+    pub events_sent_total: u64,
+    pub events_skipped_total: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationTargetMetricSnapshot {
+    pub failed_messages: u64,
+    pub queue_length: u64,
+    pub target_id: String,
+    pub target_type: String,
+    pub total_messages: u64,
 }
 
 impl Default for NotificationMetrics {
@@ -122,6 +141,7 @@ impl NotificationMetrics {
             processing_events: AtomicUsize::new(0),
             processed_events: AtomicUsize::new(0),
             failed_events: AtomicUsize::new(0),
+            skipped_events: AtomicUsize::new(0),
             start_time: Instant::now(),
         }
     }
@@ -136,9 +156,17 @@ impl NotificationMetrics {
         self.processed_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn decrement_processing(&self) {
+        self.processing_events.fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub fn increment_failed(&self) {
         self.processing_events.fetch_sub(1, Ordering::Relaxed);
         self.failed_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_skipped(&self) {
+        self.skipped_events.fetch_add(1, Ordering::Relaxed);
     }
 
     // Provide public methods to get count
@@ -154,8 +182,21 @@ impl NotificationMetrics {
         self.failed_events.load(Ordering::Relaxed)
     }
 
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_events.load(Ordering::Relaxed)
+    }
+
     pub fn uptime(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    pub fn snapshot(&self) -> NotificationMetricSnapshot {
+        NotificationMetricSnapshot {
+            current_send_in_progress: self.processing_count() as u64,
+            events_errors_total: self.failed_count() as u64,
+            events_sent_total: self.processed_count() as u64,
+            events_skipped_total: self.skipped_count() as u64,
+        }
     }
 }
 
@@ -187,14 +228,15 @@ impl NotificationSystem {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         let (live_event_sender, _) = broadcast::channel(1024);
+        let metrics = Arc::new(NotificationMetrics::new());
         NotificationSystem {
             subscriber_view: NotificationSystemSubscriberView::new(),
-            notifier: Arc::new(EventNotifier::new()),
+            notifier: Arc::new(EventNotifier::new(metrics.clone())),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
             concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
-            metrics: Arc::new(NotificationMetrics::new()),
+            metrics,
             live_event_sender,
             live_event_history: Arc::new(RwLock::new(LiveEventHistory::default())),
         }
@@ -585,8 +627,33 @@ impl NotificationSystem {
         status.insert("processing_events".to_string(), self.metrics.processing_count().to_string());
         status.insert("processed_events".to_string(), self.metrics.processed_count().to_string());
         status.insert("failed_events".to_string(), self.metrics.failed_count().to_string());
+        status.insert("skipped_events".to_string(), self.metrics.skipped_count().to_string());
 
         status
+    }
+
+    pub fn snapshot_metrics(&self) -> NotificationMetricSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
+        let targets = self.notifier.target_list().read().await.values();
+        let mut snapshots = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let delivery = target.delivery_snapshot();
+            let target_id = target.id();
+            snapshots.push(NotificationTargetMetricSnapshot {
+                failed_messages: delivery.failed_messages,
+                queue_length: delivery.queue_length,
+                target_id: target_id.to_string(),
+                target_type: target_id.name,
+                total_messages: delivery.total_messages,
+            });
+        }
+
+        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        snapshots
     }
 
     // Add a method to shut down the system
