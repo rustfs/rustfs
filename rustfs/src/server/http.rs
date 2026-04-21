@@ -593,7 +593,7 @@ fn process_connection(
         // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
         // 16. ConditionalCorsLayer                   — S3 API CORS
         // 17. RedirectLayer                          — console redirect (conditional)
-        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/304 responses
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
