@@ -478,7 +478,10 @@ where
 }
 
 fn is_bodyless_status(status: StatusCode) -> bool {
-    status.is_informational() || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
+        || status == StatusCode::NOT_MODIFIED
 }
 
 fn is_xml_response(headers: &HeaderMap) -> bool {
