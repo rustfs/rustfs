@@ -198,6 +198,15 @@ pub fn get_lock_acquire_timeout() -> Duration {
     ))
 }
 
+/// Get disk read timeout from environment variable RUSTFS_OBJECT_DISK_READ_TIMEOUT (in seconds)
+/// Defaults to 10 seconds. Set to 0 to disable disk-read timeout.
+pub fn get_disk_read_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT,
+    ))
+}
+
 /// Check if lock optimization is enabled.
 /// When enabled, read locks are released after metadata read instead of
 /// being held for the entire data transfer duration.
@@ -701,27 +710,61 @@ impl ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let disk_read_timeout = get_disk_read_timeout();
         // Move the read-lock guard into the task so it lives for the duration of the read
         // Note: when lock optimization is enabled, read_lock_guard is None
         // let _guard_to_hold = _read_lock_guard; // moved into closure below
         tokio::spawn(async move {
             let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
-            if let Err(e) = Self::get_object_with_fileinfo(
-                &bucket,
-                &object,
-                offset,
-                length,
-                &mut writer,
-                fi,
-                files,
-                &disks,
-                set_index,
-                pool_index,
-                skip_verify,
-            )
-            .await
-            {
+            let read_result = if disk_read_timeout.is_zero() {
+                Self::get_object_with_fileinfo(
+                    &bucket,
+                    &object,
+                    offset,
+                    length,
+                    &mut writer,
+                    fi,
+                    files,
+                    &disks,
+                    set_index,
+                    pool_index,
+                    skip_verify,
+                )
+                .await
+            } else {
+                match timeout(
+                    disk_read_timeout,
+                    Self::get_object_with_fileinfo(
+                        &bucket,
+                        &object,
+                        offset,
+                        length,
+                        &mut writer,
+                        fi,
+                        files,
+                        &disks,
+                        set_index,
+                        pool_index,
+                        skip_verify,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        error!(
+                            bucket = %bucket,
+                            object = %object,
+                            timeout_secs = disk_read_timeout.as_secs(),
+                            "get_object_with_fileinfo timed out"
+                        );
+                        return;
+                    }
+                }
+            };
+
+            if let Err(e) = read_result {
                 error!("get_object_with_fileinfo  {bucket}/{object} err {:?}", e);
             };
         });
@@ -757,7 +800,6 @@ impl ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
@@ -4384,6 +4426,23 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use time::OffsetDateTime;
+
+    #[test]
+    fn test_get_disk_read_timeout_default() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
+            assert_eq!(
+                get_disk_read_timeout(),
+                Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT)
+            );
+        });
+    }
+
+    #[test]
+    fn test_get_disk_read_timeout_override() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("17"), || {
+            assert_eq!(get_disk_read_timeout(), Duration::from_secs(17));
+        });
+    }
 
     #[derive(Debug, Default)]
     struct FailingClient;
