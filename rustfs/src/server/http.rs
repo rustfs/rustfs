@@ -22,8 +22,8 @@ use crate::server::{
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
-        RequestContextLayer, S3ErrorMessageCompatLayer,
+        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer,
+        RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -593,6 +593,7 @@ fn process_connection(
         // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
         // 16. ConditionalCorsLayer                   — S3 API CORS
         // 17. RedirectLayer                          — console redirect (conditional)
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -735,6 +736,12 @@ fn process_connection(
             // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
             .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
+            // Must run first on responses: clear the body and remove
+            // Content-Length, Content-Type, and Transfer-Encoding for statuses
+            // that MUST NOT carry a body (1xx/204/304). Kept innermost so all
+            // other response-transforming layers see the already-bodyless
+            // response and so no layer (e.g. CORS) re-adds body headers afterward.
+            .layer(BodylessStatusFixLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
