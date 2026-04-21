@@ -230,6 +230,11 @@ mtls:
   enabled: false
   clientCertPath: "/opt/tls/client_cert.pem"
   clientKeyPath: "/opt/tls/client_key.pem"
+  existingIssuerRef:
+    enabled: false
+    name: ""
+    kind: ""
+    group: ""
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious

@@ -105,6 +105,11 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mtls.enabled | bool | `false` | Enable mtls betweens pods. |
 | mtls.clientCertPath | string | `/opt/tls/client_cert.pem` | The path for client cert. |
 | mtls.clientKeyPath | string | `/opt/tls/client_key.pem` | The path for client key. |
+| mtls.existingIssuerRef.enabled | bool | `false` | Enable to use external/existing certificate issuer.|
+| mtls.existingIssuerRef.name | string | `""` | The name of external/existing certificate issuer. |
+| mtls.existingIssuerRef.kind | string | `""` | The kind of external/existing certificate iss
+uer. `ClusterIssuer` or `Issuer`. |
+| mtls.existingIssuerRef.group | string | `""` | The group of external/existing certificate issuer. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
