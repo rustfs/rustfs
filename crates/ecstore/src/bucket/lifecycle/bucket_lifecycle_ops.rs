@@ -1771,7 +1771,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
-    //debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
+    debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {
