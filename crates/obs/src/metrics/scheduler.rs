@@ -21,29 +21,30 @@
 //! - Process CPU metrics
 //! - Process memory metrics
 //! - Process disk I/O metrics
-//! - Process network I/O metrics
+//! - Host network I/O metrics
 
 use crate::metrics::collectors::{
     AuditTargetStats,
     NotificationStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
+    ProcessAttributeError,
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
-    ProcessNetworkStats,
     collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
     collect_cluster_metrics,
+    collect_host_network_metrics,
     collect_node_metrics,
     collect_notification_metrics,
     collect_notification_target_metrics,
+    collect_process_attributes,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
     collect_process_memory_metrics,
     collect_process_metrics,
-    collect_process_network_metrics,
     collect_resource_metrics,
 };
 use crate::metrics::config::{
@@ -53,17 +54,17 @@ use crate::metrics::config::{
     ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
     ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
-use crate::metrics::report::report_metrics;
+use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
-    collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats, collect_disk_stats,
-    collect_process_resource_and_system_stats,
+    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats,
+    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
 use std::time::Duration;
-use sysinfo::{Pid, System};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -222,26 +223,6 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         }
     });
 
-    // Spawn task for resource metrics
-    let token_clone = token.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(resource_interval);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let (resource_stats, process_stats) = collect_process_resource_and_system_stats();
-                    let mut metrics = collect_resource_metrics(&resource_stats);
-                    metrics.extend(collect_process_metrics(&process_stats));
-                    report_metrics(&metrics);
-                }
-                _ = token_clone.cancelled() => {
-                    warn!("Metrics collection for resource stats cancelled.");
-                    return;
-                }
-            }
-        }
-    });
-
     // Spawn task for audit target delivery metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
@@ -315,25 +296,66 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
     let token_clone = token;
     tokio::spawn(async move {
-        // Get current process PID
-        let pid = match sysinfo::get_current_pid() {
-            Ok(p) => p,
+        let labels = current_process_metric_labels();
+        let process_interval = resource_interval.min(system_interval);
+        let mut interval = tokio::time::interval(process_interval);
+        let now = Instant::now();
+        let mut next_resource_run = now;
+        let mut next_system_run = now;
+
+        #[cfg(feature = "gpu")]
+        let current_pid = match sysinfo::get_current_pid() {
+            Ok(pid) => Some(pid),
             Err(e) => {
                 warn!("Failed to get current PID for system monitoring: {}", e);
-                return;
+                None
             }
         };
 
-        let mut interval = tokio::time::interval(system_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Collect system monitoring metrics
-                    let metrics = collect_system_monitoring_metrics(pid);
-                    report_metrics(&metrics);
+                    let now = Instant::now();
+                    let bundle = collect_process_metric_bundle();
+
+                    if now >= next_resource_run {
+                        let mut metrics = collect_resource_metrics(&bundle.resource);
+                        metrics.extend(collect_process_metrics(&bundle.process));
+                        report_metrics(&metrics);
+                        advance_deadline(&mut next_resource_run, resource_interval, now);
+                    }
+
+                    if now >= next_system_run {
+                        #[cfg(feature = "gpu")]
+                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels);
+                        #[cfg(not(feature = "gpu"))]
+                        let metrics = collect_system_monitoring_metrics(&bundle, &labels);
+
+                        #[cfg(feature = "gpu")]
+                        if let Some(pid) = current_pid {
+                            use crate::metrics::collectors::{GpuCollector, collect_gpu_metrics};
+
+                            match GpuCollector::new(pid) {
+                                Ok(collector) => match collector.collect() {
+                                    Ok(gpu_stats) => {
+                                        metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
+                                    }
+                                    Err(e) => {
+                                        warn!("GPU metrics collection failed: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!("GPU collector initialization failed: {}", e);
+                                }
+                            }
+                        }
+
+                        report_metrics(&metrics);
+                        advance_deadline(&mut next_system_run, system_interval, now);
+                    }
                 }
                 _ = token_clone.cancelled() => {
-                    warn!("System monitoring metrics collection cancelled.");
+                    warn!("Process metrics collection cancelled.");
                     return;
                 }
             }
@@ -346,95 +368,99 @@ pub fn init_metrics_collectors(token: CancellationToken) {
     init_metrics_runtime(token);
 }
 
-/// Collect all system monitoring metrics for a process.
-///
-/// This function collects CPU, memory, disk I/O, and network I/O metrics
-/// for the specified process PID.
-///
-/// # Arguments
-/// * `pid` - The process ID to monitor
-///
-/// # Returns
-/// A vector of Prometheus metrics for the process.
-fn collect_system_monitoring_metrics(pid: Pid) -> Vec<crate::metrics::report::PrometheusMetric> {
-    let mut metrics = Vec::new();
-    let mut system = System::new();
-
-    // Refresh process information
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-
-    if let Some(process) = system.process(pid) {
-        // Create labels with process attributes
-        let labels: Vec<(&'static str, Cow<'static, str>)> = vec![
-            ("process_pid", Cow::Owned(pid.as_u32().to_string())),
-            ("process_executable_name", Cow::Owned(process.name().to_string_lossy().to_string())),
-        ];
-
-        // Collect CPU metrics
-        let cpu_stats = ProcessCpuStats {
-            usage: process.cpu_usage() as f64,
-            utilization: process.cpu_usage() as f64, // Same as usage for single process
-        };
-        metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(&labels)));
-
-        // Collect memory metrics
-        let memory_stats = ProcessMemoryStats {
-            resident: process.memory(),
-            virtual_mem: process.virtual_memory(),
-        };
-        metrics.extend(collect_process_memory_metrics(&memory_stats, Some(&labels)));
-
-        // Collect disk I/O metrics
-        let disk_usage = process.disk_usage();
-        let disk_stats = ProcessDiskStats {
-            read_bytes: disk_usage.read_bytes,
-            written_bytes: disk_usage.written_bytes,
-        };
-        metrics.extend(collect_process_disk_metrics(&disk_stats, Some(&labels)));
-
-        // Collect network I/O metrics
-        // Note: sysinfo 0.38.x provides network info via Networks new type
-        // We use Networks::new_with_refreshed_list() to get network interfaces
-        let networks = sysinfo::Networks::new_with_refreshed_list();
-        let mut total_received = 0u64;
-        let mut total_transmitted = 0u64;
-        let mut per_interface = Vec::new();
-
-        for (interface_name, data) in networks.iter() {
-            let received = data.received();
-            let transmitted = data.transmitted();
-            total_received += received;
-            total_transmitted += transmitted;
-            per_interface.push((interface_name.to_string(), received, transmitted));
-        }
-
-        let network_stats = ProcessNetworkStats {
-            total_received,
-            total_transmitted,
-            per_interface,
-        };
-        metrics.extend(collect_process_network_metrics(&network_stats, Some(&labels)));
-
-        // Collect GPU metrics (if gpu feature is enabled)
-        #[cfg(feature = "gpu")]
-        {
-            use crate::metrics::collectors::{GpuCollector, collect_gpu_metrics};
-
-            match GpuCollector::new(pid) {
-                Ok(collector) => match collector.collect() {
-                    Ok(gpu_stats) => {
-                        metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
-                    }
-                    Err(e) => {
-                        warn!("GPU metrics collection failed: {}", e);
-                    }
-                },
-                Err(e) => {
-                    warn!("GPU collector initialization failed: {}", e);
-                }
-            }
-        }
+fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
+    if *deadline > now {
+        return;
     }
 
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return;
+    }
+
+    let elapsed = now.duration_since(*deadline);
+    let missed_intervals = (elapsed.as_nanos() / interval_nanos) + 1;
+    let mut remaining = missed_intervals;
+
+    while remaining > 0 {
+        let chunk_u128 = remaining.min(u128::from(u32::MAX));
+        let chunk_u32 = chunk_u128 as u32;
+
+        if let Some(advance_by) = interval.checked_mul(chunk_u32) {
+            *deadline += advance_by;
+            remaining -= chunk_u128;
+            continue;
+        }
+
+        *deadline += interval;
+        remaining -= 1;
+    }
+}
+
+fn current_process_metric_labels() -> Vec<(&'static str, Cow<'static, str>)> {
+    match collect_process_attributes() {
+        Ok(attrs) => vec![
+            ("process_pid", Cow::Owned(attrs.pid.to_string())),
+            ("process_executable_name", Cow::Owned(attrs.executable_name)),
+        ],
+        Err(err) => fallback_process_metric_labels(err),
+    }
+}
+
+fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
+    warn!("Failed to collect process attributes for metrics labels: {}", err);
+    vec![
+        ("process_pid", Cow::Owned(std::process::id().to_string())),
+        ("process_executable_name", Cow::Borrowed("unknown")),
+    ]
+}
+
+fn collect_system_monitoring_metrics(
+    bundle: &ProcessMetricBundle,
+    labels: &[(&'static str, Cow<'static, str>)],
+) -> Vec<PrometheusMetric> {
+    let cpu_stats = ProcessCpuStats {
+        usage: bundle.resource.cpu_percent,
+        utilization: bundle.resource.cpu_percent,
+    };
+    let memory_stats = ProcessMemoryStats {
+        resident: bundle.process.resident_memory_bytes,
+        virtual_mem: bundle.process.virtual_memory_bytes,
+    };
+    let disk_stats = ProcessDiskStats {
+        read_bytes: bundle.disk_read_bytes,
+        written_bytes: bundle.disk_write_bytes,
+    };
+    let network_stats = collect_host_network_stats();
+
+    let mut metrics = Vec::new();
+    metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
+    metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
+    metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));
+    // Interface counters are host-wide, so keep these metrics free of process labels.
+    metrics.extend(collect_host_network_metrics(&network_stats, None));
     metrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_deadline;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn advance_deadline_keeps_future_deadline_unchanged() {
+        let base = Instant::now();
+        let mut deadline = base + Duration::from_secs(10);
+        advance_deadline(&mut deadline, Duration::from_secs(5), base);
+        assert_eq!(deadline, base + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn advance_deadline_moves_to_first_tick_after_now() {
+        let base = Instant::now();
+        let mut deadline = base;
+        advance_deadline(&mut deadline, Duration::from_secs(5), base + Duration::from_secs(12));
+        assert_eq!(deadline, base + Duration::from_secs(15));
+    }
 }

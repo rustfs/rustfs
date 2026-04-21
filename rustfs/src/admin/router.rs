@@ -343,7 +343,8 @@ fn parse_misc_extension_request(method: &Method, uri: &Uri) -> Option<MiscExtRou
         if uri.path() == "/" {
             return Some(MiscExtRoute::ListenNotification { bucket: None });
         }
-        if let Some(bucket) = extract_bucket_for_bucket_level_path(uri.path()) {
+        let path = uri.path().strip_suffix('/').unwrap_or(uri.path());
+        if let Some(bucket) = extract_bucket_for_bucket_level_path(path) {
             return Some(MiscExtRoute::ListenNotification { bucket: Some(bucket) });
         }
     }
@@ -2492,12 +2493,14 @@ mod tests {
         let object_level: Uri = "/demo-bucket/path/file?replication-metrics"
             .parse()
             .expect("uri should parse");
+        let bucket_trailing_slash: Uri = "/demo-bucket/?replication-metrics".parse().expect("uri should parse");
         let invalid_value: Uri = "/demo-bucket?replication-metrics=1".parse().expect("uri should parse");
         let wrong_method: Uri = "/demo-bucket?replication-check".parse().expect("uri should parse");
         let wrong_method_reset: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
         let wrong_method_status: Uri = "/demo-bucket?replication-reset-status".parse().expect("uri should parse");
 
         assert!(parse_replication_extension_request(&Method::GET, &object_level).is_none());
+        assert!(parse_replication_extension_request(&Method::GET, &bucket_trailing_slash).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &invalid_value).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
@@ -3099,6 +3102,7 @@ mod tests {
             .parse()
             .expect("uri should parse");
         let listen_bucket: Uri = "/demo-bucket?events=s3:ObjectCreated:*".parse().expect("uri should parse");
+        let listen_bucket_trailing_slash: Uri = "/demo-bucket/?events=s3:ObjectCreated:*".parse().expect("uri should parse");
         let listen_root: Uri = "/?events=s3:ObjectRemoved:*".parse().expect("uri should parse");
 
         let object_route = parse_misc_extension_request(&Method::GET, &object_lambda).expect("object lambda route should parse");
@@ -3114,6 +3118,15 @@ mod tests {
             parse_misc_extension_request(&Method::GET, &listen_bucket).expect("bucket listen route should parse");
         assert_eq!(
             listen_bucket_route,
+            MiscExtRoute::ListenNotification {
+                bucket: Some("demo-bucket".to_string())
+            }
+        );
+
+        let listen_bucket_trailing_slash_route = parse_misc_extension_request(&Method::GET, &listen_bucket_trailing_slash)
+            .expect("bucket listen route with trailing slash should parse");
+        assert_eq!(
+            listen_bucket_trailing_slash_route,
             MiscExtRoute::ListenNotification {
                 bucket: Some("demo-bucket".to_string())
             }

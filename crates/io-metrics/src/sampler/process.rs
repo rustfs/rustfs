@@ -12,16 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
-/// Process start time used for computing process uptime.
-static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+static PROCESS_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 #[inline]
-fn get_process_start() -> &'static Instant {
-    PROCESS_START.get_or_init(Instant::now)
+fn current_pid() -> Pid {
+    Pid::from_u32(std::process::id())
+}
+
+#[inline]
+fn process_system() -> &'static Mutex<System> {
+    PROCESS_SYSTEM.get_or_init(|| {
+        let pid = current_pid();
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+        Mutex::new(system)
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -57,6 +65,8 @@ pub struct ProcessSystemSnapshot {
     pub locks_write_total: u64,
     pub cpu_total_seconds: f64,
     pub go_routine_total: u64,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
     pub io_rchar_bytes: u64,
     pub io_read_bytes: u64,
     pub io_wchar_bytes: u64,
@@ -89,17 +99,16 @@ pub fn snapshot_process_system() -> ProcessSystemSnapshot {
 /// Collect both resource and system snapshots in one sysinfo refresh.
 #[inline]
 pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
-    let uptime_seconds = get_process_start().elapsed().as_secs();
     let platform_stats = crate::snapshot_process_platform_stats();
     let lock_snapshot = crate::snapshot_process_lock_counts();
-
-    let mut sys = System::new();
-    let pid = Pid::from_u32(std::process::id());
+    let pid = current_pid();
+    let mut sys = process_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
 
     if let Some(process) = sys.process(pid) {
         let disk_usage = process.disk_usage();
         let status = ProcessStatusSnapshot::from(process.status());
+        let uptime_seconds = process.run_time();
 
         let resource_stats = ProcessResourceSnapshot {
             cpu_percent: process.cpu_usage() as f64,
@@ -111,6 +120,8 @@ pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, Proce
             locks_read_total: lock_snapshot.read_locks_held,
             locks_write_total: lock_snapshot.write_locks_held,
             cpu_total_seconds: process.accumulated_cpu_time() as f64 / 1000.0,
+            disk_read_bytes: disk_usage.read_bytes,
+            disk_write_bytes: disk_usage.written_bytes,
             file_descriptor_limit_total: process.open_files_limit().map_or(0, |value| value as u64),
             file_descriptor_open_total: process.open_files().map_or(0, |value| value as u64),
             go_routine_total: process.tasks().map_or(0, |tasks| tasks.len() as u64),
@@ -131,16 +142,7 @@ pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, Proce
 
         (resource_stats, process_stats)
     } else {
-        (
-            ProcessResourceSnapshot {
-                uptime_seconds,
-                ..Default::default()
-            },
-            ProcessSystemSnapshot {
-                uptime_seconds,
-                ..Default::default()
-            },
-        )
+        (ProcessResourceSnapshot::default(), ProcessSystemSnapshot::default())
     }
 }
 

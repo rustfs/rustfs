@@ -16,6 +16,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_confi
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
@@ -384,13 +385,17 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
     let mod_time = info.mod_time;
     let etag = info.etag.as_deref();
+    let if_match = non_empty_header_value(headers, IF_MATCH);
+    let if_none_match = non_empty_header_value(headers, IF_NONE_MATCH);
+    let if_modified_since = non_empty_header_value(headers, IF_MODIFIED_SINCE);
+    let if_unmodified_since = non_empty_header_value(headers, IF_UNMODIFIED_SINCE);
 
     if mod_time.is_none() && etag.is_none() {
         return Ok(());
     }
 
     // If-Match: requires ETag to exist
-    if let Some(if_match_val) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+    if let Some(if_match_val) = if_match {
         match etag {
             Some(e) if is_etag_equal(e, if_match_val) => {}
             _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
@@ -398,9 +403,9 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-Unmodified-Since (only when If-Match is absent)
-    if headers.get("if-match").is_none()
+    if if_match.is_none()
         && let Some(t) = mod_time
-        && let Some(if_unmodified_since) = headers.get("if-unmodified-since").and_then(|v| v.to_str().ok())
+        && let Some(if_unmodified_since) = if_unmodified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t > given_time.add(time::Duration::seconds(1))
     {
@@ -408,7 +413,7 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-None-Match
-    if let Some(if_none_match) = headers.get("if-none-match").and_then(|v| v.to_str().ok())
+    if let Some(if_none_match) = if_none_match
         && let Some(e) = etag
         && is_etag_equal(e, if_none_match)
     {
@@ -431,9 +436,9 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
-    if headers.get("if-none-match").is_none()
+    if if_none_match.is_none()
         && let Some(t) = mod_time
-        && let Some(if_modified_since) = headers.get("if-modified-since").and_then(|v| v.to_str().ok())
+        && let Some(if_modified_since) = if_modified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
         && t < given_time.add(time::Duration::seconds(1))
     {
@@ -458,6 +463,14 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
     }
 
     Ok(())
+}
+
+fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// Compares an object ETag with an ETag value from an HTTP header.

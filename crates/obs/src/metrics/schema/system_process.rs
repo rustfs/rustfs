@@ -221,26 +221,6 @@ pub static PROCESS_DISK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     )
 });
 
-/// Process network I/O bytes
-pub static PROCESS_NETWORK_IO_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_gauge_md(
-        MetricName::ProcessNetworkIO,
-        "Network bytes transferred by the process",
-        &[],
-        subsystems::SYSTEM_PROCESS,
-    )
-});
-
-/// Process network I/O bytes per interface
-pub static PROCESS_NETWORK_IO_PER_INTERFACE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_gauge_md(
-        MetricName::ProcessNetworkIOPerInterface,
-        "Network bytes transferred by the process (per interface)",
-        &[],
-        subsystems::SYSTEM_PROCESS,
-    )
-});
-
 /// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
 pub static PROCESS_STATUS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(

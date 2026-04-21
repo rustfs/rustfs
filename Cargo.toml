@@ -38,7 +38,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
-    "crates/concurrency", # Rust I/O utilities and abstractions
+    "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-common", # Common utilities and data structures for S3 compatibility
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
@@ -118,11 +118,13 @@ async-channel = "2.5.0"
 async-compression = { version = "0.4.41" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
+async-nats = "0.47.0"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 pollster = "0.4.0"
+pulsar = { version = "6.7.2", default-features = false, features = ["tokio-rustls-runtime"] }
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
@@ -248,7 +250,7 @@ rumqttc = { package = "rumqttc-next", version = "0.30.0", features = ["websocket
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "0dd8fcaaa72eda68fafd49c38daea43bb8697558", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "a3b16608df35aaeed8fff08b4988d03f4ca9445b", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "1.7.1", default-features = false }
 siphasher = "1.0.2"

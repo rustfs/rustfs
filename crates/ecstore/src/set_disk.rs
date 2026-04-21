@@ -2808,18 +2808,10 @@ impl MultipartOperations for SetDisks {
         if part_numbers.is_empty() {
             return Ok(ret);
         }
-        let start_op = part_numbers.iter().find(|&&v| v != 0 && v == part_number_marker);
-        if part_number_marker > 0 && start_op.is_none() {
+        let Some(remaining_part_numbers) = parts_after_marker(&part_numbers, part_number_marker) else {
             return Ok(ret);
-        }
-
-        if let Some(start) = start_op {
-            if start + 1 > part_numbers.len() {
-                return Ok(ret);
-            }
-
-            part_numbers = part_numbers[start + 1..].to_vec();
-        }
+        };
+        part_numbers = remaining_part_numbers.to_vec();
 
         let mut parts = Vec::with_capacity(part_numbers.len());
 
@@ -3346,22 +3338,17 @@ impl MultipartOperations for SetDisks {
                     return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 };
 
-                let part_crc = match checksum_type {
-                    rustfs_rio::ChecksumType::SHA256 => p.checksum_sha256.clone(),
-                    rustfs_rio::ChecksumType::SHA1 => p.checksum_sha1.clone(),
-                    rustfs_rio::ChecksumType::CRC32 => p.checksum_crc32.clone(),
-                    rustfs_rio::ChecksumType::CRC32C => p.checksum_crc32c.clone(),
-                    rustfs_rio::ChecksumType::CRC64_NVME => p.checksum_crc64nvme.clone(),
-                    _ => {
-                        error!(
-                            "complete_multipart_upload checksum type={checksum_type}, part_id={}, bucket={}, object={}",
-                            p.part_num, bucket, object
-                        );
-                        return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
-                    }
+                let Some(part_crc) = complete_part_checksum(p, checksum_type) else {
+                    error!(
+                        "complete_multipart_upload checksum type={checksum_type}, part_id={}, bucket={}, object={}",
+                        p.part_num, bucket, object
+                    );
+                    return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
                 };
 
-                if part_crc.clone().unwrap_or_default() != crc {
+                if let Some(part_crc) = part_crc
+                    && part_crc != crc
+                {
                     error!("complete_multipart_upload checksum_type={checksum_type:?}, part_crc={part_crc:?}, crc={crc:?}");
                     error!(
                         "complete_multipart_upload checksum mismatch part_id={}, bucket={}, object={}",
@@ -4283,6 +4270,28 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
+fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
+    match checksum_type.base() {
+        rustfs_rio::ChecksumType::SHA256 => Some(part.checksum_sha256.clone()),
+        rustfs_rio::ChecksumType::SHA1 => Some(part.checksum_sha1.clone()),
+        rustfs_rio::ChecksumType::CRC32 => Some(part.checksum_crc32.clone()),
+        rustfs_rio::ChecksumType::CRC32C => Some(part.checksum_crc32c.clone()),
+        rustfs_rio::ChecksumType::CRC64_NVME => Some(part.checksum_crc64nvme.clone()),
+        _ => None,
+    }
+}
+
+fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Option<&[usize]> {
+    if part_number_marker == 0 {
+        return Some(part_numbers);
+    }
+
+    part_numbers
+        .iter()
+        .position(|&part_number| part_number != 0 && part_number == part_number_marker)
+        .map(|index| &part_numbers[index + 1..])
+}
+
 pub fn canonicalize_etag(etag: &str) -> String {
     let re = Regex::new("\"*?([^\"]*?)\"*?$").unwrap();
     re.replace_all(etag, "$1").to_string()
@@ -4296,15 +4305,21 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
 }
 
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
+    let if_none_match = if_none_match
+        .as_deref()
+        .map(str::trim)
+        .filter(|condition| !condition.is_empty());
+    let if_match = if_match.as_deref().map(str::trim).filter(|condition| !condition.is_empty());
+
     match &oi.etag {
         Some(etag) => {
             if let Some(if_none_match) = if_none_match
-                && e_tag_matches(etag, &if_none_match)
+                && e_tag_matches(etag, if_none_match)
             {
                 return true;
             }
             if let Some(if_match) = if_match
-                && !e_tag_matches(etag, &if_match)
+                && !e_tag_matches(etag, if_match)
             {
                 return true;
             }
@@ -5514,6 +5529,10 @@ mod tests {
         let if_none_match = None;
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let if_none_match = Some(String::new());
+        let if_match = Some(" ".to_string());
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
     }
 
     #[test]
@@ -5535,6 +5554,39 @@ mod tests {
         assert!(!is_valid_storage_class("INVALID"));
         assert!(!is_valid_storage_class(""));
         assert!(!is_valid_storage_class("standard")); // lowercase
+    }
+
+    #[test]
+    fn complete_part_checksum_accepts_missing_value_and_uses_base_type() {
+        let missing_checksum_part = CompletePart::default();
+        assert_eq!(
+            complete_part_checksum(&missing_checksum_part, rustfs_rio::ChecksumType::CRC64_NVME),
+            Some(None)
+        );
+
+        let full_object_crc32 =
+            rustfs_rio::ChecksumType(rustfs_rio::ChecksumType::CRC32.0 | rustfs_rio::ChecksumType::FULL_OBJECT.0);
+        let part = CompletePart {
+            checksum_crc32: Some("AAAAAA==".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(complete_part_checksum(&part, full_object_crc32), Some(Some("AAAAAA==".to_string())));
+    }
+
+    #[test]
+    fn parts_after_marker_uses_marker_position() {
+        let part_numbers = (1..=1002).collect::<Vec<_>>();
+
+        let remaining = parts_after_marker(&part_numbers, 1000).expect("marker should exist");
+
+        assert_eq!(remaining, &[1001, 1002]);
+    }
+
+    #[test]
+    fn parts_after_marker_returns_none_for_missing_marker() {
+        let part_numbers = vec![1, 2, 3];
+
+        assert!(parts_after_marker(&part_numbers, 4).is_none());
     }
 
     #[test]

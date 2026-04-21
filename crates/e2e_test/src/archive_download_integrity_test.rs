@@ -218,6 +218,34 @@ mod tests {
         Ok(builder.send().await?)
     }
 
+    async fn signed_get_request_with_headers(
+        url: &str,
+        access_key: &str,
+        secret_key: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+        let uri = url.parse::<http::Uri>()?;
+        let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+        let mut request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .header(HOST, authority)
+            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+
+        let signed = sign_v4(request.body(Body::empty())?, 0, access_key, secret_key, "", "us-east-1");
+
+        let client = local_http_client();
+        let mut builder = client.get(url);
+        for (name, value) in signed.headers() {
+            builder = builder.header(name, value);
+        }
+
+        Ok(builder.send().await?)
+    }
+
     async fn assert_archive_object_content_encoding(
         client: &S3Client,
         bucket: &str,
@@ -650,6 +678,42 @@ mod tests {
             expected_sha256.as_slice(),
             "multipart archive SHA256 mismatch"
         );
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multipart_get_ignores_empty_conditional_etag_headers() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+        env.create_test_bucket(MULTIPART_ARCHIVE_TEST_BUCKET).await?;
+
+        let client = env.create_s3_client();
+        let key = "multipart-empty-conditional-headers.zip";
+        let zip_bytes =
+            complete_archive_multipart_upload_with_content_encoding(&client, MULTIPART_ARCHIVE_TEST_BUCKET, key, None).await?;
+        let object_url = format!("{}/{}/{}", env.url, MULTIPART_ARCHIVE_TEST_BUCKET, key);
+
+        let response = signed_get_request_with_headers(
+            &object_url,
+            &env.access_key,
+            &env.secret_key,
+            &[("if-match", ""), ("if-none-match", "")],
+        )
+        .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected multipart GET status {status}, body: {}",
+            String::from_utf8_lossy(body.as_ref())
+        );
+        assert_eq!(body.as_ref(), zip_bytes.as_slice());
 
         env.stop_server();
         Ok(())

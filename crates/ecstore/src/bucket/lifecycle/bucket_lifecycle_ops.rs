@@ -1355,7 +1355,7 @@ pub async fn expire_transitioned_object(
         }
     };
 
-    schedule_lifecycle_replication_delete_if_needed(oi).await;
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
@@ -1779,8 +1779,8 @@ pub async fn apply_expiry_on_non_transitioned_objects(
             return false;
         }
     };
-    schedule_lifecycle_replication_delete_if_needed(oi).await;
-    //debug!("expiry_on_non_transitioned_objects dobj: {:?}", dobj);
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+    //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
     }
@@ -1820,25 +1820,55 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
     true
 }
 
-async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo) {
-    if !oi.delete_marker || oi.version_id.is_none() {
-        return;
+fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_api::DeletedObject {
+    if dobj.delete_marker {
+        return crate::store_api::DeletedObject {
+            object_name: oi.name.clone(),
+            delete_marker: true,
+            delete_marker_version_id: dobj.version_id,
+            delete_marker_mtime: dobj.mod_time.or(oi.mod_time),
+            ..Default::default()
+        };
     }
 
-    let replication_state = lifecycle_delete_replication_state(oi).await;
+    if oi.delete_marker && oi.version_id.is_some() {
+        return crate::store_api::DeletedObject {
+            object_name: oi.name.clone(),
+            delete_marker: false,
+            delete_marker_version_id: oi.version_id,
+            delete_marker_mtime: oi.mod_time,
+            ..Default::default()
+        };
+    }
+
+    crate::store_api::DeletedObject {
+        object_name: oi.name.clone(),
+        delete_marker: false,
+        version_id: oi.version_id,
+        delete_marker_mtime: oi.mod_time,
+        ..Default::default()
+    }
+}
+
+async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo) {
+    let mut delete_object = lifecycle_deleted_object(oi, dobj);
+    let version_id = if delete_object.delete_marker {
+        None
+    } else if delete_object.delete_marker_version_id.is_some() {
+        delete_object.delete_marker_version_id
+    } else {
+        delete_object.version_id
+    };
+
+    let replication_state = lifecycle_delete_replication_state(oi, version_id).await;
     if replication_state.is_none() {
         return;
     }
 
+    delete_object.replication_state = replication_state;
+
     schedule_replication_delete(DeletedObjectReplicationInfo {
-        delete_object: crate::store_api::DeletedObject {
-            object_name: oi.name.clone(),
-            delete_marker_version_id: oi.version_id,
-            delete_marker: false,
-            delete_marker_mtime: oi.mod_time,
-            replication_state,
-            ..Default::default()
-        },
+        delete_object,
         bucket: oi.bucket.clone(),
         event_type: REPLICATE_INCOMING_DELETE.to_string(),
         ..Default::default()
@@ -1846,21 +1876,56 @@ async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo) {
     .await;
 }
 
-async fn lifecycle_delete_replication_state(oi: &ObjectInfo) -> Option<ReplicationState> {
-    if !oi.replication_decision.is_empty() || oi.version_purge_status == VersionPurgeStatusType::Pending {
+fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
+    let state = oi.replication_state();
+    if version_delete {
+        oi.version_purge_status == VersionPurgeStatusType::Pending && !state.purge_targets.is_empty()
+    } else {
+        oi.replication_status == rustfs_filemeta::ReplicationStatusType::Pending && !state.targets.is_empty()
+    }
+}
+
+fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Option<ReplicationState> {
+    if oi.replication_status != rustfs_filemeta::ReplicationStatusType::Completed {
+        return None;
+    }
+
+    let targets = oi.replication_state().targets;
+    if targets.is_empty() {
+        return None;
+    }
+
+    let pending_status = targets.keys().map(|arn| format!("{arn}=PENDING;")).collect::<String>();
+
+    Some(ReplicationState {
+        replicate_decision_str: oi.replication_decision.clone(),
+        version_purge_status_internal: Some(pending_status.clone()),
+        purge_targets: rustfs_filemeta::version_purge_statuses_map(&pending_status),
+        ..Default::default()
+    })
+}
+
+async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<Uuid>) -> Option<ReplicationState> {
+    if should_reuse_lifecycle_delete_replication_state(oi, version_id.is_some()) {
         return Some(oi.replication_state());
+    }
+
+    if version_id.is_some()
+        && let Some(state) = lifecycle_version_purge_state_from_completed_targets(oi)
+    {
+        return Some(state);
     }
 
     let dsc = check_replicate_delete(
         &oi.bucket,
         &ObjectToDelete {
             object_name: oi.name.clone(),
-            version_id: oi.version_id,
+            version_id,
             ..Default::default()
         },
         oi,
         &ObjectOptions {
-            version_id: oi.version_id.map(|v| v.to_string()),
+            version_id: version_id.map(|v| v.to_string()),
             versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
             ..Default::default()
         },
@@ -1871,17 +1936,23 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo) -> Option<Replicati
         return None;
     }
 
-    Some(replication_state_for_version_delete(dsc))
+    Some(replication_state_for_delete(dsc, version_id.is_some()))
 }
 
-fn replication_state_for_version_delete(dsc: ReplicateDecision) -> ReplicationState {
+fn replication_state_for_delete(dsc: ReplicateDecision, version_delete: bool) -> ReplicationState {
     let pending_status = dsc.pending_status();
-    ReplicationState {
+    let mut state = ReplicationState {
         replicate_decision_str: dsc.to_string(),
-        version_purge_status_internal: pending_status.clone(),
-        purge_targets: rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default()),
         ..Default::default()
+    };
+    if version_delete {
+        state.version_purge_status_internal = pending_status.clone();
+        state.purge_targets = rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+    } else {
+        state.replication_status_internal = pending_status.clone();
+        state.targets = rustfs_filemeta::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
     }
+    state
 }
 
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
@@ -1907,7 +1978,9 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        lifecycle_deleted_object, lifecycle_version_purge_state_from_completed_targets,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -1918,8 +1991,9 @@ mod tests {
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
     use crate::store_api::{
-        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectOptions, PutObjReader,
+        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
+    use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1959,6 +2033,136 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_delete_marker_created_by_expiry() {
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            ..Default::default()
+        };
+        let delete_result = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &delete_result);
+
+        assert!(deleted.delete_marker);
+        assert_eq!(deleted.delete_marker_version_id, delete_result.version_id);
+        assert_eq!(deleted.version_id, None);
+        assert_eq!(deleted.object_name, "key");
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_version_id_for_noncurrent_version_purge() {
+        let version_id = Uuid::new_v4();
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &ObjectInfo::default());
+
+        assert!(!deleted.delete_marker);
+        assert_eq!(deleted.version_id, Some(version_id));
+        assert_eq!(deleted.delete_marker_version_id, None);
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_delete_marker_version_for_marker_purge() {
+        let version_id = Uuid::new_v4();
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: true,
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &ObjectInfo::default());
+
+        assert!(!deleted.delete_marker);
+        assert_eq!(deleted.delete_marker_version_id, Some(version_id));
+        assert_eq!(deleted.version_id, None);
+    }
+
+    #[test]
+    fn replication_state_for_delete_uses_replication_targets_for_current_delete() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let mut dsc = ReplicateDecision::default();
+        dsc.set(rustfs_filemeta::ReplicateTargetDecision::new(arn.to_string(), true, false));
+
+        let state = replication_state_for_delete(dsc, false);
+
+        assert_eq!(state.replication_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
+        assert!(state.version_purge_status_internal.is_none());
+        assert!(state.targets.contains_key(arn));
+    }
+
+    #[test]
+    fn replication_state_for_delete_uses_purge_targets_for_version_delete() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let mut dsc = ReplicateDecision::default();
+        dsc.set(rustfs_filemeta::ReplicateTargetDecision::new(arn.to_string(), true, false));
+
+        let state = replication_state_for_delete(dsc, true);
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
+        assert!(state.replication_status_internal.is_none());
+        assert!(state.purge_targets.contains_key(arn));
+    }
+
+    #[test]
+    fn lifecycle_delete_replication_state_reuses_only_pending_version_purge_state() {
+        let oi = ObjectInfo {
+            version_purge_status: VersionPurgeStatusType::Pending,
+            version_purge_status_internal: Some("arn:aws:s3:::target=PENDING;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        assert!(should_reuse_lifecycle_delete_replication_state(&oi, true));
+        assert!(!should_reuse_lifecycle_delete_replication_state(&oi, false));
+    }
+
+    #[test]
+    fn lifecycle_delete_replication_state_does_not_reuse_put_replication_for_version_delete() {
+        let oi = ObjectInfo {
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            !should_reuse_lifecycle_delete_replication_state(&oi, true),
+            "version purges must not reuse plain object replication state from prior PUT/delete-marker replication"
+        );
+    }
+
+    #[test]
+    fn lifecycle_version_purge_state_from_completed_targets_derives_pending_purge_targets() {
+        let oi = ObjectInfo {
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        let state = lifecycle_version_purge_state_from_completed_targets(&oi)
+            .expect("completed replication targets should be convertible into version-purge targets");
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
+        assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
+        assert_eq!(state.replicate_decision_str, oi.replication_decision);
     }
 
     static STALE_MULTIPART_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();

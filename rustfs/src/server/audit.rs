@@ -23,6 +23,8 @@ fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
 fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
     for subsystem in [
         rustfs_config::audit::AUDIT_MQTT_SUB_SYS,
+        rustfs_config::audit::AUDIT_NATS_SUB_SYS,
+        rustfs_config::audit::AUDIT_PULSAR_SUB_SYS,
         rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
     ] {
         let Some(targets) = config.0.get(subsystem) else {
@@ -73,7 +75,7 @@ pub async fn start_audit_system() -> AuditResult<()> {
     if !has_targets {
         info!(
             target: "rustfs::main::start_audit_system",
-            "Audit subsystem (MQTT/Webhook) is not configured, and audit system initialization is skipped."
+            "Audit subsystem (Webhook/MQTT/NATS/Pulsar) is not configured, and audit system initialization is skipped."
         );
         return Ok(());
     }

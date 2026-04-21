@@ -69,6 +69,24 @@ fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error
     Ok(())
 }
 
+async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
+    store: Arc<S>,
+    updates: &mpsc::Sender<DataUsageCache>,
+    cache_snapshot: DataUsageCache,
+) -> Option<SystemTime> {
+    let last_update = cache_snapshot.info.last_update;
+
+    if let Err(e) = cache_snapshot.save(store, DATA_USAGE_CACHE_NAME).await {
+        error!("Failed to save data usage cache: {}", e);
+    }
+
+    if let Err(e) = updates.send(cache_snapshot).await {
+        error!("Failed to send data usage cache: {}", e);
+    }
+
+    last_update
+}
+
 #[async_trait::async_trait]
 pub trait ScannerIO: Send + Sync + Debug + 'static {
     async fn nsscanner(
@@ -339,22 +357,20 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
                     _ = ticker.tick() => {
+                        let cache_snapshot = {
+                            let cache = cache_mutex_clone.lock().await;
+                            if cache.info.last_update == last_update {
+                                None
+                            } else {
+                                Some(cache.clone())
+                            }
+                        };
 
-                       let cache = cache_mutex_clone.lock().await;
-                       if cache.info.last_update == last_update {
-                        continue;
-                       }
-
-                       if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
-                           error!("Failed to save data usage cache: {}", e);
-                       }
-
-                       if let Err(e) = updates.send(cache.clone()).await {
-                           error!("Failed to send data usage cache: {}", e);
-
-                       }
-
-                       last_update = cache.info.last_update;
+                        let Some(cache_snapshot) = cache_snapshot else {
+                            continue;
+                        };
+                        last_update =
+                            persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
@@ -363,18 +379,13 @@ impl ScannerIOCache for SetDisks {
                             cache.info.last_update = Some(SystemTime::now());
 
                         } else {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.info.next_cycle =want_cycle;
-                            cache.info.last_update = Some(SystemTime::now());
-
-                            if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
-                                error!("Failed to save data usage cache: {}", e);
-                            }
-
-                            if let Err(e) = updates.send(cache.clone()).await {
-                                error!("Failed to send data usage cache: {}", e);
-
-                            }
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                cache.info.next_cycle = want_cycle;
+                                cache.info.last_update = Some(SystemTime::now());
+                                cache.clone()
+                            };
+                            let _ = persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
 
                             return;
                         }

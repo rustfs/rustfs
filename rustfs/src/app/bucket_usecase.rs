@@ -34,17 +34,19 @@ use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_ecstore::bucket::{
+    bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
         BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
-        BUCKET_VERSIONING_CONFIG,
+        BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
     object_lock::ObjectLockApi,
     policy_sys::PolicySys,
+    target::BucketTargetType,
     utils::serialize,
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
@@ -97,6 +99,59 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
     }
+}
+
+fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+    let mut arns = HashSet::new();
+
+    if !config.role.trim().is_empty() {
+        arns.insert(config.role.clone());
+        return arns;
+    }
+
+    for rule in &config.rules {
+        let arn = rule.destination.bucket.trim();
+        if !arn.is_empty() {
+            arns.insert(arn.to_string());
+        }
+    }
+
+    arns
+}
+
+async fn remove_replication_targets_for_config(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+    let target_arns = replication_target_arns(config);
+    if target_arns.is_empty() {
+        return Ok(());
+    }
+
+    let mut targets = match metadata_sys::get_bucket_targets_config(bucket).await {
+        Ok(targets) => targets,
+        Err(StorageError::ConfigNotFound) => {
+            BucketTargetSys::get().update_all_targets(bucket, None).await;
+            return Ok(());
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    let original_len = targets.targets.len();
+    targets.targets.retain(|target| {
+        target.target_type != BucketTargetType::ReplicationService || !target_arns.contains(target.arn.as_str())
+    });
+
+    if targets.targets.len() == original_len {
+        return Ok(());
+    }
+
+    let removed = original_len - targets.targets.len();
+    let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
+    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        .await
+        .map_err(ApiError::from)?;
+    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
+    info!(bucket = %bucket, removed, "removed replication remote targets referenced by deleted bucket replication config");
+
+    Ok(())
 }
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
@@ -840,16 +895,26 @@ impl DefaultBucketUsecase {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
+        let replication_config = match metadata_sys::get_replication_config(&bucket).await {
+            Ok((config, _)) => Some(config),
+            Err(StorageError::ConfigNotFound) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
+
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
             .map_err(ApiError::from)?;
+        if let Some(config) = replication_config.as_ref()
+            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await
+        {
+            warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
+        }
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config delete hook failed");
         }
 
-        // TODO: remove targets
         info!(bucket = %bucket, "deleted bucket replication config");
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
@@ -1866,6 +1931,52 @@ mod tests {
         let mut req = build_request(input, method);
         req.extensions.insert(req_info);
         req
+    }
+
+    fn replication_rule_for_target(arn: &str) -> ReplicationRule {
+        ReplicationRule {
+            delete_marker_replication: None,
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: None,
+            filter: None,
+            id: Some("rule-1".to_string()),
+            prefix: None,
+            priority: Some(1),
+            source_selection_criteria: None,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    #[test]
+    fn replication_target_arns_use_role_when_present() {
+        let role = "arn:rustfs:replication:us-east-1:source:bucket";
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![replication_rule_for_target(destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(role));
+        assert!(!arns.contains(destination));
+    }
+
+    #[test]
+    fn replication_target_arns_use_rule_destinations_without_role() {
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(destination));
     }
 
     #[test]
