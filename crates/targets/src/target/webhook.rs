@@ -79,7 +79,7 @@ impl WebhookArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration("webhook queueDir path should be absolute".to_string()));
+                return Err(TargetError::Configuration("webhook queue_dir path should be absolute".to_string()));
             }
         }
 

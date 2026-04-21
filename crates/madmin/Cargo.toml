@@ -38,3 +38,6 @@ time.workspace = true
 
 [lib]
 doctest = false
+
+[dev-dependencies]
+rmp-serde.workspace = true
