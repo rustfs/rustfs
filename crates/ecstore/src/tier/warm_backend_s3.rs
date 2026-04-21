@@ -95,7 +95,10 @@ impl WarmBackendS3 {
             region: conf.region.clone(),
             ..Default::default()
         };
-        let client = TransitionClient::new(&u.host().expect("err").to_string(), opts, "s3").await?;
+        let host = u
+            .host()
+            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+        let client = TransitionClient::new(&host.to_string(), opts, "s3").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -164,8 +167,10 @@ impl WarmBackend for WarmBackendS3 {
             ropts.version_id = rv.to_string();
         }
         let client = self.client.clone();
-        let err = client.remove_object(&self.bucket, &self.get_dest(object), ropts).await;
-        Err(std::io::Error::other(err.expect("err")))
+        match client.remove_object(&self.bucket, &self.get_dest(object), ropts).await {
+            None => Ok(()),
+            Some(err) => Err(std::io::Error::other(err)),
+        }
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

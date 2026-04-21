@@ -439,8 +439,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, _newer_noncurrent_versions: usize) -> Event {
         let mut events = Vec::<Event>::new();
         debug!(
-            "eval_inner: object={}, mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
-            obj.name, obj.mod_time, now, obj.is_latest, obj.delete_marker
+            "eval_inner: object={}, mod_time={:?}, successor_mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
+            obj.name, obj.mod_time, obj.successor_mod_time, now, obj.is_latest, obj.delete_marker
         );
 
         // Gracefully handle missing mod_time instead of panicking
