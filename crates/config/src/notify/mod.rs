@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod arn;
+mod kafka;
 mod mqtt;
 mod nats;
 mod pulsar;
@@ -20,6 +21,7 @@ mod store;
 mod webhook;
 
 pub use arn::*;
+pub use kafka::*;
 pub use mqtt::*;
 pub use nats::*;
 pub use pulsar::*;
