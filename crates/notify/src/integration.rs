@@ -15,7 +15,12 @@
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::{
-    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
+    Event,
+    error::NotificationError,
+    notifier::EventNotifier,
+    registry::TargetRegistry,
+    rules::{BucketNotificationConfig, ParseConfigError},
+    stream,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
@@ -599,7 +604,6 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration("No targets configured".to_string()));
@@ -608,9 +612,18 @@ impl NotificationSystem {
         // Validate the configuration against the available ARNs
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
             debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
-            return Err(NotificationError::BucketNotification(e.to_string()));
+            if !matches!(e, ParseConfigError::ArnNotFound(_)) {
+                return Err(NotificationError::BucketNotification(e.to_string()));
+            }
+            warn!(
+                bucket = %bucket,
+                region = %cfg.region,
+                error = %e,
+                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+            );
         }
 
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let rules_map = cfg.get_rules_map();
         self.notifier.add_rules_map(bucket, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket);
