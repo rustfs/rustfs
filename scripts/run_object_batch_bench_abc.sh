@@ -34,6 +34,7 @@ SAMPLES=20000
 
 # optional hooks
 APPLY_CMD=""
+APPLY_CMD_ARR=()
 APPLY_WAIT_SECS=20
 
 EXTRA_ARGS=()
@@ -74,7 +75,7 @@ s3bench options:
 
 Hooks:
   --apply-cmd                 Optional command to apply/restart RustFS after profile env switch.
-                              Runs via: eval "$APPLY_CMD"
+                              Executed directly (no shell eval), e.g. "bash scripts/restart.sh"
   --apply-wait-secs           Wait time after apply cmd (default: 20)
 
 Extra:
@@ -108,6 +109,24 @@ validate_positive_int() {
     echo "ERROR: $n must be a positive integer, got: $v" >&2
     exit 1
   fi
+}
+
+parse_apply_cmd() {
+  local raw="$1"
+
+  if [[ "$raw" == *';'* || "$raw" == *'&&'* || "$raw" == *'||'* || "$raw" == *'|'* || "$raw" == *'<'* || "$raw" == *'>'* || "$raw" == *'`'* || "$raw" == *'$'* ]]; then
+    echo "ERROR: --apply-cmd does not allow shell operators or expansions; pass a plain command and args only" >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC2206
+  APPLY_CMD_ARR=($raw)
+  if [[ "${#APPLY_CMD_ARR[@]}" -eq 0 ]]; then
+    echo "ERROR: --apply-cmd must not be empty" >&2
+    exit 1
+  fi
+
+  require_cmd "${APPLY_CMD_ARR[0]}"
 }
 
 parse_args() {
@@ -170,6 +189,9 @@ validate_args() {
   validate_positive_int "$APPLY_WAIT_SECS" "--apply-wait-secs"
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
+  fi
+  if [[ -n "$APPLY_CMD" ]]; then
+    parse_apply_cmd "$APPLY_CMD"
   fi
 }
 
@@ -238,15 +260,17 @@ sizes_for_group() {
 
 run_apply_hook_if_needed() {
   local group="$1"
-  if [[ -z "$APPLY_CMD" ]]; then
+  if [[ "${#APPLY_CMD_ARR[@]}" -eq 0 ]]; then
     return
   fi
   echo "[${group}] running apply command..."
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[DRY-RUN] eval \"$APPLY_CMD\""
+    printf '[DRY-RUN] '
+    printf '%q ' "${APPLY_CMD_ARR[@]}"
+    printf '\n'
     echo "[DRY-RUN] sleep $APPLY_WAIT_SECS"
   else
-    eval "$APPLY_CMD"
+    "${APPLY_CMD_ARR[@]}"
     echo "[${group}] waiting ${APPLY_WAIT_SECS}s for service readiness..."
     sleep "$APPLY_WAIT_SECS"
   fi
