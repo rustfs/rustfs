@@ -37,6 +37,7 @@ pub mod service_account;
 pub mod site_replication;
 pub mod sts;
 pub mod system;
+mod target_descriptor;
 pub mod tier;
 pub mod trace;
 pub mod user;
