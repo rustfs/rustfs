@@ -25,7 +25,7 @@ use hyper::body::Bytes;
 use rustfs_utils::HashAlgorithm;
 use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
-use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
+use s3s::header::{X_AMZ_BYPASS_GOVERNANCE_RETENTION, X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use serde::Deserialize;
 use std::fmt::Display;
 use std::{
@@ -111,8 +111,9 @@ impl TransitionClient {
             .await?;
 
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.delete(bucket_name);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.delete(bucket_name);
+            }
         }
         Ok(())
     }
@@ -142,8 +143,9 @@ impl TransitionClient {
             .await?;
 
         {
-            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-            bucket_loc_cache.delete(bucket_name);
+            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                bucket_loc_cache.delete(bucket_name);
+            }
         }
 
         Ok(())
@@ -168,7 +170,7 @@ impl TransitionClient {
         let mut headers = HeaderMap::new();
 
         if opts.governance_bypass {
-            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err")); //amzBypassGovernance
+            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, HeaderValue::from_static("true")); //amzBypassGovernance
         }
 
         let resp = self
@@ -197,13 +199,12 @@ impl TransitionClient {
         Ok(RemoveObjectResult {
             object_name: object_name.to_string(),
             object_version_id: opts.version_id,
-            delete_marker: resp.headers().get("x-amz-delete-marker").expect("err") == "true",
+            delete_marker: resp.headers().get(X_AMZ_DELETE_MARKER).map_or(false, |v| v == "true"),
             delete_marker_version_id: resp
                 .headers()
-                .get("x-amz-version-id")
-                .expect("err")
-                .to_str()
-                .expect("err")
+                .get(X_AMZ_VERSION_ID)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
                 .to_string(),
             ..Default::default()
         })
@@ -290,15 +291,15 @@ impl TransitionClient {
                             bucket_name,
                             &object.name,
                             RemoveObjectOptions {
-                                version_id: object.version_id.expect("err").to_string(),
+                                version_id: object.version_id.map(|id| id.to_string()).unwrap_or_default(),
                                 governance_bypass: opts.governance_bypass,
                                 ..Default::default()
                             },
                         )
                         .await?;
                     let remove_result_clone = remove_result.clone();
-                    if !remove_result.err.is_none() {
-                        match to_error_response(&remove_result.err.expect("err")).code {
+                    if let Some(err) = &remove_result.err {
+                        match to_error_response(err).code {
                             S3ErrorCode::InvalidArgument | S3ErrorCode::NoSuchVersion => {
                                 continue;
                             }
@@ -326,7 +327,7 @@ impl TransitionClient {
 
             let mut headers = HeaderMap::new();
             if opts.governance_bypass {
-                headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err"));
+                headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, HeaderValue::from_static("true"));
             }
 
             let remove_bytes = generate_remove_multi_objects_request(&batch);
@@ -423,23 +424,20 @@ impl TransitionClient {
                         request_id: resp
                             .headers()
                             .get("x-amz-request-id")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         host_id: resp
                             .headers()
                             .get("x-amz-id-2")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         region: resp
                             .headers()
                             .get("x-amz-bucket-region")
-                            .expect("err")
-                            .to_str()
-                            .expect("err")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
                             .to_string(),
                         ..Default::default()
                     };
@@ -472,10 +470,11 @@ pub struct RemoveObjectError {
 
 impl Display for RemoveObjectError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if self.err.is_none() {
-            return write!(f, "unexpected remove object error result");
+        if let Some(err) = &self.err {
+            write!(f, "{}", err.to_string())
+        } else {
+            write!(f, "unexpected remove object error result")
         }
-        write!(f, "{}", self.err.as_ref().expect("err").to_string())
     }
 }
 

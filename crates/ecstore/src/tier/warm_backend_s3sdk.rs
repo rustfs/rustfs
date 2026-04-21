@@ -190,6 +190,6 @@ impl WarmBackend for WarmBackendS3 {
             return Err(std::io::Error::other("list_objects_v2 error"));
         };
 
-        Ok(res.common_prefixes.unwrap().len() > 0 || res.contents.unwrap().len() > 0)
+        Ok(res.common_prefixes.unwrap_or_default().len() > 0 || res.contents.unwrap_or_default().len() > 0)
     }
 }
