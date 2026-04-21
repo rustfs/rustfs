@@ -1,4 +1,4 @@
-{{- if .Values.mtls.enabled }}
+{{- if and .Values.mtls.enabled (not .Values.mtls.existingIssuerRef.enabled) }}
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -6,3 +6,4 @@ metadata:
 spec:
   selfSigned: {}
 {{- end }}
+
