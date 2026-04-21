@@ -27,7 +27,7 @@ use crate::error::is_err_bucket_not_found;
 use crate::tier::{
     tier::ERR_TIER_TYPE_UNSUPPORTED,
     tier_config::{TierConfig, TierType},
-    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_PERM_ERR, ERR_TIER_NOT_FOUND},
+    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
     warm_backend_gcs::WarmBackendGCS,

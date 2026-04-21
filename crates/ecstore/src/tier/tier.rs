@@ -988,7 +988,10 @@ impl TierConfigMgr {
 
         // Insert and return reference
         self.driver_cache.insert(tier_name.to_string(), driver);
-        Ok(self.driver_cache.get(tier_name).expect("Driver not found in cache after insertion"))
+        Ok(self
+            .driver_cache
+            .get(tier_name)
+            .expect("Driver not found in cache after insertion"))
     }
 
     pub async fn reload(&mut self, api: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {

@@ -70,7 +70,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 

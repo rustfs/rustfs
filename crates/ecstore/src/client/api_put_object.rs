@@ -137,8 +137,7 @@ impl Default for PutObjectOptions {
 impl PutObjectOptions {
     fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header
-                .insert("If-Match", HeaderValue::from_static("*"));
+            self.custom_header.insert("If-Match", HeaderValue::from_static("*"));
         } else {
             if let Ok(etag_value) = HeaderValue::from_str(&format!("\"{}\"", etag)) {
                 self.custom_header.insert("If-Match", etag_value);
@@ -148,8 +147,7 @@ impl PutObjectOptions {
 
     fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header
-                .insert("If-None-Match", HeaderValue::from_static("*"));
+            self.custom_header.insert("If-None-Match", HeaderValue::from_static("*"));
         } else {
             if let Ok(etag_value) = HeaderValue::from_str(&format!("\"{etag}\"")) {
                 self.custom_header.insert("If-None-Match", etag_value);

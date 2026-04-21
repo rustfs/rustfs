@@ -626,8 +626,12 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            let header_name = "X-Amz-Content-Sha256".parse::<HeaderName>().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            let header_value = sha_header.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let header_name = "X-Amz-Content-Sha256"
+                .parse::<HeaderName>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let header_value = sha_header
+                .parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             req.headers_mut().insert(header_name, header_value);
 
             req = rustfs_signer::sign_v4_trailer(
@@ -668,7 +672,10 @@ impl TransitionClient {
         query_values: &HashMap<String, String>,
     ) -> Result<Url, std::io::Error> {
         let scheme = self.endpoint_url.scheme();
-        let host = self.endpoint_url.host().ok_or_else(|| std::io::Error::other("Endpoint URL has no host"))?;
+        let host = self
+            .endpoint_url
+            .host()
+            .ok_or_else(|| std::io::Error::other("Endpoint URL has no host"))?;
         let default_port = if scheme == "https" { 443 } else { 80 };
         let port = self.endpoint_url.port().unwrap_or(default_port);
 

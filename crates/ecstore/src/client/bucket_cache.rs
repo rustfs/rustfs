@@ -109,7 +109,11 @@ impl TransitionClient {
             url_str.push_str("://");
             url_str.push_str(bucket_name);
             url_str.push_str(".");
-            url_str.push_str(target_url.host_str().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "host is none"))?);
+            url_str.push_str(
+                target_url
+                    .host_str()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "host is none"))?,
+            );
             url_str.push_str("/?location");
         } else {
             let mut path = bucket_name.to_string();
@@ -240,9 +244,7 @@ async fn process_bucket_location_response(
         }
     } else {
         if let Ok(body_str) = String::from_utf8(body_vec) {
-            if let Ok(LocationConstraint { field }) =
-                quick_xml::de::from_str::<LocationConstraint>(&body_str)
-            {
+            if let Ok(LocationConstraint { field }) = quick_xml::de::from_str::<LocationConstraint>(&body_str) {
                 location = field;
             }
         }

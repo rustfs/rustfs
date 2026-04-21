@@ -95,7 +95,9 @@ impl WarmBackendS3 {
             region: conf.region.clone(),
             ..Default::default()
         };
-        let host = u.host().ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+        let host = u
+            .host()
+            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
         let client = TransitionClient::new(&host.to_string(), opts, "s3").await?;
 
         let client = Arc::new(client);

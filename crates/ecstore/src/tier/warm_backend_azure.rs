@@ -76,13 +76,10 @@ impl WarmBackendAzure {
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let host = u.host_str().ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-        let client = TransitionClient::new(
-            &format!("{}:{}", host, u.port().unwrap_or(default_port)),
-            opts,
-            "azure",
-        )
-        .await?;
+        let host = u
+            .host_str()
+            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+        let client = TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, "azure").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

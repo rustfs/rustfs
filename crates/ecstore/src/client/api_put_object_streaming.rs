@@ -18,10 +18,10 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use std::io::Error;
 use bytes::Bytes;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use std::io::Error;
 use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use time::{OffsetDateTime, format_description};
@@ -345,7 +345,7 @@ impl TransitionClient {
                         None => {
                             //let _ = err_tx_clone.send(std::io::Error::other("MD5 hasher not initialized")).await;
                             return Ok::<(), Error>(());
-                        },
+                        }
                     };
                     let hash = md5_hash.hash_encode(&buf[..length]);
                     md5_base64 = base64_encode(hash.as_ref());

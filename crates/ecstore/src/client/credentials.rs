@@ -57,7 +57,9 @@ impl<P: Provider + Default> Credentials<P> {
 
     pub fn get_with_context(&mut self, mut cc: Option<CredContext>) -> Result<Value, std::io::Error> {
         if self.is_expired() {
-            let creds = self.provider.retrieve_with_cred_context(cc.unwrap_or(CredContext { endpoint: "".to_string() }));
+            let creds = self.provider.retrieve_with_cred_context(cc.unwrap_or(CredContext {
+                endpoint: "".to_string(),
+            }));
             self.creds = creds;
             self.force_refresh = false;
         }
