@@ -401,7 +401,7 @@ where
 
 /// Tower middleware that strips the body (and body-describing headers) from
 /// responses whose HTTP status code MUST NOT carry a body per RFC 9110 §6.4.1
-/// and §15 (1xx, 204, 304).
+/// and §15 (1xx, 204, 205, 304).
 ///
 /// The inner s3s layer serializes every `S3Error` — including 304 `NotModified`
 /// preconditions — as an XML body. Returning that body for a 304 is a protocol
