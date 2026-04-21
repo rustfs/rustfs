@@ -14,7 +14,9 @@
 
 use crate::{
     AuditEntry, AuditError, AuditResult,
-    factory::{KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory},
+    factory::{
+        KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory,
+    },
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;

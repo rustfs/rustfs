@@ -272,10 +272,10 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
     let brokers_raw = config
         .lookup(KAFKA_BROKERS)
         .ok_or_else(|| TargetError::Configuration("Missing Kafka brokers".to_string()))?;
-    let brokers: Vec<String> = brokers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    if brokers.is_empty() {
+    if brokers_raw.split(',').all(|s| s.trim().is_empty()) {
         return Err(TargetError::Configuration("Kafka brokers cannot be empty".to_string()));
     }
+    let brokers: Vec<String> = brokers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
     let topic = config
         .lookup(KAFKA_TOPIC)
@@ -285,11 +285,10 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         enable: true,
         brokers,
         topic,
-        acks: config
-            .lookup(KAFKA_ACKS)
-            .and_then(|v| v.parse::<i16>().ok())
-            .unwrap_or(1),
-        queue_dir: config.lookup(KAFKA_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string()),
+        acks: config.lookup(KAFKA_ACKS).and_then(|v| v.parse::<i16>().ok()).unwrap_or(1),
+        queue_dir: config
+            .lookup(KAFKA_QUEUE_DIR)
+            .unwrap_or_else(|| default_queue_dir.to_string()),
         queue_limit: config
             .lookup(KAFKA_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -302,8 +301,7 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
     let brokers_raw = config
         .lookup(KAFKA_BROKERS)
         .ok_or_else(|| TargetError::Configuration("Missing Kafka brokers".to_string()))?;
-    let brokers: Vec<String> = brokers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    if brokers.is_empty() {
+    if brokers_raw.split(',').map(|s| s.trim()).all(|s| s.is_empty()) {
         return Err(TargetError::Configuration("Kafka brokers cannot be empty".to_string()));
     }
 
@@ -311,7 +309,9 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
         return Err(TargetError::Configuration("Missing Kafka topic".to_string()));
     }
 
-    let queue_dir = config.lookup(KAFKA_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string());
+    let queue_dir = config
+        .lookup(KAFKA_QUEUE_DIR)
+        .unwrap_or_else(|| default_queue_dir.to_string());
     if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
         return Err(TargetError::Configuration("Kafka queue directory must be an absolute path".to_string()));
     }

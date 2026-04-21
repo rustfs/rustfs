@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::Event;
-use crate::factory::{KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory};
+use crate::factory::{
+    KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
