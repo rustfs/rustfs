@@ -410,10 +410,10 @@ impl ExpiryState {
                         let _ = rx;
                         return;
                     }
-                    debug!("lifecycle expiry worker received task: {:?}", v);
                     let v = v.expect("received None after None check");
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
+                        //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
                         if !v.obj_info.transitioned_object.status.is_empty() {
                             apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await;
                         } else {
@@ -1771,7 +1771,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
-    debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
+    //debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {
@@ -1780,7 +1780,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         }
     };
     schedule_lifecycle_replication_delete_if_needed(oi).await;
-    debug!("expiry_on_non_transitioned_objects dobj: {:?}", dobj);
+    //debug!("expiry_on_non_transitioned_objects dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
     }
