@@ -91,9 +91,11 @@ impl BinaryFunc {
     /// the comparison to ever succeed.
     ///
     /// All key/value pairs in the function must match (logical AND); for a
-    /// given key, any request value that matches satisfies that pair. A
-    /// missing request key, or a request value that is not valid base64,
-    /// causes the condition to evaluate to false (fail-closed).
+    /// given key, any decoded request value that equals the expected bytes
+    /// satisfies that pair (OR across values). A missing request key, or
+    /// *any* request value that is not valid base64, causes the condition
+    /// to evaluate to false (fail-closed). This matches `AddrFunc::evaluate`,
+    /// which also rejects unparsable request values outright.
     pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
             let Some(rvalues) = values.get(inner.key.name().as_str()) else {
@@ -101,12 +103,15 @@ impl BinaryFunc {
             };
 
             let expected = inner.values.decoded.as_slice();
-            let matched = rvalues
-                .iter()
-                .any(|v| match base64_simd::STANDARD.decode_to_vec(v.as_bytes()) {
-                    Ok(decoded) => decoded.as_slice() == expected,
-                    Err(_) => false,
-                });
+            let mut matched = false;
+            for v in rvalues {
+                let Ok(decoded) = base64_simd::STANDARD.decode_to_vec(v.as_bytes()) else {
+                    return false;
+                };
+                if decoded.as_slice() == expected {
+                    matched = true;
+                }
+            }
             if !matched {
                 return false;
             }
@@ -193,6 +198,22 @@ mod tests {
         let mut ctx = HashMap::new();
         ctx.insert("username".to_string(), vec!["!!!not-base64!!!".to_string()]);
         assert!(!f.evaluate(&ctx));
+    }
+
+    #[test]
+    fn evaluate_mixed_valid_and_invalid_request_values_fails_closed() {
+        // A valid matching value alongside an invalid base64 value must still
+        // fail closed — any unparsable request value short-circuits to false,
+        // matching AddrFunc::evaluate semantics.
+        let f = new_func(Aws(AWSUsername), None, "aGVsbG8="); // "hello"
+        let mut ctx = HashMap::new();
+        ctx.insert("username".to_string(), vec!["aGVsbG8=".to_string(), "!!!not-base64!!!".to_string()]);
+        assert!(!f.evaluate(&ctx));
+
+        // Order-independent: invalid first, valid second — still false.
+        let mut ctx2 = HashMap::new();
+        ctx2.insert("username".to_string(), vec!["!!!not-base64!!!".to_string(), "aGVsbG8=".to_string()]);
+        assert!(!f.evaluate(&ctx2));
     }
 
     #[test]
