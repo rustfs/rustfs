@@ -86,10 +86,6 @@ pub struct Disk {
     pub write_latency: f64,
     pub utilization: f64,
     pub metrics: Option<DiskMetrics>,
-    #[serde(rename = "runtimeState", default, skip_serializing_if = "Option::is_none")]
-    pub runtime_state: Option<String>,
-    #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
-    pub offline_duration_seconds: Option<u64>,
     pub heal_info: Option<HealingDisk>,
     pub used_inodes: u64,
     pub free_inodes: u64,
@@ -97,6 +93,10 @@ pub struct Disk {
     pub pool_index: i32,
     pub set_index: i32,
     pub disk_index: i32,
+    #[serde(rename = "runtimeState", default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub offline_duration_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -353,9 +353,49 @@ pub struct InfoMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmp_serde::{Deserializer, Serializer};
     use serde_json;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Cursor};
     use time::OffsetDateTime;
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LegacyDiskCompat {
+        endpoint: String,
+        #[serde(rename = "rootDisk")]
+        root_disk: bool,
+        #[serde(rename = "path")]
+        drive_path: String,
+        healing: bool,
+        scanning: bool,
+        state: String,
+        uuid: String,
+        major: u32,
+        minor: u32,
+        model: Option<String>,
+        #[serde(rename = "totalspace")]
+        total_space: u64,
+        #[serde(rename = "usedspace")]
+        used_space: u64,
+        #[serde(rename = "availspace")]
+        available_space: u64,
+        #[serde(rename = "readthroughput")]
+        read_throughput: f64,
+        #[serde(rename = "writethroughput")]
+        write_throughput: f64,
+        #[serde(rename = "readlatency")]
+        read_latency: f64,
+        #[serde(rename = "writelatency")]
+        write_latency: f64,
+        utilization: f64,
+        metrics: Option<DiskMetrics>,
+        heal_info: Option<HealingDisk>,
+        used_inodes: u64,
+        free_inodes: u64,
+        local: bool,
+        pool_index: i32,
+        set_index: i32,
+        disk_index: i32,
+    }
 
     #[test]
     fn test_item_state_to_string() {
@@ -494,6 +534,47 @@ mod tests {
         assert_eq!(disk.runtime_state.as_deref(), Some("online"));
         assert_eq!(disk.offline_duration_seconds, Some(0));
         assert!(disk.local);
+    }
+
+    #[test]
+    fn test_disk_msgpack_backward_compat_from_legacy_layout() {
+        let legacy = LegacyDiskCompat {
+            endpoint: "http://legacy-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/legacy".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "legacy-uuid".to_string(),
+            major: 8,
+            minor: 2,
+            model: Some("legacy".to_string()),
+            total_space: 42,
+            used_space: 12,
+            available_space: 30,
+            read_throughput: 1.0,
+            write_throughput: 2.0,
+            read_latency: 3.0,
+            write_latency: 4.0,
+            utilization: 5.0,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 11_125,
+            free_inodes: 98_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+        };
+
+        let mut encoded = Vec::new();
+        legacy.serialize(&mut Serializer::new(&mut encoded)).unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: Disk = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 11_125);
+        assert_eq!(decoded.runtime_state, None);
+        assert_eq!(decoded.offline_duration_seconds, None);
     }
 
     #[test]

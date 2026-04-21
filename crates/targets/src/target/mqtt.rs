@@ -467,12 +467,12 @@ impl MQTTArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration("mqtt queueDir path should be absolute".to_string()));
+                return Err(TargetError::Configuration("mqtt queue_dir path should be absolute".to_string()));
             }
 
             if self.qos == QoS::AtMostOnce {
                 return Err(TargetError::Configuration(
-                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queueDir is set".to_string(),
+                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queue_dir is set".to_string(),
                 ));
             }
         }
