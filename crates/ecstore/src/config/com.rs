@@ -40,6 +40,8 @@ const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
+pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
+
 static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
 
 static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
@@ -264,15 +266,15 @@ fn parse_oidc_scalar_value(key: &str, value: &Value) -> Option<String> {
         }),
         Value::Bool(v) => Some(v.to_string()),
         Value::Number(v) => Some(v.to_string()),
-        Value::Array(values) if key == rustfs_config::oidc::OIDC_SCOPES => {
-            let scopes = values
+        Value::Array(values) if COMMA_SEPARATED_LISTS.contains(&key) => {
+            let values_str = values
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::trim)
-                .filter(|scope| !scope.is_empty())
+                .filter(|val| !val.is_empty())
                 .collect::<Vec<_>>()
                 .join(",");
-            Some(scopes)
+            Some(values_str)
         }
         Value::Null => None,
         _ => None,
@@ -570,15 +572,15 @@ fn build_oidc_provider_object(kvs: &KVS) -> Map<String, Value> {
             continue;
         }
 
-        if kv.key == rustfs_config::oidc::OIDC_SCOPES {
-            let scopes = kv
+        if COMMA_SEPARATED_LISTS.contains(&kv.key.as_str()) {
+            let values = kv
                 .value
                 .split(',')
                 .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-                .map(|scope| Value::String(scope.to_string()))
+                .filter(|val| !val.is_empty())
+                .map(|val| Value::String(val.to_string()))
                 .collect::<Vec<_>>();
-            provider.insert(kv.key.clone(), Value::Array(scopes));
+            provider.insert(kv.key.clone(), Value::Array(values));
             continue;
         }
 
@@ -1689,6 +1691,7 @@ mod tests {
               "client_id":"console",
               "client_secret":"secret-value",
               "scopes":["openid","profile","email"],
+              "other_audiences":["aud1", "aud2"],
               "redirect_uri_dynamic":true,
               "display_name":"Default Provider"
             },
@@ -1713,6 +1716,7 @@ mod tests {
         );
         assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "console");
         assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_SCOPES), "openid,profile,email");
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_OTHER_AUDIENCES), "aud1,aud2");
         assert_eq!(default_kvs.get(ENABLE_KEY), EnableState::On.to_string());
 
         let smoke_kvs = cfg
@@ -1897,6 +1901,7 @@ mod tests {
         );
         default_provider.insert(rustfs_config::oidc::OIDC_CLIENT_ID.to_string(), "console".to_string());
         default_provider.insert(rustfs_config::oidc::OIDC_SCOPES.to_string(), "openid,profile,email".to_string());
+        default_provider.insert(rustfs_config::oidc::OIDC_OTHER_AUDIENCES.to_string(), "aud1,aud2".to_string());
         oidc_section.insert(DEFAULT_DELIMITER.to_string(), default_provider);
         cfg.0.insert(IDENTITY_OPENID_SUB_SYS.to_string(), oidc_section);
 
@@ -1923,6 +1928,13 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
             Some(vec!["openid", "profile", "email"])
+        );
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_OTHER_AUDIENCES)
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["aud1", "aud2"])
         );
         assert_eq!(default_provider.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
     }
