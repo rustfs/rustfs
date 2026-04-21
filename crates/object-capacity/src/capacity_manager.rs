@@ -20,13 +20,14 @@ use futures::FutureExt;
 use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
-    DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_CAPACITY_STALL_TIMEOUT_SECS,
-    DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
-    DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
-    ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS,
-    ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_SYMLINK_DEPTH, ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_MIN_TIMEOUT,
-    ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL, ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT,
-    ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS,
+    DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE,
+    DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD,
+    DEFAULT_WRITE_TRIGGER_DELAY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
+    ENV_CAPACITY_FOLLOW_SYMLINKS, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_SYMLINK_DEPTH, ENV_CAPACITY_MAX_TIMEOUT,
+    ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL,
+    ENV_CAPACITY_STALL_TIMEOUT, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+    ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_current_bytes, record_capacity_dirty_disk_count, record_capacity_refresh_inflight,
@@ -63,6 +64,8 @@ struct CachedCapacityConfig {
     stat_timeout: Duration,
     /// Sample rate
     sample_rate: usize,
+    /// Metrics logging interval
+    metrics_interval: Duration,
     /// Follow symlinks flag
     follow_symlinks: bool,
     /// Max symlink depth
@@ -97,6 +100,10 @@ impl CachedCapacityConfig {
             max_files_threshold: get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD),
             stat_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS)),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
+            metrics_interval: Duration::from_secs(get_env_u64(
+                ENV_CAPACITY_METRICS_INTERVAL,
+                DEFAULT_CAPACITY_METRICS_INTERVAL_SECS,
+            )),
             follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
             max_symlink_depth: get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8,
             enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
@@ -202,6 +209,18 @@ pub fn get_sample_rate() -> usize {
 #[cfg(test)]
 pub fn get_sample_rate() -> usize {
     get_cached_config().sample_rate
+}
+
+/// Get capacity metrics logging interval from environment or default
+#[cfg(not(test))]
+pub fn get_metrics_interval() -> Duration {
+    get_cached_config().metrics_interval
+}
+
+/// Get capacity metrics logging interval from environment or default (test mode)
+#[cfg(test)]
+pub fn get_metrics_interval() -> Duration {
+    get_cached_config().metrics_interval
 }
 
 /// Get follow symlinks flag from environment or default
@@ -462,6 +481,8 @@ pub struct HybridStrategyConfig {
     pub write_frequency_threshold: usize,
     /// Fast update threshold
     pub fast_update_threshold: Duration,
+    /// Metrics logging interval
+    pub metrics_interval: Duration,
     /// Enable smart update
     pub enable_smart_update: bool,
     /// Enable write trigger
@@ -475,6 +496,7 @@ impl Default for HybridStrategyConfig {
             write_trigger_delay: get_write_trigger_delay(),
             write_frequency_threshold: get_write_frequency_threshold(),
             fast_update_threshold: get_fast_update_threshold(),
+            metrics_interval: get_metrics_interval(),
             enable_smart_update: true,
             enable_write_trigger: true,
         }
@@ -877,6 +899,35 @@ impl HybridCapacityManager {
     pub async fn refresh_in_progress(&self) -> bool {
         self.refresh_state.lock().await.running
     }
+
+    /// Log capacity runtime summary for observability.
+    async fn log_runtime_summary(&self) {
+        let cached = self.get_capacity().await;
+        let recent_write_frequency = self.get_write_frequency().await;
+        let dirty_disks = self.get_dirty_disks().await;
+        let refresh_running = self.refresh_in_progress().await;
+
+        if let Some(cached) = cached {
+            info!(
+                total_used = cached.total_used,
+                file_count = cached.file_count,
+                estimated = cached.is_estimated,
+                source = ?cached.source,
+                cache_age_secs = cached.last_update.elapsed().as_secs(),
+                writes_per_minute = recent_write_frequency,
+                dirty_disk_count = dirty_disks.len(),
+                refresh_inflight = refresh_running,
+                "Capacity metrics summary"
+            );
+        } else {
+            info!(
+                writes_per_minute = recent_write_frequency,
+                dirty_disk_count = dirty_disks.len(),
+                refresh_inflight = refresh_running,
+                "Capacity metrics summary (cache empty)"
+            );
+        }
+    }
 }
 
 /// Global capacity manager instance
@@ -909,23 +960,30 @@ pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapaci
 /// Start background update task
 pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     let manager = get_capacity_manager();
-    let mut interval = manager.get_config().scheduled_update_interval;
+    let manager_for_refresh = manager.clone();
+    let manager_for_metrics = manager.clone();
+    let mut refresh_interval = manager.get_config().scheduled_update_interval;
+    let mut metrics_interval = manager.get_config().metrics_interval;
 
     // Prevent panic in tokio::time::interval when misconfigured to 0
-    if interval.is_zero() {
+    if refresh_interval.is_zero() {
         warn!("RUSTFS_CAPACITY_SCHEDULED_INTERVAL is configured as 0; clamping to 1s to avoid panic");
-        interval = Duration::from_secs(1);
+        refresh_interval = Duration::from_secs(1);
+    }
+    if metrics_interval.is_zero() {
+        warn!("RUSTFS_CAPACITY_METRICS_INTERVAL is configured as 0; clamping to 1s to avoid panic");
+        metrics_interval = Duration::from_secs(1);
     }
 
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(interval);
+        let mut timer = tokio::time::interval(refresh_interval);
 
         loop {
             timer.tick().await;
 
             info!("Starting scheduled capacity update");
             let start = Instant::now();
-            let manager = manager.clone();
+            let manager = manager_for_refresh.clone();
             let disks = disks.clone();
             let started = manager
                 .clone()
@@ -942,6 +1000,14 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
             }
         }
     });
+
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(metrics_interval);
+        loop {
+            timer.tick().await;
+            manager_for_metrics.log_runtime_summary().await;
+        }
+    });
 }
 
 // ============================================================================
@@ -953,8 +1019,9 @@ mod tests {
     use super::*;
     use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
-        ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE,
-        ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_METRICS_INTERVAL,
+        ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+        ENV_CAPACITY_WRITE_TRIGGER_DELAY,
     };
     use serial_test::serial;
     use std::sync::Arc;
@@ -1011,6 +1078,13 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_get_metrics_interval() {
+        let interval = get_metrics_interval();
+        assert_eq!(interval, Duration::from_secs(600));
+    }
+
+    #[test]
+    #[serial]
     fn test_env_var_override_scheduled_interval() {
         temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
             let interval = get_scheduled_update_interval();
@@ -1042,6 +1116,15 @@ mod tests {
         temp_env::with_var(ENV_CAPACITY_FAST_UPDATE_THRESHOLD, Some("120"), || {
             let threshold = get_fast_update_threshold();
             assert_eq!(threshold, Duration::from_secs(120));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_override_metrics_interval() {
+        temp_env::with_var(ENV_CAPACITY_METRICS_INTERVAL, Some("90"), || {
+            let interval = get_metrics_interval();
+            assert_eq!(interval, Duration::from_secs(90));
         });
     }
 
@@ -1214,6 +1297,7 @@ mod tests {
             write_trigger_delay: Duration::from_millis(50),
             write_frequency_threshold: 1,
             fast_update_threshold: Duration::from_millis(10),
+            metrics_interval: Duration::from_secs(600),
             enable_smart_update: true,
             enable_write_trigger: true,
         });
@@ -1244,6 +1328,7 @@ mod tests {
             write_trigger_delay: Duration::from_secs(60),
             write_frequency_threshold: 1,
             fast_update_threshold: Duration::from_millis(10),
+            metrics_interval: Duration::from_secs(600),
             enable_smart_update: true,
             enable_write_trigger: false,
         });
