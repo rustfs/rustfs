@@ -736,9 +736,10 @@ fn process_connection(
             // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
             .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
-            // Must run first on responses: clear the body and content-* headers
-            // for statuses that MUST NOT carry a body (1xx/204/304). Kept innermost
-            // so all other response-transforming layers see the already-bodyless
+            // Must run first on responses: clear the body and remove
+            // Content-Length, Content-Type, and Transfer-Encoding for statuses
+            // that MUST NOT carry a body (1xx/204/304). Kept innermost so all
+            // other response-transforming layers see the already-bodyless
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
             .service(service);
