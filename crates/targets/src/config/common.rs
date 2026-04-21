@@ -180,3 +180,52 @@ pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_
 pub(super) fn parse_url(value: &str, field_label: &str) -> Result<Url, TargetError> {
     Url::parse(value).map_err(|e| TargetError::Configuration(format!("Invalid {field_label}: {e} (value: '{value}')")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_nats_server_config, validate_pulsar_broker_config};
+    use async_nats::ServerAddr;
+    use rustfs_config::{
+        NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TOPIC,
+    };
+    use rustfs_ecstore::config::KVS;
+    use std::str::FromStr;
+
+    #[test]
+    fn validate_nats_server_config_rejects_multiple_auth_methods() {
+        let server = ServerAddr::from_str("nats://127.0.0.1:4222").expect("valid nats address");
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_TOKEN.to_string(), "token".to_string());
+        config.insert(NATS_USERNAME.to_string(), "user".to_string());
+        config.insert(NATS_PASSWORD.to_string(), "password".to_string());
+
+        let err = validate_nats_server_config(&server, &config, "").expect_err("conflicting auth should be rejected");
+
+        assert!(err.to_string().contains("only one auth method"));
+    }
+
+    #[test]
+    fn validate_nats_server_config_rejects_relative_queue_dir() {
+        let server = ServerAddr::from_str("nats://127.0.0.1:4222").expect("valid nats address");
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), "relative-queue".to_string());
+
+        let err = validate_nats_server_config(&server, &config, "").expect_err("relative queue_dir should be rejected");
+
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_pulsar_broker_config_rejects_tls_flags_without_tls_scheme() {
+        let mut config = KVS::new();
+        config.insert(PULSAR_TOPIC.to_string(), "events".to_string());
+        config.insert(PULSAR_TLS_ALLOW_INSECURE.to_string(), "on".to_string());
+
+        let err = validate_pulsar_broker_config("pulsar://127.0.0.1:6650", &config, "")
+            .expect_err("TLS flags should require pulsar+ssl");
+
+        assert!(err.to_string().contains("only allowed with pulsar+ssl"));
+    }
+}
