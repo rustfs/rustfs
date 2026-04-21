@@ -288,7 +288,7 @@ where
             bucket = %meta.bucket_name,
             object = %meta.object_name,
             event = %meta.event_name,
-            preview = %meta.best_effort_preview(&body, 256),
+            payload_len = body.len(),
             "Sending webhook payload"
         );
 
