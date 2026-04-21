@@ -164,8 +164,10 @@ where
             merged_config.extend(env_instance_cfg.clone());
         }
 
-        let redacted_config = redacted_target_config(&merged_config);
-        debug!(instance_id = %id, ?redacted_config, "Merged target configuration");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let redacted_config = redacted_target_config(&merged_config);
+            debug!(instance_id = %id, ?redacted_config, "Merged target configuration");
+        }
         if is_target_enabled(&merged_config) {
             merged_configs.push((id, merged_config));
         }

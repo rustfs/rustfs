@@ -119,8 +119,7 @@ parse_apply_cmd() {
     exit 1
   fi
 
-  # shellcheck disable=SC2206
-  APPLY_CMD_ARR=($raw)
+  IFS=$' \t\n' read -r -a APPLY_CMD_ARR <<< "$raw"
   if [[ "${#APPLY_CMD_ARR[@]}" -eq 0 ]]; then
     echo "ERROR: --apply-cmd must not be empty" >&2
     exit 1
