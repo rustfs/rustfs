@@ -1258,6 +1258,7 @@ mod tests {
             assert!(is_bodyless_status(StatusCode::CONTINUE));
             assert!(is_bodyless_status(StatusCode::SWITCHING_PROTOCOLS));
             assert!(is_bodyless_status(StatusCode::NO_CONTENT));
+            assert!(is_bodyless_status(StatusCode::RESET_CONTENT));
             assert!(is_bodyless_status(StatusCode::NOT_MODIFIED));
 
             assert!(!is_bodyless_status(StatusCode::OK));
