@@ -578,6 +578,51 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_msgpack_forward_compat_to_legacy_layout() {
+        let current = Disk {
+            endpoint: "http://current-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/current".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "current-uuid".to_string(),
+            major: 8,
+            minor: 3,
+            model: Some("current".to_string()),
+            total_space: 64,
+            used_space: 20,
+            available_space: 44,
+            read_throughput: 1.5,
+            write_throughput: 2.5,
+            read_latency: 3.5,
+            write_latency: 4.5,
+            utilization: 6.5,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 22_250,
+            free_inodes: 97_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
+        };
+
+        let mut encoded = Vec::new();
+        current
+            .serialize(&mut Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: LegacyDiskCompat = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 22_250);
+        assert_eq!(decoded.disk_index, 3);
+        assert_eq!(decoded.endpoint, "http://current-node:9000");
+    }
+
+    #[test]
     fn test_healing_disk_default() {
         let healing_disk = HealingDisk::default();
         assert!(healing_disk.id.is_empty());
