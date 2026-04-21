@@ -137,21 +137,21 @@ impl Default for PutObjectOptions {
 impl PutObjectOptions {
     fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header
-                .insert("If-Match", HeaderValue::from_str("*").expect("err"));
+            self.custom_header.insert("If-Match", HeaderValue::from_static("*"));
         } else {
-            self.custom_header
-                .insert("If-Match", HeaderValue::from_str(&format!("\"{}\"", etag)).expect("err"));
+            if let Ok(etag_value) = HeaderValue::from_str(&format!("\"{}\"", etag)) {
+                self.custom_header.insert("If-Match", etag_value);
+            }
         }
     }
 
     fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header
-                .insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
+            self.custom_header.insert("If-None-Match", HeaderValue::from_static("*"));
         } else {
-            self.custom_header
-                .insert("If-None-Match", HeaderValue::from_str(&format!("\"{etag}\"")).expect("err"));
+            if let Ok(etag_value) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+                self.custom_header.insert("If-None-Match", etag_value);
+            }
         }
     }
 
@@ -162,59 +162,75 @@ impl PutObjectOptions {
         if content_type == "" {
             content_type = "application/octet-stream".to_string();
         }
-        header.insert("Content-Type", HeaderValue::from_str(&content_type).expect("err"));
+        if let Ok(content_type_value) = HeaderValue::from_str(&content_type) {
+            header.insert("Content-Type", content_type_value);
+        }
 
         if self.content_encoding != "" {
-            header.insert("Content-Encoding", HeaderValue::from_str(&self.content_encoding).expect("err"));
+            if let Ok(encoding_value) = HeaderValue::from_str(&self.content_encoding) {
+                header.insert("Content-Encoding", encoding_value);
+            }
         }
         if self.content_disposition != "" {
-            header.insert("Content-Disposition", HeaderValue::from_str(&self.content_disposition).expect("err"));
+            if let Ok(disposition_value) = HeaderValue::from_str(&self.content_disposition) {
+                header.insert("Content-Disposition", disposition_value);
+            }
         }
         if self.content_language != "" {
-            header.insert("Content-Language", HeaderValue::from_str(&self.content_language).expect("err"));
+            if let Ok(language_value) = HeaderValue::from_str(&self.content_language) {
+                header.insert("Content-Language", language_value);
+            }
         }
         if self.cache_control != "" {
-            header.insert("Cache-Control", HeaderValue::from_str(&self.cache_control).expect("err"));
+            if let Ok(cache_value) = HeaderValue::from_str(&self.cache_control) {
+                header.insert("Cache-Control", cache_value);
+            }
         }
 
         if self.expires.unix_timestamp() != 0 {
-            header.insert(
-                "Expires",
-                HeaderValue::from_str(&self.expires.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
-            ); //rustfs invalid header
+            if let Ok(expires_str) = self.expires.format(ISO8601_DATEFORMAT) {
+                if let Ok(expires_value) = HeaderValue::from_str(&expires_str) {
+                    header.insert("Expires", expires_value);
+                }
+            }
         }
 
         if self.mode.as_str() != "" {
-            header.insert(X_AMZ_OBJECT_LOCK_MODE, HeaderValue::from_str(self.mode.as_str()).expect("err"));
+            if let Ok(mode_value) = HeaderValue::from_str(self.mode.as_str()) {
+                header.insert(X_AMZ_OBJECT_LOCK_MODE, mode_value);
+            }
         }
 
         if self.retain_until_date.unix_timestamp() != 0 {
-            header.insert(
-                X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-                HeaderValue::from_str(&self.retain_until_date.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
-            );
+            if let Ok(retain_str) = self.retain_until_date.format(ISO8601_DATEFORMAT) {
+                if let Ok(retain_value) = HeaderValue::from_str(&retain_str) {
+                    header.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, retain_value);
+                }
+            }
         }
 
         if self.legalhold.as_str() != "" {
-            header.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD, HeaderValue::from_str(self.legalhold.as_str()).expect("err"));
+            if let Ok(legalhold_value) = HeaderValue::from_str(self.legalhold.as_str()) {
+                header.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD, legalhold_value);
+            }
         }
 
         if self.storage_class != "" {
-            header.insert(X_AMZ_STORAGE_CLASS, HeaderValue::from_str(&self.storage_class).expect("err"));
+            if let Ok(storage_class_value) = HeaderValue::from_str(&self.storage_class) {
+                header.insert(X_AMZ_STORAGE_CLASS, storage_class_value);
+            }
         }
 
         if self.website_redirect_location != "" {
-            header.insert(
-                X_AMZ_WEBSITE_REDIRECT_LOCATION,
-                HeaderValue::from_str(&self.website_redirect_location).expect("err"),
-            );
+            if let Ok(redirect_value) = HeaderValue::from_str(&self.website_redirect_location) {
+                header.insert(X_AMZ_WEBSITE_REDIRECT_LOCATION, redirect_value);
+            }
         }
 
         if !self.internal.replication_status.as_str().is_empty() {
-            header.insert(
-                X_AMZ_REPLICATION_STATUS,
-                HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"),
-            );
+            if let Ok(replication_status_value) = HeaderValue::from_str(self.internal.replication_status.as_str()) {
+                header.insert(X_AMZ_REPLICATION_STATUS, replication_status_value);
+            }
         }
 
         for (k, v) in &self.user_metadata {
@@ -360,17 +376,21 @@ impl TransitionClient {
 
             let mut md5_base64: String = "".to_string();
             if opts.send_content_md5 {
-                let mut md5_hasher = self.md5_hasher.lock().unwrap();
-                let hash = md5_hasher.as_mut().expect("err");
-                let hash = hash.hash_encode(&buf[..length]);
-                md5_base64 = base64_encode(hash.as_ref());
+                if let Some(mut md5_hasher) = self.md5_hasher.lock().unwrap().as_mut() {
+                    let hash = md5_hasher.hash_encode(&buf[..length]);
+                    md5_base64 = base64_encode(hash.as_ref());
+                }
             } else {
                 let mut crc = opts.auto_checksum.hasher()?;
                 crc.update(&buf[..length]);
                 let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    custom_header.insert(header_name, base64_encode(csum.as_ref()).parse().expect("err"));
+                    if let Ok(header_value) = base64_encode(csum.as_ref()).parse() {
+                        custom_header.insert(header_name, header_value);
+                    } else {
+                        warn!("Failed to parse checksum value");
+                    }
                 } else {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }

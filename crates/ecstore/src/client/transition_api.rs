@@ -251,9 +251,10 @@ impl TransitionClient {
         };
 
         {
-            let mut md5_hasher = client.md5_hasher.lock().unwrap();
-            if md5_hasher.is_none() {
-                *md5_hasher = Some(HashAlgorithm::Md5);
+            if let Ok(mut md5_hasher) = client.md5_hasher.lock() {
+                if md5_hasher.is_none() {
+                    *md5_hasher = Some(HashAlgorithm::Md5);
+                }
             }
         }
         if client.sha256_hasher.is_none() {
@@ -275,25 +276,30 @@ impl TransitionClient {
     }
 
     fn trace_errors_only_off(&self) {
-        let mut trace_errors_only = self.trace_errors_only.lock().unwrap();
-        *trace_errors_only = false;
+        if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
+            *trace_errors_only = false;
+        }
     }
 
     fn trace_off(&self) {
-        let mut is_trace_enabled = self.is_trace_enabled.lock().unwrap();
-        *is_trace_enabled = false;
-        let mut trace_errors_only = self.trace_errors_only.lock().unwrap();
-        *trace_errors_only = false;
+        if let Ok(mut is_trace_enabled) = self.is_trace_enabled.lock() {
+            *is_trace_enabled = false;
+        }
+        if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
+            *trace_errors_only = false;
+        }
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
-        *endpoint = accelerate_endpoint.to_string();
+        if let Ok(mut endpoint) = self.s3_accelerate_endpoint.lock() {
+            *endpoint = accelerate_endpoint.to_string();
+        }
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
-        *dual_stack = enabled;
+        if let Ok(mut dual_stack) = self.s3_dual_stack_enabled.lock() {
+            *dual_stack = enabled;
+        }
     }
 
     pub fn hash_materials(
@@ -352,7 +358,6 @@ impl TransitionClient {
         let resp;
         let http_client = self.http_client.clone();
         {
-            //let mut http_client = http_client.lock().unwrap();
             req_method = req.method().clone();
             req_uri = req.uri().clone();
             req_headers = req.headers().clone();
@@ -368,7 +373,10 @@ impl TransitionClient {
             return Err(std::io::Error::other(err));
         }
 
-        let resp = resp.unwrap();
+        let resp = match resp {
+            Ok(r) => r,
+            Err(_) => return Err(std::io::Error::other("Unexpected error in response")),
+        };
         debug!("http_resp: {:?}", resp);
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
@@ -455,11 +463,13 @@ impl TransitionClient {
                             return Err(std::io::Error::other(err_response));
                         }
                         if metadata.bucket_name != "" {
-                            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-                            let location = bucket_loc_cache.get(&metadata.bucket_name);
-                            if location.is_some() && location.unwrap() != err_response.region {
-                                bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
-                                //continue;
+                            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                                if let Some(location) = bucket_loc_cache.get(&metadata.bucket_name) {
+                                    if location != err_response.region {
+                                        bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
+                                        //continue;
+                                    }
+                                }
                             }
                         } else if err_response.region != metadata.bucket_location {
                             metadata.bucket_location = err_response.region.clone();
@@ -518,8 +528,11 @@ impl TransitionClient {
 
         let value;
         {
-            let mut creds_provider = self.creds_provider.lock().unwrap();
-            value = creds_provider.get_with_context(Some(self.cred_context()))?;
+            if let Ok(mut creds_provider) = self.creds_provider.lock() {
+                value = creds_provider.get_with_context(Some(self.cred_context()))?;
+            } else {
+                return Err(std::io::Error::other("Failed to acquire credentials provider lock"));
+            }
         }
 
         let mut signer_type = value.signer_type.clone();
@@ -548,8 +561,10 @@ impl TransitionClient {
                     )));
                 }
                 let headers = req.headers_mut();
-                for (k, v) in metadata.extra_pre_sign_header.as_ref().unwrap() {
-                    headers.insert(k, v.clone());
+                if let Some(extra_headers) = metadata.extra_pre_sign_header.as_ref() {
+                    for (k, v) in extra_headers {
+                        headers.insert(k, v.clone());
+                    }
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
@@ -571,18 +586,22 @@ impl TransitionClient {
         self.set_user_agent(&mut req);
 
         for (k, v) in metadata.custom_header.clone() {
-            req.headers_mut().insert(k.expect("err"), v);
+            if let Some(key) = k {
+                req.headers_mut().insert(key, v);
+            }
         }
 
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
-            let chunked_value = HeaderValue::from_str(&vec!["chunked"].join(",")).expect("err");
-            req.headers_mut().insert(http::header::TRANSFER_ENCODING, chunked_value);
+            if let Ok(chunked_value) = HeaderValue::from_str(&vec!["chunked"].join(",")) {
+                req.headers_mut().insert(http::header::TRANSFER_ENCODING, chunked_value);
+            }
         }
 
         if metadata.content_md5_base64.len() > 0 {
-            let md5_value = HeaderValue::from_str(&metadata.content_md5_base64).expect("err");
-            req.headers_mut().insert("Content-Md5", md5_value);
+            if let Ok(md5_value) = HeaderValue::from_str(&metadata.content_md5_base64) {
+                req.headers_mut().insert("Content-Md5", md5_value);
+            }
         }
 
         if signer_type == SignatureType::SignatureAnonymous {
@@ -607,8 +626,13 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            req.headers_mut()
-                .insert("X-Amz-Content-Sha256".parse::<HeaderName>().unwrap(), sha_header.parse().expect("err"));
+            let header_name = "X-Amz-Content-Sha256"
+                .parse::<HeaderName>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let header_value = sha_header
+                .parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            req.headers_mut().insert(header_name, header_value);
 
             req = rustfs_signer::sign_v4_trailer(
                 req,
@@ -636,7 +660,7 @@ impl TransitionClient {
 
     pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
         let headers = req.headers_mut();
-        headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
+        headers.insert("User-Agent", HeaderValue::from_static(C_USER_AGENT));
     }
 
     fn make_target_url(
@@ -648,7 +672,10 @@ impl TransitionClient {
         query_values: &HashMap<String, String>,
     ) -> Result<Url, std::io::Error> {
         let scheme = self.endpoint_url.scheme();
-        let host = self.endpoint_url.host().unwrap();
+        let host = self
+            .endpoint_url
+            .host()
+            .ok_or_else(|| std::io::Error::other("Endpoint URL has no host"))?;
         let default_port = if scheme == "https" { 443 } else { 80 };
         let port = self.endpoint_url.port().unwrap_or(default_port);
 
@@ -1155,9 +1182,10 @@ pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Re
         for (name, value) in h.iter() {
             let header_name = name.as_str().to_lowercase();
             if header_name.starts_with("x-amz-meta-") {
-                let key = header_name.strip_prefix("x-amz-meta-").unwrap().to_string();
-                if let Ok(value_str) = value.to_str() {
-                    meta.insert(key, value_str.to_string());
+                if let Some(key) = header_name.strip_prefix("x-amz-meta-") {
+                    if let Ok(value_str) = value.to_str() {
+                        meta.insert(key.to_string(), value_str.to_string());
+                    }
                 }
             }
         }

@@ -155,49 +155,67 @@ impl Clone for TierConfig {
         let mut r2 = None;
         match self.tier_type {
             TierType::S3 => {
-                let mut s3_ = self.s3.as_ref().expect("err").clone();
-                s3_.secret_key = "REDACTED".to_string();
-                s3 = Some(s3_);
+                if let Some(s3_) = self.s3.as_ref() {
+                    let mut s3_clone = s3_.clone();
+                    s3_clone.secret_key = "REDACTED".to_string();
+                    s3 = Some(s3_clone);
+                }
             }
             TierType::RustFS => {
-                let mut r_ = self.rustfs.as_ref().expect("err").clone();
-                r_.secret_key = "REDACTED".to_string();
-                r = Some(r_);
+                if let Some(r_) = self.rustfs.as_ref() {
+                    let mut r_clone = r_.clone();
+                    r_clone.secret_key = "REDACTED".to_string();
+                    r = Some(r_clone);
+                }
             }
             TierType::MinIO => {
-                let mut compatible_backend_ = self.minio.as_ref().expect("err").clone();
-                compatible_backend_.secret_key = "REDACTED".to_string();
-                compatible_backend = Some(compatible_backend_);
+                if let Some(compatible_backend_) = self.minio.as_ref() {
+                    let mut compatible_backend_clone = compatible_backend_.clone();
+                    compatible_backend_clone.secret_key = "REDACTED".to_string();
+                    compatible_backend = Some(compatible_backend_clone);
+                }
             }
             TierType::Aliyun => {
-                let mut aliyun_ = self.aliyun.as_ref().expect("err").clone();
-                aliyun_.secret_key = "REDACTED".to_string();
-                aliyun = Some(aliyun_);
+                if let Some(aliyun_) = self.aliyun.as_ref() {
+                    let mut aliyun_clone = aliyun_.clone();
+                    aliyun_clone.secret_key = "REDACTED".to_string();
+                    aliyun = Some(aliyun_clone);
+                }
             }
             TierType::Tencent => {
-                let mut tencent_ = self.tencent.as_ref().expect("err").clone();
-                tencent_.secret_key = "REDACTED".to_string();
-                tencent = Some(tencent_);
+                if let Some(tencent_) = self.tencent.as_ref() {
+                    let mut tencent_clone = tencent_.clone();
+                    tencent_clone.secret_key = "REDACTED".to_string();
+                    tencent = Some(tencent_clone);
+                }
             }
             TierType::Huaweicloud => {
-                let mut huaweicloud_ = self.huaweicloud.as_ref().expect("err").clone();
-                huaweicloud_.secret_key = "REDACTED".to_string();
-                huaweicloud = Some(huaweicloud_);
+                if let Some(huaweicloud_) = self.huaweicloud.as_ref() {
+                    let mut huaweicloud_clone = huaweicloud_.clone();
+                    huaweicloud_clone.secret_key = "REDACTED".to_string();
+                    huaweicloud = Some(huaweicloud_clone);
+                }
             }
             TierType::Azure => {
-                let mut azure_ = self.azure.as_ref().expect("err").clone();
-                azure_.secret_key = "REDACTED".to_string();
-                azure = Some(azure_);
+                if let Some(azure_) = self.azure.as_ref() {
+                    let mut azure_clone = azure_.clone();
+                    azure_clone.secret_key = "REDACTED".to_string();
+                    azure = Some(azure_clone);
+                }
             }
             TierType::GCS => {
-                let mut gcs_ = self.gcs.as_ref().expect("err").clone();
-                gcs_.creds = "REDACTED".to_string();
-                gcs = Some(gcs_);
+                if let Some(gcs_) = self.gcs.as_ref() {
+                    let mut gcs_clone = gcs_.clone();
+                    gcs_clone.creds = "REDACTED".to_string();
+                    gcs = Some(gcs_clone);
+                }
             }
             TierType::R2 => {
-                let mut r2_ = self.r2.as_ref().expect("err").clone();
-                r2_.secret_key = "REDACTED".to_string();
-                r2 = Some(r2_);
+                if let Some(r2_) = self.r2.as_ref() {
+                    let mut r2_clone = r2_.clone();
+                    r2_clone.secret_key = "REDACTED".to_string();
+                    r2 = Some(r2_clone);
+                }
             }
             _ => (),
         }
@@ -222,15 +240,15 @@ impl Clone for TierConfig {
 impl TierConfig {
     fn endpoint(&self) -> String {
         match self.tier_type {
-            TierType::S3 => self.s3.as_ref().expect("err").endpoint.clone(),
-            TierType::RustFS => self.rustfs.as_ref().expect("err").endpoint.clone(),
-            TierType::MinIO => self.minio.as_ref().expect("err").endpoint.clone(),
-            TierType::Aliyun => self.aliyun.as_ref().expect("err").endpoint.clone(),
-            TierType::Tencent => self.tencent.as_ref().expect("err").endpoint.clone(),
-            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").endpoint.clone(),
-            TierType::Azure => self.azure.as_ref().expect("err").endpoint.clone(),
-            TierType::GCS => self.gcs.as_ref().expect("err").endpoint.clone(),
-            TierType::R2 => self.r2.as_ref().expect("err").endpoint.clone(),
+            TierType::S3 => self.s3.as_ref().map(|s| s.endpoint.clone()).unwrap_or_default(),
+            TierType::RustFS => self.rustfs.as_ref().map(|r| r.endpoint.clone()).unwrap_or_default(),
+            TierType::MinIO => self.minio.as_ref().map(|m| m.endpoint.clone()).unwrap_or_default(),
+            TierType::Aliyun => self.aliyun.as_ref().map(|a| a.endpoint.clone()).unwrap_or_default(),
+            TierType::Tencent => self.tencent.as_ref().map(|t| t.endpoint.clone()).unwrap_or_default(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().map(|h| h.endpoint.clone()).unwrap_or_default(),
+            TierType::Azure => self.azure.as_ref().map(|a| a.endpoint.clone()).unwrap_or_default(),
+            TierType::GCS => self.gcs.as_ref().map(|g| g.endpoint.clone()).unwrap_or_default(),
+            TierType::R2 => self.r2.as_ref().map(|r| r.endpoint.clone()).unwrap_or_default(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -240,15 +258,15 @@ impl TierConfig {
 
     fn bucket(&self) -> String {
         match self.tier_type {
-            TierType::S3 => self.s3.as_ref().expect("err").bucket.clone(),
-            TierType::RustFS => self.rustfs.as_ref().expect("err").bucket.clone(),
-            TierType::MinIO => self.minio.as_ref().expect("err").bucket.clone(),
-            TierType::Aliyun => self.aliyun.as_ref().expect("err").bucket.clone(),
-            TierType::Tencent => self.tencent.as_ref().expect("err").bucket.clone(),
-            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").bucket.clone(),
-            TierType::Azure => self.azure.as_ref().expect("err").bucket.clone(),
-            TierType::GCS => self.gcs.as_ref().expect("err").bucket.clone(),
-            TierType::R2 => self.r2.as_ref().expect("err").bucket.clone(),
+            TierType::S3 => self.s3.as_ref().map(|s| s.bucket.clone()).unwrap_or_default(),
+            TierType::RustFS => self.rustfs.as_ref().map(|r| r.bucket.clone()).unwrap_or_default(),
+            TierType::MinIO => self.minio.as_ref().map(|m| m.bucket.clone()).unwrap_or_default(),
+            TierType::Aliyun => self.aliyun.as_ref().map(|a| a.bucket.clone()).unwrap_or_default(),
+            TierType::Tencent => self.tencent.as_ref().map(|t| t.bucket.clone()).unwrap_or_default(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().map(|h| h.bucket.clone()).unwrap_or_default(),
+            TierType::Azure => self.azure.as_ref().map(|a| a.bucket.clone()).unwrap_or_default(),
+            TierType::GCS => self.gcs.as_ref().map(|g| g.bucket.clone()).unwrap_or_default(),
+            TierType::R2 => self.r2.as_ref().map(|r| r.bucket.clone()).unwrap_or_default(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -258,15 +276,15 @@ impl TierConfig {
 
     fn prefix(&self) -> String {
         match self.tier_type {
-            TierType::S3 => self.s3.as_ref().expect("err").prefix.clone(),
-            TierType::RustFS => self.rustfs.as_ref().expect("err").prefix.clone(),
-            TierType::MinIO => self.minio.as_ref().expect("err").prefix.clone(),
-            TierType::Aliyun => self.aliyun.as_ref().expect("err").prefix.clone(),
-            TierType::Tencent => self.tencent.as_ref().expect("err").prefix.clone(),
-            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").prefix.clone(),
-            TierType::Azure => self.azure.as_ref().expect("err").prefix.clone(),
-            TierType::GCS => self.gcs.as_ref().expect("err").prefix.clone(),
-            TierType::R2 => self.r2.as_ref().expect("err").prefix.clone(),
+            TierType::S3 => self.s3.as_ref().map(|s| s.prefix.clone()).unwrap_or_default(),
+            TierType::RustFS => self.rustfs.as_ref().map(|r| r.prefix.clone()).unwrap_or_default(),
+            TierType::MinIO => self.minio.as_ref().map(|m| m.prefix.clone()).unwrap_or_default(),
+            TierType::Aliyun => self.aliyun.as_ref().map(|a| a.prefix.clone()).unwrap_or_default(),
+            TierType::Tencent => self.tencent.as_ref().map(|t| t.prefix.clone()).unwrap_or_default(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().map(|h| h.prefix.clone()).unwrap_or_default(),
+            TierType::Azure => self.azure.as_ref().map(|a| a.prefix.clone()).unwrap_or_default(),
+            TierType::GCS => self.gcs.as_ref().map(|g| g.prefix.clone()).unwrap_or_default(),
+            TierType::R2 => self.r2.as_ref().map(|r| r.prefix.clone()).unwrap_or_default(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
@@ -276,15 +294,15 @@ impl TierConfig {
 
     fn region(&self) -> String {
         match self.tier_type {
-            TierType::S3 => self.s3.as_ref().expect("err").region.clone(),
-            TierType::RustFS => self.rustfs.as_ref().expect("err").region.clone(),
-            TierType::MinIO => self.minio.as_ref().expect("err").region.clone(),
-            TierType::Aliyun => self.aliyun.as_ref().expect("err").region.clone(),
-            TierType::Tencent => self.tencent.as_ref().expect("err").region.clone(),
-            TierType::Huaweicloud => self.huaweicloud.as_ref().expect("err").region.clone(),
-            TierType::Azure => self.azure.as_ref().expect("err").region.clone(),
-            TierType::GCS => self.gcs.as_ref().expect("err").region.clone(),
-            TierType::R2 => self.r2.as_ref().expect("err").region.clone(),
+            TierType::S3 => self.s3.as_ref().map(|s| s.region.clone()).unwrap_or_default(),
+            TierType::RustFS => self.rustfs.as_ref().map(|r| r.region.clone()).unwrap_or_default(),
+            TierType::MinIO => self.minio.as_ref().map(|m| m.region.clone()).unwrap_or_default(),
+            TierType::Aliyun => self.aliyun.as_ref().map(|a| a.region.clone()).unwrap_or_default(),
+            TierType::Tencent => self.tencent.as_ref().map(|t| t.region.clone()).unwrap_or_default(),
+            TierType::Huaweicloud => self.huaweicloud.as_ref().map(|h| h.region.clone()).unwrap_or_default(),
+            TierType::Azure => self.azure.as_ref().map(|a| a.region.clone()).unwrap_or_default(),
+            TierType::GCS => self.gcs.as_ref().map(|g| g.region.clone()).unwrap_or_default(),
+            TierType::R2 => self.r2.as_ref().map(|r| r.region.clone()).unwrap_or_default(),
             _ => {
                 info!("unexpected tier type {}", self.tier_type);
                 "".to_string()
