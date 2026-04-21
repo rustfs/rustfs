@@ -6,9 +6,16 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   secretName: {{ include "rustfs.fullname" . }}-server-tls
+  {{- if .Values.mtls.existingIssuerRef.enabled }}
+  issuerRef:
+    name: {{ .Values.mtls.existingIssuerRef.name }}
+    kind: {{ .Values.mtls.existingIssuerRef.kind }}
+    group: {{ .Values.mtls.existingIssuerRef.group }}
+  {{- else }}
   issuerRef:
     name: {{ include "rustfs.fullname" . }}-ca-issuer
     kind: Issuer
+  {{- end }}
   commonName: {{ include "rustfs.fullname" . }}-cluster
   dnsNames:
     - "*.{{ include "rustfs.fullname" . }}-headless"
