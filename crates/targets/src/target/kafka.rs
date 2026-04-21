@@ -18,22 +18,17 @@ use crate::{
     error::TargetError,
     store::{Key, QueueStore, Store},
     target::{
-        ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta,
-        TargetDeliveryCounters, TargetDeliverySnapshot, TargetType,
+        ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
+        TargetType,
     },
 };
 use async_trait::async_trait;
 use kafka::producer::{Producer, Record, RequiredAcks};
-use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use rustfs_config::audit::AUDIT_STORE_EXTENSION;
+use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::{
-    marker::PhantomData,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, error, info, instrument, warn};
 
 /// Arguments for configuring a Kafka target
@@ -73,9 +68,7 @@ impl KafkaArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration(
-                    "kafka queueDir path should be absolute".to_string(),
-                ));
+                return Err(TargetError::Configuration("kafka queueDir path should be absolute".to_string()));
             }
         }
 
@@ -107,8 +100,8 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Kafka.as_str().to_string());
 
         let queue_store = if !args.queue_dir.is_empty() {
-            let queue_dir = PathBuf::from(&args.queue_dir)
-                .join(format!("rustfs-{}-{}", ChannelTargetType::Kafka.as_str(), target_id.id));
+            let queue_dir =
+                PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Kafka.as_str(), target_id.id));
 
             let extension = match args.target_type {
                 TargetType::AuditLog => AUDIT_STORE_EXTENSION,
@@ -162,8 +155,7 @@ where
             records: vec![event.data.clone()],
         };
 
-        let body = serde_json::to_vec(&log)
-            .map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
 
         let meta = QueuedPayloadMeta::new(
             event.event_name,

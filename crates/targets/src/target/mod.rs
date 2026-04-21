@@ -25,12 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+pub mod kafka;
 pub mod mqtt;
 pub mod nats;
 pub mod pulsar;
 pub mod webhook;
-pub mod kafka;
-
 
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
