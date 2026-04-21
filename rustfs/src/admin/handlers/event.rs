@@ -14,6 +14,13 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    handlers::target_descriptor::{
+        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, allowed_target_keys,
+        collect_config_entry_keys as shared_collect_config_entry_keys,
+        collect_configured_endpoint_keys as shared_collect_configured_endpoint_keys,
+        collect_env_endpoint_keys as shared_collect_env_endpoint_keys, normalized_endpoint_key, target_service_name, target_spec,
+        validate_target_request,
+    },
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -24,23 +31,19 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{
-    NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_targets::{TargetError, check_mqtt_broker_available_with_tls, target::mqtt::MQTTTlsConfig};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::io::{Error, ErrorKind};
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 use tracing::{Span, info, warn};
-use url::Url;
 
 pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -94,8 +97,6 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-type EndpointKey = (String, String);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum NotificationEndpointSource {
@@ -105,8 +106,33 @@ enum NotificationEndpointSource {
     Runtime,
 }
 
-fn normalized_endpoint_key(account_id: &str, service: &str) -> EndpointKey {
-    (account_id.to_lowercase(), service.to_string())
+fn notification_target_specs() -> [AdminTargetSpec; 4] {
+    [
+        AdminTargetSpec {
+            subsystem: NOTIFY_WEBHOOK_SUB_SYS,
+            service: "webhook",
+            valid_keys: NOTIFY_WEBHOOK_KEYS,
+            validator: AdminTargetValidator::Webhook,
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_MQTT_SUB_SYS,
+            service: "mqtt",
+            valid_keys: NOTIFY_MQTT_KEYS,
+            validator: AdminTargetValidator::Mqtt,
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_NATS_SUB_SYS,
+            service: "nats",
+            valid_keys: NOTIFY_NATS_KEYS,
+            validator: AdminTargetValidator::Nats(TargetDomain::Notify),
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_PULSAR_SUB_SYS,
+            service: "pulsar",
+            valid_keys: NOTIFY_PULSAR_KEYS,
+            validator: AdminTargetValidator::Pulsar(TargetDomain::Notify),
+        },
+    ]
 }
 
 // --- Helper Functions ---
@@ -134,123 +160,16 @@ fn build_response(status: StatusCode, body: Body, request_id: Option<&http::Head
     S3Response::with_headers((status, body), header)
 }
 
-async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
-{
-    let mut attempts = 0;
-    let mut delay = base_delay;
-    let mut last_err = None;
-
-    while attempts < max_attempts {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                last_err = Some(e);
-                attempts += 1;
-                if attempts < max_attempts {
-                    sleep(delay).await;
-                    delay = delay.saturating_mul(2);
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| Error::other("retry_with_backoff: unknown error")))
-}
-
-async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
-    if !queue_dir.is_empty() {
-        if !Path::new(queue_dir).is_absolute() {
-            return Err(s3_error!(InvalidArgument, "queue_dir must be absolute path"));
-        }
-        retry_with_backoff(
-            || async { tokio::fs::metadata(queue_dir).await.map(|_| ()) },
-            3,
-            Duration::from_millis(100),
-        )
-        .await
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => s3_error!(InvalidArgument, "queue_dir does not exist"),
-            ErrorKind::PermissionDenied => s3_error!(InvalidArgument, "queue_dir exists but permission denied"),
-            _ => s3_error!(InvalidArgument, "failed to access queue_dir: {}", e),
-        })?;
-    }
-    Ok(())
-}
-
-fn config_enable_is_on(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
-}
-
 fn collect_configured_endpoint_keys(config: &Config) -> Vec<EndpointKey> {
-    let mut endpoints = Vec::new();
-    for (subsystem, service) in [(NOTIFY_WEBHOOK_SUB_SYS, "webhook"), (NOTIFY_MQTT_SUB_SYS, "mqtt")] {
-        let Some(targets) = config.0.get(subsystem) else {
-            continue;
-        };
-
-        for (target_name, kvs) in targets {
-            if target_name == DEFAULT_DELIMITER {
-                continue;
-            }
-            let enabled = kvs.lookup(ENABLE_KEY).as_deref().map(config_enable_is_on).unwrap_or(false);
-            if enabled {
-                endpoints.push((target_name.clone(), service.to_string()));
-            }
-        }
-    }
-    endpoints
+    shared_collect_configured_endpoint_keys(&notification_target_specs(), config)
 }
 
 fn collect_config_entry_keys(config: &Config) -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-    for (subsystem, service) in [(NOTIFY_WEBHOOK_SUB_SYS, "webhook"), (NOTIFY_MQTT_SUB_SYS, "mqtt")] {
-        let Some(targets) = config.0.get(subsystem) else {
-            continue;
-        };
-
-        for target_name in targets.keys() {
-            if target_name == DEFAULT_DELIMITER {
-                continue;
-            }
-            endpoints.insert(normalized_endpoint_key(target_name, service));
-        }
-    }
-    endpoints
+    shared_collect_config_entry_keys(&notification_target_specs(), config)
 }
 
 fn collect_env_endpoint_keys() -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-
-    for (service, valid_keys) in [("webhook", NOTIFY_WEBHOOK_KEYS), ("mqtt", NOTIFY_MQTT_KEYS)] {
-        let env_prefix = format!("{ENV_PREFIX}{NOTIFY_ROUTE_PREFIX}{service}{DEFAULT_DELIMITER}").to_uppercase();
-
-        for (key, _value) in std::env::vars() {
-            let Some(rest) = key.strip_prefix(&env_prefix) else {
-                continue;
-            };
-
-            let mut parts = rest.rsplitn(2, DEFAULT_DELIMITER);
-            let instance_id_part = parts.next().unwrap_or(DEFAULT_DELIMITER);
-            let field_name_part = parts.next();
-
-            let (field_name, instance_id) = match field_name_part {
-                Some(field) => (field.to_lowercase(), instance_id_part.to_lowercase()),
-                None => (instance_id_part.to_lowercase(), DEFAULT_DELIMITER.to_string()),
-            };
-
-            if instance_id == DEFAULT_DELIMITER || instance_id.is_empty() {
-                continue;
-            }
-
-            if valid_keys.contains(&field_name.as_str()) {
-                endpoints.insert(normalized_endpoint_key(&instance_id, service));
-            }
-        }
-    }
-
-    endpoints
+    shared_collect_env_endpoint_keys(&notification_target_specs(), NOTIFY_ROUTE_PREFIX)
 }
 
 fn classify_notification_endpoint_source(
@@ -269,11 +188,7 @@ fn classify_notification_endpoint_source(
 fn notification_endpoint_source(config: &Config, target_type: &str, target_name: &str) -> NotificationEndpointSource {
     let config_targets = collect_config_entry_keys(config);
     let env_targets = collect_env_endpoint_keys();
-    let service = match target_type {
-        NOTIFY_WEBHOOK_SUB_SYS => "webhook",
-        NOTIFY_MQTT_SUB_SYS => "mqtt",
-        _ => "",
-    };
+    let service = target_service_name(&notification_target_specs(), target_type).unwrap_or_default();
 
     let key = normalized_endpoint_key(target_name, service);
     classify_notification_endpoint_source(&config_targets, &env_targets, &key)
@@ -414,78 +329,15 @@ impl Operation for NotificationTarget {
         let notification_body: NotificationTargetBody = serde_json::from_slice(&body_bytes)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
 
-        let allowed_keys: HashSet<&str> = match target_type {
-            NOTIFY_WEBHOOK_SUB_SYS => rustfs_config::notify::NOTIFY_WEBHOOK_KEYS.iter().cloned().collect(),
-            NOTIFY_MQTT_SUB_SYS => rustfs_config::notify::NOTIFY_MQTT_KEYS.iter().cloned().collect(),
-            _ => unreachable!(),
-        };
+        let specs = notification_target_specs();
+        let allowed_keys: HashSet<&str> = allowed_target_keys(&specs, target_type);
 
         let kv_map = collect_validated_key_values(&notification_body.key_values, &allowed_keys, target_type)?;
-
-        // Type-specific validation
-        if target_type == NOTIFY_WEBHOOK_SUB_SYS {
-            let endpoint = kv_map
-                .get("endpoint")
-                .map(String::as_str)
-                .ok_or_else(|| s3_error!(InvalidArgument, "endpoint is required"))?;
-            let parsed_endpoint = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid endpoint url: {}", e))?;
-            match parsed_endpoint.scheme() {
-                "http" | "https" => {}
-                other => {
-                    return Err(s3_error!(
-                        InvalidArgument,
-                        "unsupported endpoint scheme: {} (only http and https are allowed)",
-                        other
-                    ));
-                }
-            }
-            if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir.as_str()).await?;
-            }
-            if kv_map.contains_key("client_cert") != kv_map.contains_key("client_key") {
-                return Err(s3_error!(InvalidArgument, "client_cert and client_key must be specified as a pair"));
-            }
-        } else if target_type == NOTIFY_MQTT_SUB_SYS {
-            let endpoint = kv_map
-                .get(rustfs_config::MQTT_BROKER)
-                .map(String::as_str)
-                .ok_or_else(|| s3_error!(InvalidArgument, "broker endpoint is required"))?;
-            let topic = kv_map
-                .get(rustfs_config::MQTT_TOPIC)
-                .map(String::as_str)
-                .ok_or_else(|| s3_error!(InvalidArgument, "topic is required"))?;
-            let username = kv_map.get(rustfs_config::MQTT_USERNAME).map(String::as_str);
-            let password = kv_map.get(rustfs_config::MQTT_PASSWORD).map(String::as_str);
-            let tls = MQTTTlsConfig::from_values(
-                kv_map.get(rustfs_config::MQTT_TLS_POLICY).map(String::as_str),
-                kv_map.get(rustfs_config::MQTT_TLS_CA).map(String::as_str),
-                kv_map.get(rustfs_config::MQTT_TLS_CLIENT_CERT).map(String::as_str),
-                kv_map.get(rustfs_config::MQTT_TLS_CLIENT_KEY).map(String::as_str),
-                kv_map.get(rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA).map(String::as_str),
-                kv_map.get(rustfs_config::MQTT_WS_PATH_ALLOWLIST).map(String::as_str),
-            )
-            .map_err(|e| s3_error!(InvalidArgument, "invalid MQTT TLS settings: {}", e))?;
-            let parsed_broker = Url::parse(endpoint).map_err(|e| s3_error!(InvalidArgument, "invalid broker URL: {}", e))?;
-            rustfs_targets::target::mqtt::validate_mqtt_broker_url(&parsed_broker, &tls)
-                .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
-            check_mqtt_broker_available_with_tls(parsed_broker.as_str(), topic, username, password, &tls)
-                .await
-                .map_err(|e| match e {
-                    TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
-                    _ => s3_error!(InvalidArgument, "MQTT broker check failed: {}", e),
-                })?;
-
-            if let Some(queue_dir) = kv_map.get("queue_dir") {
-                validate_queue_dir(queue_dir.as_str()).await?;
-                if let Some(qos) = kv_map.get("qos") {
-                    match qos.parse::<u8>() {
-                        Ok(1) | Ok(2) => {}
-                        Ok(0) => return Err(s3_error!(InvalidArgument, "qos should be 1 or 2 if queue_dir is set")),
-                        _ => return Err(s3_error!(InvalidArgument, "qos must be an integer 0, 1, or 2")),
-                    }
-                }
-            }
-        }
+        let spec = target_spec(&specs, target_type)
+            .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
+        timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR))
+            .await
+            .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
 
         let mut kvs = rustfs_ecstore::config::KVS::new();
         for (key, value) in kv_map {
@@ -616,7 +468,7 @@ fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str>
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
     let target_type = extract_param(params, "target_type")?;
-    if target_type != NOTIFY_WEBHOOK_SUB_SYS && target_type != NOTIFY_MQTT_SUB_SYS {
+    if target_service_name(&notification_target_specs(), target_type).is_none() {
         return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
     }
     let target_name = extract_param(params, "target_name")?;
@@ -626,6 +478,7 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::DEFAULT_DELIMITER;
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
     use std::collections::{HashMap, HashSet};
