@@ -1,3 +1,6 @@
+// Copyright (c) RustFS contributors
+// SPDX-License-Identifier: Apache-2.0
+
 use bytes::Bytes;
 use rustfs_protos::proto_gen::node_service::{
     ReadMultipleRequest, ReadMultipleResponse, ReadVersionResponse, ReadXlResponse, UpdateMetadataRequest, WriteMetadataRequest,

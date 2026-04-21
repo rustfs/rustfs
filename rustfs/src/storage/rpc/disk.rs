@@ -144,7 +144,7 @@ impl NodeService {
                 Err(err) => Ok(Response::new(ReadMultipleResponse {
                     success: false,
                     read_multiple_resps: Vec::new(),
-                    read_multiple_resps_bin: Vec::new().into(),
+                    read_multiple_resps_bin: Vec::new(),
                     error: Some(err.into()),
                 })),
             }
@@ -152,7 +152,7 @@ impl NodeService {
             Ok(Response::new(ReadMultipleResponse {
                 success: false,
                 read_multiple_resps: Vec::new(),
-                read_multiple_resps_bin: Vec::new().into(),
+                read_multiple_resps_bin: Vec::new(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
