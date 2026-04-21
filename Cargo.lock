@@ -8344,6 +8344,7 @@ dependencies = [
  "chrono",
  "humantime",
  "hyper",
+ "rmp-serde",
  "serde",
  "serde_json",
  "time",

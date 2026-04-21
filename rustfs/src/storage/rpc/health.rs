@@ -204,7 +204,9 @@ impl NodeService {
     ) -> Result<Response<ServerInfoResponse>, Status> {
         let info = get_local_server_property().await;
         let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+        // Use map encoding for forward/backward compatibility across mixed versions:
+        // unknown fields can be ignored by older nodes during deserialization.
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf).with_struct_map()) {
             return Ok(Response::new(ServerInfoResponse {
                 success: false,
                 server_properties: Bytes::new(),
