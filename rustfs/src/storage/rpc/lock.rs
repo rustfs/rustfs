@@ -30,6 +30,18 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
     }
 }
 
+fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> GenerallyLockResult {
+    if success {
+        GenerallyLockResult {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        }
+    } else {
+        lock_result_from_error(format!("lock not found for release: {lock_id}"))
+    }
+}
+
 impl NodeService {
     pub(super) async fn handle_refresh(
         &self,
@@ -71,12 +83,15 @@ impl NodeService {
         };
 
         let lock_client = self.get_lock_client()?;
-        match lock_client.release(&args.lock_id).await {
-            Ok(_) => Ok(Response::new(GenerallyLockResponse {
-                success: true,
-                error_info: None,
-                lock_info: None,
-            })),
+        match lock_client.force_release(&args.lock_id).await {
+            Ok(success) => {
+                let result = lock_result_from_release(&args.lock_id, success);
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: result.error_info,
+                    lock_info: None,
+                }))
+            }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!(
@@ -106,11 +121,14 @@ impl NodeService {
 
         let lock_client = self.get_lock_client()?;
         match lock_client.release(&args.lock_id).await {
-            Ok(_) => Ok(Response::new(GenerallyLockResponse {
-                success: true,
-                error_info: None,
-                lock_info: None,
-            })),
+            Ok(success) => {
+                let result = lock_result_from_release(&args.lock_id, success);
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: result.error_info,
+                    lock_info: None,
+                }))
+            }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!(
@@ -146,7 +164,7 @@ impl NodeService {
                 let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
                 Ok(Response::new(GenerallyLockResponse {
                     success: result.success,
-                    error_info: None,
+                    error_info: result.error,
                     lock_info: lock_info_json,
                 }))
             }
@@ -230,10 +248,9 @@ impl NodeService {
                 Ok(batch_results) => {
                     for (result_idx, success) in batch_results.into_iter().enumerate() {
                         if let Some(request_idx) = valid_indices.get(result_idx) {
-                            results[*request_idx] = GenerallyLockResult {
-                                success,
-                                error_info: None,
-                                lock_info: None,
+                            results[*request_idx] = match lock_ids.get(result_idx) {
+                                Some(lock_id) => lock_result_from_release(lock_id, success),
+                                None => lock_result_from_error(format!("unlock response index out of range: {result_idx}")),
                             };
                         }
                     }
@@ -247,5 +264,40 @@ impl NodeService {
         }
 
         Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_lock_id() -> rustfs_lock::LockId {
+        rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Exclusive, "owner")
+            .lock_id
+    }
+
+    #[test]
+    fn lock_result_from_release_reports_missing_lock() {
+        let lock_id = test_lock_id();
+        let result = lock_result_from_release(&lock_id, false);
+
+        assert!(!result.success);
+        assert!(result.lock_info.is_none());
+        assert!(
+            result
+                .error_info
+                .expect("missing release should include error")
+                .contains("lock not found for release")
+        );
+    }
+
+    #[test]
+    fn lock_result_from_response_preserves_lock_failure_error() {
+        let response = rustfs_lock::LockResponse::failure("lock conflict", std::time::Duration::ZERO);
+        let result = lock_result_from_response(response);
+
+        assert!(!result.success);
+        assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
+        assert!(result.lock_info.is_none());
     }
 }

@@ -16,7 +16,10 @@ use super::*;
 use crate::client::{ClientFactory, local::LocalClient};
 use crate::types::LockType;
 use crate::{GlobalLockManager, LockError, LockInfo, LockResponse, LockStats};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 #[derive(Debug, Default)]
@@ -107,11 +110,115 @@ impl crate::client::LockClient for DelayedClient {
     }
 }
 
+#[derive(Debug)]
+struct FlakyReleaseClient {
+    inner: LocalClient,
+    failed_releases_remaining: AtomicUsize,
+    release_attempts: AtomicUsize,
+}
+
+impl FlakyReleaseClient {
+    fn new(manager: Arc<GlobalLockManager>, failed_releases: usize) -> Self {
+        Self {
+            inner: LocalClient::with_manager(manager),
+            failed_releases_remaining: AtomicUsize::new(failed_releases),
+            release_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn release_attempts(&self) -> usize {
+        self.release_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FlakyReleaseClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        self.inner.acquire_lock(request).await
+    }
+
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.release_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failed_releases_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(false);
+        }
+
+        self.inner.release(lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.refresh(lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.force_release(lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.inner.check_status(lock_id).await
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn is_online(&self) -> bool {
+        true
+    }
+
+    async fn is_local(&self) -> bool {
+        true
+    }
+}
+
 fn create_test_object_key(bucket: &str, object: &str) -> ObjectKey {
     ObjectKey {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
         version: None,
+    }
+}
+
+async fn wait_until_all_managers_can_write(managers: &[Arc<GlobalLockManager>], resource: ObjectKey) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    loop {
+        let mut guards = Vec::with_capacity(managers.len());
+        let mut all_available = true;
+
+        for (idx, manager) in managers.iter().enumerate() {
+            let local_lock = NamespaceLock::with_local_manager(format!("probe-node-{idx}"), manager.clone());
+            match local_lock
+                .get_write_lock(resource.clone(), "probe-owner", Duration::from_millis(20))
+                .await
+            {
+                Ok(guard) => guards.push(guard),
+                Err(_) => {
+                    all_available = false;
+                    break;
+                }
+            }
+        }
+
+        drop(guards);
+
+        if all_available {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "distributed lock was not released on all simulated nodes"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -172,6 +279,24 @@ async fn test_lock_client_default_batch_acquire_and_release() {
     let released = client.release_locks_batch(&lock_ids).await.unwrap();
 
     assert_eq!(released, vec![true, true]);
+}
+
+#[tokio::test]
+async fn test_local_client_uses_request_lock_id_for_release() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client = LocalClient::with_manager(manager);
+    let resource = create_test_object_key("bucket", "object");
+    let request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a").with_acquire_timeout(Duration::from_secs(1));
+
+    let response = client.acquire_lock(&request).await.unwrap();
+    let lock_info = response.lock_info.expect("successful acquire should return lock info");
+    assert_eq!(lock_info.id, request.lock_id);
+
+    assert!(client.release(&request.lock_id).await.unwrap());
+
+    let second_request = LockRequest::new(resource, LockType::Exclusive, "owner-b").with_acquire_timeout(Duration::from_secs(1));
+    let second_response = client.acquire_lock(&second_request).await.unwrap();
+    assert!(second_response.success);
 }
 
 #[tokio::test]
@@ -489,6 +614,97 @@ async fn test_namespace_lock_distributed_with_clients_and_quorum() {
 }
 
 #[tokio::test]
+async fn test_namespace_lock_distributed_eight_node_write_releases_all_nodes() {
+    let managers = (0..8).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager(manager.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients_and_quorum("eight-node".to_string(), clients, 5);
+    let resource = create_test_object_key("bucket", "object-eight-node");
+
+    let mut guard = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("owner-a should acquire write lock across eight simulated nodes");
+
+    let err = lock
+        .get_write_lock(resource.clone(), "owner-b", Duration::from_millis(100))
+        .await
+        .expect_err("owner-b should not acquire while owner-a holds all node locks");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("required 5") && err_str.contains("achieved"),
+        "expected 8-node quorum failure below required write quorum, got: {err}"
+    );
+
+    assert!(guard.release(), "distributed guard should enqueue release");
+    wait_until_all_managers_can_write(&managers, resource).await;
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_unlock_retries_release_false() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyReleaseClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients("flaky-release".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-flaky-release");
+
+    let mut guard = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("owner-a should acquire write lock before flaky release");
+
+    assert!(guard.release(), "distributed guard should enqueue release");
+    wait_until_all_managers_can_write(&managers, resource).await;
+
+    assert!(
+        flaky_clients.iter().all(|client| client.release_attempts() >= 2),
+        "each simulated node should be retried after an initial false release"
+    );
+}
+
+#[test]
+fn test_namespace_lock_distributed_drop_without_runtime_does_not_panic() {
+    let (manager, resource, guard) = {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created");
+        runtime.block_on(async {
+            let manager = Arc::new(GlobalLockManager::new());
+            let resource = create_test_object_key("bucket", "object-drop-no-runtime");
+            let lock = NamespaceLock::with_clients(
+                "drop-no-runtime".to_string(),
+                vec![Arc::new(LocalClient::with_manager(manager.clone()))],
+            );
+            let guard = lock
+                .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+                .await
+                .expect("lock should be acquired");
+            (manager, resource, guard)
+        })
+    };
+
+    let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+    assert!(drop_result.is_ok(), "dropping distributed guard without runtime should not panic");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(wait_until_all_managers_can_write(&[manager], resource));
+}
+
+#[tokio::test]
 async fn test_namespace_lock_distributed_read_lock_succeeds_with_two_nodes_one_offline() {
     let manager = Arc::new(GlobalLockManager::new());
     let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
@@ -566,6 +782,39 @@ async fn test_namespace_lock_distributed_quorum_failure_rolls_back_successful_no
 
     drop(guard1);
     drop(guard2);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_quorum_rollback_retries_release_false() {
+    let managers = (0..2).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyReleaseClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = vec![
+        flaky_clients[0].clone() as Arc<dyn LockClient>,
+        flaky_clients[1].clone() as Arc<dyn LockClient>,
+        Arc::new(FailingClient) as Arc<dyn LockClient>,
+    ];
+    let resource = create_test_object_key("bucket", "object-rollback-retry");
+    let lock = NamespaceLock::with_clients_and_quorum("rollback-retry".to_string(), clients, 3);
+
+    let err = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail when quorum requires the offline node");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
+    wait_until_all_managers_can_write(&managers, resource).await;
+
+    assert!(
+        flaky_clients.iter().all(|client| client.release_attempts() >= 2),
+        "rollback should retry node releases that initially returned false"
+    );
 }
 
 #[tokio::test]
