@@ -178,7 +178,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value};
+    use super::{
+        collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
+        redacted_target_config,
+    };
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT};
     use rustfs_ecstore::config::{Config, KVS};
@@ -278,5 +281,28 @@ mod tests {
     fn redact_target_field_value_keeps_non_sensitive_fields() {
         assert_eq!(redact_target_field_value("endpoint", "https://example.com"), "https://example.com");
         assert_eq!(redact_target_field_value("queue_limit", "1000"), "1000");
+    }
+
+    #[test]
+    fn redacted_target_config_masks_sensitive_values_without_mutating_shape() {
+        let mut config = KVS::new();
+        config.insert("endpoint".to_string(), "https://example.com/hook".to_string());
+        config.insert("password".to_string(), "super-secret".to_string());
+        config.insert("client_key".to_string(), "private-key".to_string());
+        config.insert("auth_token".to_string(), "bearer-token".to_string());
+        config.insert("empty_secret".to_string(), String::new());
+
+        let redacted = redacted_target_config(&config);
+
+        assert_eq!(
+            redacted,
+            vec![
+                ("endpoint".to_string(), "https://example.com/hook".to_string()),
+                ("password".to_string(), "***redacted***".to_string()),
+                ("client_key".to_string(), "***redacted***".to_string()),
+                ("auth_token".to_string(), "***redacted***".to_string()),
+                ("empty_secret".to_string(), String::new()),
+            ]
+        );
     }
 }

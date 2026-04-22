@@ -190,11 +190,6 @@ impl LockClient for RemoteClient {
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
         };
 
-        // Check for explicit error first
-        if let Some(error_info) = resp.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
         // Check if the lock acquisition was successful
         if resp.success {
             Ok(LockResponse::success(
@@ -204,7 +199,8 @@ impl LockClient for RemoteClient {
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
-                "Lock acquisition failed on remote server".to_string(),
+                resp.error_info
+                    .unwrap_or_else(|| "Lock acquisition failed on remote server".to_string()),
                 std::time::Duration::ZERO,
             ))
         }
