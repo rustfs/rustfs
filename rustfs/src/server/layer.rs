@@ -1379,7 +1379,11 @@ mod tests {
         }
 
         fn request_with_method(method: Method) -> Request<()> {
-            Request::builder().method(method).uri("/bucket/object").body(()).expect("request")
+            Request::builder()
+                .method(method)
+                .uri("/bucket/object")
+                .body(())
+                .expect("request")
         }
 
         async fn collect_body<B: Body<Data = Bytes>>(body: B) -> Bytes
