@@ -202,8 +202,8 @@ mod tests {
     #[test]
     fn evaluate_mixed_valid_and_invalid_request_values_fails_closed() {
         // A valid matching value alongside an invalid base64 value must still
-        // fail closed — any unparsable request value short-circuits to false,
-        // matching AddrFunc::evaluate semantics.
+        // fail closed — for BinaryEquals, any unparsable request value causes
+        // evaluation to return false even if another request value matches.
         let f = new_func(Aws(AWSUsername), None, "aGVsbG8="); // "hello"
         let mut ctx = HashMap::new();
         ctx.insert("username".to_string(), vec!["aGVsbG8=".to_string(), "!!!not-base64!!!".to_string()]);
