@@ -19,6 +19,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use serial_test::serial;
     use tracing::info;
@@ -178,5 +179,85 @@ mod tests {
             Some(false),
             "Delete marker should no longer be latest after the second put"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_object_versions_prefix_with_marker_object_returns_children() {
+        init_logging();
+        info!("🧪 TEST: ListObjectVersions returns prefix children when a marker object also exists");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-list-versions-prefix-marker";
+        let marker_key = "data01";
+        let child_keys = [
+            "data01/meta/dump-2026-04-08-053205.json.gz",
+            "data01/meta/dump-2026-04-08-063209.json.gz",
+        ];
+
+        client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Suspended)
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("Failed to suspend versioning");
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(marker_key)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .expect("Failed to put marker object");
+
+        for key in child_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"payload"))
+                .send()
+                .await
+                .expect("Failed to put child object");
+        }
+
+        let listing = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix("data01/")
+            .send()
+            .await
+            .expect("Failed to list object versions by prefix");
+
+        let version_keys: Vec<_> = listing.versions().iter().filter_map(|version| version.key()).collect();
+
+        assert_eq!(
+            version_keys.len(),
+            child_keys.len(),
+            "ListObjectVersions with a trailing slash prefix should include child objects even when the marker object exists"
+        );
+
+        for key in child_keys {
+            assert!(
+                version_keys.contains(&key),
+                "ListObjectVersions(prefix=data01/) should include child object {key}"
+            );
+        }
     }
 }

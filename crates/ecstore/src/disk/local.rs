@@ -2072,6 +2072,7 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
+        let mut skip_current_dir_object = false;
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
@@ -2098,7 +2099,7 @@ impl DiskAPI for LocalDisk {
                 if let Ok(meta) = tokio::fs::metadata(fpath).await
                     && meta.is_file()
                 {
-                    return Err(DiskError::FileNotFound);
+                    skip_current_dir_object = true;
                 }
             }
         }
@@ -2109,7 +2110,7 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
-            false,
+            skip_current_dir_object,
         )
         .await?;
 
