@@ -130,7 +130,9 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
 }
 
 pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
-    use rustfs_kafka::error::{ConnectionError, Error as KafkaError};
+    use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
+    use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks, SecurityConfig};
+    use std::time::Duration;
 
     let map_kafka_error = |err: KafkaError, context: &str| match err {
         KafkaError::Connection(ConnectionError::NoHostReachable) => crate::TargetError::NotConnected,
@@ -140,12 +142,30 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         _ => crate::TargetError::Request(format!("{context}: {err}")),
     };
 
-    let producer = rustfs_kafka_async::AsyncProducer::from_hosts(args.brokers.clone())
+    let acks = match args.acks {
+        0 => RequiredAcks::None,
+        1 => RequiredAcks::One,
+        _ => RequiredAcks::All,
+    };
+
+    let mut config = AsyncProducerConfig::new()
+        .with_ack_timeout(Duration::from_secs(5))
+        .with_required_acks(acks);
+
+    if args.tls_enable {
+        let mut security = SecurityConfig::new();
+        if !args.tls_ca.is_empty() {
+            security = security.with_ca_cert(args.tls_ca.clone());
+        }
+        if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
+            security = security.with_client_cert(args.tls_client_cert.clone(), args.tls_client_key.clone());
+        }
+        config = config.with_security(security);
+    }
+
+    let _ = AsyncProducer::from_hosts_with_config(args.brokers.clone(), config)
         .await
-        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create async producer"))?;
-    producer
-        .close()
-        .await
-        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to close async producer"))?;
+        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create producer"))?;
+
     Ok(())
 }

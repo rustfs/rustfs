@@ -484,6 +484,7 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matchit::Router;
     use rustfs_config::DEFAULT_DELIMITER;
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
@@ -601,6 +602,42 @@ mod tests {
                     .find(|entry| entry.account_id == "config-target")
                     .expect("config target should be present");
                 assert_eq!(config_only.source, NotificationEndpointSource::Config);
+            },
+        );
+    }
+
+    #[test]
+    fn merge_notification_endpoints_marks_kafka_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            NOTIFY_KAFKA_SUB_SYS.to_string(),
+            HashMap::from([("mixed-kafka".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_KAFKA_ENABLE_MIXED-KAFKA", Some("on")),
+                ("RUSTFS_NOTIFY_KAFKA_BROKERS_MIXED-KAFKA", Some("127.0.0.1:9092")),
+                ("RUSTFS_NOTIFY_KAFKA_ENABLE_ENV-KAFKA", Some("on")),
+                ("RUSTFS_NOTIFY_KAFKA_BROKERS_ENV-KAFKA", Some("127.0.0.1:9093")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                ]);
+                let merged = merge_notification_endpoints(&config, runtime);
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-kafka" && entry.service == "kafka")
+                    .expect("mixed kafka target should be present");
+                assert_eq!(mixed.source, NotificationEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-kafka" && entry.service == "kafka")
+                    .expect("env kafka target should be present");
+                assert_eq!(env_only.source, NotificationEndpointSource::Env);
             },
         );
     }
@@ -789,6 +826,22 @@ mod tests {
             delete_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
             "notification target deletion should require SetBucketTargetAction"
         );
+    }
+
+    #[test]
+    fn extract_target_params_accepts_kafka_target_type() {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+
+        let params = router
+            .at("/v3/target/notify_kafka/streaming")
+            .expect("route should match")
+            .params;
+        let (target_type, target_name) = extract_target_params(&params).expect("kafka target type should be accepted");
+        assert_eq!(target_type, NOTIFY_KAFKA_SUB_SYS);
+        assert_eq!(target_name, "streaming");
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {

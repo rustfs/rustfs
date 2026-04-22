@@ -24,15 +24,15 @@ use crate::target::{
 };
 use rumqttc::QoS;
 use rustfs_config::{
-    DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TOPIC, MQTT_BROKER,
-    MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA,
-    MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT,
-    NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN,
-    PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
-    PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN,
-    WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
-    WEBHOOK_SKIP_TLS_VERIFY,
+    DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT,
+    KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
+    MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
+    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS,
+    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
+    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD,
+    PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
+    PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use std::path::Path;
@@ -290,6 +290,10 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         brokers,
         topic,
         acks: config.lookup(KAFKA_ACKS).and_then(|v| v.parse::<i16>().ok()).unwrap_or(1),
+        tls_enable: parse_target_bool(config.lookup(KAFKA_TLS_ENABLE).as_deref()).unwrap_or(false),
+        tls_ca: config.lookup(KAFKA_TLS_CA).unwrap_or_default(),
+        tls_client_cert: config.lookup(KAFKA_TLS_CLIENT_CERT).unwrap_or_default(),
+        tls_client_key: config.lookup(KAFKA_TLS_CLIENT_KEY).unwrap_or_default(),
         queue_dir: config
             .lookup(KAFKA_QUEUE_DIR)
             .unwrap_or_else(|| default_queue_dir.to_string()),
@@ -311,6 +315,14 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
 
     if config.lookup(KAFKA_TOPIC).is_none() {
         return Err(TargetError::Configuration("Missing Kafka topic".to_string()));
+    }
+
+    let tls_client_cert = config.lookup(KAFKA_TLS_CLIENT_CERT).unwrap_or_default();
+    let tls_client_key = config.lookup(KAFKA_TLS_CLIENT_KEY).unwrap_or_default();
+    if tls_client_cert.is_empty() != tls_client_key.is_empty() {
+        return Err(TargetError::Configuration(
+            "Kafka tls_client_cert and tls_client_key must be specified together".to_string(),
+        ));
     }
 
     let queue_dir = config

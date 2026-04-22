@@ -601,6 +601,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_audit_endpoints_marks_kafka_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            AUDIT_KAFKA_SUB_SYS.to_string(),
+            HashMap::from([("mixed-kafka".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_KAFKA_ENABLE_MIXED-KAFKA", Some("on")),
+                ("RUSTFS_AUDIT_KAFKA_BROKERS_MIXED-KAFKA", Some("127.0.0.1:9092")),
+                ("RUSTFS_AUDIT_KAFKA_ENABLE_ENV-KAFKA", Some("on")),
+                ("RUSTFS_AUDIT_KAFKA_BROKERS_ENV-KAFKA", Some("127.0.0.1:9093")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                ]);
+                let merged = merge_audit_endpoints(&config, runtime);
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-kafka" && entry.service == "kafka")
+                    .expect("mixed kafka target should be present");
+                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-kafka" && entry.service == "kafka")
+                    .expect("env kafka target should be present");
+                assert_eq!(env_only.source, AuditEndpointSource::Env);
+            },
+        );
+    }
+
+    #[test]
     fn audit_target_mutation_block_reason_rejects_env_managed_target() {
         with_vars(
             [
@@ -721,6 +757,14 @@ mod tests {
             .expect("route should match");
         let unsupported_type = extract_target_params(&unsupported_type_params.params).unwrap_err();
         assert!(unsupported_type.to_string().contains("unsupported audit target type"));
+
+        let supported_kafka_params = full_router
+            .at("/v3/audit/target/audit_kafka/primary")
+            .expect("route should match");
+        let (target_type, target_name) =
+            extract_target_params(&supported_kafka_params.params).expect("audit kafka target should be supported");
+        assert_eq!(target_type, AUDIT_KAFKA_SUB_SYS);
+        assert_eq!(target_name, "primary");
 
         let mut partial_router = Router::new();
         partial_router

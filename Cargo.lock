@@ -8280,14 +8280,11 @@ dependencies = [
 [[package]]
 name = "rustfs-kafka"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e001284fafdd0aca6dd344aeb450735a1f218266654251f4f5e24bfbc2d26a9"
 dependencies = [
  "bytes",
  "fnv",
  "indexmap 2.14.0",
  "kafka-protocol",
- "metrics",
  "rustls",
  "rustls-native-certs",
  "socket2",
@@ -8300,8 +8297,6 @@ dependencies = [
 [[package]]
 name = "rustfs-kafka-async"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b571cf860d48537a306ab3a3f32a91ce8931fe08122516ccd7b7735cba280f"
 dependencies = [
  "bytes",
  "rustfs-kafka",
@@ -8726,7 +8721,6 @@ dependencies = [
  "rumqttc-next",
  "rustfs-config",
  "rustfs-ecstore",
- "rustfs-kafka",
  "rustfs-kafka-async",
  "rustfs-s3-common",
  "rustfs-utils",

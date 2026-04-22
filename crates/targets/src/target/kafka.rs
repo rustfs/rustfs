@@ -25,9 +25,8 @@ use crate::{
 use async_trait::async_trait;
 use rustfs_config::audit::AUDIT_STORE_EXTENSION;
 use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
-use rustfs_kafka::error::{ConnectionError, Error as KafkaError};
-use rustfs_kafka::producer::{Producer, Record, RequiredAcks};
-use rustfs_kafka_async::AsyncProducer;
+use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
+use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SecurityConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
@@ -44,6 +43,14 @@ pub struct KafkaArgs {
     pub topic: String,
     /// Required acks: 0 = none, 1 = leader, -1 = all
     pub acks: i16,
+    /// Whether to enable TLS for Kafka transport
+    pub tls_enable: bool,
+    /// Optional path to CA cert used for broker verification
+    pub tls_ca: String,
+    /// Optional path to client certificate for mTLS
+    pub tls_client_cert: String,
+    /// Optional path to client private key for mTLS
+    pub tls_client_key: String,
     /// The directory to store events in case of failure
     pub queue_dir: String,
     /// The maximum number of events to store
@@ -65,6 +72,12 @@ impl KafkaArgs {
 
         if self.topic.is_empty() {
             return Err(TargetError::Configuration("kafka topic cannot be empty".to_string()));
+        }
+
+        if self.tls_client_cert.is_empty() != self.tls_client_key.is_empty() {
+            return Err(TargetError::Configuration(
+                "kafka tls_client_cert and tls_client_key must be specified together".to_string(),
+            ));
         }
 
         if !self.queue_dir.is_empty() {
@@ -142,17 +155,30 @@ where
     }
 
     /// Builds a Kafka producer from the current args
-    fn build_producer(&self) -> Result<Producer, TargetError> {
+    async fn build_producer(&self) -> Result<AsyncProducer, TargetError> {
         let acks = match self.args.acks {
             0 => RequiredAcks::None,
             1 => RequiredAcks::One,
             _ => RequiredAcks::All,
         };
 
-        Producer::from_hosts(self.args.brokers.clone())
+        let mut config = AsyncProducerConfig::new()
             .with_ack_timeout(Duration::from_secs(30))
-            .with_required_acks(acks)
-            .create()
+            .with_required_acks(acks);
+
+        if self.args.tls_enable {
+            let mut security = SecurityConfig::new();
+            if !self.args.tls_ca.is_empty() {
+                security = security.with_ca_cert(self.args.tls_ca.clone());
+            }
+            if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
+                security = security.with_client_cert(self.args.tls_client_cert.clone(), self.args.tls_client_key.clone());
+            }
+            config = config.with_security(security);
+        }
+
+        AsyncProducer::from_hosts_with_config(self.args.brokers.clone(), config)
+            .await
             .map_err(|e| Self::map_kafka_error(e, "Failed to create Kafka producer"))
     }
 
@@ -182,7 +208,7 @@ where
 
     /// Sends the raw body to Kafka
     #[instrument(skip(self, body, meta), fields(target_id = %self.id))]
-    fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
+    async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
         debug!(
             target = %self.id,
             bucket = %meta.bucket_name,
@@ -192,10 +218,11 @@ where
             "Sending Kafka payload"
         );
 
-        let mut producer = self.build_producer()?;
+        let producer = self.build_producer().await?;
 
         producer
             .send(&Record::from_value(&self.args.topic, body.as_slice()))
+            .await
             .map_err(|e| Self::map_kafka_error(e, "Failed to send message to Kafka"))?;
 
         debug!(target_id = %self.id, topic = %self.args.topic, "Event published to Kafka topic");
@@ -225,13 +252,7 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        let producer = AsyncProducer::from_hosts(self.args.brokers.clone())
-            .await
-            .map_err(|err| Self::map_kafka_error(err, "Failed to create Kafka async producer"))?;
-        producer
-            .close()
-            .await
-            .map_err(|err| Self::map_kafka_error(err, "Failed to close Kafka async producer"))?;
+        let _ = self.build_producer().await?;
         Ok(true)
     }
 
@@ -259,7 +280,7 @@ where
             debug!("Event saved to store for Kafka target: {}", self.id);
             Ok(())
         } else {
-            if let Err(err) = self.send_body(queued.body, &queued.meta) {
+            if let Err(err) = self.send_body(queued.body, &queued.meta).await {
                 self.delivery_counters.record_final_failure();
                 return Err(err);
             }
@@ -270,7 +291,7 @@ where
     async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
         debug!("Sending queued payload from store for Kafka target: {}, key: {}", self.id, key);
 
-        if let Err(e) = self.send_body(body, &meta) {
+        if let Err(e) = self.send_body(body, &meta).await {
             if matches!(e, TargetError::NotConnected) {
                 warn!(target_id = %self.id, "Kafka not reachable, event remains in store.");
                 return Err(TargetError::NotConnected);
@@ -320,6 +341,10 @@ mod tests {
             brokers: vec!["localhost:9092".to_string()],
             topic: "rustfs-events".to_string(),
             acks: 1,
+            tls_enable: false,
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
             queue_dir: String::new(),
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
@@ -367,5 +392,15 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_tls_client_cert_and_key_must_be_paired() {
+        let args = KafkaArgs {
+            tls_client_cert: "/tmp/client.crt".to_string(),
+            tls_client_key: String::new(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
     }
 }
