@@ -22,12 +22,14 @@ use futures::future::join_all;
 use rustfs_io_metrics::{
     record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
 };
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
+
+const UNLOCK_RETRY_ATTEMPTS: usize = 3;
+const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
@@ -36,45 +38,6 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
         uuid: Uuid::new_v4().to_string(),
     }
 }
-
-#[derive(Debug, Clone)]
-struct UnlockJob {
-    /// Entries to release: each (LockId, client) pair will be released independently.
-    entries: Vec<(LockId, Arc<dyn LockClient>)>,
-}
-
-#[derive(Debug)]
-struct UnlockRuntime {
-    tx: mpsc::Sender<UnlockJob>,
-}
-
-// Global unlock runtime with background worker
-static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
-    // Larger buffer to reduce contention during bursts
-    let (tx, mut rx) = mpsc::channel::<UnlockJob>(8192);
-
-    // Spawn background worker when first used; assumes a Tokio runtime is available
-    tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            // Best-effort release across all (LockId, client) entries.
-            let results = join_all(
-                job.entries
-                    .into_iter()
-                    .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) }),
-            )
-            .await;
-            let any_ok = results.into_iter().any(|released| released);
-
-            if !any_ok {
-                tracing::warn!("DistributedLockGuard background release failed for one or more entries");
-            } else {
-                tracing::debug!("DistributedLockGuard background released one or more entries");
-            }
-        }
-    });
-
-    UnlockRuntime { tx }
-});
 
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
 #[derive(Debug)]
@@ -126,47 +89,22 @@ impl DistributedLockGuard {
     }
 
     /// Manually release the lock early.
-    /// This sends a release job to the background worker and then disarms the guard
+    /// This spawns a background release task and then disarms the guard
     /// to prevent double-release on drop.
-    /// Returns true if the lock was released (or was already released), false otherwise.
+    /// Returns true if release was scheduled or the guard was already disarmed.
     pub fn release(&mut self) -> bool {
         if self.disarmed {
             // Lock was already released, return true to indicate lock is in released state
             return true;
         }
 
-        let job = UnlockJob {
-            entries: self.entries.clone(),
-        };
-
-        // Try a non-blocking send to avoid panics
-        let success = if let Err(err) = UNLOCK_RUNTIME.tx.try_send(job) {
-            // Channel full or closed; best-effort fallback: spawn a detached task
-            let entries = self.entries.clone();
-            tracing::warn!(
-                "DistributedLockGuard channel send failed ({}), spawning fallback unlock task for {} entries",
-                err,
-                entries.len()
-            );
-
-            // If runtime is not available, this will panic; but in RustFS we are inside Tokio contexts.
-            let handle = tokio::spawn(async move {
-                let futures_iter = entries
-                    .into_iter()
-                    .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) });
-                let _ = join_all(futures_iter).await;
-            });
-            // Explicitly drop the JoinHandle to acknowledge detaching the task.
-            drop(handle);
-            true // Consider it successful even if we had to use fallback
-        } else {
-            true
-        };
+        let entries = self.entries.clone();
+        DistributedLock::spawn_release_cleanup(entries, "distributed_lock_guard_release");
 
         // Disarm to prevent double-release on drop
         self.disarmed = true;
         record_lock_held_release(self.lock_type);
-        success
+        true
     }
 }
 
@@ -349,22 +287,64 @@ impl DistributedLock {
         pending
     }
 
-    async fn release_entries(entries: &[(LockId, Arc<dyn LockClient>)], context: &'static str) {
-        let release_results = join_all(
-            entries
-                .iter()
-                .map(|(lock_id, client)| async move { (lock_id, client.release(lock_id).await) }),
-        )
-        .await;
+    async fn release_entries(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        let mut pending = entries;
 
-        for (lock_id, result) in release_results {
-            match result {
-                Ok(true) | Ok(false) => {}
-                Err(err) => {
-                    tracing::warn!("{context}: failed to release lock {} on client: {}", lock_id, err);
+        for attempt in 1..=UNLOCK_RETRY_ATTEMPTS {
+            let release_results = join_all(pending.into_iter().map(|(lock_id, client)| async move {
+                match client.release(&lock_id).await {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        warn!(%lock_id, attempt, context, "distributed unlock did not find lock on client");
+                        Some((lock_id, client))
+                    }
+                    Err(err) => {
+                        warn!(%lock_id, attempt, context, "distributed unlock failed on client: {}", err);
+                        Some((lock_id, client))
+                    }
                 }
+            }))
+            .await;
+
+            pending = release_results.into_iter().flatten().collect();
+            if pending.is_empty() {
+                debug!(attempt, context, "distributed unlock completed");
+                return;
+            }
+
+            if attempt < UNLOCK_RETRY_ATTEMPTS {
+                tokio::time::sleep(UNLOCK_RETRY_BACKOFF * attempt as u32).await;
             }
         }
+
+        warn!(
+            remaining = pending.len(),
+            attempts = UNLOCK_RETRY_ATTEMPTS,
+            context,
+            "distributed unlock left unreleased entries after retry"
+        );
+    }
+
+    fn spawn_release_cleanup(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        if entries.is_empty() {
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let join_handle = handle.spawn(async move {
+                Self::release_entries(entries, context).await;
+            });
+            drop(join_handle);
+            return;
+        }
+
+        let join_handle = std::thread::spawn(move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(async move {
+                Self::release_entries(entries, context).await;
+            }),
+            Err(err) => warn!(context, "failed to create fallback unlock runtime: {}", err),
+        });
+        drop(join_handle);
     }
 
     fn spawn_pending_cleanup(
@@ -387,9 +367,7 @@ impl DistributedLock {
                             continue;
                         };
 
-                        if let Err(err) = client.release(&lock_id).await {
-                            tracing::warn!("{context}: failed to cleanup late lock {} on client {}: {}", lock_id, idx, err);
-                        }
+                        Self::release_entries(vec![(lock_id, client.clone())], context).await;
                     }
                     Ok((idx, Ok(resp))) => {
                         tracing::debug!(
@@ -506,7 +484,7 @@ impl DistributedLock {
 
             if individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
-                Self::release_entries(&individual_locks, "distributed_lock_quorum_rollback").await;
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -525,7 +503,7 @@ impl DistributedLock {
         }
 
         let rollback_count = individual_locks.len();
-        Self::release_entries(&individual_locks, "distributed_lock_quorum_rollback").await;
+        Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
         let resp = LockResponse::failure(
             format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
             Duration::ZERO,
