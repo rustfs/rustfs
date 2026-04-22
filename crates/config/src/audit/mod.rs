@@ -16,11 +16,13 @@
 //! This module defines the configuration for audit systems, including
 //! webhook and MQTT audit-related settings.
 
+mod kafka;
 mod mqtt;
 mod nats;
 mod pulsar;
 mod webhook;
 
+pub use kafka::*;
 pub use mqtt::*;
 pub use nats::*;
 pub use pulsar::*;
