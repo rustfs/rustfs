@@ -23,9 +23,11 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use kafka::producer::{Producer, Record, RequiredAcks};
 use rustfs_config::audit::AUDIT_STORE_EXTENSION;
 use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
+use rustfs_kafka::error::{ConnectionError, Error as KafkaError};
+use rustfs_kafka::producer::{Producer, Record, RequiredAcks};
+use rustfs_kafka_async::AsyncProducer;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
@@ -92,6 +94,16 @@ impl<E> KafkaTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
+    fn map_kafka_error(err: KafkaError, context: &str) -> TargetError {
+        match err {
+            KafkaError::Connection(ConnectionError::NoHostReachable) => TargetError::NotConnected,
+            KafkaError::Connection(ConnectionError::Timeout(_)) => TargetError::Timeout(format!("{context}: {err}")),
+            KafkaError::Connection(_) => TargetError::Network(format!("{context}: {err}")),
+            KafkaError::Config(_) => TargetError::Configuration(format!("{context}: {err}")),
+            _ => TargetError::Request(format!("{context}: {err}")),
+        }
+    }
+
     /// Creates a new KafkaTarget
     #[instrument(skip(args), fields(target_id = %id))]
     pub fn new(id: String, args: KafkaArgs) -> Result<Self, TargetError> {
@@ -141,7 +153,7 @@ where
             .with_ack_timeout(Duration::from_secs(30))
             .with_required_acks(acks)
             .create()
-            .map_err(|e| TargetError::Network(format!("Failed to create Kafka producer: {e}")))
+            .map_err(|e| Self::map_kafka_error(e, "Failed to create Kafka producer"))
     }
 
     /// Serializes the event and builds a QueuedPayload
@@ -184,7 +196,7 @@ where
 
         producer
             .send(&Record::from_value(&self.args.topic, body.as_slice()))
-            .map_err(|e| TargetError::Request(format!("Failed to send message to Kafka: {e}")))?;
+            .map_err(|e| Self::map_kafka_error(e, "Failed to send message to Kafka"))?;
 
         debug!(target_id = %self.id, topic = %self.args.topic, "Event published to Kafka topic");
         self.delivery_counters.record_success();
@@ -213,13 +225,14 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        match self.build_producer() {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                debug!("Kafka target {} is not reachable: {}", self.id, e);
-                Err(TargetError::NotConnected)
-            }
-        }
+        let producer = AsyncProducer::from_hosts(self.args.brokers.clone())
+            .await
+            .map_err(|err| Self::map_kafka_error(err, "Failed to create Kafka async producer"))?;
+        producer
+            .close()
+            .await
+            .map_err(|err| Self::map_kafka_error(err, "Failed to close Kafka async producer"))?;
+        Ok(true)
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {

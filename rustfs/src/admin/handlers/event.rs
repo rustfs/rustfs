@@ -31,8 +31,8 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{
-    NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS,
-    NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
+    NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -106,13 +106,19 @@ enum NotificationEndpointSource {
     Runtime,
 }
 
-fn notification_target_specs() -> [AdminTargetSpec; 4] {
+fn notification_target_specs() -> [AdminTargetSpec; 5] {
     [
         AdminTargetSpec {
             subsystem: NOTIFY_WEBHOOK_SUB_SYS,
             service: "webhook",
             valid_keys: NOTIFY_WEBHOOK_KEYS,
             validator: AdminTargetValidator::Webhook,
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_KAFKA_SUB_SYS,
+            service: "kafka",
+            valid_keys: NOTIFY_KAFKA_KEYS,
+            validator: AdminTargetValidator::Kafka(TargetDomain::Notify),
         },
         AdminTargetSpec {
             subsystem: NOTIFY_MQTT_SUB_SYS,

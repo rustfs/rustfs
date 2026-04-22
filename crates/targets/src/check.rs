@@ -128,3 +128,24 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
         Err(_) => Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())),
     }
 }
+
+pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
+    use rustfs_kafka::error::{ConnectionError, Error as KafkaError};
+
+    let map_kafka_error = |err: KafkaError, context: &str| match err {
+        KafkaError::Connection(ConnectionError::NoHostReachable) => crate::TargetError::NotConnected,
+        KafkaError::Connection(ConnectionError::Timeout(_)) => crate::TargetError::Timeout(format!("{context}: {err}")),
+        KafkaError::Connection(_) => crate::TargetError::Network(format!("{context}: {err}")),
+        KafkaError::Config(_) => crate::TargetError::Configuration(format!("{context}: {err}")),
+        _ => crate::TargetError::Request(format!("{context}: {err}")),
+    };
+
+    let producer = rustfs_kafka_async::AsyncProducer::from_hosts(args.brokers.clone())
+        .await
+        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create async producer"))?;
+    producer
+        .close()
+        .await
+        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to close async producer"))?;
+    Ok(())
+}

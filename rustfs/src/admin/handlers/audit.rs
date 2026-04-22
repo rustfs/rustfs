@@ -32,8 +32,8 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
-    AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
-    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -101,13 +101,19 @@ enum AuditEndpointSource {
     Runtime,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 4] {
+fn audit_target_specs() -> [AdminTargetSpec; 5] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
             service: "webhook",
             valid_keys: AUDIT_WEBHOOK_KEYS,
             validator: AdminTargetValidator::Webhook,
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_KAFKA_SUB_SYS,
+            service: "kafka",
+            valid_keys: AUDIT_KAFKA_KEYS,
+            validator: AdminTargetValidator::Kafka(TargetDomain::Audit),
         },
         AdminTargetSpec {
             subsystem: AUDIT_MQTT_SUB_SYS,
@@ -711,7 +717,7 @@ mod tests {
             .insert("/v3/audit/target/{target_type}/{target_name}", ())
             .expect("route should insert");
         let unsupported_type_params = full_router
-            .at("/v3/audit/target/audit_kafka/primary")
+            .at("/v3/audit/target/audit_unknown/primary")
             .expect("route should match");
         let unsupported_type = extract_target_params(&unsupported_type_params.params).unwrap_err();
         assert!(unsupported_type.to_string().contains("unsupported audit target type"));

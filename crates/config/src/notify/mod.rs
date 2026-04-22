@@ -71,13 +71,13 @@ pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
 
 #[allow(dead_code)]
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
+    NOTIFY_KAFKA_SUB_SYS,
     NOTIFY_MQTT_SUB_SYS,
     NOTIFY_NATS_SUB_SYS,
     NOTIFY_PULSAR_SUB_SYS,
     NOTIFY_WEBHOOK_SUB_SYS,
 ];
 
-#[allow(dead_code)]
 pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
 pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
 #[allow(dead_code)]
