@@ -925,11 +925,13 @@ impl Operation for ListServiceAccount {
         };
 
         let target_account = if query.user.as_ref().is_some_and(|v| v != &cred.access_key) {
+            // Cross-user listing must be authorized by ListServiceAccounts, matching the
+            // sibling InfoServiceAccount/InfoAccessKey/ListAccessKeysBulk handlers.
             if !iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
-                    action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+                    action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                     bucket: "",
                     conditions: &get_condition_values(
                         &req.headers,
