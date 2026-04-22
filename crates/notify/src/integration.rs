@@ -15,7 +15,12 @@
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::{
-    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
+    Event,
+    error::NotificationError,
+    notifier::EventNotifier,
+    registry::TargetRegistry,
+    rules::{BucketNotificationConfig, ParseConfigError},
+    stream,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
@@ -33,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
 
@@ -309,7 +314,10 @@ impl NotificationSystem {
 
         let config = {
             let guard = self.config.read().await;
-            debug!("Initializing notification system with config: {:?}", *guard);
+            debug!(
+                subsystem_count = guard.0.len(),
+                "Initializing notification system with configuration summary"
+            );
             guard.clone()
         };
 
@@ -517,7 +525,10 @@ impl NotificationSystem {
                 if !changed {
                     info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-                debug!("Config after remove: {:?}", config);
+                debug!(
+                    subsystem_count = config.0.len(),
+                    "Target config removal processed and configuration summary updated"
+                );
                 changed
             })
             .await;
@@ -593,7 +604,6 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration("No targets configured".to_string()));
@@ -602,13 +612,18 @@ impl NotificationSystem {
         // Validate the configuration against the available ARNs
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
             debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
-            if !e.to_string().contains("ARN not found") {
+            if !matches!(e, ParseConfigError::ArnNotFound(_)) {
                 return Err(NotificationError::BucketNotification(e.to_string()));
-            } else {
-                error!("config validate failed, err: {}", e);
             }
+            warn!(
+                bucket = %bucket,
+                region = %cfg.region,
+                error = %e,
+                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+            );
         }
 
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let rules_map = cfg.get_rules_map();
         self.notifier.add_rules_map(bucket, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket);

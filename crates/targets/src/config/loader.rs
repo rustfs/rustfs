@@ -28,6 +28,33 @@ pub fn collect_target_configs(
     collect_target_configs_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
 }
 
+fn is_sensitive_target_field(field_name: &str) -> bool {
+    let field_name = field_name.to_ascii_lowercase();
+    field_name.contains("password")
+        || field_name.contains("secret")
+        || field_name.contains("token")
+        || field_name.contains("credential")
+        || field_name.contains("private_key")
+        || field_name.contains("client_key")
+        || field_name.contains("access_key")
+        || field_name.contains("auth")
+}
+
+fn redact_target_field_value(field_name: &str, value: &str) -> String {
+    if is_sensitive_target_field(field_name) && !value.is_empty() {
+        return "***redacted***".to_string();
+    }
+    value.to_string()
+}
+
+fn redacted_target_config(config: &KVS) -> Vec<(String, String)> {
+    config
+        .0
+        .iter()
+        .map(|kv| (kv.key.clone(), redact_target_field_value(&kv.key, &kv.value)))
+        .collect()
+}
+
 pub fn collect_env_target_instance_ids(route_prefix: &str, target_type: &str, valid_fields: &HashSet<String>) -> HashSet<String> {
     collect_env_target_instance_ids_from_env(route_prefix, target_type, valid_fields, std::env::vars())
 }
@@ -104,7 +131,7 @@ where
         debug!(
             instance_id = %if instance_id == DEFAULT_DELIMITER { DEFAULT_DELIMITER } else { &instance_id },
             %field_name,
-            %value,
+            value = %redact_target_field_value(&field_name, value),
             "Parsed target environment override"
         );
         env_overrides
@@ -137,7 +164,10 @@ where
             merged_config.extend(env_instance_cfg.clone());
         }
 
-        debug!(instance_id = %id, ?merged_config, "Merged target configuration");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let redacted_config = redacted_target_config(&merged_config);
+            debug!(instance_id = %id, ?redacted_config, "Merged target configuration");
+        }
         if is_target_enabled(&merged_config) {
             merged_configs.push((id, merged_config));
         }
@@ -148,7 +178,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_env_target_instance_ids_from_env, collect_target_configs_from_env};
+    use super::{
+        collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
+        redacted_target_config,
+    };
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT};
     use rustfs_ecstore::config::{Config, KVS};
@@ -235,5 +268,41 @@ mod tests {
         );
 
         assert_eq!(ids, HashSet::from(["primary".to_string()]));
+    }
+
+    #[test]
+    fn redact_target_field_value_redacts_sensitive_fields() {
+        assert_eq!(redact_target_field_value("password", "secret"), "***redacted***");
+        assert_eq!(redact_target_field_value("auth_token", "token"), "***redacted***");
+        assert_eq!(redact_target_field_value("credentials_file", "/tmp/creds"), "***redacted***");
+    }
+
+    #[test]
+    fn redact_target_field_value_keeps_non_sensitive_fields() {
+        assert_eq!(redact_target_field_value("endpoint", "https://example.com"), "https://example.com");
+        assert_eq!(redact_target_field_value("queue_limit", "1000"), "1000");
+    }
+
+    #[test]
+    fn redacted_target_config_masks_sensitive_values_without_mutating_shape() {
+        let mut config = KVS::new();
+        config.insert("endpoint".to_string(), "https://example.com/hook".to_string());
+        config.insert("password".to_string(), "super-secret".to_string());
+        config.insert("client_key".to_string(), "private-key".to_string());
+        config.insert("auth_token".to_string(), "bearer-token".to_string());
+        config.insert("empty_secret".to_string(), String::new());
+
+        let redacted = redacted_target_config(&config);
+
+        assert_eq!(
+            redacted,
+            vec![
+                ("endpoint".to_string(), "https://example.com/hook".to_string()),
+                ("password".to_string(), "***redacted***".to_string()),
+                ("client_key".to_string(), "***redacted***".to_string()),
+                ("auth_token".to_string(), "***redacted***".to_string()),
+                ("empty_secret".to_string(), String::new()),
+            ]
+        );
     }
 }
