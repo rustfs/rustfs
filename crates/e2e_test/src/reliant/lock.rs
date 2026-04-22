@@ -276,6 +276,41 @@ async fn test_grpc_lock_client_batch_acquire_and_release() {
 }
 
 #[tokio::test]
+async fn test_grpc_lock_client_uses_request_lock_id_and_reports_missing_unlock() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let local_client: Arc<dyn rustfs_lock::LockClient> = Arc::new(LocalClient::with_manager(manager));
+
+    let (addr, handle) = spawn_lock_server(local_client).await.expect("Failed to spawn server");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let grpc_client = GrpcLockClient::new(addr);
+    let request = LockRequest::new(test_resource(), LockType::Exclusive, "owner-a").with_acquire_timeout(Duration::from_secs(2));
+
+    let response = grpc_client.acquire_lock(&request).await.expect("gRPC acquire should succeed");
+    let lock_info = response.lock_info.expect("gRPC acquire should include lock info");
+    assert_eq!(lock_info.id, request.lock_id);
+
+    assert!(
+        grpc_client
+            .release(&request.lock_id)
+            .await
+            .expect("gRPC release should succeed"),
+        "release should find the request lock id"
+    );
+
+    let missing_release = grpc_client
+        .release(&request.lock_id)
+        .await
+        .expect_err("second release should report missing lock");
+    assert!(
+        missing_release.to_string().contains("lock not found for release"),
+        "missing release should preserve server error, got: {missing_release}"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn test_distributed_lock_4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes() {
     let manager1 = Arc::new(GlobalLockManager::new());
     let manager2 = Arc::new(GlobalLockManager::new());

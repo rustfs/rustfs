@@ -886,7 +886,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout_for_op(
             "write_metadata",
-            || async {
+            move || async move {
                 let disk = self.disk_ref().await;
                 let mut client = self
                     .get_client()
@@ -896,8 +896,8 @@ impl DiskAPI for RemoteDisk {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
-                    file_info: file_info.clone(),
-                    file_info_bin: file_info_bin.clone(),
+                    file_info,
+                    file_info_bin: file_info_bin.into(),
                 });
 
                 let response = client.write_metadata(request).await?.into_inner();
@@ -951,7 +951,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout_for_op(
             "update_metadata",
-            || async {
+            move || async move {
                 let disk = self.disk_ref().await;
                 let mut client = self
                     .get_client()
@@ -961,10 +961,10 @@ impl DiskAPI for RemoteDisk {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
-                    file_info: file_info.clone(),
-                    opts: opts_str.clone(),
-                    file_info_bin: file_info_bin.clone(),
-                    opts_bin: opts_bin.clone(),
+                    file_info,
+                    opts: opts_str,
+                    file_info_bin: file_info_bin.into(),
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.update_metadata(request).await?.into_inner();
@@ -994,7 +994,7 @@ impl DiskAPI for RemoteDisk {
         let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout(
-            || async {
+            move || async {
                 let disk = self.disk_ref().await;
                 let mut client = self
                     .get_client()
@@ -1005,8 +1005,8 @@ impl DiskAPI for RemoteDisk {
                     volume: volume.to_string(),
                     path: path.to_string(),
                     version_id: version_id.to_string(),
-                    opts: opts_str.clone(),
-                    opts_bin: opts_bin.clone(),
+                    opts: opts_str,
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.read_version(request).await?.into_inner();
@@ -1480,7 +1480,7 @@ impl DiskAPI for RemoteDisk {
                 let request = Request::new(ReadMultipleRequest {
                     disk,
                     read_multiple_req,
-                    read_multiple_req_bin,
+                    read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
                 let response = client.read_multiple(request).await?.into_inner();

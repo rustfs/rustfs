@@ -26,6 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 pub mod mqtt;
+pub mod nats;
+pub mod pulsar;
 pub mod webhook;
 
 /// A read-only snapshot of delivery counters for a target.
@@ -286,6 +288,8 @@ pub enum ChannelTargetType {
     Webhook,
     Kafka,
     Mqtt,
+    Nats,
+    Pulsar,
 }
 
 impl ChannelTargetType {
@@ -294,6 +298,8 @@ impl ChannelTargetType {
             ChannelTargetType::Webhook => "webhook",
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
+            ChannelTargetType::Nats => "nats",
+            ChannelTargetType::Pulsar => "pulsar",
         }
     }
 }
@@ -304,6 +310,8 @@ impl std::fmt::Display for ChannelTargetType {
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
+            ChannelTargetType::Nats => write!(f, "nats"),
+            ChannelTargetType::Pulsar => write!(f, "pulsar"),
         }
     }
 }

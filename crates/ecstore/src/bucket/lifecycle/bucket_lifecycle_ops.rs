@@ -70,7 +70,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -413,6 +413,7 @@ impl ExpiryState {
                     let v = v.expect("received None after None check");
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
+                        //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
                         if !v.obj_info.transitioned_object.status.is_empty() {
                             apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await;
                         } else {
@@ -1340,8 +1341,8 @@ pub async fn expire_transitioned_object(
         &oi.transitioned_object.tier,
     )
     .await;
-    if ret.is_err() {
-        //transitionLogIf(ctx, err);
+    if let Err(e) = &ret {
+        error!("Failed to delete remote transitioned object {}: {:?}", oi.transitioned_object.name, e);
     }
     mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
@@ -1356,7 +1357,7 @@ pub async fn expire_transitioned_object(
 
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
 
-    //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
+    //audit_log_lifecycle(oi, ILMExpiry, tags);
 
     let event_name = if oi.delete_marker {
         EventName::LifecycleExpirationDelete
@@ -1770,7 +1771,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
-    //debug!("opts: {:?}", opts);
+    debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {

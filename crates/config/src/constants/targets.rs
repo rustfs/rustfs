@@ -41,6 +41,30 @@ pub const MQTT_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const MQTT_TLS_TRUST_LEAF_AS_CA: &str = "tls_trust_leaf_as_ca";
 pub const MQTT_WS_PATH_ALLOWLIST: &str = "ws_path_allowlist";
 
+pub const NATS_ADDRESS: &str = "address";
+pub const NATS_SUBJECT: &str = "subject";
+pub const NATS_USERNAME: &str = "username";
+pub const NATS_PASSWORD: &str = "password";
+pub const NATS_TOKEN: &str = "token";
+pub const NATS_CREDENTIALS_FILE: &str = "credentials_file";
+pub const NATS_TLS_CA: &str = "tls_ca";
+pub const NATS_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const NATS_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const NATS_TLS_REQUIRED: &str = "tls_required";
+pub const NATS_QUEUE_DIR: &str = "queue_dir";
+pub const NATS_QUEUE_LIMIT: &str = "queue_limit";
+
+pub const PULSAR_BROKER: &str = "broker";
+pub const PULSAR_TOPIC: &str = "topic";
+pub const PULSAR_AUTH_TOKEN: &str = "auth_token";
+pub const PULSAR_USERNAME: &str = "username";
+pub const PULSAR_PASSWORD: &str = "password";
+pub const PULSAR_TLS_CA: &str = "tls_ca";
+pub const PULSAR_TLS_ALLOW_INSECURE: &str = "tls_allow_insecure";
+pub const PULSAR_TLS_HOSTNAME_VERIFICATION: &str = "tls_hostname_verification";
+pub const PULSAR_QUEUE_DIR: &str = "queue_dir";
+pub const PULSAR_QUEUE_LIMIT: &str = "queue_limit";
+
 /// Environment variable controlling whether target queue files are Snappy-compressed.
 /// Applies to both notify and audit target queue stores.
 pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";

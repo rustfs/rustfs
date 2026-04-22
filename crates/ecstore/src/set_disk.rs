@@ -18,6 +18,7 @@
 use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
 use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -707,6 +708,10 @@ impl ObjectIO for SetDisks {
         tokio::spawn(async move {
             let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
+            // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
+            // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
+            // would incorrectly treat downstream backpressure as disk-read latency.
+            // Disk read timeouts must be enforced at the actual disk I/O operations.
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
@@ -757,7 +762,6 @@ impl ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
@@ -1338,6 +1342,22 @@ impl BucketOperations for SetDisks {
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
+}
+
+fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+    if let Some(retention) = &opts.object_lock_retention
+        && check_retention_for_modification(
+            &obj_info.user_defined,
+            retention.mode.as_deref(),
+            retention.retain_until,
+            retention.bypass_governance,
+        )
+        .is_some()
+    {
+        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1985,6 +2005,8 @@ impl ObjectOperations for SetDisks {
         }
 
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+
+        check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
 
         for (k, v) in obj_info.user_defined {
             fi.metadata.insert(k, v);
@@ -5478,6 +5500,74 @@ mod tests {
 
         assert!(rendered.contains("bucket"), "{rendered}");
         assert!(rendered.contains("object"), "{rendered}");
+    }
+
+    #[test]
+    fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
+        let now = OffsetDateTime::now_utc();
+        let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
+        let requested_until = now + Duration::from_secs(60 * 60 * 24);
+
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+                mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
+                retain_until: Some(requested_until),
+                bypass_governance: true,
+            }),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+            .expect_err("COMPLIANCE shortening must be blocked");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[test]
+    fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
+        let now = OffsetDateTime::now_utc();
+        let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
+        let requested_until = now + Duration::from_secs(60 * 60 * 24);
+
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+                mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
+                retain_until: Some(requested_until),
+                bypass_governance: true,
+            }),
+            ..Default::default()
+        };
+
+        check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+            .expect("GOVERNANCE shortening with bypass should remain allowed");
     }
 
     #[test]

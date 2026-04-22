@@ -18,8 +18,14 @@ use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
-use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
-use rustfs_config::notify::{NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::audit::{
+    AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
+    AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+};
+use rustfs_config::notify::{
+    NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+};
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -34,6 +40,8 @@ const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
+pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
+
 static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
 
 static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
@@ -41,6 +49,72 @@ static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
     h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
     h
 });
+
+#[derive(Clone, Copy)]
+struct TargetConfigDescriptor {
+    external_key: &'static str,
+    subsystem_key: &'static str,
+    default_kvs: &'static LazyLock<KVS>,
+    valid_keys: &'static [&'static str],
+}
+
+fn notify_target_descriptors() -> [TargetConfigDescriptor; 4] {
+    [
+        TargetConfigDescriptor {
+            external_key: "webhook",
+            subsystem_key: NOTIFY_WEBHOOK_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_WEBHOOK_KVS,
+            valid_keys: NOTIFY_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "mqtt",
+            subsystem_key: NOTIFY_MQTT_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_MQTT_KVS,
+            valid_keys: NOTIFY_MQTT_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "nats",
+            subsystem_key: NOTIFY_NATS_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_NATS_KVS,
+            valid_keys: NOTIFY_NATS_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "pulsar",
+            subsystem_key: NOTIFY_PULSAR_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_PULSAR_KVS,
+            valid_keys: NOTIFY_PULSAR_KEYS,
+        },
+    ]
+}
+
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 4] {
+    [
+        TargetConfigDescriptor {
+            external_key: "webhook",
+            subsystem_key: AUDIT_WEBHOOK_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_WEBHOOK_KVS,
+            valid_keys: AUDIT_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "mqtt",
+            subsystem_key: AUDIT_MQTT_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_MQTT_KVS,
+            valid_keys: AUDIT_MQTT_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "nats",
+            subsystem_key: AUDIT_NATS_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_NATS_KVS,
+            valid_keys: AUDIT_NATS_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "pulsar",
+            subsystem_key: AUDIT_PULSAR_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_PULSAR_KVS,
+            valid_keys: AUDIT_PULSAR_KEYS,
+        },
+    ]
+}
 
 #[instrument(skip(api))]
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
@@ -192,15 +266,15 @@ fn parse_oidc_scalar_value(key: &str, value: &Value) -> Option<String> {
         }),
         Value::Bool(v) => Some(v.to_string()),
         Value::Number(v) => Some(v.to_string()),
-        Value::Array(values) if key == rustfs_config::oidc::OIDC_SCOPES => {
-            let scopes = values
+        Value::Array(values) if COMMA_SEPARATED_LISTS.contains(&key) => {
+            let values_str = values
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::trim)
-                .filter(|scope| !scope.is_empty())
+                .filter(|val| !val.is_empty())
                 .collect::<Vec<_>>()
                 .join(",");
-            Some(scopes)
+            Some(values_str)
         }
         Value::Null => None,
         _ => None,
@@ -363,29 +437,31 @@ fn apply_external_notify_section(
     applied
 }
 
+fn apply_external_target_descriptors(
+    cfg: &mut Config,
+    section_obj: &Map<String, Value>,
+    descriptors: &[TargetConfigDescriptor],
+) -> bool {
+    let mut applied = false;
+    for descriptor in descriptors {
+        applied |= apply_external_notify_section(
+            cfg,
+            section_obj,
+            descriptor.external_key,
+            descriptor.subsystem_key,
+            descriptor.default_kvs,
+            descriptor.valid_keys,
+        );
+    }
+    applied
+}
+
 fn apply_external_notify_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
     let Some(Value::Object(notify_obj)) = root.get("notify") else {
         return false;
     };
 
-    let mut applied = false;
-    applied |= apply_external_notify_section(
-        cfg,
-        notify_obj,
-        "webhook",
-        NOTIFY_WEBHOOK_SUB_SYS,
-        &notify::DEFAULT_NOTIFY_WEBHOOK_KVS,
-        NOTIFY_WEBHOOK_KEYS,
-    );
-    applied |= apply_external_notify_section(
-        cfg,
-        notify_obj,
-        "mqtt",
-        NOTIFY_MQTT_SUB_SYS,
-        &notify::DEFAULT_NOTIFY_MQTT_KVS,
-        NOTIFY_MQTT_KEYS,
-    );
-    applied
+    apply_external_target_descriptors(cfg, notify_obj, &notify_target_descriptors())
 }
 
 fn apply_external_audit_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
@@ -394,24 +470,7 @@ fn apply_external_audit_map(cfg: &mut Config, root: &Map<String, Value>) -> bool
         return false;
     };
 
-    let mut applied = false;
-    applied |= apply_external_notify_section(
-        cfg,
-        audit_obj,
-        "webhook",
-        AUDIT_WEBHOOK_SUB_SYS,
-        &audit::DEFAULT_AUDIT_WEBHOOK_KVS,
-        AUDIT_WEBHOOK_KEYS,
-    );
-    applied |= apply_external_notify_section(
-        cfg,
-        audit_obj,
-        "mqtt",
-        AUDIT_MQTT_SUB_SYS,
-        &audit::DEFAULT_AUDIT_MQTT_KVS,
-        AUDIT_MQTT_KEYS,
-    );
-    applied
+    apply_external_target_descriptors(cfg, audit_obj, &audit_target_descriptors())
 }
 
 fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
@@ -513,15 +572,15 @@ fn build_oidc_provider_object(kvs: &KVS) -> Map<String, Value> {
             continue;
         }
 
-        if kv.key == rustfs_config::oidc::OIDC_SCOPES {
-            let scopes = kv
+        if COMMA_SEPARATED_LISTS.contains(&kv.key.as_str()) {
+            let values = kv
                 .value
                 .split(',')
                 .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-                .map(|scope| Value::String(scope.to_string()))
+                .filter(|val| !val.is_empty())
+                .map(|val| Value::String(val.to_string()))
                 .collect::<Vec<_>>();
-            provider.insert(kv.key.clone(), Value::Array(scopes));
+            provider.insert(kv.key.clone(), Value::Array(values));
             continue;
         }
 
@@ -605,7 +664,15 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
 }
 
 fn is_notify_bool_key(key: &str) -> bool {
-    key == ENABLE_KEY || key == rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
+    matches!(
+        key,
+        ENABLE_KEY
+            | rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
+            | rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA
+            | rustfs_config::NATS_TLS_REQUIRED
+            | rustfs_config::PULSAR_TLS_ALLOW_INSECURE
+            | rustfs_config::PULSAR_TLS_HOSTNAME_VERIFICATION
+    )
 }
 
 fn encode_notify_scalar_value(key: &str, value: &str) -> Value {
@@ -703,38 +770,43 @@ fn build_notify_subsystem_object(
     subsystem_obj
 }
 
+fn build_target_object(cfg: &Config, descriptors: &[TargetConfigDescriptor]) -> Map<String, Value> {
+    let mut target_obj = Map::new();
+    for descriptor in descriptors {
+        let subsystem_obj =
+            build_notify_subsystem_object(cfg, descriptor.subsystem_key, descriptor.default_kvs, descriptor.valid_keys);
+        if !subsystem_obj.is_empty() {
+            target_obj.insert(descriptor.external_key.to_string(), Value::Object(subsystem_obj));
+        }
+    }
+    target_obj
+}
+
 fn build_notify_object(cfg: &Config) -> Map<String, Value> {
-    let mut notify_obj = Map::new();
-
-    let webhook_obj =
-        build_notify_subsystem_object(cfg, NOTIFY_WEBHOOK_SUB_SYS, &notify::DEFAULT_NOTIFY_WEBHOOK_KVS, NOTIFY_WEBHOOK_KEYS);
-    if !webhook_obj.is_empty() {
-        notify_obj.insert("webhook".to_string(), Value::Object(webhook_obj));
-    }
-
-    let mqtt_obj = build_notify_subsystem_object(cfg, NOTIFY_MQTT_SUB_SYS, &notify::DEFAULT_NOTIFY_MQTT_KVS, NOTIFY_MQTT_KEYS);
-    if !mqtt_obj.is_empty() {
-        notify_obj.insert("mqtt".to_string(), Value::Object(mqtt_obj));
-    }
-
-    notify_obj
+    build_target_object(cfg, &notify_target_descriptors())
 }
 
 fn build_audit_object(cfg: &Config) -> Map<String, Value> {
-    let mut audit_obj = Map::new();
+    build_target_object(cfg, &audit_target_descriptors())
+}
 
-    let webhook_obj =
-        build_notify_subsystem_object(cfg, AUDIT_WEBHOOK_SUB_SYS, &audit::DEFAULT_AUDIT_WEBHOOK_KVS, AUDIT_WEBHOOK_KEYS);
-    if !webhook_obj.is_empty() {
-        audit_obj.insert("webhook".to_string(), Value::Object(webhook_obj));
+fn sync_rendered_target_object(
+    target_obj: &mut Map<String, Value>,
+    rendered_target: &Map<String, Value>,
+    descriptors: &[TargetConfigDescriptor],
+) {
+    for descriptor in descriptors {
+        match rendered_target.get(descriptor.external_key) {
+            Some(Value::Object(v)) => {
+                target_obj.insert(descriptor.external_key.to_string(), Value::Object(v.clone()));
+                target_obj.remove(descriptor.subsystem_key);
+            }
+            _ => {
+                target_obj.remove(descriptor.external_key);
+                target_obj.remove(descriptor.subsystem_key);
+            }
+        }
     }
-
-    let mqtt_obj = build_notify_subsystem_object(cfg, AUDIT_MQTT_SUB_SYS, &audit::DEFAULT_AUDIT_MQTT_KVS, AUDIT_MQTT_KEYS);
-    if !mqtt_obj.is_empty() {
-        audit_obj.insert("mqtt".to_string(), Value::Object(mqtt_obj));
-    }
-
-    audit_obj
 }
 
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -771,67 +843,31 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
         _ => Map::new(),
     };
     let rendered_notify = build_notify_object(cfg);
-    match rendered_notify.get("webhook") {
-        Some(Value::Object(v)) => {
-            notify_obj.insert("webhook".to_string(), Value::Object(v.clone()));
-            notify_obj.remove(NOTIFY_WEBHOOK_SUB_SYS);
-        }
-        _ => {
-            notify_obj.remove("webhook");
-            notify_obj.remove(NOTIFY_WEBHOOK_SUB_SYS);
-        }
-    }
-    match rendered_notify.get("mqtt") {
-        Some(Value::Object(v)) => {
-            notify_obj.insert("mqtt".to_string(), Value::Object(v.clone()));
-            notify_obj.remove(NOTIFY_MQTT_SUB_SYS);
-        }
-        _ => {
-            notify_obj.remove("mqtt");
-            notify_obj.remove(NOTIFY_MQTT_SUB_SYS);
-        }
-    }
+    sync_rendered_target_object(&mut notify_obj, &rendered_notify, &notify_target_descriptors());
     if notify_obj.is_empty() {
         root.remove("notify");
     } else {
         root.insert("notify".to_string(), Value::Object(notify_obj));
     }
-    root.remove(NOTIFY_WEBHOOK_SUB_SYS);
-    root.remove(NOTIFY_MQTT_SUB_SYS);
+    for descriptor in notify_target_descriptors() {
+        root.remove(descriptor.subsystem_key);
+    }
 
     let mut logger_obj = match root.remove("logger") {
         Some(Value::Object(v)) => v,
         _ => Map::new(),
     };
     let rendered_audit = build_audit_object(cfg);
-    match rendered_audit.get("webhook") {
-        Some(Value::Object(v)) => {
-            logger_obj.insert("webhook".to_string(), Value::Object(v.clone()));
-            logger_obj.remove(AUDIT_WEBHOOK_SUB_SYS);
-        }
-        _ => {
-            logger_obj.remove("webhook");
-            logger_obj.remove(AUDIT_WEBHOOK_SUB_SYS);
-        }
-    }
-    match rendered_audit.get("mqtt") {
-        Some(Value::Object(v)) => {
-            logger_obj.insert("mqtt".to_string(), Value::Object(v.clone()));
-            logger_obj.remove(AUDIT_MQTT_SUB_SYS);
-        }
-        _ => {
-            logger_obj.remove("mqtt");
-            logger_obj.remove(AUDIT_MQTT_SUB_SYS);
-        }
-    }
+    sync_rendered_target_object(&mut logger_obj, &rendered_audit, &audit_target_descriptors());
     if logger_obj.is_empty() {
         root.remove("logger");
     } else {
         root.insert("logger".to_string(), Value::Object(logger_obj));
     }
     root.remove("audit");
-    root.remove(AUDIT_WEBHOOK_SUB_SYS);
-    root.remove(AUDIT_MQTT_SUB_SYS);
+    for descriptor in audit_target_descriptors() {
+        root.remove(descriptor.subsystem_key);
+    }
 
     Ok(serde_json::to_vec(&Value::Object(root))?)
 }
@@ -1655,6 +1691,7 @@ mod tests {
               "client_id":"console",
               "client_secret":"secret-value",
               "scopes":["openid","profile","email"],
+              "other_audiences":["aud1", "aud2"],
               "redirect_uri_dynamic":true,
               "display_name":"Default Provider"
             },
@@ -1679,6 +1716,7 @@ mod tests {
         );
         assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_CLIENT_ID), "console");
         assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_SCOPES), "openid,profile,email");
+        assert_eq!(default_kvs.get(rustfs_config::oidc::OIDC_OTHER_AUDIENCES), "aud1,aud2");
         assert_eq!(default_kvs.get(ENABLE_KEY), EnableState::On.to_string());
 
         let smoke_kvs = cfg
@@ -1863,6 +1901,7 @@ mod tests {
         );
         default_provider.insert(rustfs_config::oidc::OIDC_CLIENT_ID.to_string(), "console".to_string());
         default_provider.insert(rustfs_config::oidc::OIDC_SCOPES.to_string(), "openid,profile,email".to_string());
+        default_provider.insert(rustfs_config::oidc::OIDC_OTHER_AUDIENCES.to_string(), "aud1,aud2".to_string());
         oidc_section.insert(DEFAULT_DELIMITER.to_string(), default_provider);
         cfg.0.insert(IDENTITY_OPENID_SUB_SYS.to_string(), oidc_section);
 
@@ -1889,6 +1928,13 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
             Some(vec!["openid", "profile", "email"])
+        );
+        assert_eq!(
+            default_provider
+                .get(rustfs_config::oidc::OIDC_OTHER_AUDIENCES)
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["aud1", "aud2"])
         );
         assert_eq!(default_provider.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
     }

@@ -39,6 +39,9 @@ pub const ENV_CAPACITY_STAT_TIMEOUT: &str = "RUSTFS_CAPACITY_STAT_TIMEOUT";
 /// Environment variable for sample rate
 pub const ENV_CAPACITY_SAMPLE_RATE: &str = "RUSTFS_CAPACITY_SAMPLE_RATE";
 
+/// Environment variable for metrics logging interval
+pub const ENV_CAPACITY_METRICS_INTERVAL: &str = "RUSTFS_CAPACITY_METRICS_INTERVAL";
+
 /// Environment variable for following symbolic links during capacity calculation
 pub const ENV_CAPACITY_FOLLOW_SYMLINKS: &str = "RUSTFS_CAPACITY_FOLLOW_SYMLINKS";
 
@@ -89,6 +92,10 @@ pub const DEFAULT_STAT_TIMEOUT_SECS: u64 = 3;
 /// Default: 200
 pub const DEFAULT_SAMPLE_RATE: usize = 200;
 
+/// Capacity metrics logging interval in seconds
+/// Default: 600 seconds (10 minutes)
+pub const DEFAULT_CAPACITY_METRICS_INTERVAL_SECS: u64 = 600;
+
 /// Follow symbolic links during capacity calculation
 /// Default: false (disabled for safety)
 pub const DEFAULT_CAPACITY_FOLLOW_SYMLINKS: bool = false;
@@ -130,6 +137,7 @@ mod tests {
         assert_eq!(ENV_CAPACITY_MAX_FILES_THRESHOLD, "RUSTFS_CAPACITY_MAX_FILES_THRESHOLD");
         assert_eq!(ENV_CAPACITY_STAT_TIMEOUT, "RUSTFS_CAPACITY_STAT_TIMEOUT");
         assert_eq!(ENV_CAPACITY_SAMPLE_RATE, "RUSTFS_CAPACITY_SAMPLE_RATE");
+        assert_eq!(ENV_CAPACITY_METRICS_INTERVAL, "RUSTFS_CAPACITY_METRICS_INTERVAL");
         assert_eq!(ENV_CAPACITY_FOLLOW_SYMLINKS, "RUSTFS_CAPACITY_FOLLOW_SYMLINKS");
         assert_eq!(ENV_CAPACITY_MAX_SYMLINK_DEPTH, "RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH");
         assert_eq!(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT");
@@ -147,6 +155,7 @@ mod tests {
         assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 200_000);
         assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 3);
         assert_eq!(DEFAULT_SAMPLE_RATE, 200);
+        assert_eq!(DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, 600);
         assert_eq!(DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH, 3);
         assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 2);
         assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 15);

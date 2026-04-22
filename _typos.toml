@@ -39,6 +39,7 @@ abd = "abd"
 mak = "mak"
 gae = "gae"
 GAE = "GAE"
+thr = "thr"
 # s3-tests original test names (cannot be changed)
 nonexisted = "nonexisted"
 consts = "consts"

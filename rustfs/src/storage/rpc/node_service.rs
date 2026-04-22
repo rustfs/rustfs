@@ -1389,8 +1389,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "{}".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1411,8 +1411,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
             opts: "{}".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1433,8 +1433,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "invalid json".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1454,7 +1454,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
-            file_info_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1474,7 +1474,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
-            file_info_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1495,7 +1495,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "{}".to_string(),
-            opts_bin: Vec::new(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.read_version(request).await;
@@ -1517,7 +1517,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "invalid json".to_string(),
-            opts_bin: Vec::new(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.read_version(request).await;
@@ -1675,7 +1675,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "{}".to_string(),
-            read_multiple_req_bin: Vec::new(),
+            read_multiple_req_bin: Vec::new().into(),
         });
 
         let response = service.read_multiple(request).await;
@@ -1694,7 +1694,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "invalid json".to_string(),
-            read_multiple_req_bin: Vec::new(),
+            read_multiple_req_bin: Vec::new().into(),
         });
 
         let response = service.read_multiple(request).await;

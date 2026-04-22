@@ -1169,9 +1169,6 @@ impl FolderScanner {
                 let bucket_clone = bucket.clone();
                 let prefix_clone = prefix.clone();
                 let child_ctx_clone = child_ctx.clone();
-                let agreed_tx = agreed_tx.clone();
-                let partial_tx = partial_tx.clone();
-                let finished_tx = finished_tx.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = list_path_raw(
@@ -1219,13 +1216,28 @@ impl FolderScanner {
                 });
 
                 let mut found_objects = false;
+                let mut agreed_closed = false;
+                let mut partial_closed = false;
+                let mut finished_closed = false;
 
                 loop {
+                    if agreed_closed && partial_closed && finished_closed {
+                        break;
+                    }
+
                     select! {
-                        Some(entry_name) = agreed_rx.recv() => {
+                        entry_name = agreed_rx.recv(), if !agreed_closed => {
+                            let Some(entry_name) = entry_name else {
+                                agreed_closed = true;
+                                continue;
+                            };
                             (self.update_current_path)(&entry_name).await;
                         }
-                        Some(entries) = partial_rx.recv() => {
+                        entries = partial_rx.recv(), if !partial_closed => {
+                            let Some(entries) = entries else {
+                                partial_closed = true;
+                                continue;
+                            };
                             if !self.should_heal().await {
                                 child_ctx.cancel();
                                 break;
@@ -1297,7 +1309,11 @@ impl FolderScanner {
 
 
                         }
-                        Some(errs) = finished_rx.recv() => {
+                        errs = finished_rx.recv(), if !finished_closed => {
+                            let Some(errs) = errs else {
+                                finished_closed = true;
+                                continue;
+                            };
                             error!("scan_folder: list_path_raw: failed to get finished errs: {:?}", errs);
                             child_ctx.cancel();
                         }
@@ -1838,6 +1854,74 @@ mod tests {
             .expect("failed to restore bad dir permissions");
 
         assert!(result.is_ok(), "expected unreadable child directory to be skipped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+        let _heal_responder = rustfs_common::heal_channel::init_heal_channel().ok().map(|mut heal_rx| {
+            tokio::spawn(async move {
+                while let Some(command) = heal_rx.recv().await {
+                    if let rustfs_common::heal_channel::HealChannelCommand::Start { response_tx, .. } = command {
+                        let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                    }
+                }
+            })
+        });
+
+        let bucket = "src-archive";
+        tokio::fs::create_dir_all(temp_dir.join(bucket))
+            .await
+            .expect("failed to create bucket directory");
+
+        let mut disks = vec![scanner.local_disk.clone()];
+        for disk_name in ["disk2", "disk3", "disk4"] {
+            let disk_root = temp_dir.join(disk_name);
+            tokio::fs::create_dir_all(disk_root.join(bucket))
+                .await
+                .expect("failed to create extra disk bucket directory");
+            let endpoint =
+                Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("failed to create extra disk endpoint");
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("failed to create extra disk");
+            disks.push(disk);
+        }
+
+        scanner.heal_object_select = 1;
+        scanner.disks = disks;
+        scanner.disks_quorum = 2;
+        scanner.old_cache.replace(
+            "src-archive/snapshots/37b3f20d941e2f5e6d99114d9bb2f3e67a8a2e5c9c4c5a1b0d6e7f8091a2b3c4",
+            bucket,
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut into = DataUsageEntry::default();
+        let folder = CachedFolder {
+            name: bucket.to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            scanner.scan_folder(CancellationToken::new(), folder, &mut into),
+        )
+        .await
+        .expect("scan_folder should not hang after list_path_raw finishes")
+        .expect("scan_folder should finish successfully");
     }
 
     #[tokio::test]
