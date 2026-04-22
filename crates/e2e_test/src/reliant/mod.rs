@@ -16,6 +16,7 @@ mod conditional_writes;
 mod get_deleted_object_test;
 mod grpc_lock_client;
 mod grpc_lock_server;
+mod head_tls_bodyless_test;
 mod head_deleted_object_versioning_test;
 mod lifecycle;
 mod lock;
