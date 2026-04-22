@@ -44,6 +44,13 @@ impl HTTPPreconditions {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct ObjectLockRetentionOptions {
+    pub mode: Option<String>,
+    pub retain_until: Option<OffsetDateTime>,
+    pub bypass_governance: bool,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
@@ -79,6 +86,7 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+    pub object_lock_retention: Option<ObjectLockRetentionOptions>,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
