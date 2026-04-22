@@ -94,8 +94,7 @@ impl BinaryFunc {
     /// given key, any decoded request value that equals the expected bytes
     /// satisfies that pair (OR across values). A missing request key, or
     /// *any* request value that is not valid base64, causes the condition
-    /// to evaluate to false (fail-closed). This matches `AddrFunc::evaluate`,
-    /// which also rejects unparsable request values outright.
+    /// to evaluate to false (fail-closed).
     pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
             let Some(rvalues) = values.get(inner.key.name().as_str()) else {
