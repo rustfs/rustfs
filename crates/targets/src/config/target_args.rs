@@ -275,7 +275,11 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
     if brokers_raw.split(',').all(|s| s.trim().is_empty()) {
         return Err(TargetError::Configuration("Kafka brokers cannot be empty".to_string()));
     }
-    let brokers: Vec<String> = brokers_raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let brokers: Vec<String> = brokers_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let topic = config
         .lookup(KAFKA_TOPIC)
