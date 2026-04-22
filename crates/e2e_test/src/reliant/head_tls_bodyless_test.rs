@@ -108,13 +108,13 @@ async fn ensure_bucket_exists(client: &Client, endpoint: &str) -> Result<(), Box
     }
 }
 
-async fn wait_for_tls_server_ready(_client: &Client, endpoint: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let address = endpoint.trim_start_matches("https://");
+async fn wait_for_tls_server_ready(client: &Client, endpoint: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let ready_url = format!("{endpoint}/");
     for _attempt in 0..60 {
-        if TcpStream::connect(address).await.is_ok() {
-            return Ok(());
+        match signed_empty_request(client, http::Method::GET, &ready_url).await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(500)).await,
         }
-        sleep(Duration::from_millis(500)).await;
     }
 
     Err("RustFS TLS server failed to become ready within 30 seconds".into())
