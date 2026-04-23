@@ -21,7 +21,8 @@ pub mod sys;
 pub mod target;
 
 pub use check::{
-    check_mqtt_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available, check_pulsar_broker_available,
+    check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
+    check_pulsar_broker_available,
 };
 pub use error::{StoreError, TargetError};
 pub use rustfs_s3_common::EventName;
