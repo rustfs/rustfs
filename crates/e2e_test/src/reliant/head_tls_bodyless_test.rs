@@ -133,8 +133,6 @@ async fn start_tls_rustfs_server(env: &mut RustFSTestEnvironment, tls_dir: &Path
         "RUSTFS_ACCESS_KEY",
         "RUSTFS_SECRET_KEY",
         "RUSTFS_TLS_PATH",
-        "RUSTFS_CONSOLE_ADDRESS",
-        "RUSTFS_CONSOLE_ENABLE",
         "RUSTFS_OBS_LOG_DIRECTORY",
     ] {
         command.env_remove(key);
@@ -142,6 +140,7 @@ async fn start_tls_rustfs_server(env: &mut RustFSTestEnvironment, tls_dir: &Path
 
     let process = command
         .env("RUSTFS_TLS_PATH", tls_dir)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .args([
             "--address",
             &env.address,
