@@ -3255,6 +3255,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "clap",
  "flatbuffers",
  "flate2",
  "futures",

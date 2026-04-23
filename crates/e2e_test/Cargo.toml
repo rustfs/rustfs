@@ -73,3 +73,4 @@ rcgen.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
 zip.workspace = true
+clap.workspace = true
