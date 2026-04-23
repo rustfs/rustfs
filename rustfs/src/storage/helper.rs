@@ -16,6 +16,7 @@ use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use hashbrown::HashMap;
 use http::StatusCode;
+use metrics::counter;
 use rustfs_audit::{
     entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
@@ -80,6 +81,7 @@ pub struct OperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        counter!("rustfs.log.chain.audit.total").increment(1);
         // Parse path -> bucket/object
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -119,8 +121,11 @@ impl OperationHelper {
         }
         // Audit builder
         // Resolve canonical request context and request_id in a single pass:
-        //   RequestContext.request_id > extract_request_id_from_headers() > "unknown"
+        //   RequestContext.request_id > extract_request_id_from_headers() > generated fallback id
         let request_context = request_context_from_req(req);
+        if request_context.is_none() {
+            counter!("rustfs.log.chain.orphan.total", "component" => "operation_helper").increment(1);
+        }
         let request_id = request_context
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
