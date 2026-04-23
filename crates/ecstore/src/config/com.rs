@@ -680,6 +680,7 @@ fn is_target_bool_key(key: &str) -> bool {
         key,
         ENABLE_KEY
             | rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
+            | rustfs_config::KAFKA_TLS_ENABLE
             | rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA
             | rustfs_config::NATS_TLS_REQUIRED
             | rustfs_config::PULSAR_TLS_ALLOW_INSECURE
@@ -1771,7 +1772,8 @@ mod tests {
                 "enable":true,
                 "brokers":"127.0.0.1:9092,127.0.0.1:9093",
                 "topic":"events-kafka",
-                "acks":"all"
+                "acks":"all",
+                "tls_enable":true
               }
             }
           }
@@ -1808,6 +1810,7 @@ mod tests {
         assert_eq!(kafka.get(rustfs_config::KAFKA_BROKERS), "127.0.0.1:9092,127.0.0.1:9093");
         assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
     }
 
     #[test]
@@ -2057,6 +2060,11 @@ mod tests {
                     value: "all".to_string(),
                     hidden_if_empty: false,
                 },
+                crate::config::KV {
+                    key: rustfs_config::KAFKA_TLS_ENABLE.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
             ]),
         );
         cfg.0.insert(NOTIFY_KAFKA_SUB_SYS.to_string(), kafka_section);
@@ -2108,6 +2116,7 @@ mod tests {
             Some("127.0.0.1:9092,127.0.0.1:9093")
         );
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS).and_then(Value::as_str), Some("all"));
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE).and_then(Value::as_bool), Some(true));
     }
 
     #[test]
