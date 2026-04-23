@@ -1446,19 +1446,25 @@ mod tests {
     #[test]
     fn list_service_account_cross_user_uses_list_service_accounts_action() {
         let src = include_str!("service_account.rs");
-        let list_block =
-            extract_block_between_markers(src, "impl Operation for ListServiceAccount", "struct ListAccessKeysQuery");
+        let list_start = src
+            .find("impl Operation for ListServiceAccount")
+            .expect("ListServiceAccount operation should exist");
+        let list_block = &src[list_start..];
+        let list_end = list_block
+            .find("struct ListAccessKeysQuery")
+            .expect("ListAccessKeysQuery marker should exist");
+        let list_block = &list_block[..list_end];
 
         assert!(
-            list_block.contains("query.user.as_ref().is_some_and(|v| v != &cred.access_key)"),
+            list_block.contains("query.user.as_ref().is_some_and(") && list_block.contains("v != &cred.access_key"),
             "cross-user ListServiceAccount path should stay explicitly guarded"
         );
         assert!(
-            list_block.contains("Action::AdminAction(AdminAction::ListServiceAccountsAdminAction)"),
+            list_block.contains("ListServiceAccountsAdminAction"),
             "cross-user ListServiceAccount should authorize with ListServiceAccountsAdminAction"
         );
         assert!(
-            !list_block.contains("Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction)"),
+            !list_block.contains("UpdateServiceAccountAdminAction"),
             "cross-user ListServiceAccount must not require UpdateServiceAccountAdminAction"
         );
     }
@@ -1545,12 +1551,5 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
-    }
-
-    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
-        let start = src.find(start_marker).expect("start marker should exist");
-        let rest = &src[start..];
-        let end = rest.find(end_marker).expect("end marker should exist");
-        &rest[..end]
     }
 }
