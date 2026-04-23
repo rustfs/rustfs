@@ -126,10 +126,10 @@ impl OperationHelper {
         if request_context.is_none() {
             counter!("rustfs.log.chain.orphan.total", "component" => "operation_helper").increment(1);
         }
-        let request_id = request_context.as_ref().map(|ctx| ctx.request_id.clone()).unwrap_or_else(|| {
-            counter!("rustfs.log.chain.fallback_request_id.total", "source" => "operation_helper").increment(1);
-            extract_request_id_from_headers(&req.headers)
-        });
+        let request_id = request_context
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_else(|| extract_request_id_from_headers(&req.headers));
 
         let audit_builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
             .remote_host(remote_host)
