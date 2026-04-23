@@ -1444,6 +1444,32 @@ mod tests {
     }
 
     #[test]
+    fn list_service_account_cross_user_uses_list_service_accounts_action() {
+        let src = include_str!("service_account.rs");
+        let list_start = src
+            .find("impl Operation for ListServiceAccount")
+            .expect("ListServiceAccount operation should exist");
+        let list_block = &src[list_start..];
+        let list_end = list_block
+            .find("struct ListAccessKeysQuery")
+            .expect("ListAccessKeysQuery marker should exist");
+        let list_block = &list_block[..list_end];
+
+        assert!(
+            list_block.contains("query.user.as_ref().is_some_and(") && list_block.contains("v != &cred.access_key"),
+            "cross-user ListServiceAccount path should stay explicitly guarded"
+        );
+        assert!(
+            list_block.contains("ListServiceAccountsAdminAction"),
+            "cross-user ListServiceAccount should authorize with ListServiceAccountsAdminAction"
+        );
+        assert!(
+            !list_block.contains("UpdateServiceAccountAdminAction"),
+            "cross-user ListServiceAccount must not require UpdateServiceAccountAdminAction"
+        );
+    }
+
+    #[test]
     fn delete_service_account_uses_external_success_status() {
         assert_eq!(
             delete_service_account_success_status("/minio/admin/v3/delete-service-account"),
