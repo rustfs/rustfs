@@ -347,7 +347,7 @@ fn apply_external_oidc_map(cfg: &mut Config, root: &Map<String, Value>) -> bool 
     applied
 }
 
-fn parse_notify_scalar_value(key: &str, value: &Value) -> Option<String> {
+fn parse_target_scalar_value(key: &str, value: &Value) -> Option<String> {
     match value {
         Value::String(v) => Some(v.trim().to_string()),
         Value::Bool(v) if key == ENABLE_KEY || key == rustfs_config::WEBHOOK_SKIP_TLS_VERIFY => Some(if *v {
@@ -362,7 +362,7 @@ fn parse_notify_scalar_value(key: &str, value: &Value) -> Option<String> {
     }
 }
 
-fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&str]) -> KVS {
+fn decode_target_instance_object(instance: &Map<String, Value>, valid_keys: &[&str]) -> KVS {
     let mut kvs = KVS::new();
 
     for (key, value) in instance {
@@ -370,7 +370,7 @@ fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&s
             continue;
         }
 
-        if let Some(parsed) = parse_notify_scalar_value(key, value) {
+        if let Some(parsed) = parse_target_scalar_value(key, value) {
             kvs.insert(key.clone(), parsed);
         }
     }
@@ -378,21 +378,21 @@ fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&s
     kvs
 }
 
-fn decode_notify_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KVS> {
+fn decode_target_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KVS> {
     match value {
-        Value::Object(instance) => Some(decode_notify_instance_object(instance, valid_keys)),
+        Value::Object(instance) => Some(decode_target_instance_object(instance, valid_keys)),
         Value::Array(_) => serde_json::from_value::<KVS>(value.clone()).ok(),
         _ => None,
     }
 }
 
-fn is_notify_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
+fn is_target_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
     section
         .iter()
-        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_notify_scalar_value(key, value).is_some())
+        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_target_scalar_value(key, value).is_some())
 }
 
-fn apply_external_notify_section(
+fn apply_external_target_section(
     cfg: &mut Config,
     notify_obj: &Map<String, Value>,
     external_key: &str,
@@ -411,8 +411,8 @@ fn apply_external_notify_section(
     let subsystem = cfg.0.entry(subsystem_key.to_string()).or_default();
     let mut applied = false;
 
-    if is_notify_instance_shorthand(section_obj, valid_keys) {
-        let kvs = decode_notify_instance_object(section_obj, valid_keys);
+    if is_target_instance_shorthand(section_obj, valid_keys) {
+        let kvs = decode_target_instance_object(section_obj, valid_keys);
         if !kvs.is_empty() {
             let mut merged = default_kvs.clone();
             merged.extend(kvs);
@@ -423,7 +423,7 @@ fn apply_external_notify_section(
     }
 
     for (raw_instance, value) in section_obj {
-        let Some(mut kvs) = decode_notify_instance_value(value, valid_keys) else {
+        let Some(mut kvs) = decode_target_instance_value(value, valid_keys) else {
             continue;
         };
         if kvs.is_empty() {
@@ -456,7 +456,7 @@ fn apply_external_target_descriptors(
 ) -> bool {
     let mut applied = false;
     for descriptor in descriptors {
-        applied |= apply_external_notify_section(
+        applied |= apply_external_target_section(
             cfg,
             section_obj,
             descriptor.external_key,
@@ -675,7 +675,7 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
     oidc_obj
 }
 
-fn is_notify_bool_key(key: &str) -> bool {
+fn is_target_bool_key(key: &str) -> bool {
     matches!(
         key,
         ENABLE_KEY
@@ -687,8 +687,8 @@ fn is_notify_bool_key(key: &str) -> bool {
     )
 }
 
-fn encode_notify_scalar_value(key: &str, value: &str) -> Value {
-    if is_notify_bool_key(key) {
+fn encode_target_scalar_value(key: &str, value: &str) -> Value {
+    if is_target_bool_key(key) {
         if let Ok(state) = value.parse::<EnableState>() {
             return Value::Bool(state.is_enabled());
         }
@@ -709,7 +709,7 @@ fn is_hidden_if_empty(default_kvs: &KVS, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_notify_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&str], default_kvs: &KVS) -> Map<String, Value> {
+fn build_target_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&str], default_kvs: &KVS) -> Map<String, Value> {
     let mut instance = Map::new();
 
     for key in valid_keys {
@@ -732,13 +732,13 @@ fn build_notify_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&s
             continue;
         }
 
-        instance.insert((*key).to_string(), encode_notify_scalar_value(key, &effective_value));
+        instance.insert((*key).to_string(), encode_target_scalar_value(key, &effective_value));
     }
 
     instance
 }
 
-fn merged_notify_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS) -> KVS {
+fn merged_target_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS) -> KVS {
     let mut merged = default_kvs.clone();
     if let Some(kvs) = subsystem.get(DEFAULT_DELIMITER) {
         merged.extend(kvs.clone());
@@ -746,7 +746,7 @@ fn merged_notify_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS
     merged
 }
 
-fn build_notify_subsystem_object(
+fn build_target_subsystem_object(
     cfg: &Config,
     subsystem_key: &str,
     default_kvs: &KVS,
@@ -756,11 +756,11 @@ fn build_notify_subsystem_object(
         return Map::new();
     };
 
-    let effective_default = merged_notify_default_kvs(subsystem, default_kvs);
+    let effective_default = merged_target_default_kvs(subsystem, default_kvs);
     let mut subsystem_obj = Map::new();
 
     if let Some(default_instance) = subsystem.get(DEFAULT_DELIMITER) {
-        let default_obj = build_notify_instance_diff_object(default_instance, default_kvs, valid_keys, default_kvs);
+        let default_obj = build_target_instance_diff_object(default_instance, default_kvs, valid_keys, default_kvs);
         if !default_obj.is_empty() {
             subsystem_obj.insert("default".to_string(), Value::Object(default_obj));
         }
@@ -773,7 +773,7 @@ fn build_notify_subsystem_object(
     instances.sort_by_key(|(lhs, _)| *lhs);
 
     for (instance_key, kvs) in instances {
-        let instance_obj = build_notify_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
+        let instance_obj = build_target_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
         if !instance_obj.is_empty() {
             subsystem_obj.insert(instance_key.clone(), Value::Object(instance_obj));
         }
@@ -786,7 +786,7 @@ fn build_target_object(cfg: &Config, descriptors: &[TargetConfigDescriptor]) -> 
     let mut target_obj = Map::new();
     for descriptor in descriptors {
         let subsystem_obj =
-            build_notify_subsystem_object(cfg, descriptor.subsystem_key, descriptor.default_kvs, descriptor.valid_keys);
+            build_target_subsystem_object(cfg, descriptor.subsystem_key, descriptor.default_kvs, descriptor.valid_keys);
         if !subsystem_obj.is_empty() {
             target_obj.insert(descriptor.external_key.to_string(), Value::Object(subsystem_obj));
         }
