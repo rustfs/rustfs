@@ -38,6 +38,24 @@ use rustfs_ecstore::config::KVS;
 use std::path::Path;
 use std::time::Duration;
 
+fn parse_kafka_acks_value(value: Option<&str>) -> Result<i16, TargetError> {
+    let Some(value) = value else {
+        return Ok(1);
+    };
+
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(TargetError::Configuration("Kafka acks must be one of: 0, 1, -1, all".to_string()));
+    }
+
+    match normalized.to_ascii_lowercase().as_str() {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        "-1" | "all" => Ok(-1),
+        _ => Err(TargetError::Configuration("Kafka acks must be one of: 0, 1, -1, all".to_string())),
+    }
+}
+
 pub fn build_webhook_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<WebhookArgs, TargetError> {
     let endpoint = config
         .lookup(WEBHOOK_ENDPOINT)
@@ -289,7 +307,7 @@ pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         enable: true,
         brokers,
         topic,
-        acks: config.lookup(KAFKA_ACKS).and_then(|v| v.parse::<i16>().ok()).unwrap_or(1),
+        acks: parse_kafka_acks_value(config.lookup(KAFKA_ACKS).as_deref())?,
         tls_enable: parse_target_bool(config.lookup(KAFKA_TLS_ENABLE).as_deref()).unwrap_or(false),
         tls_ca: config.lookup(KAFKA_TLS_CA).unwrap_or_default(),
         tls_client_cert: config.lookup(KAFKA_TLS_CLIENT_CERT).unwrap_or_default(),
@@ -317,6 +335,8 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
         return Err(TargetError::Configuration("Missing Kafka topic".to_string()));
     }
 
+    parse_kafka_acks_value(config.lookup(KAFKA_ACKS).as_deref())?;
+
     let tls_client_cert = config.lookup(KAFKA_TLS_CLIENT_CERT).unwrap_or_default();
     let tls_client_key = config.lookup(KAFKA_TLS_CLIENT_KEY).unwrap_or_default();
     if tls_client_cert.is_empty() != tls_client_key.is_empty() {
@@ -333,4 +353,46 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_kafka_args, validate_kafka_config};
+    use crate::target::TargetType;
+    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC};
+    use rustfs_ecstore::config::KVS;
+
+    fn kafka_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(KAFKA_BROKERS.to_string(), "127.0.0.1:9092".to_string());
+        config.insert(KAFKA_TOPIC.to_string(), "events".to_string());
+        config
+    }
+
+    #[test]
+    fn build_kafka_args_accepts_all_ack_alias() {
+        let mut config = kafka_base_config();
+        config.insert(KAFKA_ACKS.to_string(), "all".to_string());
+
+        let args = build_kafka_args(&config, "", TargetType::NotifyEvent).expect("valid kafka args");
+        assert_eq!(args.acks, -1);
+    }
+
+    #[test]
+    fn build_kafka_args_rejects_invalid_acks() {
+        let mut config = kafka_base_config();
+        config.insert(KAFKA_ACKS.to_string(), "leader".to_string());
+
+        let err = build_kafka_args(&config, "", TargetType::NotifyEvent).expect_err("invalid acks should fail");
+        assert!(err.to_string().contains("Kafka acks must be one of"));
+    }
+
+    #[test]
+    fn validate_kafka_config_rejects_invalid_acks() {
+        let mut config = kafka_base_config();
+        config.insert(KAFKA_ACKS.to_string(), "2".to_string());
+
+        let err = validate_kafka_config(&config, "").expect_err("invalid acks should fail");
+        assert!(err.to_string().contains("Kafka acks must be one of"));
+    }
 }

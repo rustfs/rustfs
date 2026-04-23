@@ -449,10 +449,10 @@ async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_
     }
 
     if !kv_map.contains_key(KAFKA_BROKERS) {
-        return Err(s3_error!(InvalidArgument, "brokers is required"));
+        return Err(s3_error!(InvalidArgument, "Kafka brokers are required"));
     }
     if !kv_map.contains_key(KAFKA_TOPIC) {
-        return Err(s3_error!(InvalidArgument, "topic is required"));
+        return Err(s3_error!(InvalidArgument, "Kafka topic is required"));
     }
 
     let args = build_kafka_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())

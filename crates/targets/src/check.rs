@@ -163,9 +163,15 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         config = config.with_security(security);
     }
 
-    let _ = AsyncProducer::from_hosts_with_config(args.brokers.clone(), config)
-        .await
-        .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create producer"))?;
-
-    Ok(())
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = AsyncProducer::from_hosts_with_config(args.brokers.clone(), config)
+            .await
+            .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create producer"))?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("Kafka connection timed out".to_string())),
+    }
 }

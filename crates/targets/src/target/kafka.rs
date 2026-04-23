@@ -30,6 +30,7 @@ use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAck
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Arguments for configuring a Kafka target
@@ -74,6 +75,10 @@ impl KafkaArgs {
             return Err(TargetError::Configuration("kafka topic cannot be empty".to_string()));
         }
 
+        if !matches!(self.acks, -1..=1) {
+            return Err(TargetError::Configuration("kafka acks must be one of: 0, 1, -1".to_string()));
+        }
+
         if self.tls_client_cert.is_empty() != self.tls_client_key.is_empty() {
             return Err(TargetError::Configuration(
                 "kafka tls_client_cert and tls_client_key must be specified together".to_string(),
@@ -99,6 +104,7 @@ where
     id: TargetID,
     args: KafkaArgs,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
+    producer: Arc<Mutex<Option<Arc<AsyncProducer>>>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
@@ -115,6 +121,10 @@ where
             KafkaError::Config(_) => TargetError::Configuration(format!("{context}: {err}")),
             _ => TargetError::Request(format!("{context}: {err}")),
         }
+    }
+
+    fn is_connection_error(err: &TargetError) -> bool {
+        matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
     }
 
     /// Creates a new KafkaTarget
@@ -149,6 +159,7 @@ where
             id: target_id,
             args,
             store: queue_store,
+            producer: Arc::new(Mutex::new(None)),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -180,6 +191,22 @@ where
         AsyncProducer::from_hosts_with_config(self.args.brokers.clone(), config)
             .await
             .map_err(|e| Self::map_kafka_error(e, "Failed to create Kafka producer"))
+    }
+
+    async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
+        let mut cached = self.producer.lock().await;
+        if let Some(producer) = cached.as_ref() {
+            return Ok(Arc::clone(producer));
+        }
+
+        let producer = Arc::new(self.build_producer().await?);
+        *cached = Some(Arc::clone(&producer));
+        Ok(producer)
+    }
+
+    async fn invalidate_cached_producer(&self) {
+        let mut cached = self.producer.lock().await;
+        *cached = None;
     }
 
     /// Serializes the event and builds a QueuedPayload
@@ -218,12 +245,15 @@ where
             "Sending Kafka payload"
         );
 
-        let producer = self.build_producer().await?;
+        let producer = self.get_or_build_producer().await?;
 
-        producer
-            .send(&Record::from_value(&self.args.topic, body.as_slice()))
-            .await
-            .map_err(|e| Self::map_kafka_error(e, "Failed to send message to Kafka"))?;
+        if let Err(err) = producer.send(&Record::from_value(&self.args.topic, body.as_slice())).await {
+            let mapped = Self::map_kafka_error(err, "Failed to send message to Kafka");
+            if Self::is_connection_error(&mapped) {
+                self.invalidate_cached_producer().await;
+            }
+            return Err(mapped);
+        }
 
         debug!(target_id = %self.id, topic = %self.args.topic, "Event published to Kafka topic");
         self.delivery_counters.record_success();
@@ -236,6 +266,7 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
+            producer: Arc::clone(&self.producer),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
@@ -252,7 +283,7 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        let _ = self.build_producer().await?;
+        let _ = self.get_or_build_producer().await?;
         Ok(true)
     }
 
