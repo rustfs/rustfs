@@ -61,6 +61,14 @@ fn current_trace_id() -> Option<String> {
     Some(span_context.trace_id().to_string())
 }
 
+fn fallback_request_id() -> String {
+    format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8])
+}
+
+fn propagated_request_id() -> String {
+    current_trace_id().unwrap_or_else(fallback_request_id)
+}
+
 pub(crate) fn inject_trace_context_into_http_headers(headers: &mut HeaderMap) {
     let current_context = Span::current().context();
     global::get_text_map_propagator(|propagator| {
@@ -73,9 +81,8 @@ pub(crate) fn inject_request_id_into_http_headers(headers: &mut HeaderMap) {
     if headers.contains_key(REQUEST_ID_HEADER) {
         return;
     }
-    if let Some(trace_id) = current_trace_id()
-        && let Ok(value) = HeaderValue::from_str(&trace_id)
-    {
+    let request_id = propagated_request_id();
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
         headers.insert(REQUEST_ID_HEADER, value);
     }
 }
@@ -93,10 +100,8 @@ pub(crate) fn inject_request_id_into_metadata(metadata: &mut tonic::metadata::Me
     if metadata.contains_key(&request_id_key) {
         return;
     }
-    let Some(trace_id) = current_trace_id() else {
-        return;
-    };
-    let Ok(value) = tonic::metadata::MetadataValue::try_from(trace_id.as_str()) else {
+    let request_id = propagated_request_id();
+    let Ok(value) = tonic::metadata::MetadataValue::try_from(request_id.as_str()) else {
         return;
     };
     metadata.insert(request_id_key, value);
@@ -182,5 +187,29 @@ mod tests {
         });
 
         assert_eq!(metadata.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some(trace_id));
+    }
+
+    #[test]
+    fn test_inject_request_id_into_http_headers_uses_req_fallback_when_trace_missing() {
+        let mut headers = HeaderMap::new();
+        inject_request_id_into_http_headers(&mut headers);
+
+        let request_id = headers
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id should be injected");
+        assert!(request_id.starts_with("req-"), "expected req- fallback, got: {request_id}");
+    }
+
+    #[test]
+    fn test_inject_request_id_into_metadata_uses_req_fallback_when_trace_missing() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        inject_request_id_into_metadata(&mut metadata);
+
+        let request_id = metadata
+            .get(REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("request id should be injected");
+        assert!(request_id.starts_with("req-"), "expected req- fallback, got: {request_id}");
     }
 }

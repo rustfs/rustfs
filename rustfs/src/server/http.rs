@@ -880,6 +880,11 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
+    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
+        error!("RPC signature verification failed: {}", e);
+        Status::unauthenticated("No valid auth token")
+    })?;
+
     let parent_context =
         global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
     if parent_context.has_active_span() {
@@ -894,11 +899,6 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             warn!("Failed to propagate tracing context from gRPC metadata: `{:?}`", e);
         }
     }
-
-    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
-        error!("RPC signature verification failed: {}", e);
-        Status::unauthenticated("No valid auth token")
-    })?;
     Ok(req)
 }
 
