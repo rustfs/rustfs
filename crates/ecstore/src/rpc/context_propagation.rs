@@ -66,7 +66,9 @@ fn fallback_request_id() -> String {
 }
 
 fn propagated_request_id() -> String {
-    current_trace_id().unwrap_or_else(fallback_request_id)
+    current_trace_id()
+        .map(|trace_id| format!("trace-{trace_id}"))
+        .unwrap_or_else(fallback_request_id)
 }
 
 pub(crate) fn inject_trace_context_into_http_headers(headers: &mut HeaderMap) {
