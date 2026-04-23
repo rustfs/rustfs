@@ -61,6 +61,12 @@ pub(crate) const RPC_PREFIX: &str = "/rustfs/rpc";
 /// For example, the full gRPC method path would be "/node_service.NodeService/MethodName".
 pub(crate) const TONIC_PREFIX: &str = "/node_service.NodeService";
 
+/// version information path for RustFS server. This path is used to access version information about the RustFS server.
+pub(crate) const VERSION: &str = "/version";
+
+/// license information path for RustFS server. This path is used to access license information about the RustFS server.
+pub(crate) const LICENSE: &str = "/license";
+
 /// LOGO art for RustFS server.
 pub const LOGO: &str = r#"
 
