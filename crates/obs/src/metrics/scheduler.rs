@@ -36,7 +36,11 @@ use crate::metrics::collectors::{
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
     collect_cluster_metrics,
+    collect_cpu_metrics,
+    collect_drive_count_metrics,
+    collect_drive_detailed_metrics,
     collect_host_network_metrics,
+    collect_memory_metrics,
     collect_node_metrics,
     collect_notification_metrics,
     collect_notification_target_metrics,
@@ -57,7 +61,8 @@ use crate::metrics::config::{
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats,
-    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
+    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle, collect_system_cpu_stats,
+    collect_system_drive_stats, collect_system_memory_stats,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
@@ -351,6 +356,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         }
 
                         report_metrics(&metrics);
+
+                        let (drive_stats, drive_counts) = collect_system_drive_stats().await;
+                        let mut drive_metrics = collect_drive_detailed_metrics(&drive_stats);
+                        drive_metrics.extend(collect_drive_count_metrics(&drive_counts));
+                        report_metrics(&drive_metrics);
                         advance_deadline(&mut next_system_run, system_interval, now);
                     }
                 }
@@ -432,8 +442,12 @@ fn collect_system_monitoring_metrics(
         written_bytes: bundle.disk_write_bytes,
     };
     let network_stats = collect_host_network_stats();
+    let system_cpu_stats = collect_system_cpu_stats();
+    let system_memory_stats = collect_system_memory_stats();
 
     let mut metrics = Vec::new();
+    metrics.extend(collect_cpu_metrics(&system_cpu_stats));
+    metrics.extend(collect_memory_metrics(&system_memory_stats));
     metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
     metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
     metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));

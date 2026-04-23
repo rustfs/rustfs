@@ -596,72 +596,6 @@
       "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "fixedColor": "red",
-            "mode": "fixed"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 18,
-        "y": 6
-      },
-      "id": 16,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "percentChangeColorMode": "standard",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showPercentChange": false,
-        "textMode": "auto",
-        "wideLayout": true
-      },
-      "pluginVersion": "12.3.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(rustfs_object_cache_invalidations_total{job=~\"$job\"}[$__range]))",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Cache Invalidations",
-      "type": "stat"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -765,13 +699,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (key_request_uri_path) (rate(rustfs_api_requests_total{job=~\"$job\", key_request_uri_path=~\"$path\"}[$__rate_interval]))",
-          "legendFormat": "{{key_request_uri_path}}",
+          "expr": "sum by (request_method) (rate(rustfs_api_requests_total{job=~\"$job\", request_method=~\"$method\"}[$__rate_interval]))",
+          "legendFormat": "{{request_method}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Request Rate",
+      "title": "Request Rate by Method",
       "type": "timeseries"
     },
     {
@@ -917,7 +851,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -928,7 +862,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -939,7 +873,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
@@ -1091,7 +1025,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -1102,7 +1036,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -1113,7 +1047,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\", key_request_uri_path=~\"$path\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
@@ -1971,7 +1905,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (rustfs_system_drive_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "legendFormat": "{{drive}} (bytes)",
           "range": true,
           "refId": "A"
@@ -1982,7 +1916,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_node_disk_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_node_disk_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "sum by (drive) (rustfs_system_drive_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_system_drive_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
           "hide": false,
           "instant": false,
           "legendFormat": "{{drive}} (percent)",
@@ -1990,7 +1924,7 @@
           "refId": "B"
         }
       ],
-      "title": "Node Disk Usage",
+      "title": "System Drive Usage",
       "type": "timeseries"
     },
     {
@@ -2474,12 +2408,23 @@
           },
           "editorMode": "code",
           "expr": "sum by (job) (rustfs_system_process_cpu_usage{job=~\"$job\"})",
-          "legendFormat": "{{job}}",
+          "legendFormat": "process cpu - {{job}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rustfs_system_cpu_load_perc{job=~\"$job\"}",
+          "legendFormat": "system load - {{job}}",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "CPU",
+      "title": "CPU Usage and Load",
       "type": "timeseries"
     },
     {
@@ -2539,7 +2484,24 @@
           },
           "unit": "bytes"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/.*percent.*/"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 7,
@@ -2573,12 +2535,34 @@
           },
           "editorMode": "code",
           "expr": "sum by (job) (rustfs_system_process_resident_memory_bytes{job=~\"$job\"})",
-          "legendFormat": "{{job}}",
+          "legendFormat": "process rss - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rustfs_system_memory_used_bytes{job=~\"$job\"}",
+          "legendFormat": "system used - {{job}}",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rustfs_system_memory_used_perc{job=~\"$job\"}",
+          "legendFormat": "system used percent - {{job}}",
+          "range": true,
+          "refId": "C"
         }
       ],
-      "title": "Memory",
+      "title": "Memory Usage",
       "type": "timeseries"
     },
     {
@@ -2687,7 +2671,7 @@
           "refId": "D"
         }
       ],
-      "title": "Network",
+      "title": "Host Network Throughput",
       "type": "timeseries"
     },
     {
@@ -2796,7 +2780,7 @@
           "refId": "F"
         }
       ],
-      "title": "Network by Interface",
+      "title": "Host Network by Interface",
       "type": "timeseries"
     },
     {
@@ -4762,23 +4746,30 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
               }
             ]
           },
-          "unit": "percent"
+          "unit": "ops"
         }
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
-        "y": 93
+        "y": 101
       },
-      "id": 109,
+      "id": 111,
       "options": {
         "legend": {
-          "calcs": ["mean"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -4793,12 +4784,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(rustfs_cache_hits_total{job=~\"$job\"}[5m]) / (rate(rustfs_cache_hits_total{job=~\"$job\"}[5m]) + rate(rustfs_cache_misses_total{job=~\"$job\"}[5m])) * 100",
-          "legendFormat": "Cache Hit Rate ({{cache}})",
+          "expr": "sum by (failure_type) (rate(rustfs_tls_handshake_failures{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{failure_type}}",
           "refId": "A"
         }
       ],
-      "title": "Cache Hit Rate",
+      "title": "TLS Handshake Failures",
       "type": "timeseries"
     },
     {
@@ -4840,23 +4831,26 @@
             "steps": [
               {
                 "color": "green",
-                "value": null
+                "value": 0
               }
             ]
           },
-          "unit": "bytes"
+          "unit": "short"
         }
       },
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 93
+        "x": 0,
+        "y": 109
       },
-      "id": 110,
+      "id": 112,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -4871,21 +4865,93 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rustfs_cache_size_bytes{job=~\"$job\",cache=\"l1\"}",
-          "legendFormat": "L1 Cache Size",
+          "expr": "sum by (job) (rustfs_system_process_file_descriptor_open_total{job=~\"$job\"})",
+          "legendFormat": "{{job}}",
           "refId": "A"
+        }
+      ],
+      "title": "Open File Descriptors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 109
+      },
+      "id": 113,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
         },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rustfs_cache_size_bytes{job=~\"$job\",cache=\"l2\"}",
-          "legendFormat": "L2 Cache Size",
-          "refId": "B"
+          "expr": "sum by (job, direction) (rustfs_system_process_disk_io{job=~\"$job\"})",
+          "legendFormat": "{{direction}} - {{job}}",
+          "refId": "A"
         }
       ],
-      "title": "Cache Size",
+      "title": "Process Disk I/O",
       "type": "timeseries"
     }
   ],
@@ -4948,15 +5014,15 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total,key_request_uri_path)",
+        "definition": "label_values(rustfs_api_requests_total,request_method)",
         "includeAll": true,
-        "label": "Path",
+        "label": "Method",
         "multi": true,
-        "name": "path",
+        "name": "method",
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total,key_request_uri_path)",
+          "query": "label_values(rustfs_api_requests_total,request_method)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -4991,7 +5057,7 @@
           "text": "All",
           "value": "$__all"
         },
-        "definition": "label_values(rustfs_node_disk_used_bytes,drive)",
+        "definition": "label_values(rustfs_system_drive_used_bytes,drive)",
         "includeAll": true,
         "label": "Drive",
         "multi": true,
@@ -4999,7 +5065,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_node_disk_used_bytes,drive)",
+          "query": "label_values(rustfs_system_drive_used_bytes,drive)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

@@ -21,8 +21,8 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketStats, ClusterStats, DiskStats, HostNetworkStats, ProcessStats, ProcessStatusType,
-    ResourceStats,
+    BucketReplicationBandwidthStats, BucketStats, ClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
+    HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ResourceStats,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -31,7 +31,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
-use sysinfo::Networks;
+use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -196,6 +196,102 @@ pub async fn collect_disk_stats() -> Vec<DiskStats> {
             free_bytes: disk.available_space,
         })
         .collect()
+}
+
+/// Collect system CPU statistics from the current host.
+pub fn collect_system_cpu_stats() -> CpuStats {
+    let mut system = System::new_all();
+    system.refresh_cpu_all();
+
+    let cpu_usage = system.global_cpu_usage() as f64;
+    let cpu_count = system.cpus().len().max(1) as f64;
+    let load_avg = System::load_average().one;
+
+    CpuStats {
+        avg_idle: (100.0 - cpu_usage).max(0.0),
+        avg_iowait: 0.0,
+        load_avg,
+        load_avg_perc: (load_avg / cpu_count) * 100.0,
+        nice: 0.0,
+        steal: 0.0,
+        system: cpu_usage,
+        user: 0.0,
+    }
+}
+
+/// Collect system memory statistics from the current host.
+pub fn collect_system_memory_stats() -> MemoryStats {
+    let mut system = System::new_all();
+    system.refresh_memory();
+
+    let total = system.total_memory();
+    let used = system.used_memory();
+
+    MemoryStats {
+        total,
+        used,
+        used_perc: if total > 0 {
+            (used as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        },
+        free: system.free_memory(),
+        buffers: 0,
+        cache: 0,
+        shared: 0,
+        available: system.available_memory(),
+    }
+}
+
+/// Collect system drive statistics using the storage layer snapshot.
+pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCountStats) {
+    let Some(store) = new_object_layer_fn() else {
+        return (Vec::new(), DriveCountStats::default());
+    };
+
+    let storage_info = store.storage_info().await;
+    let total_count = storage_info.disks.len() as u64;
+
+    let drive_stats = storage_info
+        .disks
+        .iter()
+        .map(|disk| DriveDetailedStats {
+            server: disk.endpoint.clone(),
+            drive: disk.drive_path.clone(),
+            total_bytes: disk.total_space,
+            used_bytes: disk.used_space,
+            free_bytes: disk.available_space,
+            used_inodes: 0,
+            free_inodes: 0,
+            total_inodes: 0,
+            timeout_errors_total: 0,
+            io_errors_total: 0,
+            availability_errors_total: 0,
+            waiting_io: 0,
+            api_latency_micros: 0,
+            health: 1,
+            reads_per_sec: 0.0,
+            reads_kb_per_sec: 0.0,
+            reads_await: 0.0,
+            writes_per_sec: 0.0,
+            writes_kb_per_sec: 0.0,
+            writes_await: 0.0,
+            perc_util: if disk.total_space > 0 {
+                (disk.used_space as f64 / disk.total_space as f64) * 100.0
+            } else {
+                0.0
+            },
+        })
+        .collect();
+
+    (
+        drive_stats,
+        DriveCountStats {
+            offline_count: 0,
+            online_count: total_count,
+            total_count,
+        },
+    )
 }
 
 /// Collect resource and process statistics for the current process in one sysinfo refresh.
