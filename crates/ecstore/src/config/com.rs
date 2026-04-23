@@ -19,12 +19,12 @@ use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{
-    AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
-    AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
-    NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS,
-    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
+    NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -58,13 +58,19 @@ struct TargetConfigDescriptor {
     valid_keys: &'static [&'static str],
 }
 
-fn notify_target_descriptors() -> [TargetConfigDescriptor; 4] {
+fn notify_target_descriptors() -> [TargetConfigDescriptor; 5] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
             subsystem_key: NOTIFY_WEBHOOK_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_WEBHOOK_KVS,
             valid_keys: NOTIFY_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "kafka",
+            subsystem_key: NOTIFY_KAFKA_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_KAFKA_KVS,
+            valid_keys: NOTIFY_KAFKA_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "mqtt",
@@ -87,13 +93,19 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 4] {
     ]
 }
 
-fn audit_target_descriptors() -> [TargetConfigDescriptor; 4] {
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 5] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
             subsystem_key: AUDIT_WEBHOOK_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_WEBHOOK_KVS,
             valid_keys: AUDIT_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "kafka",
+            subsystem_key: AUDIT_KAFKA_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_KAFKA_KVS,
+            valid_keys: AUDIT_KAFKA_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "mqtt",
@@ -335,7 +347,7 @@ fn apply_external_oidc_map(cfg: &mut Config, root: &Map<String, Value>) -> bool 
     applied
 }
 
-fn parse_notify_scalar_value(key: &str, value: &Value) -> Option<String> {
+fn parse_target_scalar_value(key: &str, value: &Value) -> Option<String> {
     match value {
         Value::String(v) => Some(v.trim().to_string()),
         Value::Bool(v) if key == ENABLE_KEY || key == rustfs_config::WEBHOOK_SKIP_TLS_VERIFY => Some(if *v {
@@ -350,7 +362,7 @@ fn parse_notify_scalar_value(key: &str, value: &Value) -> Option<String> {
     }
 }
 
-fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&str]) -> KVS {
+fn decode_target_instance_object(instance: &Map<String, Value>, valid_keys: &[&str]) -> KVS {
     let mut kvs = KVS::new();
 
     for (key, value) in instance {
@@ -358,7 +370,7 @@ fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&s
             continue;
         }
 
-        if let Some(parsed) = parse_notify_scalar_value(key, value) {
+        if let Some(parsed) = parse_target_scalar_value(key, value) {
             kvs.insert(key.clone(), parsed);
         }
     }
@@ -366,21 +378,21 @@ fn decode_notify_instance_object(instance: &Map<String, Value>, valid_keys: &[&s
     kvs
 }
 
-fn decode_notify_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KVS> {
+fn decode_target_instance_value(value: &Value, valid_keys: &[&str]) -> Option<KVS> {
     match value {
-        Value::Object(instance) => Some(decode_notify_instance_object(instance, valid_keys)),
+        Value::Object(instance) => Some(decode_target_instance_object(instance, valid_keys)),
         Value::Array(_) => serde_json::from_value::<KVS>(value.clone()).ok(),
         _ => None,
     }
 }
 
-fn is_notify_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
+fn is_target_instance_shorthand(section: &Map<String, Value>, valid_keys: &[&str]) -> bool {
     section
         .iter()
-        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_notify_scalar_value(key, value).is_some())
+        .any(|(key, value)| valid_keys.contains(&key.as_str()) && parse_target_scalar_value(key, value).is_some())
 }
 
-fn apply_external_notify_section(
+fn apply_external_target_section(
     cfg: &mut Config,
     notify_obj: &Map<String, Value>,
     external_key: &str,
@@ -399,8 +411,8 @@ fn apply_external_notify_section(
     let subsystem = cfg.0.entry(subsystem_key.to_string()).or_default();
     let mut applied = false;
 
-    if is_notify_instance_shorthand(section_obj, valid_keys) {
-        let kvs = decode_notify_instance_object(section_obj, valid_keys);
+    if is_target_instance_shorthand(section_obj, valid_keys) {
+        let kvs = decode_target_instance_object(section_obj, valid_keys);
         if !kvs.is_empty() {
             let mut merged = default_kvs.clone();
             merged.extend(kvs);
@@ -411,7 +423,7 @@ fn apply_external_notify_section(
     }
 
     for (raw_instance, value) in section_obj {
-        let Some(mut kvs) = decode_notify_instance_value(value, valid_keys) else {
+        let Some(mut kvs) = decode_target_instance_value(value, valid_keys) else {
             continue;
         };
         if kvs.is_empty() {
@@ -444,7 +456,7 @@ fn apply_external_target_descriptors(
 ) -> bool {
     let mut applied = false;
     for descriptor in descriptors {
-        applied |= apply_external_notify_section(
+        applied |= apply_external_target_section(
             cfg,
             section_obj,
             descriptor.external_key,
@@ -663,11 +675,12 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
     oidc_obj
 }
 
-fn is_notify_bool_key(key: &str) -> bool {
+fn is_target_bool_key(key: &str) -> bool {
     matches!(
         key,
         ENABLE_KEY
             | rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
+            | rustfs_config::KAFKA_TLS_ENABLE
             | rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA
             | rustfs_config::NATS_TLS_REQUIRED
             | rustfs_config::PULSAR_TLS_ALLOW_INSECURE
@@ -675,8 +688,8 @@ fn is_notify_bool_key(key: &str) -> bool {
     )
 }
 
-fn encode_notify_scalar_value(key: &str, value: &str) -> Value {
-    if is_notify_bool_key(key) {
+fn encode_target_scalar_value(key: &str, value: &str) -> Value {
+    if is_target_bool_key(key) {
         if let Ok(state) = value.parse::<EnableState>() {
             return Value::Bool(state.is_enabled());
         }
@@ -697,7 +710,7 @@ fn is_hidden_if_empty(default_kvs: &KVS, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_notify_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&str], default_kvs: &KVS) -> Map<String, Value> {
+fn build_target_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&str], default_kvs: &KVS) -> Map<String, Value> {
     let mut instance = Map::new();
 
     for key in valid_keys {
@@ -720,13 +733,13 @@ fn build_notify_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&s
             continue;
         }
 
-        instance.insert((*key).to_string(), encode_notify_scalar_value(key, &effective_value));
+        instance.insert((*key).to_string(), encode_target_scalar_value(key, &effective_value));
     }
 
     instance
 }
 
-fn merged_notify_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS) -> KVS {
+fn merged_target_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS) -> KVS {
     let mut merged = default_kvs.clone();
     if let Some(kvs) = subsystem.get(DEFAULT_DELIMITER) {
         merged.extend(kvs.clone());
@@ -734,7 +747,7 @@ fn merged_notify_default_kvs(subsystem: &HashMap<String, KVS>, default_kvs: &KVS
     merged
 }
 
-fn build_notify_subsystem_object(
+fn build_target_subsystem_object(
     cfg: &Config,
     subsystem_key: &str,
     default_kvs: &KVS,
@@ -744,11 +757,11 @@ fn build_notify_subsystem_object(
         return Map::new();
     };
 
-    let effective_default = merged_notify_default_kvs(subsystem, default_kvs);
+    let effective_default = merged_target_default_kvs(subsystem, default_kvs);
     let mut subsystem_obj = Map::new();
 
     if let Some(default_instance) = subsystem.get(DEFAULT_DELIMITER) {
-        let default_obj = build_notify_instance_diff_object(default_instance, default_kvs, valid_keys, default_kvs);
+        let default_obj = build_target_instance_diff_object(default_instance, default_kvs, valid_keys, default_kvs);
         if !default_obj.is_empty() {
             subsystem_obj.insert("default".to_string(), Value::Object(default_obj));
         }
@@ -761,7 +774,7 @@ fn build_notify_subsystem_object(
     instances.sort_by_key(|(lhs, _)| *lhs);
 
     for (instance_key, kvs) in instances {
-        let instance_obj = build_notify_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
+        let instance_obj = build_target_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
         if !instance_obj.is_empty() {
             subsystem_obj.insert(instance_key.clone(), Value::Object(instance_obj));
         }
@@ -774,7 +787,7 @@ fn build_target_object(cfg: &Config, descriptors: &[TargetConfigDescriptor]) -> 
     let mut target_obj = Map::new();
     for descriptor in descriptors {
         let subsystem_obj =
-            build_notify_subsystem_object(cfg, descriptor.subsystem_key, descriptor.default_kvs, descriptor.valid_keys);
+            build_target_subsystem_object(cfg, descriptor.subsystem_key, descriptor.default_kvs, descriptor.valid_keys);
         if !subsystem_obj.is_empty() {
             target_obj.insert(descriptor.external_key.to_string(), Value::Object(subsystem_obj));
         }
@@ -1118,8 +1131,8 @@ mod tests {
         ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
-    use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::audit::{AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
     use rustfs_filemeta::FileInfo;
@@ -1753,6 +1766,15 @@ mod tests {
                 "topic":"events",
                 "queue_dir":""
               }
+            },
+            "kafka":{
+              "streaming":{
+                "enable":true,
+                "brokers":"127.0.0.1:9092,127.0.0.1:9093",
+                "topic":"events-kafka",
+                "acks":"all",
+                "tls_enable":true
+              }
             }
           }
         }"#;
@@ -1781,6 +1803,14 @@ mod tests {
             .expect("mqtt target should be decoded");
         assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER), "tcp://127.0.0.1:1883");
         assert_eq!(mqtt.get(rustfs_config::MQTT_QUEUE_DIR), "");
+
+        let kafka = cfg
+            .get_value(NOTIFY_KAFKA_SUB_SYS, "streaming")
+            .expect("kafka target should be decoded");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_BROKERS), "127.0.0.1:9092,127.0.0.1:9093");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
     }
 
     #[test]
@@ -1850,6 +1880,14 @@ mod tests {
                 "broker":"tcp://127.0.0.1:1883",
                 "topic":"audit-events"
               }
+            },
+            "kafka":{
+              "auditlog":{
+                "enable":true,
+                "brokers":"127.0.0.1:9092",
+                "topic":"audit-events-kafka",
+                "acks":"1"
+              }
             }
           }
         }"#;
@@ -1873,6 +1911,12 @@ mod tests {
             .get_value(AUDIT_MQTT_SUB_SYS, "analytics")
             .expect("audit mqtt target should be decoded");
         assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER), "tcp://127.0.0.1:1883");
+
+        let kafka = cfg
+            .get_value(AUDIT_KAFKA_SUB_SYS, "auditlog")
+            .expect("audit kafka target should be decoded");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_BROKERS), "127.0.0.1:9092");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "audit-events-kafka");
     }
 
     #[test]
@@ -1993,6 +2037,38 @@ mod tests {
         );
         cfg.0.insert(NOTIFY_MQTT_SUB_SYS.to_string(), mqtt_section);
 
+        let mut kafka_default = notify::DEFAULT_NOTIFY_KAFKA_KVS.clone();
+        kafka_default.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kafka_default.insert(rustfs_config::KAFKA_TOPIC.to_string(), "events-kafka".to_string());
+        let mut kafka_section = std::collections::HashMap::new();
+        kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
+        kafka_section.insert(
+            "streaming".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::KAFKA_BROKERS.to_string(),
+                    value: "127.0.0.1:9092,127.0.0.1:9093".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::KAFKA_ACKS.to_string(),
+                    value: "all".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::KAFKA_TLS_ENABLE.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(NOTIFY_KAFKA_SUB_SYS.to_string(), kafka_section);
+
         let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
         let v: Value = serde_json::from_slice(&out).expect("output should be json");
         let notify = v
@@ -2028,6 +2104,19 @@ mod tests {
             .expect("mqtt target should be encoded");
         assert_eq!(mqtt.get(rustfs_config::MQTT_BROKER).and_then(Value::as_str), Some("tcp://127.0.0.1:1883"));
         assert_eq!(mqtt.get(rustfs_config::MQTT_QUEUE_DIR).and_then(Value::as_str), Some(""));
+
+        let kafka = notify
+            .get("kafka")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("streaming"))
+            .and_then(Value::as_object)
+            .expect("kafka target should be encoded");
+        assert_eq!(
+            kafka.get(rustfs_config::KAFKA_BROKERS).and_then(Value::as_str),
+            Some("127.0.0.1:9092,127.0.0.1:9093")
+        );
+        assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS).and_then(Value::as_str), Some("all"));
+        assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE).and_then(Value::as_bool), Some(true));
     }
 
     #[test]
@@ -2079,6 +2168,28 @@ mod tests {
         );
         cfg.0.insert(AUDIT_MQTT_SUB_SYS.to_string(), mqtt_section);
 
+        let mut kafka_default = audit::DEFAULT_AUDIT_KAFKA_KVS.clone();
+        kafka_default.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kafka_default.insert(rustfs_config::KAFKA_TOPIC.to_string(), "audit-events-kafka".to_string());
+        let mut kafka_section = std::collections::HashMap::new();
+        kafka_section.insert(DEFAULT_DELIMITER.to_string(), kafka_default);
+        kafka_section.insert(
+            "auditlog".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::KAFKA_BROKERS.to_string(),
+                    value: "127.0.0.1:9092".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(AUDIT_KAFKA_SUB_SYS.to_string(), kafka_section);
+
         let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
         let v: Value = serde_json::from_slice(&out).expect("output should be json");
         let logger = v
@@ -2105,6 +2216,14 @@ mod tests {
             .expect("audit mqtt default should be encoded");
         assert_eq!(mqtt_default.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
         assert_eq!(mqtt_default.get(rustfs_config::MQTT_TOPIC).and_then(Value::as_str), Some("audit-events"));
+
+        let kafka = logger
+            .get("kafka")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("auditlog"))
+            .and_then(Value::as_object)
+            .expect("audit kafka target should be encoded");
+        assert_eq!(kafka.get(rustfs_config::KAFKA_BROKERS).and_then(Value::as_str), Some("127.0.0.1:9092"));
     }
 
     #[test]
