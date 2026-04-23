@@ -956,6 +956,9 @@ pub type DynReplicationPool = dyn ReplicationPoolTrait + Send + Sync;
 /// Trait that abstracts the replication pool operations
 #[async_trait::async_trait]
 pub trait ReplicationPoolTrait: std::fmt::Debug {
+    fn active_workers(&self) -> i32;
+    fn active_mrf_workers(&self) -> i32;
+    fn active_lrg_workers(&self) -> i32;
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
@@ -972,6 +975,18 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
 impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
+    fn active_workers(&self) -> i32 {
+        self.active_workers()
+    }
+
+    fn active_mrf_workers(&self) -> i32 {
+        self.active_mrf_workers()
+    }
+
+    fn active_lrg_workers(&self) -> i32 {
+        self.active_lrg_workers()
+    }
+
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
         self.queue_replica_task(ri).await;
     }

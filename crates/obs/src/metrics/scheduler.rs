@@ -35,6 +35,7 @@ use crate::metrics::collectors::{
     collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
+    collect_bucket_replication_metrics,
     collect_cluster_health_metrics,
     collect_cluster_metrics,
     collect_cpu_metrics,
@@ -62,9 +63,10 @@ use crate::metrics::config::{
 };
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_health_stats,
-    collect_cluster_stats, collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
-    collect_replication_stats, collect_system_cpu_stats, collect_system_drive_stats, collect_system_memory_stats,
+    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
+    collect_bucket_stats, collect_cluster_health_stats, collect_cluster_stats, collect_disk_stats, collect_host_network_stats,
+    collect_process_metric_bundle, collect_replication_stats, collect_system_cpu_stats, collect_system_drive_stats,
+    collect_system_memory_stats,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
@@ -222,6 +224,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                 _ = interval.tick() => {
                     let stats = collect_bucket_replication_bandwidth_stats();
                     let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+                    let bucket_replication = collect_bucket_replication_detail_stats().await;
+                    metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
                     let replication = collect_replication_stats().await;
                     metrics.extend(collect_replication_metrics(&replication));
                     report_metrics(&metrics);

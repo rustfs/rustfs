@@ -21,8 +21,9 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketStats, ClusterHealthStats, ClusterStats, CpuStats, DiskStats, DriveCountStats,
-    DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats,
+    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, ClusterHealthStats,
+    ClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats,
+    ProcessStatusType, ReplicationStats, ResourceStats,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
@@ -32,6 +33,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
@@ -207,6 +209,77 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
         .collect()
 }
 
+/// Collect bucket and target level replication stats from the global replication runtime.
+pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
+    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
+        return Vec::new();
+    };
+
+    let all_bucket_stats = stats.get_all().await;
+    let mut buckets = Vec::with_capacity(all_bucket_stats.len());
+
+    for (bucket, bucket_stats) in all_bucket_stats {
+        let proxy = stats.get_proxy_stats(&bucket).await;
+        let mut total_failed_bytes = 0u64;
+        let mut total_failed_count = 0u64;
+        let mut last_min_failed_bytes = 0u64;
+        let mut last_min_failed_count = 0u64;
+        let mut last_hour_failed_bytes = 0u64;
+        let mut last_hour_failed_count = 0u64;
+        let mut sent_bytes = 0u64;
+        let mut sent_count = 0u64;
+        let mut targets = Vec::with_capacity(bucket_stats.stats.len());
+
+        for (target_arn, target_stats) in bucket_stats.stats {
+            total_failed_bytes += target_stats.fail_stats.size.max(0) as u64;
+            total_failed_count += target_stats.fail_stats.count.max(0) as u64;
+
+            let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
+            last_min_failed_bytes += last_min.size.max(0) as u64;
+            last_min_failed_count += last_min.count.max(0) as u64;
+
+            let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
+            last_hour_failed_bytes += last_hour.size.max(0) as u64;
+            last_hour_failed_count += last_hour.count.max(0) as u64;
+
+            sent_bytes += target_stats.replicated_size.max(0) as u64;
+            sent_count += target_stats.replicated_count.max(0) as u64;
+
+            targets.push(BucketReplicationTargetStats {
+                target_arn,
+                bandwidth_limit_bytes_per_sec: target_stats.bandwidth_limit_bytes_per_sec.max(0) as u64,
+                current_bandwidth_bytes_per_sec: target_stats.current_bandwidth_bytes_per_sec,
+                latency_ms: target_stats.latency.curr,
+            });
+        }
+
+        buckets.push(BucketReplicationStats {
+            bucket,
+            total_failed_bytes,
+            total_failed_count,
+            last_min_failed_bytes,
+            last_min_failed_count,
+            last_hour_failed_bytes,
+            last_hour_failed_count,
+            sent_bytes,
+            sent_count,
+            proxied_get_requests_total: proxy.get_total.max(0) as u64,
+            proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
+            proxied_head_requests_total: proxy.head_total.max(0) as u64,
+            proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
+            proxied_put_tagging_requests_total: proxy.put_total.max(0) as u64,
+            proxied_put_tagging_requests_failures: proxy.put_failed.max(0) as u64,
+            proxied_get_tagging_requests_total: 0,
+            proxied_get_tagging_requests_failures: 0,
+            proxied_delete_tagging_requests_total: 0,
+            proxied_delete_tagging_requests_failures: 0,
+            targets,
+        });
+    }
+
+    buckets
+}
+
 /// Collect site-level replication stats from the global replication runtime.
 pub async fn collect_replication_stats() -> ReplicationStats {
     let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
@@ -249,8 +322,8 @@ pub async fn collect_replication_stats() -> ReplicationStats {
         average_data_transfer_rate,
         active_workers: current_active_workers,
         current_data_transfer_rate,
-        last_minute_queued_bytes: site_metrics.queued.curr.bytes.max(0) as u64,
-        last_minute_queued_count: site_metrics.queued.curr.count.max(0) as u64,
+        last_minute_queued_bytes: site_metrics.queued.last_minute.bytes.max(0) as u64,
+        last_minute_queued_count: site_metrics.queued.last_minute.count.max(0) as u64,
         max_active_workers: u64::try_from(site_metrics.active_workers.max).unwrap_or(0),
         max_queued_bytes: site_metrics.queued.max.bytes.max(0) as u64,
         max_queued_count: site_metrics.queued.max.count.max(0) as u64,
