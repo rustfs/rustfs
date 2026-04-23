@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn collect_validated_key_values_rejects_duplicate_keys() {
         let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
-        let key_values = vec![
+        let key_values = [
             KeyValue {
                 key: "endpoint".to_string(),
                 value: "https://example.com/one".to_string(),

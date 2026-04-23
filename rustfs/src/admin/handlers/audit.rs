@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn collect_validated_key_values_rejects_duplicate_keys() {
         let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
-        let key_values = vec![
+        let key_values = [
             KeyValue {
                 key: "endpoint".to_string(),
                 value: "https://example.com/one".to_string(),
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn collect_validated_key_values_rejects_unsupported_key() {
         let allowed_keys: HashSet<&str> = AUDIT_WEBHOOK_KEYS.iter().copied().collect();
-        let key_values = vec![KeyValue {
+        let key_values = [KeyValue {
             key: "not_a_real_key".to_string(),
             value: "/tmp/rustfs-audit".to_string(),
         }];
