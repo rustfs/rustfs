@@ -62,6 +62,7 @@ use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
+use std::collections::HashMap;
 use std::{fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
@@ -94,7 +95,7 @@ use tracing_subscriber::{
 ///
 /// # Note
 /// This function is intentionally kept unchanged from the pre-refactor
-/// implementation to preserve existing OTLP behaviour.
+/// implementation to preserve existing OTLP behavior.
 pub(super) fn init_observability_http(
     config: &OtelConfig,
     logger_level: &str,
@@ -339,11 +340,19 @@ fn build_tracer_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(trace_ep)
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let trace_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.trace_headers.as_deref());
+    if !trace_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(trace_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
@@ -398,12 +407,20 @@ fn build_meter_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_endpoint(metric_ep)
         .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let metric_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.metric_headers.as_deref());
+    if !metric_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(metric_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
@@ -444,11 +461,19 @@ fn build_logger_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::LogExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::LogExporter::builder()
         .with_http()
         .with_endpoint(log_ep)
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let log_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.log_headers.as_deref());
+    if !log_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(log_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
 
@@ -513,6 +538,35 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
         .build()
 }
 
+fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(raw_headers) = common_headers {
+        headers.extend(parse_otlp_headers(raw_headers));
+    }
+    if let Some(raw_headers) = signal_headers {
+        headers.extend(parse_otlp_headers(raw_headers));
+    }
+    headers
+}
+
+fn parse_otlp_headers(raw_headers: &str) -> HashMap<String, String> {
+    raw_headers
+        .split(',')
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_millis: Option<u64>) -> Option<Duration> {
+    signal_timeout_millis.or(common_timeout_millis).map(Duration::from_millis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +592,33 @@ mod tests {
 
         let sampler = build_tracer_sampler(1.2);
         assert!(format!("{sampler:?}").contains("AlwaysOn"));
+    }
+
+    #[test]
+    fn test_parse_otlp_headers_ignores_invalid_entries() {
+        let headers = parse_otlp_headers("Authorization=Bearer%20abc,empty=,missing, =ignored,key=value");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer%20abc".to_string()));
+        assert_eq!(headers.get("empty"), Some(&"".to_string()));
+        assert_eq!(headers.get("key"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_signal_headers_signal_overrides_common() {
+        let headers = resolve_signal_headers(Some("k1=v1,k2=common"), Some("k2=signal,k3=v3"));
+        assert_eq!(headers.get("k1"), Some(&"v1".to_string()));
+        assert_eq!(headers.get("k2"), Some(&"signal".to_string()));
+        assert_eq!(headers.get("k3"), Some(&"v3".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_signal_timeout_prefers_signal_value() {
+        assert_eq!(resolve_signal_timeout(Some(2_000), Some(5_000)), Some(Duration::from_millis(5_000)));
+    }
+
+    #[test]
+    fn test_resolve_signal_timeout_falls_back_to_common() {
+        assert_eq!(resolve_signal_timeout(Some(3_000), None), Some(Duration::from_millis(3_000)));
+        assert_eq!(resolve_signal_timeout(None, None), None);
     }
 }
