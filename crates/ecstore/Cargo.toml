@@ -129,6 +129,7 @@ criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
 tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

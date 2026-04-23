@@ -162,6 +162,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    fn with_trace_parent<F>(trace_id_hex: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("request-context-tests");
+        let subscriber = Registry::default().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request-context-test-span");
+
+            let trace_id = TraceId::from_hex(trace_id_hex).expect("trace id should be valid hex");
+            let span_id = opentelemetry::trace::SpanId::from_hex("0102030405060708").expect("span id should be valid hex");
+            let parent = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+            span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent))
+                .expect("failed to set parent context");
+            let _guard = span.enter();
+
+            f();
+        });
+        let _ = provider.shutdown();
+    }
 
     #[test]
     fn test_request_context_clone_send_sync() {
@@ -176,6 +203,17 @@ mod tests {
         assert_eq!(ctx.request_id, ctx.x_amz_request_id);
         assert!(ctx.trace_id.is_none());
         assert!(ctx.span_id.is_none());
+    }
+
+    #[test]
+    fn test_request_context_fallback_uses_trace_prefix_when_span_context_valid() {
+        let trace_id = "70f5f77e2f0a4f24be343b59f8b66f8f";
+        with_trace_parent(trace_id, || {
+            let ctx = RequestContext::fallback();
+            assert_eq!(ctx.request_id, format!("trace-{trace_id}"));
+            assert_eq!(ctx.trace_id.as_deref(), Some(trace_id));
+            assert!(ctx.span_id.is_some());
+        });
     }
 
     #[test]
@@ -212,5 +250,15 @@ mod tests {
             "fallback request id should use req-/trace- prefix, got: {}",
             id
         );
+    }
+
+    #[test]
+    fn test_extract_request_id_no_headers_uses_trace_prefix_when_span_context_valid() {
+        let trace_id = "8d8b7d58055d45f793b8ca7fcb91bc17";
+        with_trace_parent(trace_id, || {
+            let headers = HeaderMap::new();
+            let id = extract_request_id_from_headers(&headers);
+            assert_eq!(id, format!("trace-{trace_id}"));
+        });
     }
 }

@@ -101,3 +101,86 @@ pub(crate) fn inject_request_id_into_metadata(metadata: &mut tonic::metadata::Me
     };
     metadata.insert(request_id_key, value);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    fn with_trace_parent<F>(trace_id_hex: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("context-propagation-tests");
+        let subscriber = Registry::default().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("context-propagation-test-span");
+
+            let trace_id = TraceId::from_hex(trace_id_hex).expect("trace id should be valid hex");
+            let span_id = opentelemetry::trace::SpanId::from_hex("0102030405060708").expect("span id should be valid hex");
+            let parent = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+            span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent))
+                .expect("failed to set parent context");
+            let _guard = span.enter();
+
+            f();
+        });
+        let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn test_inject_request_id_into_http_headers_preserves_existing_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req-upstream-123"));
+
+        with_trace_parent("0123456789abcdef0123456789abcdef", || {
+            inject_request_id_into_http_headers(&mut headers);
+        });
+
+        assert_eq!(headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some("req-upstream-123"));
+    }
+
+    #[test]
+    fn test_inject_request_id_into_http_headers_uses_trace_id_when_missing() {
+        let trace_id = "abcdefabcdefabcdefabcdefabcdefab";
+        let mut headers = HeaderMap::new();
+
+        with_trace_parent(trace_id, || {
+            inject_request_id_into_http_headers(&mut headers);
+        });
+
+        assert_eq!(headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some(trace_id));
+    }
+
+    #[test]
+    fn test_inject_request_id_into_metadata_preserves_existing_value() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            tonic::metadata::MetadataKey::from_static(REQUEST_ID_HEADER),
+            tonic::metadata::MetadataValue::from_static("req-upstream-456"),
+        );
+
+        with_trace_parent("fedcba9876543210fedcba9876543210", || {
+            inject_request_id_into_metadata(&mut metadata);
+        });
+
+        assert_eq!(metadata.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some("req-upstream-456"));
+    }
+
+    #[test]
+    fn test_inject_request_id_into_metadata_uses_trace_id_when_missing() {
+        let trace_id = "1234567890abcdef1234567890abcdef";
+        let mut metadata = tonic::metadata::MetadataMap::new();
+
+        with_trace_parent(trace_id, || {
+            inject_request_id_into_metadata(&mut metadata);
+        });
+
+        assert_eq!(metadata.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some(trace_id));
+    }
+}
