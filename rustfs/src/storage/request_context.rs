@@ -56,8 +56,12 @@
 //! - NEVER use bare `tokio::spawn` in request-handling code paths
 
 use http::HeaderMap;
+use metrics::counter;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::time::Instant;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Canonical request context carried through the entire request lifecycle.
 ///
@@ -79,17 +83,40 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// Create a fallback `RequestContext` for paths that bypass HTTP ingress.
-    /// Generates a `req-{uuid}` format request-id.
+    /// Generates a `trace-{trace_id}` or `req-{uuid}` format request-id.
     pub fn fallback() -> Self {
-        let id = format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let id = generate_fallback_request_id();
+        let (trace_id, span_id) = current_trace_context_ids();
+        counter!("rustfs.log.chain.fallback_request_id.total", "source" => "request_context_fallback").increment(1);
         Self {
             request_id: id.clone(),
             x_amz_request_id: id,
-            trace_id: None,
-            span_id: None,
+            trace_id,
+            span_id,
             start_time: Instant::now(),
         }
     }
+}
+
+fn current_trace_context_ids() -> (Option<String>, Option<String>) {
+    let current_context = Span::current().context();
+    let current_span = current_context.span();
+    let span_context = current_span.span_context();
+    if !span_context.is_valid() {
+        return (None, None);
+    }
+
+    (Some(span_context.trace_id().to_string()), Some(span_context.span_id().to_string()))
+}
+
+fn generate_fallback_request_id() -> String {
+    let current_context = Span::current().context();
+    let current_span = current_context.span();
+    let span_context = current_span.span_context();
+    if span_context.is_valid() {
+        return format!("trace-{}", span_context.trace_id());
+    }
+    format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
 /// Extract the canonical request ID from HTTP headers.
@@ -97,14 +124,20 @@ impl RequestContext {
 /// Priority:
 /// 1. `x-request-id` (primary, set by `SetRequestIdLayer`)
 /// 2. `x-amz-request-id` (fallback, from S3 client forwarding)
-/// 3. `"unknown"` (no header present)
+/// 3. generated fallback id (`trace-{trace_id}` or `req-{uuid}`)
 pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
-    headers
+    let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .or_else(|| headers.get(AMZ_REQUEST_ID).and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(generate_fallback_request_id);
+
+    if !headers.contains_key("x-request-id") && !headers.contains_key(AMZ_REQUEST_ID) {
+        counter!("rustfs.log.chain.fallback_request_id.total", "source" => "headers_missing").increment(1);
+    }
+
+    request_id
 }
 
 /// Spawn a request-internal task that inherits the current tracing span.
@@ -171,6 +204,10 @@ mod tests {
     fn test_extract_request_id_no_headers() {
         let headers = HeaderMap::new();
         let id = extract_request_id_from_headers(&headers);
-        assert_eq!(id, "unknown");
+        assert!(
+            id.starts_with("req-") || id.starts_with("trace-"),
+            "fallback request id should use req-/trace- prefix, got: {}",
+            id
+        );
     }
 }
