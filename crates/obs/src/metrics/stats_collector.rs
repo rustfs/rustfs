@@ -22,10 +22,10 @@
 
 use crate::metrics::collectors::{
     BucketReplicationBandwidthStats, BucketStats, ClusterHealthStats, ClusterStats, CpuStats, DiskStats, DriveCountStats,
-    DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ResourceStats,
+    DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats,
 };
-use rustfs_common::heal_channel::DriveState;
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
+use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -34,6 +34,9 @@ use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
+
+const DRIVE_STATE_OK: &str = "ok";
+const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMetricBundle {
@@ -99,7 +102,7 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 
     for disk in &storage_info.disks {
         let state = disk.state.as_str();
-        if state == DriveState::Ok.to_str() || state == DriveState::Unformatted.to_str() {
+        if state == DRIVE_STATE_OK || state == DRIVE_STATE_UNFORMATTED {
             online += 1;
         } else {
             offline += 1;
@@ -202,6 +205,58 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
             }
         })
         .collect()
+}
+
+/// Collect site-level replication stats from the global replication runtime.
+pub async fn collect_replication_stats() -> ReplicationStats {
+    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
+        return ReplicationStats::default();
+    };
+
+    let site_metrics = stats.get_sr_metrics_for_node().await;
+    let current_active_workers = u64::try_from(site_metrics.active_workers.curr).unwrap_or(0);
+
+    let bandwidth_stats = collect_bucket_replication_bandwidth_stats();
+    let current_data_transfer_rate = bandwidth_stats
+        .iter()
+        .map(|stat| stat.current_bandwidth_bytes_per_sec)
+        .sum::<f64>();
+
+    let all_bucket_stats = stats.get_all().await;
+    let average_data_transfer_rate = all_bucket_stats
+        .values()
+        .flat_map(|bucket| bucket.stats.values())
+        .map(|stat| stat.xfer_rate_lrg.avg + stat.xfer_rate_sml.avg)
+        .sum::<f64>();
+    let max_data_transfer_rate = all_bucket_stats
+        .values()
+        .flat_map(|bucket| bucket.stats.values())
+        .map(|stat| stat.xfer_rate_lrg.peak + stat.xfer_rate_sml.peak)
+        .sum::<f64>();
+    let recent_backlog_count = stats
+        .mrf_stats
+        .values()
+        .copied()
+        .filter(|value| *value > 0)
+        .sum::<i64>()
+        .try_into()
+        .unwrap_or(0);
+
+    ReplicationStats {
+        average_active_workers: site_metrics.active_workers.avg,
+        average_queued_bytes: site_metrics.queued.avg.bytes,
+        average_queued_count: site_metrics.queued.avg.count,
+        average_data_transfer_rate,
+        active_workers: current_active_workers,
+        current_data_transfer_rate,
+        last_minute_queued_bytes: site_metrics.queued.curr.bytes.max(0) as u64,
+        last_minute_queued_count: site_metrics.queued.curr.count.max(0) as u64,
+        max_active_workers: u64::try_from(site_metrics.active_workers.max).unwrap_or(0),
+        max_queued_bytes: site_metrics.queued.max.bytes.max(0) as u64,
+        max_queued_count: site_metrics.queued.max.count.max(0) as u64,
+        max_data_transfer_rate,
+        recent_backlog_count,
+    }
 }
 
 /// Collect disk statistics from the storage layer.
