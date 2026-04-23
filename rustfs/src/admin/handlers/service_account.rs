@@ -1444,6 +1444,26 @@ mod tests {
     }
 
     #[test]
+    fn list_service_account_cross_user_uses_list_service_accounts_action() {
+        let src = include_str!("service_account.rs");
+        let list_block =
+            extract_block_between_markers(src, "impl Operation for ListServiceAccount", "struct ListAccessKeysQuery");
+
+        assert!(
+            list_block.contains("query.user.as_ref().is_some_and(|v| v != &cred.access_key)"),
+            "cross-user ListServiceAccount path should stay explicitly guarded"
+        );
+        assert!(
+            list_block.contains("Action::AdminAction(AdminAction::ListServiceAccountsAdminAction)"),
+            "cross-user ListServiceAccount should authorize with ListServiceAccountsAdminAction"
+        );
+        assert!(
+            !list_block.contains("Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction)"),
+            "cross-user ListServiceAccount must not require UpdateServiceAccountAdminAction"
+        );
+    }
+
+    #[test]
     fn delete_service_account_uses_external_success_status() {
         assert_eq!(
             delete_service_account_success_status("/minio/admin/v3/delete-service-account"),
@@ -1525,5 +1545,12 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+    }
+
+    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src.find(start_marker).expect("start marker should exist");
+        let rest = &src[start..];
+        let end = rest.find(end_marker).expect("end marker should exist");
+        &rest[..end]
     }
 }
