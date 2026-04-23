@@ -24,6 +24,13 @@ use s3s::{Body, S3Request, S3Response, S3Result};
 use serde_json::{Value, json};
 
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE,
+    ) {
+        return Ok(());
+    }
+
     // Health check endpoint for monitoring and orchestration
     r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
     r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
@@ -51,9 +58,9 @@ pub(crate) enum HealthProbe {
     Readiness,
 }
 
-pub(crate) fn collect_dependency_readiness() -> (bool, bool) {
+pub(crate) async fn collect_dependency_readiness() -> (bool, bool) {
     let usecase = DefaultAdminUsecase::from_global();
-    let readiness = usecase.execute_collect_dependency_readiness();
+    let readiness = usecase.execute_collect_dependency_readiness().await;
     (readiness.storage_ready, readiness.iam_ready)
 }
 
@@ -131,7 +138,7 @@ impl Operation for HealthCheckHandler {
         let method = req.method;
 
         // Only GET and HEAD are allowed
-        if method != http::Method::GET && method != http::Method::HEAD {
+        if method != Method::GET && method != Method::HEAD {
             // 405 Method Not Allowed
             let mut headers = HeaderMap::new();
             headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
@@ -142,7 +149,7 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let (storage_ready, iam_ready) = collect_dependency_readiness();
+        let (storage_ready, iam_ready) = collect_dependency_readiness().await;
 
         Ok(build_health_response(method, probe, storage_ready, iam_ready))
     }

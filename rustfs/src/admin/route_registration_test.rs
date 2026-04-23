@@ -21,6 +21,7 @@ use crate::admin::{
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
+use temp_env::with_var;
 
 fn admin_path(path: &str) -> String {
     format!("{}{}", ADMIN_PREFIX, path)
@@ -222,6 +223,31 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
             path
         );
     }
+}
+
+#[test]
+fn test_health_routes_not_registered_when_disabled_by_env() {
+    with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"), || {
+        let mut router: S3Router<AdminOperation> = S3Router::new(false);
+        health::register_health_route(&mut router).expect("register health route");
+
+        assert!(
+            !router.contains_route(Method::GET, HEALTH_PREFIX),
+            "GET /health must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::HEAD, HEALTH_PREFIX),
+            "HEAD /health must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::GET, HEALTH_READY_PATH),
+            "GET /health/ready must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::HEAD, HEALTH_READY_PATH),
+            "HEAD /health/ready must not be registered when health endpoint is disabled"
+        );
+    });
 }
 
 #[test]
