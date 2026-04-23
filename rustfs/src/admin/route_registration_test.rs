@@ -247,6 +247,14 @@ fn test_health_routes_not_registered_when_disabled_by_env() {
             !router.contains_route(Method::HEAD, HEALTH_READY_PATH),
             "HEAD /health/ready must not be registered when health endpoint is disabled"
         );
+        assert!(
+            router.contains_route(Method::GET, PROFILE_CPU_PATH),
+            "GET /profile/cpu must stay registered when health endpoint is disabled"
+        );
+        assert!(
+            router.contains_route(Method::GET, PROFILE_MEMORY_PATH),
+            "GET /profile/memory must stay registered when health endpoint is disabled"
+        );
     });
 }
 

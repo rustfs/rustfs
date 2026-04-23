@@ -247,18 +247,17 @@ impl DefaultAdminUsecase {
     }
 
     fn disk_is_online_for_readiness(disk: &Disk) -> bool {
+        let state_is_acceptable = disk.state.eq_ignore_ascii_case(Self::DISK_STATE_OK)
+            || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+            || disk.state.eq_ignore_ascii_case(Self::DISK_STATE_UNFORMATTED);
+
         if let Some(runtime_state) = disk.runtime_state.as_deref() {
-            if runtime_state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
-                || runtime_state.eq_ignore_ascii_case(Self::RUNTIME_STATE_RETURNING)
-            {
-                return true;
-            }
-            return false;
+            let runtime_state_is_acceptable = runtime_state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+                || runtime_state.eq_ignore_ascii_case(Self::RUNTIME_STATE_RETURNING);
+            return runtime_state_is_acceptable && state_is_acceptable;
         }
 
-        disk.state.eq_ignore_ascii_case(Self::DISK_STATE_OK)
-            || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
-            || disk.state.eq_ignore_ascii_case(Self::DISK_STATE_UNFORMATTED)
+        state_is_acceptable
     }
 
     fn health_readiness_cache_ttl() -> Duration {
@@ -372,7 +371,11 @@ impl DefaultAdminUsecase {
             return false;
         }
 
-        set_drive_counts.into_iter().any(|((pool_idx, set_idx), set_drive_count)| {
+        if set_drive_counts.is_empty() {
+            return false;
+        }
+
+        set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
             let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
             let write_quorum = Self::pool_write_quorum(info, pool_idx, set_drive_count);
             online >= write_quorum
@@ -494,6 +497,54 @@ mod tests {
         assert!(
             !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
             "duplicate rows must not satisfy write quorum"
+        );
+    }
+
+    #[test]
+    fn disk_online_for_readiness_requires_runtime_and_state_both_acceptable() {
+        let disk = Disk {
+            state: "disk io error".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        assert!(!DefaultAdminUsecase::disk_is_online_for_readiness(&disk));
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_requires_all_sets_meet_quorum() {
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![2],
+                ..Default::default()
+            },
+            disks: vec![
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set0d0".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 0,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set1d0".to_string(),
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 0,
+                    state: "offline".to_string(),
+                    runtime_state: Some("offline".to_string()),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        assert!(
+            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
+            "if any set fails write quorum, readiness must be false"
         );
     }
 }

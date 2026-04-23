@@ -24,15 +24,15 @@ use s3s::{Body, S3Request, S3Response, S3Result};
 use serde_json::{Value, json};
 
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
-    if !rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
-        return Ok(());
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
+        // Health check endpoint for monitoring and orchestration
+        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
     }
 
-    // Health check endpoint for monitoring and orchestration
-    r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+    // Profiling routes are controlled separately and must not be affected by health endpoint toggles.
     r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
     r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
 
