@@ -522,6 +522,45 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
     }
 }
 
+/// Adapter that implements the OpenTelemetry [`Extractor`] trait for gRPC
+/// metadata maps so internode gRPC requests can continue distributed traces.
+struct MetadataMapCarrier<'a> {
+    metadata: &'a tonic::metadata::MetadataMap,
+}
+
+impl<'a> MetadataMapCarrier<'a> {
+    fn new(metadata: &'a tonic::metadata::MetadataMap) -> Self {
+        Self { metadata }
+    }
+}
+
+impl<'a> opentelemetry::propagation::Extractor for MetadataMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.metadata
+            .keys()
+            .filter_map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(v) => Some(v.as_str()),
+                tonic::metadata::KeyRef::Binary(_) => None,
+            })
+            .collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let values = self
+            .metadata
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if values.is_empty() { None } else { Some(values) }
+    }
+}
+
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task, and it will:
@@ -850,6 +889,21 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         error!("RPC signature verification failed: {}", e);
         Status::unauthenticated("No valid auth token")
     })?;
+
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
+    if parent_context.has_active_span() {
+        let span_ref = parent_context.span();
+        debug!(
+            otel_trace_id = %span_ref.span_context().trace_id(),
+            otel_parent_span_id = %span_ref.span_context().span_id(),
+            sampled = span_ref.span_context().is_sampled(),
+            "Extracted trace context from incoming gRPC metadata"
+        );
+        if let Err(e) = tracing::Span::current().set_parent(parent_context) {
+            warn!("Failed to propagate tracing context from gRPC metadata: `{:?}`", e);
+        }
+    }
     Ok(req)
 }
 

@@ -15,13 +15,13 @@
 use crate::AuditEntry;
 use async_trait::async_trait;
 use rustfs_config::AUDIT_DEFAULT_DIR;
-use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_NATS_KEYS, AUDIT_PULSAR_KEYS, AUDIT_WEBHOOK_KEYS};
+use rustfs_config::audit::{AUDIT_KAFKA_KEYS, AUDIT_MQTT_KEYS, AUDIT_NATS_KEYS, AUDIT_PULSAR_KEYS, AUDIT_WEBHOOK_KEYS};
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
     Target,
     config::{
-        build_mqtt_args, build_nats_args, build_pulsar_args, build_webhook_args, validate_mqtt_config, validate_nats_config,
-        validate_pulsar_config, validate_webhook_config,
+        build_kafka_args, build_mqtt_args, build_nats_args, build_pulsar_args, build_webhook_args, validate_kafka_config,
+        validate_mqtt_config, validate_nats_config, validate_pulsar_config, validate_webhook_config,
     },
     error::TargetError,
     target::TargetType,
@@ -117,5 +117,24 @@ impl TargetFactory for PulsarTargetFactory {
 
     fn get_valid_fields(&self) -> HashSet<String> {
         AUDIT_PULSAR_KEYS.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+pub struct KafkaTargetFactory;
+
+#[async_trait]
+impl TargetFactory for KafkaTargetFactory {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
+        let args = build_kafka_args(config, AUDIT_DEFAULT_DIR, TargetType::AuditLog)?;
+        let target = rustfs_targets::target::kafka::KafkaTarget::new(id, args)?;
+        Ok(Box::new(target))
+    }
+
+    fn validate_config(&self, _id: &str, config: &KVS) -> Result<(), TargetError> {
+        validate_kafka_config(config, AUDIT_DEFAULT_DIR)
+    }
+
+    fn get_valid_fields(&self) -> HashSet<String> {
+        AUDIT_KAFKA_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }

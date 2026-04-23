@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
@@ -62,6 +63,8 @@ pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) {
     let auth_headers = gen_signature_headers(url, method);
 
     headers.extend(auth_headers);
+    inject_trace_context_into_http_headers(headers);
+    inject_request_id_into_http_headers(headers);
 }
 
 pub fn gen_signature_headers(url: &str, method: &Method) -> HeaderMap {
@@ -132,6 +135,7 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::context_propagation::REQUEST_ID_HEADER;
     use http::{HeaderMap, Method};
     use time::OffsetDateTime;
 
@@ -208,6 +212,33 @@ mod tests {
 
         // Should be within a reasonable range (within 1 second of current time)
         assert!((current_time - timestamp).abs() <= 1, "Timestamp should be close to current time");
+    }
+
+    #[test]
+    fn test_build_auth_headers_preserves_existing_request_id() {
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req-upstream-123"));
+
+        build_auth_headers(url, &method, &mut headers);
+
+        assert_eq!(headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some("req-upstream-123"));
+    }
+
+    #[test]
+    fn test_build_auth_headers_may_set_request_id_from_trace_id() {
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let mut headers = HeaderMap::new();
+
+        let span = tracing::info_span!("rpc-test-span");
+        let _guard = span.enter();
+        build_auth_headers(url, &method, &mut headers);
+
+        if let Some(value) = headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()) {
+            assert!(!value.is_empty(), "request id should not be empty");
+        }
     }
 
     #[test]

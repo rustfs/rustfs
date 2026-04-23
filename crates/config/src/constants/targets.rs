@@ -40,6 +40,15 @@ pub const MQTT_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const MQTT_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const MQTT_TLS_TRUST_LEAF_AS_CA: &str = "tls_trust_leaf_as_ca";
 pub const MQTT_WS_PATH_ALLOWLIST: &str = "ws_path_allowlist";
+pub const KAFKA_BROKERS: &str = "brokers";
+pub const KAFKA_TOPIC: &str = "topic";
+pub const KAFKA_ACKS: &str = "acks";
+pub const KAFKA_QUEUE_DIR: &str = "queue_dir";
+pub const KAFKA_QUEUE_LIMIT: &str = "queue_limit";
+pub const KAFKA_TLS_ENABLE: &str = "tls_enable";
+pub const KAFKA_TLS_CA: &str = "tls_ca";
+pub const KAFKA_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const KAFKA_TLS_CLIENT_KEY: &str = "tls_client_key";
 
 pub const NATS_ADDRESS: &str = "address";
 pub const NATS_SUBJECT: &str = "subject";

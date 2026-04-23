@@ -24,8 +24,8 @@ use crate::{
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
-    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS,
-    NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
+    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
@@ -45,6 +45,7 @@ const MAX_RECENT_LIVE_EVENTS: usize = 1024;
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
         NOTIFY_WEBHOOK_SUB_SYS => "webhook",
+        NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
         NOTIFY_NATS_SUB_SYS => "nats",
         NOTIFY_PULSAR_SUB_SYS => "pulsar",
@@ -763,6 +764,13 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_MQTT_SUB_SYS, "Analytics");
         assert_eq!(target_id.id, "analytics");
         assert_eq!(target_id.name, "mqtt");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_kafka_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_KAFKA_SUB_SYS, "EventBus");
+        assert_eq!(target_id.id, "eventbus");
+        assert_eq!(target_id.name, "kafka");
     }
 
     #[test]
