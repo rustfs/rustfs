@@ -35,6 +35,7 @@ use crate::metrics::collectors::{
     collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
+    collect_cluster_health_metrics,
     collect_cluster_metrics,
     collect_cpu_metrics,
     collect_drive_count_metrics,
@@ -60,9 +61,9 @@ use crate::metrics::config::{
 };
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats,
-    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle, collect_system_cpu_stats,
-    collect_system_drive_stats, collect_system_memory_stats,
+    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_health_stats,
+    collect_cluster_stats, collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
+    collect_system_cpu_stats, collect_system_drive_stats, collect_system_memory_stats,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
@@ -160,7 +161,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             tokio::select! {
                 _ = interval.tick() => {
                     let stats = collect_cluster_stats().await;
-                    let metrics = collect_cluster_metrics(&stats);
+                    let mut metrics = collect_cluster_metrics(&stats);
+                    let cluster_health = collect_cluster_health_stats().await;
+                    metrics.extend(collect_cluster_health_metrics(&cluster_health));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {

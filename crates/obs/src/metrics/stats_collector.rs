@@ -21,9 +21,10 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketStats, ClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
-    HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ResourceStats,
+    BucketReplicationBandwidthStats, BucketStats, ClusterHealthStats, ClusterStats, CpuStats, DiskStats, DriveCountStats,
+    DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats, ProcessStatusType, ResourceStats,
 };
+use rustfs_common::heal_channel::DriveState;
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::global::get_global_bucket_monitor;
@@ -83,6 +84,32 @@ pub async fn collect_cluster_stats() -> ClusterStats {
         free_bytes: free,
         objects_count,
         buckets_count,
+    }
+}
+
+/// Collect cluster health statistics from the storage layer.
+pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
+    let Some(store) = new_object_layer_fn() else {
+        return ClusterHealthStats::default();
+    };
+
+    let storage_info = store.storage_info().await;
+    let mut online = 0u64;
+    let mut offline = 0u64;
+
+    for disk in &storage_info.disks {
+        let state = disk.state.as_str();
+        if state == DriveState::Ok.to_str() || state == DriveState::Unformatted.to_str() {
+            online += 1;
+        } else {
+            offline += 1;
+        }
+    }
+
+    ClusterHealthStats {
+        drives_offline_count: offline,
+        drives_online_count: online,
+        drives_count: storage_info.disks.len() as u64,
     }
 }
 
