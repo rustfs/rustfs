@@ -27,9 +27,9 @@ use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{Disk, InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
@@ -272,13 +272,13 @@ impl DefaultAdminUsecase {
         CACHE.get_or_init(|| Mutex::new(None))
     }
 
-    fn load_cached_storage_readiness() -> Option<bool> {
+    async fn load_cached_storage_readiness() -> Option<bool> {
         let ttl = Self::health_readiness_cache_ttl();
         if ttl.is_zero() {
             return None;
         }
 
-        let cache = Self::storage_readiness_cache().lock().ok()?;
+        let cache = Self::storage_readiness_cache().lock().await;
         let entry = cache.as_ref()?;
         if entry.captured_at.elapsed() <= ttl {
             return Some(entry.storage_ready);
@@ -287,17 +287,16 @@ impl DefaultAdminUsecase {
         None
     }
 
-    fn update_storage_readiness_cache(storage_ready: bool) {
+    async fn update_storage_readiness_cache(storage_ready: bool) {
         if Self::health_readiness_cache_ttl().is_zero() {
             return;
         }
 
-        if let Ok(mut cache) = Self::storage_readiness_cache().lock() {
-            *cache = Some(StorageReadinessCacheEntry {
-                captured_at: Instant::now(),
-                storage_ready,
-            });
-        }
+        let mut cache = Self::storage_readiness_cache().lock().await;
+        *cache = Some(StorageReadinessCacheEntry {
+            captured_at: Instant::now(),
+            storage_ready,
+        });
     }
 
     fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
@@ -384,16 +383,16 @@ impl DefaultAdminUsecase {
 
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
         let iam_ready = self.context.as_ref().map(|context| context.iam().is_ready()).unwrap_or(false);
-        let storage_ready = if let Some(cached) = Self::load_cached_storage_readiness() {
+        let storage_ready = if let Some(cached) = Self::load_cached_storage_readiness().await {
             cached
         } else {
             let computed = if let Some(store) = new_object_layer_fn() {
-                let storage_info = store.local_storage_info().await;
+                let storage_info = store.storage_info().await;
                 Self::storage_ready_from_runtime_state(&storage_info)
             } else {
                 false
             };
-            Self::update_storage_readiness_cache(computed);
+            Self::update_storage_readiness_cache(computed).await;
             computed
         };
 
