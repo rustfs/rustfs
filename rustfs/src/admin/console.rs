@@ -466,10 +466,7 @@ fn setup_console_middleware_stack(
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
-    if rustfs_utils::get_env_bool(
-        rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE,
-        rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE,
-    ) {
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         app = app
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));

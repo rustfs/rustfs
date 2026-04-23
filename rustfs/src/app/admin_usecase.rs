@@ -27,9 +27,9 @@ use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{Disk, InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
@@ -468,5 +468,32 @@ mod tests {
         };
 
         assert!(DefaultAdminUsecase::storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_deduplicates_duplicate_disk_rows() {
+        let duplicate_disk = Disk {
+            endpoint: "127.0.0.1:9000".to_string(),
+            drive_path: "/data0".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            disk_index: 0,
+            state: "ok".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        let info = StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: vec![duplicate_disk.clone(), duplicate_disk],
+        };
+
+        assert!(
+            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
+            "duplicate rows must not satisfy write quorum"
+        );
     }
 }
