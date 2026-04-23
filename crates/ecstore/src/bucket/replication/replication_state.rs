@@ -1045,14 +1045,26 @@ impl ReplicationStats {
     /// Get replication metrics for all buckets
     pub async fn get_all(&self) -> HashMap<String, BucketReplicationStats> {
         let cache = self.cache.read().await;
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(cache.len());
 
         for (bucket, stats) in cache.iter() {
-            let mut cloned_stats = stats.clone_stats();
-            // Add queue statistics
+            result.insert(bucket.clone(), stats.clone_stats());
+        }
+        drop(cache);
+
+        {
             let q_cache = self.q_cache.lock().await;
-            cloned_stats.q_stat = q_cache.get_bucket_stats(bucket);
-            result.insert(bucket.clone(), cloned_stats);
+            for (bucket, queue_stats) in &q_cache.bucket_stats {
+                let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+                bucket_stats.q_stat = queue_stats.snapshot();
+            }
+        }
+
+        {
+            let p_cache = self.p_cache.lock().await;
+            for bucket in p_cache.bucket_stats.keys() {
+                result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+            }
         }
 
         result
@@ -1381,6 +1393,15 @@ mod tests {
         let stat = &bucket_stats.stats["test-arn"];
         assert_eq!(stat.replicated_size, 1024);
         assert_eq!(stat.replicated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_includes_proxy_only_bucket() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-only-bucket", "HeadObject", false).await;
+
+        let all = stats.get_all().await;
+        assert!(all.contains_key("proxy-only-bucket"));
     }
 
     #[test]
