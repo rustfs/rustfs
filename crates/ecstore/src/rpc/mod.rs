@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod client;
+mod context_propagation;
 mod http_auth;
 mod peer_rest_client;
 mod peer_s3_client;

@@ -55,7 +55,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
 # RustFS OR OTEL exporter configuration
 #export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/traces # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
 #export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:14318/v1/traces

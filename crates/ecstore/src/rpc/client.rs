@@ -20,6 +20,8 @@ use std::error::Error;
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::debug;
 
+use super::context_propagation::{inject_request_id_into_metadata, inject_trace_context_into_metadata};
+
 /// 3. Subsequent calls will attempt fresh connections
 /// 4. If node is still down, connection will fail fast (3s timeout)
 pub async fn node_service_time_out_client(
@@ -55,6 +57,8 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET);
         req.metadata_mut().as_mut().extend(headers);
+        inject_trace_context_into_metadata(req.metadata_mut());
+        inject_request_id_into_metadata(req.metadata_mut());
         Ok(req)
     }
 }
@@ -81,6 +85,37 @@ impl tonic::service::Interceptor for TonicInterceptor {
         match self {
             TonicInterceptor::Signature(interceptor) => interceptor.call(req),
             TonicInterceptor::NoOp(interceptor) => interceptor.call(req),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::service::Interceptor;
+
+    #[test]
+    fn test_signature_interceptor_keeps_auth_headers() {
+        let mut interceptor = TonicSignatureInterceptor;
+        let req = tonic::Request::new(());
+
+        let req = interceptor.call(req).expect("interceptor call should succeed");
+
+        assert!(req.metadata().contains_key("x-rustfs-signature"));
+        assert!(req.metadata().contains_key("x-rustfs-timestamp"));
+    }
+
+    #[test]
+    fn test_signature_interceptor_may_inject_request_id() {
+        let mut interceptor = TonicSignatureInterceptor;
+        let req = tonic::Request::new(());
+
+        let span = tracing::info_span!("grpc-rpc-test-span");
+        let _guard = span.enter();
+        let req = interceptor.call(req).expect("interceptor call should succeed");
+
+        if let Some(v) = req.metadata().get("x-request-id") {
+            assert!(!v.as_encoded_bytes().is_empty());
         }
     }
 }

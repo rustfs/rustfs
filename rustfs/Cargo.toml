@@ -195,6 +195,8 @@ aws-config = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = { workspace = true, features = ["async_closure"] }
+tracing-subscriber = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

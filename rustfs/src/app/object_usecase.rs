@@ -23,7 +23,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
+use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -3105,7 +3105,11 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        spawn_background(async move {
+        let request_context = req
+            .extensions
+            .get::<crate::storage::request_context::RequestContext>()
+            .cloned();
+        spawn_background_with_context(request_context, async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
