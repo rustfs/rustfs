@@ -57,6 +57,7 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+use percent_encoding::percent_decode_str;
 use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
@@ -558,13 +559,17 @@ fn parse_otlp_headers(raw_headers: &str) -> HashMap<String, String> {
             if key.is_empty() {
                 return None;
             }
-            Some((key.to_string(), value.trim().to_string()))
+            let value = percent_decode_str(value.trim()).decode_utf8().ok()?;
+            Some((key.to_string(), value.into_owned()))
         })
         .collect()
 }
 
 fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_millis: Option<u64>) -> Option<Duration> {
-    signal_timeout_millis.or(common_timeout_millis).map(Duration::from_millis)
+    signal_timeout_millis
+        .or(common_timeout_millis)
+        .filter(|timeout_millis| *timeout_millis > 0)
+        .map(Duration::from_millis)
 }
 
 #[cfg(test)]
@@ -596,9 +601,9 @@ mod tests {
 
     #[test]
     fn test_parse_otlp_headers_ignores_invalid_entries() {
-        let headers = parse_otlp_headers("Authorization=Bearer%20abc,empty=,missing, =ignored,key=value");
+        let headers = parse_otlp_headers("Authorization=Bearer%20abc,empty=,missing, =ignored,key=value,bad=%FF");
         assert_eq!(headers.len(), 3);
-        assert_eq!(headers.get("Authorization"), Some(&"Bearer%20abc".to_string()));
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer abc".to_string()));
         assert_eq!(headers.get("empty"), Some(&"".to_string()));
         assert_eq!(headers.get("key"), Some(&"value".to_string()));
     }
@@ -620,5 +625,7 @@ mod tests {
     fn test_resolve_signal_timeout_falls_back_to_common() {
         assert_eq!(resolve_signal_timeout(Some(3_000), None), Some(Duration::from_millis(3_000)));
         assert_eq!(resolve_signal_timeout(None, None), None);
+        assert_eq!(resolve_signal_timeout(Some(0), None), None);
+        assert_eq!(resolve_signal_timeout(None, Some(0)), None);
     }
 }

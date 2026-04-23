@@ -105,13 +105,18 @@ pub struct OtelConfig {
     /// Dedicated log endpoint; overrides `endpoint` + `/v1/logs` fallback.
     pub log_endpoint: Option<String>,
     /// Headers applied to all OTLP signals when using HTTP exporter.
-    /// Format: `key=value,key2=value2`.
+    /// Format: comma-separated `key=value` pairs with URL-encoded values, for
+    /// example: `Authorization=Bearer%20abc%20123,X-Scope-OrgID=my-tenant`.
+    /// URL-encode reserved characters in values such as spaces, commas, and `=`.
     pub endpoint_headers: Option<String>,
     /// Additional headers for traces; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
     pub trace_headers: Option<String>,
     /// Additional headers for metrics; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
     pub metric_headers: Option<String>,
     /// Additional headers for logs; merged on top of `endpoint_headers`.
+    /// Uses the same comma-separated `key=value` format with URL-encoded values.
     pub log_headers: Option<String>,
     /// Timeout (milliseconds) for all OTLP HTTP exports.
     pub endpoint_timeout_millis: Option<u64>,
