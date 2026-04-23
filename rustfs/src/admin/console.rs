@@ -377,15 +377,15 @@ async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
 async fn console_logging_middleware(req: Request, next: middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let request_id = req
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+    let request_id = response
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
-    let start = std::time::Instant::now();
-    let response = next.run(req).await;
-    let duration = start.elapsed();
 
     info!(
         target: "rustfs::console::access",
@@ -471,9 +471,9 @@ fn setup_console_middleware_stack(
     // Add comprehensive middleware layers using tower-http features
     app = app
         .layer(CatchPanicLayer::new())
+        .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
-        .layer(PropagateRequestIdLayer::x_request_id())
         // Compress responses
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(console_logging_middleware))
@@ -664,7 +664,10 @@ pub(crate) fn make_console_server() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
     use std::net::{IpAddr, Ipv4Addr};
+    use tower::ServiceExt;
 
     #[test]
     fn console_api_base_url_keeps_rustfs_admin_prefix() {
@@ -693,5 +696,21 @@ mod tests {
         assert!(is_console_path("/rustfs/console/"));
         assert!(!is_console_path("/minio/admin/v3/info"));
         assert!(!is_console_path("/rustfs/admin/v3/info"));
+    }
+
+    #[tokio::test]
+    async fn console_middleware_stack_propagates_request_id_header() {
+        let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
+        let request = Request::builder()
+            .uri(format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"))
+            .body(Body::empty())
+            .expect("failed to build request");
+
+        let response = app.oneshot(request).await.expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().contains_key("x-request-id"),
+            "console response should include propagated x-request-id header"
+        );
     }
 }

@@ -43,6 +43,7 @@
 //! - Canonical source: HTTP ingress `x-request-id` header (set by `SetRequestIdLayer`)
 //! - `x-amz-request_id` is an alias for S3 compatibility, always equal to `request_id`
 //! - Internal modules MUST NOT generate a second request-id under the name `request_id`
+//!   except for orphan/non-ingress fallback paths where no canonical request-id exists.
 //! - Internal identifiers for sub-operations should use `operation_id` or `subtask_id`
 //!
 //! ## tokio::spawn usage
