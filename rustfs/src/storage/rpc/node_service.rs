@@ -913,11 +913,14 @@ mod tests {
         ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
+        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
         ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
         ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
         UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
     };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     fn create_test_node_service() -> NodeService {
         make_server()
@@ -2308,6 +2311,46 @@ mod tests {
                 .await,
             "load_transition_tier_config",
         );
+    }
+
+    async fn connect_test_node_service_client() -> NodeServiceClient<tonic::transport::Channel> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = create_test_node_service();
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        NodeServiceClient::connect(format!("http://{addr}")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_stream_unimplemented() {
+        let mut client = connect_test_node_service_client().await;
+        let request = tokio_stream::iter([WriteRequest::default()]);
+
+        let response = client.write_stream(request).await;
+
+        let err = response.expect_err("write_stream should return unimplemented status");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("write_stream"));
+    }
+
+    #[tokio::test]
+    async fn test_read_at_unimplemented() {
+        let mut client = connect_test_node_service_client().await;
+        let request = tokio_stream::iter([ReadAtRequest::default()]);
+
+        let response = client.read_at(request).await;
+
+        let err = response.expect_err("read_at should return unimplemented status");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("read_at"));
     }
 
     #[tokio::test]
