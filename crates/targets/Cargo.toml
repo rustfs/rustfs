@@ -33,6 +33,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 sysinfo = { workspace = true, features = ["multithread"] }
+rustfs-kafka-async = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -4957,6 +4957,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kafka-protocol"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66292444a1cd4d430d450d472c30cba839d0724229aba2d79affffcf901516e2"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crc",
+ "crc32c",
+ "indexmap 2.14.0",
+ "paste",
+ "uuid",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6435,9 +6450,9 @@ dependencies = [
 
 [[package]]
 name = "pbkdf2"
-version = "0.13.0-rc.10"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f24f3eb2f4471b1730d59e4b730b747939960a8c7eb0c33c5a9076f2d3dddea"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
  "digest 0.11.2",
  "hmac 0.13.0",
@@ -7870,6 +7885,7 @@ dependencies = [
  "mimalloc",
  "mime_guess",
  "opentelemetry",
+ "opentelemetry_sdk",
  "percent-encoding",
  "pin-project-lite",
  "pprof-pyroscope-fork",
@@ -7937,6 +7953,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "url",
  "urlencoding",
  "uuid",
@@ -8050,7 +8067,7 @@ dependencies = [
  "cfg-if",
  "chacha20poly1305",
  "jsonwebtoken",
- "pbkdf2 0.13.0-rc.10",
+ "pbkdf2 0.13.0",
  "rand 0.10.1",
  "serde_json",
  "sha2 0.11.0",
@@ -8100,6 +8117,8 @@ dependencies = [
  "memmap2 0.9.10",
  "metrics",
  "num_cpus",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot 0.12.5",
  "path-absolutize",
  "pin-project-lite",
@@ -8146,6 +8165,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
  "urlencoding",
@@ -8260,6 +8280,54 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-kafka"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4eee0644a99743fb2f51db7fbae1a6ca2d85f064daf7595784eaa52834a68c96"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "fnv",
+ "hmac 0.13.0",
+ "indexmap 2.14.0",
+ "kafka-protocol",
+ "metrics",
+ "pbkdf2 0.13.0",
+ "rand 0.10.1",
+ "rustls",
+ "rustls-native-certs",
+ "sha2 0.11.0",
+ "socket2",
+ "thiserror 2.0.18",
+ "tracing",
+ "twox-hash",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "rustfs-kafka-async"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cd1997c3116cb94ede80d9a0b828f46dd27386cc93825fce141a92eb3aa9630"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "hmac 0.13.0",
+ "kafka-protocol",
+ "metrics",
+ "pbkdf2 0.13.0",
+ "rand 0.10.1",
+ "rustfs-kafka",
+ "rustls",
+ "rustls-native-certs",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -8679,6 +8747,7 @@ dependencies = [
  "rumqttc-next",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-kafka-async",
  "rustfs-s3-common",
  "rustfs-utils",
  "rustls",
@@ -8851,9 +8920,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "log",

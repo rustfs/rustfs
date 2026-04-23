@@ -55,6 +55,7 @@ flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 serde.workspace = true
 time.workspace = true
 bytesize.workspace = true
@@ -62,6 +63,7 @@ serde_json.workspace = true
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 s3s.workspace = true
 http.workspace = true
+opentelemetry.workspace = true
 http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
@@ -127,6 +129,7 @@ criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
 tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

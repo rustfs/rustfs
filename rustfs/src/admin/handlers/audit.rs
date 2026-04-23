@@ -15,10 +15,10 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, allowed_target_keys,
-        collect_config_entry_keys as shared_collect_config_entry_keys,
-        collect_configured_endpoint_keys as shared_collect_configured_endpoint_keys,
-        collect_env_endpoint_keys as shared_collect_env_endpoint_keys, normalized_endpoint_key, target_service_name, target_spec,
+        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
+        collect_validated_key_values as shared_collect_validated_key_values,
+        merge_target_endpoints as shared_merge_target_endpoints,
+        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
     },
     router::{AdminOperation, Operation, S3Router},
@@ -26,14 +26,13 @@ use crate::admin::{
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use futures::stream::{FuturesUnordered, StreamExt};
-use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
-    AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
-    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -84,7 +83,7 @@ struct AuditEndpoint {
     account_id: String,
     service: String,
     status: String,
-    source: AuditEndpointSource,
+    source: TargetEndpointSource,
 }
 
 #[derive(Serialize, Debug)]
@@ -92,22 +91,19 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum AuditEndpointSource {
-    Config,
-    Env,
-    Mixed,
-    Runtime,
-}
-
-fn audit_target_specs() -> [AdminTargetSpec; 4] {
+fn audit_target_specs() -> [AdminTargetSpec; 5] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
             service: "webhook",
             valid_keys: AUDIT_WEBHOOK_KEYS,
             validator: AdminTargetValidator::Webhook,
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_KAFKA_SUB_SYS,
+            service: "kafka",
+            valid_keys: AUDIT_KAFKA_KEYS,
+            validator: AdminTargetValidator::Kafka(TargetDomain::Audit),
         },
         AdminTargetSpec {
             subsystem: AUDIT_MQTT_SUB_SYS,
@@ -161,140 +157,27 @@ fn has_any_audit_targets(config: &Config) -> bool {
     false
 }
 
-fn collect_configured_audit_endpoint_keys(config: &Config) -> Vec<EndpointKey> {
-    shared_collect_configured_endpoint_keys(&audit_target_specs(), config)
-}
-
-fn collect_config_entry_keys(config: &Config) -> HbHashSet<EndpointKey> {
-    shared_collect_config_entry_keys(&audit_target_specs(), config)
-}
-
-fn collect_env_endpoint_keys() -> HbHashSet<EndpointKey> {
-    shared_collect_env_endpoint_keys(&audit_target_specs(), AUDIT_ROUTE_PREFIX)
-}
-
-fn classify_audit_endpoint_source(
-    config_targets: &HbHashSet<EndpointKey>,
-    env_targets: &HbHashSet<EndpointKey>,
-    key: &EndpointKey,
-) -> AuditEndpointSource {
-    match (config_targets.contains(key), env_targets.contains(key)) {
-        (true, true) => AuditEndpointSource::Mixed,
-        (true, false) => AuditEndpointSource::Config,
-        (false, true) => AuditEndpointSource::Env,
-        (false, false) => AuditEndpointSource::Runtime,
-    }
-}
-
-fn audit_endpoint_source(config: &Config, target_type: &str, target_name: &str) -> AuditEndpointSource {
-    let config_targets = collect_config_entry_keys(config);
-    let env_targets = collect_env_endpoint_keys();
-    let service = target_service_name(&audit_target_specs(), target_type).unwrap_or_default();
-
-    let key = normalized_endpoint_key(target_name, service);
-    classify_audit_endpoint_source(&config_targets, &env_targets, &key)
-}
-
 fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
-    match audit_endpoint_source(config, target_type, target_name) {
-        AuditEndpointSource::Env => Some(format!(
-            "audit target '{}' is managed by environment variables and cannot be modified from the console",
-            target_name
-        )),
-        AuditEndpointSource::Mixed => Some(format!(
-            "audit target '{}' is configured by both persisted config and environment variables; remove the environment variables first",
-            target_name
-        )),
-        AuditEndpointSource::Config | AuditEndpointSource::Runtime => None,
-    }
+    shared_target_mutation_block_reason(
+        &audit_target_specs(),
+        AUDIT_ROUTE_PREFIX,
+        config,
+        target_type,
+        target_name,
+        "audit target",
+    )
 }
 
 fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
-    let mut audit_endpoints = Vec::new();
-    let mut seen = HashSet::new();
-    let configured_keys = collect_configured_audit_endpoint_keys(config);
-    let config_targets = collect_config_entry_keys(config);
-    let env_targets = collect_env_endpoint_keys();
-    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
-    for ((account_id, service), status) in runtime_statuses {
-        let normalized = normalized_endpoint_key(&account_id, &service);
-        normalized_runtime_statuses
-            .entry(normalized)
-            .or_insert((account_id, service, status));
-    }
-
-    for key in configured_keys {
-        let normalized = normalized_endpoint_key(&key.0, &key.1);
-        if !seen.insert(normalized.clone()) {
-            continue;
-        }
-        let status = normalized_runtime_statuses
-            .remove(&normalized)
-            .map(|(_, _, status)| status)
-            .unwrap_or_else(|| "offline".to_string());
-        let source = classify_audit_endpoint_source(&config_targets, &env_targets, &normalized);
-        audit_endpoints.push(AuditEndpoint {
-            account_id: key.0,
-            service: key.1,
-            status,
-            source,
-        });
-    }
-
-    for (normalized, (account_id, service, status)) in normalized_runtime_statuses {
-        if seen.insert(normalized.clone()) {
-            audit_endpoints.push(AuditEndpoint {
-                account_id,
-                service,
-                status,
-                source: classify_audit_endpoint_source(&config_targets, &env_targets, &normalized),
-            });
-        }
-    }
-
-    for key in &env_targets {
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-
-        audit_endpoints.push(AuditEndpoint {
-            account_id: key.0.clone(),
-            service: key.1.clone(),
-            status: "offline".to_string(),
-            source: classify_audit_endpoint_source(&config_targets, &env_targets, key),
-        });
-    }
-
-    audit_endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
-    audit_endpoints
-}
-
-fn collect_validated_key_values(
-    key_values: &[KeyValue],
-    allowed_keys: &HashSet<&str>,
-    target_type: &str,
-) -> S3Result<HashMap<String, String>> {
-    let mut kv_map = HashMap::new();
-    let mut seen = HashSet::new();
-
-    for kv in key_values {
-        if !allowed_keys.contains(kv.key.as_str()) {
-            return Err(s3_error!(
-                InvalidArgument,
-                "key '{}' not allowed for audit target type '{}'",
-                kv.key,
-                target_type
-            ));
-        }
-
-        if !seen.insert(kv.key.as_str()) {
-            return Err(s3_error!(InvalidArgument, "duplicate key '{}' in request body", kv.key));
-        }
-
-        kv_map.insert(kv.key.clone(), kv.value.clone());
-    }
-
-    Ok(kv_map)
+    shared_merge_target_endpoints(&audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
+        .into_iter()
+        .map(|endpoint| AuditEndpoint {
+            account_id: endpoint.account_id,
+            service: endpoint.service,
+            status: endpoint.status,
+            source: endpoint.source,
+        })
+        .collect()
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
@@ -406,7 +289,12 @@ impl Operation for AuditTargetConfig {
         let specs = audit_target_specs();
         let allowed_keys: HashSet<&str> = allowed_target_keys(&specs, target_type);
 
-        let kv_map = collect_validated_key_values(&audit_body.key_values, &allowed_keys, target_type)?;
+        let kv_map = shared_collect_validated_key_values(
+            audit_body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            &allowed_keys,
+            target_type,
+            "audit target",
+        )?;
 
         let spec = target_spec(&specs, target_type)
             .ok_or_else(|| s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type))?;
@@ -577,19 +465,55 @@ mod tests {
                     .iter()
                     .find(|entry| entry.account_id == "mixed-target")
                     .expect("mixed target should be present");
-                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
 
                 let env_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "env-only")
                     .expect("env-only target should be present");
-                assert_eq!(env_only.source, AuditEndpointSource::Env);
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
 
                 let config_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "config-target")
                     .expect("config target should be present");
-                assert_eq!(config_only.source, AuditEndpointSource::Config);
+                assert_eq!(config_only.source, TargetEndpointSource::Config);
+            },
+        );
+    }
+
+    #[test]
+    fn merge_audit_endpoints_marks_kafka_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            AUDIT_KAFKA_SUB_SYS.to_string(),
+            HashMap::from([("mixed-kafka".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_KAFKA_ENABLE_MIXED-KAFKA", Some("on")),
+                ("RUSTFS_AUDIT_KAFKA_BROKERS_MIXED-KAFKA", Some("127.0.0.1:9092")),
+                ("RUSTFS_AUDIT_KAFKA_ENABLE_ENV-KAFKA", Some("on")),
+                ("RUSTFS_AUDIT_KAFKA_BROKERS_ENV-KAFKA", Some("127.0.0.1:9093")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                ]);
+                let merged = merge_audit_endpoints(&config, runtime);
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-kafka" && entry.service == "kafka")
+                    .expect("mixed kafka target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-kafka" && entry.service == "kafka")
+                    .expect("env kafka target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
             },
         );
     }
@@ -641,7 +565,7 @@ mod tests {
                     .iter()
                     .find(|entry| entry.account_id == "mixed-disabled")
                     .expect("mixed target should be present");
-                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
                 assert_eq!(mixed.status, "offline");
             },
         );
@@ -662,7 +586,7 @@ mod tests {
                     .iter()
                     .find(|entry| entry.account_id == "env-only")
                     .expect("env-only target should be present");
-                assert_eq!(env_only.source, AuditEndpointSource::Env);
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
                 assert_eq!(env_only.status, "offline");
             },
         );
@@ -671,7 +595,7 @@ mod tests {
     #[test]
     fn collect_validated_key_values_rejects_duplicate_keys() {
         let allowed_keys: HashSet<&str> = ["endpoint", "auth_token"].into_iter().collect();
-        let key_values = vec![
+        let key_values = [
             KeyValue {
                 key: "endpoint".to_string(),
                 value: "https://example.com/one".to_string(),
@@ -682,19 +606,31 @@ mod tests {
             },
         ];
 
-        let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
+        let err = shared_collect_validated_key_values(
+            key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            &allowed_keys,
+            AUDIT_WEBHOOK_SUB_SYS,
+            "audit target",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("duplicate key"));
     }
 
     #[test]
     fn collect_validated_key_values_rejects_unsupported_key() {
         let allowed_keys: HashSet<&str> = AUDIT_WEBHOOK_KEYS.iter().copied().collect();
-        let key_values = vec![KeyValue {
+        let key_values = [KeyValue {
             key: "not_a_real_key".to_string(),
             value: "/tmp/rustfs-audit".to_string(),
         }];
 
-        let err = collect_validated_key_values(&key_values, &allowed_keys, AUDIT_WEBHOOK_SUB_SYS).unwrap_err();
+        let err = shared_collect_validated_key_values(
+            key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            &allowed_keys,
+            AUDIT_WEBHOOK_SUB_SYS,
+            "audit target",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not allowed for audit target type"));
     }
 
@@ -711,10 +647,18 @@ mod tests {
             .insert("/v3/audit/target/{target_type}/{target_name}", ())
             .expect("route should insert");
         let unsupported_type_params = full_router
-            .at("/v3/audit/target/audit_kafka/primary")
+            .at("/v3/audit/target/audit_unknown/primary")
             .expect("route should match");
         let unsupported_type = extract_target_params(&unsupported_type_params.params).unwrap_err();
         assert!(unsupported_type.to_string().contains("unsupported audit target type"));
+
+        let supported_kafka_params = full_router
+            .at("/v3/audit/target/audit_kafka/primary")
+            .expect("route should match");
+        let (target_type, target_name) =
+            extract_target_params(&supported_kafka_params.params).expect("audit kafka target should be supported");
+        assert_eq!(target_type, AUDIT_KAFKA_SUB_SYS);
+        assert_eq!(target_name, "primary");
 
         let mut partial_router = Router::new();
         partial_router
@@ -746,7 +690,7 @@ mod tests {
                     .iter()
                     .find(|entry| entry.account_id == "PrimaryCase" && entry.service == "webhook")
                     .expect("mixed target should be present");
-                assert_eq!(mixed.source, AuditEndpointSource::Mixed);
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
             },
         );
     }

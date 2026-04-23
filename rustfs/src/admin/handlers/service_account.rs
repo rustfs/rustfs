@@ -79,6 +79,16 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     }
 }
 
+fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
+    let caller_parent = if caller.parent_user.is_empty() {
+        caller.access_key.as_str()
+    } else {
+        caller.parent_user.as_str()
+    };
+
+    caller_parent == target_parent_user
+}
+
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_service_account(&err) {
@@ -551,6 +561,15 @@ impl Operation for UpdateServiceAccount {
             })
             .await
         {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
+
+        let (svc_account, _) = iam_store
+            .get_service_account(&access_key)
+            .await
+            .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
+
+        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
@@ -1483,5 +1502,28 @@ mod tests {
         let policy = policy.unwrap();
         assert!(policy.version.is_empty());
         assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn update_service_account_requires_requester_parent_match() {
+        let parent_owner = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            parent_user: String::new(),
+            ..Default::default()
+        };
+        let derived_owner = StoredCredentials {
+            access_key: "sa-user".to_string(),
+            parent_user: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let foreign_user = StoredCredentials {
+            access_key: "other".to_string(),
+            parent_user: String::new(),
+            ..Default::default()
+        };
+
+        assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
+        assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
+        assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
     }
 }
