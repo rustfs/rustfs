@@ -21,3 +21,8 @@ pub const DEFAULT_HEALTH_ENDPOINT_ENABLE: bool = true;
 /// This reduces storage-layer pressure when probes are called at high frequency.
 pub const ENV_HEALTH_READINESS_CACHE_TTL_MS: &str = "RUSTFS_HEALTH_READINESS_CACHE_TTL_MS";
 pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
+
+/// Enable minimal health payload mode for GET `/health*` responses.
+/// When enabled, only `status` and `ready` fields are returned.
+pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";
+pub const DEFAULT_HEALTH_MINIMAL_RESPONSE_ENABLE: bool = false;
