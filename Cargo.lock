@@ -8488,6 +8488,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "percent-encoding",
  "pyroscope",
  "rustfs-audit",
  "rustfs-config",
