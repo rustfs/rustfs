@@ -161,7 +161,10 @@ mod tests {
             inject_request_id_into_http_headers(&mut headers);
         });
 
-        assert_eq!(headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some(trace_id));
+        assert_eq!(
+            headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()),
+            Some(format!("trace-{trace_id}").as_str())
+        );
     }
 
     #[test]
@@ -188,7 +191,10 @@ mod tests {
             inject_request_id_into_metadata(&mut metadata);
         });
 
-        assert_eq!(metadata.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some(trace_id));
+        assert_eq!(
+            metadata.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()),
+            Some(format!("trace-{trace_id}").as_str())
+        );
     }
 
     #[test]
