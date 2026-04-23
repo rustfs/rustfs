@@ -6558,9 +6558,31 @@
           "legendFormat": "head failures - {{bucket}}",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_total{job=~\"$job\",bucket=~\"$bucket\"}",
+          "legendFormat": "put - {{bucket}}",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_failures_total{job=~\"$job\",bucket=~\"$bucket\"}",
+          "legendFormat": "put failures - {{bucket}}",
+          "range": true,
+          "refId": "F"
         }
       ],
-      "title": "Bucket Replication Proxy Requests",
+      "title": "Bucket Replication Proxy Requests (Get/Head/Put)",
       "type": "timeseries"
     },
     {
