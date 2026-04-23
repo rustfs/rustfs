@@ -38,6 +38,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
@@ -376,12 +377,19 @@ async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
 async fn console_logging_middleware(req: Request, next: middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
     let start = std::time::Instant::now();
     let response = next.run(req).await;
     let duration = start.elapsed();
 
     info!(
         target: "rustfs::console::access",
+        request_id = %request_id,
         method = %method,
         uri = %uri,
         status = %response.status(),
@@ -463,7 +471,9 @@ fn setup_console_middleware_stack(
     // Add comprehensive middleware layers using tower-http features
     app = app
         .layer(CatchPanicLayer::new())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
+        .layer(PropagateRequestIdLayer::x_request_id())
         // Compress responses
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(console_logging_middleware))
