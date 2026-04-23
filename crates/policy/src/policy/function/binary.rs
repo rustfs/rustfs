@@ -20,37 +20,56 @@ use super::func::InnerFunc;
 
 pub type BinaryFunc = InnerFunc<BinaryFuncValue>;
 
+#[derive(thiserror::Error, Clone, Debug, Eq, PartialEq)]
+pub enum BinaryFuncValueError {
+    #[error("invalid base64 for BinaryEquals")]
+    InvalidBase64,
+}
+
 /// Policy value for the AWS IAM `BinaryEquals` condition.
 ///
-/// Policies store the value as a base64-encoded string. During deserialization
-/// the value is validated and the raw bytes are cached, so evaluation is a
-/// plain byte comparison and malformed policies are rejected at parse time.
+/// Policies store the value as a base64-encoded string or array of strings.
+/// During deserialization the values are validated and the raw bytes are
+/// cached, so evaluation is a plain byte comparison and malformed policies
+/// are rejected at parse time.
 #[derive(Clone, Debug)]
 pub struct BinaryFuncValue {
-    /// Original base64 form, preserved for serialization round-trips.
-    encoded: String,
+    /// Original base64 forms, preserved for serialization round-trips.
+    encoded: Vec<String>,
     /// Decoded bytes used for comparison during `evaluate`.
-    decoded: Vec<u8>,
+    decoded: Vec<Vec<u8>>,
 }
 
 impl BinaryFuncValue {
     /// Construct from a base64-encoded string, validating the encoding.
-    pub fn new(encoded: impl Into<String>) -> Result<Self, base64_simd::Error> {
-        let encoded = encoded.into();
-        let decoded = base64_simd::STANDARD.decode_to_vec(encoded.as_bytes())?;
+    pub fn new(encoded: impl Into<String>) -> Result<Self, BinaryFuncValueError> {
+        Self::from_encoded_values(vec![encoded.into()])
+    }
+
+    fn from_encoded_values(encoded: Vec<String>) -> Result<Self, BinaryFuncValueError> {
+        let decoded = encoded
+            .iter()
+            .map(|value| {
+                base64_simd::STANDARD
+                    .decode_to_vec(value.as_bytes())
+                    .map_err(|_| BinaryFuncValueError::InvalidBase64)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { encoded, decoded })
     }
 }
 
 impl TryFrom<String> for BinaryFuncValue {
-    type Error = base64_simd::Error;
+    type Error = BinaryFuncValueError;
+
     fn try_from(encoded: String) -> Result<Self, Self::Error> {
         Self::new(encoded)
     }
 }
 
 impl TryFrom<&str> for BinaryFuncValue {
-    type Error = base64_simd::Error;
+    type Error = BinaryFuncValueError;
+
     fn try_from(encoded: &str) -> Result<Self, Self::Error> {
         Self::new(encoded)
     }
@@ -68,14 +87,49 @@ impl Eq for BinaryFuncValue {}
 
 impl Serialize for BinaryFuncValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.encoded)
+        if self.encoded.len() == 1 {
+            serializer.serialize_str(&self.encoded[0])
+        } else {
+            self.encoded.serialize(serializer)
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for BinaryFuncValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let encoded = String::deserialize(deserializer)?;
-        Self::new(encoded).map_err(|e| de::Error::custom(format!("invalid base64 for BinaryEquals: {e}")))
+        struct StringOrVecVisitor;
+
+        impl<'de> de::Visitor<'de> for StringOrVecVisitor {
+            type Value = BinaryFuncValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 string or an array of base64 strings")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                BinaryFuncValue::new(value).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<String>()? {
+                    values.push(value);
+                }
+                if values.is_empty() {
+                    return Err(de::Error::custom("empty"));
+                }
+
+                BinaryFuncValue::from_encoded_values(values).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_any(StringOrVecVisitor)
     }
 }
 
@@ -91,23 +145,27 @@ impl BinaryFunc {
     /// the comparison to ever succeed.
     ///
     /// All key/value pairs in the function must match (logical AND); for a
-    /// given key, any decoded request value that equals the expected bytes
-    /// satisfies that pair (OR across values). A missing request key, or
-    /// *any* request value that is not valid base64, causes the condition
-    /// to evaluate to false (fail-closed).
+    /// given key, any decoded request value that equals any expected decoded
+    /// policy value satisfies that pair (OR across request values and policy
+    /// values). A missing request key, or *any* request value that is not
+    /// valid base64, causes the condition to evaluate to false (fail-closed).
     pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
             let Some(rvalues) = values.get(inner.key.name().as_str()) else {
                 return false;
             };
 
-            let expected = inner.values.decoded.as_slice();
             let mut matched = false;
             for v in rvalues {
                 let Ok(decoded) = base64_simd::STANDARD.decode_to_vec(v.as_bytes()) else {
                     return false;
                 };
-                if decoded.as_slice() == expected {
+                if inner
+                    .values
+                    .decoded
+                    .iter()
+                    .any(|expected| decoded.as_slice() == expected.as_slice())
+                {
                     matched = true;
                 }
             }
@@ -122,7 +180,7 @@ impl BinaryFunc {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryFunc, BinaryFuncValue};
+    use super::{BinaryFunc, BinaryFuncValue, BinaryFuncValueError};
     use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
@@ -136,6 +194,16 @@ mod tests {
             0: vec![FuncKeyValue {
                 key: Key { name, variable },
                 values: BinaryFuncValue::new(value).expect("valid base64 in test"),
+            }],
+        }
+    }
+
+    fn new_multi_func(name: KeyName, variable: Option<String>, values: &[&str]) -> BinaryFunc {
+        BinaryFunc {
+            0: vec![FuncKeyValue {
+                key: Key { name, variable },
+                values: BinaryFuncValue::from_encoded_values(values.iter().map(|value| (*value).to_string()).collect())
+                    .expect("valid binary array in test"),
             }],
         }
     }
@@ -191,6 +259,14 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_matches_any_policy_value() {
+        let f = new_multi_func(Aws(AWSUsername), None, &["aGVsbG8=", "d29ybGQ="]);
+        let mut ctx = HashMap::new();
+        ctx.insert("username".to_string(), vec!["d29ybGQ=".to_string()]);
+        assert!(f.evaluate(&ctx));
+    }
+
+    #[test]
     fn evaluate_invalid_base64_request_value_fails_closed() {
         // Malformed base64 in the request must never match, regardless of policy value.
         let f = new_func(Aws(AWSUsername), None, "aGVsbG8=");
@@ -234,7 +310,7 @@ mod tests {
         let from_str: BinaryFuncValue = "aGVsbG8=".try_into().unwrap();
         let from_string: BinaryFuncValue = String::from("aGVsbG8=").try_into().unwrap();
         assert_eq!(from_str, from_string);
-        assert!(BinaryFuncValue::try_from("!!!bad!!!").is_err());
+        assert_eq!(BinaryFuncValue::try_from("!!!bad!!!").unwrap_err(), BinaryFuncValueError::InvalidBase64,);
     }
 
     #[test]
@@ -280,6 +356,15 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_array_from_policy_json() {
+        let json = r#"{"aws:username": ["aGVsbG8=", "d29ybGQ="]}"#;
+        let f: BinaryFunc = serde_json::from_str(json).unwrap();
+        let mut ctx = HashMap::new();
+        ctx.insert("username".to_string(), vec!["d29ybGQ=".to_string()]);
+        assert!(f.evaluate(&ctx));
+    }
+
+    #[test]
     fn deserialize_rejects_invalid_base64_at_parse_time() {
         // Malformed policies must be rejected eagerly, not silently fail at eval.
         let json = r#"{"aws:username": "!!!not-base64!!!"}"#;
@@ -289,8 +374,32 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_rejects_invalid_base64_in_array_at_parse_time() {
+        let json = r#"{"aws:username": ["aGVsbG8=", "!!!not-base64!!!"]}"#;
+        let err = serde_json::from_str::<BinaryFunc>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid base64"), "unexpected error message: {msg}");
+    }
+
+    #[test]
+    fn deserialize_rejects_empty_array() {
+        let json = r#"{"aws:username": []}"#;
+        let err = serde_json::from_str::<BinaryFunc>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty"), "unexpected error message: {msg}");
+    }
+
+    #[test]
     fn serialize_round_trip_preserves_encoded_form() {
         let json = r#"{"aws:username":"aGVsbG8="}"#;
+        let f: BinaryFunc = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&f).unwrap();
+        assert_eq!(out, json);
+    }
+
+    #[test]
+    fn serialize_round_trip_preserves_encoded_array_form() {
+        let json = r#"{"aws:username":["aGVsbG8=","d29ybGQ="]}"#;
         let f: BinaryFunc = serde_json::from_str(json).unwrap();
         let out = serde_json::to_string(&f).unwrap();
         assert_eq!(out, json);
