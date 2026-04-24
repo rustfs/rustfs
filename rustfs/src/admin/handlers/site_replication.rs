@@ -3125,9 +3125,11 @@ mod tests {
 
     #[test]
     fn test_reconcile_site_replication_bucket_targets_upserts_remote_peer_targets() {
-        let mut state = SiteReplicationState::default();
-        state.service_account_access_key = "site-replicator-0".to_string();
-        state.service_account_secret_key = "secret".to_string();
+        let mut state = SiteReplicationState {
+            service_account_access_key: "site-replicator-0".to_string(),
+            service_account_secret_key: "secret".to_string(),
+            ..Default::default()
+        };
         state.peers.insert(
             "local".to_string(),
             PeerInfo {
