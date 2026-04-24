@@ -14,7 +14,7 @@
 
 //! Tower service implementation for the trusted proxy middleware.
 
-use crate::{ClientInfo, ProxyValidator, TrustedProxyLayer};
+use crate::{ClientInfo, ProxyValidator};
 use http::Request;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -43,7 +43,7 @@ impl<S> TrustedProxyMiddleware<S> {
     }
 
     /// Creates a new `TrustedProxyMiddleware` from a `TrustedProxyLayer`.
-    pub fn from_layer(inner: S, layer: &TrustedProxyLayer) -> Self {
+    pub fn from_layer(inner: S, layer: &super::layer::TrustedProxyLayer) -> Self {
         Self::new(inner, layer.validator.clone(), layer.enabled)
     }
 }

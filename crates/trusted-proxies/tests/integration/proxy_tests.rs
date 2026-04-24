@@ -14,14 +14,14 @@
 
 use axum::body::Body;
 use axum::{Router, routing::get};
-use rustfs_trusted_proxies::{TrustedProxy, TrustedProxyConfig, TrustedProxyLayer, ValidationMode};
+use rustfs_trusted_proxies::{LegacyTrustedProxyLayer, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use tower::ServiceExt;
 
 #[tokio::test]
 async fn test_proxy_validation_flow() {
     let proxies = vec![TrustedProxy::Single("127.0.0.1".parse().unwrap())];
     let config = TrustedProxyConfig::new(proxies, ValidationMode::HopByHop, true, 10, true, vec![]);
-    let proxy_layer = TrustedProxyLayer::enabled(config, None);
+    let proxy_layer = LegacyTrustedProxyLayer::enabled(config, None);
 
     let app = Router::new().route("/test", get(|| async { "OK" })).layer(proxy_layer);
 
