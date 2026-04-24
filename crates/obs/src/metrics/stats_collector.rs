@@ -38,7 +38,23 @@ use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
 const DRIVE_STATE_OK: &str = "ok";
+const DRIVE_STATE_ONLINE: &str = "online";
 const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
+const DRIVE_RUNTIME_STATE_RETURNING: &str = "returning";
+
+fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool {
+    let state_is_acceptable = state.eq_ignore_ascii_case(DRIVE_STATE_OK)
+        || state.eq_ignore_ascii_case(DRIVE_STATE_ONLINE)
+        || state.eq_ignore_ascii_case(DRIVE_STATE_UNFORMATTED);
+
+    if let Some(runtime_state) = runtime_state {
+        let runtime_state_is_acceptable = runtime_state.eq_ignore_ascii_case(DRIVE_STATE_ONLINE)
+            || runtime_state.eq_ignore_ascii_case(DRIVE_RUNTIME_STATE_RETURNING);
+        return runtime_state_is_acceptable && state_is_acceptable;
+    }
+
+    state_is_acceptable
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMetricBundle {
@@ -103,8 +119,7 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
     let mut offline = 0u64;
 
     for disk in &storage_info.disks {
-        let state = disk.state.as_str();
-        if state == DRIVE_STATE_OK || state == DRIVE_STATE_UNFORMATTED {
+        if disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref()) {
             online += 1;
         } else {
             offline += 1;
@@ -405,46 +420,56 @@ pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCoun
     };
 
     let storage_info = store.storage_info().await;
-    let total_count = storage_info.disks.len() as u64;
+    let mut online_count = 0u64;
+    let mut offline_count = 0u64;
 
     let drive_stats = storage_info
         .disks
         .iter()
-        .map(|disk| DriveDetailedStats {
-            server: disk.endpoint.clone(),
-            drive: disk.drive_path.clone(),
-            total_bytes: disk.total_space,
-            used_bytes: disk.used_space,
-            free_bytes: disk.available_space,
-            used_inodes: 0,
-            free_inodes: 0,
-            total_inodes: 0,
-            timeout_errors_total: 0,
-            io_errors_total: 0,
-            availability_errors_total: 0,
-            waiting_io: 0,
-            api_latency_micros: 0,
-            health: 1,
-            reads_per_sec: 0.0,
-            reads_kb_per_sec: 0.0,
-            reads_await: 0.0,
-            writes_per_sec: 0.0,
-            writes_kb_per_sec: 0.0,
-            writes_await: 0.0,
-            perc_util: if disk.total_space > 0 {
-                (disk.used_space as f64 / disk.total_space as f64) * 100.0
+        .map(|disk| {
+            let is_online = disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref());
+            if is_online {
+                online_count += 1;
             } else {
-                0.0
-            },
+                offline_count += 1;
+            }
+
+            DriveDetailedStats {
+                server: disk.endpoint.clone(),
+                drive: disk.drive_path.clone(),
+                total_bytes: disk.total_space,
+                used_bytes: disk.used_space,
+                free_bytes: disk.available_space,
+                used_inodes: 0,
+                free_inodes: 0,
+                total_inodes: 0,
+                timeout_errors_total: 0,
+                io_errors_total: 0,
+                availability_errors_total: 0,
+                waiting_io: 0,
+                api_latency_micros: 0,
+                health: if is_online { 1 } else { 0 },
+                reads_per_sec: 0.0,
+                reads_kb_per_sec: 0.0,
+                reads_await: 0.0,
+                writes_per_sec: 0.0,
+                writes_kb_per_sec: 0.0,
+                writes_await: 0.0,
+                perc_util: if disk.total_space > 0 {
+                    (disk.used_space as f64 / disk.total_space as f64) * 100.0
+                } else {
+                    0.0
+                },
+            }
         })
         .collect();
 
     (
         drive_stats,
         DriveCountStats {
-            offline_count: 0,
-            online_count: total_count,
-            total_count,
+            offline_count,
+            online_count,
+            total_count: online_count + offline_count,
         },
     )
 }
@@ -535,5 +560,20 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
         total_received,
         total_transmitted,
         per_interface,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_is_online_for_metrics_accepts_online_state_case_insensitive() {
+        assert!(disk_is_online_for_metrics("OnLiNe", Some("online")));
+    }
+
+    #[test]
+    fn disk_is_online_for_metrics_rejects_offline_runtime_state() {
+        assert!(!disk_is_online_for_metrics(DRIVE_STATE_OK, Some("offline")));
     }
 }
