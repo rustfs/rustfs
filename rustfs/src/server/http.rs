@@ -66,6 +66,29 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+const LABEL_REQUEST_METHOD: &str = "request_method";
+const METRIC_API_REQUESTS_TOTAL: &str = "rustfs_api_requests_total";
+const METRIC_API_REQUESTS_FAILURE_TOTAL: &str = "rustfs_api_requests_failure_total";
+const METRIC_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_request_body_bytes_total";
+const METRIC_REQUEST_LATENCY_MS: &str = "rustfs_request_latency_ms";
+const METRIC_REQUEST_BODY_LEN: &str = "rustfs_request_body_len";
+
+#[inline]
+fn request_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
@@ -715,28 +738,31 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [("key_request_method", request.method().to_string())];
-                        counter!("rustfs.api.requests.total", &labels).increment(1);
+                        counter!(
+                            METRIC_API_REQUESTS_TOTAL,
+                            LABEL_REQUEST_METHOD => request_method_label(request.method())
+                        )
+                        .increment(1);
                         // Aggregate request body size for throughput monitoring (lightweight)
                         if let Some(cl) = request.headers().get("content-length")
                             && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                         {
-                            counter!("rustfs.request.body.bytes_total", "direction" => "request").increment(len);
+                            counter!(METRIC_REQUEST_BODY_BYTES_TOTAL, "direction" => "request").increment(len);
                         }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
+                        histogram!(METRIC_REQUEST_LATENCY_MS).record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         // Always track aggregate body bytes (lightweight counter, no debug logging)
-                        counter!("rustfs.request.body.bytes_total", "direction" => "response").increment(chunk.len() as u64);
+                        counter!(METRIC_REQUEST_BODY_BYTES_TOTAL, "direction" => "response").increment(chunk.len() as u64);
+                        histogram!(METRIC_REQUEST_BODY_LEN, "direction" => "response").record(chunk.len() as f64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                             debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
@@ -757,7 +783,7 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs.api.requests.failure.total").increment(1);
+                        counter!(METRIC_API_REQUESTS_FAILURE_TOTAL).increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
@@ -1079,6 +1105,24 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&"user-agent"));
         assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_http_metric_names_and_labels_use_snake_case() {
+        let metric_names = [
+            METRIC_API_REQUESTS_TOTAL,
+            METRIC_API_REQUESTS_FAILURE_TOTAL,
+            METRIC_REQUEST_BODY_BYTES_TOTAL,
+            METRIC_REQUEST_LATENCY_MS,
+            METRIC_REQUEST_BODY_LEN,
+        ];
+
+        for metric_name in metric_names {
+            assert!(metric_name.starts_with("rustfs_"));
+            assert!(!metric_name.contains('.'));
+        }
+
+        assert_eq!(LABEL_REQUEST_METHOD, "request_method");
     }
 
     #[test]
