@@ -42,6 +42,7 @@ use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
+use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts, get_claims_from_token_with_secret};
 use rustfs_iam::{get_global_iam_sys, get_oidc};
@@ -2158,39 +2159,43 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             };
             if let Some(create) = change.create {
                 let session_policy = create.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok());
-                if iam_sys.get_service_account(&create.access_key).await.is_ok() {
-                    iam_sys
-                        .update_service_account(
-                            &create.access_key,
-                            UpdateServiceAccountOpts {
-                                session_policy,
-                                secret_key: Some(create.secret_key),
-                                name: (!create.name.is_empty()).then_some(create.name),
-                                description: (!create.description.is_empty()).then_some(create.description),
-                                expiration: create.expiration,
-                                status: (!create.status.is_empty()).then_some(create.status),
-                            },
-                        )
-                        .await
-                        .map_err(ApiError::from)?;
-                } else {
-                    iam_sys
-                        .new_service_account(
-                            &create.parent,
-                            Some(create.groups),
-                            NewServiceAccountOpts {
-                                session_policy,
-                                access_key: create.access_key,
-                                secret_key: create.secret_key,
-                                name: (!create.name.is_empty()).then_some(create.name),
-                                description: (!create.description.is_empty()).then_some(create.description),
-                                expiration: create.expiration,
-                                allow_site_replicator_account: true,
-                                claims: Some(create.claims),
-                            },
-                        )
-                        .await
-                        .map_err(ApiError::from)?;
+                match iam_sys.get_service_account(&create.access_key).await {
+                    Ok(_) => {
+                        iam_sys
+                            .update_service_account(
+                                &create.access_key,
+                                UpdateServiceAccountOpts {
+                                    session_policy,
+                                    secret_key: Some(create.secret_key),
+                                    name: (!create.name.is_empty()).then_some(create.name),
+                                    description: (!create.description.is_empty()).then_some(create.description),
+                                    expiration: create.expiration,
+                                    status: (!create.status.is_empty()).then_some(create.status),
+                                },
+                            )
+                            .await
+                            .map_err(ApiError::from)?;
+                    }
+                    Err(err) if is_err_no_such_service_account(&err) => {
+                        iam_sys
+                            .new_service_account(
+                                &create.parent,
+                                Some(create.groups),
+                                NewServiceAccountOpts {
+                                    session_policy,
+                                    access_key: create.access_key,
+                                    secret_key: create.secret_key,
+                                    name: (!create.name.is_empty()).then_some(create.name),
+                                    description: (!create.description.is_empty()).then_some(create.description),
+                                    expiration: create.expiration,
+                                    allow_site_replicator_account: true,
+                                    claims: Some(create.claims),
+                                },
+                            )
+                            .await
+                            .map_err(ApiError::from)?;
+                    }
+                    Err(err) => return Err(ApiError::from(err).into()),
                 }
                 return Ok(());
             }
