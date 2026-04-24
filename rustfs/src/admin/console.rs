@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_component_details, collect_dependency_readiness, health_check_state};
+use crate::admin::handlers::health::{HealthProbe, build_health_payload, collect_dependency_readiness, health_check_state};
 use crate::license::get_license;
-use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, RUSTFS_ADMIN_PREFIX};
+use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::version::build;
 use axum::{
     Router,
@@ -461,12 +461,27 @@ fn setup_console_middleware_stack(
 ) -> Router {
     let mut app = Router::new()
         .route(FAVICON_PATH, get(static_handler))
-        .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
-        .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
-        .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check))
+        .route(&format!("{CONSOLE_PREFIX}{LICENSE}"), get(license_handler))
+        .route(&format!("{CONSOLE_PREFIX}{VERSION}"), get(version_handler))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
+
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
+        app = app
+            .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+            .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
+    } else {
+        // Keep disabled health probes from falling through to the SPA fallback.
+        app = app
+            .route(
+                &format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+                get(health_route_disabled).head(health_route_disabled),
+            )
+            .route(
+                &format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+                get(health_route_disabled).head(health_route_disabled),
+            );
+    }
 
     // Add comprehensive middleware layers using tower-http features
     app = app
@@ -511,7 +526,7 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let (storage_ready, iam_ready) = collect_dependency_readiness();
+    let (storage_ready, iam_ready) = collect_dependency_readiness().await;
     let health = health_check_state(storage_ready, iam_ready, probe);
 
     let builder = Response::builder()
@@ -521,18 +536,11 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     match method {
         // GET: Returns complete JSON
         Method::GET => {
-            let body_json = json!({
-                "status": health.status,
-                "ready": health.ready,
-                "service": "rustfs-console",
-                "timestamp": jiff::Zoned::now().to_string(),
-                "version": env!("CARGO_PKG_VERSION"),
-                "details": build_component_details(storage_ready, iam_ready),
-                "uptime": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            });
+            let uptime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let body_json = build_health_payload(health, storage_ready, iam_ready, "rustfs-console", Some(uptime));
 
             // Return a minimal JSON when serialization fails to avoid panic
             let body_str = serde_json::to_string(&body_json).unwrap_or_else(|e| {
@@ -591,6 +599,10 @@ async fn health_check(method: Method, uri: Uri) -> Response {
                 Response::new(Body::from("Method Not Allowed"))
             }),
     }
+}
+
+async fn health_route_disabled() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 /// Parse CORS allowed origins from configuration
@@ -667,6 +679,7 @@ mod tests {
     use axum::body::Body;
     use http::{Request, StatusCode};
     use std::net::{IpAddr, Ipv4Addr};
+    use temp_env::async_with_vars;
     use tower::ServiceExt;
 
     #[test]
@@ -712,5 +725,36 @@ mod tests {
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
         );
+    }
+
+    #[tokio::test]
+    async fn console_middleware_stack_hides_health_routes_when_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
+
+            let health_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"))
+                        .body(Body::empty())
+                        .expect("failed to build health request"),
+                )
+                .await
+                .expect("health request should complete");
+            assert_eq!(health_response.status(), StatusCode::NOT_FOUND);
+
+            let readiness_response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"))
+                        .body(Body::empty())
+                        .expect("failed to build readiness request"),
+                )
+                .await
+                .expect("readiness request should complete");
+            assert_eq!(readiness_response.status(), StatusCode::NOT_FOUND);
+        })
+        .await;
     }
 }
