@@ -260,19 +260,20 @@ impl OperationHelper {
             return self;
         };
 
+        let (status, status_code, error_msg) = match result {
+            Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
+            Err(e) => (
+                "failure".to_string(),
+                e.status_code().unwrap_or(StatusCode::BAD_REQUEST).as_u16() as i32,
+                e.message().map(|s| s.to_string()),
+            ),
+        };
+        state.api_builder = state.api_builder.clone().status(status.clone()).status_code(status_code);
+
         // Complete audit log
         if state.audit_enabled
             && let Some(builder) = state.audit_builder.take()
         {
-            let (status, status_code, error_msg) = match result {
-                Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
-                Err(e) => (
-                    "failure".to_string(),
-                    e.status_code().unwrap_or(StatusCode::BAD_REQUEST).as_u16() as i32,
-                    e.message().map(|s| s.to_string()),
-                ),
-            };
-
             let ttr = state.start_time.elapsed();
             let api_details = state
                 .api_builder
@@ -419,11 +420,7 @@ mod tests {
 
                 let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
                 let event_args = match &helper {
-                    OperationHelper::Enabled(state) => state
-                        .event_builder
-                        .clone()
-                        .expect("event builder should exist")
-                        .build(),
+                    OperationHelper::Enabled(state) => state.event_builder.clone().expect("event builder should exist").build(),
                     OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
                 };
 
