@@ -4351,7 +4351,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(rustfs_zero_copy_memory_saved_bytes_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_memory_saved_bytes{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_bytes_saved_total{job=~\"$job\"}[$__rate_interval])) or vector(0)",
+          "expr": "sum(increase(rustfs_zero_copy_memory_saved_bytes_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_bytes_saved_total{job=~\"$job\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "Memory Saved",
           "refId": "A"
         }
@@ -4429,7 +4429,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"small\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"small\"}[$__rate_interval])), 1)",
+          "expr": "(100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"small\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"small\"}[$__rate_interval])), 1)) or vector(0)",
           "legendFormat": "Hit Rate (Small)",
           "refId": "A"
         },
@@ -4438,7 +4438,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"medium\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"medium\"}[$__rate_interval])), 1)",
+          "expr": "(100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"medium\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"medium\"}[$__rate_interval])), 1)) or vector(0)",
           "legendFormat": "Hit Rate (Medium)",
           "refId": "B"
         },
@@ -4447,7 +4447,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"large\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"large\"}[$__rate_interval])), 1)",
+          "expr": "(100 * sum(rate(rustfs_bytes_pool_hits_total{job=~\"$job\",tier=\"large\"}[$__rate_interval])) / clamp_min(sum(rate(rustfs_bytes_pool_acquisitions_total{job=~\"$job\",tier=\"large\"}[$__rate_interval])), 1)) or vector(0)",
           "legendFormat": "Hit Rate (Large)",
           "refId": "C"
         }
@@ -4525,7 +4525,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"small\"}[$__rate_interval]) or max_over_time(rustfs_bytes_pool_size_bytes{job=~\"$job\",tier=\"small\"}[$__rate_interval])",
+          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"small\"}[$__rate_interval]) or vector(0)",
           "legendFormat": "Allocated (Small)",
           "refId": "A"
         },
@@ -4534,7 +4534,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"medium\"}[$__rate_interval]) or max_over_time(rustfs_bytes_pool_size_bytes{job=~\"$job\",tier=\"medium\"}[$__rate_interval])",
+          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"medium\"}[$__rate_interval]) or vector(0)",
           "legendFormat": "Allocated (Medium)",
           "refId": "B"
         },
@@ -4543,7 +4543,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"large\"}[$__rate_interval]) or max_over_time(rustfs_bytes_pool_size_bytes{job=~\"$job\",tier=\"large\"}[$__rate_interval])",
+          "expr": "max_over_time(rustfs_bytes_pool_allocated_bytes{job=~\"$job\",tier=\"large\"}[$__rate_interval]) or vector(0)",
           "legendFormat": "Allocated (Large)",
           "refId": "C"
         }
