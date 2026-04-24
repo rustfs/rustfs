@@ -470,6 +470,17 @@ fn setup_console_middleware_stack(
         app = app
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
+    } else {
+        // Keep disabled health probes from falling through to the SPA fallback.
+        app = app
+            .route(
+                &format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+                get(health_route_disabled).head(health_route_disabled),
+            )
+            .route(
+                &format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+                get(health_route_disabled).head(health_route_disabled),
+            );
     }
 
     // Add comprehensive middleware layers using tower-http features
@@ -590,6 +601,10 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     }
 }
 
+async fn health_route_disabled() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
 /// Parse CORS allowed origins from configuration
 ///
 /// # Arguments:
@@ -664,6 +679,7 @@ mod tests {
     use axum::body::Body;
     use http::{Request, StatusCode};
     use std::net::{IpAddr, Ipv4Addr};
+    use temp_env::async_with_vars;
     use tower::ServiceExt;
 
     #[test]
@@ -709,5 +725,36 @@ mod tests {
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
         );
+    }
+
+    #[tokio::test]
+    async fn console_middleware_stack_hides_health_routes_when_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
+
+            let health_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"))
+                        .body(Body::empty())
+                        .expect("failed to build health request"),
+                )
+                .await
+                .expect("health request should complete");
+            assert_eq!(health_response.status(), StatusCode::NOT_FOUND);
+
+            let readiness_response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"))
+                        .body(Body::empty())
+                        .expect("failed to build readiness request"),
+                )
+                .await
+                .expect("readiness request should complete");
+            assert_eq!(readiness_response.status(), StatusCode::NOT_FOUND);
+        })
+        .await;
     }
 }
