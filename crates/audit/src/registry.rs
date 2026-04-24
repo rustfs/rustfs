@@ -200,8 +200,8 @@ impl AuditRegistry {
             }
         }
 
-        if !errors.is_empty() {
-            return Err(AuditError::Target(errors.into_iter().next().unwrap()));
+        if let Some(error) = errors.into_iter().next() {
+            return Err(AuditError::Target(error));
         }
 
         Ok(())

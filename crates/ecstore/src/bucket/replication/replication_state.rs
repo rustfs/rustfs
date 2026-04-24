@@ -12,17 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::replication::get_global_replication_pool;
 use crate::error::Error;
 use crate::global::get_global_bucket_monitor;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
+
+const ROLLING_WINDOW: Duration = Duration::from_secs(60);
+const FAILURE_LAST_HOUR_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// Exponential Moving Average with thread-safe interior mutability
 #[derive(Debug)]
@@ -328,6 +332,13 @@ pub struct InQueueStats {
     pub now_count: AtomicI64,
 }
 
+#[derive(Debug, Clone)]
+struct QueueSample {
+    observed_at: Instant,
+    bytes: i64,
+    count: i64,
+}
+
 impl Clone for InQueueStats {
     fn clone(&self) -> Self {
         Self {
@@ -359,9 +370,60 @@ pub struct InQueueMetric {
     pub curr: InQueueStats,
     pub avg: InQueueStats,
     pub max: InQueueStats,
+    pub last_minute: InQueueStats,
+    #[serde(skip)]
+    samples: VecDeque<QueueSample>,
 }
 
 impl InQueueMetric {
+    fn observe(&mut self, observed_at: Instant) {
+        let bytes = self.curr.now_bytes.load(Ordering::Relaxed);
+        let count = self.curr.now_count.load(Ordering::Relaxed);
+
+        self.curr.bytes = bytes;
+        self.curr.count = count;
+        self.samples.push_back(QueueSample {
+            observed_at,
+            bytes,
+            count,
+        });
+
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| observed_at.duration_since(sample.observed_at) > ROLLING_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+
+        if self.samples.is_empty() {
+            self.avg = InQueueStats::default();
+            self.max = InQueueStats::default();
+            self.last_minute = InQueueStats::default();
+            return;
+        }
+
+        let sample_count = self.samples.len() as i64;
+        let total_bytes = self.samples.iter().map(|sample| sample.bytes).sum::<i64>();
+        let total_count = self.samples.iter().map(|sample| sample.count).sum::<i64>();
+        let max_bytes = self.samples.iter().map(|sample| sample.bytes).max().unwrap_or(0);
+        let max_count = self.samples.iter().map(|sample| sample.count).max().unwrap_or(0);
+
+        self.avg.bytes = total_bytes / sample_count;
+        self.avg.count = total_count / sample_count;
+        self.max.bytes = max_bytes;
+        self.max.count = max_count;
+        self.last_minute.bytes = self.avg.bytes;
+        self.last_minute.count = self.avg.count;
+    }
+
+    fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.curr.bytes = snapshot.curr.now_bytes.load(Ordering::Relaxed);
+        snapshot.curr.count = snapshot.curr.now_count.load(Ordering::Relaxed);
+        snapshot
+    }
+
     pub fn merge(&self, other: &InQueueMetric) -> Self {
         Self {
             curr: InQueueStats {
@@ -384,6 +446,12 @@ impl InQueueMetric {
                 count: self.max.count.max(other.max.count),
                 ..Default::default()
             },
+            last_minute: InQueueStats {
+                bytes: self.last_minute.bytes + other.last_minute.bytes,
+                count: self.last_minute.count + other.last_minute.count,
+                ..Default::default()
+            },
+            samples: VecDeque::new(),
         }
     }
 }
@@ -391,8 +459,8 @@ impl InQueueMetric {
 /// Queue cache
 #[derive(Debug, Default)]
 pub struct QueueCache {
-    pub bucket_stats: HashMap<String, InQueueStats>,
-    pub sr_queue_stats: InQueueStats,
+    pub bucket_stats: HashMap<String, InQueueMetric>,
+    pub sr_queue_stats: InQueueMetric,
 }
 
 impl QueueCache {
@@ -401,36 +469,19 @@ impl QueueCache {
     }
 
     pub fn update(&mut self) {
-        // Update queue statistics cache
-        // In actual implementation, this would get latest statistics from queue system
+        let observed_at = Instant::now();
+        self.sr_queue_stats.observe(observed_at);
+        for stats in self.bucket_stats.values_mut() {
+            stats.observe(observed_at);
+        }
     }
 
     pub fn get_bucket_stats(&self, bucket: &str) -> InQueueMetric {
-        if let Some(bucket_stat) = self.bucket_stats.get(bucket) {
-            InQueueMetric {
-                curr: InQueueStats {
-                    bytes: bucket_stat.now_bytes.load(Ordering::Relaxed),
-                    count: bucket_stat.now_count.load(Ordering::Relaxed),
-                    ..Default::default()
-                },
-                avg: InQueueStats::default(), // simplified implementation
-                max: InQueueStats::default(), // simplified implementation
-            }
-        } else {
-            InQueueMetric::default()
-        }
+        self.bucket_stats.get(bucket).map(InQueueMetric::snapshot).unwrap_or_default()
     }
 
     pub fn get_site_stats(&self) -> InQueueMetric {
-        InQueueMetric {
-            curr: InQueueStats {
-                bytes: self.sr_queue_stats.now_bytes.load(Ordering::Relaxed),
-                count: self.sr_queue_stats.now_count.load(Ordering::Relaxed),
-                ..Default::default()
-            },
-            avg: InQueueStats::default(), // simplified implementation
-            max: InQueueStats::default(), // simplified implementation
-        }
+        self.sr_queue_stats.snapshot()
     }
 }
 
@@ -505,11 +556,19 @@ impl ProxyStatsCache {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FailureSample {
+    observed_at: Instant,
+    size: i64,
+}
+
 /// Failure statistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailStats {
     pub count: i64,
     pub size: i64,
+    #[serde(skip)]
+    recent: VecDeque<FailureSample>,
 }
 
 impl FailStats {
@@ -518,14 +577,42 @@ impl FailStats {
     }
 
     pub fn add_size(&mut self, size: i64, _err: Option<&Error>) {
+        let observed_at = Instant::now();
         self.count += 1;
         self.size += size;
+        self.recent.push_back(FailureSample { observed_at, size });
+        self.prune(observed_at);
+    }
+
+    fn prune(&mut self, observed_at: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|sample| observed_at.duration_since(sample.observed_at) > FAILURE_LAST_HOUR_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+    }
+
+    pub fn recent_since(&self, window: Duration) -> FailedMetric {
+        let now = Instant::now();
+        let mut count = 0i64;
+        let mut size = 0i64;
+        for sample in self.recent.iter().rev() {
+            if now.duration_since(sample.observed_at) > window {
+                break;
+            }
+            count += 1;
+            size += sample.size;
+        }
+        FailedMetric { count, size }
     }
 
     pub fn merge(&self, other: &FailStats) -> Self {
         Self {
             count: self.count + other.count,
             size: self.size + other.size,
+            recent: VecDeque::new(),
         }
     }
 
@@ -674,6 +761,14 @@ pub struct ActiveWorkerStat {
     pub curr: i32,
     pub max: i32,
     pub avg: f64,
+    #[serde(skip)]
+    samples: VecDeque<WorkerSample>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerSample {
+    observed_at: Instant,
+    workers: i32,
 }
 
 impl ActiveWorkerStat {
@@ -685,9 +780,31 @@ impl ActiveWorkerStat {
         self.clone()
     }
 
-    pub fn update(&mut self) {
-        // Simulate worker statistics update logic
-        // In actual implementation, this would get current active count from worker pool
+    pub fn update(&mut self, curr: i32) {
+        let observed_at = Instant::now();
+        self.curr = curr;
+        self.samples.push_back(WorkerSample {
+            observed_at,
+            workers: curr,
+        });
+
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| observed_at.duration_since(sample.observed_at) > ROLLING_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+
+        if self.samples.is_empty() {
+            self.max = curr;
+            self.avg = curr as f64;
+            return;
+        }
+
+        self.max = self.samples.iter().map(|sample| sample.workers).max().unwrap_or(curr);
+        let total = self.samples.iter().map(|sample| sample.workers as i64).sum::<i64>();
+        self.avg = total as f64 / self.samples.len() as f64;
     }
 }
 
@@ -740,8 +857,11 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
+                let current = get_global_replication_pool()
+                    .map(|pool| pool.active_workers() + pool.active_lrg_workers() + pool.active_mrf_workers())
+                    .unwrap_or(0);
                 let mut workers = workers_clone.lock().await;
-                workers.update();
+                workers.update(current);
             }
         });
 
@@ -925,14 +1045,26 @@ impl ReplicationStats {
     /// Get replication metrics for all buckets
     pub async fn get_all(&self) -> HashMap<String, BucketReplicationStats> {
         let cache = self.cache.read().await;
-        let mut result = HashMap::new();
+        let mut result = HashMap::with_capacity(cache.len());
 
         for (bucket, stats) in cache.iter() {
-            let mut cloned_stats = stats.clone_stats();
-            // Add queue statistics
+            result.insert(bucket.clone(), stats.clone_stats());
+        }
+        drop(cache);
+
+        {
             let q_cache = self.q_cache.lock().await;
-            cloned_stats.q_stat = q_cache.get_bucket_stats(bucket);
-            result.insert(bucket.clone(), cloned_stats);
+            for (bucket, queue_stats) in &q_cache.bucket_stats {
+                let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+                bucket_stats.q_stat = queue_stats.snapshot();
+            }
+        }
+
+        {
+            let p_cache = self.p_cache.lock().await;
+            for bucket in p_cache.bucket_stats.keys() {
+                result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
+            }
         }
 
         result
@@ -1114,12 +1246,12 @@ impl ReplicationStats {
         let stats = q_cache
             .bucket_stats
             .entry(bucket.to_string())
-            .or_insert_with(InQueueStats::default);
-        stats.now_bytes.fetch_add(size, Ordering::Relaxed);
-        stats.now_count.fetch_add(1, Ordering::Relaxed);
+            .or_insert_with(InQueueMetric::default);
+        stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
+        stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
 
-        q_cache.sr_queue_stats.now_bytes.fetch_add(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.now_count.fetch_add(1, Ordering::Relaxed);
+        q_cache.sr_queue_stats.curr.now_bytes.fetch_add(size, Ordering::Relaxed);
+        q_cache.sr_queue_stats.curr.now_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrease queue statistics
@@ -1128,12 +1260,12 @@ impl ReplicationStats {
         let stats = q_cache
             .bucket_stats
             .entry(bucket.to_string())
-            .or_insert_with(InQueueStats::default);
-        stats.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        stats.now_count.fetch_sub(1, Ordering::Relaxed);
+            .or_insert_with(InQueueMetric::default);
+        stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
+        stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
 
-        q_cache.sr_queue_stats.now_bytes.fetch_sub(size, Ordering::Relaxed);
-        q_cache.sr_queue_stats.now_count.fetch_sub(1, Ordering::Relaxed);
+        q_cache.sr_queue_stats.curr.now_bytes.fetch_sub(size, Ordering::Relaxed);
+        q_cache.sr_queue_stats.curr.now_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Increase proxy metrics
@@ -1164,6 +1296,51 @@ mod tests {
         let stats = ReplicationStats::new();
         let workers = stats.active_workers();
         assert_eq!(workers.curr, 0);
+    }
+
+    #[test]
+    fn test_in_queue_metric_observe_updates_rolling_stats() {
+        let mut metric = InQueueMetric::default();
+        metric.curr.now_bytes.store(128, Ordering::Relaxed);
+        metric.curr.now_count.store(4, Ordering::Relaxed);
+        metric.observe(Instant::now());
+
+        metric.curr.now_bytes.store(256, Ordering::Relaxed);
+        metric.curr.now_count.store(6, Ordering::Relaxed);
+        metric.observe(Instant::now());
+
+        assert_eq!(metric.curr.bytes, 256);
+        assert_eq!(metric.curr.count, 6);
+        assert_eq!(metric.max.bytes, 256);
+        assert_eq!(metric.max.count, 6);
+        assert_eq!(metric.last_minute.bytes, 192);
+        assert_eq!(metric.last_minute.count, 5);
+    }
+
+    #[test]
+    fn test_fail_stats_recent_since_tracks_windows() {
+        let mut stats = FailStats::default();
+        stats.add_size(64, None);
+        stats.add_size(32, None);
+
+        let last_minute = stats.recent_since(Duration::from_secs(60));
+        let last_hour = stats.recent_since(Duration::from_secs(60 * 60));
+        assert_eq!(last_minute.count, 2);
+        assert_eq!(last_minute.size, 96);
+        assert_eq!(last_hour.count, 2);
+        assert_eq!(last_hour.size, 96);
+    }
+
+    #[test]
+    fn test_active_worker_stat_update_tracks_rolling_avg_and_max() {
+        let mut stats = ActiveWorkerStat::default();
+        stats.update(2);
+        stats.update(6);
+        stats.update(4);
+
+        assert_eq!(stats.curr, 4);
+        assert_eq!(stats.max, 6);
+        assert_eq!(stats.avg, 4.0);
     }
 
     #[tokio::test]
@@ -1216,6 +1393,15 @@ mod tests {
         let stat = &bucket_stats.stats["test-arn"];
         assert_eq!(stat.replicated_size, 1024);
         assert_eq!(stat.replicated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_includes_proxy_only_bucket() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-only-bucket", "HeadObject", false).await;
+
+        let all = stats.get_all().await;
+        assert!(all.contains_key("proxy-only-bucket"));
     }
 
     #[test]

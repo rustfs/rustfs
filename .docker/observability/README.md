@@ -13,6 +13,9 @@ The stack is composed of the following best-in-class open-source components:
 - **Jaeger** (v1.59.0): Distributed tracing system (configured as a secondary UI/storage).
 - **OpenTelemetry Collector** (v0.104.0): A vendor-agnostic implementation for receiving, processing, and exporting telemetry data.
 
+By default, this stack uses Tempo in single-binary mode and does not require Kafka/Redpanda.
+If you want the Kafka-backed HA Tempo path, use `docker-compose-example-for-rustfs.yml` together with `docker-compose-tempo-ha-override.yml`.
+
 ## Architecture
 
 1. **Telemetry Collection**: Applications send OTLP (OpenTelemetry Protocol) data (Metrics, Logs, Traces) to the **OpenTelemetry Collector**.
@@ -44,6 +47,15 @@ Run the following command to start the entire stack:
 
 ```bash
 docker compose up -d
+```
+
+### High Availability Tempo
+
+The default `docker-compose.yml` is the single-node stack.
+If you need the Kafka-backed HA Tempo configuration, start it with:
+
+```bash
+docker compose -f docker-compose-example-for-rustfs.yml -f docker-compose-tempo-ha-override.yml up -d
 ```
 
 ### Access Dashboards
