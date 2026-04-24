@@ -18,11 +18,11 @@
 //! `openidconnect` crate for standards-compliant discovery, token exchange,
 //! and ID token verification.
 
-use crate::oidc_state::{OidcAuthSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
+use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
-    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
@@ -216,7 +216,7 @@ pub struct OidcClaims {
 /// on-the-fly from metadata when needed.
 #[derive(Clone)]
 struct ProviderState {
-    metadata: CoreProviderMetadata,
+    metadata: ProviderMetadataWithLogout,
     discovered_at: Instant,
 }
 
@@ -364,7 +364,7 @@ impl OidcSys {
         state: &str,
         code: &str,
         redirect_uri: &str,
-    ) -> Result<(OidcClaims, String, OidcAuthSession), String> {
+    ) -> Result<(OidcClaims, String, OidcAuthSession, String), String> {
         // Retrieve and consume the state (single-use)
         let session = self
             .state_store
@@ -449,7 +449,63 @@ impl OidcSys {
             raw,
         };
 
-        Ok((claims, session.provider_id.clone(), session))
+        Ok((claims, session.provider_id.clone(), session, raw_jwt))
+    }
+
+    /// Store a one-time logout session keyed by an opaque token so the console can
+    /// trigger browser logout without persisting the raw ID token.
+    pub async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String, String> {
+        if !self.configs.contains_key(provider_id) {
+            return Err(format!("unknown OIDC provider: {provider_id}"));
+        }
+
+        let token = CsrfToken::new_random().secret().clone();
+        self.state_store
+            .insert_logout(
+                token.clone(),
+                OidcLogoutSession {
+                    provider_id: provider_id.to_string(),
+                    id_token: id_token.to_string(),
+                },
+            )
+            .await;
+
+        Ok(token)
+    }
+
+    /// Build the RP-initiated logout URL for a previously issued logout token.
+    /// Returns `Ok(None)` when the provider does not advertise an end-session endpoint.
+    pub async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>, String> {
+        let session = self
+            .state_store
+            .take_logout(logout_token)
+            .await
+            .ok_or_else(|| "invalid or expired OIDC logout token".to_string())?;
+
+        let config = self
+            .configs
+            .get(&session.provider_id)
+            .ok_or_else(|| format!("unknown OIDC provider: {}", session.provider_id))?;
+        let state = self.ensure_provider_state(&session.provider_id, config).await?;
+        let Some(end_session_endpoint) = state.metadata.additional_metadata().end_session_endpoint.clone() else {
+            return Ok(None);
+        };
+
+        let id_token: CoreIdToken = session
+            .id_token
+            .parse()
+            .map_err(|e: serde_json::Error| format!("failed to parse ID token for logout: {e}"))?;
+        let post_logout_redirect_uri = PostLogoutRedirectUrl::new(post_logout_redirect_uri.to_string())
+            .map_err(|e| format!("invalid post logout redirect URI: {e}"))?;
+
+        let logout_url = LogoutRequest::from(end_session_endpoint)
+            .set_id_token_hint(&id_token)
+            .set_client_id(ClientId::new(config.client_id.clone()))
+            .set_post_logout_redirect_uri(post_logout_redirect_uri)
+            .http_get_url()
+            .to_string();
+
+        Ok(Some(logout_url))
     }
 
     /// Map OIDC claims to rustfs policy names.
@@ -930,7 +986,7 @@ impl OidcSys {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
             for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
-                match CoreProviderMetadata::discover_async(issuer_url.clone(), http_client)
+                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client)
                     .await
                     .map_err(|e| format!("discovery failed: {e}"))
                 {

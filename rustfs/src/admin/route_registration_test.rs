@@ -159,6 +159,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/oidc/validate"));
     assert_route(&router, Method::GET, &admin_path("/v3/oidc/authorize/default"));
     assert_route(&router, Method::GET, &admin_path("/v3/oidc/callback/default"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/logout"));
 
     assert!(
         !router.contains_route(Method::GET, "/rustfs/rpc/read_file_stream"),
@@ -200,6 +201,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/logout")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
         (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
         (Method::PUT, compat_admin_alias_path("/v3/site-replication/add")),
