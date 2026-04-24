@@ -13,6 +13,9 @@
 - **Jaeger** (v1.59.0): 分布式追踪系统（配置为辅助 UI/存储）。
 - **OpenTelemetry Collector** (v0.104.0): 接收、处理和导出遥测数据的供应商无关实现。
 
+默认情况下，这套技术栈使用 Tempo 单二进制模式，不依赖 Kafka/Redpanda。
+如果需要基于 Kafka 的 HA Tempo 路径，请使用 `docker-compose-example-for-rustfs.yml` 配合 `docker-compose-tempo-ha-override.yml`。
+
 ## 架构
 
 1.  **遥测收集**: 应用程序将 OTLP (OpenTelemetry Protocol) 数据（指标、日志、追踪）发送到 **OpenTelemetry Collector**。
@@ -44,6 +47,15 @@
 
 ```bash
 docker compose up -d
+```
+
+### Tempo 高可用模式
+
+默认的 `docker-compose.yml` 对应单机栈。
+如果需要基于 Kafka 的 HA Tempo 配置，请使用：
+
+```bash
+docker compose -f docker-compose-example-for-rustfs.yml -f docker-compose-tempo-ha-override.yml up -d
 ```
 
 ### 访问仪表盘
