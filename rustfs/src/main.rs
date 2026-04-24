@@ -457,6 +457,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // Initialize event notifier
     init_event_notifier().await;
+
     // Start the audit system
     match start_audit_system().await {
         Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),

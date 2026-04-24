@@ -14,10 +14,23 @@
 
 use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
+
+static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+pub fn refresh_audit_module_enabled() -> bool {
+    let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_AUDIT_ENABLE, rustfs_config::DEFAULT_AUDIT_ENABLE);
+    AUDIT_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+pub fn is_audit_module_enabled() -> bool {
+    AUDIT_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
 fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
@@ -43,6 +56,15 @@ fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
 /// If not configured, it skips the initialization.
 /// It also handles cases where the audit system is already running or if the global configuration is not loaded.
 pub async fn start_audit_system() -> AuditResult<()> {
+    let enabled = refresh_audit_module_enabled();
+    if !enabled {
+        info!(
+            target: "rustfs::main::start_audit_system",
+            "Audit module is disabled by RUSTFS_AUDIT_ENABLE=false, audit system initialization is skipped."
+        );
+        return Ok(());
+    }
+
     info!(
         target: "rustfs::main::start_audit_system",
         "Initializing the audit system..."

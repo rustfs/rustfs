@@ -16,11 +16,24 @@ use crate::app::context::resolve_server_config;
 use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
 use rustfs_s3_common::EventName;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::spawn;
 use tracing::{error, info, instrument, warn};
 
+static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
+
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+pub fn refresh_notify_module_enabled() -> bool {
+    let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_NOTIFY_ENABLE, rustfs_config::DEFAULT_NOTIFY_ENABLE);
+    NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+pub fn is_notify_module_enabled() -> bool {
+    NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
@@ -85,6 +98,15 @@ pub async fn shutdown_event_notifier() {
 
 #[instrument]
 pub async fn init_event_notifier() {
+    let enabled = refresh_notify_module_enabled();
+    if !enabled {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Notify module is disabled by RUSTFS_NOTIFY_ENABLE=false, event notifier initialization is skipped."
+        );
+        return;
+    }
+
     info!(
         target: "rustfs::main::init_event_notifier",
         "Initializing event notifier..."
