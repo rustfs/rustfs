@@ -34,6 +34,8 @@ use std::error::Error;
 use time::Duration as TimeDuration;
 use tokio::time::{Duration, sleep};
 
+type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
     #[serde(rename = "Targets", default)]
@@ -1925,8 +1927,7 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
 
 #[tokio::test]
 #[serial]
-async fn test_site_replication_replicates_object_with_bucket_versioning_real_dual_node()
--> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_site_replication_replicates_object_with_bucket_versioning_real_dual_node() -> TestResult {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
@@ -2260,8 +2261,7 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
 
 #[tokio::test]
 #[serial]
-async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node()
--> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node() -> TestResult {
     init_logging();
 
     if !awscurl_available() {

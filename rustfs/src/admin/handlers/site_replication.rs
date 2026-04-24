@@ -2160,7 +2160,14 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             if let Some(create) = change.create {
                 let session_policy = create.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok());
                 match iam_sys.get_service_account(&create.access_key).await {
-                    Ok(_) => {
+                    Ok((existing, _)) => {
+                        if existing.parent_user != create.parent {
+                            return Err(s3_error!(
+                                InvalidRequest,
+                                "service account {} already exists with a different parent user",
+                                create.access_key
+                            ));
+                        }
                         iam_sys
                             .update_service_account(
                                 &create.access_key,
