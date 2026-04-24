@@ -16,7 +16,7 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::bucket_replication::{
-    BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD,
+    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_LAST_HR_FAILED_BYTES_MD,
     BUCKET_REPL_LAST_HR_FAILED_COUNT_MD, BUCKET_REPL_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_LAST_MIN_FAILED_COUNT_MD,
     BUCKET_REPL_LATENCY_MS_MD, BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD,
@@ -24,7 +24,7 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD,
-    BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD,
+    BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
@@ -80,14 +80,14 @@ pub fn collect_bucket_replication_bandwidth_metrics(stats: &[BucketReplicationBa
 
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_LIMIT_MD, stat.limit_bytes_per_sec as f64)
-                .with_label("bucket", bucket_label.clone())
-                .with_label("target_arn", target_arn_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
         );
 
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_CURRENT_MD, stat.current_bandwidth_bytes_per_sec)
-                .with_label("bucket", bucket_label)
-                .with_label("target_arn", target_arn_label),
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(TARGET_ARN_L, target_arn_label),
         );
     }
 
@@ -105,122 +105,112 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
 
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_TOTAL_FAILED_BYTES_MD, stat.total_failed_bytes as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_TOTAL_FAILED_COUNT_MD, stat.total_failed_count as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_LAST_MIN_FAILED_BYTES_MD, stat.last_min_failed_bytes as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_LAST_MIN_FAILED_COUNT_MD, stat.last_min_failed_count as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_LAST_HR_FAILED_BYTES_MD, stat.last_hour_failed_bytes as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_LAST_HR_FAILED_COUNT_MD, stat.last_hour_failed_count as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_SENT_BYTES_MD, stat.sent_bytes as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_SENT_COUNT_MD, stat.sent_count as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD, stat.proxied_get_requests_total as f64)
-                .with_label("bucket", bucket_label.clone()),
+                .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD,
                 stat.proxied_get_requests_failures as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD,
                 stat.proxied_head_requests_total as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
                 stat.proxied_head_requests_failures as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD,
                 stat.proxied_put_tagging_requests_total as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
                 stat.proxied_put_tagging_requests_failures as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD,
                 stat.proxied_get_tagging_requests_total as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_FAILURES_MD,
                 stat.proxied_get_tagging_requests_failures as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD,
                 stat.proxied_delete_tagging_requests_total as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
         metrics.push(
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD,
                 stat.proxied_delete_tagging_requests_failures as f64,
             )
-            .with_label("bucket", bucket_label.clone()),
+            .with_label(BUCKET_L, bucket_label.clone()),
         );
 
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
             metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_LIMIT_MD, target.bandwidth_limit_bytes_per_sec as f64)
-                    .with_label("bucket", bucket_label.clone())
-                    .with_label("target_arn", target_label.clone()),
-            );
-            metrics.push(
-                PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_CURRENT_MD, target.current_bandwidth_bytes_per_sec)
-                    .with_label("bucket", bucket_label.clone())
-                    .with_label("target_arn", target_label.clone()),
-            );
-            metrics.push(
                 PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, target.latency_ms)
-                    .with_label("bucket", bucket_label.clone())
-                    .with_label("operation", Cow::Borrowed("object_replication"))
-                    .with_label("range", Cow::Borrowed("all"))
-                    .with_label("target_arn", target_label),
+                    .with_label(BUCKET_L, bucket_label.clone())
+                    .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
+                    .with_label(RANGE_L, Cow::Borrowed("all"))
+                    .with_label(TARGET_ARN_L, target_label),
             );
         }
     }
@@ -263,13 +253,13 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 21);
+        assert_eq!(metrics.len(), 19);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
             metric.name == sent_name
                 && metric.value == 8.0
-                && metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "b1")
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
 
         let latency_name = BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name();
@@ -279,7 +269,7 @@ mod tests {
                 && metric
                     .labels
                     .iter()
-                    .any(|(key, value)| *key == "target_arn" && value == "arn:rustfs:replication:us-east-1:1:target")
+                    .any(|(key, value)| *key == TARGET_ARN_L && value == "arn:rustfs:replication:us-east-1:1:target")
         }));
     }
 
@@ -306,7 +296,7 @@ mod tests {
         let limit_metric = metrics.iter().find(|metric| {
             metric.name == limit_metric_name
                 && metric.value == 1_048_576.0
-                && metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "b1")
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         });
         assert!(limit_metric.is_some());
         assert!(
@@ -315,7 +305,7 @@ mod tests {
                     metric
                         .labels
                         .iter()
-                        .find(|(key, _)| *key == "target_arn")
+                        .find(|(key, _)| *key == TARGET_ARN_L)
                         .map(|(_, value)| value.as_ref() == "arn:rustfs:replication:us-east-1:1:test-2")
                 })
                 .unwrap_or(false)
@@ -325,7 +315,7 @@ mod tests {
         let current_metric = metrics.iter().find(|metric| {
             metric.name == current_metric_name
                 && metric.value == 204_800.0
-                && metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "b1")
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         });
         assert!(current_metric.is_some());
     }

@@ -405,7 +405,7 @@ pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
 pub fn collect_system_cpu_and_memory_stats_with(system: &mut System) -> (CpuStats, MemoryStats) {
     system.refresh_cpu_all();
     system.refresh_memory();
-    (build_system_cpu_stats(&system), build_system_memory_stats(&system))
+    (build_system_cpu_stats(system), build_system_memory_stats(system))
 }
 
 /// Collect system CPU statistics from the current host.

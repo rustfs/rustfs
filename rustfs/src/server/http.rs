@@ -759,7 +759,7 @@ fn process_connection(
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         // Always track aggregate body bytes (lightweight counter, no debug logging)
                         counter!(METRIC_REQUEST_BODY_BYTES_TOTAL, "direction" => "response").increment(chunk.len() as u64);
-                        histogram!(METRIC_REQUEST_BODY_LEN).record(chunk.len() as f64);
+                        histogram!(METRIC_REQUEST_BODY_LEN, "direction" => "response").record(chunk.len() as f64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
