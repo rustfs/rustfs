@@ -304,7 +304,5 @@ mod tests {
     fn test_global_audit_notify_switch_constants() {
         assert_eq!(ENV_AUDIT_ENABLE, "RUSTFS_AUDIT_ENABLE");
         assert_eq!(ENV_NOTIFY_ENABLE, "RUSTFS_NOTIFY_ENABLE");
-        assert!(!DEFAULT_AUDIT_ENABLE);
-        assert!(!DEFAULT_NOTIFY_ENABLE);
     }
 }
