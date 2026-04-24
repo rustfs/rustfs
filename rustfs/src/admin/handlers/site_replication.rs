@@ -34,8 +34,8 @@ use rustfs_ecstore::bucket::metadata::{
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::bucket::replication::{ReplicationConfigurationExt, ResyncOpts, get_global_replication_pool};
-use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType};
-use rustfs_ecstore::bucket::utils::serialize;
+use rustfs_ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use rustfs_ecstore::bucket::utils::{deserialize, serialize};
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
 use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::error::Error as StorageError;
@@ -59,7 +59,11 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+use s3s::dto::{
+    BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
+    Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule,
+    ReplicationRuleStatus, VersioningConfiguration,
+};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
@@ -695,6 +699,12 @@ fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> O
         .cloned()
 }
 
+fn peer_deployment_id_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<String> {
+    existing_peer_for_endpoint(state, endpoint)
+        .map(|peer| peer.deployment_id)
+        .filter(|deployment_id| !deployment_id.is_empty())
+}
+
 fn normalize_peer_info(mut peer: PeerInfo) -> PeerInfo {
     if peer.deployment_id.is_empty() {
         peer.deployment_id = deployment_id_for_endpoint(&peer.endpoint);
@@ -938,9 +948,12 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
-    let Some((_, _)) = runtime_site_replication_targets().await? else {
+    let Some((state, local_peer)) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
+
+    ensure_site_replication_bucket_targets(bucket, &state, &local_peer, None).await?;
+    ensure_site_replication_bucket_replication_config(bucket, &state, &local_peer).await?;
 
     let created_at = new_object_layer_fn()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
@@ -1533,6 +1546,244 @@ fn bucket_target_matches_peer(target: &BucketTarget, peer: &PeerInfo) -> bool {
         || bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint)
 }
 
+fn site_replication_target_arns_by_peer(config: Option<&s3s::dto::ReplicationConfiguration>) -> HashMap<String, String> {
+    let mut arns_by_peer = HashMap::new();
+    let Some(config) = config else {
+        return arns_by_peer;
+    };
+
+    let mut configured_arns = Vec::new();
+    if !config.role.trim().is_empty() {
+        configured_arns.push(config.role.clone());
+    }
+    for rule in &config.rules {
+        let arn = rule.destination.bucket.trim();
+        if !arn.is_empty() {
+            configured_arns.push(arn.to_string());
+        }
+    }
+
+    for arn in configured_arns {
+        if let Ok(parsed) = arn.parse::<ARN>()
+            && parsed.arn_type == BucketTargetType::ReplicationService
+            && !parsed.id.is_empty()
+        {
+            arns_by_peer.entry(parsed.id).or_insert(arn);
+        }
+    }
+
+    arns_by_peer
+}
+
+fn site_replication_bucket_target_for_peer(
+    bucket: &str,
+    state: &SiteReplicationState,
+    peer: &PeerInfo,
+    arn_override: Option<String>,
+) -> Option<BucketTarget> {
+    if state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+        return None;
+    }
+
+    let parsed = Url::parse(&peer.endpoint)
+        .ok()
+        .or_else(|| Url::parse(&format!("http://{}", peer.endpoint.trim())).ok())?;
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default()?;
+    let arn = arn_override.unwrap_or_else(|| {
+        ARN::new(
+            BucketTargetType::ReplicationService,
+            peer.deployment_id.clone(),
+            String::new(),
+            bucket.to_string(),
+        )
+        .to_string()
+    });
+
+    Some(BucketTarget {
+        source_bucket: bucket.to_string(),
+        endpoint: format!("{host}:{port}"),
+        credentials: Some(Credentials {
+            access_key: state.service_account_access_key.clone(),
+            secret_key: state.service_account_secret_key.clone(),
+            session_token: None,
+            expiration: None,
+        }),
+        target_bucket: bucket.to_string(),
+        secure: parsed.scheme().eq_ignore_ascii_case("https"),
+        arn,
+        target_type: BucketTargetType::ReplicationService,
+        deployment_id: peer.deployment_id.clone(),
+        ..Default::default()
+    })
+}
+
+fn reconcile_site_replication_bucket_targets(
+    existing: BucketTargets,
+    bucket: &str,
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    config: Option<&s3s::dto::ReplicationConfiguration>,
+) -> BucketTargets {
+    if !state.enabled() || state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
+        return existing;
+    }
+
+    let configured_arns = site_replication_target_arns_by_peer(config);
+    let mut targets = existing.targets;
+
+    for peer in state.peers.values() {
+        if peer.deployment_id == local_peer.deployment_id || same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+            continue;
+        }
+
+        let Some(mut target) =
+            site_replication_bucket_target_for_peer(bucket, state, peer, configured_arns.get(&peer.deployment_id).cloned())
+        else {
+            continue;
+        };
+
+        if let Some(index) = targets.iter().position(|existing| {
+            existing.target_type == BucketTargetType::ReplicationService
+                && (bucket_target_matches_peer(existing, peer) || existing.arn == target.arn)
+        }) {
+            let existing = targets[index].clone();
+            target.path = existing.path;
+            target.region = existing.region;
+            target.bandwidth_limit = existing.bandwidth_limit;
+            target.replication_sync = existing.replication_sync;
+            target.storage_class = existing.storage_class;
+            target.health_check_duration = existing.health_check_duration;
+            target.disable_proxy = existing.disable_proxy;
+            target.reset_before_date = existing.reset_before_date;
+            target.reset_id = existing.reset_id;
+            target.total_downtime = existing.total_downtime;
+            target.last_online = existing.last_online;
+            target.online = existing.online;
+            target.latency = existing.latency;
+            target.edge = existing.edge;
+            target.edge_sync_before_expiry = existing.edge_sync_before_expiry;
+            target.offline_count = existing.offline_count;
+            targets[index] = target;
+        } else {
+            targets.push(target);
+        }
+    }
+
+    BucketTargets { targets }
+}
+
+fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> ReplicationRule {
+    ReplicationRule {
+        delete_marker_replication: Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        }),
+        delete_replication: Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        }),
+        destination: Destination {
+            bucket: arn.to_string(),
+            ..Default::default()
+        },
+        existing_object_replication: Some(ExistingObjectReplication {
+            status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+        }),
+        filter: None,
+        id: Some(rule_id.to_string()),
+        prefix: None,
+        priority: Some(priority),
+        source_selection_criteria: None,
+        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+    }
+}
+
+fn build_site_replication_config(
+    bucket: &str,
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+) -> Option<ReplicationConfiguration> {
+    let mut rules = Vec::new();
+    for peer in state.peers.values() {
+        if peer.deployment_id == local_peer.deployment_id || same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+            continue;
+        }
+
+        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, None) else {
+            continue;
+        };
+        rules.push(build_site_replication_rule(
+            &target.arn,
+            (rules.len() + 1) as i32,
+            &format!("site-repl-{}", peer.deployment_id),
+        ));
+    }
+
+    if rules.is_empty() {
+        None
+    } else {
+        Some(ReplicationConfiguration {
+            role: String::new(),
+            rules,
+        })
+    }
+}
+
+async fn ensure_site_replication_bucket_targets(
+    bucket: &str,
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    config: Option<&s3s::dto::ReplicationConfiguration>,
+) -> S3Result<()> {
+    let existing = match metadata_sys::list_bucket_targets(bucket).await {
+        Ok(targets) => targets,
+        Err(StorageError::ConfigNotFound) => BucketTargets::default(),
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    let updated = reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config);
+    if updated.targets.is_empty() {
+        return Ok(());
+    }
+
+    let json_targets = serde_json::to_vec(&updated)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}")))?;
+    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        .await
+        .map_err(ApiError::from)?;
+    BucketTargetSys::get().update_all_targets(bucket, Some(&updated)).await;
+
+    Ok(())
+}
+
+async fn ensure_site_replication_bucket_replication_config(
+    bucket: &str,
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+) -> S3Result<()> {
+    match metadata_sys::get_replication_config(bucket).await {
+        Ok(_) => return Ok(()),
+        Err(StorageError::ConfigNotFound) => {}
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    let Some(config) = build_site_replication_config(bucket, state, local_peer) else {
+        return Ok(());
+    };
+
+    let data = serialize(&config)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
+    metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(())
+}
+
+pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) -> Option<String> {
+    let state = load_site_replication_state().await.ok()?;
+    peer_deployment_id_for_endpoint(&state, endpoint)
+}
+
 async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
@@ -1744,6 +1995,16 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         }
     };
 
+    let replication_config = if item.r#type == "replication-config" {
+        item.replication_config
+            .as_ref()
+            .map(|raw| deserialize::<s3s::dto::ReplicationConfiguration>(raw.as_bytes()))
+            .transpose()
+            .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?
+    } else {
+        None
+    };
+
     let data = match item.r#type.as_str() {
         "policy" => item
             .policy
@@ -1775,6 +2036,12 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         metadata_sys::delete(&item.bucket, config_file)
             .await
             .map_err(ApiError::from)?;
+    }
+
+    if item.r#type == "replication-config"
+        && let Some((state, local_peer)) = runtime_site_replication_targets().await?
+    {
+        ensure_site_replication_bucket_targets(&item.bucket, &state, &local_peer, replication_config.as_ref()).await?;
     }
     Ok(())
 }
@@ -1891,23 +2158,40 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             };
             if let Some(create) = change.create {
                 let session_policy = create.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok());
-                iam_sys
-                    .new_service_account(
-                        &create.parent,
-                        Some(create.groups),
-                        NewServiceAccountOpts {
-                            session_policy,
-                            access_key: create.access_key,
-                            secret_key: create.secret_key,
-                            name: (!create.name.is_empty()).then_some(create.name),
-                            description: (!create.description.is_empty()).then_some(create.description),
-                            expiration: create.expiration,
-                            allow_site_replicator_account: true,
-                            claims: Some(create.claims),
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
+                if iam_sys.get_service_account(&create.access_key).await.is_ok() {
+                    iam_sys
+                        .update_service_account(
+                            &create.access_key,
+                            UpdateServiceAccountOpts {
+                                session_policy,
+                                secret_key: Some(create.secret_key),
+                                name: (!create.name.is_empty()).then_some(create.name),
+                                description: (!create.description.is_empty()).then_some(create.description),
+                                expiration: create.expiration,
+                                status: (!create.status.is_empty()).then_some(create.status),
+                            },
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    iam_sys
+                        .new_service_account(
+                            &create.parent,
+                            Some(create.groups),
+                            NewServiceAccountOpts {
+                                session_policy,
+                                access_key: create.access_key,
+                                secret_key: create.secret_key,
+                                name: (!create.name.is_empty()).then_some(create.name),
+                                description: (!create.description.is_empty()).then_some(create.description),
+                                expiration: create.expiration,
+                                allow_site_replicator_account: true,
+                                claims: Some(create.claims),
+                            },
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                }
                 return Ok(());
             }
 
@@ -2267,6 +2551,14 @@ impl Operation for SRPeerBucketOpsHandler {
                     .get_bucket_info(&bucket, &BucketOptions::default())
                     .await
                     .map_err(ApiError::from)?;
+                if let Some((state, local_peer)) = runtime_site_replication_targets().await? {
+                    let replication_config = metadata_sys::get_replication_config(&bucket)
+                        .await
+                        .ok()
+                        .map(|(config, _)| config);
+                    ensure_site_replication_bucket_targets(&bucket, &state, &local_peer, replication_config.as_ref()).await?;
+                    ensure_site_replication_bucket_replication_config(&bucket, &state, &local_peer).await?;
+                }
             }
             "delete-bucket" => {
                 store
@@ -2817,6 +3109,65 @@ mod tests {
         let remote = peer("remote", "https://remote.example.com/");
 
         assert!(bucket_target_matches_peer(&target, &remote));
+    }
+
+    #[test]
+    fn test_peer_deployment_id_for_endpoint_matches_normalized_endpoint() {
+        let mut state = SiteReplicationState::default();
+        let mut remote = peer("remote", "https://remote.example.com");
+        remote.deployment_id = "remote-dep".to_string();
+        state.peers.insert(remote.deployment_id.clone(), remote);
+
+        let deployment_id = peer_deployment_id_for_endpoint(&state, "https://remote.example.com/");
+
+        assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
+    }
+
+    #[test]
+    fn test_reconcile_site_replication_bucket_targets_upserts_remote_peer_targets() {
+        let mut state = SiteReplicationState::default();
+        state.service_account_access_key = "site-replicator-0".to_string();
+        state.service_account_secret_key = "secret".to_string();
+        state.peers.insert(
+            "local".to_string(),
+            PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "http://remote.example.com:9000")
+            },
+        );
+
+        let targets = reconcile_site_replication_bucket_targets(
+            BucketTargets::default(),
+            "photos",
+            &state,
+            &PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+            None,
+        );
+
+        assert_eq!(targets.targets.len(), 1);
+        let target = &targets.targets[0];
+        assert_eq!(target.target_type, BucketTargetType::ReplicationService);
+        assert_eq!(target.endpoint, "remote.example.com:9000");
+        assert!(!target.secure);
+        assert_eq!(target.target_bucket, "photos");
+        assert_eq!(target.deployment_id, "remote");
+        assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        let credentials = target
+            .credentials
+            .as_ref()
+            .expect("site replication target should carry credentials");
+        assert_eq!(credentials.access_key, "site-replicator-0");
+        assert_eq!(credentials.secret_key, "secret");
     }
 
     #[test]

@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{
+    RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
+};
+use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
 use rustfs_madmin::{
-    PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus, ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus,
-    SRStatusInfo, SiteReplicationInfo, SyncStatus,
+    AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
+    ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
@@ -77,6 +81,65 @@ async fn signed_request(
     }
 
     Ok(request_builder.send().await?)
+}
+
+async fn signed_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if !session_token.is_empty() {
+        request = request.header("x-amz-security-token", session_token);
+    }
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_len,
+        access_key,
+        secret_key,
+        session_token,
+        "us-east-1",
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
+    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
+    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
+    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
+    Ok((access_key, secret_key, session_token))
 }
 
 async fn set_replication_target(
@@ -213,6 +276,143 @@ async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> 
     Ok(())
 }
 
+fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
+    let credentials = Credentials::new(access_key, secret_key, None, None, "e2e-site-replication");
+    let config = Config::builder()
+        .credentials_provider(credentials)
+        .region(Region::new("us-east-1"))
+        .endpoint_url(&env.url)
+        .force_path_style(true)
+        .behavior_version_latest()
+        .build();
+    Client::from_conf(config)
+}
+
+async fn admin_create_user(
+    env: &RustFSTestEnvironment,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
+    let body = serde_json::json!({
+        "secretKey": secret_key,
+        "status": "enabled"
+    });
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("create user failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn admin_add_canned_policy(
+    env: &RustFSTestEnvironment,
+    policy_name: &str,
+    policy: &serde_json::Value,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(policy.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("add canned policy failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn admin_attach_policy_to_user(
+    env: &RustFSTestEnvironment,
+    policy_name: &str,
+    username: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!(
+        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
+        env.url, policy_name, username
+    );
+    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, Some(Vec::new()), None).await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("attach policy to user failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn admin_update_group_members(
+    env: &RustFSTestEnvironment,
+    group_name: &str,
+    members: &[&str],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/update-group-members", env.url);
+    let body = serde_json::json!({
+        "group": group_name,
+        "members": members,
+        "isRemove": false,
+        "groupStatus": "enabled"
+    });
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("update group members failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn admin_attach_policy_to_group(
+    env: &RustFSTestEnvironment,
+    policy_name: &str,
+    group_name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!(
+        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=true",
+        env.url, policy_name, group_name
+    );
+    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, Some(Vec::new()), None).await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("attach policy to group failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
 async fn run_replication_check(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -257,6 +457,182 @@ async fn remove_replication_target_request(
     }
 
     signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
+async fn add_service_account(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+    req: &AddServiceAccountReq,
+) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-service-account", env.url);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        signer_access_key,
+        signer_secret_key,
+        Some(serde_json::to_vec(req)?),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("add service account failed: {status} {body}").into());
+    }
+
+    let body = response.bytes().await?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body)?;
+    let credentials = parsed
+        .get("credentials")
+        .ok_or("add service account response missing credentials")?;
+    let access_key = credentials
+        .get("accessKey")
+        .and_then(|value| value.as_str())
+        .ok_or("add service account response missing access key")?
+        .to_string();
+    let secret_key = credentials
+        .get("secretKey")
+        .and_then(|value| value.as_str())
+        .ok_or("add service account response missing secret key")?
+        .to_string();
+
+    Ok((access_key, secret_key))
+}
+
+async fn add_service_account_with_session_token(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+    session_token: &str,
+    req: &AddServiceAccountReq,
+) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-service-account", env.url);
+    let response = signed_request_with_session_token(
+        http::Method::PUT,
+        &url,
+        signer_access_key,
+        signer_secret_key,
+        session_token,
+        Some(serde_json::to_vec(req)?),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("add service account with session token failed: {status} {body}").into());
+    }
+
+    let body = response.bytes().await?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body)?;
+    let credentials = parsed
+        .get("credentials")
+        .ok_or("add service account response missing credentials")?;
+    let access_key = credentials
+        .get("accessKey")
+        .and_then(|value| value.as_str())
+        .ok_or("add service account response missing access key")?
+        .to_string();
+    let secret_key = credentials
+        .get("secretKey")
+        .and_then(|value| value.as_str())
+        .ok_or("add service account response missing secret key")?
+        .to_string();
+
+    Ok((access_key, secret_key))
+}
+
+async fn list_service_accounts(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+    user: Option<&str>,
+) -> Result<ListServiceAccountsResp, Box<dyn Error + Send + Sync>> {
+    let mut url = format!("{}/rustfs/admin/v3/list-service-accounts", env.url);
+    if let Some(user) = user {
+        url.push_str("?user=");
+        url.push_str(&urlencoding::encode(user));
+    }
+
+    let response = signed_request(http::Method::GET, &url, signer_access_key, signer_secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("list service accounts failed: {status} {body}").into());
+    }
+
+    Ok(response.json().await?)
+}
+
+async fn wait_for_service_accounts(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+    user: Option<&str>,
+    expected: &[&str],
+) -> Result<ListServiceAccountsResp, Box<dyn Error + Send + Sync>> {
+    for _ in 0..20 {
+        let resp = list_service_accounts(env, signer_access_key, signer_secret_key, user).await?;
+        let access_keys: Vec<&str> = resp.accounts.iter().map(|account| account.access_key.as_str()).collect();
+        if expected
+            .iter()
+            .all(|expected_key| access_keys.iter().any(|actual| actual == expected_key))
+        {
+            return Ok(resp);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("service accounts did not reach expected keys {expected:?} on {}", env.address).into())
+}
+
+async fn wait_for_object_on_target(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes().to_vec();
+                return Ok(body);
+            }
+            Err(err) => {
+                if err.to_string().contains("NoSuchKey") || err.to_string().contains("NotFound") {
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    Err(format!("object {bucket}/{key} was not replicated in time").into())
+}
+
+async fn wait_for_user_get_object(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let mut last_error = None;
+    for _ in 0..40 {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes().to_vec();
+                return Ok(body);
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    Err(format!(
+        "user could not read replicated object {bucket}/{key} in time; last error: {}",
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    )
+    .into())
 }
 
 async fn list_replication_targets_request(
@@ -1543,6 +1919,454 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
 
     let source_after_fresh = site_replication_info(&source_env).await?;
     assert!(source_after_fresh.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_replicates_object_with_bucket_versioning_real_dual_node()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-versioned";
+    let key = "hello.txt";
+    let payload = b"site replication should replicate after enabling versioning".to_vec();
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    let replication_response = signed_request(
+        http::Method::GET,
+        &format!("{}/{bucket}?replication", source_env.url),
+        &source_env.access_key,
+        &source_env.secret_key,
+        None,
+        None,
+    )
+    .await?;
+    let replication_status = replication_response.status();
+    let replication_body = replication_response.text().await.unwrap_or_default();
+    assert_eq!(
+        replication_status,
+        StatusCode::OK,
+        "source bucket replication config missing after site replication setup: {replication_body}"
+    );
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+
+    let replicated = wait_for_object_on_target(&target_client, bucket, key).await?;
+    assert_eq!(replicated, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_replicates_policy_backed_user_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-policy-user";
+    let key = "seed.txt";
+    let payload = b"site replication policy-backed user access".to_vec();
+    let policy_name = "site-repl-readonly";
+    let username = "site-repl-user";
+    let secret_key = "site-repl-user-secret-key-123456";
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+
+    let replicated = wait_for_object_on_target(&target_client, bucket, key).await?;
+    assert_eq!(replicated, payload);
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [format!("arn:aws:s3:::{bucket}/*")]
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")]
+            }
+        ]
+    });
+    admin_add_canned_policy(&source_env, policy_name, &policy).await?;
+    admin_create_user(&source_env, username, secret_key).await?;
+    admin_attach_policy_to_user(&source_env, policy_name, username).await?;
+
+    let target_user_client = create_user_s3_client(&target_env, username, secret_key);
+    let fetched = wait_for_user_get_object(&target_user_client, bucket, key).await?;
+    assert_eq!(fetched, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_replicates_group_policy_backed_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-policy-group";
+    let key = "seed.txt";
+    let payload = b"site replication group-policy-backed user access".to_vec();
+    let policy_name = "site-repl-group-readonly";
+    let group_name = "site-repl-group";
+    let username = "site-repl-group-user";
+    let secret_key = "site-repl-group-user-secret-key-12";
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await?;
+
+    let replicated = wait_for_object_on_target(&target_client, bucket, key).await?;
+    assert_eq!(replicated, payload);
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [format!("arn:aws:s3:::{bucket}/*")]
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")]
+            }
+        ]
+    });
+    admin_add_canned_policy(&source_env, policy_name, &policy).await?;
+    admin_create_user(&source_env, username, secret_key).await?;
+    admin_update_group_members(&source_env, group_name, &[username]).await?;
+    admin_attach_policy_to_group(&source_env, policy_name, group_name).await?;
+
+    let target_user_client = create_user_s3_client(&target_env, username, secret_key);
+    let fetched = wait_for_user_get_object(&target_user_client, bucket, key).await?;
+    assert_eq!(fetched, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_replicates_multiple_service_accounts_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    let first_req = AddServiceAccountReq {
+        policy: None,
+        target_user: None,
+        access_key: "svc-alpha".to_string(),
+        secret_key: "svc-alpha-secret-key-1234567890abcdef".to_string(),
+        name: Some("svc-alpha".to_string()),
+        description: Some("first replicated service account".to_string()),
+        expiration: None,
+        comment: None,
+    };
+    let first = add_service_account(&source_env, &source_env.access_key, &source_env.secret_key, &first_req).await?;
+
+    let target_after_first = wait_for_service_accounts(
+        &target_env,
+        &target_env.access_key,
+        &target_env.secret_key,
+        Some(&source_env.access_key),
+        &["svc-alpha"],
+    )
+    .await?;
+    assert!(
+        target_after_first
+            .accounts
+            .iter()
+            .any(|account| account.access_key == "svc-alpha"),
+        "target accounts missing svc-alpha: {:?}",
+        target_after_first.accounts
+    );
+
+    let second_req = AddServiceAccountReq {
+        policy: None,
+        target_user: None,
+        access_key: "svc-beta".to_string(),
+        secret_key: "svc-beta-secret-key-1234567890abcdef1".to_string(),
+        name: Some("svc-beta".to_string()),
+        description: Some("second replicated service account".to_string()),
+        expiration: None,
+        comment: None,
+    };
+    let _second = add_service_account(&source_env, &first.0, &first.1, &second_req).await?;
+
+    let target_after_second = wait_for_service_accounts(
+        &target_env,
+        &target_env.access_key,
+        &target_env.secret_key,
+        Some(&source_env.access_key),
+        &["svc-alpha", "svc-beta"],
+    )
+    .await?;
+    assert!(
+        target_after_second
+            .accounts
+            .iter()
+            .any(|account| account.access_key == "svc-beta"),
+        "target accounts missing svc-beta: {:?}",
+        target_after_second.accounts
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    if !awscurl_available() {
+        eprintln!("Skipping STS site replication service-account test because awscurl is unavailable");
+        return Ok(());
+    }
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {:?}", add_status);
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    let assume_role_body = "Action=AssumeRole&Version=2011-06-15&DurationSeconds=3600";
+    let sts_xml = awscurl_post_sts_form_urlencoded(
+        &format!("{}/", source_env.url.trim_end_matches('/')),
+        assume_role_body,
+        &source_env.access_key,
+        &source_env.secret_key,
+    )
+    .await?;
+    let (sts_access_key, sts_secret_key, sts_session_token) = parse_assume_role_credentials(&sts_xml)?;
+
+    let first_req = AddServiceAccountReq {
+        policy: None,
+        target_user: None,
+        access_key: "svc-sts-alpha".to_string(),
+        secret_key: "svc-sts-alpha-secret-key-1234567890".to_string(),
+        name: Some("svc-sts-alpha".to_string()),
+        description: Some("sts-created replicated service account".to_string()),
+        expiration: None,
+        comment: None,
+    };
+    let first =
+        add_service_account_with_session_token(&source_env, &sts_access_key, &sts_secret_key, &sts_session_token, &first_req)
+            .await?;
+
+    let target_after_first = wait_for_service_accounts(
+        &target_env,
+        &target_env.access_key,
+        &target_env.secret_key,
+        Some(&source_env.access_key),
+        &["svc-sts-alpha"],
+    )
+    .await?;
+    assert!(
+        target_after_first
+            .accounts
+            .iter()
+            .any(|account| account.access_key == "svc-sts-alpha"),
+        "target accounts missing svc-sts-alpha: {:?}",
+        target_after_first.accounts
+    );
+
+    let second_req = AddServiceAccountReq {
+        policy: None,
+        target_user: None,
+        access_key: "svc-sts-beta".to_string(),
+        secret_key: "svc-sts-beta-secret-key-1234567890a".to_string(),
+        name: Some("svc-sts-beta".to_string()),
+        description: Some("second replicated service account from sts-created ak".to_string()),
+        expiration: None,
+        comment: None,
+    };
+    let _second = add_service_account(&source_env, &first.0, &first.1, &second_req).await?;
+
+    let target_after_second = wait_for_service_accounts(
+        &target_env,
+        &target_env.access_key,
+        &target_env.secret_key,
+        Some(&source_env.access_key),
+        &["svc-sts-alpha", "svc-sts-beta"],
+    )
+    .await?;
+    assert!(
+        target_after_second
+            .accounts
+            .iter()
+            .any(|account| account.access_key == "svc-sts-beta"),
+        "target accounts missing svc-sts-beta: {:?}",
+        target_after_second.accounts
+    );
 
     Ok(())
 }
