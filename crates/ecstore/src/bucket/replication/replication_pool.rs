@@ -976,15 +976,15 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 #[async_trait::async_trait]
 impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
     fn active_workers(&self) -> i32 {
-        self.active_workers()
+        ReplicationPool::<S>::active_workers(self)
     }
 
     fn active_mrf_workers(&self) -> i32 {
-        self.active_mrf_workers()
+        ReplicationPool::<S>::active_mrf_workers(self)
     }
 
     fn active_lrg_workers(&self) -> i32 {
-        self.active_lrg_workers()
+        ReplicationPool::<S>::active_lrg_workers(self)
     }
 
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {

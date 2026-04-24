@@ -73,6 +73,22 @@ const METRIC_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_request_body_bytes_total";
 const METRIC_REQUEST_LATENCY_MS: &str = "rustfs_request_latency_ms";
 const METRIC_REQUEST_BODY_LEN: &str = "rustfs_request_body_len";
 
+#[inline]
+fn request_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
@@ -722,8 +738,11 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [(LABEL_REQUEST_METHOD, request.method().as_str().to_owned())];
-                        counter!(METRIC_API_REQUESTS_TOTAL, &labels).increment(1);
+                        counter!(
+                            METRIC_API_REQUESTS_TOTAL,
+                            LABEL_REQUEST_METHOD => request_method_label(request.method())
+                        )
+                        .increment(1);
                         // Aggregate request body size for throughput monitoring (lightweight)
                         if let Some(cl) = request.headers().get("content-length")
                             && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())

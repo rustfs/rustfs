@@ -320,5 +320,20 @@ mod tests {
                 })
                 .unwrap_or(false)
         );
+
+        let current_metric_name = BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name();
+        let current_metric = metrics.iter().find(|metric| {
+            metric.name == current_metric_name
+                && metric.value == 204_800.0
+                && metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "b1")
+        });
+        assert!(current_metric.is_some());
+    }
+
+    #[test]
+    fn test_collect_bucket_replication_bandwidth_metrics_empty() {
+        let stats: Vec<BucketReplicationBandwidthStats> = Vec::new();
+        let metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+        assert!(metrics.is_empty());
     }
 }

@@ -64,15 +64,15 @@ use crate::metrics::config::{
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
-    collect_bucket_stats, collect_cluster_health_stats, collect_cluster_stats, collect_disk_stats, collect_host_network_stats,
-    collect_process_metric_bundle, collect_replication_stats, collect_system_cpu_stats, collect_system_drive_stats,
-    collect_system_memory_stats,
+    collect_bucket_stats, collect_cluster_and_health_stats, collect_disk_and_system_drive_stats, collect_host_network_stats,
+    collect_process_metric_bundle, collect_replication_stats, collect_system_cpu_and_memory_stats_with,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
 use std::time::Duration;
+use sysinfo::System;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -163,9 +163,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_cluster_stats().await;
+                    let (stats, cluster_health) = collect_cluster_and_health_stats().await;
                     let mut metrics = collect_cluster_metrics(&stats);
-                    let cluster_health = collect_cluster_health_stats().await;
                     metrics.extend(collect_cluster_health_metrics(&cluster_health));
                     report_metrics(&metrics);
                 }
@@ -203,8 +202,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_disk_stats().await;
-                    let metrics = collect_node_metrics(&stats);
+                    let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
+                    let mut metrics = collect_node_metrics(&disk_stats);
+                    metrics.extend(collect_drive_detailed_metrics(&drive_stats));
+                    metrics.extend(collect_drive_count_metrics(&drive_counts));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
@@ -312,6 +313,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token;
     tokio::spawn(async move {
         let labels = current_process_metric_labels();
+        let mut host_system = System::new_all();
         let process_interval = resource_interval.min(system_interval);
         let mut interval = tokio::time::interval(process_interval);
         let now = Instant::now();
@@ -342,9 +344,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                     if now >= next_system_run {
                         #[cfg(feature = "gpu")]
-                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels);
+                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
                         #[cfg(not(feature = "gpu"))]
-                        let metrics = collect_system_monitoring_metrics(&bundle, &labels);
+                        let metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
 
                         #[cfg(feature = "gpu")]
                         if let Some(pid) = current_pid {
@@ -366,11 +368,6 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         }
 
                         report_metrics(&metrics);
-
-                        let (drive_stats, drive_counts) = collect_system_drive_stats().await;
-                        let mut drive_metrics = collect_drive_detailed_metrics(&drive_stats);
-                        drive_metrics.extend(collect_drive_count_metrics(&drive_counts));
-                        report_metrics(&drive_metrics);
                         advance_deadline(&mut next_system_run, system_interval, now);
                     }
                 }
@@ -438,6 +435,7 @@ fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static s
 fn collect_system_monitoring_metrics(
     bundle: &ProcessMetricBundle,
     labels: &[(&'static str, Cow<'static, str>)],
+    host_system: &mut System,
 ) -> Vec<PrometheusMetric> {
     let cpu_stats = ProcessCpuStats {
         usage: bundle.resource.cpu_percent,
@@ -452,8 +450,7 @@ fn collect_system_monitoring_metrics(
         written_bytes: bundle.disk_write_bytes,
     };
     let network_stats = collect_host_network_stats();
-    let system_cpu_stats = collect_system_cpu_stats();
-    let system_memory_stats = collect_system_memory_stats();
+    let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(host_system);
 
     let mut metrics = Vec::new();
     metrics.extend(collect_cpu_metrics(&system_cpu_stats));

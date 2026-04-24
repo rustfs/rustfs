@@ -64,60 +64,40 @@ pub struct ProcessMetricBundle {
     pub disk_write_bytes: u64,
 }
 
-/// Collect cluster statistics from the storage layer.
-#[instrument]
-pub async fn collect_cluster_stats() -> ClusterStats {
+/// Collect cluster and cluster-health statistics from a single storage snapshot.
+pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthStats) {
     let Some(store) = new_object_layer_fn() else {
-        return ClusterStats::default();
+        return (ClusterStats::default(), ClusterHealthStats::default());
     };
 
     let storage_info = store.storage_info().await;
-
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
     let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
     let usable_capacity = get_total_usable_capacity(&storage_info.disks, &storage_info) as u64;
     let free = get_total_usable_capacity_free(&storage_info.disks, &storage_info) as u64;
 
-    // Get bucket and object counts from data usage info
+    // Get bucket and object counts from data usage info.
     let (buckets_count, objects_count) = match load_data_usage_from_backend(store.clone()).await {
         Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
         Err(e) => {
             warn!("Failed to load data usage from backend: {}", e);
-            // Fall back to bucket list for buckets_count, objects_count stays 0
+            // Fall back to bucket list for buckets_count, objects_count stays 0.
             let buckets = store
                 .list_bucket(&BucketOptions {
                     cached: true,
                     ..Default::default()
                 })
                 .await
-                .unwrap_or_else(|e| {
-                    warn!("Failed to list buckets for cluster metrics: {}", e);
+                .unwrap_or_else(|err| {
+                    warn!("Failed to list buckets for cluster metrics: {}", err);
                     Vec::new()
                 });
             (buckets.len() as u64, 0)
         }
     };
 
-    ClusterStats {
-        raw_capacity_bytes: raw_capacity,
-        usable_capacity_bytes: usable_capacity,
-        used_bytes: used,
-        free_bytes: free,
-        objects_count,
-        buckets_count,
-    }
-}
-
-/// Collect cluster health statistics from the storage layer.
-pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
-    let Some(store) = new_object_layer_fn() else {
-        return ClusterHealthStats::default();
-    };
-
-    let storage_info = store.storage_info().await;
     let mut online = 0u64;
     let mut offline = 0u64;
-
     for disk in &storage_info.disks {
         if disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref()) {
             online += 1;
@@ -126,11 +106,34 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
         }
     }
 
-    ClusterHealthStats {
-        drives_offline_count: offline,
-        drives_online_count: online,
-        drives_count: storage_info.disks.len() as u64,
-    }
+    (
+        ClusterStats {
+            raw_capacity_bytes: raw_capacity,
+            usable_capacity_bytes: usable_capacity,
+            used_bytes: used,
+            free_bytes: free,
+            objects_count,
+            buckets_count,
+        },
+        ClusterHealthStats {
+            drives_offline_count: offline,
+            drives_online_count: online,
+            drives_count: storage_info.disks.len() as u64,
+        },
+    )
+}
+
+/// Collect cluster statistics from the storage layer.
+#[instrument]
+pub async fn collect_cluster_stats() -> ClusterStats {
+    let (cluster_stats, _) = collect_cluster_and_health_stats().await;
+    cluster_stats
+}
+
+/// Collect cluster health statistics from the storage layer.
+pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
+    let (_, cluster_health_stats) = collect_cluster_and_health_stats().await;
+    cluster_health_stats
 }
 
 /// Collect bucket statistics from the storage layer.
@@ -282,8 +285,10 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
             proxied_head_requests_total: proxy.head_total.max(0) as u64,
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
-            proxied_put_tagging_requests_total: proxy.put_total.max(0) as u64,
-            proxied_put_tagging_requests_failures: proxy.put_failed.max(0) as u64,
+            // Proxy cache currently tracks generic PutObject requests, not tagging-specific APIs.
+            // Keep tagging counters zero until PutObjectTagging stats are tracked separately.
+            proxied_put_tagging_requests_total: 0,
+            proxied_put_tagging_requests_failures: 0,
             proxied_get_tagging_requests_total: 0,
             proxied_get_tagging_requests_failures: 0,
             proxied_delete_tagging_requests_total: 0,
@@ -349,30 +354,11 @@ pub async fn collect_replication_stats() -> ReplicationStats {
 
 /// Collect disk statistics from the storage layer.
 pub async fn collect_disk_stats() -> Vec<DiskStats> {
-    let Some(store) = new_object_layer_fn() else {
-        return Vec::new();
-    };
-
-    let storage_info = store.storage_info().await;
-
-    storage_info
-        .disks
-        .iter()
-        .map(|disk| DiskStats {
-            server: disk.endpoint.clone(),
-            drive: disk.drive_path.clone(),
-            total_bytes: disk.total_space,
-            used_bytes: disk.used_space,
-            free_bytes: disk.available_space,
-        })
-        .collect()
+    let (disk_stats, _, _) = collect_disk_and_system_drive_stats().await;
+    disk_stats
 }
 
-/// Collect system CPU statistics from the current host.
-pub fn collect_system_cpu_stats() -> CpuStats {
-    let mut system = System::new_all();
-    system.refresh_cpu_all();
-
+fn build_system_cpu_stats(system: &System) -> CpuStats {
     let cpu_usage = system.global_cpu_usage() as f64;
     let cpu_count = system.cpus().len().max(1) as f64;
     let load_avg = System::load_average().one;
@@ -389,11 +375,7 @@ pub fn collect_system_cpu_stats() -> CpuStats {
     }
 }
 
-/// Collect system memory statistics from the current host.
-pub fn collect_system_memory_stats() -> MemoryStats {
-    let mut system = System::new_all();
-    system.refresh_memory();
-
+fn build_system_memory_stats(system: &System) -> MemoryStats {
     let total = system.total_memory();
     let used = system.used_memory();
 
@@ -413,16 +395,52 @@ pub fn collect_system_memory_stats() -> MemoryStats {
     }
 }
 
-/// Collect system drive statistics using the storage layer snapshot.
-pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCountStats) {
+/// Collect system CPU and memory statistics from a shared sysinfo snapshot.
+pub fn collect_system_cpu_and_memory_stats() -> (CpuStats, MemoryStats) {
+    let mut system = System::new_all();
+    collect_system_cpu_and_memory_stats_with(&mut system)
+}
+
+/// Collect system CPU and memory statistics by refreshing a reusable sysinfo instance.
+pub fn collect_system_cpu_and_memory_stats_with(system: &mut System) -> (CpuStats, MemoryStats) {
+    system.refresh_cpu_all();
+    system.refresh_memory();
+    (build_system_cpu_stats(&system), build_system_memory_stats(&system))
+}
+
+/// Collect system CPU statistics from the current host.
+pub fn collect_system_cpu_stats() -> CpuStats {
+    let (cpu_stats, _) = collect_system_cpu_and_memory_stats();
+    cpu_stats
+}
+
+/// Collect system memory statistics from the current host.
+pub fn collect_system_memory_stats() -> MemoryStats {
+    let (_, memory_stats) = collect_system_cpu_and_memory_stats();
+    memory_stats
+}
+
+/// Collect node disk stats and drive stats from a single storage snapshot.
+pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<DriveDetailedStats>, DriveCountStats) {
     let Some(store) = new_object_layer_fn() else {
-        return (Vec::new(), DriveCountStats::default());
+        return (Vec::new(), Vec::new(), DriveCountStats::default());
     };
 
     let storage_info = store.storage_info().await;
+    let disk_stats = storage_info
+        .disks
+        .iter()
+        .map(|disk| DiskStats {
+            server: disk.endpoint.clone(),
+            drive: disk.drive_path.clone(),
+            total_bytes: disk.total_space,
+            used_bytes: disk.used_space,
+            free_bytes: disk.available_space,
+        })
+        .collect();
+
     let mut online_count = 0u64;
     let mut offline_count = 0u64;
-
     let drive_stats = storage_info
         .disks
         .iter()
@@ -464,14 +482,18 @@ pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCoun
         })
         .collect();
 
-    (
-        drive_stats,
-        DriveCountStats {
-            offline_count,
-            online_count,
-            total_count: online_count + offline_count,
-        },
-    )
+    let drive_count_stats = DriveCountStats {
+        offline_count,
+        online_count,
+        total_count: online_count + offline_count,
+    };
+    (disk_stats, drive_stats, drive_count_stats)
+}
+
+/// Collect system drive statistics using the storage layer snapshot.
+pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCountStats) {
+    let (_, drive_stats, drive_count_stats) = collect_disk_and_system_drive_stats().await;
+    (drive_stats, drive_count_stats)
 }
 
 /// Collect resource and process statistics for the current process in one sysinfo refresh.
