@@ -27,7 +27,8 @@ use rustfs::init::init_webdav_system;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, is_audit_module_enabled,
+    is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
@@ -456,11 +457,22 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     init_buffer_profile_system(&config);
 
     // Initialize event notifier
-    init_event_notifier().await;
+    refresh_notify_module_enabled();
+    if is_notify_module_enabled() {
+        init_event_notifier().await;
+    } else {
+        info!(target: "rustfs::main::run", "Notify module disabled by RUSTFS_NOTIFY_ENABLE=false, skip notifier initialization.");
+    }
+
     // Start the audit system
-    match start_audit_system().await {
-        Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
-        Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+    refresh_audit_module_enabled();
+    if is_audit_module_enabled() {
+        match start_audit_system().await {
+            Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
+            Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+        }
+    } else {
+        info!(target: "rustfs::main::run", "Audit module disabled by RUSTFS_AUDIT_ENABLE=false, skip audit initialization.");
     }
 
     // Initialize deadlock detector if enabled

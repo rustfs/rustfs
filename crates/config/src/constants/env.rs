@@ -26,6 +26,15 @@ pub const RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT: bool = false;
 pub const ENABLE_KEY: &str = "enable";
 pub const COMMENT_KEY: &str = "comment";
 
+/// Global switch for enabling the audit module.
+pub const ENV_AUDIT_ENABLE: &str = "RUSTFS_AUDIT_ENABLE";
+/// Global switch for enabling the notify module.
+pub const ENV_NOTIFY_ENABLE: &str = "RUSTFS_NOTIFY_ENABLE";
+/// Default global audit switch (disabled by default).
+pub const DEFAULT_AUDIT_ENABLE: bool = false;
+/// Default global notify switch (disabled by default).
+pub const DEFAULT_NOTIFY_ENABLE: bool = false;
+
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.
 pub const ENV_WORD_DELIMITER_DASH: &str = "-";
@@ -289,5 +298,13 @@ mod tests {
         for state in disabled_states.iter() {
             assert!(state.is_disabled());
         }
+    }
+
+    #[test]
+    fn test_global_audit_notify_switch_constants() {
+        assert_eq!(ENV_AUDIT_ENABLE, "RUSTFS_AUDIT_ENABLE");
+        assert_eq!(ENV_NOTIFY_ENABLE, "RUSTFS_NOTIFY_ENABLE");
+        assert!(!DEFAULT_AUDIT_ENABLE);
+        assert!(!DEFAULT_NOTIFY_ENABLE);
     }
 }

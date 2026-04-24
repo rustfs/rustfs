@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::{
+    is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled,
+};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use hashbrown::HashMap;
@@ -71,6 +74,8 @@ where
 
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
 pub struct OperationHelper {
+    audit_enabled: bool,
+    notify_enabled: bool,
     audit_builder: Option<AuditEntryBuilder>,
     api_builder: ApiDetailsBuilder,
     event_builder: Option<EventArgsBuilder>,
@@ -81,7 +86,13 @@ pub struct OperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
-        counter!("rustfs.log.chain.audit.total").increment(1);
+        refresh_audit_module_enabled();
+        refresh_notify_module_enabled();
+        let audit_enabled = is_audit_module_enabled();
+        let notify_enabled = is_notify_module_enabled();
+        if audit_enabled {
+            counter!("rustfs.log.chain.audit.total").increment(1);
+        }
         // Parse path -> bucket/object
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -131,13 +142,19 @@ impl OperationHelper {
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| extract_request_id_from_headers(&req.headers));
 
-        let audit_builder = AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
-            .remote_host(remote_host)
-            .user_agent(get_request_user_agent(&req.headers))
-            .req_host(get_request_host(&req.headers))
-            .req_path(req.uri.path().to_string())
-            .req_query(extract_req_params(req))
-            .request_id(&request_id);
+        let audit_builder = if audit_enabled {
+            Some(
+                AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
+                    .remote_host(remote_host)
+                    .user_agent(get_request_user_agent(&req.headers))
+                    .req_host(get_request_host(&req.headers))
+                    .req_path(req.uri.path().to_string())
+                    .req_query(extract_req_params(req))
+                    .request_id(&request_id),
+            )
+        } else {
+            None
+        };
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -162,22 +179,29 @@ impl OperationHelper {
 
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
-        let mut event_builder = EventArgsBuilder::new(event, bucket, event_object)
-            .host(get_request_host(&req.headers))
-            .port(get_request_port(&req.headers))
-            .user_agent(get_request_user_agent(&req.headers))
-            .req_params(req_params);
-        if let Some(version_id) = req_info
-            .and_then(|info| info.version_id.clone())
-            .filter(|value| !value.is_empty())
-        {
-            event_builder = event_builder.version_id(version_id);
-        }
+        let event_builder = if notify_enabled {
+            let mut event_builder = EventArgsBuilder::new(event, bucket, event_object)
+                .host(get_request_host(&req.headers))
+                .port(get_request_port(&req.headers))
+                .user_agent(get_request_user_agent(&req.headers))
+                .req_params(req_params);
+            if let Some(version_id) = req_info
+                .and_then(|info| info.version_id.clone())
+                .filter(|value| !value.is_empty())
+            {
+                event_builder = event_builder.version_id(version_id);
+            }
+            Some(event_builder)
+        } else {
+            None
+        };
 
         Self {
-            audit_builder: Some(audit_builder),
+            audit_enabled,
+            notify_enabled,
+            audit_builder,
             api_builder,
-            event_builder: Some(event_builder),
+            event_builder,
             start_time: request_context
                 .as_ref()
                 .map(|ctx| ctx.start_time)
@@ -288,7 +312,9 @@ impl OperationHelper {
 impl Drop for OperationHelper {
     fn drop(&mut self) {
         // Distribute audit logs
-        if let Some(builder) = self.audit_builder.take() {
+        if self.audit_enabled
+            && let Some(builder) = self.audit_builder.take()
+        {
             let ctx = self.request_context.clone();
             spawn_background_with_context(ctx, async move {
                 AuditLogger::log(builder.build()).await;
@@ -296,7 +322,8 @@ impl Drop for OperationHelper {
         }
 
         // Distribute event notification (only on success)
-        if self.api_builder.0.status.as_deref() == Some("success")
+        if self.notify_enabled
+            && self.api_builder.0.status.as_deref() == Some("success")
             && let Some(builder) = self.event_builder.take()
         {
             let event_args = builder.build();
@@ -317,6 +344,7 @@ mod tests {
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use rustfs_credentials::Credentials;
     use s3s::dto::DeleteObjectTaggingInput;
+    use temp_env::with_vars;
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
         S3Request {
@@ -334,33 +362,41 @@ mod tests {
 
     #[test]
     fn operation_helper_uses_req_info_for_notification_context() {
-        let input = DeleteObjectTaggingInput::builder()
-            .bucket("input-bucket".to_string())
-            .key("input-object".to_string())
-            .build()
-            .unwrap();
-        let mut req = build_request(input, Method::DELETE, Uri::from_static("/from-uri/ignored"));
-        req.headers.insert("host", HeaderValue::from_static("example.com"));
-        req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
-        req.extensions.insert(ReqInfo {
-            cred: Some(Credentials {
-                access_key: "notifyTag".to_string(),
-                ..Default::default()
-            }),
-            bucket: Some("issue-2292-bucket".to_string()),
-            object: Some("prefix/issue-2292.txt".to_string()),
-            version_id: Some("version-123".to_string()),
-            ..Default::default()
-        });
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("input-bucket".to_string())
+                    .key("input-object".to_string())
+                    .build()
+                    .unwrap();
+                let mut req = build_request(input, Method::DELETE, Uri::from_static("/from-uri/ignored"));
+                req.headers.insert("host", HeaderValue::from_static("example.com"));
+                req.headers.insert("user-agent", HeaderValue::from_static("rustfs-test"));
+                req.extensions.insert(ReqInfo {
+                    cred: Some(Credentials {
+                        access_key: "notifyTag".to_string(),
+                        ..Default::default()
+                    }),
+                    bucket: Some("issue-2292-bucket".to_string()),
+                    object: Some("prefix/issue-2292.txt".to_string()),
+                    version_id: Some("version-123".to_string()),
+                    ..Default::default()
+                });
 
-        let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
-        let event_args = helper.event_builder.clone().expect("event builder should exist").build();
+                let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
+                let event_args = helper.event_builder.clone().expect("event builder should exist").build();
 
-        assert_eq!(event_args.bucket_name, "issue-2292-bucket");
-        assert_eq!(event_args.object.bucket, "issue-2292-bucket");
-        assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
-        assert_eq!(event_args.version_id, "version-123");
-        assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
+                assert_eq!(event_args.bucket_name, "issue-2292-bucket");
+                assert_eq!(event_args.object.bucket, "issue-2292-bucket");
+                assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
+                assert_eq!(event_args.version_id, "version-123");
+                assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
+            },
+        );
     }
 
     #[test]

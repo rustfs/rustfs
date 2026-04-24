@@ -49,7 +49,10 @@
 use crate::app::context::{AppContext, init_global_app_context};
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
-use crate::server::{init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system};
+use crate::server::{
+    init_event_notifier, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled,
+    refresh_notify_module_enabled, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system,
+};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -401,11 +404,21 @@ impl RustFSServerBuilder {
         init_buffer_profile_system(&config);
 
         // Event notifier.
-        init_event_notifier().await;
+        refresh_notify_module_enabled();
+        if is_notify_module_enabled() {
+            init_event_notifier().await;
+        } else {
+            info!("Notify module disabled by RUSTFS_NOTIFY_ENABLE=false, skip notifier initialization.");
+        }
 
         // Audit (non-fatal).
-        if let Err(e) = start_audit_system().await {
-            warn!("Audit system: {e}");
+        refresh_audit_module_enabled();
+        if is_audit_module_enabled() {
+            if let Err(e) = start_audit_system().await {
+                warn!("Audit system: {e}");
+            }
+        } else {
+            info!("Audit module disabled by RUSTFS_AUDIT_ENABLE=false, skip audit initialization.");
         }
 
         // Bucket listing for metadata + notification init.
