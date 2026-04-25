@@ -20,6 +20,7 @@ use crate::{
     },
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
+    server::RemoteAddr,
 };
 use http::StatusCode;
 use http::header::HeaderValue;
@@ -30,7 +31,13 @@ use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
-use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
+use rustfs_policy::{
+    auth::get_new_credentials_with_metadata,
+    policy::{
+        Args, Policy,
+        action::{Action, StsAction},
+    },
+};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -147,7 +154,10 @@ impl Operation for AssumeRoleHandle {
         let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "invalid STS request format"))?;
 
         match body.action.as_str() {
-            ASSUME_ROLE_ACTION => handle_assume_role(req.credentials, req.uri, req.headers, body).await,
+            ASSUME_ROLE_ACTION => {
+                let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body).await
+            }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
         }
@@ -159,6 +169,7 @@ async fn handle_assume_role(
     credentials: Option<s3s::auth::Credentials>,
     uri: http::Uri,
     headers: http::HeaderMap,
+    remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(user) = credentials else {
@@ -170,11 +181,31 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidRequest, "AccessDenied1"));
     }
 
-    let (cred, _owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
+    let (cred, owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
 
-    // TODO: Check permissions, do not allow STS access
     if cred.is_temp() || cred.is_service_account() {
         return Err(s3_error!(InvalidRequest, "AccessDenied"));
+    }
+
+    let Ok(iam_store) = rustfs_iam::get() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+    let conditions = crate::auth::get_condition_values(&headers, &cred, None, None, remote_addr);
+    if !iam_store
+        .is_allowed(&Args {
+            account: &cred.access_key,
+            groups: &cred.groups,
+            action: Action::StsAction(StsAction::AssumeRoleAction),
+            conditions: &conditions,
+            is_owner: owner,
+            claims: cred.claims_or_empty(),
+            deny_only: false,
+            bucket: "",
+            object: "",
+        })
+        .await
+    {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
     if body.version.as_str() != ASSUME_ROLE_VERSION {
@@ -199,10 +230,6 @@ async fn handle_assume_role(
     );
 
     claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
-
-    let Ok(iam_store) = rustfs_iam::get() else {
-        return Err(s3_error!(InvalidRequest, "iam not init"));
-    };
 
     if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
         error!(

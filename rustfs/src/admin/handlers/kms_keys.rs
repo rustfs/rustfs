@@ -170,7 +170,7 @@ impl Operation for CreateKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)], // TODO: Add specific KMS action
+            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -249,7 +249,7 @@ impl Operation for DescribeKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -351,7 +351,7 @@ impl Operation for ListKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -479,7 +479,7 @@ impl Operation for CreateKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -891,7 +891,7 @@ impl Operation for ListKmsKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -1003,7 +1003,7 @@ impl Operation for DescribeKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
