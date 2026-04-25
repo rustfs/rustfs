@@ -27,7 +27,7 @@ use crate::metrics::collectors::{
     ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use chrono::Utc;
-use rustfs_common::metrics::global_metrics;
+use rustfs_common::{internode_metrics::global_internode_metrics, metrics::global_metrics};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
@@ -602,7 +602,15 @@ pub async fn collect_request_stats() -> Vec<ApiRequestStats> {
 /// Task 3 only wires the scheduler entrypoint; Task 6 will replace this with
 /// a real snapshot from internode metrics state.
 pub fn collect_internode_network_stats() -> Option<NetworkStats> {
-    None
+    let snapshot = global_internode_metrics().snapshot();
+
+    Some(NetworkStats {
+        internode_errors_total: snapshot.errors_total,
+        internode_dial_errors_total: snapshot.dial_errors_total,
+        internode_dial_avg_time_nanos: snapshot.dial_avg_time_nanos,
+        internode_sent_bytes_total: snapshot.sent_bytes_total,
+        internode_recv_bytes_total: snapshot.recv_bytes_total,
+    })
 }
 
 /// Collect cluster config metrics from a runtime source.
