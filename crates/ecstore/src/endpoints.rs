@@ -1512,24 +1512,28 @@ mod test {
     }
 
     #[cfg(target_os = "linux")]
+    #[serial]
     #[tokio::test]
     async fn reject_shared_local_physical_disks_by_default() {
-        let dir = tempdir().unwrap();
-        let disk1 = dir.path().join("disk1");
-        let disk2 = dir.path().join("disk2");
-        std::fs::create_dir_all(&disk1).unwrap();
-        std::fs::create_dir_all(&disk2).unwrap();
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None), (ENV_MINIO_CI, None)], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
 
-        let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
-        let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
 
-        let err = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout)
-            .await
-            .unwrap_err();
+            let err = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout)
+                .await
+                .unwrap_err();
 
-        let err_text = err.to_string();
-        assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
-        assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+            let err_text = err.to_string();
+            assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
+            assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+        })
+        .await;
     }
 
     #[cfg(target_os = "linux")]

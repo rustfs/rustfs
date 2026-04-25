@@ -259,7 +259,7 @@ fn ensure_no_sub_mounts(path: &str, mount_paths: &[String]) -> std::io::Result<(
     cross_mounts.dedup();
 
     Err(Error::other(format!(
-        "Cross-device mounts detected on path ({path}) at following locations {}. Export path should not have any sub-mounts, refusing to start.",
+        "Nested mount points detected under path ({path}) at the following locations: {}. Export path should not have any sub-mounts, refusing to start.",
         cross_mounts.join(", ")
     )))
 }
@@ -387,7 +387,7 @@ mod tests {
 ";
 
         let err = check_cross_device_mounts_with_reader(&["/data/disk1".to_string()], mounts.as_bytes()).unwrap_err();
-        assert!(err.to_string().contains("Cross-device mounts detected"));
+        assert!(err.to_string().contains("Nested mount points detected under path"));
         assert!(err.to_string().contains("/data/disk1/sub"));
     }
 
