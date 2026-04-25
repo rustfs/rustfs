@@ -405,15 +405,16 @@
 - replication 非 tagging 相关指标已通过 `GLOBAL_REPLICATION_STATS` 和 obs collectors 接入
 - dashboard 中 replication 相关主面板已保留并可继续优化
 - `proxied_put_tagging_requests_total` / `proxied_put_tagging_requests_failures_total` 已改为消费 replication runtime 中真实存在的 `proxy.put_total` / `proxy.put_failed` 来源，用于反映“通过带标签复制 PUT 完成的标签复制请求”
+- replication runtime 已进一步补充独立 `PutObjectTagging` 风格计数点，不再与 generic `PutObject` 完全复用同一计数槽
 - tagging proxy metrics 仍未完成，当前底层 `ProxyMetric` 只统计：
   - `GetObject`
-  - `PutObject`
   - `HeadObject`
 
 未完成原因：
 
-- 目前底层 replication runtime 没有单独的 `GetObjectTagging` / `PutObjectTagging` / `DeleteObjectTagging` 真实计数源
+- 目前底层 replication runtime 仍没有单独的 `GetObjectTagging` / `DeleteObjectTagging` 真实计数源
 - 在 source 未建立前，不能把这部分改成“看似有值”的伪指标
+- 已通过 `cargo check -p rustfs-ecstore -p rustfs-obs -p rustfs`
 
 ### 依赖关系
 
