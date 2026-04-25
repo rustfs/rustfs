@@ -25,6 +25,10 @@ use crate::metrics::schema::cluster_iam::*;
 /// IAM statistics.
 #[derive(Debug, Clone, Default)]
 pub struct IamStats {
+    /// Last successful IAM data sync duration in milliseconds
+    pub last_sync_duration_millis: u64,
+    /// Failed requests count in the last full minute
+    pub plugin_authn_service_failed_requests_minute: u64,
     /// Time in seconds since last failed authn service request
     pub plugin_authn_service_last_fail_seconds: u64,
     /// Time in seconds since last successful authn service request
@@ -48,6 +52,11 @@ pub struct IamStats {
 /// Returns a vector of Prometheus metrics for IAM statistics.
 pub fn collect_iam_metrics(stats: &IamStats) -> Vec<PrometheusMetric> {
     vec![
+        PrometheusMetric::from_descriptor(&LAST_SYNC_DURATION_MILLIS_MD, stats.last_sync_duration_millis as f64),
+        PrometheusMetric::from_descriptor(
+            &PLUGIN_AUTHN_SERVICE_FAILED_REQUESTS_MINUTE_MD,
+            stats.plugin_authn_service_failed_requests_minute as f64,
+        ),
         PrometheusMetric::from_descriptor(
             &PLUGIN_AUTHN_SERVICE_LAST_FAIL_SECONDS_MD,
             stats.plugin_authn_service_last_fail_seconds as f64,
@@ -82,6 +91,8 @@ mod tests {
     #[test]
     fn test_collect_iam_metrics() {
         let stats = IamStats {
+            last_sync_duration_millis: 250,
+            plugin_authn_service_failed_requests_minute: 7,
             plugin_authn_service_last_fail_seconds: 3600,
             plugin_authn_service_last_succ_seconds: 10,
             plugin_authn_service_succ_avg_rtt_ms_minute: 50,
@@ -95,7 +106,7 @@ mod tests {
         let metrics = collect_iam_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 10);
 
         let sync_successes_name = SYNC_SUCCESSES_MD.get_full_metric_name();
         let sync_successes = metrics.iter().find(|m| m.name == sync_successes_name);
@@ -108,7 +119,7 @@ mod tests {
         let stats = IamStats::default();
         let metrics = collect_iam_metrics(&stats);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 10);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());

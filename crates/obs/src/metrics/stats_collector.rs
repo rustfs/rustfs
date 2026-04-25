@@ -36,6 +36,7 @@ use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
+use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -696,12 +697,23 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
     stats
 }
 
-/// Collect cluster IAM metrics from a runtime source.
-///
-/// Task 3 only wires the scheduler entrypoint; Task 8 will replace this
-/// placeholder with real IAM sync and authn service stats.
 pub async fn collect_iam_stats() -> Option<IamStats> {
-    None
+    let iam_sys = get_global_iam_sys()?;
+    let sync = iam_sys.sync_metrics_snapshot();
+    let oidc = oidc_plugin_authn_metrics_snapshot();
+
+    Some(IamStats {
+        last_sync_duration_millis: sync.last_sync_duration_millis,
+        plugin_authn_service_failed_requests_minute: oidc.failed_requests_minute,
+        plugin_authn_service_last_fail_seconds: oidc.last_fail_seconds,
+        plugin_authn_service_last_succ_seconds: oidc.last_succ_seconds,
+        plugin_authn_service_succ_avg_rtt_ms_minute: oidc.succ_avg_rtt_ms_minute,
+        plugin_authn_service_succ_max_rtt_ms_minute: oidc.succ_max_rtt_ms_minute,
+        plugin_authn_service_total_requests_minute: oidc.total_requests_minute,
+        since_last_sync_millis: sync.since_last_sync_millis,
+        sync_failures: sync.sync_failures,
+        sync_successes: sync.sync_successes,
+    })
 }
 
 /// Collect cluster and per-bucket usage metrics from a runtime source.

@@ -31,11 +31,11 @@ use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_conf
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -44,6 +44,106 @@ use url::Url;
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_PLUGIN_AUTHN_WINDOW: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OidcPluginAuthnMetricsSnapshot {
+    pub failed_requests_minute: u64,
+    pub last_fail_seconds: u64,
+    pub last_succ_seconds: u64,
+    pub succ_avg_rtt_ms_minute: u64,
+    pub succ_max_rtt_ms_minute: u64,
+    pub total_requests_minute: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OidcPluginAuthnSample {
+    observed_at: Instant,
+    succeeded: bool,
+    rtt_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct OidcPluginAuthnMetrics {
+    samples: Mutex<VecDeque<OidcPluginAuthnSample>>,
+    last_fail_at: Mutex<Option<Instant>>,
+    last_succ_at: Mutex<Option<Instant>>,
+}
+
+impl OidcPluginAuthnMetrics {
+    fn record(&self, rtt_ms: u64, succeeded: bool) {
+        let now = Instant::now();
+        let mut samples = self.samples.lock().expect("oidc plugin authn samples lock poisoned");
+        samples.push_back(OidcPluginAuthnSample {
+            observed_at: now,
+            succeeded,
+            rtt_ms,
+        });
+        while samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+        {
+            samples.pop_front();
+        }
+        drop(samples);
+
+        if succeeded {
+            *self.last_succ_at.lock().expect("oidc plugin authn success lock poisoned") = Some(now);
+        } else {
+            *self.last_fail_at.lock().expect("oidc plugin authn failure lock poisoned") = Some(now);
+        }
+    }
+
+    fn snapshot(&self) -> OidcPluginAuthnMetricsSnapshot {
+        let now = Instant::now();
+        let mut samples = self.samples.lock().expect("oidc plugin authn samples lock poisoned");
+        while samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+        {
+            samples.pop_front();
+        }
+
+        let total_requests_minute = samples.len() as u64;
+        let failed_requests_minute = samples.iter().filter(|sample| !sample.succeeded).count() as u64;
+        let successful = samples.iter().filter(|sample| sample.succeeded).collect::<Vec<_>>();
+        let succ_avg_rtt_ms_minute = if successful.is_empty() {
+            0
+        } else {
+            successful.iter().map(|sample| sample.rtt_ms).sum::<u64>() / successful.len() as u64
+        };
+        let succ_max_rtt_ms_minute = successful.iter().map(|sample| sample.rtt_ms).max().unwrap_or_default();
+        drop(samples);
+
+        let last_fail_seconds = self
+            .last_fail_at
+            .lock()
+            .expect("oidc plugin authn failure lock poisoned")
+            .map(|instant| now.duration_since(instant).as_secs())
+            .unwrap_or_default();
+        let last_succ_seconds = self
+            .last_succ_at
+            .lock()
+            .expect("oidc plugin authn success lock poisoned")
+            .map(|instant| now.duration_since(instant).as_secs())
+            .unwrap_or_default();
+
+        OidcPluginAuthnMetricsSnapshot {
+            failed_requests_minute,
+            last_fail_seconds,
+            last_succ_seconds,
+            succ_avg_rtt_ms_minute,
+            succ_max_rtt_ms_minute,
+            total_requests_minute,
+        }
+    }
+}
+
+static OIDC_PLUGIN_AUTHN_METRICS: LazyLock<OidcPluginAuthnMetrics> = LazyLock::new(OidcPluginAuthnMetrics::default);
+
+pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
+    OIDC_PLUGIN_AUTHN_METRICS.snapshot()
+}
 
 // ---- HTTP Client Adapter ----
 
@@ -120,6 +220,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
     fn call(&'c self, request: http::Request<Vec<u8>>) -> Self::Future {
         Box::pin(async move {
+            let started_at = Instant::now();
             let (parts, body) = request.into_parts();
             let uri = parts.uri.to_string();
             let client = self.client_for_uri(&uri);
@@ -128,8 +229,13 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 .headers(parts.headers)
                 .body(body)
                 .send()
-                .await
-                .map_err(OidcHttpError::Reqwest)?;
+                .await;
+
+            let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let succeeded = response.as_ref().is_ok_and(|resp| resp.status().is_success());
+            OIDC_PLUGIN_AUTHN_METRICS.record(elapsed_ms, succeeded);
+
+            let response = response.map_err(OidcHttpError::Reqwest)?;
 
             let status = response.status();
             let headers = response.headers().clone();

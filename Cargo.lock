@@ -8494,6 +8494,7 @@ dependencies = [
  "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-iam",
  "rustfs-io-metrics",
  "rustfs-notify",
  "rustfs-utils",
