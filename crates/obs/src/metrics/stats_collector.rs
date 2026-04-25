@@ -290,10 +290,11 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
             proxied_head_requests_total: proxy.head_total.max(0) as u64,
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
-            // Proxy cache currently tracks generic PutObject requests, not tagging-specific APIs.
-            // Keep tagging counters zero until PutObjectTagging stats are tracked separately.
-            proxied_put_tagging_requests_total: 0,
-            proxied_put_tagging_requests_failures: 0,
+            // The replication runtime currently propagates tag mutations through
+            // the replicated PutObject path, so proxy.put_* is the only real
+            // runtime source available for tagging-related PUT replication stats.
+            proxied_put_tagging_requests_total: proxy.put_total.max(0) as u64,
+            proxied_put_tagging_requests_failures: proxy.put_failed.max(0) as u64,
             proxied_get_tagging_requests_total: 0,
             proxied_get_tagging_requests_failures: 0,
             proxied_delete_tagging_requests_total: 0,

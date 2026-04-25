@@ -395,6 +395,7 @@
 
 - replication 非 tagging 相关指标已通过 `GLOBAL_REPLICATION_STATS` 和 obs collectors 接入
 - dashboard 中 replication 相关主面板已保留并可继续优化
+- `proxied_put_tagging_requests_total` / `proxied_put_tagging_requests_failures_total` 已改为消费 replication runtime 中真实存在的 `proxy.put_total` / `proxy.put_failed` 来源，用于反映“通过带标签复制 PUT 完成的标签复制请求”
 - tagging proxy metrics 仍未完成，当前底层 `ProxyMetric` 只统计：
   - `GetObject`
   - `PutObject`

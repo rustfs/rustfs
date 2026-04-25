@@ -6566,7 +6566,7 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put - {{bucket}}",
+          "legendFormat": "put via tagging - {{bucket}}",
           "range": true,
           "refId": "E"
         },
@@ -6577,12 +6577,12 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_failures_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put failures - {{bucket}}",
+          "legendFormat": "put via tagging failures - {{bucket}}",
           "range": true,
           "refId": "F"
         }
       ],
-      "title": "Bucket Replication Proxy Requests (Get/Head/Put)",
+      "title": "Bucket Replication Proxy Requests (Get/Head/Put+Tagging)",
       "type": "timeseries"
     },
     {
@@ -6941,7 +6941,7 @@
           "refId": "D"
         }
       ],
-      "title": "Bucket Replication Proxy Tagging Requests",
+      "title": "Bucket Replication Proxy Tagging Requests (Source Pending)",
       "type": "timeseries"
     },
     {
