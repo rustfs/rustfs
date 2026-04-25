@@ -38,6 +38,14 @@ TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
 
+# Compatibility default for the s3-tests harness:
+# this script provisions multiple local export directories on the same physical disk.
+# Prefer the canonical bypass knob by default, and only honor the legacy CI alias
+# when it is already provided by the environment.
+if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK="true"
+fi
+
 # Directories (define early for use in test list loading)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"

@@ -596,6 +596,8 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
+    /// Leaf physical block devices backing this mount path when available.
+    pub physical_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,

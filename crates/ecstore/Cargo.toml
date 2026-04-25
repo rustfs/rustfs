@@ -126,7 +126,7 @@ metrics = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
 opentelemetry_sdk = { workspace = true }
