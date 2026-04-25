@@ -16,7 +16,7 @@
 1. [x] 建立指标 inventory 与 canonical naming contract
 2. [x] 扫描并迁移 dot notation 指标到 underscore notation
 3. [x] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
-4. [ ] 统一 HTTP / request 指标语义
+4. [x] 统一 HTTP / request 指标语义
 5. [ ] 统一 scanner / background job 指标语义
 6. [ ] 补齐 internode / system network 指标
 7. [ ] 补齐 cluster usage / erasure set / config 指标
@@ -171,6 +171,23 @@
 
 - dashboard 中 request 面板不再同时依赖两套不一致语义
 - `Request Rate by Method`、延迟、body size 面板都能直接消费 canonical family
+
+本轮完成范围：
+
+- `rustfs/src/server/http.rs` 已统一到 `rustfs_http_server_*` 核心指标族
+- 已补齐：
+  - `requests_total`
+  - `failures_total`
+  - `active_requests`
+  - `request_duration_seconds`
+  - `request_body_bytes_total`
+  - `request_body_size_bytes`
+  - `response_body_bytes_total`
+  - `response_body_size_bytes`
+- 标签已统一为低基数入口维度：
+  - `method`
+  - `status_class`
+- 已通过 `cargo check -p rustfs --lib`
 
 ### 依赖关系
 
