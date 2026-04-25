@@ -658,12 +658,16 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         }
     }
 
-    if local_paths.len() <= 1 {
+    if local_paths.is_empty() {
         return Ok(());
     }
 
     let local_paths = local_paths.into_iter().collect::<Vec<_>>();
     validate_local_cross_device_mounts(&local_paths)?;
+
+    if local_paths.len() <= 1 {
+        return Ok(());
+    }
 
     if rustfs_utils::get_env_bool(ENV_UNSAFE_BYPASS_DISK_CHECK, DEFAULT_UNSAFE_BYPASS_DISK_CHECK) {
         warn!(

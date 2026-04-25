@@ -170,7 +170,13 @@ impl LocalDisk {
             file_info: format_meta,
             last_check: format_last_check,
         };
-        let physical_device_ids = rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref()).unwrap_or_default();
+        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref()) {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!(root = ?root, error = ?err, "failed to resolve physical device ids for disk root");
+                Vec::new()
+            }
+        };
         let root_clone = root.clone();
         let physical_device_ids_clone = physical_device_ids.clone();
         let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
