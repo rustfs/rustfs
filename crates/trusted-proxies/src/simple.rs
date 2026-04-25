@@ -25,7 +25,7 @@ use rustfs_config::{
     ENV_TRUSTED_PROXY_IMPLEMENTATION,
 };
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
@@ -286,7 +286,9 @@ fn parse_forwarded_header(headers: &HeaderMap) -> Option<IpAddr> {
     let first_entry = value.split(',').next()?.trim();
 
     for part in first_entry.split(';') {
-        let (key, raw_value) = part.split_once('=')?;
+        let Some((key, raw_value)) = part.split_once('=') else {
+            continue;
+        };
         if key.trim().eq_ignore_ascii_case("for") {
             return parse_ip_token(raw_value.trim());
         }
@@ -313,12 +315,6 @@ fn parse_ip_token(value: &str) -> Option<IpAddr> {
 
     if let Ok(socket_addr) = SocketAddr::from_str(value) {
         return Some(socket_addr.ip());
-    }
-
-    if let Some((ip, _port)) = value.rsplit_once(':')
-        && ip.parse::<Ipv4Addr>().is_ok()
-    {
-        return IpAddr::from_str(ip).ok();
     }
 
     None
@@ -433,6 +429,20 @@ mod tests {
             client_info.real_ip,
             ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)).real_ip
         );
+    }
+
+    #[test]
+    fn test_forwarded_header_segment_without_equals() {
+        // A segment without '=' before 'for=' must not abort parsing.
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_FORWARDED, HeaderValue::from_static("proto;for=203.0.113.10"));
+        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([203, 0, 113, 10])));
+    }
+
+    #[test]
+    fn test_parse_ip_token_invalid_port_rejected() {
+        // A bare "ip:notaport" token must not be accepted as a valid IP.
+        assert_eq!(parse_ip_token("203.0.113.10:notaport"), None);
     }
 
     #[test]
