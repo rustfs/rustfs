@@ -530,6 +530,18 @@ make pre-commit
 - 关键主题面板均有数据
 - 文档与实际实现一致
 
+当前状态：
+
+- 已完成静态与仓库门禁验证：
+  - `cargo fmt --all`
+  - `cargo fmt --all --check`
+  - `cargo check -p rustfs-obs`
+  - `cargo check -p rustfs --lib`
+  - `make pre-commit`
+  - `jq empty .docker/observability/grafana/dashboards/rustfs.json`
+  - YAML 解析校验 `prometheus.yml` 与 `prometheus-rules/rustfs-dashboard.yml`
+- 仍未完成最终收尾，因为 `Task 8` 与 `Task 9` 还有底层 source 缺口未完全补齐
+
 ### 依赖关系
 
 - 依赖全部前置任务
