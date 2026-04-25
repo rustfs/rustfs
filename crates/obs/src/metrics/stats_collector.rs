@@ -21,10 +21,10 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    ApiRequestStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats,
-    BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats,
-    DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats,
-    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
+    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats,
+    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats,
+    DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
+    ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use chrono::Utc;
 use rustfs_common::{internode_metrics::global_internode_metrics, metrics::global_metrics};
@@ -587,14 +587,6 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
         total_transmitted,
         per_interface,
     }
-}
-
-/// Collect request metrics from a runtime source.
-///
-/// Task 3 only wires the scheduler entrypoint; Task 4 will connect this to
-/// the canonical request producer and labels.
-pub async fn collect_request_stats() -> Vec<ApiRequestStats> {
-    Vec::new()
 }
 
 /// Collect internode network metrics from a runtime source.

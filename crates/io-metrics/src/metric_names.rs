@@ -50,5 +50,5 @@ pub mod zero_copy {
     pub const THROUGHPUT_MBPS: &str = "rustfs_zero_copy_throughput_mbps";
 
     /// Memory saved by zero-copy in bytes
-    pub const MEMORY_SAVED_BYTES: &str = "rustfs_zero_copy_memory_saved_bytes";
+    pub const MEMORY_SAVED_BYTES: &str = "rustfs_zero_copy_memory_saved_bytes_total";
 }

@@ -6941,7 +6941,7 @@
           "refId": "D"
         }
       ],
-      "title": "Bucket Replication Proxy Tagging Requests (Source Pending)",
+      "title": "Bucket Replication Proxy Tagging Requests",
       "type": "timeseries"
     },
     {

@@ -229,7 +229,7 @@ pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
 /// * `bytes_saved` - Number of bytes that would have been copied without zero-copy
 #[inline(always)]
 pub fn record_memory_copy_saved(bytes_saved: usize) {
-    counter!("rustfs_zero_copy_memory_saved_bytes").increment(bytes_saved as u64);
+    counter!("rustfs_zero_copy_memory_saved_bytes_total").increment(bytes_saved as u64);
 }
 
 /// Record a fallback from zero-copy to regular read.
