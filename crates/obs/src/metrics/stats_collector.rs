@@ -26,6 +26,9 @@ use crate::metrics::collectors::{
     DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats,
     ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
+use chrono::Utc;
+use rustfs_common::metrics::global_metrics;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -639,15 +642,46 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
 /// Task 3 only wires the scheduler entrypoint; Task 5 will replace this
 /// placeholder with real ILM runtime statistics.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
-    None
+    let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks().await as u64;
+    let transition_active_tasks = GLOBAL_TransitionState.active_tasks().max(0) as u64;
+    let transition_pending_tasks = GLOBAL_TransitionState.pending_tasks() as u64;
+    let transition_missed_immediate_tasks = GLOBAL_TransitionState.missed_immediate_tasks().max(0) as u64;
+    let metrics = global_metrics().report().await;
+    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+
+    Some(IlmStats {
+        expiry_pending_tasks,
+        transition_active_tasks,
+        transition_pending_tasks,
+        transition_missed_immediate_tasks,
+        versions_scanned,
+    })
 }
 
 /// Collect scanner metrics from a runtime source.
 ///
-/// Task 3 only wires the scheduler entrypoint; Task 5 will replace this
-/// placeholder with real scanner runtime statistics.
+/// Task 5 maps scanner runtime snapshots from `global_metrics()` into the
+/// rustfs-obs scanner collector shape.
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
-    None
+    let metrics = global_metrics().report().await;
+    let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
+    let directories_scanned = metrics.life_time_ops.get("scan_folder").copied().unwrap_or_default();
+    let objects_scanned = metrics.life_time_ops.get("scan_object").copied().unwrap_or_default();
+    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+    let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
+    let last_activity_seconds = Utc::now().signed_duration_since(reference_time).num_seconds().max(0) as u64;
+
+    Some(ScannerStats {
+        bucket_scans_finished,
+        // `global_metrics()` currently tracks completed bucket-drive scans, not a
+        // separate started counter. Mirror the finished count until Task 5/Task 10
+        // expands the scanner runtime source shape.
+        bucket_scans_started: bucket_scans_finished,
+        directories_scanned,
+        objects_scanned,
+        versions_scanned,
+        last_activity_seconds,
+    })
 }
 
 #[cfg(test)]

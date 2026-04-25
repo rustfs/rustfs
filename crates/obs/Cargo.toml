@@ -34,11 +34,13 @@ workspace = true
 
 [dependencies]
 rustfs-audit = { workspace = true }
+rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
 rustfs-ecstore = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-utils = { workspace = true, features = ["ip"] }
+chrono = { workspace = true }
 flate2 = { workspace = true }
 glob = { workspace = true }
 jiff = { workspace = true }

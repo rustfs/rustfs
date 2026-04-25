@@ -8471,6 +8471,7 @@ dependencies = [
 name = "rustfs-obs"
 version = "0.0.5"
 dependencies = [
+ "chrono",
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-utils",
@@ -8490,6 +8491,7 @@ dependencies = [
  "percent-encoding",
  "pyroscope",
  "rustfs-audit",
+ "rustfs-common",
  "rustfs-config",
  "rustfs-ecstore",
  "rustfs-io-metrics",

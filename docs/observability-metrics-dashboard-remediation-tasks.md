@@ -17,7 +17,7 @@
 2. [x] 扫描并迁移 dot notation 指标到 underscore notation
 3. [x] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
 4. [x] 统一 HTTP / request 指标语义
-5. [ ] 统一 scanner / background job 指标语义
+5. [x] 统一 scanner / background job 指标语义
 6. [ ] 补齐 internode / system network 指标
 7. [ ] 补齐 cluster usage / erasure set / config 指标
 8. [ ] 补齐 IAM / audit / notification 指标治理
@@ -230,6 +230,16 @@
 
 - dashboard 中 scanner 行既能看吞吐，也能看周期健康
 - `ILM / Scanner` 不再是混合半空面板
+
+本轮完成范围：
+
+- `stats_collector.rs` 已将 scanner source 接到 `global_metrics().report()`
+- `stats_collector.rs` 已将 ILM source 接到：
+  - `GLOBAL_ExpiryState`
+  - `GLOBAL_TransitionState`
+  - `global_metrics().report()` 的 ILM 聚合计数
+- `scheduler.rs` 中的 background workflow 调度现已产出真实 scanner / ILM 指标，而不再是 placeholder
+- 已通过 `cargo check -p rustfs-obs`
 
 ### 依赖关系
 
