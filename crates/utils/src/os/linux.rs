@@ -240,6 +240,12 @@ fn ensure_no_sub_mounts(path: &str, mount_paths: &[String]) -> std::io::Result<(
             format!("Invalid argument, path ({path}) is expected to be absolute"),
         ));
     }
+    if path == "/" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid argument, path (/) cannot be the filesystem root for export validation",
+        ));
+    }
 
     let base = normalize_mount_path(path);
     let mut cross_mounts = Vec::new();
@@ -414,6 +420,13 @@ mod tests {
         let err = ensure_no_sub_mounts("relative/path", &[]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("expected to be absolute"));
+    }
+
+    #[test]
+    fn reject_root_path_for_cross_device_validation() {
+        let err = ensure_no_sub_mounts("/", &[]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cannot be the filesystem root"));
     }
 
     #[test]
