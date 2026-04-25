@@ -1515,7 +1515,7 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn reject_shared_local_physical_disks_by_default() {
-        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None), (ENV_MINIO_CI, None)], async {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, None::<&str>)], async {
             let dir = tempdir().unwrap();
             let disk1 = dir.path().join("disk1");
             let disk2 = dir.path().join("disk2");
@@ -1560,7 +1560,7 @@ mod test {
     #[serial]
     #[tokio::test]
     async fn allow_shared_local_physical_disks_with_minio_ci_alias() {
-        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None), (ENV_MINIO_CI, Some("1"))], async {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, Some("1"))], async {
             let dir = tempdir().unwrap();
             let disk1 = dir.path().join("disk1");
             let disk2 = dir.path().join("disk2");
