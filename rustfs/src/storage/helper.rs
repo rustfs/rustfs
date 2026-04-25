@@ -111,7 +111,7 @@ impl OperationHelper {
         }
 
         if audit_enabled {
-            counter!("rustfs.log.chain.audit.total").increment(1);
+            counter!("rustfs_log_chain_audit_total").increment(1);
         }
         // Parse path -> bucket/object
         let object_key = req_info
@@ -122,9 +122,9 @@ impl OperationHelper {
         // Infer remote address
         let remote_host = req
             .headers
-            .get("x-forwarded-for")
+            .get(rustfs_utils::http::X_FORWARDED_FOR)
             .and_then(|v| v.to_str().ok())
-            .or_else(|| req.headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .or_else(|| req.headers.get(rustfs_utils::http::X_REAL_IP).and_then(|v| v.to_str().ok()))
             .unwrap_or("")
             .to_string();
 
@@ -143,7 +143,7 @@ impl OperationHelper {
         //   RequestContext.request_id > extract_request_id_from_headers() > generated fallback id
         let request_context = request_context_from_req(req);
         if request_context.is_none() {
-            counter!("rustfs.log.chain.orphan.total", "component" => "operation_helper").increment(1);
+            counter!("rustfs_log_chain_orphan_total", "component" => "operation_helper").increment(1);
         }
         let request_id = request_context
             .as_ref()
