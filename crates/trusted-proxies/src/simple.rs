@@ -82,7 +82,7 @@ pub fn init() {
 
 /// Returns whether the default trusted proxy implementation is enabled.
 pub fn is_enabled() -> bool {
-    *ENABLED.get_or_init(|| parse_env_bool(ENV_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_ENABLED))
+    *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_ENABLED))
 }
 
 /// Returns the selected implementation.
@@ -335,17 +335,6 @@ fn is_usable_ip(ip: IpAddr) -> bool {
     !ip.is_unspecified() && !ip.is_multicast()
 }
 
-fn parse_env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
-    }
-}
-
 fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         Some(mode) if mode == "legacy" || mode == "full" || mode == "full_legacy" => TrustedProxyImplementation::Legacy,
@@ -361,8 +350,7 @@ fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
 mod tests {
     use super::{
         ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_REAL_IP, TrustedProxyImplementation,
-        TrustedProxyLayer, forwarded_client_ip, is_internal_ip, parse_env_bool, parse_implementation, parse_ip_token,
-        resolve_client_info,
+        TrustedProxyLayer, forwarded_client_ip, is_internal_ip, parse_implementation, parse_ip_token, resolve_client_info,
     };
     use crate::ClientInfo;
     use axum::http::{HeaderMap, HeaderValue};
@@ -453,20 +441,6 @@ mod tests {
         assert!(is_internal_ip(IpAddr::from([127, 0, 0, 1])));
         assert!(is_internal_ip("fd00::1".parse().unwrap()));
         assert!(!is_internal_ip(IpAddr::from([203, 0, 113, 10])));
-    }
-
-    #[test]
-    #[serial]
-    fn test_parse_env_bool() {
-        temp_env::with_vars(vec![("RUSTFS_TRUSTED_PROXY_TEST_BOOL", Some("on"))], || {
-            assert!(parse_env_bool("RUSTFS_TRUSTED_PROXY_TEST_BOOL", false));
-        });
-        temp_env::with_vars(vec![("RUSTFS_TRUSTED_PROXY_TEST_BOOL", Some("off"))], || {
-            assert!(!parse_env_bool("RUSTFS_TRUSTED_PROXY_TEST_BOOL", true));
-        });
-        temp_env::with_vars(vec![("RUSTFS_TRUSTED_PROXY_TEST_BOOL", Some("invalid"))], || {
-            assert!(parse_env_bool("RUSTFS_TRUSTED_PROXY_TEST_BOOL", true));
-        });
     }
 
     #[test]
