@@ -14,7 +14,7 @@
 ## 执行顺序总览
 
 1. [x] 建立指标 inventory 与 canonical naming contract
-2. [ ] 扫描并迁移 dot notation 指标到 underscore notation
+2. [x] 扫描并迁移 dot notation 指标到 underscore notation
 3. [ ] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
 4. [ ] 统一 HTTP / request 指标语义
 5. [ ] 统一 scanner / background job 指标语义
@@ -92,6 +92,12 @@
 - 代码中不再保留主路径 dot notation 指标
 - dashboard 查询不再依赖 dot 名称
 - 若有兼容窗口，明确标注过渡规则与下线时间
+
+本轮完成范围：
+
+- 代码侧 `counter!` / `gauge!` / `histogram!` / `describe_*` 中的 dot notation 指标已迁移为 underscore notation
+- `crates/obs` 相关 README 中的旧点号指标示例已同步改为下划线 canonical names
+- 保留未改项仅限非指标字符串，例如日志文件名 `rustfs.log`、URL、文档路径
 
 ### 依赖关系
 

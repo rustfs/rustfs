@@ -1277,7 +1277,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     // Record concurrent request metrics
     {
         use metrics::gauge;
-        gauge!("rustfs.concurrent.get.requests").set(concurrent_requests as f64);
+        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
     }
 
     // For low concurrency, use the base buffer size for maximum throughput

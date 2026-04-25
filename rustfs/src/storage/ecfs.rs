@@ -393,7 +393,7 @@ impl S3 for FS {
             }
         };
 
-        counter!("rustfs.delete_object_tagging.success").increment(1);
+        counter!("rustfs_delete_object_tagging_success").increment(1);
 
         let event_version_id = version_id
             .as_deref()
@@ -413,7 +413,7 @@ impl S3 for FS {
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
     }
 
@@ -813,9 +813,9 @@ impl S3 for FS {
         let tag_set = decode_tags(tags.as_str());
         debug!("Decoded tag set: {:?}", tag_set);
 
-        counter!("rustfs.get_object_tagging.success").increment(1);
+        counter!("rustfs_get_object_tagging_success").increment(1);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "get").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
             version_id: req.input.version_id.clone(),
@@ -1365,7 +1365,7 @@ impl S3 for FS {
 
         store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
             error!("Failed to put object tags: {}", e);
-            counter!("rustfs.put_object_tagging.failure").increment(1);
+            counter!("rustfs_put_object_tagging_failure").increment(1);
             ApiError::from(e)
         })?;
 
@@ -1383,7 +1383,7 @@ impl S3 for FS {
             }
         };
 
-        counter!("rustfs.put_object_tagging.success").increment(1);
+        counter!("rustfs_put_object_tagging_success").increment(1);
 
         let event_version_id = req
             .input
@@ -1407,7 +1407,7 @@ impl S3 for FS {
         }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
