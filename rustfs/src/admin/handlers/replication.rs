@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
@@ -231,11 +232,23 @@ impl Operation for SetRemoteTargetHandler {
         }
 
         remote_target.source_bucket = bucket.clone();
+        let site_endpoint = if remote_target.endpoint.starts_with("http://") || remote_target.endpoint.starts_with("https://") {
+            remote_target.endpoint.clone()
+        } else if remote_target.secure {
+            format!("https://{}", remote_target.endpoint)
+        } else {
+            format!("http://{}", remote_target.endpoint)
+        };
+        if let Some(deployment_id) = site_replication_peer_deployment_id_for_endpoint(&site_endpoint).await {
+            remote_target.deployment_id = deployment_id;
+        }
 
         let bucket_target_sys = BucketTargetSys::get();
 
         if !update {
-            let (arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+            let (arn, exist) = bucket_target_sys
+                .get_remote_arn(bucket, Some(&remote_target), remote_target.deployment_id.as_str())
+                .await;
             remote_target.arn = arn.clone();
             if exist && !arn.is_empty() {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();

@@ -1837,7 +1837,6 @@ impl DefaultObjectUsecase {
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
