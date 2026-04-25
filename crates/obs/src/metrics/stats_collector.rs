@@ -21,9 +21,10 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, ClusterHealthStats,
-    ClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats,
-    ProcessStatusType, ReplicationStats, ResourceStats,
+    ApiRequestStats, BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats,
+    BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats,
+    DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats,
+    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
@@ -583,6 +584,70 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
         total_transmitted,
         per_interface,
     }
+}
+
+/// Collect request metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 4 will connect this to
+/// the canonical request producer and labels.
+pub async fn collect_request_stats() -> Vec<ApiRequestStats> {
+    Vec::new()
+}
+
+/// Collect internode network metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 6 will replace this with
+/// a real snapshot from internode metrics state.
+pub fn collect_internode_network_stats() -> Option<NetworkStats> {
+    None
+}
+
+/// Collect cluster config metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
+/// placeholder with real cluster config parity values.
+pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
+    None
+}
+
+/// Collect cluster erasure set metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
+/// placeholder with real erasure-set topology and health stats.
+pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
+    Vec::new()
+}
+
+/// Collect cluster IAM metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 8 will replace this
+/// placeholder with real IAM sync and authn service stats.
+pub async fn collect_iam_stats() -> Option<IamStats> {
+    None
+}
+
+/// Collect cluster and per-bucket usage metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
+/// placeholder with real usage data and distributions.
+pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
+    None
+}
+
+/// Collect ILM metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 5 will replace this
+/// placeholder with real ILM runtime statistics.
+pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
+    None
+}
+
+/// Collect scanner metrics from a runtime source.
+///
+/// Task 3 only wires the scheduler entrypoint; Task 5 will replace this
+/// placeholder with real scanner runtime statistics.
+pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
+    None
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@
 
 1. [x] 建立指标 inventory 与 canonical naming contract
 2. [x] 扫描并迁移 dot notation 指标到 underscore notation
-3. [ ] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
+3. [x] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
 4. [ ] 统一 HTTP / request 指标语义
 5. [ ] 统一 scanner / background job 指标语义
 6. [ ] 补齐 internode / system network 指标
@@ -133,6 +133,12 @@
 
 - `scheduler.rs` 中可以明确看到上述 collector 的 runtime 接线
 - 对于暂未接到真实 source 的 collector，要么返回显式空集并标记 TODO，要么在本任务中直接补真实 source
+
+本轮完成范围：
+
+- `scheduler.rs` 已补齐 `cluster_config`、`cluster_erasure_set`、`cluster_iam`、`cluster_usage`、`ilm`、`system_network`、`request`、`scanner` 的 runtime 调度入口
+- `stats_collector.rs` 已新增对应 no-op / placeholder source，后续主题任务可以在不改调度骨架的情况下逐项填入真实数据源
+- 已通过 `cargo check -p rustfs-obs`
 
 ### 依赖关系
 
