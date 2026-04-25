@@ -711,7 +711,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
     if !missing_paths.is_empty() {
         warn!(
             missing_paths = ?missing_paths,
-            "Skipping physical disk independence checks for non-existent local endpoint paths during endpoint parsing",
+            "Excluding non-existent local endpoint paths from physical disk independence validation during endpoint parsing",
         );
     }
 
