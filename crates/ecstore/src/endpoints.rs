@@ -683,11 +683,15 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
     }
 
     let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut missing_paths = Vec::new();
 
     for path in &local_paths {
         let canonical = match rustfs_utils::canonicalize(path) {
             Ok(path) => path,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                missing_paths.push(path.clone());
+                continue;
+            }
             Err(err) => {
                 return Err(Error::other(format!(
                     "failed to resolve local endpoint path '{path}' for disk validation: {err}"
@@ -702,6 +706,13 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         for device_id in device_ids {
             device_paths.entry(device_id).or_default().insert(canonical_path.clone());
         }
+    }
+
+    if !missing_paths.is_empty() {
+        warn!(
+            missing_paths = ?missing_paths,
+            "Skipping physical disk independence checks for non-existent local endpoint paths during endpoint parsing",
+        );
     }
 
     let shared_devices = device_paths
