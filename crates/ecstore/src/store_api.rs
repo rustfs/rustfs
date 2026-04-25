@@ -34,7 +34,7 @@ use rustfs_filemeta::{
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
-use rustfs_rio::{DecompressReader, HashReader, LimitReader};
+use rustfs_rio::HashReader;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};

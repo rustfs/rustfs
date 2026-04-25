@@ -359,6 +359,15 @@ where
 
 delegate_reader_capabilities_generic_no_index!(DecompressReader<R>, inner);
 
+impl<R> TryGetIndex for DecompressReader<R>
+where
+    R: TryGetIndex,
+{
+    fn try_get_index(&self) -> Option<&Index> {
+        self.inner.try_get_index()
+    }
+}
+
 /// Build compressed block with header + uvarint + compressed data
 fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: CompressionAlgorithm) -> Vec<u8> {
     let crc = {

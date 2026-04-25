@@ -47,6 +47,7 @@ fi
 
 export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
+export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"

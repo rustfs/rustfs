@@ -73,7 +73,7 @@ use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader, RangedReader,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -83,7 +83,7 @@ use rustfs_filemeta::{
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DynReader, HashReader, wrap_reader};
+use rustfs_rio::{CompressReader, DecompressReader, DynReader, HashReader, wrap_reader};
 use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
@@ -1198,10 +1198,10 @@ impl DefaultObjectUsecase {
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
-        mut rs: Option<HTTPRangeSpec>,
+        rs: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
-        part_number: Option<usize>,
+        _part_number: Option<usize>,
         read_start: std::time::Instant,
     ) -> S3Result<GetObjectReadSetup> {
         let reader = store
@@ -1209,6 +1209,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let read_plan = reader.read_plan.clone();
         let info = reader.object_info;
 
         use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
@@ -1245,23 +1246,13 @@ impl DefaultObjectUsecase {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
-        if let Some(part_number) = part_number
-            && rs.is_none()
-        {
-            rs = HTTPRangeSpec::from_object_info(&info, part_number);
-        }
-
         validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
-
-        let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
-        let content_range = if let Some(rs) = &rs {
-            let total_size = content_length;
-            let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
-            content_length = length;
-            Some(format!("bytes {}-{}/{}", start, start as i64 + length - 1, total_size))
-        } else {
-            None
-        };
+        let rs = read_plan.plaintext_range.as_ref().map(|range| HTTPRangeSpec {
+            is_suffix_length: false,
+            start: range.start as i64,
+            end: range.start as i64 + range.length - 1,
+        });
+        let content_range = read_plan.content_range();
 
         debug!(
             "GET object metadata check: parts={}, provided_sse_key={:?}",
@@ -1280,41 +1271,55 @@ impl DefaultObjectUsecase {
             etag: info.etag.as_deref(),
         };
 
-        let mut response_content_length = content_length;
-        let encrypted_stream = reader.stream;
+        let response_content_length = read_plan.response_length;
+        let mut final_stream: DynReader = wrap_reader(reader.stream);
+        let mut server_side_encryption = None;
+        let mut sse_customer_algorithm = None;
+        let mut sse_customer_key_md5 = None;
+        let mut ssekms_key_id = None;
+        let mut encryption_applied = false;
 
-        let (
-            server_side_encryption,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            ssekms_key_id,
-            encryption_applied,
-            final_stream,
-        ) = match sse_decryption(decryption_request).await? {
-            Some(material) => {
-                let server_side_encryption = Some(material.server_side_encryption.clone());
-                let sse_customer_algorithm = Some(material.algorithm.clone());
-                let sse_customer_key_md5 = material.customer_key_md5.clone();
-                let ssekms_key_id = material.kms_key_id.clone();
+        let mut decryption_material = sse_decryption(decryption_request).await?;
 
-                let (decrypted_stream, plaintext_size) = material
-                    .wrap_reader(encrypted_stream, content_length)
-                    .await
-                    .map_err(ApiError::from)?;
-
-                response_content_length = plaintext_size;
-
-                (
-                    server_side_encryption,
-                    sse_customer_algorithm,
-                    sse_customer_key_md5,
-                    ssekms_key_id,
-                    true,
-                    decrypted_stream,
-                )
+        for transform in &read_plan.transforms {
+            match transform {
+                rustfs_ecstore::store_api::ReadTransform::Decrypt => {
+                    let Some(material) = decryption_material.take() else {
+                        return Err(ApiError::from(StorageError::other("ecstore read plan requires decryption material")).into());
+                    };
+                    server_side_encryption = Some(material.server_side_encryption.clone());
+                    sse_customer_algorithm = Some(material.algorithm.clone());
+                    sse_customer_key_md5 = material.customer_key_md5.clone();
+                    ssekms_key_id = material.kms_key_id.clone();
+                    final_stream = material
+                        .wrap_reader(final_stream, read_plan.plaintext_size)
+                        .await
+                        .map_err(ApiError::from)?
+                        .0;
+                    encryption_applied = true;
+                }
+                rustfs_ecstore::store_api::ReadTransform::Decompress { algorithm } => {
+                    final_stream = Box::new(DecompressReader::new(final_stream, *algorithm));
+                }
+                rustfs_ecstore::store_api::ReadTransform::Slice {
+                    offset,
+                    length,
+                    total_size,
+                } => {
+                    final_stream = Box::new(
+                        RangedReader::new(
+                            final_stream,
+                            *offset,
+                            *length,
+                            usize::try_from(*total_size).map_err(|_| {
+                                ApiError::from(StorageError::other(format!("invalid plaintext size {total_size}")))
+                            })?,
+                        )
+                        .map_err(ApiError::from)?,
+                    );
+                }
             }
-            None => (None, None, None, None, false, wrap_reader(encrypted_stream)),
-        };
+        }
 
         Ok(GetObjectReadSetup {
             info,
@@ -3507,13 +3512,16 @@ impl DefaultObjectUsecase {
             }
         };
         let last_modified = info.mod_time.map(Timestamp::from);
-
-        // TODO: range download
-
-        let content_length = info.get_actual_size().map_err(|e| {
-            error!("get_actual_size error: {}", e);
+        let read_plan = rustfs_ecstore::store_api::ObjectReadPlan::build(&info, rs.clone(), &opts).map_err(|e| {
+            error!("build head read plan error: {}", e);
             ApiError::from(e)
         })?;
+        let rs = read_plan.plaintext_range.as_ref().map(|range| HTTPRangeSpec {
+            is_suffix_length: false,
+            start: range.start as i64,
+            end: range.start as i64 + range.length - 1,
+        });
+        let content_length = read_plan.response_length;
 
         let metadata_map = info.user_defined.clone();
         let server_side_encryption = metadata_map

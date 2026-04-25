@@ -658,6 +658,7 @@ impl ObjectIO for SetDisks {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::new())),
                 object_info,
+                read_plan: crate::store_api::ObjectReadPlan::default(),
             };
             return Ok(reader);
         }
@@ -694,7 +695,9 @@ impl ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
+        let reader = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
+        let offset = reader.read_plan.physical_offset;
+        let length = reader.read_plan.physical_length;
 
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
@@ -2133,6 +2136,7 @@ impl ObjectOperations for SetDisks {
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
             stream: Box::new(pr),
             object_info: oi,
+            read_plan: crate::store_api::ObjectReadPlan::default(),
         });
 
         let cloned_bucket = bucket.to_string();

@@ -148,6 +148,7 @@ pub fn new_getobjectreader<'a>(
             let r = GetObjectReader {
                 object_info: oi.clone(),
                 stream: Box::new(input_reader),
+                read_plan: crate::store_api::ObjectReadPlan::default(),
             };
             r
             //})

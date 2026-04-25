@@ -1344,6 +1344,7 @@ mod tests {
                     _guard: guard,
                 }),
                 object_info: self.object_info(bucket, object),
+                read_plan: crate::store_api::ObjectReadPlan::default(),
             })
         }
 

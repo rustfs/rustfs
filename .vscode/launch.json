@@ -184,6 +184,7 @@
                 "RUSTFS_ACCESS_KEY": "rustfsadmin",
                 "RUSTFS_SECRET_KEY": "rustfsadmin",
                 "RUSTFS_VOLUMES": "./target/volumes/test{1...4}",
+                "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
                 "RUSTFS_ADDRESS": ":9000",
                 "RUSTFS_CONSOLE_ENABLE": "true",
                 "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",

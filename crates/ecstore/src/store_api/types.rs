@@ -383,6 +383,15 @@ impl ObjectInfo {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
+    pub fn is_encrypted(&self) -> bool {
+        self.user_defined.contains_key("x-amz-server-side-encryption")
+            || self.user_defined.contains_key("x-rustfs-encryption-key")
+            || self.user_defined.contains_key("x-rustfs-encryption-original-size")
+            || self
+                .user_defined
+                .contains_key("x-amz-server-side-encryption-customer-original-size")
+    }
+
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
         if self.actual_size > 0 {
             return Ok(self.actual_size);

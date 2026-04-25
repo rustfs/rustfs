@@ -1,4 +1,5 @@
 use super::*;
+use crate::data_movement::decode_part_index;
 
 pub struct PutObjReader {
     pub stream: HashReader,
@@ -44,6 +45,144 @@ impl PutObjReader {
 pub struct GetObjectReader {
     pub stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     pub object_info: ObjectInfo,
+    pub read_plan: ObjectReadPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaintextRange {
+    pub start: usize,
+    pub length: i64,
+    pub total_size: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadTransform {
+    Decrypt,
+    Decompress { algorithm: CompressionAlgorithm },
+    Slice { offset: usize, length: i64, total_size: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjectReadPlan {
+    pub physical_offset: usize,
+    pub physical_length: i64,
+    pub plaintext_size: i64,
+    pub response_length: i64,
+    pub plaintext_range: Option<PlaintextRange>,
+    pub transforms: Vec<ReadTransform>,
+}
+
+impl ObjectReadPlan {
+    pub fn build(oi: &ObjectInfo, rs: Option<HTTPRangeSpec>, opts: &ObjectOptions) -> Result<Self> {
+        let mut rs = rs;
+        if let Some(part_number) = opts.part_number
+            && rs.is_none()
+        {
+            rs = plaintext_range_for_part(oi, part_number);
+        }
+
+        let plaintext_size = oi.get_actual_size()?;
+        let plaintext_range = if let Some(rs) = &rs {
+            let (start, length) = rs.get_offset_length(plaintext_size)?;
+            Some(PlaintextRange {
+                start,
+                length,
+                total_size: plaintext_size,
+            })
+        } else {
+            None
+        };
+
+        let (algorithm, is_compressed) = oi.is_compressed_ok()?;
+        let is_encrypted = oi.is_encrypted();
+
+        let (physical_offset, physical_length) = build_physical_range(oi, plaintext_range.as_ref(), is_compressed, is_encrypted);
+
+        let mut transforms = Vec::new();
+        if is_encrypted {
+            transforms.push(ReadTransform::Decrypt);
+        }
+        if is_compressed {
+            transforms.push(ReadTransform::Decompress { algorithm });
+        }
+        if let Some(range) = &plaintext_range
+            && (is_encrypted || is_compressed)
+        {
+            transforms.push(ReadTransform::Slice {
+                offset: range.start,
+                length: range.length,
+                total_size: range.total_size,
+            });
+        }
+
+        Ok(Self {
+            physical_offset,
+            physical_length,
+            plaintext_size,
+            response_length: plaintext_range.as_ref().map(|range| range.length).unwrap_or(plaintext_size),
+            plaintext_range,
+            transforms,
+        })
+    }
+
+    pub fn content_range(&self) -> Option<String> {
+        self.plaintext_range
+            .as_ref()
+            .map(|range| format!("bytes {}-{}/{}", range.start, range.start as i64 + range.length - 1, range.total_size))
+    }
+}
+
+fn plaintext_range_for_part(oi: &ObjectInfo, part_number: usize) -> Option<HTTPRangeSpec> {
+    if oi.parts.is_empty() || part_number == 0 {
+        return None;
+    }
+
+    let mut start = 0_i64;
+    for (index, part) in oi.parts.iter().enumerate() {
+        let part_plaintext_size = if part.actual_size > 0 {
+            part.actual_size
+        } else {
+            part.size as i64
+        };
+        if part.number == part_number || index + 1 == part_number {
+            return Some(HTTPRangeSpec {
+                is_suffix_length: false,
+                start: start.max(0),
+                end: start + part_plaintext_size - 1,
+            });
+        }
+        start += part_plaintext_size;
+    }
+
+    None
+}
+
+fn build_physical_range(
+    oi: &ObjectInfo,
+    plaintext_range: Option<&PlaintextRange>,
+    is_compressed: bool,
+    is_encrypted: bool,
+) -> (usize, i64) {
+    if is_encrypted {
+        return (0, oi.size);
+    }
+
+    if is_compressed && let Some(range) = plaintext_range {
+        if let Some(index) = oi.parts.first().and_then(|part| decode_part_index(part.index.as_ref()))
+            && let Ok((compressed_offset, _)) = index.find(range.start as i64)
+        {
+            let compressed_offset = compressed_offset.max(0) as usize;
+            return (compressed_offset, oi.size - compressed_offset as i64);
+        }
+
+        return (0, oi.size);
+    }
+
+    if let Some(range) = plaintext_range {
+        return (range.start, range.length);
+    }
+
+    (0, oi.size)
 }
 
 impl GetObjectReader {
@@ -54,95 +193,14 @@ impl GetObjectReader {
         oi: &ObjectInfo,
         opts: &ObjectOptions,
         _h: &HeaderMap<HeaderValue>,
-    ) -> Result<(Self, usize, i64)> {
-        let mut rs = rs;
+    ) -> Result<Self> {
+        let read_plan = ObjectReadPlan::build(oi, rs, opts)?;
 
-        if let Some(part_number) = opts.part_number
-            && rs.is_none()
-        {
-            rs = HTTPRangeSpec::from_object_info(oi, part_number);
-        }
-
-        // TODO:Encrypted
-
-        let (algo, is_compressed) = oi.is_compressed_ok()?;
-
-        // TODO: check TRANSITION
-
-        if is_compressed {
-            let actual_size = oi.get_actual_size()?;
-            let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
-                // Support range requests for compressed objects
-                let (dec_off, dec_length) = rs.get_offset_length(actual_size)?;
-                (0, oi.size, dec_off, dec_length)
-            } else {
-                (0, oi.size, 0, actual_size)
-            };
-
-            let dec_reader = DecompressReader::new(reader, algo);
-
-            let actual_size_usize = if actual_size > 0 {
-                actual_size as usize
-            } else {
-                return Err(Error::other(format!("invalid decompressed size {actual_size}")));
-            };
-
-            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != actual_size {
-                // Use RangedDecompressReader for streaming range processing
-                // The new implementation supports any offset size by streaming and skipping data
-                match RangedDecompressReader::new(dec_reader, dec_off, dec_length, actual_size_usize) {
-                    Ok(ranged_reader) => {
-                        tracing::debug!(
-                            "Successfully created RangedDecompressReader for offset={}, length={}",
-                            dec_off,
-                            dec_length
-                        );
-                        Box::new(ranged_reader)
-                    }
-                    Err(e) => {
-                        // Only fail if the range parameters are fundamentally invalid (e.g., offset >= file size)
-                        tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
-                        return Err(e);
-                    }
-                }
-            } else {
-                Box::new(LimitReader::new(dec_reader, actual_size_usize))
-            };
-
-            let mut oi = oi.clone();
-            oi.size = dec_length;
-
-            return Ok((
-                GetObjectReader {
-                    stream: final_reader,
-                    object_info: oi,
-                },
-                off,
-                length,
-            ));
-        }
-
-        if let Some(rs) = rs {
-            let (off, length) = rs.get_offset_length(oi.size)?;
-
-            Ok((
-                GetObjectReader {
-                    stream: reader,
-                    object_info: oi.clone(),
-                },
-                off,
-                length,
-            ))
-        } else {
-            Ok((
-                GetObjectReader {
-                    stream: reader,
-                    object_info: oi.clone(),
-                },
-                0,
-                oi.size,
-            ))
-        }
+        Ok(GetObjectReader {
+            stream: reader,
+            object_info: oi.clone(),
+            read_plan,
+        })
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
@@ -262,6 +320,140 @@ impl HTTPRangeSpec {
             "range value invalid: start={}, end={}, expected start <= end and end >= -1",
             self.start, self.end
         )))
+    }
+}
+
+#[derive(Debug)]
+pub struct RangedReader<R> {
+    inner: R,
+    target_offset: usize,
+    target_length: usize,
+    total_size: usize,
+    current_offset: usize,
+    bytes_returned: usize,
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> RangedReader<R> {
+    pub fn new(inner: R, offset: usize, length: i64, total_size: usize) -> Result<Self> {
+        if offset > total_size {
+            tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
+            return Err(Error::InvalidRangeSpec("Range offset exceeds file size".to_string()));
+        }
+
+        let actual_length = std::cmp::min(length.max(0) as usize, total_size.saturating_sub(offset));
+
+        Ok(Self {
+            inner,
+            target_offset: offset,
+            target_length: actual_length,
+            total_size,
+            current_offset: 0,
+            bytes_returned: 0,
+        })
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::pin::Pin;
+        use std::task::Poll;
+        use tokio::io::ReadBuf;
+
+        loop {
+            if self.bytes_returned >= self.target_length {
+                return Poll::Ready(Ok(()));
+            }
+
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let mut temp_buf = vec![0u8; std::cmp::min(buf.remaining(), 8192)];
+            let mut temp_read_buf = ReadBuf::new(&mut temp_buf);
+
+            match Pin::new(&mut self.inner).poll_read(cx, &mut temp_read_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let n = temp_read_buf.filled().len();
+                    if n == 0 {
+                        if self.current_offset < self.target_offset {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "Unexpected EOF: only read {} bytes, target offset is {}, total size is {}",
+                                    self.current_offset, self.target_offset, self.total_size
+                                ),
+                            )));
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    let old_offset = self.current_offset;
+                    self.current_offset += n;
+
+                    if old_offset < self.target_offset {
+                        let skip_end = std::cmp::min(self.current_offset, self.target_offset);
+                        let skipped = skip_end - old_offset;
+
+                        if self.current_offset <= self.target_offset {
+                            continue;
+                        }
+
+                        let data_start = skipped;
+                        let available = n - data_start;
+                        let bytes_to_return =
+                            std::cmp::min(available, std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned));
+
+                        if bytes_to_return > 0 {
+                            let data_slice = &temp_read_buf.filled()[data_start..data_start + bytes_to_return];
+                            buf.put_slice(data_slice);
+                            self.bytes_returned += bytes_to_return;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    let bytes_to_return =
+                        std::cmp::min(n, std::cmp::min(buf.remaining(), self.target_length - self.bytes_returned));
+                    if bytes_to_return > 0 {
+                        buf.put_slice(&temp_read_buf.filled()[..bytes_to_return]);
+                        self.bytes_returned += bytes_to_return;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+}
+
+impl<R> rustfs_rio::EtagResolvable for RangedReader<R>
+where
+    R: rustfs_rio::EtagResolvable,
+{
+    fn try_resolve_etag(&mut self) -> Option<String> {
+        self.inner.try_resolve_etag()
+    }
+}
+
+impl<R> rustfs_rio::HashReaderDetector for RangedReader<R>
+where
+    R: rustfs_rio::HashReaderDetector,
+{
+    fn is_hash_reader(&self) -> bool {
+        self.inner.is_hash_reader()
+    }
+}
+
+impl<R> rustfs_rio::TryGetIndex for RangedReader<R>
+where
+    R: rustfs_rio::TryGetIndex,
+{
+    fn try_get_index(&self) -> Option<&rustfs_rio::Index> {
+        self.inner.try_get_index()
     }
 }
 
@@ -676,8 +868,18 @@ mod tests {
         assert_eq!(&buf2[..1], b"e");
     }
 
+    #[tokio::test]
+    async fn test_ranged_reader_returns_requested_slice() {
+        let original_data = b"abcdefghijklmnopqrstuvwxyz";
+        let cursor = Cursor::new(original_data.to_vec());
+        let mut ranged_reader = RangedReader::new(cursor, 5, 4, original_data.len()).unwrap();
+        let mut result = Vec::new();
+        ranged_reader.read_to_end(&mut result).await.unwrap();
+        assert_eq!(result, b"fghi");
+    }
+
     #[test]
-    fn test_get_object_reader_range_uses_stored_size_for_encrypted_metadata() {
+    fn test_get_object_reader_range_uses_plaintext_size_for_encrypted_metadata() {
         let object_info = ObjectInfo {
             size: 10,
             user_defined: HashMap::from([("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string())]),
@@ -690,7 +892,7 @@ mod tests {
             end: -1,
         };
 
-        let (_, offset, length) = GetObjectReader::new(
+        let reader = GetObjectReader::new(
             Box::new(Cursor::new(b"0123456789".to_vec())),
             Some(range),
             &object_info,
@@ -699,12 +901,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(offset, 8);
-        assert_eq!(length, 2);
+        assert_eq!(reader.read_plan.physical_offset, 0);
+        assert_eq!(reader.read_plan.physical_length, 10);
     }
 
     #[test]
-    fn test_get_object_reader_suffix_range_uses_stored_size_for_encrypted_metadata() {
+    fn test_get_object_reader_suffix_range_uses_plaintext_size_for_encrypted_metadata() {
         let object_info = ObjectInfo {
             size: 10,
             user_defined: HashMap::from([("x-rustfs-encryption-original-size".to_string(), "20".to_string())]),
@@ -717,7 +919,7 @@ mod tests {
             end: -1,
         };
 
-        let (_, offset, length) = GetObjectReader::new(
+        let reader = GetObjectReader::new(
             Box::new(Cursor::new(b"0123456789".to_vec())),
             Some(range),
             &object_info,
@@ -726,7 +928,128 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(offset, 6);
-        assert_eq!(length, 4);
+        assert_eq!(reader.read_plan.physical_offset, 0);
+        assert_eq!(reader.read_plan.physical_length, 10);
+    }
+
+    #[test]
+    fn test_build_read_plan_uses_plaintext_part_sizes_for_transformed_part_number() {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "gzip".to_string());
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "180".to_string());
+        user_defined.insert("x-rustfs-encryption-original-size".to_string(), "180".to_string());
+
+        let object_info = ObjectInfo {
+            size: 220,
+            user_defined,
+            parts: vec![
+                ObjectPartInfo {
+                    number: 1,
+                    size: 120,
+                    actual_size: 100,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 2,
+                    size: 100,
+                    actual_size: 80,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let plan = ObjectReadPlan::build(
+            &object_info,
+            None,
+            &ObjectOptions {
+                part_number: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.plaintext_size, 180);
+        assert_eq!(plan.response_length, 80);
+        assert_eq!(
+            plan.plaintext_range,
+            Some(PlaintextRange {
+                start: 100,
+                length: 80,
+                total_size: 180,
+            })
+        );
+    }
+
+    #[test]
+    fn test_build_read_plan_orders_decrypt_before_decompress_for_compressed_encrypted_range() {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "gzip".to_string());
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "64".to_string());
+        user_defined.insert("x-rustfs-encryption-original-size".to_string(), "64".to_string());
+
+        let object_info = ObjectInfo {
+            size: 100,
+            user_defined,
+            ..Default::default()
+        };
+
+        let plan = ObjectReadPlan::build(
+            &object_info,
+            Some(HTTPRangeSpec {
+                is_suffix_length: false,
+                start: 8,
+                end: 15,
+            }),
+            &ObjectOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.physical_offset, 0);
+        assert_eq!(plan.physical_length, 100);
+        assert_eq!(
+            plan.transforms,
+            vec![
+                ReadTransform::Decrypt,
+                ReadTransform::Decompress {
+                    algorithm: CompressionAlgorithm::Gzip,
+                },
+                ReadTransform::Slice {
+                    offset: 8,
+                    length: 8,
+                    total_size: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_read_plan_returns_plaintext_content_range_for_suffix_request() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([("x-rustfs-encryption-original-size".to_string(), "20".to_string())]),
+            ..Default::default()
+        };
+
+        let plan = ObjectReadPlan::build(
+            &object_info,
+            Some(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: 4,
+                end: -1,
+            }),
+            &ObjectOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.plaintext_range,
+            Some(PlaintextRange {
+                start: 16,
+                length: 4,
+                total_size: 20,
+            })
+        );
+        assert_eq!(plan.content_range(), Some("bytes 16-19/20".to_string()));
     }
 }

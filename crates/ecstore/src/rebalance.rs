@@ -1910,6 +1910,7 @@ mod rebalance_unit_tests {
             GetObjectReader {
                 stream: Box::new(Cursor::new(vec![0_u8; 3])),
                 object_info: ObjectInfo::default(),
+                read_plan: crate::store_api::ObjectReadPlan::default(),
             }
         }
     }
