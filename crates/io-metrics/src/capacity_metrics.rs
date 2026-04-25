@@ -38,7 +38,7 @@ pub fn record_capacity_cache_served(state: &'static str) {
 /// Record current capacity gauge.
 #[inline(always)]
 pub fn record_capacity_current_bytes(used_bytes: u64) {
-    gauge!("rustfs_capacity_current").set(used_bytes as f64);
+    gauge!("rustfs_capacity_current_bytes").set(used_bytes as f64);
 }
 
 /// Record capacity update completion.

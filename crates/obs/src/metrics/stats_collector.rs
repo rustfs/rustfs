@@ -589,10 +589,11 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
     }
 }
 
-/// Collect internode network metrics from a runtime source.
+/// Collect internode network metrics from the global internode metrics snapshot.
 ///
-/// Task 3 only wires the scheduler entrypoint; Task 6 will replace this with
-/// a real snapshot from internode metrics state.
+/// The returned values come directly from `global_internode_metrics().snapshot()`
+/// and currently include only the counters and dial timing data tracked by the
+/// internode metrics runtime.
 pub fn collect_internode_network_stats() -> Option<NetworkStats> {
     let snapshot = global_internode_metrics().snapshot();
 
@@ -605,10 +606,7 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
     })
 }
 
-/// Collect cluster config metrics from a runtime source.
-///
-/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
-/// placeholder with real cluster config parity values.
+/// Collect cluster config metrics from backend parity configuration.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
     let store = new_object_layer_fn()?;
     let backend = store.backend_info().await;
@@ -619,10 +617,7 @@ pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
     })
 }
 
-/// Collect cluster erasure set metrics from a runtime source.
-///
-/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
-/// placeholder with real erasure-set topology and health stats.
+/// Collect cluster erasure set metrics from storage and backend topology info.
 pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
     let Some(store) = new_object_layer_fn() else {
         return Vec::new();
@@ -705,10 +700,11 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
     })
 }
 
-/// Collect cluster and per-bucket usage metrics from a runtime source.
+/// Collect cluster and per-bucket usage metrics from backend usage snapshots.
 ///
-/// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
-/// placeholder with real usage data and distributions.
+/// This reads persisted usage data via `load_data_usage_from_backend()` and
+/// builds cluster totals plus per-bucket distributions from the returned
+/// histograms. It does not trigger an inline object-data rescan.
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
     let store = new_object_layer_fn()?;
     let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
@@ -777,10 +773,7 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
     ))
 }
 
-/// Collect ILM metrics from a runtime source.
-///
-/// Task 3 only wires the scheduler entrypoint; Task 5 will replace this
-/// placeholder with real ILM runtime statistics.
+/// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks().await as u64;
     let transition_active_tasks = GLOBAL_TransitionState.active_tasks().max(0) as u64;
