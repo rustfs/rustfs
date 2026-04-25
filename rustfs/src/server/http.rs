@@ -22,8 +22,8 @@ use crate::server::{
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer,
-        RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
+        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -656,6 +656,7 @@ fn process_connection(
         // 16. ConditionalCorsLayer                   — S3 API CORS
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -807,6 +808,10 @@ fn process_connection(
             // other response-transforming layers see the already-bodyless
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
+            // HEAD responses must not send body bytes even when the inner S3 layer
+            // serializes an XML error payload. Keep this innermost so the final
+            // HTTP response written to hyper/h2 is bodyless.
+            .layer(HeadRequestBodyFixLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);

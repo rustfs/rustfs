@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod conditional_writes;
-mod get_deleted_object_test;
-mod grpc_lock_client;
-mod grpc_lock_server;
-mod head_deleted_object_versioning_test;
-mod head_tls_bodyless_test;
-mod lifecycle;
-mod lock;
-mod node_interact_test;
-mod sql;
+use clap::Parser;
+use e2e_test::tls_gen::{Args, run};
+
+fn main() -> anyhow::Result<()> {
+    let out_dir = run(Args::parse())?;
+    println!("Generated RustFS TLS bundle in {}", out_dir.display());
+    Ok(())
+}
