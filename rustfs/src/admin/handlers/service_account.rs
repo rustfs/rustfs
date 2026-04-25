@@ -79,6 +79,18 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     }
 }
 
+fn merge_derived_service_account_claims(
+    target_claims: &mut HashMap<String, serde_json::Value>,
+    source_claims: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in source_claims {
+        if key == "exp" {
+            continue;
+        }
+        target_claims.insert(key.clone(), value.clone());
+    }
+}
+
 fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
     let caller_parent = if caller.parent_user.is_empty() {
         caller.access_key.as_str()
@@ -303,13 +315,7 @@ impl Operation for AddServiceAccount {
                     opts.claims = Some(HashMap::new());
                 }
 
-                for (k, v) in claims.iter() {
-                    if claims.contains_key("exp") {
-                        continue;
-                    }
-
-                    opts.claims.as_mut().unwrap().insert(k.clone(), v.clone());
-                }
+                merge_derived_service_account_claims(opts.claims.as_mut().unwrap(), &claims);
             }
         }
 
@@ -1551,5 +1557,21 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+    }
+
+    #[test]
+    fn merge_derived_service_account_claims_skips_only_expiration() {
+        let mut merged = HashMap::new();
+        let source = HashMap::from([
+            ("exp".to_string(), json!(123456)),
+            ("parent".to_string(), json!("owner-user")),
+            ("custom".to_string(), json!("value")),
+        ]);
+
+        merge_derived_service_account_claims(&mut merged, &source);
+
+        assert!(!merged.contains_key("exp"));
+        assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
+        assert_eq!(merged.get("custom"), Some(&json!("value")));
     }
 }

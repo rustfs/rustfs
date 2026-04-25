@@ -17,7 +17,7 @@
 //! This module provides a unified interface for initializing and using the
 //! trusted proxy functionality within the RustFS server.
 
-use crate::{AppConfig, ConfigLoader, ProxyMetrics, TrustedProxyLayer, default_proxy_metrics};
+use crate::{AppConfig, ConfigLoader, LegacyTrustedProxyLayer, ProxyMetrics, default_proxy_metrics};
 use rustfs_config::{DEFAULT_TRUSTED_PROXY_ENABLED, ENV_TRUSTED_PROXY_ENABLED};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -29,7 +29,7 @@ static CONFIG: OnceLock<Arc<AppConfig>> = OnceLock::new();
 static METRICS: OnceLock<Option<ProxyMetrics>> = OnceLock::new();
 
 /// Global instance of the trusted proxy layer.
-static PROXY_LAYER: OnceLock<TrustedProxyLayer> = OnceLock::new();
+static PROXY_LAYER: OnceLock<LegacyTrustedProxyLayer> = OnceLock::new();
 
 /// Global flag indicating if the trusted proxy middleware is enabled.
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -39,33 +39,32 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 /// This function should be called once at the start of the application.
 /// It loads the configuration, initializes metrics, and sets up the proxy layer.
 pub fn init() {
-    // Check if the trusted proxy system is enabled via environment variable.
-    let enabled = rustfs_utils::get_env_bool(ENV_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_ENABLED);
-    ENABLED.set(enabled).expect("Trusted proxy enabled flag already initialized");
+    let enabled = is_enabled();
+    ENABLED.get_or_init(|| enabled);
 
     if !enabled {
         tracing::info!("Trusted Proxies module is disabled via configuration");
         return;
     }
 
-    // Load configuration from environment variables.
-    let config = Arc::new(ConfigLoader::from_env_or_default());
-    CONFIG.set(config.clone()).expect("Trusted proxy config already initialized");
+    let config = CONFIG.get_or_init(|| Arc::new(ConfigLoader::from_env_or_default())).clone();
 
-    // Initialize metrics if enabled.
-    let metrics = if config.monitoring.metrics_enabled {
-        let m = default_proxy_metrics(enabled);
-        Some(m)
-    } else {
-        None
-    };
-    METRICS
-        .set(metrics.clone())
-        .expect("Trusted proxy metrics already initialized");
+    METRICS.get_or_init(|| {
+        if config.monitoring.metrics_enabled {
+            Some(default_proxy_metrics(enabled))
+        } else {
+            None
+        }
+    });
 
-    // Initialize the trusted proxy layer.
-    let layer = TrustedProxyLayer::with_cache_config(config.proxy.clone(), config.cache.clone(), metrics, enabled);
-    PROXY_LAYER.set(layer).expect("Trusted proxy layer already initialized");
+    PROXY_LAYER.get_or_init(|| {
+        LegacyTrustedProxyLayer::with_cache_config(
+            config.proxy.clone(),
+            config.cache.clone(),
+            METRICS.get().and_then(|m| m.clone()),
+            enabled,
+        )
+    });
 
     tracing::info!("Trusted Proxies module initialized");
     ConfigLoader::print_summary(&config);
@@ -78,7 +77,7 @@ pub fn init() {
 /// # Panics
 ///
 /// Panics if `init()` has not been called.
-pub fn layer() -> &'static TrustedProxyLayer {
+pub fn layer() -> &'static LegacyTrustedProxyLayer {
     PROXY_LAYER
         .get()
         .expect("Trusted proxy system not initialized. Call init() first.")
@@ -102,5 +101,5 @@ pub fn metrics() -> Option<&'static ProxyMetrics> {
 
 /// Returns true if the trusted proxy system is enabled.
 pub fn is_enabled() -> bool {
-    *ENABLED.get().unwrap_or(&false)
+    *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_ENABLED))
 }

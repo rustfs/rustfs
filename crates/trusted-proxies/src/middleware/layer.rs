@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use tower::Layer;
 
+use crate::LegacyTrustedProxyMiddleware;
 use crate::ProxyValidator;
 use crate::TrustedProxyConfig;
-use crate::TrustedProxyMiddleware;
 use crate::{CacheConfig, ProxyMetrics};
 
 /// Tower Layer for the trusted proxy middleware.
@@ -73,10 +73,10 @@ impl TrustedProxyLayer {
 }
 
 impl<S> Layer<S> for TrustedProxyLayer {
-    type Service = TrustedProxyMiddleware<S>;
+    type Service = LegacyTrustedProxyMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        TrustedProxyMiddleware {
+        LegacyTrustedProxyMiddleware {
             inner,
             validator: self.validator.clone(),
             enabled: self.enabled,
