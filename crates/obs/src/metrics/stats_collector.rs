@@ -651,7 +651,7 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
             .get(pool_idx)
             .copied()
             .or(backend.standard_sc_parity)
-            .unwrap_or_else(|| set_drive_count / 2);
+            .unwrap_or(set_drive_count / 2);
         let data_shards = set_drive_count.saturating_sub(parity);
         let mut write_quorum = data_shards.max(1);
         if data_shards == parity {
