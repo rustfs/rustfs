@@ -80,6 +80,12 @@ fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static s
     }
 }
 
+fn seconds_since(now: Instant, observed_at: Option<Instant>) -> u64 {
+    observed_at
+        .map(|instant| now.duration_since(instant).as_secs())
+        .unwrap_or_default()
+}
+
 impl OidcPluginAuthnMetrics {
     fn record(&self, rtt_ms: u64, succeeded: bool) {
         let now = Instant::now();
@@ -106,43 +112,42 @@ impl OidcPluginAuthnMetrics {
 
     fn snapshot(&self) -> OidcPluginAuthnMetricsSnapshot {
         let now = Instant::now();
-        let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
-        while samples
-            .front()
-            .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
-        {
-            samples.pop_front();
-        }
+        let (total_requests_minute, failed_requests_minute, succ_avg_rtt_ms_minute, succ_max_rtt_ms_minute) = {
+            let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
+            while samples
+                .front()
+                .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+            {
+                samples.pop_front();
+            }
 
-        let total_requests_minute = samples.len() as u64;
-        let failed_requests_minute = samples.iter().filter(|sample| !sample.succeeded).count() as u64;
-        let successful = samples.iter().filter(|sample| sample.succeeded).collect::<Vec<_>>();
-        let succ_avg_rtt_ms_minute = if successful.is_empty() {
-            0
-        } else {
-            successful.iter().map(|sample| sample.rtt_ms).sum::<u64>() / successful.len() as u64
+            let mut failed_requests_minute = 0u64;
+            let mut successful_requests = 0u64;
+            let mut successful_rtt_sum = 0u64;
+            let mut succ_max_rtt_ms_minute = 0u64;
+
+            for sample in samples.iter() {
+                if sample.succeeded {
+                    successful_requests += 1;
+                    successful_rtt_sum += sample.rtt_ms;
+                    succ_max_rtt_ms_minute = succ_max_rtt_ms_minute.max(sample.rtt_ms);
+                } else {
+                    failed_requests_minute += 1;
+                }
+            }
+
+            let succ_avg_rtt_ms_minute = successful_rtt_sum.checked_div(successful_requests).unwrap_or_default();
+
+            (
+                samples.len() as u64,
+                failed_requests_minute,
+                succ_avg_rtt_ms_minute,
+                succ_max_rtt_ms_minute,
+            )
         };
-        let succ_max_rtt_ms_minute = successful.iter().map(|sample| sample.rtt_ms).max().unwrap_or_default();
-        drop(samples);
 
-        let last_fail_seconds = self
-            .last_fail_at
-            .lock()
-            .unwrap_or_else(|err| {
-                warn!("recovering poisoned OIDC plugin authn metrics lock: last_fail_at");
-                err.into_inner()
-            })
-            .map(|instant| now.duration_since(instant).as_secs())
-            .unwrap_or_default();
-        let last_succ_seconds = self
-            .last_succ_at
-            .lock()
-            .unwrap_or_else(|err| {
-                warn!("recovering poisoned OIDC plugin authn metrics lock: last_succ_at");
-                err.into_inner()
-            })
-            .map(|instant| now.duration_since(instant).as_secs())
-            .unwrap_or_default();
+        let last_fail_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at"));
+        let last_succ_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at"));
 
         OidcPluginAuthnMetricsSnapshot {
             failed_requests_minute,

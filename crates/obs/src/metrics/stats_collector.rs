@@ -48,6 +48,15 @@ const DRIVE_STATE_ONLINE: &str = "online";
 const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
 const DRIVE_RUNTIME_STATE_RETURNING: &str = "returning";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErasureSetQuorumShape {
+    data_shards: u32,
+    read_quorum: u32,
+    write_quorum: u32,
+    read_tolerance: u32,
+    write_tolerance: u32,
+}
+
 fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool {
     let state_is_acceptable = state.eq_ignore_ascii_case(DRIVE_STATE_OK)
         || state.eq_ignore_ascii_case(DRIVE_STATE_ONLINE)
@@ -60,6 +69,30 @@ fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool 
     }
 
     state_is_acceptable
+}
+
+fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
+    let data_shards = set_drive_count.saturating_sub(parity);
+    let read_quorum = data_shards.max(1);
+    let mut write_quorum = read_quorum;
+    if data_shards == parity {
+        write_quorum += 1;
+    }
+
+    ErasureSetQuorumShape {
+        data_shards: data_shards as u32,
+        read_quorum: read_quorum as u32,
+        write_quorum: write_quorum as u32,
+        read_tolerance: parity as u32,
+        write_tolerance: set_drive_count.saturating_sub(write_quorum) as u32,
+    }
+}
+
+fn apply_erasure_set_health(entry: &mut ErasureSetStats) {
+    let online = entry.online_drives_count;
+    entry.read_health = u8::from(online >= entry.read_quorum);
+    entry.write_health = u8::from(online >= entry.write_quorum);
+    entry.health = u8::from(entry.write_health == 1);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -637,26 +670,21 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
             .copied()
             .or(backend.standard_sc_parity)
             .unwrap_or(set_drive_count / 2);
-        let data_shards = set_drive_count.saturating_sub(parity);
-        let mut write_quorum = data_shards.max(1);
-        if data_shards == parity {
-            write_quorum += 1;
-        }
-        let read_quorum = data_shards.max(1);
+        let quorum_shape = derive_erasure_set_quorum_shape(set_drive_count, parity);
 
         let entry = grouped.entry((pool_idx, set_idx)).or_insert_with(|| ErasureSetStats {
             pool_id: pool_idx as u32,
             set_id: set_idx as u32,
             size: set_drive_count as u32,
             parity: parity as u32,
-            data_shards: data_shards as u32,
-            read_quorum: read_quorum as u32,
-            write_quorum: write_quorum as u32,
+            data_shards: quorum_shape.data_shards,
+            read_quorum: quorum_shape.read_quorum,
+            write_quorum: quorum_shape.write_quorum,
             online_drives_count: 0,
             healing_drives_count: 0,
             health: 0,
-            read_tolerance: parity as u32,
-            write_tolerance: set_drive_count.saturating_sub(write_quorum) as u32,
+            read_tolerance: quorum_shape.read_tolerance,
+            write_tolerance: quorum_shape.write_tolerance,
             read_health: 0,
             write_health: 0,
         });
@@ -670,10 +698,7 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
     }
 
     for entry in grouped.values_mut() {
-        let online = entry.online_drives_count;
-        entry.read_health = u8::from(online >= entry.read_quorum);
-        entry.write_health = u8::from(online >= entry.write_quorum);
-        entry.health = u8::from(entry.write_health == 1);
+        apply_erasure_set_health(entry);
     }
 
     let mut stats = grouped.into_values().collect::<Vec<_>>();
@@ -829,5 +854,58 @@ mod tests {
     #[test]
     fn disk_is_online_for_metrics_rejects_offline_runtime_state() {
         assert!(!disk_is_online_for_metrics(DRIVE_STATE_OK, Some("offline")));
+    }
+
+    #[test]
+    fn derive_erasure_set_quorum_shape_handles_standard_layout() {
+        let shape = derive_erasure_set_quorum_shape(16, 4);
+
+        assert_eq!(
+            shape,
+            ErasureSetQuorumShape {
+                data_shards: 12,
+                read_quorum: 12,
+                write_quorum: 12,
+                read_tolerance: 4,
+                write_tolerance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn derive_erasure_set_quorum_shape_handles_equal_data_and_parity() {
+        let shape = derive_erasure_set_quorum_shape(4, 2);
+
+        assert_eq!(
+            shape,
+            ErasureSetQuorumShape {
+                data_shards: 2,
+                read_quorum: 2,
+                write_quorum: 3,
+                read_tolerance: 2,
+                write_tolerance: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_erasure_set_health_marks_read_and_write_health_from_online_count() {
+        let mut stats = ErasureSetStats {
+            read_quorum: 3,
+            write_quorum: 4,
+            online_drives_count: 3,
+            ..Default::default()
+        };
+
+        apply_erasure_set_health(&mut stats);
+        assert_eq!(stats.read_health, 1);
+        assert_eq!(stats.write_health, 0);
+        assert_eq!(stats.health, 0);
+
+        stats.online_drives_count = 4;
+        apply_erasure_set_health(&mut stats);
+        assert_eq!(stats.read_health, 1);
+        assert_eq!(stats.write_health, 1);
+        assert_eq!(stats.health, 1);
     }
 }

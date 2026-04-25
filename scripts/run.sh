@@ -43,7 +43,7 @@ fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
 
-# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"√
+# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
 # This script provisions multiple local export directories on the same disk.
 # Default the bypass only for this local layout, while still allowing callers

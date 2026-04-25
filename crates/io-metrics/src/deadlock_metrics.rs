@@ -20,7 +20,7 @@ use std::time::Duration;
 #[inline(always)]
 pub fn record_deadlock_detected(cycle_length: usize) {
     use metrics::{counter, histogram};
-    counter!("rustfs_deadlock_detected").increment(1);
+    counter!("rustfs_deadlock_detected_total").increment(1);
     histogram!("rustfs_deadlock_cycle_length").record(cycle_length as f64);
 }
 

@@ -499,11 +499,9 @@ pub fn record_cache_size(tier: &str, size_bytes: usize, entries: u64) {
 /// * `tier` - Bandwidth tier ("low", "medium", "high", "unknown")
 #[inline(always)]
 pub fn record_bandwidth(bytes_per_second: u64, tier: &str) {
-    gauge!("rustfs_bandwidth_current_bps").set(bytes_per_second as f64);
-    gauge!("rustfs_bandwidth_current_bps",
-        "tier" => tier.to_string(),
-    )
-    .set(bytes_per_second as f64);
+    let tier_label = if tier.is_empty() { "unknown" } else { tier };
+    gauge!("rustfs_bandwidth_current_bps", "tier" => "all").set(bytes_per_second as f64);
+    gauge!("rustfs_bandwidth_current_bps", "tier" => tier_label.to_string()).set(bytes_per_second as f64);
 
     histogram!("rustfs_bandwidth_observed_bps").record(bytes_per_second as f64);
 }
@@ -566,13 +564,10 @@ pub fn record_cpu_usage(percent: f64) {
 /// * `write_ops` - Number of write operations
 #[inline(always)]
 pub fn record_disk_io(read_bytes: u64, write_bytes: u64, read_ops: u64, write_ops: u64) {
-    counter!("rustfs_disk_read_bytes").increment(read_bytes);
-    counter!("rustfs_disk_write_bytes").increment(write_bytes);
-    counter!("rustfs_disk_read_ops").increment(read_ops);
-    counter!("rustfs_disk_write_ops").increment(write_ops);
-
-    gauge!("rustfs_disk_read_bytes_total").set(read_bytes as f64);
-    gauge!("rustfs_disk_write_bytes_total").set(write_bytes as f64);
+    counter!("rustfs_disk_read_bytes_total").increment(read_bytes);
+    counter!("rustfs_disk_write_bytes_total").increment(write_bytes);
+    counter!("rustfs_disk_read_ops_total").increment(read_ops);
+    counter!("rustfs_disk_write_ops_total").increment(write_ops);
 }
 
 // ============================================================================
