@@ -489,10 +489,14 @@ impl QueueCache {
 pub struct ProxyMetric {
     pub get_total: i64,
     pub get_failed: i64,
+    pub get_tag_total: i64,
+    pub get_tag_failed: i64,
     pub put_total: i64,
     pub put_failed: i64,
     pub put_tag_total: i64,
     pub put_tag_failed: i64,
+    pub delete_tag_total: i64,
+    pub delete_tag_failed: i64,
     pub head_total: i64,
     pub head_failed: i64,
 }
@@ -501,10 +505,14 @@ impl ProxyMetric {
     pub fn add(&mut self, other: &ProxyMetric) {
         self.get_total += other.get_total;
         self.get_failed += other.get_failed;
+        self.get_tag_total += other.get_tag_total;
+        self.get_tag_failed += other.get_tag_failed;
         self.put_total += other.put_total;
         self.put_failed += other.put_failed;
         self.put_tag_total += other.put_tag_total;
         self.put_tag_failed += other.put_tag_failed;
+        self.delete_tag_total += other.delete_tag_total;
+        self.delete_tag_failed += other.delete_tag_failed;
         self.head_total += other.head_total;
         self.head_failed += other.head_failed;
     }
@@ -531,6 +539,12 @@ impl ProxyStatsCache {
                     metric.get_failed += 1;
                 }
             }
+            "GetObjectTagging" => {
+                metric.get_tag_total += 1;
+                if is_err {
+                    metric.get_tag_failed += 1;
+                }
+            }
             "PutObject" => {
                 metric.put_total += 1;
                 if is_err {
@@ -547,6 +561,12 @@ impl ProxyStatsCache {
                 metric.head_total += 1;
                 if is_err {
                     metric.head_failed += 1;
+                }
+            }
+            "DeleteObjectTagging" => {
+                metric.delete_tag_total += 1;
+                if is_err {
+                    metric.delete_tag_failed += 1;
                 }
             }
             _ => {}

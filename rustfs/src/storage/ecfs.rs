@@ -31,6 +31,7 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         object_lock::objectlock_sys::check_retention_for_modification,
+        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
         tagging::{decode_tags, decode_tags_to_map, encode_tags},
         utils::serialize,
         versioning::VersioningApi,
@@ -70,6 +71,22 @@ impl FS {
     pub fn new() -> Self {
         rustfs_s3_common::init_s3_metrics();
         Self {}
+    }
+
+    async fn replication_tagging_enabled(bucket: &str, object: &str) -> bool {
+        metadata_sys::get_replication_config(bucket)
+            .await
+            .map(|(cfg, _)| cfg.has_active_rules(object, true))
+            .unwrap_or(false)
+    }
+
+    async fn record_replication_tagging_metric(bucket: &str, object: &str, api: &str, is_err: bool) {
+        if !Self::replication_tagging_enabled(bucket, object).await {
+            return;
+        }
+        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+            stats.inc_proxy(bucket, api, is_err).await;
+        }
     }
 
     pub async fn get_object_tag_conditions_for_policy(
@@ -374,7 +391,9 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
+        let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
+        Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
+        delete_tags_result.map_err(|e| {
             error!("Failed to delete object tags: {}", e);
             ApiError::from(e)
         })?;
@@ -801,7 +820,9 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let tags = store.get_object_tags(bucket, object, &opts).await.map_err(|e| {
+        let tags_result = store.get_object_tags(bucket, object, &opts).await;
+        Self::record_replication_tagging_metric(bucket, object, "GetObjectTagging", tags_result.is_err()).await;
+        let tags = tags_result.map_err(|e| {
             if is_err_object_not_found(&e) {
                 error!("Object not found: {}", e);
                 return s3_error!(NoSuchKey);
@@ -1363,7 +1384,9 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
+        let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
+        Self::record_replication_tagging_metric(&bucket, &object, "PutObjectTagging", put_tags_result.is_err()).await;
+        put_tags_result.map_err(|e| {
             error!("Failed to put object tags: {}", e);
             counter!("rustfs_put_object_tagging_failure").increment(1);
             ApiError::from(e)

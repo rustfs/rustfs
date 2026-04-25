@@ -293,10 +293,10 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
             proxied_put_tagging_requests_total: proxy.put_tag_total.max(0) as u64,
             proxied_put_tagging_requests_failures: proxy.put_tag_failed.max(0) as u64,
-            proxied_get_tagging_requests_total: 0,
-            proxied_get_tagging_requests_failures: 0,
-            proxied_delete_tagging_requests_total: 0,
-            proxied_delete_tagging_requests_failures: 0,
+            proxied_get_tagging_requests_total: proxy.get_tag_total.max(0) as u64,
+            proxied_get_tagging_requests_failures: proxy.get_tag_failed.max(0) as u64,
+            proxied_delete_tagging_requests_total: proxy.delete_tag_total.max(0) as u64,
+            proxied_delete_tagging_requests_failures: proxy.delete_tag_failed.max(0) as u64,
             targets,
         });
     }

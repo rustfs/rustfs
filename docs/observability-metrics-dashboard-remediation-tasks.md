@@ -21,10 +21,10 @@
 6. [x] 补齐 internode / system network 指标
 7. [x] 补齐 cluster usage / erasure set / config 指标
 8. [x] 补齐 IAM / audit / notification 指标治理
-9. [ ] 补齐 replication 尤其 tagging 相关真实埋点
+9. [x] 补齐 replication 尤其 tagging 相关真实埋点
 10. [x] 重构 `rustfs.json` 主仪表盘信息架构
 11. [x] 对高成本查询增加 recording rules / 查询治理
-12. [ ] 完成端到端验证与文档收尾
+12. [x] 完成端到端验证与文档收尾
 
 ## Task 1: 建立指标 inventory 与 canonical naming contract
 
@@ -404,16 +404,15 @@
 
 - replication 非 tagging 相关指标已通过 `GLOBAL_REPLICATION_STATS` 和 obs collectors 接入
 - dashboard 中 replication 相关主面板已保留并可继续优化
-- `proxied_put_tagging_requests_total` / `proxied_put_tagging_requests_failures_total` 已改为消费 replication runtime 中真实存在的 `proxy.put_total` / `proxy.put_failed` 来源，用于反映“通过带标签复制 PUT 完成的标签复制请求”
-- replication runtime 已进一步补充独立 `PutObjectTagging` 风格计数点，不再与 generic `PutObject` 完全复用同一计数槽
-- tagging proxy metrics 仍未完成，当前底层 `ProxyMetric` 只统计：
-  - `GetObject`
-  - `HeadObject`
-
-未完成原因：
-
-- 目前底层 replication runtime 仍没有单独的 `GetObjectTagging` / `DeleteObjectTagging` 真实计数源
-- 在 source 未建立前，不能把这部分改成“看似有值”的伪指标
+- replication runtime 已补齐独立 tagging 相关计数槽：
+  - `GetObjectTagging`
+  - `PutObjectTagging`
+  - `DeleteObjectTagging`
+- `rustfs/src/storage/ecfs.rs` 已在对象标签 API 路径中，仅对启用了复制规则的对象记录真实 tagging replication 计数
+- `stats_collector.rs` 已从 replication runtime `ProxyMetric` 输出：
+  - `proxied_get_tagging_requests_total / failures_total`
+  - `proxied_put_tagging_requests_total / failures_total`
+  - `proxied_delete_tagging_requests_total / failures_total`
 - 已通过 `cargo check -p rustfs-ecstore -p rustfs-obs -p rustfs`
 
 ### 依赖关系
@@ -550,7 +549,7 @@ make pre-commit
   - `make pre-commit`
   - `jq empty .docker/observability/grafana/dashboards/rustfs.json`
   - YAML 解析校验 `prometheus.yml` 与 `prometheus-rules/rustfs-dashboard.yml`
-- 仍未完成最终收尾，因为 `Task 8` 与 `Task 9` 还有底层 source 缺口未完全补齐
+- 上述前置任务现已完成，文档状态已同步收尾
 
 ### 依赖关系
 
