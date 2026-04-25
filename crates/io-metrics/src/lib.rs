@@ -516,7 +516,7 @@ pub fn record_bandwidth(bytes_per_second: u64, tier: &str) {
 /// * `duration_ms` - Duration of the transfer in milliseconds
 #[inline(always)]
 pub fn record_data_transfer(bytes: u64, duration_ms: f64) {
-    counter!("rustfs_io_transfer_bytes").increment(bytes);
+    counter!("rustfs_io_transfer_bytes_total").increment(bytes);
     histogram!("rustfs_io_transfer_duration_ms").record(duration_ms);
 
     if duration_ms > 0.0 {

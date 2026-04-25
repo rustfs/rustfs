@@ -191,7 +191,7 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     {
         use metrics::histogram;
         histogram!("rustfs_buffer_size_bytes").record(buffer_size as f64);
-        counter!("rustfs_buffer_size_selections").increment(1);
+        counter!("rustfs_buffer_size_selections_total").increment(1);
 
         if file_size >= 0 {
             let ratio = buffer_size as f64 / file_size as f64;

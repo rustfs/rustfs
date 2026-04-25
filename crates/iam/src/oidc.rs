@@ -35,7 +35,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -70,10 +70,20 @@ struct OidcPluginAuthnMetrics {
     last_succ_at: Mutex<Option<Instant>>,
 }
 
+fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!("recovering poisoned OIDC plugin authn metrics lock: {}", metric);
+            err.into_inner()
+        }
+    }
+}
+
 impl OidcPluginAuthnMetrics {
     fn record(&self, rtt_ms: u64, succeeded: bool) {
         let now = Instant::now();
-        let mut samples = self.samples.lock().expect("oidc plugin authn samples lock poisoned");
+        let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
         samples.push_back(OidcPluginAuthnSample {
             observed_at: now,
             succeeded,
@@ -88,15 +98,15 @@ impl OidcPluginAuthnMetrics {
         drop(samples);
 
         if succeeded {
-            *self.last_succ_at.lock().expect("oidc plugin authn success lock poisoned") = Some(now);
+            *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at") = Some(now);
         } else {
-            *self.last_fail_at.lock().expect("oidc plugin authn failure lock poisoned") = Some(now);
+            *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at") = Some(now);
         }
     }
 
     fn snapshot(&self) -> OidcPluginAuthnMetricsSnapshot {
         let now = Instant::now();
-        let mut samples = self.samples.lock().expect("oidc plugin authn samples lock poisoned");
+        let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
         while samples
             .front()
             .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
@@ -118,13 +128,19 @@ impl OidcPluginAuthnMetrics {
         let last_fail_seconds = self
             .last_fail_at
             .lock()
-            .expect("oidc plugin authn failure lock poisoned")
+            .unwrap_or_else(|err| {
+                warn!("recovering poisoned OIDC plugin authn metrics lock: last_fail_at");
+                err.into_inner()
+            })
             .map(|instant| now.duration_since(instant).as_secs())
             .unwrap_or_default();
         let last_succ_seconds = self
             .last_succ_at
             .lock()
-            .expect("oidc plugin authn success lock poisoned")
+            .unwrap_or_else(|err| {
+                warn!("recovering poisoned OIDC plugin authn metrics lock: last_succ_at");
+                err.into_inner()
+            })
             .map(|instant| now.duration_since(instant).as_secs())
             .unwrap_or_default();
 

@@ -249,7 +249,7 @@ async fn get_or_fetch_object_tag_conditions<T>(
         return Ok(cached.values.clone());
     }
 
-    counter!("rustfs_object_tag_conditions_fetched", "op" => action_tag_metric_label(&action)).increment(1);
+    counter!("rustfs_object_tag_conditions_fetched_total", "op" => action_tag_metric_label(&action)).increment(1);
     let fetched = auth_fs()
         .get_object_tag_conditions_for_policy(bucket, object, version_id)
         .await?;
@@ -268,7 +268,7 @@ async fn maybe_merge_object_tag_conditions<T>(
     needs_tag: bool,
 ) -> S3Result<()> {
     if !needs_tag || bucket.is_empty() || object.is_empty() {
-        counter!("rustfs_object_tag_conditions_skipped", "op" => action_tag_metric_label(&action)).increment(1);
+        counter!("rustfs_object_tag_conditions_skipped_total", "op" => action_tag_metric_label(&action)).increment(1);
         return Ok(());
     }
 
