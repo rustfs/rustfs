@@ -131,6 +131,12 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable to explicitly bypass local physical disk independence checks.
+pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
+
+/// Default flag value for bypassing local physical disk independence checks.
+pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
+
 /// Environment variable for server access key.
 pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 

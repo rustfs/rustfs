@@ -17,10 +17,11 @@ use crate::{
     disks_layout::DisksLayout,
     global::global_rustfs_port,
 };
+use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_UNSAFE_BYPASS_DISK_CHECK};
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
-    io::{Error, Result},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
+    io::{Error, ErrorKind, Result},
     net::IpAddr,
 };
 use tracing::{error, info, instrument, warn};
@@ -348,6 +349,8 @@ impl PoolEndpointList {
             }
         }
 
+        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
+
         let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
             EndpointType::Path => SetupType::Erasure,
             EndpointType::Url => match unique_args.len() {
@@ -645,12 +648,99 @@ impl EndpointServerPools {
     }
 }
 
+fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> {
+    let mut local_paths = BTreeSet::new();
+    for endpoints in pools {
+        for endpoint in endpoints.as_ref() {
+            if endpoint.is_local {
+                local_paths.insert(endpoint.get_file_path());
+            }
+        }
+    }
+
+    if local_paths.len() <= 1 {
+        return Ok(());
+    }
+
+    let local_paths = local_paths.into_iter().collect::<Vec<_>>();
+    validate_local_cross_device_mounts(&local_paths)?;
+
+    if rustfs_utils::get_env_bool(ENV_UNSAFE_BYPASS_DISK_CHECK, DEFAULT_UNSAFE_BYPASS_DISK_CHECK) {
+        warn!(
+            env = ENV_UNSAFE_BYPASS_DISK_CHECK,
+            local_paths = ?local_paths,
+            "Skipping local physical disk independence validation due to explicit environment override",
+        );
+        return Ok(());
+    }
+
+    let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for path in &local_paths {
+        let canonical = match rustfs_utils::canonicalize(path) {
+            Ok(path) => path,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "failed to resolve local endpoint path '{path}' for disk validation: {err}"
+                )));
+            }
+        };
+        let canonical_path = canonical.to_string_lossy().into_owned();
+        let device_ids = rustfs_utils::os::get_physical_device_ids(&canonical_path).map_err(|err| {
+            Error::other(format!("failed to inspect physical disk for local endpoint '{canonical_path}': {err}"))
+        })?;
+
+        for device_id in device_ids {
+            device_paths.entry(device_id).or_default().insert(canonical_path.clone());
+        }
+    }
+
+    let shared_devices = device_paths
+        .into_iter()
+        .filter_map(|(device_id, paths)| {
+            if paths.len() <= 1 {
+                return None;
+            }
+
+            Some((device_id, paths.into_iter().collect::<Vec<_>>()))
+        })
+        .collect::<Vec<_>>();
+
+    if shared_devices.is_empty() {
+        return Ok(());
+    }
+
+    let details = shared_devices
+        .into_iter()
+        .map(|(device_id, paths)| format!("{device_id} => {}", paths.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Err(Error::other(format!(
+        "local erasure endpoints must use distinct physical disks; detected shared devices [{details}]. \
+Set {ENV_UNSAFE_BYPASS_DISK_CHECK}=true only for local testing or CI to bypass this safety check"
+    )))
+}
+
+fn validate_local_cross_device_mounts(local_paths: &[String]) -> Result<()> {
+    rustfs_utils::os::check_cross_device_mounts(local_paths)
+        .map_err(|err| Error::other(format!("local endpoint cross-device mount validation failed: {err}")))
+}
+
 #[cfg(test)]
 mod test {
     use rustfs_utils::must_get_local_ips;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    use serial_test::serial;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use temp_env::async_with_vars;
+    #[cfg(target_os = "linux")]
+    use tempfile::tempdir;
 
     #[test]
     fn test_new_endpoints() {
@@ -1411,5 +1501,46 @@ mod test {
                 panic!("Test {}: expected failure but passed instead", i + 1);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reject_shared_local_physical_disks_by_default() {
+        let dir = tempdir().unwrap();
+        let disk1 = dir.path().join("disk1");
+        let disk2 = dir.path().join("disk2");
+        std::fs::create_dir_all(&disk1).unwrap();
+        std::fs::create_dir_all(&disk2).unwrap();
+
+        let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+        let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+        let err = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout)
+            .await
+            .unwrap_err();
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
+        assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial]
+    #[tokio::test]
+    async fn allow_shared_local_physical_disks_with_explicit_env_bypass() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true"))], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
+
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+            let ret = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout).await;
+            assert!(ret.is_ok(), "expected bypassed disk validation to succeed, got {ret:?}");
+        })
+        .await;
     }
 }

@@ -14,9 +14,11 @@
 
 use crate::os::{DiskInfo, IOStats};
 use rustix::fs::statfs;
+use std::collections::BTreeSet;
+use std::fs;
 use std::fs::File;
-use std::io::{self, BufRead, Error, ErrorKind};
-use std::path::Path;
+use std::io::{self, BufRead, Error, ErrorKind, Read};
+use std::path::{Path, PathBuf};
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
@@ -120,6 +122,158 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
+/// Resolve the leaf physical device identities backing a local filesystem path.
+///
+/// Linux block stacks such as partitions, `dm-*`, or software RAID can all
+/// expose a filesystem through an intermediate device node. This helper walks
+/// sysfs until it reaches the leaf backing devices so the caller can compare
+/// physical failure domains instead of only filesystem device numbers.
+pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
+    let stat = rustix::fs::stat(disk)?;
+    let major = rustix::fs::major(stat.st_dev) as u64;
+    let minor = rustix::fs::minor(stat.st_dev) as u64;
+    let devices = resolve_block_device_ids(major, minor)?;
+
+    Ok(devices.into_iter().collect())
+}
+
+fn resolve_block_device_ids(major: u64, minor: u64) -> std::io::Result<BTreeSet<String>> {
+    let sysfs_path = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+    let resolved = match fs::canonicalize(&sysfs_path) {
+        Ok(path) => path,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(BTreeSet::from([format!("{major}:{minor}")]));
+        }
+        Err(err) => return Err(err),
+    };
+    let devices = collect_block_device_ids(&resolved)?;
+
+    if devices.is_empty() {
+        Ok(BTreeSet::from([format!("{major}:{minor}")]))
+    } else {
+        Ok(devices)
+    }
+}
+
+fn collect_block_device_ids(device_path: &Path) -> std::io::Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    let slaves_dir = device_path.join("slaves");
+
+    match fs::read_dir(&slaves_dir) {
+        Ok(entries) => {
+            let mut found_slave = false;
+            for entry in entries {
+                let entry = entry?;
+                found_slave = true;
+                let resolved = fs::canonicalize(entry.path())?;
+                ids.extend(collect_block_device_ids(&resolved)?);
+            }
+
+            if found_slave {
+                return Ok(ids);
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    ids.insert(normalize_block_device_name(device_path));
+
+    Ok(ids)
+}
+
+fn normalize_block_device_name(device_path: &Path) -> String {
+    if device_path.join("partition").exists()
+        && let Some(parent_name) = device_path.parent().and_then(|parent| parent.file_name())
+    {
+        return parent_name.to_string_lossy().into_owned();
+    }
+
+    device_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| device_path.display().to_string())
+}
+
+/// Check whether any configured export path contains nested mount points.
+///
+/// This mirrors the intent of MinIO's cross-device mount guardrail: once an
+/// export path is selected, RustFS should not silently traverse into child
+/// mount points hosted by other devices.
+pub fn check_cross_device_mounts(paths: &[String]) -> std::io::Result<()> {
+    check_cross_device_mounts_with_reader(paths, File::open("/proc/mounts")?)
+}
+
+/// Parse `/proc/mounts`-style content and validate each export path against it.
+fn check_cross_device_mounts_with_reader(paths: &[String], mut reader: impl Read) -> std::io::Result<()> {
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    let mount_paths = parse_mount_paths(&content);
+
+    for path in paths {
+        ensure_no_sub_mounts(path, &mount_paths)?;
+    }
+
+    Ok(())
+}
+
+/// Extract mount paths from `/proc/mounts` content, decoding escaped spaces.
+fn parse_mount_paths(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 6 {
+                return None;
+            }
+
+            Some(fields[1].replace("\\040", " "))
+        })
+        .collect()
+}
+
+/// Validate that `path` does not contain nested child mount points.
+fn ensure_no_sub_mounts(path: &str, mount_paths: &[String]) -> std::io::Result<()> {
+    if !Path::new(path).is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid argument, path ({path}) is expected to be absolute"),
+        ));
+    }
+
+    let base = normalize_mount_path(path);
+    let mut cross_mounts = Vec::new();
+
+    for mount_path in mount_paths {
+        let mount_base = normalize_mount_path(mount_path);
+        if mount_base.starts_with(&base) && mount_base != base {
+            cross_mounts.push(mount_path.clone());
+        }
+    }
+
+    if cross_mounts.is_empty() {
+        return Ok(());
+    }
+
+    cross_mounts.sort();
+    cross_mounts.dedup();
+
+    Err(Error::other(format!(
+        "Cross-device mounts detected on path ({path}) at following locations {}. Export path should not have any sub-mounts, refusing to start.",
+        cross_mounts.join(", ")
+    )))
+}
+
+/// Normalize mount paths so prefix checks treat `/a/b` and `/a/b/` identically.
+fn normalize_mount_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
 pub fn get_drive_stats(major: u32, minor: u32) -> std::io::Result<IOStats> {
     read_drive_stats(&format!("/sys/dev/block/{major}:{minor}/stat"))
 }
@@ -179,4 +333,94 @@ fn read_stat(file_name: &str) -> std::io::Result<Vec<u64>> {
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn normalize_partition_device_to_parent_disk() {
+        let dir = tempdir().unwrap();
+        let block = dir.path().join("block");
+        let disk = block.join("nvme0n1");
+        let partition = disk.join("nvme0n1p1");
+        let slaves = partition.join("slaves");
+
+        fs::create_dir_all(&slaves).unwrap();
+        fs::write(partition.join("partition"), "1").unwrap();
+
+        let ids = collect_block_device_ids(&partition).unwrap();
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec!["nvme0n1".to_string()]);
+    }
+
+    #[test]
+    fn flatten_device_mapper_slaves_to_leaf_devices() {
+        let dir = tempdir().unwrap();
+        let block = dir.path().join("block");
+        let dm = block.join("dm-0");
+        let dm_slaves = dm.join("slaves");
+        let nvme0 = block.join("nvme0n1");
+        let nvme1 = block.join("nvme1n1");
+
+        fs::create_dir_all(&dm_slaves).unwrap();
+        fs::create_dir_all(&nvme0).unwrap();
+        fs::create_dir_all(&nvme1).unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&nvme0, dm_slaves.join("nvme0n1")).unwrap();
+            std::os::unix::fs::symlink(&nvme1, dm_slaves.join("nvme1n1")).unwrap();
+        }
+
+        let ids = collect_block_device_ids(&dm).unwrap();
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec!["nvme0n1".to_string(), "nvme1n1".to_string()]);
+    }
+
+    #[test]
+    fn detect_cross_device_sub_mounts() {
+        let mounts = "\
+/dev/root / ext4 rw 0 0
+/dev/sdb1 /data ext4 rw 0 0
+/dev/sdc1 /data/disk1/sub ext4 rw 0 0
+";
+
+        let err = check_cross_device_mounts_with_reader(&["/data/disk1".to_string()], mounts.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("Cross-device mounts detected"));
+        assert!(err.to_string().contains("/data/disk1/sub"));
+    }
+
+    #[test]
+    fn allow_mount_path_without_sub_mounts() {
+        let mounts = "\
+/dev/root / ext4 rw 0 0
+/dev/sdb1 /data/disk1 ext4 rw 0 0
+";
+
+        check_cross_device_mounts_with_reader(&["/data/disk1".to_string()], mounts.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn parse_mount_paths_decodes_escaped_spaces() {
+        let mounts = "/dev/sdb1 /data/my\\040disk ext4 rw 0 0\n";
+
+        let paths = parse_mount_paths(mounts);
+        assert_eq!(paths, vec!["/data/my disk".to_string()]);
+    }
+
+    #[test]
+    fn reject_relative_path_for_cross_device_validation() {
+        let err = ensure_no_sub_mounts("relative/path", &[]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("expected to be absolute"));
+    }
+
+    #[test]
+    fn fallback_to_major_minor_when_sysfs_link_missing() {
+        let major = u64::MAX;
+        let minor = u64::MAX;
+        let ids = resolve_block_device_ids(major, minor).unwrap();
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![format!("{major}:{minor}")]);
+    }
 }
