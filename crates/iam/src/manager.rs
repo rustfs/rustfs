@@ -36,7 +36,7 @@ use rustfs_policy::{
 use rustfs_utils::{get_env_opt_str, path::path_join_buf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -93,6 +93,17 @@ pub struct IamCache<T> {
     pub roles: HashMap<ARN, Vec<String>>,
     pub send_chan: Sender<i64>,
     pub last_timestamp: AtomicI64,
+    pub sync_failures: AtomicU64,
+    pub sync_successes: AtomicU64,
+    pub last_sync_duration_millis: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IamSyncMetricsSnapshot {
+    pub last_sync_duration_millis: u64,
+    pub since_last_sync_millis: u64,
+    pub sync_failures: u64,
+    pub sync_successes: u64,
 }
 
 impl<T> IamCache<T>
@@ -116,6 +127,9 @@ where
             send_chan: sender,
             roles: HashMap::new(),
             last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
         });
 
         sys.clone().init(receiver).await.unwrap();
@@ -200,11 +214,38 @@ where
     }
 
     async fn load(self: Arc<Self>) -> Result<()> {
-        // debug!("load iam to cache");
-        self.api.load_all(&self.cache).await?;
-        self.last_timestamp
-            .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
-        Ok(())
+        let started_at = std::time::Instant::now();
+        match self.api.load_all(&self.cache).await {
+            Ok(()) => {
+                self.last_timestamp
+                    .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
+                self.sync_successes.fetch_add(1, Ordering::Relaxed);
+                self.last_sync_duration_millis
+                    .store(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => {
+                self.sync_failures.fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn sync_metrics_snapshot(&self) -> IamSyncMetricsSnapshot {
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let last_sync_secs = self.last_timestamp.load(Ordering::Relaxed);
+        let since_last_sync_millis = if last_sync_secs > 0 && now_secs >= last_sync_secs {
+            ((now_secs - last_sync_secs) as u64).saturating_mul(1000)
+        } else {
+            0
+        };
+
+        IamSyncMetricsSnapshot {
+            last_sync_duration_millis: self.last_sync_duration_millis.load(Ordering::Relaxed),
+            since_last_sync_millis,
+            sync_failures: self.sync_failures.load(Ordering::Relaxed),
+            sync_successes: self.sync_successes.load(Ordering::Relaxed),
+        }
     }
 
     pub async fn load_user(&self, access_key: &str) -> Result<()> {

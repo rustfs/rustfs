@@ -157,7 +157,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(rustfs_api_requests_total{job=~\"$job\"}[$__range]))",
+          "expr": "sum(increase(rustfs_http_server_requests_total{job=~\"$job\"}[$__range]))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -518,7 +518,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$job\"}[5m]))",
+          "expr": "sum(rate(rustfs_http_server_requests_total{job=~\"$job\"}[5m]))",
           "hide": false,
           "instant": false,
           "legendFormat": "__auto",
@@ -605,7 +605,7 @@
       },
       "id": 11,
       "panels": [],
-      "title": "Requests",
+      "title": "API RED",
       "type": "row"
     },
     {
@@ -699,8 +699,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (request_method) (rate(rustfs_api_requests_total{job=~\"$job\", request_method=~\"$method\"}[$__rate_interval]))",
-          "legendFormat": "{{request_method}}",
+          "expr": "sum by (method) (rate(rustfs_http_server_requests_total{job=~\"$job\", method=~\"$method\"}[$__rate_interval]))",
+          "legendFormat": "{{method}}",
           "range": true,
           "refId": "A"
         }
@@ -851,7 +851,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -862,7 +862,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -873,7 +873,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
@@ -1025,7 +1025,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -1036,7 +1036,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -1047,13 +1047,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
         }
       ],
-      "title": "Request Body Percentiles",
+      "title": "Response Body Percentiles",
       "type": "timeseries"
     },
     {
@@ -1566,7 +1566,7 @@
       },
       "id": 34,
       "panels": [],
-      "title": "Buckets",
+      "title": "Storage and Capacity",
       "type": "row"
     },
     {
@@ -2314,7 +2314,7 @@
       },
       "id": 12,
       "panels": [],
-      "title": "Resource Usage",
+      "title": "Host and Process USE",
       "type": "row"
     },
     {
@@ -4964,7 +4964,7 @@
       },
       "id": 114,
       "panels": [],
-      "title": "Delivery Targets",
+      "title": "Security and Delivery",
       "type": "row"
     },
     {
@@ -5463,7 +5463,7 @@
       },
       "id": 121,
       "panels": [],
-      "title": "Scanner Activity",
+      "title": "Background Services",
       "type": "row"
     },
     {
@@ -6566,7 +6566,7 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put - {{bucket}}",
+          "legendFormat": "put via tagging - {{bucket}}",
           "range": true,
           "refId": "E"
         },
@@ -6577,12 +6577,12 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_failures_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put failures - {{bucket}}",
+          "legendFormat": "put via tagging failures - {{bucket}}",
           "range": true,
           "refId": "F"
         }
       ],
-      "title": "Bucket Replication Proxy Requests (Get/Head/Put)",
+      "title": "Bucket Replication Proxy Requests (Get/Head/Put+Tagging)",
       "type": "timeseries"
     },
     {
@@ -6954,7 +6954,7 @@
       },
       "id": 137,
       "panels": [],
-      "title": "System / Cluster Coverage Gap (By Subsystem)",
+      "title": "Debug / Raw Explorer",
       "type": "row"
     },
     {
@@ -8155,7 +8155,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total, job)",
+        "definition": "label_values(rustfs_http_server_requests_total, job)",
         "includeAll": true,
         "label": "Job",
         "multi": true,
@@ -8163,7 +8163,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total, job)",
+          "query": "label_values(rustfs_http_server_requests_total, job)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -8181,7 +8181,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total,request_method)",
+        "definition": "label_values(rustfs_http_server_requests_total,method)",
         "includeAll": true,
         "label": "Method",
         "multi": true,
@@ -8189,7 +8189,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total,request_method)",
+          "query": "label_values(rustfs_http_server_requests_total,method)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

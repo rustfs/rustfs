@@ -90,7 +90,7 @@ impl RequestContext {
     pub fn fallback() -> Self {
         let trace_ctx = current_trace_context_ids();
         let id = build_fallback_request_id(trace_ctx.as_ref());
-        counter!("rustfs.log.chain.fallback_request_id.total", "source" => "request_context_fallback").increment(1);
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "request_context_fallback").increment(1);
         Self {
             request_id: id.clone(),
             x_amz_request_id: id,
@@ -138,7 +138,7 @@ pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
         .unwrap_or_else(generate_fallback_request_id);
 
     if !headers.contains_key(REQUEST_ID_HEADER) && !headers.contains_key(AMZ_REQUEST_ID) {
-        counter!("rustfs.log.chain.fallback_request_id.total", "source" => "headers_missing").increment(1);
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "headers_missing").increment(1);
     }
 
     request_id

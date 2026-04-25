@@ -58,14 +58,14 @@ This strategy keeps local cache affinity while still balancing stragglers.
 
 The cleaner emits tracing events and runtime metrics:
 
-- `rustfs.log_cleaner.deleted_files_total` (counter)
-- `rustfs.log_cleaner.freed_bytes_total` (counter)
-- `rustfs.log_cleaner.compress_duration_seconds` (histogram)
-- `rustfs.log_cleaner.steal_success_rate` (gauge)
-- `rustfs.log_cleaner.rotation_total` (counter)
-- `rustfs.log_cleaner.rotation_failures_total` (counter)
-- `rustfs.log_cleaner.rotation_duration_seconds` (histogram)
-- `rustfs.log_cleaner.active_file_size_bytes` (gauge)
+- `rustfs_log_cleaner_deleted_files_total` (counter)
+- `rustfs_log_cleaner_freed_bytes_total` (counter)
+- `rustfs_log_cleaner_compress_duration_seconds` (histogram)
+- `rustfs_log_cleaner_steal_success_rate` (gauge)
+- `rustfs_log_cleaner_rotation_total` (counter)
+- `rustfs_log_cleaner_rotation_failures_total` (counter)
+- `rustfs_log_cleaner_rotation_duration_seconds` (histogram)
+- `rustfs_log_cleaner_active_file_size_bytes` (gauge)
 
 These values can be wired into dashboards and alert rules for cleanup health.
 
@@ -127,4 +127,3 @@ let _ = cleaner.cleanup();
 - Prefer `FileMatchMode::Suffix` when rotations prepend timestamps to the filename.
 - Prefer `FileMatchMode::Prefix` when rotations append counters or timestamps after a stable base name.
 - Keep `parallel_workers` modest when `zstd_workers` is greater than `1`, because each compression task may already use internal codec threads.
-

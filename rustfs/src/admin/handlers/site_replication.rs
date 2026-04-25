@@ -1282,8 +1282,8 @@ async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
             head_total: non_negative_u64(node.proxied.head_total),
             get_failed_total: non_negative_u64(node.proxied.get_failed),
             head_failed_total: non_negative_u64(node.proxied.head_failed),
-            put_tag_total: non_negative_u64(node.proxied.put_total),
-            put_tag_failed_total: non_negative_u64(node.proxied.put_failed),
+            put_tag_total: non_negative_u64(node.proxied.put_tag_total),
+            put_tag_failed_total: non_negative_u64(node.proxied.put_tag_failed),
             ..Default::default()
         },
         metrics,

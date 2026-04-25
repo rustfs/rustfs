@@ -16,9 +16,9 @@ use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
-use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
+use crate::manager::{IamCache, IamSyncMetricsSnapshot};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
@@ -184,6 +184,10 @@ impl<T: Store> IamSys<T> {
     /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
+    }
+
+    pub fn sync_metrics_snapshot(&self) -> IamSyncMetricsSnapshot {
+        self.store.sync_metrics_snapshot()
     }
 
     pub async fn set_policy_plugin_client(client: rustfs_policy::policy::opa::AuthZPlugin) {

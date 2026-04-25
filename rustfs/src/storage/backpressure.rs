@@ -280,7 +280,7 @@ impl BackpressurePipe {
         if usage >= threshold && !self.state.load(Ordering::Relaxed) {
             self.state.store(true, Ordering::Relaxed);
 
-            counter!("rustfs.backpressure.events.total", "state" => "high_watermark").increment(1);
+            counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
             warn!(
                 buffer_usage = usage,
@@ -300,7 +300,7 @@ impl BackpressurePipe {
         if usage <= threshold && self.state.load(Ordering::Relaxed) {
             self.state.store(false, Ordering::Relaxed);
 
-            counter!("rustfs.backpressure.events.total", "state" => "normal").increment(1);
+            counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
             debug!(
                 buffer_usage = usage,
@@ -406,14 +406,14 @@ impl BackpressureMonitor {
 
         if usage >= high {
             if !self.in_high_watermark.swap(true, Ordering::Relaxed) {
-                counter!("rustfs.backpressure.events.total", "state" => "high_watermark").increment(1);
+                counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
                 debug!(usage_percent = self.usage_percent() as u32, "Backpressure: entered high watermark");
             }
             BackpressureState::HighWatermark
         } else if usage <= low {
             if self.in_high_watermark.swap(false, Ordering::Relaxed) {
-                counter!("rustfs.backpressure.events.total", "state" => "normal").increment(1);
+                counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
                 debug!(usage_percent = self.usage_percent() as u32, "Backpressure: returned to normal");
             }

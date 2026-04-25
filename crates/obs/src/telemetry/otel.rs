@@ -304,7 +304,7 @@ pub(super) fn init_observability_http(
         .with(metrics_layer)
         .init();
 
-    counter!("rustfs.start.total").increment(1);
+    counter!("rustfs_start_total").increment(1);
     info!(
         "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
         trace_ep, metric_ep, log_ep
