@@ -41,11 +41,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
-url = { workspace = true }
-rumqttc = { workspace = true }
 
 [dev-dependencies]
 temp-env = { workspace = true }
+url = { workspace = true }
 
 [lints]
 workspace = true
