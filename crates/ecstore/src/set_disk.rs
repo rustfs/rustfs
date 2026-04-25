@@ -4148,6 +4148,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         total_space: res.total,
                         used_space: res.used,
                         available_space: res.free,
+                        physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
                         utilization: {
                             if res.total > 0 {
                                 res.used as f64 / res.total as f64 * 100_f64
