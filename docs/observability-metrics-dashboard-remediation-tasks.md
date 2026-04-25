@@ -18,8 +18,8 @@
 3. [x] 为 `crates/obs` 补齐 runtime scheduler 接线骨架
 4. [x] 统一 HTTP / request 指标语义
 5. [x] 统一 scanner / background job 指标语义
-6. [ ] 补齐 internode / system network 指标
-7. [ ] 补齐 cluster usage / erasure set / config 指标
+6. [x] 补齐 internode / system network 指标
+7. [x] 补齐 cluster usage / erasure set / config 指标
 8. [ ] 补齐 IAM / audit / notification 指标治理
 9. [ ] 补齐 replication 尤其 tagging 相关真实埋点
 10. [ ] 重构 `rustfs.json` 主仪表盘信息架构
@@ -271,6 +271,13 @@
 - `System Network Internode (All)` 面板有真实数据
 - 名称和标签全部变为 underscore canonical family
 
+本轮完成范围：
+
+- `crates/common/src/internode_metrics.rs` 已将 direct metric family 统一为 `rustfs_system_network_internode_*`
+- `stats_collector.rs` 已从 `global_internode_metrics().snapshot()` 组装 `NetworkStats`
+- `scheduler.rs` 中的 `system_network` 调度现已产出真实 internode 指标
+- 已通过 `cargo check -p rustfs-obs`
+
 ### 依赖关系
 
 - 依赖 Task 2
@@ -301,6 +308,13 @@
 
 - 这些 prefix explorer 不再天然空
 - capacity / erasure set / bucket usage 主面板均可直接消费
+
+本轮完成范围：
+
+- `cluster_config` 已从 `backend_info()` 提取真实 `standard_parity` / `rrs_parity`
+- `cluster_usage` 已从 `load_data_usage_from_backend()` 提取真实集群与 bucket 级 usage、对象数、版本数、delete marker 数与 histogram 分布
+- `cluster_erasure_set` 已基于 `storage_info()` + `backend_info()` 组装真实 set 级 size/parity/quorum/online/healing/health 数据
+- 已通过 `cargo check -p rustfs-obs`
 
 ### 依赖关系
 

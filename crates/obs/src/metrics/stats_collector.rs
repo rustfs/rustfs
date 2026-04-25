@@ -37,6 +37,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
@@ -618,7 +619,13 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 /// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
 /// placeholder with real cluster config parity values.
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
-    None
+    let store = new_object_layer_fn()?;
+    let backend = store.backend_info().await;
+
+    Some(ClusterConfigStats {
+        rrs_parity: backend.rr_sc_parity.unwrap_or_default() as u32,
+        standard_parity: backend.standard_sc_parity.unwrap_or_default() as u32,
+    })
 }
 
 /// Collect cluster erasure set metrics from a runtime source.
@@ -626,7 +633,66 @@ pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
 /// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
 /// placeholder with real erasure-set topology and health stats.
 pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
-    Vec::new()
+    let Some(store) = new_object_layer_fn() else {
+        return Vec::new();
+    };
+
+    let storage_info = store.storage_info().await;
+    let backend = store.backend_info().await;
+    let mut grouped: HashMap<(usize, usize), ErasureSetStats> = HashMap::new();
+
+    for disk in &storage_info.disks {
+        let pool_idx = disk.pool_index.max(0) as usize;
+        let set_idx = disk.set_index.max(0) as usize;
+        let set_drive_count = backend.drives_per_set.get(pool_idx).copied().unwrap_or_default();
+        let parity = backend
+            .standard_sc_parities
+            .get(pool_idx)
+            .copied()
+            .or(backend.standard_sc_parity)
+            .unwrap_or_else(|| set_drive_count / 2);
+        let data_shards = set_drive_count.saturating_sub(parity);
+        let mut write_quorum = data_shards.max(1);
+        if data_shards == parity {
+            write_quorum += 1;
+        }
+        let read_quorum = data_shards.max(1);
+
+        let entry = grouped.entry((pool_idx, set_idx)).or_insert_with(|| ErasureSetStats {
+            pool_id: pool_idx as u32,
+            set_id: set_idx as u32,
+            size: set_drive_count as u32,
+            parity: parity as u32,
+            data_shards: data_shards as u32,
+            read_quorum: read_quorum as u32,
+            write_quorum: write_quorum as u32,
+            online_drives_count: 0,
+            healing_drives_count: 0,
+            health: 0,
+            read_tolerance: parity as u32,
+            write_tolerance: set_drive_count.saturating_sub(write_quorum) as u32,
+            read_health: 0,
+            write_health: 0,
+        });
+
+        if disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref()) {
+            entry.online_drives_count += 1;
+        }
+        if disk.healing {
+            entry.healing_drives_count += 1;
+        }
+    }
+
+    for entry in grouped.values_mut() {
+        let online = entry.online_drives_count;
+        entry.read_health = u8::from(online >= entry.read_quorum);
+        entry.write_health = u8::from(online >= entry.write_quorum);
+        entry.health = u8::from(entry.write_health == 1);
+    }
+
+    let mut stats = grouped.into_values().collect::<Vec<_>>();
+    stats.sort_by_key(|stat| (stat.pool_id, stat.set_id));
+    stats
 }
 
 /// Collect cluster IAM metrics from a runtime source.
@@ -642,7 +708,71 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 /// Task 3 only wires the scheduler entrypoint; Task 7 will replace this
 /// placeholder with real usage data and distributions.
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
-    None
+    let store = new_object_layer_fn()?;
+    let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
+    let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
+
+    for (bucket_name, usage) in &data_usage.buckets_usage {
+        if bucket_name.starts_with('.') {
+            continue;
+        }
+
+        let quota_bytes = match get_quota_config(bucket_name).await {
+            Ok((quota, _)) => quota.get_quota_limit().unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        buckets.push(BucketUsageStats {
+            bucket: bucket_name.clone(),
+            total_bytes: usage.size,
+            objects_count: usage.objects_count,
+            versions_count: usage.versions_count,
+            delete_markers_count: usage.delete_markers_count,
+            quota_bytes,
+            object_size_distribution: usage
+                .object_size_histogram
+                .iter()
+                .map(|(range, count)| (range.clone(), *count))
+                .collect(),
+            version_count_distribution: usage
+                .object_versions_histogram
+                .iter()
+                .map(|(range, count)| (range.clone(), *count))
+                .collect(),
+        });
+    }
+
+    buckets.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+
+    Some((
+        ClusterUsageStats {
+            total_bytes: data_usage.objects_total_size,
+            objects_count: data_usage.objects_total_count,
+            versions_count: data_usage.versions_total_count,
+            delete_markers_count: data_usage.delete_markers_total_count,
+            object_size_distribution: data_usage
+                .buckets_usage
+                .values()
+                .flat_map(|usage| usage.object_size_histogram.iter())
+                .fold(HashMap::<String, u64>::new(), |mut acc, (range, count)| {
+                    *acc.entry(range.clone()).or_default() += *count;
+                    acc
+                })
+                .into_iter()
+                .collect(),
+            versions_distribution: data_usage
+                .buckets_usage
+                .values()
+                .flat_map(|usage| usage.object_versions_histogram.iter())
+                .fold(HashMap::<String, u64>::new(), |mut acc, (range, count)| {
+                    *acc.entry(range.clone()).or_default() += *count;
+                    acc
+                })
+                .into_iter()
+                .collect(),
+        },
+        buckets,
+    ))
 }
 
 /// Collect ILM metrics from a runtime source.
