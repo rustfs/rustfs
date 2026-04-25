@@ -20,7 +20,7 @@
 5. [x] 统一 scanner / background job 指标语义
 6. [x] 补齐 internode / system network 指标
 7. [x] 补齐 cluster usage / erasure set / config 指标
-8. [ ] 补齐 IAM / audit / notification 指标治理
+8. [x] 补齐 IAM / audit / notification 指标治理
 9. [ ] 补齐 replication 尤其 tagging 相关真实埋点
 10. [x] 重构 `rustfs.json` 主仪表盘信息架构
 11. [x] 对高成本查询增加 recording rules / 查询治理
@@ -350,15 +350,24 @@
 
 - audit / notification 的 runtime source 已经真实接入并由 `scheduler.rs` 周期上报
 - dashboard 已新增/重命名为 `Security and Delivery` 主题 row，便于继续收敛该主题面板
-- `cluster_iam` 仍未完成，当前仓库内尚未找到稳定、统一的 IAM runtime metrics source 来填充：
-  - `plugin_authn_service_*`
+- `cluster_iam` 已补齐真实 source：
+  - IAM sync 指标来自 `IamCache::load()` 的成功/失败/耗时统计
+  - OIDC plugin authn 指标来自统一 `ReqwestHttpClient` 出口的最近一分钟请求统计
+
+本轮完成范围：
+
+- `cluster_iam` 已补齐：
+  - `last_sync_duration_millis`
   - `since_last_sync_millis`
   - `sync_failures`
   - `sync_successes`
-
-未完成原因：
-
-- 该任务剩余部分受底层 source 缺失限制，不能安全伪造指标值
+  - `plugin_authn_service_failed_requests_minute`
+  - `plugin_authn_service_last_fail_seconds`
+  - `plugin_authn_service_last_succ_seconds`
+  - `plugin_authn_service_succ_avg_rtt_ms_minute`
+  - `plugin_authn_service_succ_max_rtt_ms_minute`
+  - `plugin_authn_service_total_requests_minute`
+- 已通过 `cargo check -p rustfs-obs -p rustfs-iam`
 
 ### 依赖关系
 
