@@ -605,7 +605,7 @@
       },
       "id": 11,
       "panels": [],
-      "title": "Requests",
+      "title": "API RED",
       "type": "row"
     },
     {
@@ -1566,7 +1566,7 @@
       },
       "id": 34,
       "panels": [],
-      "title": "Buckets",
+      "title": "Storage and Capacity",
       "type": "row"
     },
     {
@@ -2314,7 +2314,7 @@
       },
       "id": 12,
       "panels": [],
-      "title": "Resource Usage",
+      "title": "Host and Process USE",
       "type": "row"
     },
     {
@@ -4964,7 +4964,7 @@
       },
       "id": 114,
       "panels": [],
-      "title": "Delivery Targets",
+      "title": "Security and Delivery",
       "type": "row"
     },
     {
@@ -5463,7 +5463,7 @@
       },
       "id": 121,
       "panels": [],
-      "title": "Scanner Activity",
+      "title": "Background Services",
       "type": "row"
     },
     {
@@ -6954,7 +6954,7 @@
       },
       "id": 137,
       "panels": [],
-      "title": "System / Cluster Coverage Gap (By Subsystem)",
+      "title": "Debug / Raw Explorer",
       "type": "row"
     },
     {

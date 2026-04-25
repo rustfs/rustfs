@@ -1,0 +1,40 @@
+groups:
+  - name: rustfs-dashboard
+    interval: 30s
+    rules:
+      - record: rustfs:http_server_requests:rate5m
+        expr: sum by (job) (rate(rustfs_http_server_requests_total[5m]))
+
+      - record: rustfs:http_server_request_duration_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket[5m])))
+      - record: rustfs:http_server_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket[5m])))
+      - record: rustfs:http_server_request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket[5m])))
+
+      - record: rustfs:http_server_response_body_size_bytes:p50_5m
+        expr: histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket[5m])))
+      - record: rustfs:http_server_response_body_size_bytes:p95_5m
+        expr: histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket[5m])))
+      - record: rustfs:http_server_response_body_size_bytes:p99_5m
+        expr: histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket[5m])))
+
+      - record: rustfs:log_cleaner_runs:rate15m
+        expr: sum(rate(rustfs_log_cleaner_runs_total[15m]))
+      - record: rustfs:log_cleaner_failure_ratio:rate5m
+        expr: sum(rate(rustfs_log_cleaner_run_failures_total[5m])) / clamp_min(sum(rate(rustfs_log_cleaner_runs_total[5m])), 1e-9)
+      - record: rustfs:log_cleaner_rotation_failure_ratio:rate5m
+        expr: sum(rate(rustfs_log_cleaner_rotation_failures_total[5m])) / clamp_min(sum(rate(rustfs_log_cleaner_rotation_total[5m])), 1e-9)
+      - record: rustfs:log_cleaner_rotation_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(rustfs_log_cleaner_rotation_duration_seconds_bucket[5m])))
+      - record: rustfs:log_cleaner_compress_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(rustfs_log_cleaner_compress_duration_seconds_bucket[5m])))
+
+      - record: rustfs:scanner_objects_scanned:rate5m
+        expr: sum by (job) (rate(rustfs_scanner_objects_scanned_total[5m]))
+      - record: rustfs:scanner_directories_scanned:rate5m
+        expr: sum by (job) (rate(rustfs_scanner_directories_scanned_total[5m]))
+      - record: rustfs:scanner_buckets_scanned:rate5m
+        expr: sum by (job) (rate(rustfs_scanner_buckets_scanned_total[5m]))
+      - record: rustfs:scanner_cycles_success:rate5m
+        expr: sum by (job) (rate(rustfs_scanner_cycles_total{result="success"}[5m]))

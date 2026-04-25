@@ -22,8 +22,8 @@
 7. [x] 补齐 cluster usage / erasure set / config 指标
 8. [ ] 补齐 IAM / audit / notification 指标治理
 9. [ ] 补齐 replication 尤其 tagging 相关真实埋点
-10. [ ] 重构 `rustfs.json` 主仪表盘信息架构
-11. [ ] 对高成本查询增加 recording rules / 查询治理
+10. [x] 重构 `rustfs.json` 主仪表盘信息架构
+11. [x] 对高成本查询增加 recording rules / 查询治理
 12. [ ] 完成端到端验证与文档收尾
 
 ## Task 1: 建立指标 inventory 与 canonical naming contract
@@ -346,6 +346,20 @@
 - 安全与投递主题有独立 row
 - query 和 panel 名称语义一致
 
+当前状态：
+
+- audit / notification 的 runtime source 已经真实接入并由 `scheduler.rs` 周期上报
+- dashboard 已新增/重命名为 `Security and Delivery` 主题 row，便于继续收敛该主题面板
+- `cluster_iam` 仍未完成，当前仓库内尚未找到稳定、统一的 IAM runtime metrics source 来填充：
+  - `plugin_authn_service_*`
+  - `since_last_sync_millis`
+  - `sync_failures`
+  - `sync_successes`
+
+未完成原因：
+
+- 该任务剩余部分受底层 source 缺失限制，不能安全伪造指标值
+
 ### 依赖关系
 
 - 依赖 Task 3
@@ -376,6 +390,20 @@
 
 - `Bucket Replication Proxy Tagging Requests` 面板不再长期为 0
 - `Bucket Replication Target Latency`、失败数、失败字节、吞吐在 bucket/target 维度语义清晰
+
+当前状态：
+
+- replication 非 tagging 相关指标已通过 `GLOBAL_REPLICATION_STATS` 和 obs collectors 接入
+- dashboard 中 replication 相关主面板已保留并可继续优化
+- tagging proxy metrics 仍未完成，当前底层 `ProxyMetric` 只统计：
+  - `GetObject`
+  - `PutObject`
+  - `HeadObject`
+
+未完成原因：
+
+- 目前底层 replication runtime 没有单独的 `GetObjectTagging` / `PutObjectTagging` / `DeleteObjectTagging` 真实计数源
+- 在 source 未建立前，不能把这部分改成“看似有值”的伪指标
 
 ### 依赖关系
 
@@ -411,6 +439,18 @@
 - panel story 更完整
 - 所有关键 panel 有 description / unit / threshold
 
+本轮完成范围：
+
+- `rustfs.json` 已将关键 row 标题收敛到新的信息架构：
+  - `API RED`
+  - `Storage and Capacity`
+  - `Host and Process USE`
+  - `Security and Delivery`
+  - `Background Services`
+  - `Debug / Raw Explorer`
+- request 主题 panel 已对齐新的 `rustfs_http_server_*` 指标族
+- 主视图 request 面板已避免继续查询旧的 `rustfs_api_requests_total` / `rustfs_request_*` 族
+
 ### 依赖关系
 
 - 依赖 Task 4 到 Task 9 的至少一部分完成
@@ -438,6 +478,17 @@
 - 主 dashboard 默认加载更快
 - Prometheus 查询负载下降
 - quantile 面板仍保留足够精度与可读性
+
+本轮完成范围：
+
+- 已新增 `.docker/observability/prometheus-rules/rustfs-dashboard.yml`
+- 已在 `.docker/observability/prometheus.yml` 中接入 `rules_files`
+- 已为以下主题增加 recording rules：
+  - request rate / request duration quantiles
+  - response body size quantiles
+  - log cleaner ratios / p95
+  - scanner throughput / scanner success cycles
+- `rustfs.json` 中已将 request / log cleaner / scanner 的部分高成本查询切换为 recording rules
 
 ### 依赖关系
 
