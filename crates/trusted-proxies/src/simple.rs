@@ -360,8 +360,9 @@ fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_REAL_IP, TrustedProxyImplementation, TrustedProxyLayer, forwarded_client_ip, is_internal_ip,
-        parse_env_bool, parse_implementation, parse_ip_token, resolve_client_info,
+        ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_REAL_IP, TrustedProxyImplementation,
+        TrustedProxyLayer, forwarded_client_ip, is_internal_ip, parse_env_bool, parse_implementation, parse_ip_token,
+        resolve_client_info,
     };
     use crate::ClientInfo;
     use axum::http::{HeaderMap, HeaderValue};
