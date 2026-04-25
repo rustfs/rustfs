@@ -2578,6 +2578,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
+        let has_tagging_replication = !put_opts.user_tags.is_empty();
         if let Some(err) = if is_multipart {
             drop(gr);
             let result = replicate_object_with_multipart(MultipartReplicationContext {
@@ -2593,6 +2594,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             })
             .await;
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
             result.err()
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
@@ -2602,6 +2606,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()));
             record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
             result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
@@ -2867,6 +2874,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
 
+            let has_tagging_replication = !put_opts.user_tags.is_empty();
             if let Some(err) = if is_multipart {
                 drop(gr);
                 let result = replicate_object_with_multipart(MultipartReplicationContext {
@@ -2882,6 +2890,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 })
                 .await;
                 record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
                 result.err()
             } else {
                 gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
@@ -2891,6 +2902,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()));
                 record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
                 result.err()
             } {
                 rinfo.replication_status = ReplicationStatusType::Failed;

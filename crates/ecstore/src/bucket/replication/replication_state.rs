@@ -491,6 +491,8 @@ pub struct ProxyMetric {
     pub get_failed: i64,
     pub put_total: i64,
     pub put_failed: i64,
+    pub put_tag_total: i64,
+    pub put_tag_failed: i64,
     pub head_total: i64,
     pub head_failed: i64,
 }
@@ -501,6 +503,8 @@ impl ProxyMetric {
         self.get_failed += other.get_failed;
         self.put_total += other.put_total;
         self.put_failed += other.put_failed;
+        self.put_tag_total += other.put_tag_total;
+        self.put_tag_failed += other.put_tag_failed;
         self.head_total += other.head_total;
         self.head_failed += other.head_failed;
     }
@@ -531,6 +535,12 @@ impl ProxyStatsCache {
                 metric.put_total += 1;
                 if is_err {
                     metric.put_failed += 1;
+                }
+            }
+            "PutObjectTagging" => {
+                metric.put_tag_total += 1;
+                if is_err {
+                    metric.put_tag_failed += 1;
                 }
             }
             "HeadObject" => {
