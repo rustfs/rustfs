@@ -134,6 +134,12 @@ pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 /// Environment variable to explicitly bypass local physical disk independence checks.
 pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
 
+/// Compatibility alias used by legacy MinIO CI pipelines.
+///
+/// RustFS keeps this alias for backward compatibility only. Prefer
+/// `ENV_UNSAFE_BYPASS_DISK_CHECK` for explicit bypass control.
+pub const ENV_MINIO_CI: &str = "MINIO_CI";
+
 /// Default flag value for bypassing local physical disk independence checks.
 pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
 

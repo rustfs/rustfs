@@ -17,7 +17,7 @@ use crate::{
     disks_layout::DisksLayout,
     global::global_rustfs_port,
 };
-use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_UNSAFE_BYPASS_DISK_CHECK};
+use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_MINIO_CI, ENV_UNSAFE_BYPASS_DISK_CHECK};
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
@@ -669,7 +669,11 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         return Ok(());
     }
 
-    if rustfs_utils::get_env_bool(ENV_UNSAFE_BYPASS_DISK_CHECK, DEFAULT_UNSAFE_BYPASS_DISK_CHECK) {
+    // Compatibility behavior:
+    // - canonical key: RUSTFS_UNSAFE_BYPASS_DISK_CHECK
+    // - legacy CI alias: MINIO_CI
+    // If both are set, `get_env_bool_with_aliases` keeps canonical key precedence.
+    if rustfs_utils::get_env_bool_with_aliases(ENV_UNSAFE_BYPASS_DISK_CHECK, &[ENV_MINIO_CI], DEFAULT_UNSAFE_BYPASS_DISK_CHECK) {
         warn!(
             env = ENV_UNSAFE_BYPASS_DISK_CHECK,
             local_paths = ?local_paths,
@@ -1544,6 +1548,26 @@ mod test {
 
             let ret = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout).await;
             assert!(ret.is_ok(), "expected bypassed disk validation to succeed, got {ret:?}");
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[serial]
+    #[tokio::test]
+    async fn allow_shared_local_physical_disks_with_minio_ci_alias() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None), (ENV_MINIO_CI, Some("1"))], async {
+            let dir = tempdir().unwrap();
+            let disk1 = dir.path().join("disk1");
+            let disk2 = dir.path().join("disk2");
+            std::fs::create_dir_all(&disk1).unwrap();
+            std::fs::create_dir_all(&disk2).unwrap();
+
+            let args = vec![disk1.to_string_lossy().into_owned(), disk2.to_string_lossy().into_owned()];
+            let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+            let ret = EndpointServerPools::create_server_endpoints("0.0.0.0:9000", &layout).await;
+            assert!(ret.is_ok(), "expected MINIO_CI alias to bypass disk validation, got {ret:?}");
         })
         .await;
     }
