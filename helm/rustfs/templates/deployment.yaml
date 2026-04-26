@@ -75,13 +75,19 @@ spec:
             - sh
             - -c
             - |
-              mkdir -p /data /mnt/rustfs/logs
+              set -e
+              mkdir -p /data
+              {{- if $logDir }}
+              mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
+              {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if $logDir }}
             - name: logs
               mountPath: /mnt/rustfs
+            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -119,7 +125,7 @@ spec:
               subPath: ca.crt
             - name: client-cert
               mountPath: /opt/tls/client_cert.pem
-              subPath: client_cert.pem 
+              subPath: client_cert.pem
             - name: client-cert
               mountPath: /opt/tls/client_key.pem
               subPath: client_key.pem
@@ -127,9 +133,11 @@ spec:
               mountPath: /opt/tls/client_ca.crt
               subPath: client_ca.crt
             {{- end }}
+            {{- if $logDir }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
+            {{- end }}
             - name: data
               mountPath: /data
       volumes:
@@ -155,6 +163,7 @@ spec:
               - key: ca.crt
                 path: client_ca.crt
       {{- end }}
+      {{- if $logDir }}
         - name: logs
           persistentVolumeClaim:
             {{- if .Values.mode.standalone.existingClaim.logsClaim }}
@@ -162,6 +171,7 @@ spec:
             {{- else }}
             claimName: {{ include "rustfs.fullname" $ }}-logs
             {{- end }}
+      {{- end }}
         - name: data
           persistentVolumeClaim:
             {{- if .Values.mode.standalone.existingClaim.dataClaim }}

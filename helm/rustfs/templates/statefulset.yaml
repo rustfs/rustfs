@@ -74,13 +74,17 @@ spec:
             - |
               set -e
               mkdir -p /data
+              {{- if $logDir }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
+              {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if $logDir }}
             - name: logs
               mountPath: /mnt/rustfs
+            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -126,9 +130,11 @@ spec:
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
             {{- end }}
+            {{- if $logDir }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
+            {{- end }}
             - name: data
               mountPath: /data
       {{- if .Values.mtls.enabled }}
@@ -155,6 +161,7 @@ spec:
                 path: client_ca.crt
       {{- end }}
   volumeClaimTemplates:
+    {{- if $logDir }}
     - metadata:
         name: logs
         labels:
@@ -167,6 +174,7 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
+    {{- end }}
     - metadata:
         name: data
         labels:
