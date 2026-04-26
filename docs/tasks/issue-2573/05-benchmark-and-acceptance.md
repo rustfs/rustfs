@@ -47,6 +47,20 @@ Validate both peak memory behavior and post-benchmark cooldown behavior without 
    - reclaim skipped reasons
 4. Confirm cooldown happens without restart.
 
+## Helper Script
+
+Use:
+
+```bash
+scripts/run_issue_2573_acceptance.sh --host http://127.0.0.1:9000 --pid <rustfs-pid>
+```
+
+Artifacts include:
+
+- per-profile warp logs
+- per-profile RSS during load
+- per-profile RSS during cooldown
+
 ## Acceptance
 
 - post-benchmark memory returns close to `3.5GiB`
