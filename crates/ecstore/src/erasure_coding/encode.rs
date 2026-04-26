@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
-const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 8;
 
 fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {

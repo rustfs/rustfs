@@ -382,6 +382,13 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     true
 }
 
+fn object_seek_support_threshold() -> usize {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
+    )
+}
+
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
@@ -1247,11 +1254,9 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
+        use rustfs_io_metrics::record_zero_copy_read;
         let read_duration = read_start.elapsed();
-        let estimated_saved = (info.size * 2) as usize;
         record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
-        record_memory_copy_saved(estimated_saved);
 
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
 
@@ -1519,7 +1524,7 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         if encryption_applied {
-            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+            let seekable_object_size_threshold = object_seek_support_threshold();
             let should_buffer_encrypted_object = response_content_length > 0
                 && response_content_length <= seekable_object_size_threshold as i64
                 && part_number.is_none()
@@ -1550,7 +1555,7 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
-        let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+        let seekable_object_size_threshold = object_seek_support_threshold();
         let should_provide_seek_support = response_content_length > 0
             && response_content_length <= seekable_object_size_threshold as i64
             && part_number.is_none()

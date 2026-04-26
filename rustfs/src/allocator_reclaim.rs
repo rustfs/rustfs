@@ -54,9 +54,19 @@ fn current_delete_tail_activity() -> u64 {
     crate::delete_tail_activity::current_delete_tail_activity()
 }
 
+fn current_scanner_activity() -> u64 {
+    rustfs_scanner::current_scanner_activity()
+}
+
+fn current_heal_activity() -> u64 {
+    rustfs_heal::current_heal_active_tasks() + rustfs_heal::current_heal_queue_length()
+}
+
 fn reclaimable_work_inflight() -> u64 {
     active_requests()
         + current_delete_tail_activity()
+        + current_scanner_activity()
+        + current_heal_activity()
         + rustfs_io_metrics::current_ec_encode_inflight_bytes()
         + rustfs_io_metrics::current_get_object_buffered_bytes()
 }
@@ -77,6 +87,8 @@ fn collect_allocator_memory(force: bool) -> Result<(), String> {
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn collect_allocator_memory(_force: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = tikv_jemalloc_ctl::background_thread::write(true);
     tikv_jemalloc_ctl::epoch::advance().map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -144,11 +156,15 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
                 _ = ticker.tick() => {
                     let active_requests = active_requests();
                     let delete_tail_activity = current_delete_tail_activity();
+                    let scanner_activity = current_scanner_activity();
+                    let heal_activity = current_heal_activity();
                     let ec_inflight_bytes = rustfs_io_metrics::current_ec_encode_inflight_bytes();
                     let get_buffered_bytes = rustfs_io_metrics::current_get_object_buffered_bytes();
                     let reclaimable_inflight = reclaimable_work_inflight();
                     gauge!("rustfs_memory_allocator_reclaim_active_requests").set(active_requests as f64);
                     gauge!("rustfs_memory_allocator_reclaim_delete_tail_activity_current").set(delete_tail_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_scanner_activity_current").set(scanner_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_heal_activity_current").set(heal_activity as f64);
                     gauge!("rustfs_memory_allocator_reclaim_ec_inflight_bytes_current").set(ec_inflight_bytes as f64);
                     gauge!("rustfs_memory_allocator_reclaim_get_buffered_bytes_current").set(get_buffered_bytes as f64);
                     gauge!("rustfs_memory_allocator_reclaim_reclaimable_work_current").set(reclaimable_inflight as f64);

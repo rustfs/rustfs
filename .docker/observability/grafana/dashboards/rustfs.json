@@ -2534,7 +2534,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rustfs_system_process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum by (job) (rustfs_system_process_resident_memory_bytes{job=~\"$job\"}) or sum by (job) (rustfs_memory_process_resident_bytes{job=~\"$job\"})",
           "legendFormat": "process rss - {{job}}",
           "range": true,
           "refId": "A"
@@ -2545,8 +2545,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_system_memory_used_bytes{job=~\"$job\"}",
-          "legendFormat": "system used - {{job}}",
+          "expr": "sum by (job) (rustfs_memory_process_virtual_bytes{job=~\"$job\"})",
+          "legendFormat": "process virtual - {{job}}",
           "range": true,
           "refId": "B"
         },
@@ -2556,13 +2556,24 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_system_memory_used_perc{job=~\"$job\"}",
-          "legendFormat": "system used percent - {{job}}",
+          "expr": "sum by (job) (rustfs_memory_cgroup_anon_bytes{job=~\"$job\"})",
+          "legendFormat": "anon split - {{job}}",
           "range": true,
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_file_bytes{job=~\"$job\"})",
+          "legendFormat": "file split - {{job}}",
+          "range": true,
+          "refId": "D"
         }
       ],
-      "title": "Memory Usage",
+      "title": "Memory Split",
       "type": "timeseries"
     },
     {

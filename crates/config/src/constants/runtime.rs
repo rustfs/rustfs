@@ -64,4 +64,5 @@ pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
 /// When an object is smaller than this size, rustfs will provide seek support.
 ///
 /// Default is set to 10MB.
+pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD";
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;
