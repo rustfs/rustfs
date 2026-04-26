@@ -122,6 +122,10 @@ fn record_active_http_requests(delta: i64) {
     gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
 }
 
+pub(crate) fn active_http_requests() -> u64 {
+    ACTIVE_HTTP_REQUESTS.load(Ordering::Relaxed)
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,

@@ -12,6 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use super::{module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,7 @@ fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
 }
 
 pub fn refresh_audit_module_enabled() -> bool {
-    let enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_AUDIT_ENABLE, rustfs_config::DEFAULT_AUDIT_ENABLE);
+    let enabled = resolve_audit_module_state().enabled;
     AUDIT_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
     enabled
 }
@@ -56,11 +57,15 @@ fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
 /// If not configured, it skips the initialization.
 /// It also handles cases where the audit system is already running or if the global configuration is not loaded.
 pub async fn start_audit_system() -> AuditResult<()> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!("Failed to refresh persisted audit module switch from store: {}", err);
+    }
+
     let enabled = refresh_audit_module_enabled();
     if !enabled {
         info!(
             target: "rustfs::main::start_audit_system",
-            "Audit module is disabled by RUSTFS_AUDIT_ENABLE=false, audit system initialization is skipped."
+            "Audit module is disabled, audit system initialization is skipped. Enable the audit module first."
         );
         return Ok(());
     }
@@ -106,34 +111,69 @@ pub async fn start_audit_system() -> AuditResult<()> {
         target: "rustfs::main::start_audit_system",
         "Audit subsystem configuration detected and started initializing the audit system."
     );
-    // 3. Initialize and start the audit system
-    let system = init_audit_system();
-    // Check if the audit system is already running
-    let state = system.get_state().await;
-    if state == AuditSystemState::Running {
-        warn!(
-            target: "rustfs::main::start_audit_system",
-            "The audit system is running, skip repeated initialization."
-        );
-        return Err(AuditError::AlreadyInitialized);
-    }
-    // Preparation before starting
-    match system.start(server_config).await {
-        Ok(_) => {
-            info!(
-                target: "rustfs::main::start_audit_system",
-                "Audit system started successfully with time: {}.",
-                jiff::Zoned::now()
-            );
-            Ok(())
+
+    if let Some(system) = audit_system() {
+        match system.get_state().await {
+            AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
+                // Match notify behavior: prefer reloading the existing singleton
+                // instead of constructing a second lifecycle path on re-enable.
+                match system.reload_config(server_config).await {
+                    Ok(()) => {
+                        info!(
+                            target: "rustfs::main::start_audit_system",
+                            "Audit system reloaded successfully with time: {}.",
+                            jiff::Zoned::now()
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "rustfs::main::start_audit_system",
+                            "Audit system reload failed: {:?}",
+                            e
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            AuditSystemState::Stopped | AuditSystemState::Stopping => match system.start(server_config).await {
+                Ok(()) => {
+                    info!(
+                        target: "rustfs::main::start_audit_system",
+                        "Audit system started successfully with time: {}.",
+                        jiff::Zoned::now()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(
+                        target: "rustfs::main::start_audit_system",
+                        "Audit system startup failed: {:?}",
+                        e
+                    );
+                    Err(e)
+                }
+            },
         }
-        Err(e) => {
-            warn!(
-                target: "rustfs::main::start_audit_system",
-                "Audit system startup failed: {:?}",
-                e
-            );
-            Err(e)
+    } else {
+        let system = init_audit_system();
+        match system.start(server_config).await {
+            Ok(()) => {
+                info!(
+                    target: "rustfs::main::start_audit_system",
+                    "Audit system started successfully with time: {}.",
+                    jiff::Zoned::now()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    target: "rustfs::main::start_audit_system",
+                    "Audit system startup failed: {:?}",
+                    e
+                );
+                Err(e)
+            }
         }
     }
 }

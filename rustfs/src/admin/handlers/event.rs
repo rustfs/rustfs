@@ -17,14 +17,17 @@ use crate::admin::{
     handlers::target_descriptor::{
         AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
         collect_validated_key_values as shared_collect_validated_key_values,
-        merge_target_endpoints as shared_merge_target_endpoints,
+        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
     },
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::{
+    ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled,
+    refresh_persisted_module_switches_from_store,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -167,6 +170,17 @@ fn target_mutation_block_reason(config: &Config, target_type: &str, target_name:
     )
 }
 
+async fn notification_target_operation_block_reason(action: &str) -> Option<String> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!(
+            error = %err,
+            "failed to reload persisted module switches before checking notification target operation gating"
+        );
+    }
+    refresh_notify_module_enabled();
+    target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
+}
+
 fn merge_notification_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<NotificationEndpoint> {
     shared_merge_target_endpoints(&notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
@@ -197,6 +211,9 @@ impl Operation for NotificationTarget {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
         let ns = get_notification_system()?;
         let config_snapshot = ns.config.read().await.clone();
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
@@ -291,6 +308,13 @@ impl Operation for ListTargetsArns {
         let span = Span::current();
         let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason(
+            "querying notification target ARNs for bucket associations from the console",
+        )
+        .await
+        {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
         let ns = get_notification_system()?;
 
         let targets = ns.get_target_values().await;
@@ -336,6 +360,9 @@ impl Operation for RemoveNotificationTarget {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
         let ns = get_notification_system()?;
         let config_snapshot = ns.config.read().await.clone();
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
@@ -544,6 +571,29 @@ mod tests {
     }
 
     #[test]
+    fn notification_target_operation_block_reason_requires_notify_module_enable() {
+        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"), || {
+            let reason = futures::executor::block_on(notification_target_operation_block_reason(
+                "managing notification targets from the console",
+            ));
+            assert!(reason.is_some());
+            assert!(reason.unwrap().contains("set RUSTFS_NOTIFY_ENABLE=true"));
+        });
+    }
+
+    #[test]
+    fn notification_target_operation_block_reason_allows_when_notify_module_enabled() {
+        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
+            assert!(
+                futures::executor::block_on(notification_target_operation_block_reason(
+                    "managing notification targets from the console"
+                ))
+                .is_none()
+            );
+        });
+    }
+
+    #[test]
     fn target_mutation_block_reason_rejects_mixed_target() {
         with_var("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook"), || {
             let config = Config(HashMap::from([(
@@ -706,6 +756,11 @@ mod tests {
             "notification target writes should require SetBucketTargetAction"
         );
         assert!(
+            put_block.contains("notification_target_operation_block_reason(")
+                && put_block.contains("\"managing notification targets from the console\""),
+            "notification target writes should reject requests when the notify module is disabled"
+        );
+        assert!(
             list_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
             "notification target list should require GetBucketTargetAction"
         );
@@ -714,8 +769,18 @@ mod tests {
             "notification target arn listing should require GetBucketTargetAction"
         );
         assert!(
+            arns_block.contains("notification_target_operation_block_reason(")
+                && arns_block.contains("\"querying notification target ARNs for bucket associations from the console\""),
+            "notification target arn listing should reject requests when the notify module is disabled"
+        );
+        assert!(
             delete_block.contains("authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
             "notification target deletion should require SetBucketTargetAction"
+        );
+        assert!(
+            delete_block.contains("notification_target_operation_block_reason(")
+                && delete_block.contains("\"managing notification targets from the console\""),
+            "notification target deletion should reject requests when the notify module is disabled"
         );
     }
 
