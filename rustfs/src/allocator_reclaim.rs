@@ -142,20 +142,31 @@ fn run_allocator_reclaim(force: bool) {
 }
 
 pub fn init_allocator_reclaim(ctx: CancellationToken) {
+    let backend = allocator_backend();
     let enabled = rustfs_utils::get_env_bool(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_ENABLED,
         rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_ENABLED,
     );
     gauge!("rustfs_memory_allocator_reclaim_enabled").set(if enabled { 1.0 } else { 0.0 });
-    counter!("rustfs_memory_allocator_backend_info", "backend" => allocator_backend().to_string()).increment(1);
+    counter!("rustfs_memory_allocator_backend_info", "backend" => backend.to_string()).increment(1);
 
     if !enabled {
         debug!("allocator reclaim loop disabled");
         return;
     }
 
-    let force =
+    let configured_force =
         rustfs_utils::get_env_bool(rustfs_config::ENV_ALLOCATOR_RECLAIM_FORCE, rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_FORCE);
+    let force = if backend == "jemalloc" && configured_force {
+        warn!(
+            backend,
+            env = rustfs_config::ENV_ALLOCATOR_RECLAIM_FORCE,
+            "allocator reclaim force mode is not supported on jemalloc backend; ignoring configured force flag"
+        );
+        false
+    } else {
+        configured_force
+    };
     let idle_intervals = rustfs_utils::get_env_u64(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS,
         rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS,

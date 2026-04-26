@@ -530,5 +530,8 @@ fi
 # To run in release mode, use the following line
 #cargo run --profile release --bin rustfs
 
-# To run in release mode, use the following line
+# To run in debug mode, use the following line
+#cargo run --bin rustfs
+
+# Default local run mode: release
 cargo run --profile release --bin rustfs

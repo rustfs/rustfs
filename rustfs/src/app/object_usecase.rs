@@ -119,7 +119,7 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -383,10 +383,13 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
 }
 
 fn object_seek_support_threshold() -> usize {
-    rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
-    )
+    static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
+        )
+    })
 }
 
 #[cfg(test)]
