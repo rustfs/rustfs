@@ -36,7 +36,7 @@ use bytes::Bytes;
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
@@ -252,6 +252,38 @@ pin_project! {
         md5: Md5Context,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
+    }
+}
+
+pin_project! {
+    struct MemoryTrackedBytesStream {
+        bytes: Bytes,
+        emitted: bool,
+        _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    }
+}
+
+impl MemoryTrackedBytesStream {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+        Self {
+            bytes,
+            emitted: false,
+            _guard: guard,
+        }
+    }
+}
+
+impl futures::Stream for MemoryTrackedBytesStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.emitted {
+            return std::task::Poll::Ready(None);
+        }
+
+        *this.emitted = true;
+        std::task::Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
 
@@ -994,8 +1026,10 @@ impl DefaultObjectUsecase {
     }
 
     fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(buf.len());
+        let bytes = Bytes::from(buf);
         Some(StreamingBlob::wrap(bytes_stream(
-            stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(buf)) }),
+            MemoryTrackedBytesStream::new(bytes, guard),
             response_content_length as usize,
         )))
     }

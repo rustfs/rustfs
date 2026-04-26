@@ -217,7 +217,10 @@ impl Erasure {
                     Ok(n) if n > 0 => {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
+                        let queued_bytes = res.iter().map(Bytes::len).sum::<usize>();
+                        rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
+                            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
@@ -250,6 +253,8 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
+            let queued_bytes = block.iter().map(Bytes::len).sum::<usize>();
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
                 break;

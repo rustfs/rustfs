@@ -31,6 +31,7 @@ use crate::disk::{
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
+use metrics::counter;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -64,6 +65,9 @@ use uuid::Uuid;
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE";
+const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
+const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -77,6 +81,117 @@ pub struct FormatInfo {
 pub enum InternalBuf<'a> {
     Ref(&'a [u8]),
     Owned(Bytes),
+}
+
+struct FileCacheReclaimWriter {
+    inner: File,
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    reclaimed: bool,
+}
+
+impl FileCacheReclaimWriter {
+    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        Self {
+            inner,
+            reclaim_len,
+            reclaim_on_shutdown,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let fd = self.inner.as_raw_fd();
+        // SAFETY: `fd` is owned by the live `tokio::fs::File` stored in `self.inner`.
+        // `posix_fadvise` only advises the kernel to drop file-backed cache pages for
+        // this file range and does not invalidate Rust-side memory invariants.
+        let ret = unsafe { libc::posix_fadvise(fd, 0, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
+        if ret != 0 {
+            return Err(std::io::Error::from_raw_os_error(ret));
+        }
+
+        self.reclaimed = true;
+        counter!("rustfs_page_cache_reclaim_requests_total", "kind" => "write".to_string(), "result" => "ok".to_string())
+            .increment(1);
+        counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => "write".to_string()).increment(self.reclaim_len as u64);
+        metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => "write".to_string())
+            .record(started.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncWrite for FileCacheReclaimWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.inner).poll_shutdown(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                if let Err(err) = self.reclaim_file_cache() {
+                    counter!(
+                        "rustfs_page_cache_reclaim_requests_total",
+                        "kind" => "write".to_string(),
+                        "result" => "err".to_string()
+                    )
+                    .increment(1);
+                    return std::task::Poll::Ready(Err(err));
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
+    if file_size <= 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, false) {
+        return false;
+    }
+
+    let threshold =
+        rustfs_utils::get_env_usize(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD);
+    file_size as usize >= threshold
 }
 
 pub struct LocalDisk {
@@ -1847,8 +1962,9 @@ impl DiskAPI for LocalDisk {
         let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY)
             .await
             .map_err(to_file_error)?;
+        let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
 
-        Ok(Box::new(f))
+        Ok(Box::new(FileCacheReclaimWriter::new(f, _file_size.max(0) as usize, reclaim_on_shutdown)))
 
         // Ok(())
     }
@@ -3371,5 +3487,19 @@ mod test {
 
             assert_eq!(normalize_path_components("C:\\a\\..\\b"), PathBuf::from("C:\\b"));
         }
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_write_respects_env_and_threshold() {
+        temp_env::with_var_unset(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, Some("true"), || {
+            temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_write(1024));
+            });
+        });
     }
 }

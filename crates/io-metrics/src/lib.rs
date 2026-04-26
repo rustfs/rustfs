@@ -49,6 +49,8 @@
 #[macro_use]
 extern crate metrics;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 // Public modules
 pub mod adaptive_ttl;
 pub mod autotuner;
@@ -136,6 +138,33 @@ pub use config::{
 // Re-exports for convenience
 pub use collector::MetricsCollector;
 pub use performance::PerformanceMetrics;
+
+static EC_ENCODE_INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
+static GET_OBJECT_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackedMemoryGauge {
+    GetObjectBufferedBytes,
+}
+
+/// Drop-based guard for tracked in-memory payloads.
+#[derive(Debug)]
+pub struct MemoryGaugeGuard {
+    gauge: TrackedMemoryGauge,
+    bytes: u64,
+}
+
+impl Drop for MemoryGaugeGuard {
+    fn drop(&mut self) {
+        match self.gauge {
+            TrackedMemoryGauge::GetObjectBufferedBytes => {
+                let previous = GET_OBJECT_BUFFERED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+                let next = previous.saturating_sub(self.bytes);
+                gauge!("rustfs_get_object_buffered_bytes_current").set(next as f64);
+            }
+        }
+    }
+}
 
 /// Record GetObject request start.
 #[inline(always)]
@@ -544,6 +573,74 @@ pub fn record_memory_usage(used_bytes: u64, total_bytes: u64) {
     }
 }
 
+/// Record process-level memory split metrics.
+#[inline(always)]
+pub fn record_process_memory_split(resident_bytes: u64, virtual_bytes: u64) {
+    gauge!("rustfs_memory_process_resident_bytes").set(resident_bytes as f64);
+    gauge!("rustfs_memory_process_virtual_bytes").set(virtual_bytes as f64);
+}
+
+/// Record cgroup memory split metrics when available.
+#[inline(always)]
+pub fn record_cgroup_memory_split(
+    current_bytes: Option<u64>,
+    limit_bytes: Option<u64>,
+    anon_bytes: Option<u64>,
+    file_bytes: Option<u64>,
+    active_file_bytes: Option<u64>,
+    inactive_file_bytes: Option<u64>,
+) {
+    if let Some(current_bytes) = current_bytes {
+        gauge!("rustfs_memory_cgroup_current_bytes").set(current_bytes as f64);
+    }
+    if let Some(limit_bytes) = limit_bytes {
+        gauge!("rustfs_memory_cgroup_limit_bytes").set(limit_bytes as f64);
+    }
+    if let Some(anon_bytes) = anon_bytes {
+        gauge!("rustfs_memory_cgroup_anon_bytes").set(anon_bytes as f64);
+    }
+    if let Some(file_bytes) = file_bytes {
+        gauge!("rustfs_memory_cgroup_file_bytes").set(file_bytes as f64);
+    }
+    if let Some(active_file_bytes) = active_file_bytes {
+        gauge!("rustfs_memory_cgroup_active_file_bytes").set(active_file_bytes as f64);
+    }
+    if let Some(inactive_file_bytes) = inactive_file_bytes {
+        gauge!("rustfs_memory_cgroup_inactive_file_bytes").set(inactive_file_bytes as f64);
+    }
+}
+
+/// Track encoded bytes currently queued between erasure encode and disk writers.
+#[inline(always)]
+pub fn add_ec_encode_inflight_bytes(bytes: usize) {
+    let next = EC_ENCODE_INFLIGHT_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+}
+
+/// Remove encoded bytes from the tracked erasure encode in-flight gauge.
+#[inline(always)]
+pub fn remove_ec_encode_inflight_bytes(bytes: usize) {
+    let previous = EC_ENCODE_INFLIGHT_BYTES.fetch_sub(bytes as u64, Ordering::Relaxed);
+    let next = previous.saturating_sub(bytes as u64);
+    gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
+}
+
+/// Track whole-object buffering on the GET path.
+#[inline(always)]
+pub fn track_get_object_buffered_bytes(bytes: usize) -> Option<MemoryGaugeGuard> {
+    if bytes == 0 {
+        return None;
+    }
+
+    let next = GET_OBJECT_BUFFERED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+    gauge!("rustfs_get_object_buffered_bytes_current").set(next as f64);
+
+    Some(MemoryGaugeGuard {
+        gauge: TrackedMemoryGauge::GetObjectBufferedBytes,
+        bytes: bytes as u64,
+    })
+}
+
 /// Record CPU usage.
 ///
 /// # Arguments
@@ -756,6 +853,34 @@ mod tests {
     fn test_record_memory_usage() {
         record_memory_usage(1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
         record_memory_usage(2 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_record_process_memory_split() {
+        record_process_memory_split(1024, 2048);
+        record_process_memory_split(4096, 8192);
+    }
+
+    #[test]
+    fn test_record_cgroup_memory_split() {
+        record_cgroup_memory_split(Some(1), Some(2), Some(3), Some(4), Some(5), Some(6));
+        record_cgroup_memory_split(None, None, None, None, None, None);
+    }
+
+    #[test]
+    fn test_ec_encode_inflight_bytes_tracking() {
+        remove_ec_encode_inflight_bytes(EC_ENCODE_INFLIGHT_BYTES.load(Ordering::Relaxed) as usize);
+        add_ec_encode_inflight_bytes(1024);
+        add_ec_encode_inflight_bytes(2048);
+        remove_ec_encode_inflight_bytes(1024);
+        remove_ec_encode_inflight_bytes(2048);
+    }
+
+    #[test]
+    fn test_get_object_buffered_bytes_guard() {
+        drop(track_get_object_buffered_bytes(1024));
+        let guard = track_get_object_buffered_bytes(2048);
+        drop(guard);
     }
 
     #[test]
