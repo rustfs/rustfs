@@ -19,13 +19,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLED";
-const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
-const ENV_ALLOCATOR_RECLAIM_FORCE: &str = "RUSTFS_ALLOCATOR_RECLAIM_FORCE";
-const ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS: &str = "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS";
-const DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS: u64 = 30;
-const DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS: u64 = 3;
-
 pub fn allocator_backend() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     {
@@ -126,7 +119,10 @@ fn run_allocator_reclaim(force: bool) {
 }
 
 pub fn init_allocator_reclaim(ctx: CancellationToken) {
-    let enabled = rustfs_utils::get_env_bool(ENV_ALLOCATOR_RECLAIM_ENABLED, false);
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_ALLOCATOR_RECLAIM_ENABLED,
+        rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_ENABLED,
+    );
     gauge!("rustfs_memory_allocator_reclaim_enabled").set(if enabled { 1.0 } else { 0.0 });
     counter!("rustfs_memory_allocator_backend_info", "backend" => allocator_backend().to_string()).increment(1);
 
@@ -135,11 +131,19 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
         return;
     }
 
-    let force = rustfs_utils::get_env_bool(ENV_ALLOCATOR_RECLAIM_FORCE, true);
-    let idle_intervals =
-        rustfs_utils::get_env_u64(ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS, DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS).max(1);
+    let force =
+        rustfs_utils::get_env_bool(rustfs_config::ENV_ALLOCATOR_RECLAIM_FORCE, rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_FORCE);
+    let idle_intervals = rustfs_utils::get_env_u64(
+        rustfs_config::ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS,
+        rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS,
+    )
+    .max(1);
     let interval = Duration::from_secs(
-        rustfs_utils::get_env_u64(ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS, DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS).max(1),
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS,
+            rustfs_config::DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS,
+        )
+        .max(1),
     );
 
     tokio::spawn(async move {

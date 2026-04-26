@@ -65,10 +65,6 @@ use uuid::Uuid;
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
-const ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE";
-const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE";
-const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
-const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -93,13 +89,25 @@ struct FileCacheReclaimWriter {
 
 struct FileCacheReclaimReader {
     inner: File,
+    reclaim_offset: u64,
     reclaim_len: usize,
     reclaim_on_drop: bool,
     reclaimed: bool,
 }
 
+fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "ok".to_string()).increment(1);
+    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind.to_string()).increment(reclaim_len as u64);
+    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind.to_string())
+        .record(started.elapsed().as_secs_f64());
+}
+
+fn record_file_cache_reclaim_error(kind: &'static str) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+}
+
 impl FileCacheReclaimReader {
-    fn new(inner: File, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
@@ -107,6 +115,7 @@ impl FileCacheReclaimReader {
 
         Self {
             inner,
+            reclaim_offset,
             reclaim_len,
             reclaim_on_drop,
             reclaimed: false,
@@ -125,17 +134,14 @@ impl FileCacheReclaimReader {
         let fd = self.inner.as_raw_fd();
         // SAFETY: `fd` remains owned by `self.inner`, and `posix_fadvise`
         // only advises kernel cache behavior for this file range.
-        let ret = unsafe { libc::posix_fadvise(fd, 0, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
+        let ret =
+            unsafe { libc::posix_fadvise(fd, self.reclaim_offset as i64, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
         if ret != 0 {
             return Err(std::io::Error::from_raw_os_error(ret));
         }
 
         self.reclaimed = true;
-        counter!("rustfs_page_cache_reclaim_requests_total", "kind" => "read".to_string(), "result" => "ok".to_string())
-            .increment(1);
-        counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => "read".to_string()).increment(self.reclaim_len as u64);
-        metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => "read".to_string())
-            .record(started.elapsed().as_secs_f64());
+        record_file_cache_reclaim_success("read", self.reclaim_len, started);
         Ok(())
     }
 
@@ -173,7 +179,10 @@ fn set_std_fd_nocache(file: &std::fs::File) -> std::io::Result<()> {
 
 impl Drop for FileCacheReclaimReader {
     fn drop(&mut self) {
-        let _ = self.reclaim_file_cache();
+        if let Err(err) = self.reclaim_file_cache() {
+            record_file_cache_reclaim_error("read");
+            debug!(error = ?err, reclaim_offset = self.reclaim_offset, reclaim_len = self.reclaim_len, "failed to reclaim file cache after read");
+        }
     }
 }
 
@@ -221,11 +230,7 @@ impl FileCacheReclaimWriter {
         }
 
         self.reclaimed = true;
-        counter!("rustfs_page_cache_reclaim_requests_total", "kind" => "write".to_string(), "result" => "ok".to_string())
-            .increment(1);
-        counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => "write".to_string()).increment(self.reclaim_len as u64);
-        metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => "write".to_string())
-            .record(started.elapsed().as_secs_f64());
+        record_file_cache_reclaim_success("write", self.reclaim_len, started);
         Ok(())
     }
 
@@ -255,13 +260,8 @@ impl AsyncWrite for FileCacheReclaimWriter {
         match std::pin::Pin::new(&mut self.inner).poll_shutdown(cx) {
             std::task::Poll::Ready(Ok(())) => {
                 if let Err(err) = self.reclaim_file_cache() {
-                    counter!(
-                        "rustfs_page_cache_reclaim_requests_total",
-                        "kind" => "write".to_string(),
-                        "result" => "err".to_string()
-                    )
-                    .increment(1);
-                    return std::task::Poll::Ready(Err(err));
+                    record_file_cache_reclaim_error("write");
+                    debug!(error = ?err, reclaim_len = self.reclaim_len, "failed to reclaim file cache after write");
                 }
                 std::task::Poll::Ready(Ok(()))
             }
@@ -287,12 +287,17 @@ fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, false) {
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+    ) {
         return false;
     }
 
-    let threshold =
-        rustfs_utils::get_env_usize(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD);
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
     file_size as usize >= threshold
 }
 
@@ -301,12 +306,17 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, false) {
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+    ) {
         return false;
     }
 
-    let threshold =
-        rustfs_utils::get_env_usize(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD);
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
     length >= threshold
 }
 
@@ -2153,7 +2163,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
-        Ok(Box::new(FileCacheReclaimReader::new(f, length, reclaim_on_drop)))
+        Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
     }
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
@@ -3629,12 +3639,12 @@ mod test {
 
     #[test]
     fn should_reclaim_file_cache_after_write_respects_env_and_threshold() {
-        temp_env::with_var_unset(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, || {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, || {
             assert!(!should_reclaim_file_cache_after_write(8 * 1024 * 1024));
         });
 
-        temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, Some("true"), || {
-            temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
                 assert!(should_reclaim_file_cache_after_write(8 * 1024 * 1024));
                 assert!(!should_reclaim_file_cache_after_write(1024));
             });
@@ -3643,12 +3653,12 @@ mod test {
 
     #[test]
     fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
-        temp_env::with_var_unset(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
             assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
         });
 
-        temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
-            temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
                 assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
                 assert!(!should_reclaim_file_cache_after_read(1024));
             });

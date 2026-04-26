@@ -237,6 +237,14 @@ impl PriorityHealQueue {
     }
 }
 
+fn publish_active_heal_count(active_heals: &HashMap<String, Arc<HealTask>>) {
+    crate::set_heal_active_tasks(active_heals.len());
+}
+
+fn publish_heal_queue_length(queue: &PriorityHealQueue) {
+    crate::set_heal_queue_length(queue.len());
+}
+
 /// Heal config
 #[derive(Debug, Clone)]
 pub struct HealConfig {
@@ -420,7 +428,7 @@ impl HealManager {
             }
         }
         active_heals.clear();
-        crate::set_heal_active_tasks(0);
+        publish_active_heal_count(&active_heals);
         crate::set_heal_queue_length(0);
 
         // update state
@@ -437,7 +445,7 @@ impl HealManager {
         let mut queue = self.heal_queue.lock().await;
 
         let queue_len = queue.len();
-        crate::set_heal_queue_length(queue_len);
+        publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
         if queue.contains_key(&request) {
@@ -508,6 +516,7 @@ impl HealManager {
 
         let push_outcome = queue.push(request);
         debug_assert_eq!(push_outcome, QueuePushOutcome::Accepted);
+        publish_heal_queue_length(&queue);
 
         // Log queue statistics periodically (when adding high/urgent priority items)
         if matches!(priority, HealPriority::High | HealPriority::Urgent) {
@@ -547,9 +556,9 @@ impl HealManager {
 
     /// Get task progress
     pub async fn get_active_tasks_count(&self) -> usize {
-        let count = self.active_heals.lock().await.len();
-        crate::set_heal_active_tasks(count);
-        count
+        let active_heals = self.active_heals.lock().await;
+        publish_active_heal_count(&active_heals);
+        active_heals.len()
     }
 
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
@@ -569,7 +578,7 @@ impl HealManager {
         if let Some(task) = active_heals.get(task_id) {
             task.cancel().await?;
             active_heals.remove(task_id);
-            crate::set_heal_active_tasks(active_heals.len());
+            publish_active_heal_count(&active_heals);
             info!("Cancelled heal task: {}", task_id);
             Ok(())
         } else {
@@ -587,17 +596,15 @@ impl HealManager {
     /// Get active task count
     pub async fn get_active_task_count(&self) -> usize {
         let active_heals = self.active_heals.lock().await;
-        let count = active_heals.len();
-        crate::set_heal_active_tasks(count);
-        count
+        publish_active_heal_count(&active_heals);
+        active_heals.len()
     }
 
     /// Get queue length
     pub async fn get_queue_length(&self) -> usize {
         let queue = self.heal_queue.lock().await;
-        let count = queue.len();
-        crate::set_heal_queue_length(count);
-        count
+        publish_heal_queue_length(&queue);
+        queue.len()
     }
 
     /// Start scheduler
@@ -741,6 +748,7 @@ impl HealManager {
                             );
                             let mut queue = heal_queue.lock().await;
                             if matches!(queue.push(req), QueuePushOutcome::Accepted) {
+                                publish_heal_queue_length(&queue);
                                 let config = config.read().await;
                                 if config.event_driven_scheduler_enable {
                                     notify.notify_one();
@@ -767,7 +775,7 @@ impl HealManager {
     ) {
         let config = config.read().await;
         let mut active_heals_guard = active_heals.lock().await;
-        crate::set_heal_active_tasks(active_heals_guard.len());
+        publish_active_heal_count(&active_heals_guard);
 
         // Check if new heal tasks can be started
         let active_count = active_heals_guard.len();
@@ -780,7 +788,7 @@ impl HealManager {
 
         let mut queue = heal_queue.lock().await;
         let queue_len = queue.len();
-        crate::set_heal_queue_length(queue_len);
+        publish_heal_queue_length(&queue);
 
         if queue_len == 0 {
             return;
@@ -816,7 +824,7 @@ impl HealManager {
                 let task = Arc::new(HealTask::from_request(request, storage.clone()));
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
-                crate::set_heal_active_tasks(active_heals_guard.len());
+                publish_active_heal_count(&active_heals_guard);
                 update_task_running_metric_for_task(&active_heals_guard, task.as_ref());
                 let active_heals_clone = active_heals.clone();
                 let statistics_clone = statistics.clone();
@@ -841,7 +849,7 @@ impl HealManager {
                     }
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     if let Some(completed_task) = active_heals_guard.remove(&task_id) {
-                        crate::set_heal_active_tasks(active_heals_guard.len());
+                        publish_active_heal_count(&active_heals_guard);
                         update_task_running_metric_for_task(&active_heals_guard, completed_task.as_ref());
                         // update statistics
                         let mut stats = statistics_clone.write().await;
@@ -867,8 +875,8 @@ impl HealManager {
         let mut stats = statistics.write().await;
         stats.total_tasks += tasks_started as u64;
         stats.update_running_tasks(active_heals_guard.len() as u64);
-        crate::set_heal_active_tasks(active_heals_guard.len());
-        crate::set_heal_queue_length(queue.len());
+        publish_active_heal_count(&active_heals_guard);
+        publish_heal_queue_length(&queue);
 
         // Log queue status if items remain
         if !queue.is_empty() {
