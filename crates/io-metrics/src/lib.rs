@@ -142,6 +142,17 @@ pub use performance::PerformanceMetrics;
 static EC_ENCODE_INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GET_OBJECT_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrackedMemoryGauge {
     GetObjectBufferedBytes,
@@ -158,8 +169,7 @@ impl Drop for MemoryGaugeGuard {
     fn drop(&mut self) {
         match self.gauge {
             TrackedMemoryGauge::GetObjectBufferedBytes => {
-                let previous = GET_OBJECT_BUFFERED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
-                let next = previous.saturating_sub(self.bytes);
+                let next = saturating_sub_atomic(&GET_OBJECT_BUFFERED_BYTES, self.bytes);
                 gauge!("rustfs_get_object_buffered_bytes_current").set(next as f64);
             }
         }
@@ -620,8 +630,7 @@ pub fn add_ec_encode_inflight_bytes(bytes: usize) {
 /// Remove encoded bytes from the tracked erasure encode in-flight gauge.
 #[inline(always)]
 pub fn remove_ec_encode_inflight_bytes(bytes: usize) {
-    let previous = EC_ENCODE_INFLIGHT_BYTES.fetch_sub(bytes as u64, Ordering::Relaxed);
-    let next = previous.saturating_sub(bytes as u64);
+    let next = saturating_sub_atomic(&EC_ENCODE_INFLIGHT_BYTES, bytes as u64);
     gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
 }
 
@@ -881,18 +890,32 @@ mod tests {
 
     #[test]
     fn test_ec_encode_inflight_bytes_tracking() {
-        remove_ec_encode_inflight_bytes(EC_ENCODE_INFLIGHT_BYTES.load(Ordering::Relaxed) as usize);
+        EC_ENCODE_INFLIGHT_BYTES.store(0, Ordering::Relaxed);
         add_ec_encode_inflight_bytes(1024);
         add_ec_encode_inflight_bytes(2048);
         remove_ec_encode_inflight_bytes(1024);
         remove_ec_encode_inflight_bytes(2048);
+        remove_ec_encode_inflight_bytes(4096);
+        assert_eq!(current_ec_encode_inflight_bytes(), 0);
     }
 
     #[test]
     fn test_get_object_buffered_bytes_guard() {
+        GET_OBJECT_BUFFERED_BYTES.store(0, Ordering::Relaxed);
         drop(track_get_object_buffered_bytes(1024));
         let guard = track_get_object_buffered_bytes(2048);
         drop(guard);
+        assert_eq!(current_get_object_buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_get_object_buffered_bytes_guard_saturates_on_underflow() {
+        GET_OBJECT_BUFFERED_BYTES.store(1024, Ordering::Relaxed);
+        drop(MemoryGaugeGuard {
+            gauge: TrackedMemoryGauge::GetObjectBufferedBytes,
+            bytes: 2048,
+        });
+        assert_eq!(current_get_object_buffered_bytes(), 0);
     }
 
     #[test]

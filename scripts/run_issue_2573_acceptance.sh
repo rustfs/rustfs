@@ -193,7 +193,6 @@ run_profile() {
   printf '\n'
 
   local sampler_pid=""
-  sample_rss_window "$pid" "$((COOLDOWN_SECS + 1))" /dev/null >/dev/null 2>&1 || true
   if [[ -n "$pid" ]]; then
     sample_rss_loop "$pid" "$rss_during" &
     sampler_pid=$!
@@ -220,8 +219,10 @@ run_profile() {
 main() {
   parse_args "$@"
   require_cmd "$WARP_BIN"
+  require_cmd awk
   require_cmd ps
   require_cmd pgrep
+  require_cmd tee
   mkdir -p "$OUT_DIR"
 
   local pid

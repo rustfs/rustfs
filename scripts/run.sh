@@ -52,7 +52,9 @@ if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
     export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
 fi
 
-export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
+if [ -z "${RUSTFS_ALLOCATOR_RECLAIM_ENABLED+x}" ]; then
+    export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
+fi
 
 export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
@@ -528,5 +530,5 @@ fi
 # To run in release mode, use the following line
 #cargo run --profile release --bin rustfs
 
-# To run in debug mode, use the following line
+# To run in release mode, use the following line
 cargo run --profile release --bin rustfs

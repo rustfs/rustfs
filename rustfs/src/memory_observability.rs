@@ -116,23 +116,34 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
-fn record_memory_snapshot() {
-    let (resource, process) = snapshot_process_resource_and_system();
-    let total_memory = refresh_total_memory();
+async fn record_memory_snapshot() {
+    match tokio::task::spawn_blocking(|| {
+        let (resource, process) = snapshot_process_resource_and_system();
+        let total_memory = refresh_total_memory();
+        let cgroup = read_cgroup_memory_snapshot();
+        (resource, process, total_memory, cgroup)
+    })
+    .await
+    {
+        Ok((resource, process, total_memory, cgroup)) => {
+            record_memory_usage(process.resident_memory_bytes, total_memory);
+            record_cpu_usage(resource.cpu_percent);
+            record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
 
-    record_memory_usage(process.resident_memory_bytes, total_memory);
-    record_cpu_usage(resource.cpu_percent);
-    record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
-
-    if let Some(cgroup) = read_cgroup_memory_snapshot() {
-        record_cgroup_memory_split(
-            cgroup.current_bytes,
-            cgroup.limit_bytes,
-            cgroup.anon_bytes,
-            cgroup.file_bytes,
-            cgroup.active_file_bytes,
-            cgroup.inactive_file_bytes,
-        );
+            if let Some(cgroup) = cgroup {
+                record_cgroup_memory_split(
+                    cgroup.current_bytes,
+                    cgroup.limit_bytes,
+                    cgroup.anon_bytes,
+                    cgroup.file_bytes,
+                    cgroup.active_file_bytes,
+                    cgroup.inactive_file_bytes,
+                );
+            }
+        }
+        Err(err) => {
+            debug!(error = ?err, "memory observability sampler task failed");
+        }
     }
 }
 
@@ -152,7 +163,7 @@ pub fn init_memory_observability(ctx: CancellationToken) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    record_memory_snapshot();
+                    record_memory_snapshot().await;
                 }
             }
         }

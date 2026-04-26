@@ -55,13 +55,36 @@ fn current_heal_activity() -> u64 {
     rustfs_heal::current_heal_active_tasks() + rustfs_heal::current_heal_queue_length()
 }
 
-fn reclaimable_work_inflight() -> u64 {
-    active_requests()
-        + current_delete_tail_activity()
-        + current_scanner_activity()
-        + current_heal_activity()
-        + rustfs_io_metrics::current_ec_encode_inflight_bytes()
-        + rustfs_io_metrics::current_get_object_buffered_bytes()
+#[derive(Clone, Copy, Debug, Default)]
+struct ReclaimableWorkSnapshot {
+    active_requests: u64,
+    delete_tail_activity: u64,
+    scanner_activity: u64,
+    heal_activity: u64,
+    ec_inflight_bytes: u64,
+    get_buffered_bytes: u64,
+}
+
+impl ReclaimableWorkSnapshot {
+    fn active_signal_count(self) -> u64 {
+        u64::from(self.active_requests > 0)
+            + u64::from(self.delete_tail_activity > 0)
+            + u64::from(self.scanner_activity > 0)
+            + u64::from(self.heal_activity > 0)
+            + u64::from(self.ec_inflight_bytes > 0)
+            + u64::from(self.get_buffered_bytes > 0)
+    }
+}
+
+fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
+    ReclaimableWorkSnapshot {
+        active_requests: active_requests(),
+        delete_tail_activity: current_delete_tail_activity(),
+        scanner_activity: current_scanner_activity(),
+        heal_activity: current_heal_activity(),
+        ec_inflight_bytes: rustfs_io_metrics::current_ec_encode_inflight_bytes(),
+        get_buffered_bytes: rustfs_io_metrics::current_get_object_buffered_bytes(),
+    }
 }
 
 #[cfg(all(
@@ -158,21 +181,16 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    let active_requests = active_requests();
-                    let delete_tail_activity = current_delete_tail_activity();
-                    let scanner_activity = current_scanner_activity();
-                    let heal_activity = current_heal_activity();
-                    let ec_inflight_bytes = rustfs_io_metrics::current_ec_encode_inflight_bytes();
-                    let get_buffered_bytes = rustfs_io_metrics::current_get_object_buffered_bytes();
-                    let reclaimable_inflight = reclaimable_work_inflight();
-                    gauge!("rustfs_memory_allocator_reclaim_active_requests").set(active_requests as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_delete_tail_activity_current").set(delete_tail_activity as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_scanner_activity_current").set(scanner_activity as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_heal_activity_current").set(heal_activity as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_ec_inflight_bytes_current").set(ec_inflight_bytes as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_get_buffered_bytes_current").set(get_buffered_bytes as f64);
-                    gauge!("rustfs_memory_allocator_reclaim_reclaimable_work_current").set(reclaimable_inflight as f64);
-                    if reclaimable_inflight == 0 {
+                    let snapshot = reclaimable_work_snapshot();
+                    let active_signal_count = snapshot.active_signal_count();
+                    gauge!("rustfs_memory_allocator_reclaim_active_requests").set(snapshot.active_requests as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_delete_tail_activity_current").set(snapshot.delete_tail_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_scanner_activity_current").set(snapshot.scanner_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_heal_activity_current").set(snapshot.heal_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_ec_inflight_bytes_current").set(snapshot.ec_inflight_bytes as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_get_buffered_bytes_current").set(snapshot.get_buffered_bytes as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_reclaimable_work_current").set(active_signal_count as f64);
+                    if active_signal_count == 0 {
                         idle_streak = idle_streak.saturating_add(1);
                         gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(idle_streak as f64);
                     } else {
@@ -185,7 +203,7 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
                         idle_streak = 0;
                         gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(0.0);
                     } else {
-                        let reason = if reclaimable_inflight > 0 {
+                        let reason = if active_signal_count > 0 {
                             "work_inflight"
                         } else {
                             "idle_window"
@@ -200,7 +218,7 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
-    use super::{allocator_backend, reclaimable_work_inflight};
+    use super::{allocator_backend, reclaimable_work_snapshot};
 
     #[test]
     fn allocator_backend_name_is_available() {
@@ -208,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaimable_work_inflight_is_collectable() {
-        let _ = reclaimable_work_inflight();
+    fn reclaimable_work_snapshot_is_collectable() {
+        let _ = reclaimable_work_snapshot();
     }
 }

@@ -40,6 +40,16 @@ fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usiz
         .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
 }
 
+fn queued_block_bytes(block: &[Bytes]) -> usize {
+    block.iter().map(Bytes::len).sum()
+}
+
+async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
+    while let Some(block) = rx.recv().await {
+        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+    }
+}
+
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
@@ -217,7 +227,7 @@ impl Erasure {
                     Ok(n) if n > 0 => {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
-                        let queued_bytes = res.iter().map(Bytes::len).sum::<usize>();
+                        let queued_bytes = queued_block_bytes(&res);
                         rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
                             rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
@@ -253,7 +263,7 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
-            let queued_bytes = block.iter().map(Bytes::len).sum::<usize>();
+            let queued_bytes = queued_block_bytes(&block);
             rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
@@ -264,6 +274,7 @@ impl Erasure {
         if let Some(err) = write_err {
             task.abort();
             let _ = task.await;
+            drain_queued_inflight_bytes(&mut rx).await;
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
             }
