@@ -68,9 +68,6 @@ spec:
           imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          env:
-            - name: REPLICA_COUNT
-              value: {{ .Values.replicaCount | quote }}
           command:
             - sh
             - -c
