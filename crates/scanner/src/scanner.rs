@@ -18,7 +18,7 @@ use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_
 use crate::scanner_folder::data_usage_update_dir_cycles;
 use crate::scanner_io::ScannerIO;
 use crate::sleeper::SCANNER_SLEEPER;
-use crate::{DataUsageInfo, ScannerError};
+use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
@@ -183,6 +183,7 @@ fn get_lock_acquire_timeout() -> Duration {
 
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
+    let _activity_guard = ScannerActivityGuard::new();
     SCANNER_SLEEPER.refresh_from_env();
     info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
@@ -324,6 +325,7 @@ pub async fn store_data_usage_in_backend(
     let mut attempts = 1u32;
 
     while let Some(data_usage_info) = receiver.recv().await {
+        let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
         }

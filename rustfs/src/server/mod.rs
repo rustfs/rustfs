@@ -39,6 +39,7 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub(crate) use http::active_http_requests;
 pub(crate) use module_switch::{
     ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot,
     refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, validate_module_switch_update,
