@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
     admin::{
@@ -534,10 +535,7 @@ impl Operation for GetUserInfo {
         )
         .await?;
 
-        let info = iam_store
-            .get_user_info(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        let info = iam_store.get_user_info(ak).await.map_err(iam_error_to_s3_error)?;
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {e}")))?;

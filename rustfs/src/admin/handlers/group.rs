@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -155,7 +156,7 @@ impl Operation for GetGroup {
 
         let g = iam_store.get_group_description(&query.group).await.map_err(|e| {
             warn!("get group failed, e: {:?}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            iam_error_to_s3_error(e)
         })?;
 
         let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
@@ -222,7 +223,7 @@ impl Operation for DeleteGroup {
                 }
                 _ => {
                     if is_err_no_such_group(&e) {
-                        s3_error!(NoSuchKey, "group '{group}' does not exist")
+                        iam_error_to_s3_error(e)
                     } else {
                         s3_error!(InternalError, "{e}")
                     }
@@ -327,11 +328,11 @@ impl Operation for SetGroupStatus {
             match status {
                 "enabled" => iam_store.set_group_status(&query.group, true).await.map_err(|e| {
                     warn!("enable group failed, e: {:?}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    iam_error_to_s3_error(e)
                 })?,
                 "disabled" => iam_store.set_group_status(&query.group, false).await.map_err(|e| {
                     warn!("enable group failed, e: {:?}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    iam_error_to_s3_error(e)
                 })?,
                 _ => {
                     return Err(s3_error!(InvalidArgument, "invalid status"));
@@ -437,7 +438,7 @@ impl Operation for UpdateGroupMembers {
                 }
                 Err(e) => {
                     if !is_err_no_such_user(&e) {
-                        return Err(S3Error::with_message(S3ErrorCode::InternalError, e.to_string()));
+                        return Err(iam_error_to_s3_error(e));
                     }
                 }
             }
@@ -450,7 +451,7 @@ impl Operation for UpdateGroupMembers {
                 .await
                 .map_err(|e| {
                     warn!("remove group members failed, e: {:?}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    iam_error_to_s3_error(e)
                 })?
         } else {
             warn!("add group members");
@@ -467,7 +468,7 @@ impl Operation for UpdateGroupMembers {
                 .await
                 .map_err(|e| {
                     warn!("add group members failed, e: {:?}", e);
-                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    iam_error_to_s3_error(e)
                 })?
         };
 
