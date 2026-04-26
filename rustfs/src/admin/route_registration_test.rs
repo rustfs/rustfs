@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts,
-        system, tier, user,
+        audit, bucket_meta, heal, health, kms, module_switch, oidc, pools, profile_admin, quota, rebalance, replication,
+        site_replication, sts, system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -52,6 +52,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
     audit::register_audit_target_route(router).expect("register audit target route");
+    module_switch::register_module_switch_route(router).expect("register module switch route");
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
@@ -93,6 +94,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/idp/builtin/policy-entities"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/module-switches"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
@@ -185,6 +188,8 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/audit/target/list")),
+        (Method::GET, compat_admin_alias_path("/v3/module-switches")),
+        (Method::PUT, compat_admin_alias_path("/v3/module-switches")),
         (Method::PUT, compat_admin_alias_path("/v3/audit/target/audit_webhook/test-audit")),
         (Method::DELETE, compat_admin_alias_path("/v3/audit/target/audit_webhook/test-audit/reset")),
         (Method::POST, compat_admin_alias_path("/v3/heal/")),
