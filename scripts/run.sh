@@ -52,6 +52,8 @@ if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
     export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
 fi
 
+export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
+
 export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS=":9000"
