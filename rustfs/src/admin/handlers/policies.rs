@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -456,7 +457,7 @@ impl Operation for SetPolicyForUserOrGroup {
         } else {
             iam_store.get_group_description(&query.user_or_group).await.map_err(|e| {
                 warn!("get group description failed, e: {:?}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                iam_error_to_s3_error(e)
             })?;
         }
 
@@ -674,7 +675,7 @@ async fn collect_group_policy_mappings(
     for group in groups {
         let group_desc = iam_store.get_group_description(&group).await.map_err(|e| {
             warn!("get group description failed, e: {:?}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            iam_error_to_s3_error(e)
         })?;
         let policies = split_policy_names(&group_desc.policy);
         if policies.is_empty() {
@@ -866,14 +867,14 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
 
         let user_info = iam_store.get_user_info(&assoc_req.user).await.map_err(|e| {
             warn!("get user info failed, e: {:?}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            iam_error_to_s3_error(e)
         })?;
 
         (assoc_req.user, false, direct_user_policy_names(&user_info))
     } else {
         let group_desc = iam_store.get_group_description(&assoc_req.group).await.map_err(|e| {
             warn!("get group description failed, e: {:?}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            iam_error_to_s3_error(e)
         })?;
 
         (assoc_req.group, true, split_policy_names(&group_desc.policy))

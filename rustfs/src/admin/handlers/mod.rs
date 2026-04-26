@@ -19,6 +19,7 @@ pub mod event;
 pub mod group;
 pub mod heal;
 pub mod health;
+mod iam_error;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
