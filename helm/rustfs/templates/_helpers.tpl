@@ -237,7 +237,7 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 {{- $n := int $pool.replicaCount -}}
 {{- if eq $n 4 -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $n 1)) -}}
-{{- else if eq $n 16 -}}
+{{- else -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port) -}}
 {{- end -}}
 {{- end -}}
