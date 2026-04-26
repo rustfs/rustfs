@@ -560,10 +560,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     print_server_info();
 
     init_update_check();
+    rustfs::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
         init_metrics_runtime(ctx.clone());
+        rustfs::memory_observability::init_memory_observability(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
         rustfs::init::init_auto_tuner(ctx.clone()).await;
