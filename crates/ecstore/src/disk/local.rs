@@ -189,6 +189,11 @@ impl tokio::io::AsyncRead for FileCacheReclaimReader {
 
 impl FileCacheReclaimWriter {
     fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_shutdown {
+            let _ = set_fd_nocache(&inner);
+        }
+
         Self {
             inner,
             reclaim_len,
