@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
@@ -104,7 +105,7 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_service_account(&err) {
-        s3_error!(InvalidRequest, "service account not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -113,7 +114,7 @@ fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str)
 fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_temp_account(&err) {
-        s3_error!(InvalidRequest, "access key not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -1511,8 +1512,8 @@ mod tests {
             "get service account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("service account not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("service account 'missing' does not exist"));
     }
 
     #[test]
@@ -1522,8 +1523,8 @@ mod tests {
             "get temporary account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("access key not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("temp account 'missing' does not exist"));
     }
 
     #[test]
