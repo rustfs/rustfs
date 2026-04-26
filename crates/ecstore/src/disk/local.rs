@@ -124,21 +124,17 @@ impl FileCacheReclaimReader {
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
 
         if !self.reclaim_on_drop || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
 
         let started = std::time::Instant::now();
-        let fd = self.inner.as_raw_fd();
-        // SAFETY: `fd` remains owned by `self.inner`, and `posix_fadvise`
-        // only advises kernel cache behavior for this file range.
-        let ret =
-            unsafe { libc::posix_fadvise(fd, self.reclaim_offset as i64, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
-        if ret != 0 {
-            return Err(std::io::Error::from_raw_os_error(ret));
-        }
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, self.reclaim_offset, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
 
         self.reclaimed = true;
         record_file_cache_reclaim_success("read", self.reclaim_len, started);
@@ -213,21 +209,17 @@ impl FileCacheReclaimWriter {
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
 
         if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
 
         let started = std::time::Instant::now();
-        let fd = self.inner.as_raw_fd();
-        // SAFETY: `fd` is owned by the live `tokio::fs::File` stored in `self.inner`.
-        // `posix_fadvise` only advises the kernel to drop file-backed cache pages for
-        // this file range and does not invalidate Rust-side memory invariants.
-        let ret = unsafe { libc::posix_fadvise(fd, 0, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
-        if ret != 0 {
-            return Err(std::io::Error::from_raw_os_error(ret));
-        }
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, 0, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
 
         self.reclaimed = true;
         record_file_cache_reclaim_success("write", self.reclaim_len, started);
@@ -2248,15 +2240,14 @@ impl DiskAPI for LocalDisk {
 
                 #[cfg(target_os = "linux")]
                 if should_reclaim_after_read {
-                    use std::os::fd::AsRawFd;
-                    // SAFETY: `posix_fadvise` only advises kernel cache behavior
-                    // for this file descriptor and aligned range.
-                    let ret = unsafe {
-                        libc::posix_fadvise(file.as_raw_fd(), aligned_offset as i64, map_len as i64, libc::POSIX_FADV_DONTNEED)
-                    };
-                    if ret != 0 {
-                        return Err(DiskError::from(std::io::Error::from_raw_os_error(ret)));
-                    }
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+
+                    let reclaim_len =
+                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
+                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
+                        .map_err(std::io::Error::from)
+                        .map_err(DiskError::from)?;
                 }
 
                 Ok::<Bytes, DiskError>(bytes)

@@ -8115,6 +8115,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-utils",
  "rustfs-workers",
+ "rustix 1.1.4",
  "rustls",
  "s3s",
  "serde",
