@@ -17,14 +17,16 @@ use crate::admin::{
     handlers::target_descriptor::{
         AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
         collect_validated_key_values as shared_collect_validated_key_values,
-        merge_target_endpoints as shared_merge_target_endpoints,
+        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
     },
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::{
+    ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -168,6 +170,17 @@ fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target
     )
 }
 
+async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!(
+            error = %err,
+            "failed to reload persisted module switches before checking audit target operation gating"
+        );
+    }
+    refresh_audit_module_enabled();
+    target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
+}
+
 fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
     shared_merge_target_endpoints(&audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
@@ -272,6 +285,9 @@ impl Operation for AuditTargetConfig {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
         let config_snapshot = load_server_config_from_store().await?;
         if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
@@ -373,6 +389,9 @@ impl Operation for RemoveAuditTarget {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
         let config_snapshot = load_server_config_from_store().await?;
         if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
@@ -532,6 +551,26 @@ mod tests {
                 assert!(reason.unwrap().contains("managed by environment variables"));
             },
         );
+    }
+
+    #[test]
+    fn audit_target_operation_block_reason_requires_audit_module_enable() {
+        with_var(rustfs_config::ENV_AUDIT_ENABLE, Some("false"), || {
+            let reason =
+                futures::executor::block_on(audit_target_operation_block_reason("managing audit targets from the console"));
+            assert!(reason.is_some());
+            assert!(reason.unwrap().contains("set RUSTFS_AUDIT_ENABLE=true"));
+        });
+    }
+
+    #[test]
+    fn audit_target_operation_block_reason_allows_when_audit_module_enabled() {
+        with_var(rustfs_config::ENV_AUDIT_ENABLE, Some("true"), || {
+            assert!(
+                futures::executor::block_on(audit_target_operation_block_reason("managing audit targets from the console"))
+                    .is_none()
+            );
+        });
     }
 
     #[test]
@@ -728,12 +767,20 @@ mod tests {
             "audit target writes should require SetBucketTargetAction"
         );
         assert!(
+            put_block.contains("audit_target_operation_block_reason(\"managing audit targets from the console\")"),
+            "audit target writes should reject requests when the audit module is disabled"
+        );
+        assert!(
             list_block.contains("authorize_audit_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
             "audit target list should require GetBucketTargetAction"
         );
         assert!(
             delete_block.contains("authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),
             "audit target deletion should require SetBucketTargetAction"
+        );
+        assert!(
+            delete_block.contains("audit_target_operation_block_reason(\"managing audit targets from the console\")"),
+            "audit target deletion should reject requests when the audit module is disabled"
         );
     }
 
