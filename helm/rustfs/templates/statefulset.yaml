@@ -85,15 +85,8 @@ spec:
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
-            {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
             - name: logs
               mountPath: /mnt/rustfs
       containers:
@@ -144,15 +137,8 @@ spec:
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
-            {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
       {{- if .Values.mtls.enabled }}
       volumes:
         - name: server-cert
@@ -189,22 +175,6 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
-    - metadata:
-        name: data-rustfs-{{ $i }}
-        labels:
-          {{- toYaml $.Values.commonLabels | nindent 10 }}
-        annotations:
-          {{- toYaml $.Values.storageclass.pvcAnnotations.data | nindent 10 }}
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $.Values.storageclass.dataStorageSize }}
-    {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
     - metadata:
         name: data
         labels:
@@ -217,5 +187,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.dataStorageSize }}
-    {{- end }}
 {{- end }}
