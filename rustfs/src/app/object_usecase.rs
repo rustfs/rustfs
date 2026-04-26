@@ -2114,9 +2114,9 @@ impl DefaultObjectUsecase {
 
         let request_id = req
             .extensions
-            .get::<crate::storage::request_context::RequestContext>()
+            .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
-            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
         let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
@@ -3104,10 +3104,7 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        let request_context = req
-            .extensions
-            .get::<crate::storage::request_context::RequestContext>()
-            .cloned();
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         spawn_background_with_context(request_context, async move {
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
@@ -4321,10 +4318,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req
-                .extensions
-                .get::<crate::storage::request_context::RequestContext>()
-                .cloned();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
             spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });
