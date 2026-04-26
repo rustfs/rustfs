@@ -52,7 +52,7 @@ impl Drop for PhaseTimer {
 
         if !std::thread::panicking() {
             metrics::histogram!(
-                "rustfs.s3select.phase.duration.seconds",
+                "rustfs_s3select_phase_duration_seconds",
                 "phase" => self.phase_name
             )
             .record(duration.as_secs_f64());
@@ -171,7 +171,7 @@ impl QueryStateMachine {
     fn record_phase_timestamp(&self, phase: &'static str, event: &'static str) {
         let elapsed = self.start.elapsed();
         metrics::histogram!(
-            "rustfs.s3select.phase.timestamp.seconds",
+            "rustfs_s3select_phase_timestamp_seconds",
             "phase" => phase,
             "event" => event
         )

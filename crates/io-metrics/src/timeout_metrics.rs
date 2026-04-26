@@ -34,23 +34,23 @@ pub fn record_operation_duration(operation: &str, duration: Duration) {
 #[inline(always)]
 pub fn record_dynamic_timeout(size_bytes: u64, timeout: Duration) {
     use metrics::{gauge, histogram};
-    gauge!("rustfs.timeout.dynamic.size").set(size_bytes as f64);
-    gauge!("rustfs.timeout.dynamic.secs").set(timeout.as_secs_f64());
-    histogram!("rustfs.timeout.dynamic.size.histogram").record(size_bytes as f64);
+    gauge!("rustfs_timeout_dynamic_size").set(size_bytes as f64);
+    gauge!("rustfs_timeout_dynamic_secs").set(timeout.as_secs_f64());
+    histogram!("rustfs_timeout_dynamic_size_histogram").record(size_bytes as f64);
 }
 
 /// Record operation progress.
 #[inline(always)]
 pub fn record_operation_progress(operation: &str, percent: f64) {
     use metrics::gauge;
-    gauge!("rustfs.operation.progress", "operation" => operation.to_string()).set(percent);
+    gauge!("rustfs_operation_progress", "operation" => operation.to_string()).set(percent);
 }
 
 /// Record stalled operation.
 #[inline(always)]
 pub fn record_stalled_operation(operation: &str) {
     use metrics::counter;
-    counter!("rustfs.operation.stalled", "operation" => operation.to_string()).increment(1);
+    counter!("rustfs_operation_stalled", "operation" => operation.to_string()).increment(1);
 }
 
 /// Record operation completion.
@@ -58,7 +58,7 @@ pub fn record_stalled_operation(operation: &str) {
 pub fn record_operation_completion(operation: &str, success: bool) {
     use metrics::counter;
     let status = if success { "success" } else { "failure" };
-    counter!("rustfs.operation.completions", "operation" => operation.to_string(), "status" => status).increment(1);
+    counter!("rustfs_operation_completions", "operation" => operation.to_string(), "status" => status).increment(1);
 }
 
 /// Timeout statistics summary.

@@ -27,11 +27,11 @@
 pub fn record_io_scheduler_decision(buffer_size: usize, load_level: &str, strategy: &str) {
     use metrics::{counter, gauge, histogram};
 
-    counter!("rustfs.io.scheduler.decisions").increment(1);
-    gauge!("rustfs.io.scheduler.buffer_size").set(buffer_size as f64);
-    counter!("rustfs.io.scheduler.load", "level" => load_level.to_string()).increment(1);
-    counter!("rustfs.io.scheduler.strategy", "type" => strategy.to_string()).increment(1);
-    histogram!("rustfs.io.scheduler.buffer_size.histogram").record(buffer_size as f64);
+    counter!("rustfs_io_scheduler_decisions").increment(1);
+    gauge!("rustfs_io_scheduler_buffer_size").set(buffer_size as f64);
+    counter!("rustfs_io_scheduler_load", "level" => load_level.to_string()).increment(1);
+    counter!("rustfs_io_scheduler_strategy", "type" => strategy.to_string()).increment(1);
+    histogram!("rustfs_io_scheduler_buffer_size_histogram").record(buffer_size as f64);
 }
 
 /// Record I/O priority decision.
@@ -44,9 +44,9 @@ pub fn record_io_scheduler_decision(buffer_size: usize, load_level: &str, strate
 pub fn record_io_priority_decision(priority: &str, size: usize) {
     use metrics::{counter, histogram};
 
-    counter!("rustfs.io.priority.decisions").increment(1);
-    counter!("rustfs.io.priority.by_level", "priority" => priority.to_string()).increment(1);
-    histogram!("rustfs.io.priority.request_size").record(size as f64);
+    counter!("rustfs_io_priority_decisions").increment(1);
+    counter!("rustfs_io_priority_by_level", "priority" => priority.to_string()).increment(1);
+    histogram!("rustfs_io_priority_request_size").record(size as f64);
 }
 
 /// Record load level change.
@@ -58,7 +58,7 @@ pub fn record_io_priority_decision(priority: &str, size: usize) {
 #[inline(always)]
 pub fn record_load_level_change(from: &str, to: &str) {
     use metrics::counter;
-    counter!("rustfs.io.load.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
+    counter!("rustfs_io_load_changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
 }
 
 /// Record bandwidth observation.
@@ -69,8 +69,8 @@ pub fn record_load_level_change(from: &str, to: &str) {
 #[inline(always)]
 pub fn record_bandwidth_observation(bps: u64) {
     use metrics::{gauge, histogram};
-    gauge!("rustfs.io.bandwidth.bps").set(bps as f64);
-    histogram!("rustfs.io.bandwidth.histogram").record(bps as f64);
+    gauge!("rustfs_io_bandwidth_bps").set(bps as f64);
+    histogram!("rustfs_io_bandwidth_histogram").record(bps as f64);
 }
 
 /// Record buffer size adjustment.
@@ -83,9 +83,9 @@ pub fn record_bandwidth_observation(bps: u64) {
 #[inline(always)]
 pub fn record_buffer_size_adjustment(original: usize, adjusted: usize, reason: &str) {
     use metrics::{counter, gauge};
-    counter!("rustfs.io.buffer.adjustments", "reason" => reason.to_string()).increment(1);
-    gauge!("rustfs.io.buffer.original").set(original as f64);
-    gauge!("rustfs.io.buffer.adjusted").set(adjusted as f64);
+    counter!("rustfs_io_buffer_adjustments", "reason" => reason.to_string()).increment(1);
+    gauge!("rustfs_io_buffer_original").set(original as f64);
+    gauge!("rustfs_io_buffer_adjusted").set(adjusted as f64);
 }
 
 /// Record queue operation.
@@ -98,8 +98,8 @@ pub fn record_buffer_size_adjustment(original: usize, adjusted: usize, reason: &
 #[inline(always)]
 pub fn record_queue_operation(operation: &str, priority: &str, queue_size: usize) {
     use metrics::{counter, gauge};
-    counter!("rustfs.io.queue.operations", "operation" => operation.to_string(), "priority" => priority.to_string()).increment(1);
-    gauge!("rustfs.io.queue.size", "priority" => priority.to_string()).set(queue_size as f64);
+    counter!("rustfs_io_queue_operations", "operation" => operation.to_string(), "priority" => priority.to_string()).increment(1);
+    gauge!("rustfs_io_queue_size", "priority" => priority.to_string()).set(queue_size as f64);
 }
 
 /// Record starvation event.
@@ -110,7 +110,7 @@ pub fn record_queue_operation(operation: &str, priority: &str, queue_size: usize
 #[inline(always)]
 pub fn record_starvation_event(priority: &str) {
     use metrics::counter;
-    counter!("rustfs.io.starvation.events", "priority" => priority.to_string()).increment(1);
+    counter!("rustfs_io_starvation_events", "priority" => priority.to_string()).increment(1);
 }
 
 /// I/O scheduler statistics.

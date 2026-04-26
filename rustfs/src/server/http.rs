@@ -22,8 +22,8 @@ use crate::server::{
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer,
-        RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
+        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -38,7 +38,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
@@ -54,6 +54,7 @@ use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tonic::{Request, Status};
@@ -65,6 +66,61 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+const LABEL_HTTP_METHOD: &str = "method";
+const LABEL_HTTP_STATUS_CLASS: &str = "status_class";
+const METRIC_HTTP_SERVER_REQUESTS_TOTAL: &str = "rustfs_http_server_requests_total";
+const METRIC_HTTP_SERVER_FAILURES_TOTAL: &str = "rustfs_http_server_failures_total";
+const METRIC_HTTP_SERVER_ACTIVE_REQUESTS: &str = "rustfs_http_server_active_requests";
+const METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS: &str = "rustfs_http_server_request_duration_seconds";
+const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_request_body_bytes_total";
+const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+
+static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn request_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+#[inline]
+fn status_class_label(status: http::StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "unknown",
+    }
+}
+
+#[inline]
+fn record_active_http_requests(delta: i64) {
+    let next = if delta >= 0 {
+        ACTIVE_HTTP_REQUESTS.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
+    } else {
+        let decrement = (-delta) as u64;
+        ACTIVE_HTTP_REQUESTS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
+            .unwrap_or_else(|current| current)
+            .saturating_sub(decrement)
+    };
+    gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
+}
 
 pub async fn start_http_server(
     config: &config::Config,
@@ -633,6 +689,7 @@ fn process_connection(
         // 16. ConditionalCorsLayer                   — S3 API CORS
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -715,28 +772,58 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [("key_request_method", request.method().to_string())];
-                        counter!("rustfs.api.requests.total", &labels).increment(1);
-                        // Aggregate request body size for throughput monitoring (lightweight)
+                        let method = request_method_label(request.method());
+                        record_active_http_requests(1);
+                        counter!(
+                            METRIC_HTTP_SERVER_REQUESTS_TOTAL,
+                            LABEL_HTTP_METHOD => method
+                        )
+                        .increment(1);
+
                         if let Some(cl) = request.headers().get("content-length")
                             && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                         {
-                            counter!("rustfs.request.body.bytes_total", "direction" => "request").increment(len);
+                            counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
+                            histogram!(
+                                METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+                                LABEL_HTTP_METHOD => method
+                            )
+                            .record(len as f64);
                         }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
+                        let status_class = status_class_label(response.status());
+                        record_active_http_requests(-1);
+                        histogram!(
+                            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+                            LABEL_HTTP_STATUS_CLASS => status_class
+                        )
+                        .record(latency.as_secs_f64());
+                        if response.status().is_client_error() || response.status().is_server_error() {
+                            counter!(
+                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
+                                LABEL_HTTP_STATUS_CLASS => status_class
+                            )
+                            .increment(1);
+                        }
+                        if let Some(cl) = response.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            histogram!(
+                                METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+                                LABEL_HTTP_STATUS_CLASS => status_class
+                            )
+                            .record(len as f64);
+                        }
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                        // Always track aggregate body bytes (lightweight counter, no debug logging)
-                        counter!("rustfs.request.body.bytes_total", "direction" => "response").increment(chunk.len() as u64);
+                        counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                             debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
@@ -757,7 +844,12 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs.api.requests.failure.total").increment(1);
+                        record_active_http_requests(-1);
+                        counter!(
+                            METRIC_HTTP_SERVER_FAILURES_TOTAL,
+                            LABEL_HTTP_STATUS_CLASS => "transport"
+                        )
+                        .increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
@@ -781,6 +873,10 @@ fn process_connection(
             // other response-transforming layers see the already-bodyless
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
+            // HEAD responses must not send body bytes even when the inner S3 layer
+            // serializes an XML error payload. Keep this innermost so the final
+            // HTTP response written to hyper/h2 is bodyless.
+            .layer(HeadRequestBodyFixLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
@@ -1079,6 +1175,28 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&"user-agent"));
         assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_http_metric_names_and_labels_use_snake_case() {
+        let metric_names = [
+            METRIC_HTTP_SERVER_REQUESTS_TOTAL,
+            METRIC_HTTP_SERVER_FAILURES_TOTAL,
+            METRIC_HTTP_SERVER_ACTIVE_REQUESTS,
+            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+            METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL,
+            METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+        ];
+
+        for metric_name in metric_names {
+            assert!(metric_name.starts_with("rustfs_"));
+            assert!(!metric_name.contains('.'));
+        }
+
+        assert_eq!(LABEL_HTTP_METHOD, "method");
+        assert_eq!(LABEL_HTTP_STATUS_CLASS, "status_class");
     }
 
     #[test]

@@ -1651,8 +1651,8 @@ impl DefaultObjectUsecase {
 
         if enable_zero_copy {
             // Record zero-copy write attempt
-            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
-            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            counter!("rustfs_zero_copy_write_attempts_total").increment(1);
+            histogram!("rustfs_zero_copy_write_size_bytes").record(size as f64);
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
@@ -1837,7 +1837,6 @@ impl DefaultObjectUsecase {
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {

@@ -43,7 +43,14 @@ fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
 
-# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"√
+# export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
+
+# This script provisions multiple local export directories on the same disk.
+# Default the bypass only for this local layout, while still allowing callers
+# to override it explicitly through the environment.
+if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+fi
 
 export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"

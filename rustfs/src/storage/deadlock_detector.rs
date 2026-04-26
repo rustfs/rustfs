@@ -464,7 +464,7 @@ impl DeadlockDetector {
         if let Some(cycle) = Self::find_cycle(&wait_graph) {
             deadlocks_detected.fetch_add(1, Ordering::Relaxed);
 
-            counter!("rustfs.deadlock.detected.total").increment(1);
+            counter!("rustfs_deadlock_detected_total").increment(1);
 
             // Log detailed deadlock information
             error!(

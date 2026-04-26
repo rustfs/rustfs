@@ -92,15 +92,6 @@ impl OperationHelper {
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = is_notify_module_enabled();
 
-        // Fast path: when both chains are disabled, avoid all request parsing/builder work.
-        if !audit_enabled && !notify_enabled {
-            return Self::Disabled;
-        }
-
-        if audit_enabled {
-            counter!("rustfs.log.chain.audit.total").increment(1);
-        }
-        // Parse path -> bucket/object
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
         let path_bucket = segs.next().unwrap_or("").to_string();
@@ -110,6 +101,19 @@ impl OperationHelper {
             .and_then(|info| info.bucket.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
+
+        let bucket_label = if bucket.is_empty() { "*" } else { &bucket };
+        record_s3_op(op, bucket_label);
+
+        // Fast path: when both chains are disabled, avoid all request parsing/builder work.
+        if !audit_enabled && !notify_enabled {
+            return Self::Disabled;
+        }
+
+        if audit_enabled {
+            counter!("rustfs_log_chain_audit_total").increment(1);
+        }
+        // Parse path -> bucket/object
         let object_key = req_info
             .and_then(|info| info.object.clone())
             .filter(|value| !value.is_empty())
@@ -118,16 +122,13 @@ impl OperationHelper {
         // Infer remote address
         let remote_host = req
             .headers
-            .get("x-forwarded-for")
+            .get(rustfs_utils::http::X_FORWARDED_FOR)
             .and_then(|v| v.to_str().ok())
-            .or_else(|| req.headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .or_else(|| req.headers.get(rustfs_utils::http::X_REAL_IP).and_then(|v| v.to_str().ok()))
             .unwrap_or("")
             .to_string();
 
         let trigger = op.as_str();
-
-        let bucket_label = if bucket.is_empty() { "*" } else { &bucket };
-        record_s3_op(op, bucket_label);
 
         // Initialize audit builder
         let mut api_builder = ApiDetailsBuilder::new().name(trigger);
@@ -142,7 +143,7 @@ impl OperationHelper {
         //   RequestContext.request_id > extract_request_id_from_headers() > generated fallback id
         let request_context = request_context_from_req(req);
         if request_context.is_none() {
-            counter!("rustfs.log.chain.orphan.total", "component" => "operation_helper").increment(1);
+            counter!("rustfs_log_chain_orphan_total", "component" => "operation_helper").increment(1);
         }
         let request_id = request_context
             .as_ref()
@@ -371,8 +372,10 @@ mod tests {
     use super::*;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+    use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_credentials::Credentials;
     use s3s::dto::DeleteObjectTaggingInput;
+    use std::sync::{Arc, Mutex};
     use temp_env::with_vars;
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
@@ -387,6 +390,62 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct SeenMetricsRecorder {
+        counters: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl SeenMetricsRecorder {
+        fn saw_counter_named(&self, name: &str) -> bool {
+            self.counters.lock().unwrap().iter().any(|key| key.name() == name)
+        }
+    }
+
+    impl metrics::Recorder for SeenMetricsRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            self.counters.lock().unwrap().push(key.clone());
+            Counter::from_arc(Arc::new(NoopCounter))
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(NoopGauge))
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::from_arc(Arc::new(NoopHistogram))
+        }
+    }
+
+    struct NoopCounter;
+
+    impl CounterFn for NoopCounter {
+        fn increment(&self, _value: u64) {}
+
+        fn absolute(&self, _value: u64) {}
+    }
+
+    struct NoopGauge;
+
+    impl GaugeFn for NoopGauge {
+        fn increment(&self, _value: f64) {}
+
+        fn decrement(&self, _value: f64) {}
+
+        fn set(&self, _value: f64) {}
+    }
+
+    struct NoopHistogram;
+
+    impl HistogramFn for NoopHistogram {
+        fn record(&self, _value: f64) {}
     }
 
     #[test]
@@ -542,6 +601,38 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 assert!(matches!(helper, OperationHelper::Disabled));
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_still_records_s3_ops_when_audit_and_notify_are_disabled() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("false")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let recorder = SeenMetricsRecorder::default();
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("test-bucket".to_string())
+                    .key("test-key".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::DELETE, Uri::from_static("/test-bucket/test-key"));
+
+                metrics::with_local_recorder(&recorder, || {
+                    let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                    assert!(matches!(helper, OperationHelper::Disabled));
+                });
+
+                assert!(
+                    recorder.saw_counter_named("rustfs_s3_operations_total"),
+                    "S3 operation metrics should still be recorded when audit/notify are disabled"
+                );
             },
         );
     }
