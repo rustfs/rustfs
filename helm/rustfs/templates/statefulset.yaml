@@ -75,13 +75,7 @@ spec:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
-                  mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
-                mkdir -p /data
-              fi
+              mkdir -p /data
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
           volumeMounts:
