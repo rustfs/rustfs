@@ -172,7 +172,7 @@ Render RUSTFS_VOLUMES
   {{- $protocol = "https" -}}
 {{- end -}}
 
-{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
+{{- printf "%s://%s-{0...%d}.%s-headless:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
 {{- end }}
 
 {{/*
