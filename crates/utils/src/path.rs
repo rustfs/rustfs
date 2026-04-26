@@ -90,7 +90,11 @@ pub fn retain_slash(s: &str) -> String {
 
 /// Checks if string `s` starts with `prefix` using case-insensitive comparison.
 pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && (s[..prefix.len()] == *prefix || s[..prefix.len()].eq_ignore_ascii_case(prefix))
+    if s.starts_with(prefix) {
+        return true;
+    }
+
+    s.get(..prefix.len()).is_some_and(|s_prefix| s_prefix.eq_ignore_ascii_case(prefix))
 }
 
 /// Checks if string `s` starts with `prefix`.
@@ -874,5 +878,17 @@ mod tests {
         let (bucket, object) = path_to_bucket_object_with_base_path("c:\\tmp", "C:\\tmp\\bucket\\object");
         assert_eq!(bucket, "bucket");
         assert_eq!(object, "object");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_path_to_bucket_object_with_base_path_handles_unicode_without_panicking() {
+        let (bucket, object) = path_to_bucket_object_with_base_path(
+            "D:\\Github\\rustfs\\target\\volumes\\test1",
+            "s3-test-bucket/中文/日本語/한글-9cd5599a-f8eb-4e24-9df7-32ecd8d8ad1f",
+        );
+
+        assert_eq!(bucket, "s3-test-bucket");
+        assert_eq!(object, "中文/日本語/한글-9cd5599a-f8eb-4e24-9df7-32ecd8d8ad1f");
     }
 }

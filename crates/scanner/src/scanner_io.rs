@@ -40,9 +40,10 @@ use rustfs_ecstore::set_disk::SetDisks;
 use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::SystemTime;
 use std::{fmt::Debug, sync::Arc};
 use time::OffsetDateTime;
@@ -67,6 +68,13 @@ fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error
     }
 
     Ok(())
+}
+
+fn is_xl_meta_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == STORAGE_FORMAT_FILE)
 }
 
 async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
@@ -540,7 +548,7 @@ impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
         let done_object = Metrics::time(Metric::ScanObject);
 
-        if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
+        if !is_xl_meta_path(&item.path) {
             return Err(StorageError::other("skip file".to_string()));
         }
 
@@ -740,5 +748,16 @@ mod tests {
         let err = finalize_nsscanner_result(&results, Some(Error::other("set failed")))
             .expect_err("all failed sets should bubble first error");
         assert!(err.to_string().contains("set failed"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn is_xl_meta_path_accepts_windows_separator() {
+        assert!(is_xl_meta_path("D:\\data\\bucket\\object\\xl.meta"));
+    }
+
+    #[test]
+    fn is_xl_meta_path_accepts_forward_separator() {
+        assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
     }
 }
