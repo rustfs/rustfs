@@ -115,10 +115,7 @@ spec:
           image: "{{ $.Values.image.initImage.repository }}:{{ $.Values.image.initImage.tag }}"
           imagePullPolicy: {{ $.Values.image.initImage.pullPolicy }}
           securityContext:
-            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
-          env:
-            - name: REPLICA_COUNT
-              value: {{ $pool.replicaCount | quote }}
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           command:
             - sh
             - -c
