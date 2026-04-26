@@ -24,7 +24,10 @@ use crate::admin::{
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled};
+use crate::server::{
+    ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled,
+    refresh_persisted_module_switches_from_store,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -167,7 +170,13 @@ fn target_mutation_block_reason(config: &Config, target_type: &str, target_name:
     )
 }
 
-fn notification_target_operation_block_reason(action: &str) -> Option<String> {
+async fn notification_target_operation_block_reason(action: &str) -> Option<String> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!(
+            error = %err,
+            "failed to reload persisted module switches before checking notification target operation gating"
+        );
+    }
     refresh_notify_module_enabled();
     target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
 }
@@ -202,7 +211,7 @@ impl Operation for NotificationTarget {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
-        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console") {
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let ns = get_notification_system()?;
@@ -301,7 +310,9 @@ impl Operation for ListTargetsArns {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason(
             "querying notification target ARNs for bucket associations from the console",
-        ) {
+        )
+        .await
+        {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let ns = get_notification_system()?;
@@ -349,7 +360,7 @@ impl Operation for RemoveNotificationTarget {
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
-        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console") {
+        if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let ns = get_notification_system()?;
@@ -562,7 +573,9 @@ mod tests {
     #[test]
     fn notification_target_operation_block_reason_requires_notify_module_enable() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"), || {
-            let reason = notification_target_operation_block_reason("managing notification targets from the console");
+            let reason = futures::executor::block_on(notification_target_operation_block_reason(
+                "managing notification targets from the console",
+            ));
             assert!(reason.is_some());
             assert!(reason.unwrap().contains("set RUSTFS_NOTIFY_ENABLE=true"));
         });
@@ -571,7 +584,12 @@ mod tests {
     #[test]
     fn notification_target_operation_block_reason_allows_when_notify_module_enabled() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
-            assert!(notification_target_operation_block_reason("managing notification targets from the console").is_none());
+            assert!(
+                futures::executor::block_on(notification_target_operation_block_reason(
+                    "managing notification targets from the console"
+                ))
+                .is_none()
+            );
         });
     }
 

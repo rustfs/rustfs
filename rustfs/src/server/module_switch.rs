@@ -166,19 +166,18 @@ pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<Per
         return Err("storage layer not initialized".to_string());
     };
 
-    let config = match read_config(store, MODULE_SWITCH_CONFIG_PATH).await {
-        Ok(data) => serde_json::from_slice::<PersistedModuleSwitches>(&data)
-            .map_err(|e| format!("failed to deserialize module switch config: {e}"))?,
-        Err(StorageError::ConfigNotFound) => PersistedModuleSwitches::default(),
+    let (config, configured) = match read_config(store, MODULE_SWITCH_CONFIG_PATH).await {
+        Ok(data) => (
+            serde_json::from_slice::<PersistedModuleSwitches>(&data)
+                .map_err(|e| format!("failed to deserialize module switch config: {e}"))?,
+            true,
+        ),
+        Err(StorageError::ConfigNotFound) => (PersistedModuleSwitches::default(), false),
         Err(err) => return Err(format!("failed to load module switch config: {err}")),
     };
 
     // Track whether the persisted file exists so the effective state can
     // distinguish "console configured false" from "never configured, use default".
-    let configured = match new_object_layer_fn() {
-        Some(store) => read_config(store, MODULE_SWITCH_CONFIG_PATH).await.is_ok(),
-        None => false,
-    };
     set_persisted_module_switches(config, configured);
     Ok(config)
 }
