@@ -66,6 +66,7 @@ const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE";
+const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE";
 const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
 const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
@@ -88,6 +89,102 @@ struct FileCacheReclaimWriter {
     reclaim_len: usize,
     reclaim_on_shutdown: bool,
     reclaimed: bool,
+}
+
+struct FileCacheReclaimReader {
+    inner: File,
+    reclaim_len: usize,
+    reclaim_on_drop: bool,
+    reclaimed: bool,
+}
+
+impl FileCacheReclaimReader {
+    fn new(inner: File, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_drop {
+            let _ = set_fd_nocache(&inner);
+        }
+
+        Self {
+            inner,
+            reclaim_len,
+            reclaim_on_drop,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        if !self.reclaim_on_drop || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let fd = self.inner.as_raw_fd();
+        // SAFETY: `fd` remains owned by `self.inner`, and `posix_fadvise`
+        // only advises kernel cache behavior for this file range.
+        let ret = unsafe { libc::posix_fadvise(fd, 0, self.reclaim_len as i64, libc::POSIX_FADV_DONTNEED) };
+        if ret != 0 {
+            return Err(std::io::Error::from_raw_os_error(ret));
+        }
+
+        self.reclaimed = true;
+        counter!("rustfs_page_cache_reclaim_requests_total", "kind" => "read".to_string(), "result" => "ok".to_string())
+            .increment(1);
+        counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => "read".to_string()).increment(self.reclaim_len as u64);
+        metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => "read".to_string())
+            .record(started.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_fd_nocache(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_std_fd_nocache(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl Drop for FileCacheReclaimReader {
+    fn drop(&mut self) {
+        let _ = self.reclaim_file_cache();
+    }
+}
+
+impl tokio::io::AsyncRead for FileCacheReclaimReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
 impl FileCacheReclaimWriter {
@@ -192,6 +289,20 @@ fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
     let threshold =
         rustfs_utils::get_env_usize(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD);
     file_size as usize >= threshold
+}
+
+fn should_reclaim_file_cache_after_read(length: usize) -> bool {
+    if length == 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, false) {
+        return false;
+    }
+
+    let threshold =
+        rustfs_utils::get_env_usize(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD);
+    length >= threshold
 }
 
 pub struct LocalDisk {
@@ -2036,7 +2147,8 @@ impl DiskAPI for LocalDisk {
             f.seek(SeekFrom::Start(offset as u64)).await?;
         }
 
-        Ok(Box::new(f))
+        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
+        Ok(Box::new(FileCacheReclaimReader::new(f, length, reclaim_on_drop)))
     }
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
@@ -2081,8 +2193,14 @@ impl DiskAPI for LocalDisk {
             use memmap2::MmapOptions;
             let file_path_clone = file_path.clone();
 
+            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+
+                #[cfg(target_os = "macos")]
+                if should_reclaim_after_read {
+                    let _ = set_std_fd_nocache(&file);
+                }
 
                 // mmap offsets on Unix must be page-size aligned. Align the
                 // mapping down to the nearest page boundary, then slice out the
@@ -2111,7 +2229,22 @@ impl DiskAPI for LocalDisk {
                 let end = logical_offset
                     .checked_add(length)
                     .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap[logical_offset..end]))
+                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+
+                #[cfg(target_os = "linux")]
+                if should_reclaim_after_read {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: `posix_fadvise` only advises kernel cache behavior
+                    // for this file descriptor and aligned range.
+                    let ret = unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), aligned_offset as i64, map_len as i64, libc::POSIX_FADV_DONTNEED)
+                    };
+                    if ret != 0 {
+                        return Err(DiskError::from(std::io::Error::from_raw_os_error(ret)));
+                    }
+                }
+
+                Ok::<Bytes, DiskError>(bytes)
             })
             .await
             .map_err(DiskError::from)??;
@@ -3499,6 +3632,20 @@ mod test {
             temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
                 assert!(should_reclaim_file_cache_after_write(8 * 1024 * 1024));
                 assert!(!should_reclaim_file_cache_after_write(1024));
+            });
+        });
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
+        temp_env::with_var_unset(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
+            temp_env::with_var(ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_read(1024));
             });
         });
     }

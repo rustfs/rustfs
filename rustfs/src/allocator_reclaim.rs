@@ -22,7 +22,9 @@ use tracing::{debug, warn};
 const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLED";
 const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
 const ENV_ALLOCATOR_RECLAIM_FORCE: &str = "RUSTFS_ALLOCATOR_RECLAIM_FORCE";
+const ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS: &str = "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS";
 const DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS: u64 = 30;
+const DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS: u64 = 3;
 
 pub fn allocator_backend() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
@@ -46,6 +48,17 @@ pub fn allocator_backend() -> &'static str {
 
 fn active_requests() -> u64 {
     crate::server::active_http_requests()
+}
+
+fn current_delete_tail_activity() -> u64 {
+    crate::delete_tail_activity::current_delete_tail_activity()
+}
+
+fn reclaimable_work_inflight() -> u64 {
+    active_requests()
+        + current_delete_tail_activity()
+        + rustfs_io_metrics::current_ec_encode_inflight_bytes()
+        + rustfs_io_metrics::current_get_object_buffered_bytes()
 }
 
 #[cfg(all(
@@ -111,6 +124,8 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
     }
 
     let force = rustfs_utils::get_env_bool(ENV_ALLOCATOR_RECLAIM_FORCE, true);
+    let idle_intervals =
+        rustfs_utils::get_env_u64(ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS, DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS).max(1);
     let interval = Duration::from_secs(
         rustfs_utils::get_env_u64(ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS, DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS).max(1),
     );
@@ -118,6 +133,7 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut idle_streak = 0_u64;
 
         loop {
             tokio::select! {
@@ -127,15 +143,34 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
                 }
                 _ = ticker.tick() => {
                     let active_requests = active_requests();
+                    let delete_tail_activity = current_delete_tail_activity();
+                    let ec_inflight_bytes = rustfs_io_metrics::current_ec_encode_inflight_bytes();
+                    let get_buffered_bytes = rustfs_io_metrics::current_get_object_buffered_bytes();
+                    let reclaimable_inflight = reclaimable_work_inflight();
                     gauge!("rustfs_memory_allocator_reclaim_active_requests").set(active_requests as f64);
-                    if active_requests == 0 {
-                        run_allocator_reclaim(force);
+                    gauge!("rustfs_memory_allocator_reclaim_delete_tail_activity_current").set(delete_tail_activity as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_ec_inflight_bytes_current").set(ec_inflight_bytes as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_get_buffered_bytes_current").set(get_buffered_bytes as f64);
+                    gauge!("rustfs_memory_allocator_reclaim_reclaimable_work_current").set(reclaimable_inflight as f64);
+                    if reclaimable_inflight == 0 {
+                        idle_streak = idle_streak.saturating_add(1);
+                        gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(idle_streak as f64);
                     } else {
-                        counter!(
-                            "rustfs_memory_allocator_reclaim_skipped_total",
-                            "reason" => "active_requests".to_string()
-                        )
-                        .increment(1);
+                        idle_streak = 0;
+                        gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(0.0);
+                    }
+
+                    if idle_streak >= idle_intervals {
+                        run_allocator_reclaim(force);
+                        idle_streak = 0;
+                        gauge!("rustfs_memory_allocator_reclaim_idle_streak").set(0.0);
+                    } else {
+                        let reason = if reclaimable_inflight > 0 {
+                            "work_inflight"
+                        } else {
+                            "idle_window"
+                        };
+                        counter!("rustfs_memory_allocator_reclaim_skipped_total", "reason" => reason.to_string()).increment(1);
                     }
                 }
             }
@@ -145,10 +180,15 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
-    use super::allocator_backend;
+    use super::{allocator_backend, reclaimable_work_inflight};
 
     #[test]
     fn allocator_backend_name_is_available() {
         assert!(!allocator_backend().is_empty());
+    }
+
+    #[test]
+    fn reclaimable_work_inflight_is_collectable() {
+        let _ = reclaimable_work_inflight();
     }
 }

@@ -16,6 +16,7 @@
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::RustFSBufferConfig;
+use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
@@ -213,6 +214,7 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
     let Some(existing) = existing else {
         return;
     };
+    let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
         rustfs_ecstore::bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
@@ -3117,6 +3119,7 @@ impl DefaultObjectUsecase {
                 && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
                     || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
             {
+                let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
                 let mut dobj = dobj.clone();
                 if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
                     dobj.version_id = Some(Uuid::nil());
@@ -3140,6 +3143,7 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(default_notify_interface);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         spawn_background_with_context(request_context, async move {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -3329,6 +3333,7 @@ impl DefaultObjectUsecase {
         let deleted_replication_info = existing_object_info
             .as_ref()
             .filter(|_| should_use_existing_delete_replication_info(&opts));
+        let _delete_tail_guard = DeleteTailActivityGuard::new(DeleteTailStage::Tail);
         let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
         let replication_state_source =
             delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
@@ -3342,6 +3347,7 @@ impl DefaultObjectUsecase {
         };
 
         if schedule_delete_replication {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
             let mut deleted_object = DeletedObjectReplicationInfo {
                 delete_object: rustfs_ecstore::store_api::DeletedObject {
                     delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,

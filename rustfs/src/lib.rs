@@ -57,6 +57,7 @@ pub mod auth;
 pub mod auth_keystone;
 pub mod capacity;
 pub mod config;
+pub mod delete_tail_activity;
 pub mod embedded;
 pub mod error;
 pub mod init;

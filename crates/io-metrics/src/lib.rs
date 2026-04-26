@@ -625,6 +625,12 @@ pub fn remove_ec_encode_inflight_bytes(bytes: usize) {
     gauge!("rustfs_ec_encode_inflight_bytes_current").set(next as f64);
 }
 
+/// Return the current tracked EC encode in-flight bytes.
+#[inline(always)]
+pub fn current_ec_encode_inflight_bytes() -> u64 {
+    EC_ENCODE_INFLIGHT_BYTES.load(Ordering::Relaxed)
+}
+
 /// Track whole-object buffering on the GET path.
 #[inline(always)]
 pub fn track_get_object_buffered_bytes(bytes: usize) -> Option<MemoryGaugeGuard> {
@@ -639,6 +645,12 @@ pub fn track_get_object_buffered_bytes(bytes: usize) -> Option<MemoryGaugeGuard>
         gauge: TrackedMemoryGauge::GetObjectBufferedBytes,
         bytes: bytes as u64,
     })
+}
+
+/// Return the current tracked GET whole-buffered bytes.
+#[inline(always)]
+pub fn current_get_object_buffered_bytes() -> u64 {
+    GET_OBJECT_BUFFERED_BYTES.load(Ordering::Relaxed)
 }
 
 /// Record CPU usage.
