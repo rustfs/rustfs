@@ -163,6 +163,9 @@ Merges (in order of increasing precedence):
 Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
+{{- if lt (.Values.replicaCount | int) 1 }}
+{{- fail "distributed mode requires replicaCount >= 1" }}
+{{- end }}
 
 {{- $protocol := "http" -}}
 {{- if .Values.mtls.enabled -}}
