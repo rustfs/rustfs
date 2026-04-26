@@ -255,18 +255,30 @@ where
         let mut sts_policy_map = HashMap::new();
         let mut policy_docs_map = HashMap::new();
 
-        let _ = self.api.load_user(access_key, UserType::Svc, &mut users_map).await;
+        match self.api.load_user(access_key, UserType::Svc, &mut users_map).await {
+            Ok(()) => {}
+            Err(err) if is_err_no_such_user(&err) => {}
+            Err(err) => return Err(err),
+        }
 
         let parent_user = users_map.get(access_key).map(|svc| svc.credentials.parent_user.clone());
 
         if let Some(parent_user) = parent_user {
-            let _ = self.api.load_user(&parent_user, UserType::Reg, &mut users_map).await;
+            match self.api.load_user(&parent_user, UserType::Reg, &mut users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
             let _ = self
                 .api
                 .load_mapped_policy(&parent_user, UserType::Reg, false, &mut user_policy_map)
                 .await;
         } else {
-            let _ = self.api.load_user(access_key, UserType::Reg, &mut users_map).await;
+            match self.api.load_user(access_key, UserType::Reg, &mut users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
             if users_map.contains_key(access_key) {
                 let _ = self
                     .api
@@ -274,7 +286,11 @@ where
                     .await;
             }
 
-            let _ = self.api.load_user(access_key, UserType::Sts, &mut sts_users_map).await;
+            match self.api.load_user(access_key, UserType::Sts, &mut sts_users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
 
             let has_sts_user = sts_users_map.get(access_key);
 

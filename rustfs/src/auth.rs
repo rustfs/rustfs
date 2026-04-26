@@ -175,6 +175,7 @@ impl S3Auth for IAMAuth {
                 }
                 Err(e) => {
                     warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    return Err(s3_error!(InternalError, "IAM user lookup failed"));
                 }
             }
         } else {
