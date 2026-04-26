@@ -7,8 +7,8 @@ set -euo pipefail
 
 WARP_BIN="${WARP_BIN:-warp}"
 HOST="${HOST:-http://127.0.0.1:9000}"
-ACCESS_KEY="${ACCESS_KEY:-minioadmin}"
-SECRET_KEY="${SECRET_KEY:-minioadmin}"
+ACCESS_KEY="${ACCESS_KEY:-rustfsadmin}"
+SECRET_KEY="${SECRET_KEY:-rustfsadmin}"
 BUCKET="${BUCKET:-rustfs-issue-2573}"
 REGION="${REGION:-us-east-1}"
 CONCURRENCY="${CONCURRENCY:-30}"
@@ -26,16 +26,16 @@ Usage:
 
 Options:
   --warp-bin <path>        warp binary (default: warp)
-  --host <url>             S3 endpoint (default: http://127.0.0.1:9000)
-  --access-key <ak>        access key (default: minioadmin)
-  --secret-key <sk>        secret key (default: minioadmin)
+  --host <url>             S3 endpoint; accepts either URL or host:port (default: http://127.0.0.1:9000)
+  --access-key <ak>        access key (default: rustfsadmin)
+  --secret-key <sk>        secret key (default: rustfsadmin)
   --bucket <name>          bucket name (default: rustfs-issue-2573)
   --region <name>          region (default: us-east-1)
   --concurrency <n>        warp concurrency (default: 30)
   --duration <dur>         warp duration per profile (default: 60s)
   --cooldown-secs <n>      cooldown sampling after each profile (default: 180)
   --sample-secs <n>        RSS sample interval seconds (default: 1)
-  --pid <pid>              rustfs process pid (default: auto-detect by pgrep)
+  --pid <pid>              rustfs process pid (optional; auto-detect if omitted)
   --out-dir <dir>          output directory
   --insecure               pass --insecure to warp
   -h, --help               show help
@@ -89,15 +89,30 @@ resolve_pid() {
   local pid
   pid="$(pgrep -n rustfs || true)"
   if [[ -z "$pid" ]]; then
-    echo "ERROR: failed to auto-detect rustfs pid; pass --pid" >&2
-    exit 1
+    echo ""
+    return
   fi
   echo "$pid"
+}
+
+normalize_warp_host() {
+  local raw="$1"
+  # Strip scheme when a URL is provided.
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  # Remove any path/query/fragment to satisfy warp's --host requirements.
+  raw="${raw%%/*}"
+  raw="${raw%%\?*}"
+  raw="${raw%%\#*}"
+  echo "$raw"
 }
 
 sample_rss_loop() {
   local pid="$1"
   local out_file="$2"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
   local started_at
   started_at="$(date +%s)"
 
@@ -118,6 +133,9 @@ sample_rss_window() {
   local pid="$1"
   local seconds="$2"
   local out_file="$3"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
   local started_at deadline
   started_at="$(date +%s)"
   deadline="$((started_at + seconds))"
@@ -146,6 +164,8 @@ run_profile() {
   local mode="$2"
   local obj_size="$3"
   local pid="$4"
+  local warp_host
+  warp_host="$(normalize_warp_host "$HOST")"
   local benchdata="$OUT_DIR/${profile_name// /-}"
   local warp_log="$OUT_DIR/${profile_name// /-}.warp.log"
   local rss_during="$OUT_DIR/${profile_name// /-}.rss_during.csv"
@@ -153,7 +173,7 @@ run_profile() {
 
   local -a cmd=(
     "$WARP_BIN" "$mode"
-    "--host" "$HOST"
+    "--host" "$warp_host"
     "--access-key" "$ACCESS_KEY"
     "--secret-key" "$SECRET_KEY"
     "--bucket" "$BUCKET"
@@ -172,17 +192,26 @@ run_profile() {
   printf ' %q' "${cmd[@]}"
   printf '\n'
 
+  local sampler_pid=""
   sample_rss_window "$pid" "$((COOLDOWN_SECS + 1))" /dev/null >/dev/null 2>&1 || true
-  sample_rss_loop "$pid" "$rss_during" &
-  local sampler_pid=$!
+  if [[ -n "$pid" ]]; then
+    sample_rss_loop "$pid" "$rss_during" &
+    sampler_pid=$!
+  else
+    echo "WARN: rustfs pid unavailable; skipping RSS sampling for $profile_name" >&2
+  fi
   if ! "${cmd[@]}" 2>&1 | tee "$warp_log"; then
     echo "ERROR: profile failed: $profile_name" >&2
-    kill "$sampler_pid" >/dev/null 2>&1 || true
-    wait "$sampler_pid" >/dev/null 2>&1 || true
+    if [[ -n "$sampler_pid" ]]; then
+      kill "$sampler_pid" >/dev/null 2>&1 || true
+      wait "$sampler_pid" >/dev/null 2>&1 || true
+    fi
     exit 1
   fi
-  kill "$sampler_pid" >/dev/null 2>&1 || true
-  wait "$sampler_pid" >/dev/null 2>&1 || true
+  if [[ -n "$sampler_pid" ]]; then
+    kill "$sampler_pid" >/dev/null 2>&1 || true
+    wait "$sampler_pid" >/dev/null 2>&1 || true
+  fi
 
   echo "==== Cooldown sampling: $profile_name ($COOLDOWN_SECS s) ===="
   sample_rss_window "$pid" "$COOLDOWN_SECS" "$rss_cooldown"
@@ -197,10 +226,17 @@ main() {
 
   local pid
   pid="$(resolve_pid)"
+  local warp_host
+  warp_host="$(normalize_warp_host "$HOST")"
 
   echo "Output dir: $OUT_DIR"
-  echo "RustFS pid: $pid"
+  if [[ -n "$pid" ]]; then
+    echo "RustFS pid: $pid"
+  else
+    echo "RustFS pid: auto-detect failed (continuing without RSS sampling)"
+  fi
   echo "Host: $HOST"
+  echo "Warp host: $warp_host"
   echo "Bucket: $BUCKET"
   echo "Profiles:"
   echo "  - 4KiB mixed"
