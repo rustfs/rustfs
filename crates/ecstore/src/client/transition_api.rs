@@ -31,6 +31,7 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
+    signer_error,
 };
 use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use futures::{Future, StreamExt};
@@ -86,10 +87,7 @@ const C_OFFLINE: i32 = 0;
 const C_ONLINE: i32 = 1;
 
 fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("{scope}: invalid UTF-8 header value for `{header_name}`"),
-    )
+    signer_error::invalid_utf8_header_error(scope, header_name)
 }
 
 fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::io::Error> {
@@ -100,10 +98,7 @@ fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::i
 }
 
 fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
-    match error {
-        rustfs_signer::SignV4Error::InvalidHeaderValue { name } => invalid_utf8_header_error(scope, &name),
-        other => std::io::Error::other(format!("{scope}: {other}")),
-    }
+    signer_error::signer_error_to_io_error(scope, error)
 }
 
 //pub type ReaderImpl = Box<dyn Reader + Send + Sync + 'static>;

@@ -22,6 +22,7 @@ use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
 use crate::client::{
     api_error_response::http_resp_to_error_response,
+    signer_error,
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use http::Request;
@@ -36,13 +37,7 @@ use s3s::S3ErrorCode;
 use std::collections::HashMap;
 
 fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
-    match error {
-        rustfs_signer::SignV4Error::InvalidHeaderValue { name } => std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{scope}: invalid UTF-8 header value for `{name}`"),
-        ),
-        other => std::io::Error::other(format!("{scope}: {other}")),
-    }
+    signer_error::signer_error_to_io_error(scope, error)
 }
 
 #[derive(Debug, Clone)]

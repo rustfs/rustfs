@@ -20,16 +20,17 @@
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
+use crate::client::signer_error::error_chain_contains_signer_header_marker;
 use crate::global::GLOBAL_TierConfigMgr;
 use rustfs_utils::get_env_usize;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
 use uuid::Uuid;
 use xxhash_rust::xxh64;
@@ -119,31 +120,35 @@ impl Drop for RemoteDeleteInflightGuard {
 }
 
 fn is_signer_header_error(err: &std::io::Error) -> bool {
+    if err.kind() != std::io::ErrorKind::InvalidInput {
+        return false;
+    }
+
+    if let Some(source) = err.get_ref() {
+        if error_chain_contains_signer_header_marker(source) {
+            return true;
+        }
+    }
+
     let message = err.to_string().to_ascii_lowercase();
     message.contains("invalid utf-8 header value")
         || message.contains("invalidheadervalue")
         || (message.contains("sign v4") && message.contains("header value"))
 }
 
-fn remote_delete_breaker_is_open(now: Instant) -> bool {
-    let mut breaker = match REMOTE_DELETE_BREAKER.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+async fn remote_delete_breaker_is_open(now: Instant) -> bool {
+    let mut breaker = REMOTE_DELETE_BREAKER.lock().await;
     breaker.should_short_circuit(now)
 }
 
-fn record_remote_delete_failure(err: &std::io::Error, now: Instant) {
+async fn record_remote_delete_failure(err: &std::io::Error, now: Instant) {
     metrics::counter!(METRIC_DELETE_REMOTE_FAILED_TOTAL).increment(1);
 
     if !is_signer_header_error(err) {
         return;
     }
 
-    let mut breaker = match REMOTE_DELETE_BREAKER.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut breaker = REMOTE_DELETE_BREAKER.lock().await;
     if breaker.record_signer_failure(now) {
         warn!(
             threshold = breaker.threshold,
@@ -272,7 +277,7 @@ impl ExpiryOp for Jentry {
 }
 
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
-    if remote_delete_breaker_is_open(Instant::now()) {
+    if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
         return Err(std::io::Error::other("remote tier delete breaker is open due to signer/header failures"));
     }
@@ -288,13 +293,13 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
         Ok(w) => w,
         Err(e) => {
             let err = std::io::Error::other(e);
-            record_remote_delete_failure(&err, Instant::now());
+            record_remote_delete_failure(&err, Instant::now()).await;
             return Err(err);
         }
     };
     let result = w.remove(obj_name, rv_id).await;
     if let Err(err) = &result {
-        record_remote_delete_failure(err, Instant::now());
+        record_remote_delete_failure(err, Instant::now()).await;
     }
     result
 }
@@ -333,6 +338,8 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
 
 #[cfg(test)]
 mod test {
+    use crate::client::signer_error::invalid_utf8_header_error;
+
     use super::{RemoteDeleteBreaker, is_signer_header_error};
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
@@ -350,6 +357,12 @@ mod test {
     fn signer_header_error_detection_rejects_unrelated_errors() {
         let err = Error::other("dial tcp: i/o timeout");
         assert!(!is_signer_header_error(&err));
+    }
+
+    #[test]
+    fn signer_header_error_detection_matches_structured_marker() {
+        let err = invalid_utf8_header_error("failed to sign v4 request", "x-amz-meta-invalid");
+        assert!(is_signer_header_error(&err));
     }
 
     #[test]
