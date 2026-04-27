@@ -26,6 +26,7 @@ pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
+pub mod module_switch;
 pub mod oidc;
 pub mod policies;
 pub mod pools;
@@ -55,6 +56,8 @@ mod tests {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
+        let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
         let _inspect_data_handler = system::InspectDataHandler {};

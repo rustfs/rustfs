@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
-const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 8;
 
 fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {
@@ -38,6 +38,16 @@ fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usiz
     max_inflight_bytes
         .saturating_div(expanded_block_bytes)
         .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
+}
+
+fn queued_block_bytes(block: &[Bytes]) -> usize {
+    block.iter().map(Bytes::len).sum()
+}
+
+async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
+    while let Some(block) = rx.recv().await {
+        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+    }
 }
 
 pub(crate) struct MultiWriter<'a> {
@@ -217,7 +227,10 @@ impl Erasure {
                     Ok(n) if n > 0 => {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
+                        let queued_bytes = queued_block_bytes(&res);
+                        rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
+                            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
@@ -250,6 +263,8 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
+            let queued_bytes = queued_block_bytes(&block);
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
                 break;
@@ -259,6 +274,7 @@ impl Erasure {
         if let Some(err) = write_err {
             task.abort();
             let _ = task.await;
+            drain_queued_inflight_bytes(&mut rx).await;
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
             }

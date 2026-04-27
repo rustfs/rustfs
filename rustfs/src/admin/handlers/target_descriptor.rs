@@ -193,6 +193,14 @@ pub(crate) fn target_mutation_block_reason(
     }
 }
 
+pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, enabled: bool, action: &str) -> Option<String> {
+    (!enabled).then(|| {
+        format!(
+            "{module_name} module is disabled; enable the {module_name} module first in the console or set {env_key}=true before {action}"
+        )
+    })
+}
+
 pub(crate) fn merge_target_endpoints(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
