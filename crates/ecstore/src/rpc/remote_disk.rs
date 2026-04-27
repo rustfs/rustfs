@@ -16,9 +16,9 @@ use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
     FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
-        SKIP_IF_SUCCESS_BEFORE, get_drive_disk_info_timeout, get_drive_list_dir_timeout, get_drive_metadata_timeout,
-        get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
+        DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
+        get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
+        get_drive_metadata_timeout, get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
     },
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
@@ -178,7 +178,7 @@ impl RemoteDisk {
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
     ) {
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
         if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
@@ -283,7 +283,7 @@ impl RemoteDisk {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(stream)) => {
                 drop(stream);
                 Ok(())

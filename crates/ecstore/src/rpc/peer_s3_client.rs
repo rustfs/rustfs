@@ -26,7 +26,7 @@ use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
         self, VolumeInfo,
-        disk_store::{CHECK_EVERY, CHECK_TIMEOUT_DURATION, DiskHealthTracker},
+        disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
     endpoints::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
@@ -615,7 +615,7 @@ impl RemotePeerS3Client {
 
     /// Monitor remote peer health periodically
     async fn monitor_remote_peer_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         loop {
             tokio::select! {
@@ -684,7 +684,7 @@ impl RemotePeerS3Client {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => Ok(()),
             _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
         }
