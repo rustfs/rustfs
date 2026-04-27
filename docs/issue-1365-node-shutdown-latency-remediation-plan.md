@@ -615,6 +615,7 @@ helper 能力建议:
    - `curl http://127.0.0.1:9000/health/ready`
 2. 再执行 Docker 模式下的兼容测试:
    - `DEPLOY_MODE=docker ./scripts/s3-tests/run.sh`
+   - 或使用统一脚本: `./scripts/validate_issue_1365_docker.sh`
 3. 若后续补齐多节点 Docker/Compose 验证编排，再追加节点下线注入验证:
    - 停单容器
    - 观察首次请求、第二批请求和控制面恢复行为

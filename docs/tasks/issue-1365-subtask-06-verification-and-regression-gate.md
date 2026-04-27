@@ -72,6 +72,12 @@ DEPLOY_MODE=docker ./scripts/s3-tests/run.sh
 docker compose -f docker-compose-simple.yml down -v
 ```
 
+或者直接执行仓库脚本:
+
+```bash
+./scripts/validate_issue_1365_docker.sh
+```
+
 如果后续补齐多节点 Docker Compose 场景，则在该阶段追加:
 
 1. 单节点停机/断开
